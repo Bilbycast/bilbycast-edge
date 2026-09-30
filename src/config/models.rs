@@ -6037,8 +6037,9 @@ pub struct VideoEncodeConfig {
 ///   does the TS **ingress** transcoder (an input's `video_encode`): its
 ///   output is the flow's source for every output, browser-facing
 ///   passthrough ones (WebRTC / WHIP, RTMP, HLS / CMAF) included, which
-///   cannot decode MBAFF. Decided once, when the encoder opens; what it
-///   opened with is `video_encode_stats.coded_scan`.
+///   cannot decode MBAFF. Decided once, when the encoder opens (progressive vs
+///   field-coded never changes without a reopen); what it codes is
+///   `video_encode_stats.coded_scan`, its field order following the source.
 /// - `Progressive`: always frame coding — what every release before this
 ///   field did. A woven interlaced source is carried as progressive frames
 ///   holding both fields.

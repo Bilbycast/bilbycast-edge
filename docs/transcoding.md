@@ -1199,9 +1199,16 @@ on: on an Intel host whose `h264_auto` chain starts with a QSV that refuses
 fields, `auto` codes progressive on QSV rather than demoting to libx264 to get
 them; `interlaced` walks the chain for one that can (with `h264_auto` on a
 VAAPI or Rockchip host that means libx264, on the CPU). MBAFF costs libx264
-roughly 20-30 % more CPU. What an encoder actually opened with is reported
-on its stats as `video_encode_stats.coded_scan` (`progressive`,
-`interlaced_tff`, `interlaced_bff`; edge 0.113.0+).
+roughly 20-30 % more CPU. What an encoder codes is reported on its stats as
+`video_encode_stats.coded_scan` (`progressive`, `interlaced_tff`,
+`interlaced_bff`; edge 0.113.0+): the scan it opened with, its field order
+then following the source — an input switch from a TFF source to a BFF one
+keeps the encoder open and turns `interlaced_tff` into `interlaced_bff`.
+RTMP and WebRTC outputs report their **first** encoder only: each RTMP
+connection and each WebRTC viewer (or WHIP session) opens an encoder of its
+own, but the output's `video_encode_stats` stays bound to the first one, so
+after an RTMP reconnect, or for any viewer after the first, it shows what that
+first encoder last coded.
 
 With `interlaced`, a resize is done **per field**: each field is scaled on
 its own and the two are woven back, so a 1080i → 576i conversion keeps its

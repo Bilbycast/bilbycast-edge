@@ -1444,8 +1444,11 @@ pub fn edge_capabilities() -> Vec<&'static str> {
         // source goes out as stream_type 0x06 + AC-3 descriptor, `atsc`
         // pins 0x81, `dvb` pins 0x06. The field shipped in the same
         // release as `video-encode-scan`, so a manager may gate on either
-        // bit; this one names the feature it gates. An edge WITHOUT it
-        // ignores the field on a push and always signals 0x81.
+        // bit; this one names the feature it gates. An edge advertising
+        // neither this bit nor `video-encode-scan` (older than 0.112.0)
+        // accepts the field on a push, ignores it (serde unknown-field
+        // tolerance) and always signals AC-3 as 0x81, so gate on either
+        // bit, never on this one alone.
         "audio-ts-signalling",
     ];
     // Strict mode (`SO_BINDTODEVICE`) requires `CAP_NET_RAW`. Probed

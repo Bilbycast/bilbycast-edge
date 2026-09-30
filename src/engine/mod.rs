@@ -232,7 +232,8 @@ pub mod video_encode_util;
 /// `Arc<ResolvedBackendCell>` unconditionally and `stats::collector` reads
 /// `.label()` and `.coded_scan()` off it, but the real cell stores a
 /// `video_codec::VideoEncoderCodec` and so cannot compile without the codec
-/// layer. Only those two readers are reachable from ungated code — `store()` is called solely by the encoder pipeline,
+/// layer. Only those two readers are reachable from ungated code — `store()` and
+/// `store_field_order()` are called solely by the encoder pipeline,
 /// which does not exist in this configuration — so the stub answers "no encoder
 /// has opened" (and so no scan was coded), which is permanently true here.
 #[cfg(not(feature = "media-codecs"))]

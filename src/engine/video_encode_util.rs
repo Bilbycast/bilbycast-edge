@@ -34,7 +34,9 @@ use video_codec::{
 /// the operator-facing label so the manager-UI badge tracks the resolved
 /// backend after Auto-chain demotion (e.g., NVENC → x264 fallback). Scan:
 /// `0` = unset, then progressive / top field first / bottom field first,
-/// rewritten on every (re)open — `video_encode_stats.coded_scan`.
+/// rewritten on every (re)open and again when a field-coded encoder
+/// follows the source to the other field order without one —
+/// `video_encode_stats.coded_scan`.
 #[derive(Default, Debug)]
 pub struct ResolvedBackendCell {
     backend: AtomicU8,
@@ -46,12 +48,15 @@ impl ResolvedBackendCell {
     /// progressive).
     pub fn store(&self, codec: VideoEncoderCodec, field_order: Option<VideoFieldOrder>) {
         self.backend.store(codec_to_u8(codec), Ordering::Relaxed);
-        let scan = match field_order {
-            None => 1,
-            Some(VideoFieldOrder::Tff) => 2,
-            Some(VideoFieldOrder::Bff) => 3,
-        };
-        self.scan.store(scan, Ordering::Relaxed);
+        self.scan.store(scan_to_u8(field_order), Ordering::Relaxed);
+    }
+
+    /// Record that a field-coded encoder now stamps `order` on the frames
+    /// it codes: a TFF ↔ BFF source switch it followed without a reopen
+    /// ([`ScaledVideoEncoder`]'s per-frame field-order follow). The
+    /// backend is unchanged, so only the scan byte is rewritten.
+    pub fn store_field_order(&self, order: VideoFieldOrder) {
+        self.scan.store(scan_to_u8(Some(order)), Ordering::Relaxed);
     }
 
     /// Returns `Some(label)` once the encoder has lazy-opened, where
@@ -74,6 +79,17 @@ impl ResolvedBackendCell {
             3 => Some("interlaced_bff"),
             _ => None,
         }
+    }
+}
+
+/// The scan byte of a [`ResolvedBackendCell`]: `None` (progressive) = 1,
+/// top field first = 2, bottom field first = 3 — read back by
+/// [`ResolvedBackendCell::coded_scan`].
+fn scan_to_u8(field_order: Option<VideoFieldOrder>) -> u8 {
+    match field_order {
+        None => 1,
+        Some(VideoFieldOrder::Tff) => 2,
+        Some(VideoFieldOrder::Bff) => 3,
     }
 }
 
@@ -1736,7 +1752,8 @@ impl ScaledVideoEncoder {
     /// in stats use this so the manager-UI badge tracks the actually-
     /// opened backend rather than the requested one (Auto-chain
     /// demotion would otherwise show a stale label), and so
-    /// `video_encode_stats.coded_scan` reports the scan it opened with.
+    /// `video_encode_stats.coded_scan` reports the scan it codes (the one
+    /// it opened with, its field order then following the source).
     pub fn set_resolved_backend_sink(&mut self, sink: std::sync::Arc<ResolvedBackendCell>) {
         self.resolved_backend_sink = Some(sink);
     }
@@ -1906,6 +1923,11 @@ impl ScaledVideoEncoder {
             enc.set_frame_field_order(order)
                 .map_err(|e| format!("encoder field order change failed: {e}"))?;
             self.field_order = Some(order);
+            // The stream is coded the other way from here on:
+            // `video_encode_stats.coded_scan` says so.
+            if let Some(sink) = &self.resolved_backend_sink {
+                sink.store_field_order(order);
+            }
         }
 
         if self.field_split
@@ -3247,15 +3269,21 @@ mod scan_tests {
     }
 
     /// `coded_scan` is unset until an open, then names the scan of the
-    /// latest (re)open — a reopen at another scan overwrites it.
+    /// latest (re)open — a reopen at another scan overwrites it — or the
+    /// field order a field-coded encoder followed to without a reopen,
+    /// which leaves the backend alone.
     #[test]
     fn the_resolved_backend_cell_carries_the_coded_scan() {
         let cell = ResolvedBackendCell::default();
         assert_eq!((cell.label(), cell.coded_scan()), (None, None));
         cell.store(H264Nvenc, Some(Bff));
         assert_eq!((cell.label(), cell.coded_scan()), (Some("nvenc"), Some("interlaced_bff")));
+        cell.store_field_order(Tff);
+        assert_eq!((cell.label(), cell.coded_scan()), (Some("nvenc"), Some("interlaced_tff")));
         cell.store(X264, Some(Tff));
         assert_eq!((cell.label(), cell.coded_scan()), (Some("x264"), Some("interlaced_tff")));
+        cell.store_field_order(Bff);
+        assert_eq!((cell.label(), cell.coded_scan()), (Some("x264"), Some("interlaced_bff")));
         cell.store(X264, None);
         assert_eq!(cell.coded_scan(), Some("progressive"));
     }
@@ -3336,7 +3364,15 @@ mod scan_x264_tests {
     use video_codec::{VideoCodec, VideoEncoderCodec, VideoEncoderConfig, VideoFieldOrder};
 
     /// Decoded frames of a small MBAFF (top field first) stream.
-    fn with_interlaced_frames(mut f: impl FnMut(&video_engine::DecodedFrame)) {
+    fn with_interlaced_frames(f: impl FnMut(&video_engine::DecodedFrame)) {
+        with_interlaced_frames_in(VideoFieldOrder::Tff, f);
+    }
+
+    /// Decoded frames of a small MBAFF stream coded in `order`.
+    fn with_interlaced_frames_in(
+        order: VideoFieldOrder,
+        mut f: impl FnMut(&video_engine::DecodedFrame),
+    ) {
         let (w, h) = (320usize, 240usize);
         let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
             codec: VideoEncoderCodec::X264,
@@ -3345,7 +3381,7 @@ mod scan_x264_tests {
             fps_num: 25,
             fps_den: 1,
             global_header: false,
-            field_order: Some(VideoFieldOrder::Tff),
+            field_order: Some(order),
             ..VideoEncoderConfig::default()
         })
         .unwrap();
@@ -3449,5 +3485,33 @@ mod scan_x264_tests {
             p.encode(f, Some(0)).unwrap();
         });
         assert_eq!(cell.coded_scan(), Some("interlaced_tff"));
+    }
+
+    /// An input switch from a TFF source to a BFF one keeps the encoder
+    /// open and follows the field order frame by frame — and
+    /// `video_encode_stats.coded_scan` follows with it, instead of
+    /// reporting the order the encoder opened with.
+    #[test]
+    fn the_stats_cell_follows_a_tff_to_bff_switch_without_a_reopen() {
+        let mut p = pipeline(VideoScan::Interlaced);
+        let cell = std::sync::Arc::new(super::ResolvedBackendCell::default());
+        p.set_resolved_backend_sink(cell.clone());
+        p.set_source_codec(VideoCodec::H264);
+        with_interlaced_frames_in(VideoFieldOrder::Tff, |f| {
+            assert!(f.top_field_first());
+            p.encode(f, Some(0)).unwrap();
+        });
+        assert_eq!(p.field_order(), Some(VideoFieldOrder::Tff));
+        assert_eq!((cell.label(), cell.coded_scan()), (Some("x264"), Some("interlaced_tff")));
+        // A sentinel backend: a reopen would rewrite it to x264, the
+        // field-order follow leaves it alone.
+        cell.store(VideoEncoderCodec::H264Nvenc, Some(VideoFieldOrder::Tff));
+        with_interlaced_frames_in(VideoFieldOrder::Bff, |f| {
+            assert!(f.is_interlaced() && !f.top_field_first());
+            p.encode(f, Some(0)).unwrap();
+        });
+        assert!(p.is_open());
+        assert_eq!(p.field_order(), Some(VideoFieldOrder::Bff));
+        assert_eq!((cell.label(), cell.coded_scan()), (Some("nvenc"), Some("interlaced_bff")));
     }
 }

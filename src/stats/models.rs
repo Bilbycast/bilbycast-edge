@@ -1767,12 +1767,21 @@ pub struct VideoEncodeStatsSnapshot {
     /// pre-PMT gate). Absent when 0.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub pre_pmt_dropped_packets: u64,
-    /// The scan the encoder actually opened with, rewritten on every
-    /// (re)open: `"progressive"`, `"interlaced_tff"` (field-coded, top
-    /// field first) or `"interlaced_bff"` (bottom field first). What
-    /// `video_encode.scan` resolved to — `auto` and a refused `interlaced`
-    /// both show what was coded. Absent until the encoder first opens
-    /// (and on a stage that does not report its backend).
+    /// The scan the encoder codes: `"progressive"`, `"interlaced_tff"`
+    /// (field-coded, top field first) or `"interlaced_bff"` (bottom field
+    /// first). Written when the encoder (re)opens — what
+    /// `video_encode.scan` resolved to, so `auto` and a refused
+    /// `interlaced` both show what was coded — and rewritten when a
+    /// field-coded encoder follows the source to the other field order
+    /// (a TFF ↔ BFF input switch) without a reopen; progressive vs
+    /// field-coded never changes without one. Absent until the encoder
+    /// first opens (and on a stage that does not report its backend).
+    /// On RTMP and WebRTC outputs the stats handle is registered
+    /// first-wins, but each RTMP connection and each WebRTC viewer (or
+    /// WHIP session) builds its own encoder with its own stats: this
+    /// block, `coded_scan` included, reports the output's first encoder
+    /// only — after an RTMP reconnect, or for any viewer after the first,
+    /// it keeps what that first encoder last coded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coded_scan: Option<String>,
 }
