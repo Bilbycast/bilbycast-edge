@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.85.0"
 name = "is"
-version = "0.11.0"
+version = "0.11.1"
 authors = [
     "Martin Algesten <martin@algesten.se>",
     "Thomas Eizinger <thomas@eizinger.io>",

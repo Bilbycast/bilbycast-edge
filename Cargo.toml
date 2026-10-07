@@ -680,58 +680,78 @@ features = ["tls-rustls"]
 optional = true
 
 [dependencies.str0m]
-# 0.23.1 (patch on top of 0.23.0): the only change between them is the
-# `sctp-proto` requirement, ^0.10.3 -> ^0.10.4. Feature table, MSRV (1.85.0)
-# and every other dependency are byte-identical in the index, so nothing in
-# the audit below moves.
+# 0.24.1, up from 0.23.1. The edge compiles against it unchanged. The only
+# other lock movement is the vendored `is`: str0m 0.24 requires `is ^0.11.1`,
+# which the 0.11.0 vendor tree cannot satisfy, so it was re-vendored (see
+# [patch.crates-io] below). str0m's other raised floors (dimpl ^0.7.4,
+# sctp-proto ^0.10.5) were already locked. Feature table (`openssl`,
+# `vendored`) and MSRV (1.85.0) are unchanged.
 #
-# 0.23.0 (2026-08-13), up from 0.22.0. An API-only bump: the crates.io
-# dependency list and feature table are byte-identical between the two
-# versions (dimpl ^0.7.1, is ^0.11.0, str0m-proto ^0.7.0, sctp-proto ^0.10.3;
-# same openssl / aws-lc-rs feature set; rust_version 1.85.0 either side), so it
-# drags no transitive churn. Upstream lists no breaking changes, and the
-# 0.22.0...0.23.0 diff touches four source files, none of them ours:
-#   * `DirectApi::send_pli_feedback` (#1025) — an additive `pub fn`. We never
-#     build a `DirectApi`; keyframes come from the sample-level
-#     `Event::KeyframeRequest` in `engine::webrtc::session`.
-#   * RRTR -> DLRR responder (#1022) — str0m now answers a peer's RRTR with
-#     RTCP XR DLRR blocks piggybacked on an outgoing Sender Report, bounded at
-#     300 pending and 50 blocks per report. New bytes toward peers that ask.
-#   * RRTR originator-SSRC fix (#1027) — wire-visible on the RECEIVE path, and
-#     unconditionally so, unlike #1022: the XR reports str0m already emits as a
-#     receiver now carry a local SSRC as `ExtendedReport.ssrc` instead of the
-#     remote stream's. Private Rust API (`StreamRx::create_extended_receiver_
-#     report` is not `pub`), but the bytes on the wire change for every WHIP
-#     ingest we already run.
-#   * `Dlrr::write_to` block-length fix — latent in 0.22, which had no DLRR
-#     sender at all.
-# `src/media/`, `src/rtc.rs` and `src/lib.rs` are untouched, so `Event` gained
-# no variant and `Rtc::writer(mid).write(..)` is unchanged.
+# Correction to the previous entry here: 0.23.0 -> 0.23.1 was not only the
+# sctp-proto floor. It also shipped #1029, which hardens SRTP/SRTCP and RTCP
+# parsing against malformed input (parse-side only, no API change).
 #
-# The 0.19 -> 0.22 audit that preceded this: of five listed breaking changes
-# only `MediaData.data` moving `Vec<u8>` -> `Arc<[u8]>` (0.20) ever reached us,
-# handled in `engine::webrtc::session` by widening `SessionEvent::MediaData.data`
-# to match rather than copying per frame. We never call `write_rtp` / `RtpWrite`
-# (only the sample-level `writer(mid).write(..)`, whose signature widened
-# compatibly via `Vec<u8>: Into<Arc<[u8]>>`), never touch abs-capture-time, and
-# negotiate H.264 + Opus only so the permissive-VP8 depacketizer fix is
-# irrelevant. dimpl 0.7 is transitive — we use the `openssl` DTLS backend.
+# 0.24's breaking changes, none of which reach us:
+#   * RED (#982) adds a `use_red: bool` to `enable_opus` / `enable_pcmu` /
+#     `enable_pcma` / `enable_g722`. We call none of them; H.264 goes through
+#     `add_h264`, which is unchanged.
+#   * `BweKind` variants carry named fields (#1048). We never enable bandwidth
+#     estimation, and `session::handle_event` ends in `_ => None`.
+#   * New `Codec` / `CodecExtra` / `PacketError` / `Reason` variants, matched
+#     nowhere. `MediaKind` is still `Audio | Video`.
+# Everything else we call (`Writer::write`, `sdp_api()`, `Candidate::host`,
+# `net::Receive`, `MediaData`, `KeyframeRequest`, ...) is signature-identical.
+# On the write path the per-media queue grew from 100 to 512 entries and is
+# ordered by wallclock instead of FIFO; every caller passes `Instant::now()`
+# and drains between writes, so nothing reorders.
 #
-# str0m 0.23 still requires `is ^0.11.0`, unchanged from 0.22, so the vendored
-# PRIORITY patch below keeps applying with no re-vendor. Upstream `is` 0.11.0
-# still hard-rejects PRIORITY-less Binding Requests, so the vendor tree stays.
+# Visible on the wire or in behaviour:
+#   * transport-cc is negotiated per payload type (part of #1046): our answer
+#     carries `a=rtcp-fb:<pt> transport-cc` only for a PT the offer gave it
+#     on. ffmpeg's WHIP offers give it on none, so our answers to ffmpeg stop
+#     echoing it. Chrome's offers carry it, and edge <-> relay is unchanged
+#     because str0m always offers it.
+#   * Receive reordering (WHIP ingest only) now has a deadline: 2 s video,
+#     1 s audio (#1041, #1057). An incomplete video frame ahead of the first
+#     complete one holds every later frame back until it completes (NACK/RTX)
+#     or expires, where 0.23 skipped it once 30 complete frames had queued
+#     behind it. A packet lost for good inside a multi-packet video frame
+#     therefore stalls video for up to 2 s, then releases a burst. We keep
+#     str0m's defaults; `set_reordering_timeout_{video,audio}(None)` restores
+#     count-only release.
+#   * A receive stream for SSRC 0 (libwebrtc's pre-media bandwidth probes) no
+#     longer counts toward RTCP report scheduling (#1052). On 0.23 it never
+#     sent a report, so its report deadline stayed in the past and the
+#     timeout `poll_output` handed back was always already due: a busy loop
+#     for our sans-I/O driver once a peer sent one such probe.
+#   * An offered `a=msid:-` is no longer echoed into the answer (#1060);
+#     stopped m-lines carry no msid/ssrc lines (#1063).
+# Inert for us: the SCTP send buffer (#1062, no data channels), the paced
+# burst cap (#1058, BWE only), opt-in RED and telephone-event, the audio-level
+# VAD bit (#1032) and the DTLS pre-initialisation guards.
 #
-# NOT yet re-verified on live A/V, and now two bumps deep: WHIP/WHEP interop
-# against ffmpeg, OBS and a browser, plus quality gates 3 / 7 / 9. #1022 adds
-# RTCP bytes toward those peers, so gate 7 in particular wants a run before
-# shipping a release.
+# Earlier bumps: 0.23.0 added RTCP XR DLRR replies (#1022) and changed the
+# originator SSRC of the XR reports we send as a receiver (#1027). Of
+# 0.19 -> 0.22 only `MediaData.data` becoming `Arc<[u8]>` (0.20) reached us,
+# handled in `engine::webrtc::session`.
 #
-# Opportunity left on the table deliberately: 0.22 (#1016) stopped rejecting an
-# offered H.264 level above the local config's, which is exactly what the four
-# extra level-5.1 PT registrations in `engine::webrtc::session` work around.
-# Removing them would change the answered SDP m-line PT set — interop-visible,
-# so it wants its own change with its own interop run.
-version = "0.23.1"
+# NOT verified live, now three bumps deep: WHIP/WHEP interop against ffmpeg,
+# OBS and a browser, and quality gates 3 / 7 / 9. 0.23 changed the RTCP we
+# send and 0.24 the SDP we answer and the receive timing.
+#
+# Not fixed by this bump (both predate it; each reproduces in a standalone
+# probe on 0.23.1 and on 0.24.1):
+#   * The four extra level-5.1 `add_h264` registrations in
+#     `engine::webrtc::session` make `accept_offer` panic ("Pt locked multiple
+#     times") on a recvonly or sendrecv offer whose H.264 PT matches both a
+#     built-in entry and an extra one, which a Chrome WHEP offer does, and
+#     make `accept_answer` panic on a single-PT H.264 answer. Deleting them is
+#     not enough on its own: with the default codec set the WHEP writer's
+#     first PT for a Chrome offer is VP8. Either fix changes the answered PT
+#     set, so it wants its own change and interop run.
+#   * The vendored `is` PRIORITY patch lets a PRIORITY-less Binding Request
+#     reach a panicking `expect` (see [patch.crates-io] below).
+version = "0.24.1"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
 # pure-Rust dimpl DTLS implementation stalls when the active side (WHEP
@@ -813,31 +833,47 @@ alsa = { version = "0.12", optional = true }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # ---------------------------------------------------------------------------
-# BILBYCAST PATCH: vendored `is` 0.11.0 with the strict-PRIORITY check on ICE
+# BILBYCAST PATCH: vendored `is` 0.11.1 with the strict-PRIORITY check on ICE
 # Binding Requests removed. Originally vendored against `is` 0.8.0 (2026-04-09);
-# re-vendored against 0.9.0 (2026-05-12, str0m 0.19) and 0.11.0 (2026-08-11,
-# str0m 0.22); carried unchanged to str0m 0.23, which still requires `is ^0.11.0`
-# — no re-vendor was needed for that bump. Upstream still hard-rejects
-# PRIORITY-less Binding Requests in 0.11.0.
+# re-vendored against 0.9.0 (2026-05-12, str0m 0.19), 0.11.0 (2026-08-11,
+# str0m 0.22) and 0.11.1 (2026-10-07, str0m 0.24, which requires ^0.11.1).
+# Upstream still hard-rejects PRIORITY-less Binding Requests in 0.11.1: its
+# `src/stun.rs` is byte-identical to 0.11.0's. 0.11.1 changed only agent.rs
+# and pair.rs — candidate invalidation now also matches the transport protocol
+# (#1035), and an ICE-lite controlled agent marks a pair succeeded when it
+# answers a Binding Request (#1039; read only by `Rtc::accepts`, which we never
+# call).
 #
-# Why: ffmpeg's WHIP muxer (and a few other production WHIP publishers)
-# sends ICE connectivity-check Binding Requests without the PRIORITY
-# attribute. RFC 5245 §7.1.2.1 says PRIORITY is mandatory, so it's
-# technically a peer bug, but `is` hard-rejects the packets at parse
-# time and str0m never even sees them. The result is every ffmpeg-WHIP
-# publish stalls in ICE, DTLS times out at 5 s, and no media flows. See
-# the 2026-04-09 Bug A entry in testbed/QUALITY_REPORT.md.
+# Why: ffmpeg's WHIP muxer sends ICE connectivity-check Binding Requests
+# without the PRIORITY attribute in every 8.0.x release (n8.0 through n8.0.3;
+# 8.1 added it, and 7.x has no WHIP muxer). RFC 5245 §7.1.2.1 says PRIORITY
+# is mandatory, so it's technically a peer bug, but `is` hard-rejects the
+# packets at parse time and str0m never even sees them. The result is every
+# such publish stalls in ICE, DTLS times out at 5 s, and no media flows. See
+# the 2026-04-09 Bug A entry in the monorepo's testbed/QUALITY_REPORT.md
+# (since deleted; monorepo commit 0ca3baa has it).
+#
+# KNOWN GAP, unchanged by this re-vendor: the stun.rs hunk only gets the
+# request past the parser. `IceAgent::stun_server_handle_message`
+# (vendor/is/src/agent.rs) then calls `message.prio().expect("STUN request
+# prio")`, so an authenticated PRIORITY-less request panics the WHIP input
+# task instead of being rejected. The original 0.8.0 vendoring (381f5be)
+# patched that too, with `.unwrap_or(126 * 16_777_216 + 65_535 * 256 + 255)`
+# (the RFC 5245 host-candidate priority); the 0.9.0 re-vendor (435bc3c) lost
+# that hunk, and every tree since has carried the stun.rs hunk alone.
+# Reproduced with a standalone probe against this tree (agent.rs:1372) and
+# the 0.11.0 one it replaces (agent.rs:1370); upstream 0.11.1 returns a parse
+# error instead. Restoring the agent.rs hunk, or dropping the patch, closes it.
 #
 # The patched `is` (only stun.rs differs from upstream — single hunk)
 # lives in `vendor/is/`. The diff against upstream is a single
 # comment-replacement block clearly marked `BILBYCAST PATCH`.
 #
 # WHEN UPGRADING str0m:
-#   1. Run `cargo update -p str0m`. If str0m's new version still depends
-#      on the same `is` major.minor we have vendored, this patch keeps
-#      applying — done.
-#   2. If `cargo build` emits `warning: Patch ... was not used in the
-#      crate graph`, the patch's version range no longer matches. Either:
+#   1. Run `cargo update -p str0m`. If str0m's new `is` requirement is still
+#      satisfied by the vendored version, this patch keeps applying — done.
+#   2. If it is not, cargo warns `patch `is v...` was not used in the crate
+#      graph` and silently builds against the registry `is`. Either:
 #        a) re-vendor the matching `is` version (copy from
 #           ~/.cargo/registry/src/index.crates.io-*/is-X.Y.Z, re-apply
 #           the same one-hunk diff in vendor/is/src/stun.rs, update this
@@ -845,8 +881,9 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 #        b) check whether upstream `is` (or str0m) finally landed a
 #           permissive parser. If so, drop this entire
 #           `[patch.crates-io]` section and the `vendor/is/` tree.
-#   3. CI should grep the build output for `Patch .* was not used` and
-#      fail on match — guards against silent regression on str0m bumps.
+#   3. Check before committing that the patch is live: in Cargo.lock the `is`
+#      entry must carry no `source =` line (a path package) and there must be
+#      no `[[patch.unused]]` table. Nothing in CI checks this yet.
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 is = { path = "vendor/is" }

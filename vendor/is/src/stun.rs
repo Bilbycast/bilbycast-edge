@@ -186,20 +186,27 @@ impl<'a> StunMessage<'a> {
                 return Err(StunError::Parse("STUN packet missing username".into()));
             }
             // BILBYCAST PATCH (2026-04-09; re-applied for is 0.9.0 on 2026-05-12,
-            // for is 0.11.0 on 2026-08-11 alongside the str0m 0.19 -> 0.22 bump):
+            // for is 0.11.0 on 2026-08-11 alongside the str0m 0.19 -> 0.22 bump,
+            // and for is 0.11.1 on 2026-10-07 alongside the str0m 0.23 -> 0.24 bump):
             // upstream `is` hard-rejects every ICE Binding Request that lacks the
             // PRIORITY attribute. RFC 5245 §7.1.2.1 makes PRIORITY mandatory on
-            // connectivity-check requests, but several production WHIP publishers —
-            // notably ffmpeg's WHIP muxer (as of ffmpeg 7.x) — emit Binding Requests
-            // without PRIORITY. The strict check made every ffmpeg-WHIP publish fail
-            // at the STUN parser, before str0m even saw the packet, so ICE never
-            // completed and the DTLS handshake timed out at 5 s. Drop the requirement
-            // here and let the higher layers (str0m's pair selection) ignore the
-            // missing priority gracefully. Track upstream fix at
-            // <bilbycast-edge/CLAUDE.md> "WHEN UPGRADING str0m". When the upstream
+            // connectivity-check requests, but ffmpeg's WHIP muxer omits it in every
+            // 8.0.x release (n8.0 through n8.0.3; 8.1 added it in 7fd967c2c1, and 7.x
+            // has no WHIP muxer at all). The strict check made every such publish
+            // fail at the STUN parser, before str0m even saw the packet, so ICE never
+            // completed and the DTLS handshake timed out at 5 s. Track upstream fix at
+            // <bilbycast-edge/Cargo.toml> "WHEN UPGRADING str0m". When the upstream
             // `is` crate ships a permissive parser this entire vendor/ tree can be
             // deleted along with the [patch.crates-io] entry in Cargo.toml. Checked
-            // again at 0.11.0: the rejection is still there, byte-identical.
+            // again at 0.11.1: the rejection is still there, byte-identical.
+            //
+            // KNOWN GAP, NOT FIXED BY THIS HUNK: a PRIORITY-less request that passes
+            // this parser and the integrity check reaches
+            // `IceAgent::stun_server_handle_message` (src/agent.rs), which still does
+            // `message.prio().expect("STUN request prio")` — so it panics there
+            // instead of being rejected here. The original 0.8.0 vendoring had a
+            // second hunk replacing that `expect`; it was lost in the 0.9.0
+            // re-vendor. See the [patch.crates-io] comment in Cargo.toml.
             //
             // Note the "missing priority" in `src/parse.rs` is NOT a second copy of
             // this check — that one is the mandatory priority field of the SDP
@@ -208,9 +215,7 @@ impl<'a> StunMessage<'a> {
             // Original (upstream) check, kept here for diff visibility:
             //
             //     if attrs.priority.is_none() {
-            //         return Err(StunError::Parse(
-            //             "STUN packet missing priority".into(),
-            //         ));
+            //         return Err(StunError::Parse("STUN packet missing priority".into()));
             //     }
         }
 

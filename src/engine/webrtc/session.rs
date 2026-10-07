@@ -296,12 +296,13 @@ impl WebrtcSession {
 
     /// Drain str0m's pending output queue, sending any queued UDP transmits
     /// to the wire. This MUST be called between consecutive `write_media`
-    /// calls — str0m queues writes in `to_payload` (cap 100) and only
-    /// drains them via `handle_timeout`, which is reached from a
-    /// `Output::Timeout` poll cycle. Without this drain, the inner H.264
-    /// fragmentation loop overflows the queue after 100 writes and every
-    /// subsequent `write_media` returns `Err("Consecutive calls to write()
-    /// without poll_output() in between")`. We feed an `Input::Timeout`
+    /// calls — str0m queues writes in `to_payload` (cap 512 since str0m
+    /// 0.24, 100 before) and only drains them via `handle_timeout`, which
+    /// is reached from a `Output::Timeout` poll cycle. Without this drain,
+    /// the inner H.264 fragmentation loop overflows the queue after 512
+    /// writes and every subsequent `write_media` returns
+    /// `Err("Consecutive calls to write() without poll_output() in
+    /// between")`. We feed an `Input::Timeout`
     /// so the per-write payload queue is processed eagerly. Cheap when
     /// there's nothing pending (one no-op timeout + one no-op poll).
     pub async fn drain_outputs(&mut self) {
