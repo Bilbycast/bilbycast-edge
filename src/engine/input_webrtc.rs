@@ -94,10 +94,20 @@ pub fn spawn_whip_input(
         if let Some(ref _p) = post {
             tracing::info!("WHIP input: ingress post-process active");
         }
-        whip_input_loop(config, &flow_id, broadcast_tx, stats, cancel, session_rx, &event_sender, &mut transcoder, &mut post).await;
+        whip_input_loop(config, &flow_id, broadcast_tx, stats, cancel, session_rx, &event_sender, &mut transcoder, &mut post, WHIP_SETUP_DEADLINE).await;
         tracing::info!("WHIP input stopped for flow '{}'", flow_id);
     })
 }
+
+/// How long an answered WHIP publisher has to complete ICE + DTLS before the
+/// input gives up on it and waits for the next one. The input serves one
+/// publisher at a time, so a publisher that never connected — its offer
+/// answered, then not one STUN check — used to hold it for good: every later
+/// publisher's POST hung unanswered until the flow restarted. 15 s matches
+/// how long the input already took to let go of a publisher whose ICE
+/// completed before it fell silent (ICE reports it Disconnected).
+#[cfg(feature = "webrtc")]
+const WHIP_SETUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[cfg(feature = "webrtc")]
 async fn whip_input_loop(
@@ -110,6 +120,7 @@ async fn whip_input_loop(
     events: &EventSender,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
+    setup_deadline: std::time::Duration,
 ) {
     let public_ip: Option<std::net::IpAddr> =
         config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
@@ -204,10 +215,38 @@ async fn whip_input_loop(
         // carried no PCR at all, and an A/V publish's Opus never reached the
         // PMT.
         let mut layout = WhipLayout::default();
+        // Until it connects, the publisher is held to `setup_deadline`.
+        let setup_by = tokio::time::Instant::now() + setup_deadline;
+        let mut connected = false;
 
         // Receive media from the WebRTC session
         loop {
-            let event = session.poll_event(&child_cancel).await;
+            let event = if connected {
+                session.poll_event(&child_cancel).await
+            } else {
+                tokio::select! {
+                    event = session.poll_event(&child_cancel) => event,
+                    _ = tokio::time::sleep_until(setup_by) => {
+                        let secs = setup_deadline.as_secs();
+                        tracing::warn!(
+                            "WHIP publisher on flow '{}' did not connect within {} s of its answer, waiting for next",
+                            flow_id, secs,
+                        );
+                        events.emit_flow_with_details(
+                            EventSeverity::Warning,
+                            category::WEBRTC,
+                            format!("WHIP publisher did not connect within {secs} s of its answer; waiting for the next publisher"),
+                            flow_id,
+                            serde_json::json!({
+                                "error_code": "webrtc_setup_timeout",
+                                "peer": "WHIP publisher",
+                                "timeout_secs": secs,
+                            }),
+                        );
+                        break; // Go back to waiting for next publisher
+                    }
+                }
+            };
 
             match event {
                 SessionEvent::MediaData { mid, data, rtp_time, network_time, .. } => {
@@ -267,6 +306,7 @@ async fn whip_input_loop(
                     );
                 }
                 SessionEvent::Connected => {
+                    connected = true;
                     tracing::info!("WHIP publisher connected on flow '{}'", flow_id);
                     events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHIP publisher connected", flow_id);
                 }
@@ -921,5 +961,69 @@ mod tests {
         let (au, key) = ps.access_unit(&[0x65, 0x11, 0x22]);
         assert!(key);
         assert_eq!(au, vec![0, 0, 0, 1, 0x65, 0x11, 0x22]);
+    }
+
+    /// A publisher whose offer is answered and which then never connects —
+    /// not one STUN check — holds the WHIP input only until the setup
+    /// deadline, with a Warning; the next publisher is answered. The input
+    /// takes one publisher at a time, and it used to wait on such a one for
+    /// good: every later POST hung unanswered until the flow restarted.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_publisher_that_never_connects_frees_the_input() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::manager::events::EventSeverity;
+        use std::time::Duration;
+        const CHROME_WHIP_OFFER: &str = include_str!("webrtc/testdata/chrome124-whip-sendonly.sdp");
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, _keep) = tokio::sync::broadcast::channel(16);
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, mut raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config, "flow-w", broadcast_tx, stats, cancel, session_rx, &events,
+                    &mut transcoder, &mut post, Duration::from_secs(1),
+                )
+                .await;
+            }
+        });
+
+        // The phantom: its Chrome peer is nowhere, so nothing ever reaches
+        // the session.
+        let offer = |reply| NewSessionMsg { offer_sdp: CHROME_WHIP_OFFER.to_string(), reply };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        session_tx.send(offer(reply)).await.unwrap();
+        assert!(answer.await.unwrap().is_ok(), "the phantom is answered");
+
+        // The next publisher is answered once the phantom's second is up.
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        session_tx.send(offer(reply)).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), answer).await;
+        assert!(matches!(answered, Ok(Ok(Ok(_)))), "the next publisher's POST went unanswered");
+
+        let mut timeouts = Vec::new();
+        while let Ok(ev) = raised.try_recv() {
+            if let Some(d) = ev.details.filter(|d| d["error_code"] == "webrtc_setup_timeout") {
+                assert_eq!(ev.severity, EventSeverity::Warning);
+                assert_eq!(ev.flow_id.as_deref(), Some("flow-w"));
+                timeouts.push(d);
+            }
+        }
+        assert_eq!(timeouts.len(), 1, "{timeouts:?}");
+        assert_eq!(timeouts[0]["peer"], "WHIP publisher");
+        assert_eq!(timeouts[0]["timeout_secs"], 1);
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 }

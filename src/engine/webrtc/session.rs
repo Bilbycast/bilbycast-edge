@@ -153,6 +153,30 @@ fn isolate_negotiation<T>(step: &'static str, f: impl FnOnce() -> Result<T>) -> 
     }
 }
 
+/// A peer's offer this end cannot answer: it does not parse, str0m refused
+/// it, or it carries nothing this end can send. The fault is the offer's,
+/// so the edge's own WHIP / WHEP endpoint answers 400 (`api::webrtc`), not
+/// 500.
+#[derive(Debug)]
+pub struct OfferRefused(pub String);
+
+impl std::fmt::Display for OfferRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OfferRefused {}
+
+/// Whether a failed server-side negotiation was the peer's offer's fault: an
+/// [`OfferRefused`], or a str0m panic while accepting the offer (str0m keeps
+/// asserts on paths only the peer's SDP reaches). Anything else — a socket
+/// that would not bind, an input or output task gone — is this end's.
+pub fn offer_was_at_fault(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<OfferRefused>().is_some()
+        || err.downcast_ref::<NegotiationPanic>().is_some_and(|p| p.step == "SDP offer")
+}
+
 /// Raise the Warning event for a negotiation that str0m panicked in, naming
 /// the `peer` (e.g. `"WHEP viewer"`). Any other negotiation error is the
 /// peer's own — a malformed SDP — and stays a log line, as before.
@@ -263,6 +287,12 @@ pub struct WebrtcSession {
 impl WebrtcSession {
     /// Create a new session with ICE-lite and bind a UDP socket.
     pub async fn new(config: &SessionConfig) -> Result<Self> {
+        Self::with_rtc_config(config, rtc_config(config.ice_lite)).await
+    }
+
+    /// [`Self::new`] on another `Rtc` configuration — a test's peer with
+    /// another codec set (a browser without H.264, say).
+    pub(crate) async fn with_rtc_config(config: &SessionConfig, rtc_cfg: RtcConfig) -> Result<Self> {
         let socket = UdpSocket::bind(config.bind_addr).await?;
         let local_addr = socket.local_addr()?;
 
@@ -298,7 +328,7 @@ impl WebrtcSession {
         );
 
         let rtc = isolate_negotiation("session setup", || {
-            let mut rtc = rtc_config(config.ice_lite).build(Instant::now());
+            let mut rtc = rtc_cfg.build(Instant::now());
             for ip in &candidate_ips {
                 let cand_addr = SocketAddr::new(*ip, port);
                 let cand = Candidate::host(cand_addr, Protocol::Udp)
@@ -335,13 +365,13 @@ impl WebrtcSession {
 
         let answer_sdp = isolate_negotiation("SDP offer", || {
             let offer = SdpOffer::from_sdp_string(&normalised)
-                .map_err(|e| anyhow::anyhow!("SDP parse error: {}", e))?;
+                .map_err(|e| OfferRefused(format!("SDP parse error: {e}")))?;
 
             tracing::info!("SDP offer (normalised):\n{}", normalised);
 
             let answer = self.rtc.sdp_api().accept_offer(offer)
-                .map_err(|e| anyhow::anyhow!("SDP accept error: {}", e))?;
-            Ok(answer.to_sdp_string())
+                .map_err(|e| OfferRefused(format!("SDP accept error: {e}")))?;
+            Ok(fill_rejected_formats(&answer.to_sdp_string()))
         })?;
         tracing::info!("SDP answer:\n{}", answer_sdp);
 
@@ -462,6 +492,30 @@ impl WebrtcSession {
         let kind = self.rtc.media(mid)?.kind();
         let writer = self.rtc.writer(mid)?;
         send_pt(kind, writer.payload_params())
+    }
+
+    /// The payload types `answer` — the answer [`Self::accept_offer`] just
+    /// gave — settled for this end's video and audio: `(H.264, Opus)`, each
+    /// `None` when the offer carried no such m-line or the peer accepted
+    /// neither codec on it (str0m answers such an m-line on port 0).
+    ///
+    /// Read straight off the answer's mids, before any I/O: the tracks only
+    /// reach `video_mid` / `audio_mid` through `MediaAdded` events, which
+    /// would mean polling str0m before ICE.
+    pub fn answered_pts(&mut self, answer: &str) -> (Option<Pt>, Option<Pt>) {
+        let (mut video, mut audio) = (None, None);
+        for mid in answer.lines().filter_map(|l| l.trim_end().strip_prefix("a=mid:")) {
+            let mid = Mid::from(mid);
+            let Some(kind) = self.rtc.media(mid).map(|m| m.kind()) else {
+                continue;
+            };
+            let pt = self.get_pt(mid);
+            match kind {
+                MediaKind::Video => video = video.or(pt),
+                MediaKind::Audio => audio = audio.or(pt),
+            }
+        }
+        (video, audio)
     }
 
     /// Drain all pending str0m events without blocking, populating
@@ -854,9 +908,52 @@ fn normalise_sdp_offer_for_str0m(offer: &str) -> String {
     out
 }
 
+/// Give every m-line str0m's `answer` rejects a format to carry.
+///
+/// str0m answers an m-line it shares no codec on — VP8-only video, say — on
+/// port 0 with an **empty** format list (`m=video 0 UDP/TLS/RTP/SAVPF `). RFC
+/// 3264 §6 lets a rejected stream list any formats, which are ignored, but
+/// requires at least one, and str0m's own parser refuses the line ("Expected
+/// at least one PT"): a peer could not apply the answer at all — not even the
+/// m-lines it did accept (a viewer's Opus, when its video was refused). Such
+/// a line takes format `0`, as Pion writes a rejected m-line: a static payload
+/// type (RFC 3551), so no parser looks for an `a=rtpmap` to go with it (str0m
+/// does, for a dynamic one). Every other line passes unchanged.
+fn fill_rejected_formats(answer: &str) -> String {
+    let mut out = String::with_capacity(answer.len() + 8);
+    for raw_line in answer.split_inclusive('\n') {
+        let line_no_eol = raw_line.trim_end_matches(['\r', '\n']);
+        let eol = &raw_line[line_no_eol.len()..];
+        if let Some(m) = line_no_eol.strip_prefix("m=")
+            && let [media, "0", proto] = m.split_whitespace().collect::<Vec<_>>().as_slice()
+        {
+            out.push_str(&format!("m={media} 0 {proto} 0"));
+            out.push_str(eol);
+            continue;
+        }
+        out.push_str(raw_line);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rejected m-line str0m left without a format takes format 0; an
+    /// accepted one, or a rejected one that lists a format, is left as it is.
+    #[test]
+    fn a_rejected_m_line_gets_a_format() {
+        let answer = "v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF \r\na=mid:0\r\n\
+                      m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:1\r\n\
+                      m=video 0 UDP/TLS/RTP/SAVPF 96\r\na=mid:2\r\n";
+        assert_eq!(
+            fill_rejected_formats(answer),
+            "v=0\r\nm=video 0 UDP/TLS/RTP/SAVPF 0\r\na=mid:0\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=mid:1\r\n\
+             m=video 0 UDP/TLS/RTP/SAVPF 96\r\na=mid:2\r\n"
+        );
+    }
 
     #[test]
     fn normalise_replaces_real_session_name_with_dash() {
@@ -1650,6 +1747,58 @@ mod negotiation_tests {
     #[tokio::test]
     async fn a_mode_0_only_viewer_is_written_on_its_mode_0_pt() {
         accept(CHROME_WHEP_MODE_0_OFFER, 104).await;
+    }
+
+    /// A viewer offering VP8 for its video (a browser without H.264), with
+    /// Opus or without audio at all: the offer it would POST.
+    async fn vp8_viewer_offer(audio: bool) -> String {
+        let bind_addr = "127.0.0.1:0".parse().unwrap();
+        let vp8 = Rtc::builder().clear_codecs().enable_vp8(true).enable_opus(true, false);
+        let mut c = WebrtcSession::with_rtc_config(&SessionConfig { bind_addr, public_ip: None, ice_lite: false }, vp8)
+            .await
+            .unwrap();
+        c.create_offer(true, audio, false).unwrap().0
+    }
+
+    /// The PTs an answer settles are read straight off it, before any I/O
+    /// (the tracks reach `video_mid` / `audio_mid` only through events): a
+    /// Chrome viewer's H.264 and Opus; for a viewer offering VP8, no video PT
+    /// — its video m-line answered on port 0 — and its Opus if it offered
+    /// one.
+    #[tokio::test]
+    async fn the_answered_pts_are_read_off_the_answer() {
+        let mut s = server().await;
+        let answer = s.accept_offer(CHROME_WHEP_OFFER).unwrap();
+        assert_eq!(s.answered_pts(&answer), (Some(Pt::new_with_value(102)), Some(Pt::new_with_value(111))));
+        assert_eq!((s.video_mid, s.audio_mid), (None, None), "no event has been polled");
+
+        let offer = vp8_viewer_offer(true).await;
+        let mut s = server().await;
+        let answer = s.accept_offer(&offer).unwrap();
+        assert!(answer.contains("m=video 0 "), "{answer}");
+        assert_eq!(s.answered_pts(&answer), (None, Some(Pt::new_with_value(111))), "{answer}");
+
+        let offer = vp8_viewer_offer(false).await;
+        let mut s = server().await;
+        let answer = s.accept_offer(&offer).unwrap();
+        assert_eq!(s.answered_pts(&answer), (None, None), "{answer}");
+    }
+
+    /// An offer that does not parse, or that str0m panics on, is the offer's
+    /// fault — the endpoint answers it 400. A panic setting a session up, or
+    /// an error of any other kind, is this end's: 500.
+    #[tokio::test]
+    async fn only_the_offers_own_faults_are_laid_at_it() {
+        let garbage = server().await.accept_offer("v=0\r\nnot an offer\r\n").unwrap_err();
+        assert!(garbage.to_string().starts_with("SDP parse error: "), "{garbage}");
+        assert!(offer_was_at_fault(&garbage), "{garbage}");
+        let panicked = server().await.accept_offer(RTX_REPAIRING_TWO_PTS).unwrap_err();
+        assert!(offer_was_at_fault(&panicked), "{panicked}");
+        assert!(offer_was_at_fault(&OfferRefused("nothing to send".into()).into()));
+
+        let setup = isolate_negotiation::<()>("session setup", || panic!("no socket")).unwrap_err();
+        assert!(!offer_was_at_fault(&setup));
+        assert!(!offer_was_at_fault(&anyhow::anyhow!("WHEP output task dropped reply")));
     }
 
     /// The codec set through edge 0.114.0: str0m's defaults plus four level-5.1

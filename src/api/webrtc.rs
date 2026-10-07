@@ -18,9 +18,42 @@ pub mod handlers {
     use axum::body::Body;
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode, header};
-    use axum::response::Response;
+    use axum::response::{IntoResponse, Response};
 
     use crate::api::server::AppState;
+
+    /// The longest reason a refused offer's 400 carries in its body.
+    const REFUSAL_BODY_MAX: usize = 256;
+
+    /// The response to a WHIP / WHEP offer that could not be answered. An
+    /// offer at fault (`session::offer_was_at_fault`: it did not parse, str0m
+    /// refused it or panicked on it, or it carries nothing to send) gets 400
+    /// and a short text reason, as the relay answers; anything else is this
+    /// end's fault and stays a bare 500. Every failure used to be the bare
+    /// 500, so a client could not tell its own bad offer from an edge fault.
+    /// The `webrtc_negotiation_panic` Warning is raised where the offer was
+    /// negotiated, either way.
+    pub(crate) fn offer_failed(kind: &str, flow_id: &str, err: &anyhow::Error) -> Response {
+        tracing::error!("{kind} offer error for flow '{flow_id}': {err}");
+        if !crate::engine::webrtc::session::offer_was_at_fault(err) {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        let mut reason = format!("{kind} offer refused: {err}");
+        if reason.len() > REFUSAL_BODY_MAX {
+            let mut end = REFUSAL_BODY_MAX;
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason.truncate(end);
+        }
+        reason.push('\n');
+        (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            reason,
+        )
+            .into_response()
+    }
 
     /// POST /api/v1/flows/{flow_id}/whip — WHIP ingest endpoint.
     ///
@@ -58,13 +91,11 @@ pub mod handlers {
 
         // Create WebRTC session and process SDP offer
         let registry = state.webrtc_sessions.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let (answer_sdp, session_id) = registry
-            .handle_whip_offer(&flow_id, &body)
-            .await
-            .map_err(|e| {
-                tracing::error!("WHIP offer error for flow '{}': {}", flow_id, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let (answer_sdp, session_id) = match registry.handle_whip_offer(&flow_id, &body).await {
+            Ok(answered) => answered,
+            // 400 with the reason for an offer at fault, else 500.
+            Err(e) => return Ok(offer_failed("WHIP", &flow_id, &e)),
+        };
 
         let location = format!("/api/v1/flows/{}/whip/{}", flow_id, session_id);
 
@@ -122,13 +153,11 @@ pub mod handlers {
             }
 
         let registry = state.webrtc_sessions.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let (answer_sdp, session_id) = registry
-            .handle_whep_offer(&flow_id, &body)
-            .await
-            .map_err(|e| {
-                tracing::error!("WHEP offer error for flow '{}': {}", flow_id, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let (answer_sdp, session_id) = match registry.handle_whep_offer(&flow_id, &body).await {
+            Ok(answered) => answered,
+            // 400 with the reason for an offer at fault, else 500.
+            Err(e) => return Ok(offer_failed("WHEP", &flow_id, &e)),
+        };
 
         let location = format!("/api/v1/flows/{}/whep/{}", flow_id, session_id);
 
@@ -335,5 +364,77 @@ pub mod registry {
             let prefix = format!("{}/", flow_id);
             self.sessions.iter().filter(|e| e.key().starts_with(&prefix)).count()
         }
+    }
+}
+
+#[cfg(all(test, feature = "webrtc"))]
+mod tests {
+    use super::handlers::offer_failed;
+    use super::registry::WebrtcSessionRegistry;
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+
+    const CHROME_WHEP_OFFER: &str = include_str!("../engine/webrtc/testdata/chrome124-whep-recvonly.sdp");
+    const RTX_REPAIRING_TWO_PTS: &str = include_str!("../engine/webrtc/testdata/rtx-repairing-two-pts.sdp");
+
+    async fn body(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// An offer the WHEP output could not answer for its own fault — it does
+    /// not parse, or str0m panics on it — comes back 400 with a short text
+    /// reason, as the relay answers it; one this end failed is still a bare
+    /// 500. Every failure used to be the bare 500, empty-bodied.
+    #[tokio::test]
+    async fn an_offer_at_fault_is_answered_400_with_its_reason() {
+        let config: crate::config::models::WebrtcOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "whep-out",
+            "name": "WHEP",
+            "mode": "whep_server",
+            "public_ip": "127.0.0.1",
+        }))
+        .unwrap();
+        let (broadcast_tx, _keep) = tokio::sync::broadcast::channel(16);
+        let stats = Arc::new(crate::stats::collector::OutputStatsAccumulator::new(
+            "whep-out".into(),
+            "WHEP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = crate::engine::output_webrtc::spawn_webrtc_output(
+            config, &broadcast_tx, stats, cancel.clone(), Some(session_rx), events, "flow-a".into(), false,
+        );
+        let registry = WebrtcSessionRegistry::new();
+        registry.register_whep_output("flow-a", session_tx, None);
+
+        for (offer, reason) in [
+            ("v=0\r\nnot an offer\r\n", "SDP parse error"),
+            (RTX_REPAIRING_TWO_PTS, "str0m panicked during SDP offer: Pt locked multiple times"),
+        ] {
+            let err = registry.handle_whep_offer("flow-a", offer).await.unwrap_err();
+            let resp = offer_failed("WHEP", "flow-a", &err);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{err}");
+            assert_eq!(resp.headers()["content-type"], "text/plain; charset=utf-8");
+            let text = body(resp).await;
+            assert!(text.starts_with("WHEP offer refused: ") && text.contains(reason), "{text}");
+            assert!(text.len() <= 257, "{} bytes", text.len());
+        }
+        assert!(registry.handle_whep_offer("flow-a", CHROME_WHEP_OFFER).await.is_ok());
+
+        // Not the offer's fault: no WHEP output on this flow.
+        let err = registry.handle_whep_offer("flow-b", CHROME_WHEP_OFFER).await.unwrap_err();
+        let resp = offer_failed("WHEP", "flow-b", &err);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body(resp).await.is_empty());
+
+        // A long reason is cut short, on a character boundary.
+        let long = anyhow::Error::from(crate::engine::webrtc::session::OfferRefused("é".repeat(400)));
+        let text = body(offer_failed("WHIP", "flow-a", &long)).await;
+        assert!(text.len() <= 257 && text.ends_with('\n'), "{} bytes", text.len());
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
     }
 }

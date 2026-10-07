@@ -332,8 +332,9 @@ pub fn ff_codec_for_stream_type(stream_type: u8) -> Option<video_codec::AudioDec
 /// (`"AC-3 audio (stream_type 0x81)"`) — `Some` only for one the
 /// re-encoding outputs can decode into their encoder (MP2, AC-3, E-AC-3,
 /// AAC-LATM), so the Warning never names `audio_encode` for a source it
-/// cannot help: AC-4 (0xAC), DTS, an unknown type, or Opus-in-TS (0x06,
-/// which WebRTC cannot pass through and RTMP / CMAF cannot carry).
+/// cannot help: AC-4 (0xAC), DTS, an unknown type, or Opus-in-TS (0x06: a
+/// WebRTC output passes it through without `audio_encode` and re-encodes it
+/// with one, and RTMP / CMAF drop it whatever the block says).
 #[cfg(feature = "media-codecs")]
 pub fn reencodable_audio_label(stream_type: u8) -> Option<String> {
     match ff_codec_for_stream_type(stream_type)? {
