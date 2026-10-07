@@ -711,14 +711,16 @@ optional = true
 #     on. ffmpeg's WHIP offers give it on none, so our answers to ffmpeg stop
 #     echoing it. Chrome's offers carry it, and edge <-> relay is unchanged
 #     because str0m always offers it.
-#   * Receive reordering (WHIP ingest only) now has a deadline: 2 s video,
-#     1 s audio (#1041, #1057). An incomplete video frame ahead of the first
-#     complete one holds every later frame back until it completes (NACK/RTX)
-#     or expires, where 0.23 skipped it once 30 complete frames had queued
-#     behind it. A packet lost for good inside a multi-packet video frame
-#     therefore stalls video for up to 2 s, then releases a burst. We keep
-#     str0m's defaults; `set_reordering_timeout_{video,audio}(None)` restores
-#     count-only release.
+#   * Receive reordering (WHIP ingest and the WHEP-client input) now has a
+#     deadline by default: 2 s video, 1 s audio (#1041, #1057). An incomplete
+#     video frame ahead of the first complete one holds every later frame back
+#     until it completes (NACK/RTX) or expires, where 0.23 skipped it once 30
+#     complete frames had queued behind it — so a packet lost for good inside a
+#     multi-packet frame stalled video for up to 2 s instead of about 1 s
+#     (measured on the relay: 1.02 s -> 2.03 s without RTX, 67 ms either way
+#     with it). `engine::webrtc::session` therefore sets
+#     `set_reordering_timeout_{video,audio}(None)`, which restores 0.23's
+#     count-only release exactly.
 #   * A receive stream for SSRC 0 (libwebrtc's pre-media bandwidth probes) no
 #     longer counts toward RTCP report scheduling (#1052). On 0.23 it never
 #     sent a report, so its report deadline stayed in the past and the

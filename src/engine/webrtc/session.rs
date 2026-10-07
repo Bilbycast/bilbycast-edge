@@ -122,7 +122,15 @@ impl WebrtcSession {
         //
         // Whenever str0m bumps its built-in H.264 levels (or adds an
         // ergonomic API to set them), retire this block.
-        let mut rtc_builder = Rtc::builder().set_ice_lite(config.ice_lite);
+        // str0m 0.24 added a receive-reorder deadline (2 s video, 1 s audio) that
+        // holds every later frame behind an incomplete one until it expires.
+        // Without retransmission, one lost packet then stalls video about twice
+        // as long as 0.23 did. `None` restores 0.23's release by frame count,
+        // which is what this pipeline was tuned against.
+        let mut rtc_builder = Rtc::builder()
+            .set_ice_lite(config.ice_lite)
+            .set_reordering_timeout_video(None)
+            .set_reordering_timeout_audio(None);
         let codec_config = rtc_builder.codec_config();
         codec_config.add_h264(
             Pt::new_with_value(110),
