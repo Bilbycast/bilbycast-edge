@@ -141,7 +141,7 @@ strum_macros = "0.28.0"
 
 # Socket config
 socket2 = "0.6.5"
-libc = "0.2.189"
+libc = "0.2.190"
 
 # Network interface enumeration (used by util::network_interfaces to populate
 # HealthPayload.network_interfaces — name, IPv4/IPv6, MAC, MTU, loopback).
@@ -156,7 +156,7 @@ rand = "0.10.3"
 # transcode stage in `engine::audio_transcode` to bridge mismatched
 # ST 2110-30 / -31 / rtp_audio formats and feed the SMPTE 302M-over-SRT
 # pipeline). No C deps.
-rubato = "5.0.0"
+rubato = "5.0.1"
 
 # Pure-Rust audio codec decoder (used by `engine::audio_decode` to convert
 # ── AAC backend ─────────────────────────────────────────────────────────
@@ -267,7 +267,7 @@ ctr = "0.10"
 cbc = "0.2"
 
 # UUID for flow IDs
-uuid = { version = "1.26.1", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.27.0", features = ["v4", "v5", "serde"] }
 
 # WebSocket client for manager connection
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
@@ -671,7 +671,7 @@ hardware-monitor-nvml = ["dep:nvml-wrapper"]
 ptp-internal = []
 
 [dependencies.tokio-rustls]
-version = "0.26.5"
+version = "0.26.6"
 optional = true
 
 [dependencies.axum-server]
@@ -794,14 +794,23 @@ features = ["rustls", "stream", "http2"]
 # upstream's judgement, not a measurement of ours. 0.4.20 also accepts a
 # schemeless `Content-Base` header, which some cameras send.
 #
+# 0.4.21 (2026-10-07 sweep): camera-compatibility fixes, dependency set and
+# features unchanged. An `ssrc` of four or fewer hex digits in the SETUP
+# `Transport` header is now ignored with a warning (learned from the first
+# packet) instead of failing SETUP; the undefined `ssrc` some Reolink and Dahua
+# firmware put in the PLAY `RTP-Info` header is now ignored rather than parsed;
+# and keepalives prefer `GET_PARAMETER` over `SET_PARAMETER` (Tapo cameras
+# answer the latter with `400`). All three widen what connects; none changes a
+# stream that already worked.
+#
 # NOT verified on a real camera. RTSP ingest wants a live run before a release.
-version = "0.4.20"
+version = "0.4.21"
 
 # Pure-Rust mDNS-SD service registration for NMOS IS-04 discovery
 # (`_nmos-node._tcp`). Best-effort: registration is gated at runtime so
 # environments without multicast on the chosen interface degrade cleanly.
 [dependencies.mdns-sd]
-version = "0.21.4"
+version = "0.21.5"
 
 [dev-dependencies]
 tempfile = "3.27.0"
