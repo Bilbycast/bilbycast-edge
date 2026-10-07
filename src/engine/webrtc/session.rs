@@ -921,4 +921,307 @@ mod tests {
         let source: SocketAddr = "10.0.0.1:9999".parse().unwrap();
         assert_eq!(resolve_destination(local, &[], source), local);
     }
+
+    // ── ffmpeg 8.0.x ICE checks without PRIORITY (vendored `is`) ───────
+    //
+    // ffmpeg's WHIP muxer sends its connectivity checks without the PRIORITY
+    // attribute in every 8.0.x release (8.1 added it, ffmpeg 7fd967c2c1). The
+    // vendored `is` carries two hunks for that: one in `src/stun.rs` so the
+    // parser accepts the request, one in `src/agent.rs` so the ICE agent does
+    // not then `expect` the attribute and panic. These tests feed a request
+    // built the way ffmpeg builds it through both.
+
+    /// ffmpeg's ICE credentials in the offer below: its `ice_ufrag_local`
+    /// (`%08x`) and `ice_pwd_local` (`%08x` four times), fixed here.
+    const FFMPEG_UFRAG: &str = "5f3c2a91";
+    const FFMPEG_PWD: &str = "0d9e8b7a6c5d4e3f2a1b0c9d8e7f6a5b";
+
+    /// The offer ffmpeg n8.0.3's WHIP muxer sends (`generate_sdp_offer` in
+    /// libavformat/whip.c) for Opus + H.264, with its random ufrag, pwd,
+    /// SSRCs and DTLS fingerprint fixed. `profile-level-id=640028` (High@4.0)
+    /// is what libx264 reports for a 1080p source.
+    const FFMPEG_8_0_WHIP_OFFER: &str = "v=0\r\n\
+        o=FFmpeg 4489045141692799359 2 IN IP4 127.0.0.1\r\n\
+        s=FFmpegPublishSession\r\n\
+        t=0 0\r\n\
+        a=group:BUNDLE 0 1\r\n\
+        a=extmap-allow-mixed\r\n\
+        a=msid-semantic: WMS\r\n\
+        m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+        c=IN IP4 0.0.0.0\r\n\
+        a=ice-ufrag:5f3c2a91\r\n\
+        a=ice-pwd:0d9e8b7a6c5d4e3f2a1b0c9d8e7f6a5b\r\n\
+        a=fingerprint:sha-256 3A:6E:1F:90:C2:4B:7D:08:E5:A1:36:F9:2C:84:D0:5B:71:E3:0A:9F:46:B8:2D:C7:15:6A:F0:83:9E:24:BB:5D\r\n\
+        a=setup:passive\r\n\
+        a=mid:0\r\n\
+        a=sendonly\r\n\
+        a=msid:FFmpeg audio\r\n\
+        a=rtcp-mux\r\n\
+        a=rtpmap:111 opus/48000/2\r\n\
+        a=ssrc:2846271538 cname:FFmpeg\r\n\
+        a=ssrc:2846271538 msid:FFmpeg audio\r\n\
+        m=video 9 UDP/TLS/RTP/SAVPF 106\r\n\
+        c=IN IP4 0.0.0.0\r\n\
+        a=ice-ufrag:5f3c2a91\r\n\
+        a=ice-pwd:0d9e8b7a6c5d4e3f2a1b0c9d8e7f6a5b\r\n\
+        a=fingerprint:sha-256 3A:6E:1F:90:C2:4B:7D:08:E5:A1:36:F9:2C:84:D0:5B:71:E3:0A:9F:46:B8:2D:C7:15:6A:F0:83:9E:24:BB:5D\r\n\
+        a=setup:passive\r\n\
+        a=mid:1\r\n\
+        a=sendonly\r\n\
+        a=msid:FFmpeg video\r\n\
+        a=rtcp-mux\r\n\
+        a=rtcp-rsize\r\n\
+        a=rtpmap:106 H264/90000\r\n\
+        a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640028\r\n\
+        a=ssrc:2846271539 cname:FFmpeg\r\n\
+        a=ssrc:2846271539 msid:FFmpeg video\r\n";
+
+    /// The PRIORITY a PRIORITY-less request is given by the vendored `is`
+    /// (src/agent.rs): RFC 8445 §5.1.2's formula with the peer-reflexive type
+    /// preference 110, local preference 65535 and component ID 1.
+    const PRFLX_PRIORITY_WITHOUT_ATTRIBUTE: u32 = (110 << 24) | (65_535 << 8) | (256 - 1);
+
+    fn stun_sha1_hmac(key: &[u8], payloads: &[&[u8]]) -> [u8; 20] {
+        str0m::crypto::from_feature_flags()
+            .sha1_hmac_provider
+            .sha1_hmac(key, payloads)
+    }
+
+    /// CRC-32/ISO-HDLC, what ffmpeg's `AV_CRC_32_IEEE_LE` computes for the
+    /// STUN FINGERPRINT. Bitwise: a test helper, not a hot path.
+    fn crc32_ieee(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFF_u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// A STUN Binding Request laid out exactly as ffmpeg n8.0 to n8.0.3 lay it
+    /// out (`ice_create_request` in libavformat/whip.c): USERNAME
+    /// (`<server ufrag>:<ffmpeg ufrag>`), USE-CANDIDATE, MESSAGE-INTEGRITY
+    /// keyed with the server's ice-pwd, FINGERPRINT. No PRIORITY and no
+    /// ICE-CONTROLLING.
+    fn ffmpeg_8_0_binding_request(
+        trans_id: &[u8; 12],
+        server_ufrag: &str,
+        server_pwd: &str,
+    ) -> Vec<u8> {
+        fn set_length(buf: &mut [u8]) {
+            let len = u16::try_from(buf.len() - 20).unwrap();
+            buf[2..4].copy_from_slice(&len.to_be_bytes());
+        }
+
+        let mut buf = Vec::with_capacity(128);
+        buf.extend_from_slice(&0x0001_u16.to_be_bytes()); // Binding request
+        buf.extend_from_slice(&0_u16.to_be_bytes()); // length, set below
+        buf.extend_from_slice(&0x2112_A442_u32.to_be_bytes()); // magic cookie
+        buf.extend_from_slice(trans_id);
+
+        let username = format!("{server_ufrag}:{FFMPEG_UFRAG}");
+        buf.extend_from_slice(&0x0006_u16.to_be_bytes()); // USERNAME
+        buf.extend_from_slice(&u16::try_from(username.len()).unwrap().to_be_bytes());
+        buf.extend_from_slice(username.as_bytes());
+        buf.resize(buf.len() + (4 - username.len() % 4) % 4, 0);
+
+        buf.extend_from_slice(&0x0025_u16.to_be_bytes()); // USE-CANDIDATE
+        buf.extend_from_slice(&0_u16.to_be_bytes());
+
+        // MESSAGE-INTEGRITY over everything before it, with the header length
+        // already counting the attribute itself (RFC 5389 §15.4).
+        buf.extend_from_slice(&0x0008_u16.to_be_bytes());
+        buf.extend_from_slice(&20_u16.to_be_bytes());
+        buf.extend_from_slice(&[0; 20]);
+        set_length(&mut buf);
+        let at = buf.len() - 20;
+        let mac = stun_sha1_hmac(server_pwd.as_bytes(), &[&buf[..at - 4]]);
+        buf[at..].copy_from_slice(&mac);
+
+        // FINGERPRINT over everything before it, XOR "STUN".
+        buf.extend_from_slice(&0x8028_u16.to_be_bytes());
+        buf.extend_from_slice(&4_u16.to_be_bytes());
+        buf.extend_from_slice(&[0; 4]);
+        set_length(&mut buf);
+        let at = buf.len() - 4;
+        let crc = crc32_ieee(&buf[..at - 4]) ^ 0x5354_554E;
+        buf[at..].copy_from_slice(&crc.to_be_bytes());
+        buf
+    }
+
+    /// Pull one `a=<name>:` value out of an SDP.
+    fn sdp_attribute(sdp: &str, name: &str) -> String {
+        let prefix = format!("a={name}:");
+        sdp.lines()
+            .find_map(|l| l.strip_prefix(prefix.as_str()))
+            .unwrap_or_else(|| panic!("no a={name} in SDP:\n{sdp}"))
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn ffmpeg_8_0_binding_request_is_what_it_claims() {
+        // The FINGERPRINT is never checked on receive, so pin the CRC against
+        // the standard CRC-32 check value instead.
+        assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+
+        let request = ffmpeg_8_0_binding_request(b"ffmpeg-8.0.3", "srvu", "serverpasswordserverpw");
+        let message = str0m::ice::StunMessage::parse(&request)
+            .expect("the vendored `is` parser accepts a PRIORITY-less Binding Request");
+        assert!(message.is_binding_request());
+        assert_eq!(message.split_username(), Some(("srvu", FFMPEG_UFRAG)));
+        assert!(message.use_candidate());
+        assert_eq!(message.prio(), None);
+        assert_eq!(message.ice_controlling(), None);
+        assert_eq!(message.ice_controlled(), None);
+        assert!(message.verify(b"serverpasswordserverpw", stun_sha1_hmac));
+    }
+
+    /// Regression: an authenticated ffmpeg 8.0.x check used to panic the
+    /// ICE-lite agent at `message.prio().expect("STUN request prio")` — the
+    /// second hunk of the original PRIORITY patch, lost in the `is` 0.9.0
+    /// re-vendor. On the WHIP input that panic took down the input task.
+    ///
+    /// Drives the same `Rtc` the WHIP input builds (`WebrtcSession::new`,
+    /// ICE-lite, controlled after `accept_offer`) and asserts the check is
+    /// answered and ICE completes on it.
+    #[tokio::test]
+    async fn whip_ice_lite_answers_ffmpeg_8_0_check_without_priority() {
+        let mut session = WebrtcSession::new(&SessionConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            public_ip: None,
+            ice_lite: true,
+        })
+        .await
+        .unwrap();
+        // The request's USERNAME names ffmpeg by the ufrag its offer carries.
+        assert!(FFMPEG_8_0_WHIP_OFFER.contains(&format!("a=ice-ufrag:{FFMPEG_UFRAG}\r\n")));
+        let answer = session.accept_offer(FFMPEG_8_0_WHIP_OFFER).unwrap();
+        let server_ufrag = sdp_attribute(&answer, "ice-ufrag");
+        let server_pwd = sdp_attribute(&answer, "ice-pwd");
+        // Drain whatever accepting the offer queued, so everything polled
+        // below is the agent's response to the check.
+        session.drain_pending_events();
+
+        let request = ffmpeg_8_0_binding_request(b"ffmpeg-8.0.3", &server_ufrag, &server_pwd);
+        let request_trans_id = str0m::ice::StunMessage::parse(&request).unwrap().trans_id();
+        let ffmpeg_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let local_addr = session.local_addr;
+        let receive = str0m::net::Receive {
+            proto: Protocol::Udp,
+            source: ffmpeg_addr,
+            destination: local_addr,
+            contents: request.as_slice().try_into().unwrap(),
+        };
+        let rtc = &mut session.rtc;
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rtc.handle_input(Input::Receive(Instant::now(), receive))
+        }))
+        .unwrap_or_else(|_| {
+            panic!("str0m panicked on an ffmpeg 8.0.x Binding Request without PRIORITY")
+        });
+        handled.expect("str0m accepts the Binding Request");
+
+        // Drain, then advance time once so the agent re-evaluates its state,
+        // then drain again.
+        let mut replies = Vec::new();
+        let mut ice_states = Vec::new();
+        let mut advanced = false;
+        loop {
+            match session.rtc.poll_output().expect("poll_output") {
+                Output::Transmit(t) => {
+                    // ffmpeg offered `setup:passive`, so once ICE is up we
+                    // also start DTLS; only the STUN replies matter here.
+                    if let Ok(m) = str0m::ice::StunMessage::parse(&t.contents)
+                        && m.is_successful_binding_response()
+                    {
+                        assert_eq!(m.trans_id(), request_trans_id);
+                        assert_eq!(t.source, local_addr);
+                        assert_eq!(m.mapped_address(), Some(ffmpeg_addr));
+                        assert!(m.verify(server_pwd.as_bytes(), stun_sha1_hmac));
+                        replies.push(t.destination);
+                    }
+                }
+                Output::Event(Event::IceConnectionStateChange(state)) => ice_states.push(state),
+                Output::Event(_) => {}
+                Output::Timeout(_) if !advanced => {
+                    advanced = true;
+                    session
+                        .rtc
+                        .handle_input(Input::Timeout(Instant::now()))
+                        .unwrap();
+                }
+                Output::Timeout(_) => break,
+            }
+        }
+
+        assert_eq!(
+            replies,
+            vec![ffmpeg_addr],
+            "exactly one Binding Success response, to ffmpeg"
+        );
+        // An ICE-lite agent goes straight to Completed on the first
+        // USE-CANDIDATE it answers.
+        assert!(
+            ice_states.contains(&IceConnectionState::Completed),
+            "ICE should complete on ffmpeg's USE-CANDIDATE, saw {ice_states:?}"
+        );
+    }
+
+    /// The PRIORITY the agent substitutes, pinned on the peer-reflexive
+    /// candidate it learns from the request (RFC 8445 §7.3.1.3), with
+    /// `str0m::ice::IceAgent` set up as `Rtc` sets it up for an ICE-lite
+    /// answerer.
+    #[test]
+    fn ice_lite_gives_priority_less_check_a_prflx_priority() {
+        let server = str0m::ice::IceCreds {
+            ufrag: "srvu".into(),
+            pass: "serverpasswordserverpw".into(),
+        };
+        let mut agent = str0m::ice::IceAgent::with_hmac(
+            server.clone(),
+            str0m::crypto::from_feature_flags().sha1_hmac_provider,
+        );
+        agent.set_ice_lite(true);
+        agent.set_controlling(false);
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        agent.add_local_candidate(Candidate::host(local, Protocol::Udp).unwrap());
+        agent.set_remote_credentials(str0m::ice::IceCreds {
+            ufrag: FFMPEG_UFRAG.into(),
+            pass: FFMPEG_PWD.into(),
+        });
+
+        let request = ffmpeg_8_0_binding_request(b"ffmpeg-8.0.3", &server.ufrag, &server.pass);
+        let ffmpeg_addr: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let packet = str0m::ice::StunPacket {
+            proto: Protocol::Udp,
+            source: ffmpeg_addr,
+            destination: local,
+            message: str0m::ice::StunMessage::parse(&request).unwrap(),
+        };
+        let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            agent.handle_packet(Instant::now(), packet)
+        }))
+        .unwrap_or_else(|_| panic!("IceAgent panicked on a Binding Request without PRIORITY"));
+        assert!(handled);
+
+        let prflx: Vec<_> = agent
+            .remote_candidates()
+            .filter(|c| c.addr() == ffmpeg_addr)
+            .collect();
+        assert_eq!(
+            prflx.len(),
+            1,
+            "one peer-reflexive remote learnt from the request"
+        );
+        assert_eq!(prflx[0].kind(), str0m::CandidateKind::PeerReflexive);
+        assert_eq!(prflx[0].prio(), PRFLX_PRIORITY_WITHOUT_ATTRIBUTE);
+        assert_eq!(PRFLX_PRIORITY_WITHOUT_ATTRIBUTE, 1_862_270_975);
+    }
 }

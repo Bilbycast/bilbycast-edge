@@ -751,8 +751,9 @@ optional = true
 #     not enough on its own: with the default codec set the WHEP writer's
 #     first PT for a Chrome offer is VP8. Either fix changes the answered PT
 #     set, so it wants its own change and interop run.
-#   * The vendored `is` PRIORITY patch lets a PRIORITY-less Binding Request
-#     reach a panicking `expect` (see [patch.crates-io] below).
+#   * The vendored `is` PRIORITY patch let a PRIORITY-less Binding Request
+#     reach a panicking `expect`. Fixed after the bump, in the vendored tree
+#     itself (see [patch.crates-io] below).
 version = "0.24.1"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
@@ -844,16 +845,17 @@ alsa = { version = "0.12", optional = true }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # ---------------------------------------------------------------------------
-# BILBYCAST PATCH: vendored `is` 0.11.1 with the strict-PRIORITY check on ICE
-# Binding Requests removed. Originally vendored against `is` 0.8.0 (2026-04-09);
-# re-vendored against 0.9.0 (2026-05-12, str0m 0.19), 0.11.0 (2026-08-11,
-# str0m 0.22) and 0.11.1 (2026-10-07, str0m 0.24, which requires ^0.11.1).
-# Upstream still hard-rejects PRIORITY-less Binding Requests in 0.11.1: its
-# `src/stun.rs` is byte-identical to 0.11.0's. 0.11.1 changed only agent.rs
-# and pair.rs — candidate invalidation now also matches the transport protocol
-# (#1035), and an ICE-lite controlled agent marks a pair succeeded when it
-# answers a Binding Request (#1039; read only by `Rtc::accepts`, which we never
-# call).
+# BILBYCAST PATCH: vendored `is` 0.11.1, patched in two places so an ICE
+# Binding Request without the PRIORITY attribute is answered rather than
+# rejected (src/stun.rs) or panicked on (src/agent.rs). Originally vendored
+# against `is` 0.8.0 (2026-04-09); re-vendored against 0.9.0 (2026-05-12,
+# str0m 0.19), 0.11.0 (2026-08-11, str0m 0.22) and 0.11.1 (2026-10-07, str0m
+# 0.24, which requires ^0.11.1). Upstream still hard-rejects PRIORITY-less
+# Binding Requests in 0.11.1: its `src/stun.rs` is byte-identical to 0.11.0's.
+# 0.11.1 changed only agent.rs and pair.rs — candidate invalidation now also
+# matches the transport protocol (#1035), and an ICE-lite controlled agent
+# marks a pair succeeded when it answers a Binding Request (#1039; read only by
+# `Rtc::accepts`, which we never call).
 #
 # Why: ffmpeg's WHIP muxer sends ICE connectivity-check Binding Requests
 # without the PRIORITY attribute in every 8.0.x release (n8.0 through n8.0.3;
@@ -864,21 +866,25 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 # the 2026-04-09 Bug A entry in the monorepo's testbed/QUALITY_REPORT.md
 # (since deleted; monorepo commit 0ca3baa has it).
 #
-# KNOWN GAP, unchanged by this re-vendor: the stun.rs hunk only gets the
-# request past the parser. `IceAgent::stun_server_handle_message`
-# (vendor/is/src/agent.rs) then calls `message.prio().expect("STUN request
-# prio")`, so an authenticated PRIORITY-less request panics the WHIP input
-# task instead of being rejected. The original 0.8.0 vendoring (381f5be)
-# patched that too, with `.unwrap_or(126 * 16_777_216 + 65_535 * 256 + 255)`
-# (the RFC 5245 host-candidate priority); the 0.9.0 re-vendor (435bc3c) lost
-# that hunk, and every tree since has carried the stun.rs hunk alone.
-# Reproduced with a standalone probe against this tree (agent.rs:1372) and
-# the 0.11.0 one it replaces (agent.rs:1370); upstream 0.11.1 returns a parse
-# error instead. Restoring the agent.rs hunk, or dropping the patch, closes it.
-#
-# The patched `is` (only stun.rs differs from upstream — single hunk)
-# lives in `vendor/is/`. The diff against upstream is a single
-# comment-replacement block clearly marked `BILBYCAST PATCH`.
+# The two hunks, each a comment-replacement block marked `BILBYCAST PATCH`
+# with the upstream lines kept beside it:
+#   * vendor/is/src/stun.rs, `StunMessage::parse`: the "STUN packet missing
+#     priority" rejection is dropped.
+#   * vendor/is/src/agent.rs, `IceAgent::stun_server_handle_message`:
+#     `message.prio().expect("STUN request prio")` becomes an `unwrap_or` of
+#     the RFC 8445 peer-reflexive priority the request should have carried
+#     (110 * 2^24 + 65535 * 2^8 + 255; the hunk's comment has the derivation).
+#     The stun.rs hunk alone is worse than no patch: the request gets past the
+#     parser, passes the integrity check, and panics here, taking the WHIP
+#     input task with it.
+# History of the second hunk: the original 0.8.0 vendoring (381f5be) carried
+# it, with the host-candidate priority 126 * 2^24 + 65535 * 2^8 + 255; the
+# 0.9.0 re-vendor (435bc3c) lost it, and every tree from then until 2026-10-08
+# carried the stun.rs hunk alone and panicked on ffmpeg 8.0.x (reproduced on
+# 0.11.0 at agent.rs:1370 and 0.11.1 at agent.rs:1372). Restored 2026-10-08,
+# with the prflx type preference instead of the host one. The tests in
+# `engine::webrtc::session` feed a byte-exact ffmpeg 8.0.x request through
+# the WHIP input's `Rtc` and fail if either hunk is missing.
 #
 # WHEN UPGRADING str0m:
 #   1. Run `cargo update -p str0m`. If str0m's new `is` requirement is still
@@ -886,15 +892,20 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 #   2. If it is not, cargo warns `patch `is v...` was not used in the crate
 #      graph` and silently builds against the registry `is`. Either:
 #        a) re-vendor the matching `is` version (copy from
-#           ~/.cargo/registry/src/index.crates.io-*/is-X.Y.Z, re-apply
-#           the same one-hunk diff in vendor/is/src/stun.rs, update this
-#           comment and the path), OR
-#        b) check whether upstream `is` (or str0m) finally landed a
-#           permissive parser. If so, drop this entire
-#           `[patch.crates-io]` section and the `vendor/is/` tree.
-#   3. Check before committing that the patch is live: in Cargo.lock the `is`
-#      entry must carry no `source =` line (a path package) and there must be
-#      no `[[patch.unused]]` table. Nothing in CI checks this yet.
+#           ~/.cargo/registry/src/index.crates.io-*/is-X.Y.Z, re-apply BOTH
+#           hunks — vendor/is/src/stun.rs and vendor/is/src/agent.rs — and
+#           update this comment), then run the `engine::webrtc::session`
+#           tests, OR
+#        b) check whether upstream `is` (or str0m) finally accepts a
+#           PRIORITY-less Binding Request end to end, parser and agent. If so,
+#           drop this entire `[patch.crates-io]` section, the `vendor/is/`
+#           tree and the "Vendored is patch is in the crate graph" step in
+#           .github/workflows/ci.yml.
+#   3. CI enforces that the patch is live: that ci.yml step fails unless
+#      `cargo tree --locked -e normal -i is --depth 0` resolves `is` to
+#      vendor/is. By hand, the same thing shows in Cargo.lock: the `is` entry
+#      carries no `source =` line (a path package) and there is no
+#      `[[patch.unused]]` table.
 # ---------------------------------------------------------------------------
 [patch.crates-io]
 is = { path = "vendor/is" }
