@@ -196,17 +196,21 @@ impl<'a> StunMessage<'a> {
             // fail at the STUN parser, before str0m even saw the packet, so ICE never
             // completed and the DTLS handshake timed out at 5 s. Track upstream fix at
             // <bilbycast-edge/Cargo.toml> "WHEN UPGRADING str0m". When the upstream
-            // `is` crate ships a permissive parser this entire vendor/ tree can be
-            // deleted along with the [patch.crates-io] entry in Cargo.toml. Checked
-            // again at 0.11.1: the rejection is still there, byte-identical.
+            // `is` crate accepts such a request end to end (this parser AND the ICE
+            // agent, see below) this entire vendor/ tree can be deleted along with
+            // the [patch.crates-io] entry in Cargo.toml. Checked again at 0.11.1:
+            // the rejection is still there, byte-identical.
             //
-            // KNOWN GAP, NOT FIXED BY THIS HUNK: a PRIORITY-less request that passes
-            // this parser and the integrity check reaches
-            // `IceAgent::stun_server_handle_message` (src/agent.rs), which still does
-            // `message.prio().expect("STUN request prio")` — so it panics there
-            // instead of being rejected here. The original 0.8.0 vendoring had a
-            // second hunk replacing that `expect`; it was lost in the 0.9.0
-            // re-vendor. See the [patch.crates-io] comment in Cargo.toml.
+            // THIS IS ONE OF TWO HUNKS, and it is unsafe on its own. A PRIORITY-less
+            // request that passes this parser and the integrity check reaches
+            // `IceAgent::stun_server_handle_message` (src/agent.rs), whose upstream
+            // `message.prio().expect("STUN request prio")` then panics. The second
+            // `BILBYCAST PATCH` hunk, there, substitutes an RFC 8445 peer-reflexive
+            // priority instead. The original 0.8.0 vendoring carried both; the 0.9.0
+            // re-vendor dropped the agent.rs one, and every tree from then until
+            // 2026-10-08 panicked on ffmpeg 8.0.x. Re-vendoring means re-applying
+            // BOTH; bilbycast-edge's `engine::webrtc::session` tests feed an ffmpeg
+            // 8.0.x request through them and fail if either is missing.
             //
             // Note the "missing priority" in `src/parse.rs` is NOT a second copy of
             // this check — that one is the mandatory priority field of the SDP

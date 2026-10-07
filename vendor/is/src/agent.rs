@@ -1366,10 +1366,38 @@ impl IceAgent {
 
     fn stun_server_handle_message(&mut self, now: Instant, packet: &StunPacket) {
         let message = &packet.message;
-        let prio = message
-            .prio()
-            // this should be guarded in the parsing
-            .expect("STUN request prio");
+        // BILBYCAST PATCH (2026-04-09 for is 0.8.0; lost in the 0.9.0 re-vendor,
+        // restored for is 0.11.1 on 2026-10-08): the second half of the PRIORITY
+        // patch in `src/stun.rs`. That hunk lets a Binding Request without
+        // PRIORITY (ffmpeg's WHIP muxer, n8.0 through n8.0.3) past the parser;
+        // without this one the `expect` below panicked on the very same packet,
+        // out through `Rtc::handle_input`, as soon as the request also passed
+        // the integrity check.
+        //
+        // The substitute is the priority RFC 8445 says the request should have
+        // carried. §7.1.1: a Binding request's PRIORITY is the §5.1.2 priority
+        // of the sender's candidate computed with the *peer-reflexive* type
+        // preference; §7.3.1.3: a peer-reflexive remote learnt from a request
+        // takes that PRIORITY as its own. With the attribute absent we compute
+        // it the same way: type preference 110 (§5.1.2.2's recommended value
+        // for prflx), local preference 65535 (§5.1.2.1, single IP address) and
+        // component ID 1 (RTP; with rtcp-mux it is WebRTC's only component):
+        //   110 * 2^24 + 65535 * 2^8 + (256 - 1) = 1_862_270_975 (0x6EFF_FFFF)
+        // The 0.8.0 hunk used the host type preference 126 instead, which
+        // RFC 8445 never puts in a check's PRIORITY (ffmpeg 8.1+, the first
+        // ffmpeg to send one, does use 126). The value grants a peer nothing:
+        // a sender that can pass the integrity check can already put any
+        // PRIORITY it likes in the attribute. It only has to be a valid
+        // in-range priority (1 ..= 2^31 - 1) for pair ordering.
+        //
+        // Original (upstream) lines, kept here for diff visibility:
+        //
+        //     let prio = message
+        //         .prio()
+        //         // this should be guarded in the parsing
+        //         .expect("STUN request prio");
+        const PRFLX_PRIO_WITHOUT_PRIORITY_ATTR: u32 = (110 << 24) | (65_535 << 8) | (256 - 1);
+        let prio = message.prio().unwrap_or(PRFLX_PRIO_WITHOUT_PRIORITY_ATTR);
         let use_candidate = message.use_candidate();
 
         if use_candidate {

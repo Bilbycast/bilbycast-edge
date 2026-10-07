@@ -190,6 +190,33 @@ jobs:
           restore-keys: |
             ci-check-cargo-edge-
 
+      # ─── Vendored `is` patch is live ─────────────────────────────────────
+      # Cargo.toml's [patch.crates-io] swaps str0m's ICE crate for vendor/is,
+      # whose two `BILBYCAST PATCH` hunks keep an ffmpeg 8.0.x WHIP publish (no
+      # STUN PRIORITY) from being rejected at the parser or panicking the
+      # session in the ICE agent. When a str0m bump needs an `is` the vendored
+      # version cannot satisfy, cargo does not fail: it warns that the patch
+      # "was not used in the crate graph", records `[[patch.unused]]` in
+      # Cargo.lock and builds against the registry `is`. Every other step stays
+      # green while ffmpeg 8.0.x publishes break again, so fail here instead.
+      # Resolution only, no compile. Cargo.toml's "WHEN UPGRADING str0m" says
+      # what to do when it fires.
+      - name: Vendored is patch is in the crate graph
+        working-directory: bilbycast-edge
+        run: |
+          # stdout only: when the patch is unused cargo also warns, on stderr,
+          # "patch `is v... (.../vendor/is)` was not used in the crate graph" —
+          # a line that itself names vendor/is and must not reach the match.
+          if ! resolved="$(cargo tree --locked -e normal -i is --depth 0)"; then
+            echo "::error title=Vendored is patch::cargo tree could not resolve 'is' against Cargo.lock (error above): the lock file is stale, or str0m no longer depends on 'is'. See 'WHEN UPGRADING str0m' in Cargo.toml." >&2
+            exit 1
+          fi
+          echo "is resolves to: ${resolved}"
+          if ! printf '%s\n' "${resolved}" | grep -qE '^is v[^ ]+ \(.*/vendor/is\)$'; then
+            echo "::error title=Vendored is patch unused::str0m resolves 'is' to '${resolved}', not vendor/is, so the ffmpeg 8.0.x PRIORITY patch is not compiled in. Re-vendor the matching 'is'; see 'WHEN UPGRADING str0m' in Cargo.toml." >&2
+            exit 1
+          fi
+
       - name: cargo check
         working-directory: bilbycast-edge
         run: cargo check --all-targets --locked
