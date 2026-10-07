@@ -266,17 +266,22 @@ impl WireTxReceiver {
         // decremented here. Under normal flow they balance, but on
         // shutdown the receiver may drain after the sender has been
         // dropped — keep the count non-negative.
-        self.depth.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
+        // `fetch_update` is deprecated as `try_update` from Rust 1.99, and the 1.97
+        // toolchains that still build this have no `try_update`: keep the old name.
+        #[allow(deprecated)]
+        let _ = self.depth.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
             Some(d.saturating_sub(1))
-        }).ok();
+        });
         Ok(r)
     }
 
     fn try_recv(&self) -> Result<WireDatagram, TryRecvError> {
         let r = self.rx.try_recv()?;
-        self.depth.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
+        // As in `recv_timeout`.
+        #[allow(deprecated)]
+        let _ = self.depth.fetch_update(Ordering::Release, Ordering::Acquire, |d| {
             Some(d.saturating_sub(1))
-        }).ok();
+        });
         Ok(r)
     }
 }

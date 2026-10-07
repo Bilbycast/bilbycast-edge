@@ -171,6 +171,9 @@ const SRT_SEND_QUEUE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// item), and a wrapped counter reads as permanently over the ceiling —
 /// which is exactly the wedge this queue must not create.
 fn release_queued_bytes(counter: &AtomicUsize, n: usize) {
+    // `fetch_update` is deprecated as `try_update` from Rust 1.99, and the 1.97
+    // toolchains that still build this have no `try_update`: keep the old name.
+    #[allow(deprecated)]
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
         Some(v.saturating_sub(n))
     });
