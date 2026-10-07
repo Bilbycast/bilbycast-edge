@@ -137,11 +137,18 @@ pub enum DemuxedFrame {
         /// PES payload bytes (post-PES-header). The ETSI / ISO opus-in-TS
         /// control headers ride in front of each Opus frame inside this
         /// buffer.
-        #[cfg(all(feature = "display", target_os = "linux"))]
+        #[cfg(any(all(feature = "display", target_os = "linux"), feature = "webrtc"))]
         data: Vec<u8>,
-        /// Presentation timestamp in 90 kHz clock ticks.
-        #[cfg(all(feature = "display", target_os = "linux"))]
+        /// Presentation timestamp in 90 kHz clock ticks — 0 when the PES
+        /// carried none (see `pts_known`).
+        #[cfg(any(all(feature = "display", target_os = "linux"), feature = "webrtc"))]
         pts: u64,
+        /// Whether the PES carried a PTS. The WebRTC passthrough continues
+        /// a PES without one from where the previous one's packets ended
+        /// rather than stamping it 0.
+        #[cfg(any(all(feature = "display", target_os = "linux"), feature = "webrtc"))]
+        #[cfg_attr(not(feature = "webrtc"), allow(dead_code))]
+        pts_known: bool,
     },
     /// One AAC access unit (raw, ADTS header stripped), emitted as soon as
     /// it is complete — cut across PES boundaries, so an AU that straddles
@@ -408,6 +415,12 @@ pub struct TsDemuxer {
     /// an input switch from AAC → AC-3 still has the AAC config available for
     /// the AAC samples it captured before the switch).
     cached_aac_config: Option<(u8, u8, u8)>,
+    /// The `channel_config_code` the PMT signals for the selected audio
+    /// track when it is Opus (`ts_parse::opus_channel_config_code`), `None`
+    /// when that track is not Opus or its PMT entry carries no Opus
+    /// extension descriptor. Refreshed on every PMT, so a switch to a 5.1
+    /// Opus source on the same PID is seen.
+    opus_channel_config: Option<u8>,
     /// Last PMT `version_number` (5 bits) seen for the locked program. A change
     /// trips `pending_discontinuity`, which surfaces a single
     /// [`DemuxedFrame::Discontinuity`] at the head of the next `demux()` return.
@@ -463,6 +476,7 @@ impl TsDemuxer {
             cached_h265_sps: None,
             cached_h265_pps: None,
             cached_aac_config: None,
+            opus_channel_config: None,
             pmt_version: None,
             pending_discontinuity: false,
             pat_section: crate::engine::ts_parse::SectionAssembler::new(),
@@ -499,6 +513,7 @@ impl TsDemuxer {
             cached_h265_sps: None,
             cached_h265_pps: None,
             cached_aac_config: None,
+            opus_channel_config: None,
             pmt_version: None,
             pending_discontinuity: false,
             pat_section: crate::engine::ts_parse::SectionAssembler::new(),
@@ -570,6 +585,14 @@ impl TsDemuxer {
     /// Parsed from the first ADTS header encountered.
     pub fn cached_aac_config(&self) -> Option<(u8, u8, u8)> {
         self.cached_aac_config
+    }
+
+    /// The Opus `channel_config_code` the PMT signals for the selected
+    /// audio track — `None` when it is not Opus or signals none (see
+    /// `opus_channel_config`).
+    #[cfg(feature = "webrtc")]
+    pub fn opus_channel_config(&self) -> Option<u8> {
+        self.opus_channel_config
     }
 
     /// Process TS payload bytes (from an RtpPacket, after RTP header stripping).
@@ -794,6 +817,8 @@ impl TsDemuxer {
 
         // Collect all audio tracks in PMT order for track selection.
         let mut audio_tracks: Vec<(u16, u8)> = Vec::new(); // (es_pid, stream_type)
+        // The Opus tracks' channel_config_code, if signalled.
+        let mut opus_codes: Vec<(u16, Option<u8>)> = Vec::new();
 
         let mut pos = data_start;
         while pos + 5 <= data_end {
@@ -900,6 +925,12 @@ impl TsDemuxer {
                     }
                 }
                 STREAM_TYPE_PRIVATE if dvb_audio_kind.is_some() => {
+                    if dvb_audio_kind == Some(PrivateAudioKind::Opus) {
+                        opus_codes.push((
+                            es_pid,
+                            crate::engine::ts_parse::opus_channel_config_code(descriptors),
+                        ));
+                    }
                     // Use the synthesised ATSC-style marker for AC-3 /
                     // E-AC-3 / AC-4; Opus stays on 0x06 (its parse_pes
                     // arm gates on `STREAM_TYPE_PRIVATE if Some(pid) ==
@@ -938,6 +969,20 @@ impl TsDemuxer {
                 .map(|i| (i as usize).min(audio_tracks.len() - 1))
                 .unwrap_or(0);
             let (selected_pid, selected_type) = audio_tracks[idx];
+            let opus_code = opus_codes
+                .iter()
+                .find(|(pid, _)| *pid == selected_pid && selected_type == STREAM_TYPE_PRIVATE)
+                .and_then(|(_, code)| *code);
+            if let Some(code) = opus_code
+                && self.opus_channel_config != opus_code
+            {
+                tracing::info!(
+                    "TS demux: Opus audio PID 0x{:04X} channel_config_code 0x{:02X}",
+                    selected_pid,
+                    code,
+                );
+            }
+            self.opus_channel_config = opus_code;
 
             // Same PID-or-codec change story as video — switching from an
             // AC-3 source to an AAC source on the same audio PID would
@@ -1200,10 +1245,12 @@ impl TsDemuxer {
             }
             STREAM_TYPE_PRIVATE if Some(pid) == self.audio_pid => {
                 vec![DemuxedFrame::Opus {
-                    #[cfg(all(feature = "display", target_os = "linux"))]
+                    #[cfg(any(all(feature = "display", target_os = "linux"), feature = "webrtc"))]
                     data: es_data.to_vec(),
-                    #[cfg(all(feature = "display", target_os = "linux"))]
+                    #[cfg(any(all(feature = "display", target_os = "linux"), feature = "webrtc"))]
                     pts: pts.unwrap_or(0),
+                    #[cfg(any(all(feature = "display", target_os = "linux"), feature = "webrtc"))]
+                    pts_known: pts.is_some(),
                 }]
             }
             // ADTS, MP2, AC-3 / E-AC-3 and AAC-LATM never get here: the

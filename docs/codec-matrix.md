@@ -88,7 +88,7 @@ benefits from offloading decode to dedicated silicon.
 | **AAC-LC** | FDK-AAC in-process (`fdk-aac`) | FDK-AAC | 8 k–48 k | 1–8 (mono–7.1) | Production AAC; lowest latency |
 | **HE-AAC v1** | FDK-AAC in-process | FDK-AAC | 8 k–48 k | 1–2 | SBR adds chroma-bandwidth dependency |
 | **HE-AAC v2** | FDK-AAC in-process | FDK-AAC | 8 k–48 k | 2 (stereo only) | Parametric Stereo — manager UI hard-filters mono |
-| **Opus** | libopus via libavcodec in-process (`media-codecs`); ffmpeg-subprocess `-c:a libopus` fallback when `media-codecs` off | libopus via libavcodec | 48 k | 1–2 | Encode surface is WebRTC only (MPEG-TS has no standard Opus mapping). Decode wired (transcode-from-Opus-on-TS works) |
+| **Opus** | libopus via libavcodec in-process (`media-codecs`); ffmpeg-subprocess `-c:a libopus` fallback when `media-codecs` off | libopus via libavcodec | 48 k | 1–2 | Encode surface is WebRTC only (MPEG-TS has no standard Opus mapping). Decode wired (transcode-from-Opus-on-TS works). Opus-in-TS reaches a WebRTC output without either: passed through packet for packet when no `audio_encode` is set (mono / stereo single-stream only) |
 | **MP2** | libavcodec | libavcodec | 32 k / 48 k | 1–2 | DVB-T / SD broadcast |
 | **AC-3** | libavcodec | libavcodec | 32 k / 44.1 k / 48 k | 1–6 (5.1) | ATSC / Blu-ray |
 | **E-AC-3** | (passthrough only) | libavcodec | — | 1–7.1 | UHD ATSC 3.0 |

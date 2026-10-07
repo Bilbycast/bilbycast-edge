@@ -558,9 +558,19 @@ fn split_mp2_frames(buf: &[u8]) -> Vec<&[u8]> {
 /// `0xFF` then `0b111` — is accepted too, so a stream from an older edge
 /// still decodes.
 ///
+/// `au_size` counts the Opus packet alone: the optional `start_trim` /
+/// `end_trim` (two bytes each, a 13-bit sample count) and the control
+/// extension sit between it and the packet, outside it — what ffmpeg's
+/// `mpegts` muxer writes and its Opus parser reads. They used to be taken
+/// out of `au_size`, so the AU carrying a trim (ffmpeg's first, with the
+/// encoder pre-skip, and its last) came out two bytes short. The trims are
+/// skipped, not applied: no consumer here trims (an RTP Opus stream cannot
+/// signal it — RFC 7587), so a stream's priming plays, as from any RTP
+/// sender.
+///
 /// Best-effort — malformed AUs cause a resync on the next valid prefix
-/// rather than aborting the PES.
-#[cfg(feature = "media-codecs")]
+/// rather than aborting the PES, and the walk never reads past `buf`.
+#[cfg(any(feature = "media-codecs", feature = "webrtc"))]
 pub fn split_opus_frames(buf: &[u8]) -> Vec<&[u8]> {
     let mut out: Vec<&[u8]> = Vec::with_capacity(2);
     let mut i = 0;
@@ -580,58 +590,41 @@ pub fn split_opus_frames(buf: &[u8]) -> Vec<&[u8]> {
         // au_size: variable-length unsigned. Each 0xFF byte adds 255 and
         // continues; the first non-0xFF byte adds its raw value and ends
         // the field.
-        let mut size_pos = i + 2;
+        let mut pos = i + 2;
         let mut au_size: usize = 0;
         loop {
-            if size_pos >= buf.len() {
+            let Some(&b) = buf.get(pos) else {
                 return out;
-            }
-            let b = buf[size_pos];
-            size_pos += 1;
+            };
+            pos += 1;
             au_size = au_size.saturating_add(b as usize);
             if b != 0xFF {
                 break;
             }
         }
 
-        // Optional fields (gated by flags) live *inside* `au_size`. Skip
-        // them so the slice we emit is the Opus packet itself.
-        let mut payload_start = size_pos;
-        let mut consumed_optional: usize = 0;
+        // The optional fields the flags announce follow `au_size`, ahead of
+        // the packet (and are not counted in it).
         if start_trim_flag {
-            if payload_start + 2 > buf.len() {
-                return out;
-            }
-            payload_start += 2;
-            consumed_optional += 2;
+            pos += 2;
         }
         if end_trim_flag {
-            if payload_start + 2 > buf.len() {
-                return out;
-            }
-            payload_start += 2;
-            consumed_optional += 2;
+            pos += 2;
         }
         if control_extension_flag {
-            if payload_start >= buf.len() {
+            let Some(&ext_len) = buf.get(pos) else {
                 return out;
-            }
-            let ext_len = buf[payload_start] as usize;
-            payload_start += 1;
-            consumed_optional += 1;
-            if payload_start + ext_len > buf.len() {
-                return out;
-            }
-            payload_start += ext_len;
-            consumed_optional += ext_len;
+            };
+            pos += 1 + ext_len as usize;
         }
 
-        let opus_packet_size = au_size.saturating_sub(consumed_optional);
-        let payload_end = payload_start + opus_packet_size;
-        if opus_packet_size == 0 || payload_end > buf.len() {
+        let Some(payload_end) = pos.checked_add(au_size).filter(|&end| end <= buf.len()) else {
+            // Truncated: the AU runs past this PES.
             return out;
+        };
+        if au_size > 0 {
+            out.push(&buf[pos..payload_end]);
         }
-        out.push(&buf[payload_start..payload_end]);
         i = payload_end;
     }
     out
@@ -2050,7 +2043,7 @@ mod tests {
     /// 7, then 7 bytes of Opus payload. The splitter must skip the 3-byte
     /// header and emit the 7-byte Opus packet — and take the `0xFF 0xE0`
     /// an older edge's muxer wrote the same way.
-    #[cfg(feature = "media-codecs")]
+    #[cfg(any(feature = "media-codecs", feature = "webrtc"))]
     #[test]
     fn opus_splitter_strips_control_header() {
         for first in [0x7F, 0xFF] {
@@ -2064,7 +2057,7 @@ mod tests {
 
     /// `au_size` is variable-length: each `0xFF` byte adds 255 and
     /// continues. A 260-byte AU encodes as `[0xFF, 0x05]`.
-    #[cfg(feature = "media-codecs")]
+    #[cfg(any(feature = "media-codecs", feature = "webrtc"))]
     #[test]
     fn opus_splitter_decodes_variable_length_au_size() {
         let mut buf = vec![0xFF, 0xE0, 0xFF, 0x05];
@@ -2073,6 +2066,85 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].len(), 260);
         assert!(frames[0].iter().all(|b| *b == 0xAA));
+        // Exactly 255 is `[0xFF, 0x00]` — what ffmpeg's muxer writes.
+        let mut buf = vec![0x7F, 0xE0, 0xFF, 0x00];
+        buf.extend(vec![0xBB; 255]);
+        assert_eq!(split_opus_frames(&buf), vec![&[0xBB; 255][..]]);
+    }
+
+    /// `au_size` is the Opus packet alone: the trims and the control
+    /// extension sit between it and the packet. ffmpeg's muxer flags
+    /// `start_trim` on its first AU (the encoder pre-skip, 312) and
+    /// `end_trim` on its last; both came out two bytes short, taken out of
+    /// `au_size`, and the walk resynced inside the packet's tail.
+    #[cfg(any(feature = "media-codecs", feature = "webrtc"))]
+    #[test]
+    fn opus_splitter_skips_trims_and_extension_outside_au_size() {
+        let buf = [
+            0x7F, 0xF0, 0x03, 0x01, 0x38, 0x7C, 0x11, 0x22, // start_trim 312, 3-byte packet
+            0x7F, 0xE8, 0x02, 0x02, 0x88, 0x7C, 0x33, // end_trim 648, 2-byte packet
+            0x7F, 0xF4, 0x02, 0x00, 0x10, 0x02, 0xEE, 0xEE, 0x4C, 0x44, // trim + 2-byte extension
+        ];
+        assert_eq!(
+            split_opus_frames(&buf),
+            vec![&[0x7C, 0x11, 0x22][..], &[0x7C, 0x33][..], &[0x4C, 0x44][..]]
+        );
+    }
+
+    /// ffmpeg's own Opus-in-TS (`-c:a libopus -f mpegts`, 0.4 s): every
+    /// PES splits into its packets whole — the first, carrying the pre-skip
+    /// as `start_trim`, and the last, carrying `end_trim`, included — each a
+    /// 20 ms packet by its TOC. The two trimmed ones came out two bytes
+    /// short.
+    #[cfg(any(all(feature = "display", target_os = "linux"), feature = "webrtc"))]
+    #[test]
+    fn opus_splitter_takes_ffmpegs_trimmed_access_units_whole() {
+        use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
+        const TS: &[u8] = include_bytes!("testdata/sine1k_opus_48k_stereo.ts");
+        let mut demux = TsDemuxer::new(None);
+        // A PES is handed over when the next starts: twice, for the last.
+        let sizes: Vec<Vec<usize>> = demux
+            .demux(&[TS, TS].concat())
+            .into_iter()
+            .filter_map(|f| match f {
+                DemuxedFrame::Opus { data, .. } => {
+                    Some(split_opus_frames(&data).iter().map(|p| p.len()).collect())
+                }
+                _ => None,
+            })
+            .take(5)
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![
+                vec![106, 93, 91, 90, 85],
+                vec![86, 86, 85, 83, 56],
+                vec![58, 54, 57, 57, 51],
+                vec![59, 58, 54, 53, 110],
+                vec![232],
+            ]
+        );
+    }
+
+    /// Malformed input stops the walk or resyncs; it never reads past the
+    /// buffer: an `au_size` running off the end, a trim or an extension
+    /// cut short, a zero-length AU (skipped), bytes before the first prefix.
+    #[cfg(any(feature = "media-codecs", feature = "webrtc"))]
+    #[test]
+    fn opus_splitter_survives_malformed_access_units() {
+        assert!(split_opus_frames(&[0x7F, 0xE0, 0x05, 0x7C]).is_empty());
+        assert!(split_opus_frames(&[0x7F, 0xE0, 0xFF, 0xFF]).is_empty());
+        assert!(split_opus_frames(&[0x7F, 0xF8, 0x01, 0x00]).is_empty());
+        assert!(split_opus_frames(&[0x7F, 0xE4, 0x01]).is_empty());
+        assert!(split_opus_frames(&[0x7F, 0xE4, 0x01, 0x09, 0x00]).is_empty());
+        assert_eq!(
+            split_opus_frames(&[0x00, 0x12, 0x7F, 0xE0, 0x00, 0x7F, 0xE0, 0x01, 0x7C]),
+            vec![&[0x7C][..]]
+        );
+        for len in 0..64 {
+            let junk: Vec<u8> = (0..len).map(|k| [0x7F, 0xFF, 0xE4, 0xFF][k % 4]).collect();
+            let _ = split_opus_frames(&junk);
+        }
     }
 
     /// `DecodeStats` is a public hot-path counter struct. Trivial but

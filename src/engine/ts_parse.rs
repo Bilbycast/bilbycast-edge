@@ -1108,6 +1108,29 @@ pub fn descriptor_audio_kind(descriptors: &[u8]) -> Option<PrivateEsAudioKind> {
     None
 }
 
+/// The `channel_config_code` of an Opus ES, from the DVB extension
+/// descriptor (tag 0x7F) with the provisional Opus extension tag 0x80 in its
+/// PMT ES-info loop — `None` when the loop carries none (an edge's own muxer
+/// writes only the registration descriptor) or it is cut short.
+///
+/// The code is what ffmpeg's `mpegts` muxer writes and its demuxer reads:
+/// 1 / 2 a mono / stereo single Opus stream; 0 dual mono (two mono
+/// streams); 3–8 that many channels as a multistream (Vorbis order);
+/// anything else (ffmpeg writes `0x80 | n` for `n` uncoupled streams, `0xFF`
+/// for a mapping it cannot describe) another multistream layout.
+pub fn opus_channel_config_code(descriptors: &[u8]) -> Option<u8> {
+    let mut pos = 0;
+    while pos + 2 <= descriptors.len() {
+        let len = descriptors[pos + 1] as usize;
+        let body = descriptors.get(pos + 2..pos + 2 + len)?;
+        if descriptors[pos] == 0x7F && body.len() >= 2 && body[0] == 0x80 {
+            return Some(body[1]);
+        }
+        pos += 2 + len;
+    }
+    None
+}
+
 /// True when a PMT ES-info descriptor loop marks the ES as a text /
 /// data service that is definitively NOT audio: DVB teletext (0x56),
 /// VBI data (0x45), VBI teletext (0x46), or DVB subtitling (0x59).
@@ -1798,6 +1821,24 @@ mod tests {
         // Unrecognised registration → None.
         let d = [0x05, 0x04, b'K', b'L', b'V', b'A'];
         assert_eq!(descriptor_audio_kind(&d), None);
+    }
+
+    /// ffmpeg's Opus ES-info loop: registration "Opus", then the DVB
+    /// extension descriptor 0x7F / 0x80 with the channel_config_code
+    /// (2 for stereo, 6 for 5.1 — captured from `-c:a libopus -f mpegts`).
+    #[test]
+    fn opus_channel_config_code_reads_the_extension_descriptor() {
+        let stereo = [0x05, 0x04, b'O', b'p', b'u', b's', 0x7F, 0x02, 0x80, 0x02];
+        assert_eq!(descriptor_audio_kind(&stereo), Some(PrivateEsAudioKind::Opus));
+        assert_eq!(opus_channel_config_code(&stereo), Some(2));
+        let five_one = [0x05, 0x04, b'O', b'p', b'u', b's', 0x7F, 0x02, 0x80, 0x06];
+        assert_eq!(opus_channel_config_code(&five_one), Some(6));
+        // Registration only (an edge's own muxer), another extension tag,
+        // a descriptor cut short: none signalled.
+        assert_eq!(opus_channel_config_code(&stereo[..6]), None);
+        assert_eq!(opus_channel_config_code(&[0x7F, 0x02, 0x15, 0x02]), None);
+        assert_eq!(opus_channel_config_code(&[0x7F, 0x01, 0x80]), None);
+        assert_eq!(opus_channel_config_code(&[0x7F, 0x03, 0x80, 0x02]), None);
     }
 
     #[test]
