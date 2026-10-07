@@ -6267,10 +6267,7 @@ fn display_loop(
                 counters
                     .present_interval_us_max
                     .fetch_max(iv_us, Ordering::Relaxed);
-                // `fetch_update` is deprecated as `try_update` from Rust 1.99, and the 1.97
-                // toolchains that still build this have no `try_update`: keep the old name.
-                #[allow(deprecated)]
-                let _ = counters.present_interval_us_min.fetch_update(
+                let _ = counters.present_interval_us_min.try_update(
                     Ordering::Relaxed,
                     Ordering::Relaxed,
                     |cur| Some(if cur == 0 { iv_us } else { cur.min(iv_us) }),

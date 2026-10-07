@@ -2151,12 +2151,9 @@ impl FlowRuntime {
         };
         let old_thumb = self.thumbnail_cost_units.swap(new_thumb, Ordering::Relaxed);
         if new_thumb != old_thumb {
-            // `fetch_update` is deprecated as `try_update` from Rust 1.99, and the 1.97
-            // toolchains that still build this have no `try_update`: keep the old name.
-            #[allow(deprecated)]
             let _ = self
                 .cost_units
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
                     Some(total.saturating_sub(old_thumb).saturating_add(new_thumb))
                 });
         }
