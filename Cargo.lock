@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "bonding-protocol"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "bytes",
  "log",
@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "bonding-transport"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3782,7 +3782,7 @@ dependencies = [
 
 [[package]]
 name = "rist-protocol"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "log",
@@ -3792,7 +3792,7 @@ dependencies = [
 
 [[package]]
 name = "rist-transport"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "srt-transport"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "bytes",
  "libc",
