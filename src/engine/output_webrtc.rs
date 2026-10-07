@@ -811,7 +811,7 @@ async fn whep_server_loop(
     flow_id: &str,
     compressed_audio_input: bool,
 ) {
-    use super::webrtc::session::{SessionConfig, WebrtcSession};
+    use super::webrtc::session::{SessionConfig, WebrtcSession, report_negotiation_panic};
 
     let public_ip: Option<std::net::IpAddr> = config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
     let bind_addr: std::net::SocketAddr = match public_ip {
@@ -860,6 +860,7 @@ async fn whep_server_loop(
             Ok(a) => a,
             Err(e) => {
                 tracing::error!("WHEP output '{}': failed to accept SDP offer: {}", config.id, e);
+                report_negotiation_panic(&e, events, flow_id, "WHEP viewer");
                 let _ = msg.reply.send(Err(e));
                 continue;
             }
@@ -1343,7 +1344,7 @@ async fn whip_client_loop(
 ) {
     use std::time::Instant;
     use super::ts_parse::strip_rtp_header;
-    use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+    use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession, report_negotiation_panic};
     use super::webrtc::ts_demux::TsDemuxer;
     use str0m::media::MediaTime;
 
@@ -1390,6 +1391,7 @@ async fn whip_client_loop(
             Ok(o) => o,
             Err(e) => {
                 tracing::error!("WHIP client '{}': SDP offer error: {}", config.id, e);
+                report_negotiation_panic(&e, events, flow_id, "WHIP endpoint");
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
@@ -1443,6 +1445,7 @@ async fn whip_client_loop(
 
         if let Err(e) = session.apply_answer(&answer_sdp, pending) {
             tracing::error!("WHIP client '{}': SDP answer error: {}", config.id, e);
+            report_negotiation_panic(&e, events, flow_id, "WHIP endpoint");
             // Back off before retrying — a bare `continue` here spins the
             // session/offer/POST loop with no delay on a persistent SDP fault.
             tokio::select! {
@@ -2701,5 +2704,84 @@ mod needs_encode_tests {
         // AAC whose profile the demuxer has not read: not claimed.
         let aac = DemuxedFrame::Aac { data: Vec::new(), pts: 0 };
         assert_eq!(label(&aac, false, true), None);
+    }
+}
+
+#[cfg(all(test, feature = "webrtc"))]
+mod whep_server_tests {
+    use super::*;
+    use crate::api::webrtc::registry::NewSessionMsg;
+
+    /// The real Chrome 124 WHEP offer that panicked str0m inside
+    /// `whep_server_loop` in the 2026-10-07 interop run.
+    const CHROME_WHEP_OFFER: &str = include_str!("webrtc/testdata/chrome124-whep-recvonly.sdp");
+    /// An offer str0m 0.24.1 still panics on, whatever H.264 set is
+    /// registered: one RTX PT repairing two H.264 PTs.
+    const RTX_REPAIRING_TWO_PTS: &str = include_str!("webrtc/testdata/rtx-repairing-two-pts.sdp");
+
+    /// The WHEP output negotiates every viewer inline, in one task: a viewer
+    /// whose negotiation fails — str0m panicking on its offer included — must
+    /// cost that viewer its answer and nothing more. A Chrome offer used to
+    /// panic str0m there, which ended the task: every later viewer's request
+    /// found the reply dropped until the flow restarted.
+    #[tokio::test]
+    async fn a_failed_viewer_negotiation_leaves_the_whep_output_serving() {
+        let config: WebrtcOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "whep-out",
+            "name": "WHEP",
+            "mode": "whep_server",
+            "public_ip": "127.0.0.1",
+        }))
+        .unwrap();
+        let (broadcast_tx, _keep) = broadcast::channel::<RtpPacket>(16);
+        let stats = Arc::new(OutputStatsAccumulator::new("whep-out".into(), "WHEP".into(), "webrtc".into()));
+        let cancel = CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, mut raised) = crate::manager::events::event_channel();
+        let task = spawn_webrtc_output(
+            config, &broadcast_tx, stats, cancel.clone(), Some(session_rx), events, "flow-w".into(), false,
+        );
+
+        // A viewer whose offer panics str0m, a Chrome viewer, a viewer whose
+        // offer is unusable, another Chrome viewer.
+        let offers = [RTX_REPAIRING_TWO_PTS, CHROME_WHEP_OFFER, "v=0\r\nnot an offer\r\n", CHROME_WHEP_OFFER];
+        for (viewer, offer) in offers.into_iter().enumerate() {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            session_tx
+                .send(NewSessionMsg { offer_sdp: offer.to_string(), reply })
+                .await
+                .unwrap_or_else(|_| panic!("viewer {viewer}: the WHEP output task has ended"));
+            let answer = tokio::time::timeout(std::time::Duration::from_secs(10), answer)
+                .await
+                .unwrap_or_else(|_| panic!("viewer {viewer}: no reply"))
+                .unwrap_or_else(|_| panic!("viewer {viewer}: the WHEP output task dropped the reply"));
+            match viewer {
+                0 => {
+                    let err = answer.expect_err("str0m cannot negotiate this offer");
+                    assert!(err.to_string().contains("str0m panicked during SDP offer"), "{err}");
+                }
+                2 => assert!(answer.is_err(), "garbage was answered"),
+                _ => {
+                    let (sdp, _session, _cancel) = answer.unwrap();
+                    assert!(sdp.contains("a=rtpmap:102 H264/90000"), "viewer {viewer}: {sdp}");
+                }
+            }
+        }
+        assert!(!task.is_finished());
+
+        // The panic, and only the panic, raised a Warning.
+        let mut panics = Vec::new();
+        while let Ok(ev) = raised.try_recv() {
+            if let Some(d) = ev.details.filter(|d| d["error_code"] == "webrtc_negotiation_panic") {
+                assert_eq!(ev.severity, EventSeverity::Warning);
+                assert_eq!(ev.flow_id.as_deref(), Some("flow-w"));
+                panics.push(d);
+            }
+        }
+        assert_eq!(panics.len(), 1, "{panics:?}");
+        assert_eq!(panics[0]["peer"], "WHEP viewer");
+        assert_eq!(panics[0]["step"], "SDP offer");
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
     }
 }

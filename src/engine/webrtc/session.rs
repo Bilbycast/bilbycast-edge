@@ -32,11 +32,173 @@ use std::time::Instant;
 
 use anyhow::Result;
 use str0m::change::SdpOffer;
+use str0m::format::{Codec, PayloadParams};
 use str0m::media::{Direction, MediaKind, MediaTime, Mid, Pt};
-use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 use str0m::net::Protocol;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
+
+use crate::manager::events::{EventSender, EventSeverity, category};
+
+/// str0m's built-in H.264 payload types (`CodecConfig::enable_h264`, str0m
+/// 0.24.1), re-registered one for one with the level raised to 5.1 (`0x33`):
+/// `(PT, RTX PT, packetization-mode=1, profile-level-id)`. Only the level
+/// byte differs from str0m's table — see [`rtc_config`].
+const H264_LEVEL_5_1: [(u8, u8, bool, u32); 7] = [
+    (127, 121, true, 0x42_00_33),  // Baseline
+    (125, 107, false, 0x42_00_33),
+    (108, 109, true, 0x42_e0_33),  // Constrained Baseline
+    (124, 120, false, 0x42_e0_33),
+    (123, 119, true, 0x4d_00_33),  // Main
+    (35, 36, false, 0x4d_00_33),
+    (114, 115, true, 0x64_00_33),  // High
+];
+
+/// The configuration every session's `Rtc` is built from: ICE role, receive
+/// tuning, and the codec set — Opus, plus H.264 in str0m's seven built-in
+/// profile / packetization-mode variants, at level 5.1. Nothing else.
+///
+/// **The codec set.** The edge writes and muxes H.264 and Opus only, so that
+/// is all an SDP of ours offers or answers:
+///
+/// * str0m's built-in H.264 entries are level 3.1 (`0x1f`). They are
+///   *replaced* by the level-5.1 table above, not supplemented. Through edge
+///   0.114.0 four level-5.1 entries were added beside them, which gave one
+///   profile two local entries; since str0m 0.22 a level mismatch only lowers
+///   the match score, so wherever the peer's PTs are binding — a `recvonly` or
+///   `sendrecv` offer (every browser WHEP viewer), or an answer to an offer of
+///   ours that keeps one H.264 PT — both entries locked the same remote PT and
+///   str0m panicked ("Pt locked multiple times", `assert_claim_once`). The
+///   first extra also put its RTX on PT 111, Opus's own PT, so Opus was moved
+///   off it (onto Chrome's telephone-event PT 110, in a Chrome publish).
+/// * The rest of str0m's default set — VP8, VP9, AV1, H.265 — is left out.
+///   With it, VP8 headed the answer to a browser's publish (so the browser
+///   sent VP8, which the WHIP input muxes as H.264), and `Writer::
+///   payload_params` listed VP8 first on any m-line that carried it.
+/// * Level 5.1 is what the answer advertises, whatever level the peer offered:
+///   str0m does not narrow H.264's level in an answer (its own documented
+///   limitation in `update_param`), and every entry carries
+///   `level-asymmetry-allowed=1`. A level-3.1 entry would advertise less than
+///   a 1080p or 4K contribution needs.
+///
+/// **Keep this identical to `bilbycast-relay`'s
+/// `distribution::webrtc::session`** — the edge's WHIP output publishes into
+/// the relay's WHIP ingest, and both answer browsers.
+///
+/// **Receive reordering.** str0m 0.24 added a receive-reorder deadline (2 s
+/// video, 1 s audio) that holds every later frame behind an incomplete one
+/// until it expires. Without retransmission, one lost packet then stalls video
+/// about twice as long as 0.23 did. `None` restores 0.23's release by frame
+/// count, which is what this pipeline was tuned against.
+fn rtc_config(ice_lite: bool) -> RtcConfig {
+    let mut config = Rtc::builder()
+        .set_ice_lite(ice_lite)
+        .set_reordering_timeout_video(None)
+        .set_reordering_timeout_audio(None)
+        .clear_codecs()
+        .enable_opus(true, false);
+    let codecs = config.codec_config();
+    for (pt, rtx, packetization_mode_1, profile_level_id) in H264_LEVEL_5_1 {
+        codecs.add_h264(pt.into(), Some(rtx.into()), packetization_mode_1, profile_level_id);
+    }
+    config
+}
+
+/// A panic str0m raised while negotiating with one peer, caught so that it
+/// fails that peer alone (see [`isolate_negotiation`]).
+#[derive(Debug)]
+pub struct NegotiationPanic {
+    /// The step that panicked: `"session setup"`, `"SDP offer"`, `"SDP offer
+    /// creation"` or `"SDP answer"`.
+    pub step: &'static str,
+    /// The panic message.
+    pub message: String,
+}
+
+impl std::fmt::Display for NegotiationPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "str0m panicked during {}: {}", self.step, self.message)
+    }
+}
+
+impl std::error::Error for NegotiationPanic {}
+
+/// Run one synchronous str0m negotiation step, turning a panic inside it into
+/// a [`NegotiationPanic`] error.
+///
+/// Every server-side peer is negotiated inline in its input's or output's
+/// single task (`whip_input_loop`, `whep_server_loop`), so an unwind there
+/// ends the task: every later publisher or viewer finds its reply dropped
+/// until the flow restarts. The client loops would stop retrying the same way.
+/// str0m keeps asserts on paths a peer's SDP reaches, so contain them here.
+///
+/// `AssertUnwindSafe` is sound because the session is never used again after
+/// an error: every caller drops it (a server loop answers the request with the
+/// error and waits for the next peer; a client loop backs off and builds a
+/// fresh session).
+fn isolate_negotiation<T>(step: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "(no message)".to_string());
+            let panic = NegotiationPanic { step, message };
+            tracing::error!("WebRTC: {panic}; failing this peer only");
+            Err(panic.into())
+        }
+    }
+}
+
+/// Raise the Warning event for a negotiation that str0m panicked in, naming
+/// the `peer` (e.g. `"WHEP viewer"`). Any other negotiation error is the
+/// peer's own — a malformed SDP — and stays a log line, as before.
+pub fn report_negotiation_panic(err: &anyhow::Error, events: &EventSender, flow_id: &str, peer: &str) {
+    if let Some(panic) = err.downcast_ref::<NegotiationPanic>() {
+        events.emit_flow_with_details(
+            EventSeverity::Warning,
+            category::WEBRTC,
+            format!("WebRTC negotiation with {peer} failed: {panic}"),
+            flow_id,
+            serde_json::json!({
+                "error_code": "webrtc_negotiation_panic",
+                "peer": peer,
+                "step": panic.step,
+                "panic": panic.message,
+            }),
+        );
+    }
+}
+
+/// The payload type a track is written on, from the payload params its
+/// m-line negotiated: H.264 on video, Opus on audio, `None` when the peer
+/// accepted neither.
+///
+/// `Writer::payload_params` lists every negotiated param in codec-config
+/// order, and its first entry used to be taken — whatever the codec. On video,
+/// packetization-mode 1 is preferred: str0m packetizes into STAP-A / FU-A,
+/// which a mode-0 PT forbids, so a mode-0 PT is taken only when the peer
+/// accepted no other.
+fn send_pt<'a>(kind: MediaKind, params: impl Iterator<Item = &'a PayloadParams>) -> Option<Pt> {
+    let mut mode_0 = None;
+    for p in params {
+        let spec = p.spec();
+        match kind {
+            MediaKind::Audio if spec.codec == Codec::Opus => return Some(p.pt()),
+            MediaKind::Video if spec.codec == Codec::H264 => {
+                if spec.format.packetization_mode == Some(1) {
+                    return Some(p.pt());
+                }
+                mode_0.get_or_insert(p.pt());
+            }
+            _ => {}
+        }
+    }
+    mode_0
+}
 
 /// Events produced by the WebRTC session for the caller to handle.
 ///
@@ -104,60 +266,6 @@ impl WebrtcSession {
         let socket = UdpSocket::bind(config.bind_addr).await?;
         let local_addr = socket.local_addr()?;
 
-        // str0m 0.18 ships H.264 profiles all clamped to level 3.1 (0x1f).
-        // ffmpeg's WHIP muxer offers H.264 at higher levels (typically
-        // 4.0 / 0x28 for 1080p sources), and `match_h264_score` rejects
-        // any offered level higher than the local config's level. Result:
-        // ICE+DTLS complete, but the SDP answer drops all video PTs and
-        // the depayloader silently discards every RTP packet.
-        //
-        // Workaround: register additional H.264 entries with level 5.1
-        // (0x33) so the level check passes for any 1080p/4K source. The
-        // PTs we choose must NOT collide with str0m's built-in defaults
-        // (which already occupy 35, 36, 45, 46, 96–103, 107–109, 114–115,
-        // 119–125, 127). Available dynamic PTs: 110–113, 116–118, 122,
-        // 126. We pick 110/111, 112/113, 116/117, 118/122 — duplicate
-        // PTs in the m-line produce SDP that even str0m's own parser
-        // rejects (Scenario L: edge → edge WHIP failed at SDP parse).
-        //
-        // Whenever str0m bumps its built-in H.264 levels (or adds an
-        // ergonomic API to set them), retire this block.
-        // str0m 0.24 added a receive-reorder deadline (2 s video, 1 s audio) that
-        // holds every later frame behind an incomplete one until it expires.
-        // Without retransmission, one lost packet then stalls video about twice
-        // as long as 0.23 did. `None` restores 0.23's release by frame count,
-        // which is what this pipeline was tuned against.
-        let mut rtc_builder = Rtc::builder()
-            .set_ice_lite(config.ice_lite)
-            .set_reordering_timeout_video(None)
-            .set_reordering_timeout_audio(None);
-        let codec_config = rtc_builder.codec_config();
-        codec_config.add_h264(
-            Pt::new_with_value(110),
-            Some(Pt::new_with_value(111)),
-            true,        // packetization-mode=1
-            0x42_00_33,  // Baseline profile, level 5.1
-        );
-        codec_config.add_h264(
-            Pt::new_with_value(112),
-            Some(Pt::new_with_value(113)),
-            true,
-            0x42_e0_33,  // Constrained Baseline, level 5.1
-        );
-        codec_config.add_h264(
-            Pt::new_with_value(116),
-            Some(Pt::new_with_value(117)),
-            true,
-            0x4d_00_33,  // Main profile, level 5.1
-        );
-        codec_config.add_h264(
-            Pt::new_with_value(118),
-            Some(Pt::new_with_value(122)),
-            true,
-            0x64_00_33,  // High profile, level 5.1
-        );
-        let mut rtc = rtc_builder.build(Instant::now());
-
         // Build the host-candidate set the answer SDP will advertise.
         //
         // When the operator pinned a `public_ip` we honour it verbatim —
@@ -189,13 +297,17 @@ impl WebrtcSession {
             route_discovered_lan_ip,
         );
 
-        for ip in &candidate_ips {
-            let cand_addr = SocketAddr::new(*ip, port);
-            let cand = Candidate::host(cand_addr, Protocol::Udp)
-                .map_err(|e| anyhow::anyhow!("ICE candidate error: {}", e))?;
-            rtc.add_local_candidate(cand);
-            tracing::debug!("WebRTC: added local ICE host candidate {cand_addr}");
-        }
+        let rtc = isolate_negotiation("session setup", || {
+            let mut rtc = rtc_config(config.ice_lite).build(Instant::now());
+            for ip in &candidate_ips {
+                let cand_addr = SocketAddr::new(*ip, port);
+                let cand = Candidate::host(cand_addr, Protocol::Udp)
+                    .map_err(|e| anyhow::anyhow!("ICE candidate error: {}", e))?;
+                rtc.add_local_candidate(cand);
+                tracing::debug!("WebRTC: added local ICE host candidate {cand_addr}");
+            }
+            Ok(rtc)
+        })?;
 
         Ok(Self {
             rtc,
@@ -209,6 +321,9 @@ impl WebrtcSession {
     }
 
     /// Accept an SDP offer (server mode) and return the SDP answer string.
+    ///
+    /// A panic inside str0m comes back as a [`NegotiationPanic`] error; the
+    /// session must then be dropped, as on any other error.
     pub fn accept_offer(&mut self, offer_sdp: &str) -> Result<String> {
         // str0m 0.18's SDP parser hard-codes the session name field to a
         // single dash (`s=-`) and rejects every other session name. ffmpeg
@@ -218,15 +333,16 @@ impl WebrtcSession {
         // so the rest of the pipeline doesn't have to know about the quirk.
         let normalised = normalise_sdp_offer_for_str0m(offer_sdp);
 
-        let offer = SdpOffer::from_sdp_string(&normalised)
-            .map_err(|e| anyhow::anyhow!("SDP parse error: {}", e))?;
+        let answer_sdp = isolate_negotiation("SDP offer", || {
+            let offer = SdpOffer::from_sdp_string(&normalised)
+                .map_err(|e| anyhow::anyhow!("SDP parse error: {}", e))?;
 
-        tracing::info!("SDP offer (normalised):\n{}", normalised);
+            tracing::info!("SDP offer (normalised):\n{}", normalised);
 
-        let answer = self.rtc.sdp_api().accept_offer(offer)
-            .map_err(|e| anyhow::anyhow!("SDP accept error: {}", e))?;
-
-        let answer_sdp = answer.to_sdp_string();
+            let answer = self.rtc.sdp_api().accept_offer(offer)
+                .map_err(|e| anyhow::anyhow!("SDP accept error: {}", e))?;
+            Ok(answer.to_sdp_string())
+        })?;
         tracing::info!("SDP answer:\n{}", answer_sdp);
 
         // MIDs will be discovered via MediaAdded events
@@ -235,21 +351,25 @@ impl WebrtcSession {
 
     /// Create an SDP offer (client mode). Returns the SDP offer string.
     /// The pending offer must be kept and passed to `apply_answer()`.
+    ///
+    /// A panic inside str0m comes back as a [`NegotiationPanic`] error.
     pub fn create_offer(&mut self, video: bool, audio: bool, send_only: bool) -> Result<(String, str0m::change::SdpPendingOffer)> {
-        let mut api = self.rtc.sdp_api();
         let direction = if send_only { Direction::SendOnly } else { Direction::RecvOnly };
 
-        if video {
-            let mid = api.add_media(MediaKind::Video, direction, None, None, None);
-            self.video_mid = Some(mid);
-        }
-        if audio {
-            let mid = api.add_media(MediaKind::Audio, direction, None, None, None);
-            self.audio_mid = Some(mid);
-        }
+        let (offer, pending) = isolate_negotiation("SDP offer creation", || {
+            let mut api = self.rtc.sdp_api();
 
-        let (offer, pending) = api.apply()
-            .ok_or_else(|| anyhow::anyhow!("No SDP changes to apply"))?;
+            if video {
+                let mid = api.add_media(MediaKind::Video, direction, None, None, None);
+                self.video_mid = Some(mid);
+            }
+            if audio {
+                let mid = api.add_media(MediaKind::Audio, direction, None, None, None);
+                self.audio_mid = Some(mid);
+            }
+
+            api.apply().ok_or_else(|| anyhow::anyhow!("No SDP changes to apply"))
+        })?;
 
         let offer_sdp = offer.to_sdp_string();
         tracing::info!("SDP offer (created):\n{}", offer_sdp);
@@ -258,25 +378,30 @@ impl WebrtcSession {
 
     /// Apply an SDP answer received from the remote peer (client mode).
     /// Requires the pending offer from `create_offer()`.
+    ///
+    /// A panic inside str0m comes back as a [`NegotiationPanic`] error; the
+    /// session must then be dropped, as on any other error.
     pub fn apply_answer(&mut self, answer_sdp: &str, pending: str0m::change::SdpPendingOffer) -> Result<()> {
-        let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp)
-            .map_err(|e| anyhow::anyhow!("SDP answer parse error: {}", e))?;
+        isolate_negotiation("SDP answer", || {
+            let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp)
+                .map_err(|e| anyhow::anyhow!("SDP answer parse error: {}", e))?;
 
-        self.rtc.sdp_api().accept_answer(pending, answer)
-            .map_err(|e| anyhow::anyhow!("SDP answer accept error: {}", e))?;
+            self.rtc.sdp_api().accept_answer(pending, answer)
+                .map_err(|e| anyhow::anyhow!("SDP answer accept error: {}", e))?;
 
-        // Kickstart the ICE agent. After accept_answer the agent has
-        // remote candidates and credentials, but str0m's first
-        // `poll_output()` may return a `Timeout` with a deadline ~100
-        // years in the future ("nothing to do") because the sans-IO
-        // state machine hasn't been told to advance time. Without this
-        // call, our `poll_event` loop on the sender side sleeps until
-        // doomsday and ICE never starts. One zero-cost time injection
-        // wakes the agent and the next `poll_output` produces the first
-        // STUN binding request immediately.
-        let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
+            // Kickstart the ICE agent. After accept_answer the agent has
+            // remote candidates and credentials, but str0m's first
+            // `poll_output()` may return a `Timeout` with a deadline ~100
+            // years in the future ("nothing to do") because the sans-IO
+            // state machine hasn't been told to advance time. Without this
+            // call, our `poll_event` loop on the sender side sleeps until
+            // doomsday and ICE never starts. One zero-cost time injection
+            // wakes the agent and the next `poll_output` produces the first
+            // STUN binding request immediately.
+            let _ = self.rtc.handle_input(Input::Timeout(Instant::now()));
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Get the local socket address.
@@ -330,10 +455,13 @@ impl WebrtcSession {
         }
     }
 
-    /// Get the first negotiated payload type for a given MID.
+    /// The negotiated payload type to write `mid`'s media on: H.264 on a
+    /// video m-line, Opus on an audio one (see [`send_pt`]). `None` when the
+    /// peer accepted neither, rather than another codec's PT.
     pub fn get_pt(&mut self, mid: Mid) -> Option<Pt> {
+        let kind = self.rtc.media(mid)?.kind();
         let writer = self.rtc.writer(mid)?;
-        writer.payload_params().next().map(|p| p.pt())
+        send_pt(kind, writer.payload_params())
     }
 
     /// Drain all pending str0m events without blocking, populating
@@ -1223,5 +1351,438 @@ mod tests {
         assert_eq!(prflx[0].kind(), str0m::CandidateKind::PeerReflexive);
         assert_eq!(prflx[0].prio(), PRFLX_PRIORITY_WITHOUT_ATTRIBUTE);
         assert_eq!(PRFLX_PRIORITY_WITHOUT_ATTRIBUTE, 1_862_270_975);
+    }
+}
+
+/// Negotiation against real peers' SDP: what the answer carries, which payload
+/// type each track is then written on, and what one peer's str0m panic costs.
+#[cfg(test)]
+mod negotiation_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A real Chrome 124 WHEP offer (two `recvonly` m-lines), as it reached
+    /// `accept_offer` in the 2026-10-07 interop run — where it panicked str0m
+    /// ("Pt locked multiple times: 102") and took the WHEP output down.
+    const CHROME_WHEP_OFFER: &str = include_str!("testdata/chrome124-whep-recvonly.sdp");
+    /// A real Chrome 124 WHIP publish: `addTransceiver(track, { direction:
+    /// 'sendonly' })` for a canvas video and a WebAudio track, no codec
+    /// preferences. VP8 first, then H.264, AV1, VP9, red, rtx and ulpfec.
+    const CHROME_WHIP_OFFER: &str = include_str!("testdata/chrome124-whip-sendonly.sdp");
+    /// A real Chrome 124 WHEP offer narrowed by `setCodecPreferences` to its
+    /// packetization-mode=0 H.264 entries, from the same interop run.
+    const CHROME_WHEP_MODE_0_OFFER: &str = include_str!("testdata/chrome124-whep-recvonly-pm0.sdp");
+    /// A hand-made `recvonly` offer whose one RTX PT repairs two H.264 PTs
+    /// (Baseline in packetization mode 1 and 0). str0m 0.24.1 locks that RTX
+    /// PT once per primary and panics ("Pt locked multiple times: 103") with
+    /// any H.264 set it ships, this one included — so it stands for whatever
+    /// negotiation panic str0m still has.
+    const RTX_REPAIRING_TWO_PTS: &str = include_str!("testdata/rtx-repairing-two-pts.sdp");
+
+    const FINGERPRINT: &str = "5B:3E:8C:A1:0F:77:2D:94:C6:E2:19:B8:4A:D0:63:F5:\
+                               8E:21:CA:7B:90:3F:E6:58:12:AD:C4:6E:B9:07:F3:2C";
+
+    /// An offer from FFmpeg's WHIP muxer: the `generate_sdp_offer` template in
+    /// FFmpeg n9.0.2's `libavformat/whip.c` (the vendored copy), rendered for
+    /// an Opus + H.264 publish. FFmpeg always sends on PT 106 / 105 / 111,
+    /// whatever the answer says, so the answer must keep those.
+    fn ffmpeg_whip_offer(profile_level_id: &str) -> String {
+        let ice = "a=ice-ufrag:4f3a9c1e\r\n\
+                   a=ice-pwd:9b1e6c0d2f7a4e8b5c3d1a0f6e2b7c94\r\n";
+        format!(
+            "v=0\r\n\
+             o=FFmpeg 4489045141692799359 2 IN IP4 127.0.0.1\r\n\
+             s=FFmpegPublishSession\r\n\
+             t=0 0\r\n\
+             a=group:BUNDLE 0 1\r\n\
+             a=extmap-allow-mixed\r\n\
+             a=msid-semantic: WMS\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             {ice}\
+             a=fingerprint:sha-256 {FINGERPRINT}\r\n\
+             a=setup:passive\r\n\
+             a=mid:0\r\n\
+             a=sendonly\r\n\
+             a=msid:FFmpeg audio\r\n\
+             a=rtcp-mux\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=ssrc:2780934121 cname:FFmpeg\r\n\
+             a=ssrc:2780934121 msid:FFmpeg audio\r\n\
+             m=video 9 UDP/TLS/RTP/SAVPF 106 105\r\n\
+             c=IN IP4 0.0.0.0\r\n\
+             {ice}\
+             a=fingerprint:sha-256 {FINGERPRINT}\r\n\
+             a=setup:passive\r\n\
+             a=mid:1\r\n\
+             a=sendonly\r\n\
+             a=msid:FFmpeg video\r\n\
+             a=rtcp-mux\r\n\
+             a=rtcp-rsize\r\n\
+             a=rtpmap:106 H264/90000\r\n\
+             a=fmtp:106 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}\r\n\
+             a=rtcp-fb:106 nack\r\n\
+             a=rtpmap:105 rtx/90000\r\n\
+             a=fmtp:105 apt=106\r\n\
+             a=ssrc-group:FID 2780934122 2780934123\r\n\
+             a=ssrc:2780934122 cname:FFmpeg\r\n\
+             a=ssrc:2780934122 msid:FFmpeg video\r\n"
+        )
+    }
+
+    /// A server's answer to one of our offers that keeps a single H.264 PT —
+    /// at the server's own profile-level-id — plus Opus.
+    fn single_pt_answer(
+        offer: &str,
+        video_mid: Mid,
+        audio_mid: Mid,
+        (pt, rtx, profile_level_id): (u8, u8, &str),
+    ) -> String {
+        let dir = if offer.contains("a=sendonly") { "recvonly" } else { "sendonly" };
+        let transport = format!(
+            "c=IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:srvu\r\n\
+             a=ice-pwd:serverpasswordserverpw\r\n\
+             a=fingerprint:sha-256 {FINGERPRINT}\r\n\
+             a=setup:passive\r\n"
+        );
+        format!(
+            "v=0\r\n\
+             o=- 1 2 IN IP4 127.0.0.1\r\n\
+             s=-\r\n\
+             t=0 0\r\n\
+             a=group:BUNDLE {video_mid} {audio_mid}\r\n\
+             a=ice-lite\r\n\
+             m=video 9 UDP/TLS/RTP/SAVPF {pt} {rtx}\r\n\
+             {transport}\
+             a=mid:{video_mid}\r\n\
+             a={dir}\r\n\
+             a=rtcp-mux\r\n\
+             a=rtpmap:{pt} H264/90000\r\n\
+             a=fmtp:{pt} level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile_level_id}\r\n\
+             a=rtpmap:{rtx} rtx/90000\r\n\
+             a=fmtp:{rtx} apt={pt}\r\n\
+             a=candidate:1 1 udp 2130706431 127.0.0.1 5000 typ host\r\n\
+             m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+             {transport}\
+             a=mid:{audio_mid}\r\n\
+             a={dir}\r\n\
+             a=rtcp-mux\r\n\
+             a=rtpmap:111 opus/48000/2\r\n\
+             a=fmtp:111 minptime=10;useinbandfec=1\r\n"
+        )
+    }
+
+    /// One m-section: its kind, mid, the PTs on its m-line, and each PT's
+    /// `a=rtpmap` encoding name (upper-cased) and `a=fmtp` parameters.
+    #[derive(Debug, Default)]
+    struct Section {
+        kind: String,
+        mid: String,
+        pts: Vec<u8>,
+        codec: HashMap<u8, String>,
+        fmtp: HashMap<u8, String>,
+    }
+
+    fn sections(sdp: &str) -> Vec<Section> {
+        let mut out: Vec<Section> = Vec::new();
+        for line in sdp.lines().map(str::trim_end) {
+            if let Some(m) = line.strip_prefix("m=") {
+                let mut f = m.split_whitespace();
+                let kind = f.next().unwrap_or_default().to_string();
+                let pts = f.skip(2).filter_map(|p| p.parse().ok()).collect();
+                out.push(Section { kind, pts, ..Default::default() });
+                continue;
+            }
+            let Some(s) = out.last_mut() else { continue };
+            if let Some(mid) = line.strip_prefix("a=mid:") {
+                s.mid = mid.to_string();
+            } else if let Some((pt, rest)) = line.strip_prefix("a=rtpmap:").and_then(|r| r.split_once(' ')) {
+                let name = rest.split('/').next().unwrap_or_default().to_ascii_uppercase();
+                s.codec.insert(pt.parse().unwrap(), name);
+            } else if let Some((pt, rest)) = line.strip_prefix("a=fmtp:").and_then(|r| r.split_once(' ')) {
+                s.fmtp.insert(pt.parse().unwrap(), rest.to_string());
+            }
+        }
+        out
+    }
+
+    fn section<'a>(all: &'a [Section], kind: &str) -> &'a Section {
+        all.iter().find(|s| s.kind == kind).unwrap_or_else(|| panic!("no m={kind} section"))
+    }
+
+    fn fmtp_param<'a>(fmtp: &'a str, key: &str) -> Option<&'a str> {
+        fmtp.split(';').find_map(|kv| kv.trim().strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// What we put in an SDP of our own, offer or answer: a video m-line of
+    /// H.264 (with its RTX) and nothing else, every H.264 PT advertising level
+    /// 5.1, and an audio m-line of Opus alone.
+    fn assert_h264_and_opus_only(ours: &str) {
+        let ours = sections(ours);
+        let v = section(&ours, "video");
+        assert!(v.pts.iter().any(|pt| v.codec[pt] == "H264"), "no H.264 on the video m-line: {v:?}");
+        for pt in &v.pts {
+            match v.codec[pt].as_str() {
+                "H264" => {
+                    let plid = fmtp_param(&v.fmtp[pt], "profile-level-id").unwrap();
+                    assert!(plid.to_ascii_lowercase().ends_with("33"),
+                        "PT {pt} carries profile-level-id {plid}, not level 5.1");
+                }
+                "RTX" => {
+                    let apt: u8 = fmtp_param(&v.fmtp[pt], "apt").unwrap().parse().unwrap();
+                    assert_eq!(v.codec[&apt], "H264", "RTX PT {pt} repairs PT {apt}");
+                }
+                other => panic!("{other} on video PT {pt}: {v:?}"),
+            }
+        }
+        let a = section(&ours, "audio");
+        assert!(!a.pts.is_empty() && a.pts.iter().all(|pt| a.codec[pt] == "OPUS"),
+            "audio m-line: {a:?}");
+    }
+
+    /// Our answer to `offer` carries H.264 and Opus only (above), and only on
+    /// PTs the offer gave the same codec.
+    fn assert_answer_keeps_offered_pts(offer: &str, answer: &str) {
+        assert_h264_and_opus_only(answer);
+        let (offer, answer) = (sections(offer), sections(answer));
+        for a in &answer {
+            let o = section(&offer, &a.kind);
+            for pt in a.pts.iter().filter(|pt| a.codec[pt] != "RTX") {
+                assert_eq!(o.codec.get(pt), Some(&a.codec[pt]),
+                    "answered {} on {} PT {pt}, which the offer did not give it", a.codec[pt], a.kind);
+            }
+        }
+    }
+
+    async fn server() -> WebrtcSession {
+        let bind_addr = "127.0.0.1:0".parse().unwrap();
+        WebrtcSession::new(&SessionConfig { bind_addr, public_ip: None, ice_lite: true })
+            .await
+            .unwrap()
+    }
+
+    async fn client() -> WebrtcSession {
+        let bind_addr = "127.0.0.1:0".parse().unwrap();
+        WebrtcSession::new(&SessionConfig { bind_addr, public_ip: None, ice_lite: false })
+            .await
+            .unwrap()
+    }
+
+    /// Accept `offer` as the server and check the answer and the PT each of
+    /// its tracks is written on.
+    async fn accept(offer: &str, video_pt: u8) {
+        let mut s = server().await;
+        let answer = s.accept_offer(offer).unwrap();
+        assert_answer_keeps_offered_pts(offer, &answer);
+        let answered = sections(&answer);
+        let (v, a) = (section(&answered, "video"), section(&answered, "audio"));
+        assert_eq!(s.get_pt(Mid::from(v.mid.as_str())), Some(Pt::new_with_value(video_pt)));
+        assert_eq!(s.get_pt(Mid::from(a.mid.as_str())), Some(Pt::new_with_value(111)));
+    }
+
+    /// The WHEP output's case. Chrome's offer is `recvonly`, so its PTs are
+    /// binding; the video goes out on its packetization-mode=1 Baseline PT.
+    #[tokio::test]
+    async fn a_chrome_whep_offer_is_answered_with_h264_and_opus() {
+        accept(CHROME_WHEP_OFFER, 102).await;
+    }
+
+    /// The WHIP input's case. VP8 heads Chrome's list; the answer must not
+    /// carry it, or Chrome publishes VP8 that the input muxes as H.264.
+    #[tokio::test]
+    async fn a_chrome_whip_offer_is_answered_with_h264_and_opus() {
+        accept(CHROME_WHIP_OFFER, 102).await;
+    }
+
+    /// FFmpeg sends on PT 106 whatever the answer says. A High 5.1 publish
+    /// was answered on PT 118, so all of its video was discarded.
+    #[tokio::test]
+    async fn an_ffmpeg_whip_offer_keeps_its_h264_payload_type() {
+        accept(&ffmpeg_whip_offer("640033"), 106).await;
+        accept(&ffmpeg_whip_offer("42e01f"), 106).await;
+    }
+
+    /// The WHIP-output and WHEP-input case: a server that answers our offer
+    /// with one H.264 PT. That answer panicked `accept_answer`.
+    #[tokio::test]
+    async fn a_single_pt_h264_answer_is_accepted_and_written_on() {
+        for send_only in [true, false] {
+            for chosen in [(127, 121, "42001f"), (108, 109, "42e01f"), (114, 115, "64001f")] {
+                let mut c = client().await;
+                let (offer, pending) = c.create_offer(true, true, send_only).unwrap();
+                let (video_mid, audio_mid) = (c.video_mid.unwrap(), c.audio_mid.unwrap());
+                assert_h264_and_opus_only(&offer);
+                let answer = single_pt_answer(&offer, video_mid, audio_mid, chosen);
+                c.apply_answer(&answer, pending).unwrap();
+                assert_eq!(c.get_pt(video_mid), Some(Pt::new_with_value(chosen.0)));
+                assert_eq!(c.get_pt(audio_mid), Some(Pt::new_with_value(111)));
+            }
+        }
+    }
+
+    /// Edge to edge, both directions (WHIP output -> WHIP input, WHEP input ->
+    /// WHEP output): whichever side sends writes H.264 and Opus. With the old
+    /// codec set a WHIP output wrote H.264 on VP8's PT 96 and Opus on 104, and
+    /// the WHEP pull panicked `accept_offer` as a browser's offer did.
+    #[tokio::test]
+    async fn edge_to_edge_negotiation_writes_h264_and_opus() {
+        for send_only in [true, false] {
+            let (mut c, mut s) = (client().await, server().await);
+            let (offer, pending) = c.create_offer(true, true, send_only).unwrap();
+            assert_h264_and_opus_only(&offer);
+            let answer = s.accept_offer(&offer).unwrap();
+            assert_answer_keeps_offered_pts(&offer, &answer);
+            c.apply_answer(&answer, pending).unwrap();
+            let answered = sections(&answer);
+            let (v, a) = (section(&answered, "video"), section(&answered, "audio"));
+            let sender = if send_only { &mut c } else { &mut s };
+            let video_pt = *sender.get_pt(Mid::from(v.mid.as_str())).unwrap();
+            assert_eq!(v.codec[&video_pt], "H264", "video written on PT {video_pt}");
+            assert_eq!(fmtp_param(&v.fmtp[&video_pt], "packetization-mode"), Some("1"));
+            let audio_pt = *sender.get_pt(Mid::from(a.mid.as_str())).unwrap();
+            assert_eq!(a.codec[&audio_pt], "OPUS", "audio written on PT {audio_pt}");
+        }
+    }
+
+    /// A viewer that accepts only packetization-mode=0 H.264 still gets
+    /// video, on its mode-0 PT, rather than none.
+    #[tokio::test]
+    async fn a_mode_0_only_viewer_is_written_on_its_mode_0_pt() {
+        accept(CHROME_WHEP_MODE_0_OFFER, 104).await;
+    }
+
+    /// The codec set through edge 0.114.0: str0m's defaults plus four level-5.1
+    /// H.264 entries, the first with its RTX on Opus's PT 111.
+    fn legacy_rtc(ice_lite: bool) -> Rtc {
+        let mut config = Rtc::builder().set_ice_lite(ice_lite);
+        let codecs = config.codec_config();
+        codecs.add_h264(110.into(), Some(111.into()), true, 0x42_00_33);
+        codecs.add_h264(112.into(), Some(113.into()), true, 0x42_e0_33);
+        codecs.add_h264(116.into(), Some(117.into()), true, 0x4d_00_33);
+        codecs.add_h264(118.into(), Some(122.into()), true, 0x64_00_33);
+        config.build(Instant::now())
+    }
+
+    fn negotiation_panic(err: &anyhow::Error) -> &NegotiationPanic {
+        err.downcast_ref::<NegotiationPanic>().unwrap_or_else(|| panic!("not a str0m panic: {err}"))
+    }
+
+    /// A str0m panic left with this codec set — an offer, or an answer to our
+    /// offer, whose one RTX PT repairs two H.264 PTs — is that peer's error.
+    #[tokio::test]
+    async fn a_str0m_panic_in_negotiation_is_an_error() {
+        let err = server().await.accept_offer(RTX_REPAIRING_TWO_PTS).unwrap_err();
+        let panic = negotiation_panic(&err);
+        assert_eq!(panic.step, "SDP offer");
+        assert!(panic.message.contains("Pt locked multiple times"), "{panic}");
+
+        // The same shape as a server's answer to a WHIP client's offer, on the
+        // two Baseline PTs that offer carries.
+        let mut c = client().await;
+        let (offer, pending) = c.create_offer(true, false, true).unwrap();
+        let mid = c.video_mid.unwrap();
+        let answer = RTX_REPAIRING_TWO_PTS
+            .replace("a=group:BUNDLE 0", &format!("a=group:BUNDLE {mid}\r\na=ice-lite"))
+            .replace("a=mid:0", &format!("a=mid:{mid}"))
+            .replace("a=setup:actpass", "a=setup:passive")
+            .replace(" 102 104 103\r\n", " 127 125 121\r\n")
+            .replace(":102 ", ":127 ")
+            .replace(":104 ", ":125 ")
+            .replace(":103 ", ":121 ")
+            .replace("apt=102", "apt=127")
+            .replace("apt=104", "apt=125");
+        assert!(offer.contains("a=rtpmap:127 H264/90000") && offer.contains("a=rtpmap:125 H264/90000"));
+        let err = c.apply_answer(&answer, pending).unwrap_err();
+        assert_eq!(negotiation_panic(&err).step, "SDP answer");
+    }
+
+    /// The panic that shipped — the old codec set against the Chrome WHEP
+    /// offer, and against a single-PT answer — is caught the same way, and
+    /// raises one Warning event. A plain bad SDP raises none.
+    #[tokio::test]
+    async fn a_str0m_panic_fails_only_the_peer_that_hit_it() {
+        let (events, mut raised) = crate::manager::events::event_channel();
+
+        let mut s = server().await;
+        s.rtc = legacy_rtc(true);
+        let err = s.accept_offer(CHROME_WHEP_OFFER).unwrap_err();
+        let panic = negotiation_panic(&err);
+        assert_eq!(panic.step, "SDP offer");
+        assert!(panic.message.contains("Pt locked multiple times"), "{panic}");
+
+        report_negotiation_panic(&err, &events, "flow-n", "WHEP viewer");
+        let ev = raised.try_recv().expect("a Warning event");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::WEBRTC);
+        assert_eq!(ev.flow_id.as_deref(), Some("flow-n"));
+        assert!(ev.message.starts_with("WebRTC negotiation with WHEP viewer failed: str0m panicked"), "{}", ev.message);
+        let details = ev.details.unwrap();
+        assert_eq!(details["error_code"], "webrtc_negotiation_panic");
+        assert_eq!(details["peer"], "WHEP viewer");
+        assert_eq!(details["step"], "SDP offer");
+        assert!(details["panic"].as_str().unwrap().contains("Pt locked multiple times"));
+
+        let mut c = client().await;
+        c.rtc = legacy_rtc(false);
+        let (offer, pending) = c.create_offer(true, true, true).unwrap();
+        let (video_mid, audio_mid) = (c.video_mid.unwrap(), c.audio_mid.unwrap());
+        let answer = single_pt_answer(&offer, video_mid, audio_mid, (127, 121, "42001f"));
+        let err = c.apply_answer(&answer, pending).unwrap_err();
+        assert_eq!(negotiation_panic(&err).step, "SDP answer");
+
+        // The next peer is negotiated on a fresh session, as every loop does.
+        accept(CHROME_WHEP_OFFER, 102).await;
+
+        let err = server().await.accept_offer("v=0\r\nnot an offer\r\n").unwrap_err();
+        assert!(err.downcast_ref::<NegotiationPanic>().is_none(), "{err}");
+        report_negotiation_panic(&err, &events, "flow-n", "WHEP viewer");
+        assert!(raised.try_recv().is_err(), "a malformed offer raised an event");
+    }
+
+    #[test]
+    fn isolate_negotiation_reads_either_panic_payload() {
+        let err = isolate_negotiation::<()>("SDP offer", || panic!("formatted {}", 7)).unwrap_err();
+        assert_eq!(negotiation_panic(&err).message, "formatted 7");
+        let err = isolate_negotiation::<()>("SDP answer", || panic!("static")).unwrap_err();
+        assert_eq!(err.to_string(), "str0m panicked during SDP answer: static");
+        assert_eq!(isolate_negotiation("SDP offer", || Ok(5)).unwrap(), 5);
+    }
+
+    /// The H.264 table is str0m's own built-in one with only the level raised:
+    /// same PTs, RTX PTs, packetization modes and profiles, in the same order.
+    /// A str0m bump that changes its table fails here, so the edge and the
+    /// relay are re-checked together.
+    #[test]
+    fn the_h264_set_is_str0ms_built_in_one_at_level_5_1() {
+        let key = |p: &PayloadParams| {
+            let spec = p.spec();
+            (*p.pt(), p.resend().map(|r| *r), spec.format.packetization_mode, spec.format.profile_level_id)
+        };
+        let builtin: Vec<_> = str0m::format::CodecConfig::new_with_defaults()
+            .params()
+            .iter()
+            .filter(|p| p.spec().codec == Codec::H264)
+            .map(key)
+            .collect();
+        let ours: Vec<_> = H264_LEVEL_5_1
+            .iter()
+            .map(|&(pt, rtx, mode_1, plid)| (pt, Some(rtx), Some(mode_1 as u8), Some(plid)))
+            .collect();
+        assert_eq!(ours.len(), builtin.len());
+        for (o, b) in ours.iter().zip(&builtin) {
+            assert_eq!(o.3.unwrap() & 0xff, 0x33, "{o:?} is not level 5.1");
+            assert_eq!((o.0, o.1, o.2, o.3.map(|l| l >> 8)), (b.0, b.1, b.2, b.3.map(|l| l >> 8)));
+        }
+
+        // ... and it is the whole set, beside Opus on its own PT.
+        let mut config = rtc_config(true);
+        let all: Vec<_> = config.codec_config().params().iter().map(|p| (p.spec().codec, key(p))).collect();
+        assert_eq!(all.len(), 8);
+        assert_eq!(all[0], (Codec::Opus, (111, None, None, None)));
+        for (codec, k) in &all[1..] {
+            assert_eq!(*codec, Codec::H264);
+            assert!(ours.contains(k), "{k:?}");
+        }
     }
 }
