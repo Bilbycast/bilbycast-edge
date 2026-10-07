@@ -1430,7 +1430,7 @@ fn demux_decode_loop(
                         audio_decode_counters.inc_dropped_uninit();
                     }
                 }
-                DemuxedFrame::Opus { data, pts } => {
+                DemuxedFrame::Opus { data, pts, .. } => {
                     counters.set_audio_codec_label(
                         crate::stats::collector::DisplayCodecLabel::Opus,
                     );

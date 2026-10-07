@@ -2597,11 +2597,28 @@ Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP a
 | `webrtc_compatible` | boolean | No | `false` | Force a browser-safe H.264 encode (no B-frames, 8-bit 4:2:0, inline SPS/PPS per IDR). Also available on SRT outputs. Full rationale: [`transcoding.md`](transcoding.md#the-webrtc_compatible-output-flag-browser-safe-h264). |
 | `video_only` | boolean | No | `false` | Only send video (audio omitted). Mutually exclusive with `audio_encode` — validation rejects the combination because an audio MID must be negotiated in SDP for the encoder to write to. |
 | `program_number` | integer | No | `null` | MPTS program selector. `null` = lock onto the lowest program_number in the PAT (deterministic default); `Some(N)` = extract elementary streams from program N only. WebRTC is single-program by spec, so this only changes *which* program is sent. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
-| `audio_encode` | object | No | `null` | Optional audio encoder. The only realistic codec for WebRTC is `opus`, and validation rejects anything else. When set, input AAC-LC is decoded in-process via the Phase A `AacDecoder`, encoded to Opus **in-process** via libopus / libavcodec (the default `media-codecs` feature), and written to the WebRTC audio MID via str0m. This is the marquee Phase A+B "AAC contribution → Opus distribution" path. Requires `video_only=false`; no `ffmpeg` binary is needed on a default build. The encoder builds lazily on the first AAC frame after a viewer connects. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
+| `audio_encode` | object | No | `null` | Optional audio encoder. The only realistic codec for WebRTC is `opus`, and validation rejects anything else. When set, input AAC-LC is decoded in-process via the Phase A `AacDecoder`, encoded to Opus **in-process** via libopus / libavcodec (the default `media-codecs` feature), and written to the WebRTC audio MID via str0m. This is the marquee Phase A+B "AAC contribution → Opus distribution" path. MP2 / AC-3 / E-AC-3 / AAC-LATM sources and — since 2026-10 — a mono or stereo Opus-in-TS source are decoded and re-encoded through it too (an Opus source was dropped whatever the block said); without the block an Opus source passes through as it is. Requires `video_only=false`; no `ffmpeg` binary is needed on a default build. The encoder builds lazily on the first source audio frame after a viewer connects. See the [`audio_encode` block](#the-audio_encode-block-phase-b) below. |
 
-**Audio:** Without `audio_encode`, the WebRTC output is video-only when
-the source carries AAC (Opus passthrough only — Opus flows natively on
-WebRTC paths). Setting an `audio_encode` block (codec: `opus`) enables
+**Audio:** Without `audio_encode`, an Opus source passes through: a
+source carrying Opus in MPEG-TS (stream_type 0x06 + registration
+descriptor `Opus`: a WHIP input's, or ffmpeg's `-c:a libopus -f mpegts`)
+goes out on the WebRTC audio track as the Opus packets it carries
+— no decode, no re-encode, each packet stamped on the 48 kHz RTP clock from
+its PES's PTS plus the packets before it in that PES. Until 2026-10 it was
+dropped (WHEP raised one Warning per process, WHIP nothing).
+The Opus-in-TS `start_trim` / `end_trim` (the encoder's pre-skip on the
+first packet, the padding on the last) are not applied — RTP has no way to
+signal them, so a viewer hears the stream's few ms of priming, as from any
+RTP Opus sender. Only one mono or stereo Opus stream goes: a source whose
+PMT signals a multistream layout (more than two channels, or dual mono —
+the Opus extension descriptor's `channel_config_code` other than 1 or 2) is
+dropped with a Warning `opus_layout_unsupported`, once per session, with or
+without `audio_encode` (the decoder here takes a single Opus stream). A
+source that signals no layout (an edge's own muxer writes only the
+registration descriptor) is taken as one stream. Any other source codec
+leaves the output video-only without `audio_encode` (with a Warning
+`codec_needs_encode` when the re-encode could carry it). Setting an
+`audio_encode` block (codec: `opus`) enables
 the marquee Phase A+B chain: AAC decoded in-process via Phase A's
 `AacDecoder`, re-encoded as Opus in-process via Phase B's libopus /
 libavcodec `AudioEncoder`, written to the str0m audio MID. See

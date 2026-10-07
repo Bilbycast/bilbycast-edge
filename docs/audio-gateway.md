@@ -921,8 +921,11 @@ re-encode anything." Any field override (`bitrate_kbps`, `sample_rate`,
 HLS does **not** implement this fast path because we'd have to inspect
 the source TS to detect AAC-LC vs HE-AAC, which requires PMT + audio
 descriptor parsing. Operators who want HLS passthrough simply omit the
-`audio_encode` block. WebRTC also has no fast path — the source is
-always AAC, the sink is always Opus, so passthrough is impossible.
+`audio_encode` block. WebRTC has no same-codec fast path *inside*
+`audio_encode` either — with the block set every source, an Opus one
+included, is decoded and re-encoded at its settings. Its passthrough is
+the absence of the block: an Opus-in-TS source then goes out as the
+packets it carries (mono or stereo; since 2026-10).
 
 ### Failure modes
 

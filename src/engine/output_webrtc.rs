@@ -451,6 +451,9 @@ struct NeedsEncodeWarned {
     video: bool,
     /// Decodable non-Opus audio with no `audio_encode`.
     audio: bool,
+    /// Multistream Opus (more than two channels, or dual mono), which an
+    /// RTP Opus track cannot carry.
+    opus_layout: bool,
 }
 
 /// Tell the operator, once per session, that the source's `source_codec`
@@ -514,6 +517,95 @@ fn audio_needs_encode_label(
             crate::engine::audio_decode::reencodable_audio_label(*stream_type)
         }
         _ => None,
+    }
+}
+
+/// Tell the operator, once per session, that the source's Opus is a
+/// multistream layout (`channel_config_code`, from its PMT) — more than two
+/// channels, or dual mono — which an RTP Opus track does not carry, so its
+/// audio is dropped. `audio_encode` cannot help: the decoder here takes a
+/// single Opus stream (a multistream needs the channel mapping it is not
+/// given). Output-scoped, with the flow in `details`.
+#[cfg(feature = "webrtc")]
+fn warn_opus_layout_not_carried(
+    output_id: &str,
+    flow_id: &str,
+    events: &EventSender,
+    channel_config_code: u8,
+) {
+    let layout = super::webrtc::opus_passthrough::describe(channel_config_code);
+    let msg = format!(
+        "WebRTC output '{output_id}': the source's {layout} is a multistream Opus layout WebRTC does not \
+         carry (one mono or stereo Opus stream only); its audio is dropped"
+    );
+    tracing::warn!("{msg}");
+    events.emit_output_with_details(
+        EventSeverity::Warning,
+        category::WEBRTC,
+        msg,
+        output_id,
+        serde_json::json!({
+            "error_code": "opus_layout_unsupported",
+            "channel_config_code": channel_config_code,
+            "flow_id": flow_id,
+        }),
+    );
+}
+
+/// An Opus-in-TS source on a session with an `audio_encode` goes through it
+/// like any other source: as an `OtherAudio` frame on `stream_type` 0x06,
+/// which the Opus decoder takes (`audio_decode::ff_codec_for_stream_type`),
+/// then re-encoded at the block's settings. Without one (`Disabled`) the
+/// frame is left as it is for the passthrough, and so is a multistream
+/// layout the decoder cannot take (the Opus arm drops it, said once).
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
+fn opus_through_audio_encode(
+    frame: super::ts_demux::DemuxedFrame,
+    encoder_state: &WebrtcEncoderState,
+    opus_channel_config: Option<u8>,
+) -> super::ts_demux::DemuxedFrame {
+    use super::ts_demux::DemuxedFrame;
+    match frame {
+        DemuxedFrame::Opus { data, pts, .. }
+            if !matches!(encoder_state, WebrtcEncoderState::Disabled)
+                && super::webrtc::opus_passthrough::carries(opus_channel_config) =>
+        {
+            DemuxedFrame::OtherAudio { stream_type: 0x06, data, pts }
+        }
+        other => other,
+    }
+}
+
+/// Pass one Opus-in-TS PES through to the session's audio track: each Opus
+/// packet it carries written as one frame on the 48 kHz RTP clock, as the
+/// re-encode writes its encoder's (`OpusTimeline` places them). Shared by the
+/// WHIP client loop and the WHEP per-viewer loop.
+#[cfg(feature = "webrtc")]
+#[allow(clippy::too_many_arguments)]
+async fn write_opus_passthrough(
+    timeline: &mut super::webrtc::opus_passthrough::OpusTimeline,
+    pes: &[u8],
+    pts: Option<u64>,
+    recv_time_us: u64,
+    session: &mut super::webrtc::session::WebrtcSession,
+    audio_mid: str0m::media::Mid,
+    audio_pt: str0m::media::Pt,
+    stats: &Arc<OutputStatsAccumulator>,
+    output_id: &str,
+) {
+    use str0m::media::{Frequency, MediaTime};
+    use std::time::Instant;
+
+    for (packet, rtp_time) in timeline.place(pes, pts) {
+        let media_time = MediaTime::new(rtp_time, Frequency::FORTY_EIGHT_KHZ);
+        if let Err(e) = session.write_media(audio_mid, audio_pt, Instant::now(), media_time, packet) {
+            tracing::debug!("WebRTC output '{}' Opus passthrough write error: {}", output_id, e);
+        }
+        // str0m requires poll_output between consecutive writes.
+        session.drain_outputs().await;
+        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_sent.fetch_add(packet.len() as u64, Ordering::Relaxed);
+        stats.record_latency(recv_time_us);
     }
 }
 
@@ -1025,6 +1117,8 @@ async fn whep_viewer_loop(
     // Also processes incoming RTCP/STUN via drive_udp_io() to keep
     // the session alive (same pattern as whip_client_loop).
     let mut demuxer = TsDemuxer::new(program_number);
+    // The 48 kHz RTP timeline of an Opus source passed through.
+    let mut opus_timeline = super::webrtc::opus_passthrough::OpusTimeline::default();
 
     loop {
         let silence_tick = async {
@@ -1057,6 +1151,10 @@ async fn whep_viewer_loop(
 
                         let frames = demuxer.demux(payload);
                         for frame in frames {
+                            // Opus with an `audio_encode` is re-encoded
+                            // through it like any other source.
+                            #[cfg(feature = "media-codecs")]
+                            let frame = opus_through_audio_encode(frame, &encoder_state, demuxer.opus_channel_config());
                             // Source audio this viewer would hear, dropped
                             // for want of `audio_encode`: say so once.
                             #[cfg(feature = "media-codecs")]
@@ -1113,23 +1211,40 @@ async fn whep_viewer_loop(
                                         events,
                                     ).await;
                                 }
-                                super::webrtc::ts_demux::DemuxedFrame::Opus { .. } => {
-                                    // Native Opus passthrough (input already
-                                    // publishing Opus-in-TS) is not yet wired
-                                    // through the str0m audio path. The frame
-                                    // is dropped — a rate-limited warning is
-                                    // emitted once per output so operators see
-                                    // the loss instead of silent degradation.
-                                    static OPUS_PASSTHROUGH_WARN: std::sync::atomic::AtomicBool =
-                                        std::sync::atomic::AtomicBool::new(false);
-                                    if !OPUS_PASSTHROUGH_WARN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                        events.emit_flow(
-                                            EventSeverity::Warning,
-                                            category::WEBRTC,
-                                            "Opus-in-TS passthrough is not yet wired on WHEP output — dropping audio frames",
-                                            flow_id,
-                                        );
+                                super::webrtc::ts_demux::DemuxedFrame::Opus { data, pts, pts_known } => {
+                                    // Opus-in-TS (a WHIP input, ffmpeg
+                                    // libopus): its packets go out as they
+                                    // are. A multistream layout cannot —
+                                    // said once — and with an `audio_encode`
+                                    // the frame was re-encoded above, or (a
+                                    // build without the decoder) is dropped.
+                                    let (Some(audio_mid), Some(audio_pt)) = (audio_mid, audio_pt) else {
+                                        continue;
+                                    };
+                                    let layout = demuxer.opus_channel_config();
+                                    if !super::webrtc::opus_passthrough::carries(layout) {
+                                        if !needs_encode.opus_layout
+                                            && let Some(code) = layout
+                                        {
+                                            needs_encode.opus_layout = true;
+                                            warn_opus_layout_not_carried(output_id, flow_id, events, code);
+                                        }
+                                        continue;
                                     }
+                                    if !matches!(encoder_state, WebrtcEncoderState::Disabled) {
+                                        continue;
+                                    }
+                                    write_opus_passthrough(
+                                        &mut opus_timeline,
+                                        &data,
+                                        pts_known.then_some(pts),
+                                        recv_time_us,
+                                        &mut session,
+                                        audio_mid,
+                                        audio_pt,
+                                        &stats,
+                                        output_id,
+                                    ).await;
                                 }
                                 super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts } => {
                                     if matches!(encoder_state, WebrtcEncoderState::Lazy) {
@@ -1554,6 +1669,8 @@ async fn whip_client_loop(
         // the remote peer never receives RTCP feedback, timers expire,
         // and the session silently dies.
         let mut demuxer = TsDemuxer::new(config.program_number);
+        // The 48 kHz RTP timeline of an Opus source passed through.
+        let mut opus_timeline = super::webrtc::opus_passthrough::OpusTimeline::default();
 
         loop {
             let silence_tick = async {
@@ -1586,6 +1703,10 @@ async fn whip_client_loop(
 
                             let frames = demuxer.demux(payload);
                             for frame in frames {
+                                // Opus with an `audio_encode` is re-encoded
+                                // through it like any other source.
+                                #[cfg(feature = "media-codecs")]
+                                let frame = opus_through_audio_encode(frame, &encoder_state, demuxer.opus_channel_config());
                                 // Source audio the peer would hear, dropped
                                 // for want of `audio_encode`: say so once.
                                 #[cfg(feature = "media-codecs")]
@@ -1642,8 +1763,36 @@ async fn whip_client_loop(
                                             events,
                                         ).await;
                                     }
-                                    super::webrtc::ts_demux::DemuxedFrame::Opus { .. } => {
-                                        // Native Opus passthrough not yet implemented
+                                    super::webrtc::ts_demux::DemuxedFrame::Opus { data, pts, pts_known } => {
+                                        // Passed through, as on the WHEP
+                                        // viewer loop.
+                                        let (Some(audio_mid), Some(audio_pt)) = (audio_mid, audio_pt) else {
+                                            continue;
+                                        };
+                                        let layout = demuxer.opus_channel_config();
+                                        if !super::webrtc::opus_passthrough::carries(layout) {
+                                            if !needs_encode.opus_layout
+                                                && let Some(code) = layout
+                                            {
+                                                needs_encode.opus_layout = true;
+                                                warn_opus_layout_not_carried(&config.id, flow_id, events, code);
+                                            }
+                                            continue;
+                                        }
+                                        if !matches!(encoder_state, WebrtcEncoderState::Disabled) {
+                                            continue;
+                                        }
+                                        write_opus_passthrough(
+                                            &mut opus_timeline,
+                                            &data,
+                                            pts_known.then_some(pts),
+                                            recv_time_us,
+                                            &mut session,
+                                            audio_mid,
+                                            audio_pt,
+                                            &stats,
+                                            &config.id,
+                                        ).await;
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts } => {
                                         if matches!(encoder_state, WebrtcEncoderState::Lazy) {
@@ -2701,5 +2850,77 @@ mod needs_encode_tests {
         // AAC whose profile the demuxer has not read: not claimed.
         let aac = DemuxedFrame::Aac { data: Vec::new(), pts: 0 };
         assert_eq!(label(&aac, false, true), None);
+        // Opus passes through: nothing for `audio_encode` to do.
+        let opus = DemuxedFrame::Opus { data: Vec::new(), pts: 0, pts_known: true };
+        assert_eq!(label(&opus, false, true), None);
+    }
+
+    /// The multistream-Opus Warning is output-scoped, names the layout and
+    /// carries its `channel_config_code`.
+    #[test]
+    fn the_opus_layout_warning_names_the_layout() {
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        warn_opus_layout_not_carried("out-w", "flow-w", &tx, 6);
+        let ev = rx.try_recv().expect("event");
+        assert_eq!(ev.output_id.as_deref(), Some("out-w"));
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::WEBRTC);
+        assert!(ev.message.contains("6-channel Opus"), "{}", ev.message);
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "opus_layout_unsupported");
+        assert_eq!(d["channel_config_code"], 6);
+        assert_eq!(d["flow_id"], "flow-w");
+    }
+
+    /// An Opus source on a session with an `audio_encode` is decoded and
+    /// re-encoded through it, like any other source — it used to be dropped
+    /// whatever the block said. Without one it stays Opus for the
+    /// passthrough, and so does a multistream layout the decoder cannot
+    /// take.
+    #[test]
+    fn an_opus_source_goes_through_audio_encode_only_when_one_is_set() {
+        const STEREO: &[u8] = include_bytes!("testdata/sine1k_opus_48k_stereo.ts");
+        let mut demux = TsDemuxer::new(None);
+        let pes: Vec<DemuxedFrame> = demux
+            .demux(&[STEREO, STEREO].concat())
+            .into_iter()
+            .filter(|f| matches!(f, DemuxedFrame::Opus { .. }))
+            .collect();
+        assert_eq!(demux.opus_channel_config(), Some(2));
+        let is_opus = |f: &DemuxedFrame| matches!(f, DemuxedFrame::Opus { .. });
+        let opus = || DemuxedFrame::Opus { data: vec![0x7F, 0xE0, 0x01, 0xFC], pts: 0, pts_known: true };
+
+        assert!(is_opus(&opus_through_audio_encode(opus(), &WebrtcEncoderState::Disabled, Some(2))));
+        assert!(is_opus(&opus_through_audio_encode(opus(), &WebrtcEncoderState::Lazy, Some(6))));
+
+        let ae: crate::config::models::AudioEncodeConfig =
+            serde_json::from_value(serde_json::json!({ "codec": "opus", "bitrate_kbps": 32 })).unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("w1".into(), "w1".into(), "webrtc".into()));
+        let cancel = CancellationToken::new();
+        let mut state = WebrtcEncoderState::Lazy;
+        let (mut dec, mut dec_codec) = (None, None);
+        let mut encoded = 0usize;
+        for frame in pes.into_iter().take(5) {
+            let DemuxedFrame::OtherAudio { stream_type, data, pts } =
+                opus_through_audio_encode(frame, &state, demux.opus_channel_config())
+            else {
+                panic!("routed to the re-encode");
+            };
+            assert_eq!(stream_type, 0x06);
+            let decoded = decode_other_audio_for_encode(
+                &mut state, &mut dec, &mut dec_codec, stream_type, &data, pts,
+                Some(&ae), None, &cancel, &stats, "f", "w1", &events,
+            );
+            let WebrtcEncoderState::Active { encoder, stage, .. } = &mut state else {
+                panic!("the encoder is built on the first PES that decodes");
+            };
+            assert_eq!(encoder.params().target_bitrate_kbps, 32, "at the block's settings");
+            for f in decoded {
+                encoder.submit_through(stage, &f.planar, f.sample_rate, pts).unwrap();
+            }
+            encoded += encoder.drain().len();
+        }
+        assert!(encoded >= 15, "{encoded} Opus frames re-encoded from 21 packets");
     }
 }

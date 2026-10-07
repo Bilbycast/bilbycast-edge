@@ -14,6 +14,7 @@
 //! The WebRTC stack is `str0m` — a pure-Rust, sans-I/O implementation
 //! that integrates with bilbycast's tokio event loop.
 
+pub mod opus_passthrough;
 pub mod rtp_h264_depack;
 pub mod session;
 pub mod signaling;
