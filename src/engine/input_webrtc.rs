@@ -31,7 +31,7 @@ use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 #[cfg(feature = "webrtc")]
 use super::packet::RtpPacket;
 #[cfg(feature = "webrtc")]
-use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession, report_negotiation_panic};
 
 /// Spawn a WHIP server input task.
 ///
@@ -167,6 +167,7 @@ async fn whip_input_loop(
             Ok(a) => a,
             Err(e) => {
                 tracing::error!("Failed to accept SDP offer: {}", e);
+                report_negotiation_panic(&e, events, flow_id, "WHIP publisher");
                 let _ = msg.reply.send(Err(e));
                 continue;
             }
@@ -378,6 +379,7 @@ async fn whep_input_loop(
             Ok(o) => o,
             Err(e) => {
                 tracing::error!("WHEP: failed to create SDP offer: {}", e);
+                report_negotiation_panic(&e, events, flow_id, "WHEP server");
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
@@ -427,6 +429,7 @@ async fn whep_input_loop(
 
         if let Err(e) = session.apply_answer(&answer_sdp, pending) {
             tracing::error!("WHEP: failed to apply SDP answer: {}", e);
+            report_negotiation_panic(&e, events, flow_id, "WHEP server");
             // Back off before retrying — a bare `continue` spins the loop.
             tokio::select! {
                 _ = cancel.cancelled() => return,

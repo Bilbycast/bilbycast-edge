@@ -693,7 +693,9 @@ optional = true
 #
 # 0.24's breaking changes, none of which reach us:
 #   * RED (#982) adds a `use_red: bool` to `enable_opus` / `enable_pcmu` /
-#     `enable_pcma` / `enable_g722`. We call none of them; H.264 goes through
+#     `enable_pcma` / `enable_g722`. Of those we call only `enable_opus`, as
+#     `enable_opus(true, false)` (no RED), since the codec set is now built
+#     from `clear_codecs` (see the codec-set entry below); H.264 goes through
 #     `add_h264`, which is unchanged.
 #   * `BweKind` variants carry named fields (#1048). We never enable bandwidth
 #     estimation, and `session::handle_event` ends in `_ => None`.
@@ -741,18 +743,39 @@ optional = true
 # OBS and a browser, and quality gates 3 / 7 / 9. 0.23 changed the RTCP we
 # send and 0.24 the SDP we answer and the receive timing.
 #
-# Not fixed by this bump (both predate it; each reproduces in a standalone
-# probe on 0.23.1 and on 0.24.1):
-#   * The four extra level-5.1 `add_h264` registrations in
-#     `engine::webrtc::session` make `accept_offer` panic ("Pt locked multiple
-#     times") on a recvonly or sendrecv offer whose H.264 PT matches both a
-#     built-in entry and an extra one, which a Chrome WHEP offer does, and
-#     make `accept_answer` panic on a single-PT H.264 answer. Deleting them is
-#     not enough on its own: with the default codec set the WHEP writer's
-#     first PT for a Chrome offer is VP8. Either fix changes the answered PT
-#     set, so it wants its own change and interop run.
-#   * The vendored `is` PRIORITY patch lets a PRIORITY-less Binding Request
-#     reach a panicking `expect` (see [patch.crates-io] below).
+# The codec set, fixed after this bump (the defect predates it and reproduced
+# in a standalone probe on 0.23.1 and on 0.24.1). `engine::webrtc::session`
+# used to keep str0m's default set and add four level-5.1 `add_h264` entries
+# beside the level-3.1 built-ins. Since str0m 0.22 (#1016) a level mismatch
+# only lowers the match score, so where the peer's PTs are binding both
+# entries for one profile locked the same remote PT and str0m panicked ("Pt
+# locked multiple times", `payload_params.rs:41`): `accept_offer` on every
+# Chrome WHEP offer, killing the WHEP output's task for all later viewers,
+# and `accept_answer` on a single-PT H.264 answer. The first extra also put
+# its RTX on PT 111, Opus's own, so Opus was answered on another PT (110,
+# Chrome's telephone-event, in a Chrome publish); a High 5.1 FFmpeg publish
+# was answered on PT 118 while FFmpeg sends on 106; and with VP8 in the set,
+# VP8 headed a browser publish's answer, and an edge's WHIP output wrote its
+# H.264 to another edge on VP8's PT 96 (its Opus on 104).
+# `session::rtc_config` now builds `clear_codecs()` + `enable_opus(true,
+# false)` + str0m's seven built-in H.264 entries re-registered at level 5.1
+# (same PT, RTX PT, packetization-mode and profile; only the level byte is
+# 0x33). Answers carry H.264 and Opus only, at level 5.1; `get_pt` picks the
+# H.264 / Opus PT by codec; and every negotiation step runs under
+# `catch_unwind`, so a str0m panic fails that peer alone with a
+# `webrtc_negotiation_panic` Warning. One is still reachable on 0.24.1 with
+# any H.264 set str0m ships: an offer (or answer) whose one RTX PT repairs two
+# H.264 PTs locks that RTX PT twice. The tests keep it as a fixture
+# (`engine/webrtc/testdata/rtx-repairing-two-pts.sdp`); when a str0m bump
+# stops panicking on it, those tests say so. bilbycast-relay's
+# `distribution::webrtc::session` must register exactly the same set. Checked
+# against captured real SDP (Chrome 124 WHEP and WHIP offers) and FFmpeg's
+# own WHIP offer template in unit tests; not yet re-run live.
+#
+# Not fixed by this bump (it predates it): the vendored `is` PRIORITY patch
+# lets a PRIORITY-less Binding Request reach a panicking `expect` (see
+# [patch.crates-io] below). That panic is in the media path, after
+# negotiation, so the negotiation isolation above does not cover it.
 version = "0.24.1"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The

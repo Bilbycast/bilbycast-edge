@@ -1389,7 +1389,7 @@ Accepts WebRTC contributions from publishers (OBS, browsers) via the WHIP protoc
 }
 ```
 
-Publishers POST an SDP offer to `/api/v1/flows/{flow_id}/whip` and receive an SDP answer. The Bearer token (if configured) must be included in the `Authorization` header.
+Publishers POST an SDP offer to `/api/v1/flows/{flow_id}/whip` and receive an SDP answer. The Bearer token (if configured) must be included in the `Authorization` header. The answer accepts H.264 and Opus only, on the publisher's own payload types, advertising H.264 level 5.1; VP8, VP9, AV1 and the rest are declined, so a browser publishes H.264 — see [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
 
 The H.264 and Opus are remuxed into an SPTS (program 1) laid out from the
 tracks the offer negotiated: video and Opus, video alone, or **Opus alone** —
@@ -2580,7 +2580,7 @@ Supports two modes: WHIP client (push to external endpoint) and WHEP server (ser
 }
 ```
 
-Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP answer.
+Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP answer carrying H.264 (level 5.1 advertised) and Opus only, on the viewer's own payload types; the viewer must offer H.264. A viewer whose negotiation fails gets an HTTP error and the output keeps serving the others — see [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
