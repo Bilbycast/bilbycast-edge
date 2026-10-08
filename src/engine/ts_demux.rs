@@ -605,6 +605,14 @@ impl TsDemuxer {
             .is_some_and(|a| a.stream_type == STREAM_TYPE_PRIVATE)
     }
 
+    /// Whether the selected program's PMT has been read. Until it has,
+    /// [`Self::audio_is_opus`] cannot know what the audio is: its `false`
+    /// then means "not known yet", not "not Opus".
+    #[cfg(feature = "webrtc")]
+    pub fn pmt_seen(&self) -> bool {
+        self.pmt_version.is_some()
+    }
+
     /// Follow the stream's PAT and selected PMT, and nothing else: what
     /// [`Self::audio_is_opus`] and [`Self::opus_channel_config`] read, kept
     /// current at the cost of a PID check per TS packet. No elementary stream

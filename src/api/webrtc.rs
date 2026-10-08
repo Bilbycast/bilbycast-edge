@@ -33,11 +33,16 @@ pub mod handlers {
     /// 500, so a client could not tell its own bad offer from an edge fault.
     /// The `webrtc_negotiation_panic` Warning is raised where the offer was
     /// negotiated, either way.
+    ///
+    /// Only this end's failure is logged at ERROR. An offer at fault is the
+    /// client's doing — a browser offering VP8, say — and is a WARN; it was
+    /// logged at ERROR too, so every such offer reached error-level alerting.
     pub(crate) fn offer_failed(kind: &str, flow_id: &str, err: &anyhow::Error) -> Response {
-        tracing::error!("{kind} offer error for flow '{flow_id}': {err}");
         if !crate::engine::webrtc::session::offer_was_at_fault(err) {
+            tracing::error!("{kind} offer error for flow '{flow_id}': {err}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+        tracing::warn!("{kind} offer refused for flow '{flow_id}': {err}");
         let mut reason = format!("{kind} offer refused: {err}");
         if reason.len() > REFUSAL_BODY_MAX {
             let mut end = REFUSAL_BODY_MAX;
@@ -187,6 +192,8 @@ pub mod handlers {
 
 #[cfg(feature = "webrtc")]
 pub mod registry {
+    use std::sync::Arc;
+
     use anyhow::Result;
     use dashmap::DashMap;
     use tokio::sync::mpsc;
@@ -217,8 +224,9 @@ pub mod registry {
     ///
     /// Stored in `AppState` and shared between API handlers and engine tasks.
     pub struct WebrtcSessionRegistry {
-        /// Active sessions: key = "flow_id/session_id".
-        sessions: DashMap<String, WebrtcSessionHandle>,
+        /// Active sessions: key = "flow_id/session_id". Shared with the task
+        /// that removes a WHEP viewer's entry when the viewer ends.
+        sessions: Arc<DashMap<String, WebrtcSessionHandle>>,
         /// Channels for WHIP input: API handler → input task.
         /// Key = flow_id. Input tasks register their sender here on startup.
         whip_input_channels: DashMap<String, mpsc::Sender<NewSessionMsg>>,
@@ -234,7 +242,7 @@ pub mod registry {
     impl WebrtcSessionRegistry {
         pub fn new() -> Self {
             Self {
-                sessions: DashMap::new(),
+                sessions: Arc::new(DashMap::new()),
                 whip_input_channels: DashMap::new(),
                 whep_output_channels: DashMap::new(),
                 whip_tokens: DashMap::new(),
@@ -340,9 +348,21 @@ pub mod registry {
                 .map_err(|_| anyhow::anyhow!("WHEP output task dropped reply"))??;
 
             let key = format!("{}/{}", flow_id, session_id);
-            self.sessions.insert(key, WebrtcSessionHandle {
-                cancel: session_cancel,
+            self.sessions.insert(key.clone(), WebrtcSessionHandle {
+                cancel: session_cancel.clone(),
                 session_type: "whep",
+            });
+            // The viewer's task cancels this token however it ends — the
+            // setup deadline, ICE giving up, a DTLS close — so its entry
+            // goes with it. Only a DELETE removed one before, and departed
+            // viewers are the ones that send none: each was held until the
+            // flow stopped. (Cancelled already, the entry goes at once.)
+            let sessions = self.sessions.clone();
+            tokio::spawn(async move {
+                session_cancel.cancelled().await;
+                if sessions.remove(&key).is_some() {
+                    tracing::debug!("WHEP session {key} ended; removed");
+                }
             });
 
             Ok((answer, session_id))
@@ -452,5 +472,64 @@ mod tests {
         assert!(text.len() <= 257 && text.ends_with('\n'), "{} bytes", text.len());
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    /// Formatted `tracing` output, collected for a test to read.
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An offer refused for its own fault — the client's doing, a browser
+    /// offering VP8 — is logged at WARN; a failure of this end's at ERROR.
+    /// Both were logged at ERROR, so every refused offer reached
+    /// error-level alerting.
+    #[test]
+    fn only_this_ends_failure_is_logged_as_an_error() {
+        let captured = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = || {
+            let writer = captured.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .finish(),
+            )
+        };
+        let refused = anyhow::Error::from(crate::engine::webrtc::session::OfferRefused(
+            "it accepts no H.264 video".into(),
+        ));
+        let ours = anyhow::anyhow!("WHEP output task dropped reply");
+
+        // A first pass registers both callsites against a subscriber: one
+        // first hit by a parallel test with none installed can cache "never"
+        // process-wide (see the RTMP server's stream-key log test).
+        drop({
+            let warm = subscriber();
+            let _ = offer_failed("WHEP", "flow-a", &refused);
+            let _ = offer_failed("WHEP", "flow-a", &ours);
+            warm
+        });
+        let _guard = subscriber();
+        let logged = |err: &anyhow::Error| {
+            captured.0.lock().unwrap().clear();
+            let _ = offer_failed("WHEP", "flow-a", err);
+            String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned()
+        };
+
+        let text = logged(&refused);
+        assert!(text.contains("WARN") && text.contains("it accepts no H.264 video"), "{text}");
+        assert!(!text.contains("ERROR"), "{text}");
+        let text = logged(&ours);
+        assert!(text.contains("ERROR") && text.contains("dropped reply"), "{text}");
     }
 }

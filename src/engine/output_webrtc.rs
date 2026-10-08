@@ -579,6 +579,13 @@ enum WhepRefusal {
     /// no `audio_encode`, and the source's audio is not Opus it can pass
     /// through. Such a viewer used to be admitted, then sent nothing.
     NoOpusToSend,
+    /// It accepted no H.264 but Opus, the output has no `audio_encode`, and
+    /// the source's PMT has not been read yet (the output has just started,
+    /// the flow restarted, the source is not flowing), so whether it has
+    /// Opus to pass through is not known. Worth retrying: the same offer is
+    /// admitted once the PMT says Opus. It used to be refused as
+    /// `NoOpusToSend`, the Warning saying the source's audio was not Opus.
+    SourceAudioUnknown,
     /// It accepted no H.264, and its video m-line is the offer's BUNDLE tag,
     /// which an answer may not reject (RFC 8843 §7.3.3) — browsers put video
     /// first. Chrome refuses the answer ("Failed to setup RTCP mux"), so this
@@ -599,6 +606,10 @@ impl WhepRefusal {
                 "it accepts no H.264 video, and this output has no Opus to send it alone: \
                  without an audio_encode it sends audio only from an Opus source"
             }
+            Self::SourceAudioUnknown => {
+                "it accepts no H.264 video, and this output has not yet read its source's \
+                 audio to know whether it has Opus to send it alone: retry in a moment"
+            }
             Self::VideoIsBundleTag => {
                 "it accepts no H.264 video, and its video m-line is the BUNDLE tag, which an answer \
                  may not reject (RFC 8843 section 7.3.3): offer H.264, or put the audio m-line first"
@@ -615,6 +626,7 @@ impl WhepRefusal {
         match self {
             Self::NothingToSend => "nothing_to_send",
             Self::NoOpusToSend => "no_opus_to_send",
+            Self::SourceAudioUnknown => "source_audio_unknown",
             Self::VideoIsBundleTag => "video_is_bundle_tag",
             Self::BundleTagRejected => "bundle_tag_rejected",
         }
@@ -640,6 +652,9 @@ fn warn_no_h264(output_id: &str, flow_id: &str, events: &EventSender, peer: &str
                 }
                 WhepRefusal::NoOpusToSend => {
                     ", and this output has no Opus to send it (no audio_encode, and the source's audio is not Opus)"
+                }
+                WhepRefusal::SourceAudioUnknown => {
+                    ", and this output has not yet read the source's PMT to know whether its audio is Opus (no audio_encode)"
                 }
                 WhepRefusal::VideoIsBundleTag => {
                     ", and its video m-line leads the offer's BUNDLE group, which an answer may not reject"
@@ -681,8 +696,9 @@ fn warn_no_h264(output_id: &str, flow_id: &str, events: &EventSender, peer: &str
 /// answer goes back: `Ok(None)` for video (and audio, as negotiated);
 /// `Ok(Some(AudioOnly))` for a viewer that accepted no H.264 but Opus, when
 /// the output is not `video_only` and has Opus to send (`sends_opus`: an
-/// `audio_encode`, or an Opus source passed through); else the refusal.
-/// `bundle_tag_rejected`: the answer rejects the offer's BUNDLE tag
+/// `audio_encode`, or an Opus source passed through — `None` while the
+/// source's PMT has not been read, so that is not known yet); else the
+/// refusal. `bundle_tag_rejected`: the answer rejects the offer's BUNDLE tag
 /// (`session::rejected_bundle_tag`), which no browser applies.
 ///
 /// A viewer without H.264 used to get a 201 and then nothing at all: its
@@ -693,15 +709,17 @@ fn whep_viewer_outcome(
     video_pt: Option<str0m::media::Pt>,
     audio_pt: Option<str0m::media::Pt>,
     video_only: bool,
-    sends_opus: bool,
+    sends_opus: Option<bool>,
     bundle_tag_rejected: bool,
 ) -> Result<Option<NoH264>, WhepRefusal> {
     match (video_pt, audio_pt.filter(|_| !video_only)) {
         (Some(_), _) if bundle_tag_rejected => Err(WhepRefusal::BundleTagRejected),
         (Some(_), _) => Ok(None),
         (None, None) => Err(WhepRefusal::NothingToSend),
-        (None, Some(_)) if !sends_opus => Err(WhepRefusal::NoOpusToSend),
+        (None, Some(_)) if sends_opus == Some(false) => Err(WhepRefusal::NoOpusToSend),
+        // Refused whatever the source turns out to be: no retry helps.
         (None, Some(_)) if bundle_tag_rejected => Err(WhepRefusal::VideoIsBundleTag),
+        (None, Some(_)) if sends_opus.is_none() => Err(WhepRefusal::SourceAudioUnknown),
         (None, Some(_)) => Ok(Some(NoH264::AudioOnly)),
     }
 }
@@ -1157,9 +1175,19 @@ async fn whep_server_loop(
         // is one whose answer rejects its BUNDLE tag, which it could not
         // apply.
         let (video_pt, audio_pt) = session.answered_pts(&answer);
-        let sends_opus = config.audio_encode.is_some()
-            || (source.audio_is_opus()
-                && super::webrtc::opus_passthrough::carries(source.opus_channel_config()));
+        // Not known until the source's PMT has been read: a viewer that
+        // comes first — at output start, after a flow restart, while the
+        // source is not flowing — was refused as if the source were not Opus.
+        let sends_opus = if config.audio_encode.is_some() {
+            Some(true)
+        } else if !source.pmt_seen() {
+            None
+        } else {
+            Some(
+                source.audio_is_opus()
+                    && super::webrtc::opus_passthrough::carries(source.opus_channel_config()),
+            )
+        };
         let bundle_tag = rejected_bundle_tag(&msg.offer_sdp, &answer);
         match whep_viewer_outcome(
             video_pt,
@@ -1287,7 +1315,15 @@ async fn whep_viewer_loop(
     use str0m::media::MediaTime;
     use std::time::Instant;
 
+    // However the viewer ends — a DELETE, the setup deadline, ICE giving up,
+    // a DTLS close — its token is cancelled on the way out, which is what
+    // takes its entry out of the session registry (`handle_whep_offer`).
+    // Only a DELETE removed it before: every viewer that left without one
+    // stayed listed until the flow stopped.
+    let _cancel_on_exit = cancel.clone().drop_guard();
+
     // Wait for ICE+DTLS to complete — for `setup_deadline` at most.
+    let answered_at = Instant::now();
     let setup = tokio::time::timeout(setup_deadline, async {
         loop {
             match session.poll_event(&cancel).await {
@@ -1312,13 +1348,50 @@ async fn whep_viewer_loop(
                 flow_id,
             );
         }
-        Ok(false) => {
+        // A DELETE (or the output stopping) during setup.
+        Ok(false) if cancel.is_cancelled() => {
             tracing::info!("WHEP viewer '{}' disconnected during setup", session_id);
             events.emit_flow(
                 EventSeverity::Info,
                 category::WEBRTC,
                 "WHEP viewer disconnected",
                 flow_id,
+            );
+            return;
+        }
+        // The session ended before it connected: a setup that failed as
+        // surely as one the deadline closes. An offer carrying a usable
+        // candidate (an IP host, srflx or relay one — any player with a STUN
+        // or TURN server) gets its pairs made at once, and ICE gives up on
+        // them 15 s after nothing came — before the deadline. That ended
+        // the setup with an Info alone, so a viewer that was answered and
+        // could not connect was never reported.
+        Ok(false) => {
+            let (secs, after) = (setup_deadline.as_secs(), answered_at.elapsed().as_secs());
+            let (reason, why) = if session.ice_down() {
+                ("ice_failed", "ICE failed")
+            } else {
+                ("session_failed", "its session failed")
+            };
+            tracing::warn!(
+                "WHEP viewer '{}' on output '{}' did not connect: {} {} s after its answer; closing it",
+                session_id,
+                output_id,
+                why,
+                after,
+            );
+            events.emit_flow_with_details(
+                EventSeverity::Warning,
+                category::WEBRTC,
+                format!("WHEP viewer did not connect: {why} {after} s after its answer; its session is closed"),
+                flow_id,
+                serde_json::json!({
+                    "error_code": "webrtc_setup_timeout",
+                    "peer": "WHEP viewer",
+                    "reason": reason,
+                    "timeout_secs": secs,
+                    "output_id": output_id,
+                }),
             );
             return;
         }
@@ -1338,6 +1411,7 @@ async fn whep_viewer_loop(
                 serde_json::json!({
                     "error_code": "webrtc_setup_timeout",
                     "peer": "WHEP viewer",
+                    "reason": "deadline",
                     "timeout_secs": secs,
                     "output_id": output_id,
                 }),
@@ -1440,14 +1514,16 @@ async fn whep_viewer_loop(
             }
 
             _ = silence_tick => {
-                emit_webrtc_silence_if_needed(
-                    &mut encoder_state,
-                    &mut session,
-                    audio_mid,
-                    audio_pt,
-                    &stats,
-                    output_id,
-                ).await;
+                if !session.ice_down() {
+                    emit_webrtc_silence_if_needed(
+                        &mut encoder_state,
+                        &mut session,
+                        audio_mid,
+                        audio_pt,
+                        &stats,
+                        output_id,
+                    ).await;
+                }
                 continue;
             }
 
@@ -1460,6 +1536,17 @@ async fn whep_viewer_loop(
 
                         let frames = demuxer.demux(payload);
                         for frame in frames {
+                            // While ICE is down (the viewer has gone quiet;
+                            // the grace is running) nothing is encoded or
+                            // written: str0m would send it all to the last
+                            // nominated address, and a departed viewer was
+                            // sent its full bitrate for the whole grace. The
+                            // demuxer keeps up and the session is still
+                            // driven (below), so a viewer that comes back is
+                            // heard, and sent whole frames.
+                            if session.ice_down() {
+                                break;
+                            }
                             // Opus with an `audio_encode` is re-encoded
                             // through it like any other source.
                             #[cfg(feature = "media-codecs")]
@@ -1795,7 +1882,9 @@ async fn whip_client_loop(
 ) {
     use std::time::Instant;
     use super::ts_parse::strip_rtp_header;
-    use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession, report_negotiation_panic};
+    use super::webrtc::session::{
+        BACKOFF_RESET_AFTER, SessionConfig, SessionEvent, WebrtcSession, report_negotiation_panic,
+    };
     use super::webrtc::ts_demux::TsDemuxer;
     use str0m::media::MediaTime;
 
@@ -1985,10 +2074,13 @@ async fn whip_client_loop(
                 _ => continue,
             }
         }
-        // Connected: the next failure backs off from the start again. (Reset
-        // here, not when signaling succeeded, so a handshake that keeps
-        // failing backs off as a POST that keeps failing does.)
-        backoff_secs = 1;
+        // Connected. The backoff starts over only if this session lasts
+        // (`BACKOFF_RESET_AFTER`, judged when it ends). It was reset here, so
+        // an endpoint that accepts each publish and closes it was published
+        // to about once a second for good. (Never when signaling succeeds: a
+        // handshake that keeps failing backs off as a POST that keeps
+        // failing does.)
+        let connected_at = Instant::now();
 
         // str0m may emit MediaAdded *after* Connected. Flush those queued
         // events (the tracks are this end's own offer's, read above).
@@ -2048,6 +2140,9 @@ async fn whip_client_loop(
 
         loop {
             if session.is_disconnected() {
+                if connected_at.elapsed() >= BACKOFF_RESET_AFTER {
+                    backoff_secs = 1;
+                }
                 tracing::warn!(
                     "WHIP client '{}' disconnected during send; publishing again in {} s",
                     config.id,
@@ -2059,7 +2154,8 @@ async fn whip_client_loop(
                     "WHIP client disconnected",
                     flow_id,
                 );
-                // A floor under the republish: an endpoint that closes each
+                // A floor under the republish, doubling from one session to
+                // the next unless one lasted: an endpoint that closes each
                 // session as it opens would otherwise be published to in a
                 // tight loop.
                 if !whip_leave_and_back_off(None, &config, &tls, backoff_secs, &cancel).await {
@@ -2082,14 +2178,16 @@ async fn whip_client_loop(
                 }
 
                 _ = silence_tick => {
-                    emit_webrtc_silence_if_needed(
-                        &mut encoder_state,
-                        &mut session,
-                        audio_mid,
-                        audio_pt,
-                        &stats,
-                        &config.id,
-                    ).await;
+                    if !session.ice_down() {
+                        emit_webrtc_silence_if_needed(
+                            &mut encoder_state,
+                            &mut session,
+                            audio_mid,
+                            audio_pt,
+                            &stats,
+                            &config.id,
+                        ).await;
+                    }
                     continue;
                 }
 
@@ -2102,6 +2200,15 @@ async fn whip_client_loop(
 
                             let frames = demuxer.demux(payload);
                             for frame in frames {
+                                // Nothing is encoded or written while ICE is
+                                // down, as on the WHEP viewer loop. This
+                                // full-ICE session ends at that report (at
+                                // the top of the loop); what is left of the
+                                // batch does not go to the dead address
+                                // first.
+                                if session.ice_down() {
+                                    break;
+                                }
                                 // Opus with an `audio_encode` is re-encoded
                                 // through it like any other source.
                                 #[cfg(feature = "media-codecs")]
@@ -3423,6 +3530,24 @@ mod whep_server_tests {
         CancellationToken,
         JoinHandle<()>,
     ) {
+        let (broadcast_tx, session_tx, raised, cancel, task, _stats) =
+            whep_output_with_stats(extra, setup_deadline);
+        (broadcast_tx, session_tx, raised, cancel, task)
+    }
+
+    /// [`whep_output_with`], and the output's stats.
+    #[allow(clippy::type_complexity)]
+    fn whep_output_with_stats(
+        extra: serde_json::Value,
+        setup_deadline: std::time::Duration,
+    ) -> (
+        broadcast::Sender<RtpPacket>,
+        tokio::sync::mpsc::Sender<NewSessionMsg>,
+        tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        CancellationToken,
+        JoinHandle<()>,
+        Arc<OutputStatsAccumulator>,
+    ) {
         let mut config = serde_json::json!({
             "id": "whep-out",
             "name": "WHEP",
@@ -3437,7 +3562,7 @@ mod whep_server_tests {
         let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
         let (events, raised) = crate::manager::events::event_channel();
         let task = tokio::spawn({
-            let (broadcast_tx, cancel) = (broadcast_tx.clone(), cancel.clone());
+            let (broadcast_tx, cancel, stats) = (broadcast_tx.clone(), cancel.clone(), stats.clone());
             async move {
                 whep_server_loop(
                     config,
@@ -3454,16 +3579,28 @@ mod whep_server_tests {
                 .await;
             }
         });
-        (broadcast_tx, session_tx, raised, cancel, task)
+        (broadcast_tx, session_tx, raised, cancel, task, stats)
     }
 
     /// An Opus-in-TS source: a 1 kHz tone, fed into `tx` until `stop`.
     fn feed_opus(tx: broadcast::Sender<RtpPacket>, stop: CancellationToken) -> JoinHandle<()> {
         const OPUS_TS: &[u8] = include_bytes!("testdata/sine1k_opus_48k_stereo.ts");
+        feed_ts(tx, stop, OPUS_TS.to_vec())
+    }
+
+    /// A source whose audio is AAC (H.264 + AAC-LC in its PMT), fed into `tx`
+    /// until `stop`.
+    fn feed_aac(tx: broadcast::Sender<RtpPacket>, stop: CancellationToken) -> JoinHandle<()> {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        feed_ts(tx, stop, crate::engine::ts_test_fixtures::aac_program_ts(ADTS))
+    }
+
+    /// `ts`, fed into `tx` over and over until `stop`.
+    fn feed_ts(tx: broadcast::Sender<RtpPacket>, stop: CancellationToken, ts: Vec<u8>) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut seq = 0u16;
             while !stop.is_cancelled() {
-                for chunk in OPUS_TS.chunks(7 * 188) {
+                for chunk in ts.chunks(7 * 188) {
                     let _ = tx.send(RtpPacket {
                         data: bytes::Bytes::copy_from_slice(chunk),
                         sequence_number: seq,
@@ -3653,10 +3790,13 @@ mod whep_server_tests {
     ///
     /// * no H.264 and no Opus, or only Opus to a `video_only` output;
     /// * no H.264 but Opus, to an output with no Opus to send — no
-    ///   `audio_encode`, and a source not known to be Opus (none here);
+    ///   `audio_encode`, and a source whose audio is AAC;
     /// * no H.264 but Opus, the video m-line first: rejecting it rejects the
     ///   offer's BUNDLE tag, and Chrome cannot apply the answer ("Failed to
     ///   setup RTCP mux") — whether the output has Opus to send or not.
+    ///
+    /// A viewer refused because the source's audio is not known yet is
+    /// `a_viewer_before_the_sources_pmt_is_told_to_retry`.
     #[tokio::test]
     async fn a_viewer_with_nothing_to_be_sent_is_refused() {
         use super::super::webrtc::session::offer_was_at_fault;
@@ -3665,48 +3805,57 @@ mod whep_server_tests {
             Vp8(&'static [MediaKind]),
             Chrome(&'static str),
         }
+        enum Source {
+            None,
+            Opus,
+            Aac,
+        }
         let opus_encode = serde_json::json!({ "audio_encode": { "codec": "opus" } });
         let cases = [
             (
                 serde_json::json!({}),
-                false,
+                Source::None,
                 Offer::Vp8(&[Video]),
                 "nothing_to_send",
                 "and no Opus audio this output sends",
             ),
             (
                 serde_json::json!({ "video_only": true }),
-                false,
+                Source::None,
                 Offer::Vp8(&[Audio, Video]),
                 "nothing_to_send",
                 "and no Opus audio",
             ),
             (
                 serde_json::json!({}),
-                false,
+                Source::Aac,
                 Offer::Vp8(&[Audio, Video]),
                 "no_opus_to_send",
                 "without an audio_encode",
             ),
             (
                 serde_json::json!({}),
-                true,
+                Source::Opus,
                 Offer::Chrome(CHROME_VP8_VIDEO_FIRST),
                 "video_is_bundle_tag",
                 "BUNDLE tag",
             ),
             (
                 opus_encode,
-                false,
+                Source::None,
                 Offer::Chrome(CHROME_VP8_VIDEO_FIRST),
                 "video_is_bundle_tag",
                 "put the audio m-line first",
             ),
         ];
-        for (n, (extra, opus_source, offer, code, reason)) in cases.into_iter().enumerate() {
+        for (n, (extra, source, offer, code, reason)) in cases.into_iter().enumerate() {
             let (broadcast_tx, session_tx, mut raised, cancel, task) =
                 whep_output_with(extra, WHEP_SETUP_DEADLINE);
-            let feed = opus_source.then(|| feed_opus(broadcast_tx.clone(), cancel.child_token()));
+            let feed = match source {
+                Source::None => None,
+                Source::Opus => Some(feed_opus(broadcast_tx.clone(), cancel.child_token())),
+                Source::Aac => Some(feed_aac(broadcast_tx.clone(), cancel.child_token())),
+            };
             if feed.is_some() {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
@@ -3779,6 +3928,42 @@ mod whep_server_tests {
         }
     }
 
+    /// A viewer without H.264 that comes before the output has read its
+    /// source's PMT — at output start, after a flow restart, while the
+    /// source is not flowing — is refused for now (`source_audio_unknown`)
+    /// and told to retry, not that the source's audio is not Opus; the same
+    /// offer is admitted once the PMT says Opus. It used to be refused
+    /// `no_opus_to_send`, its Warning saying the source's audio was not Opus.
+    #[tokio::test]
+    async fn a_viewer_before_the_sources_pmt_is_told_to_retry() {
+        use super::super::webrtc::session::offer_was_at_fault;
+        let (broadcast_tx, session_tx, mut raised, cancel, task) = whep_output(false);
+
+        let err = offer_to(&session_tx, CHROME_VP8_AUDIO_FIRST.to_string())
+            .await
+            .expect_err("no PMT read yet");
+        assert!(offer_was_at_fault(&err), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("not yet read its source's audio") && text.contains("retry"), "{text}");
+        let warned = no_h264_warnings(&mut raised);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0]["outcome"], "refused");
+        assert_eq!(warned[0]["reason"], "source_audio_unknown");
+
+        // The source starts: the same viewer, a moment later, is sent its
+        // audio.
+        let _feed = feed_opus(broadcast_tx.clone(), cancel.child_token());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        offer_to(&session_tx, CHROME_VP8_AUDIO_FIRST.to_string())
+            .await
+            .expect("admitted once the PMT says Opus");
+        let warned = no_h264_warnings(&mut raised);
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert_eq!(warned[0]["outcome"], "audio_only");
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
     /// A viewer whose offer is answered and which then never connects holds
     /// its session only until the setup deadline, with a Warning. It used to
     /// hold its task and UDP socket until the flow stopped.
@@ -3831,10 +4016,177 @@ mod whep_server_tests {
         assert_eq!(ev.flow_id.as_deref(), Some("flow-w"));
         let d = ev.details.unwrap();
         assert_eq!(d["peer"], "WHEP viewer");
+        assert_eq!(d["reason"], "deadline");
         assert_eq!(d["timeout_secs"], 1);
         assert_eq!(d["output_id"], "whep-out");
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    /// A viewer whose offer carries a candidate the output can pair with (an
+    /// IP host candidate here; a srflx or relay one from any player with a
+    /// STUN or TURN server) and that then never answers a check fails its
+    /// setup when ICE gives up on it, 15 s after its answer — before the
+    /// deadline — and that is reported as the failed setup it is: a Warning
+    /// `webrtc_setup_timeout`, reason `ice_failed`. It used to end with an
+    /// Info "WHEP viewer disconnected" alone; only an offer with no usable
+    /// candidate (mDNS only) reached the deadline and its Warning.
+    #[tokio::test]
+    async fn a_viewer_whose_ice_fails_during_setup_is_reported() {
+        let deadline = std::time::Duration::from_secs(25);
+        let (_broadcast_tx, session_tx, mut raised, cancel, task) =
+            whep_output_with(serde_json::json!({}), deadline);
+        // A viewer on loopback that offers its host candidate, then is never
+        // driven: not one check reaches the output.
+        let mut silent = viewer().await;
+        let (offer, _pending) = silent.create_offer(true, true, false).unwrap();
+        assert!(offer.contains(" 127.0.0.1 "), "{offer}");
+        offer_to(&session_tx, offer).await.expect("answered");
+        let started = std::time::Instant::now();
+
+        let ev = tokio::time::timeout(deadline, async {
+            loop {
+                let ev = raised.recv().await.unwrap();
+                assert_ne!(ev.message, "WHEP viewer disconnected", "an Info alone");
+                if ev
+                    .details
+                    .as_ref()
+                    .is_some_and(|d| d["error_code"] == "webrtc_setup_timeout")
+                {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("no webrtc_setup_timeout before the deadline");
+        assert!(started.elapsed() < deadline, "the deadline, not ICE, ended it");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert!(ev.message.starts_with("WHEP viewer did not connect: ICE failed "), "{}", ev.message);
+        let d = ev.details.unwrap();
+        assert_eq!(d["peer"], "WHEP viewer");
+        assert_eq!(d["reason"], "ice_failed");
+        assert_eq!(d["timeout_secs"], 25);
+        assert_eq!(d["output_id"], "whep-out");
+        drop(silent);
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    /// However a viewer ends — the setup deadline, its DTLS close, a DELETE
+    /// — its entry leaves the session registry. Only a DELETE removed one
+    /// before, and departed viewers are the ones that send none: each held
+    /// its entry (and a child token) until the flow stopped.
+    #[tokio::test]
+    async fn a_viewer_that_ends_leaves_the_session_registry() {
+        use crate::api::webrtc::registry::WebrtcSessionRegistry;
+        let (broadcast_tx, session_tx, _raised, cancel, task) =
+            whep_output_with(serde_json::json!({}), std::time::Duration::from_secs(1));
+        let _feed = feed_opus(broadcast_tx.clone(), cancel.child_token());
+        let registry = WebrtcSessionRegistry::new();
+        registry.register_whep_output("flow-w", session_tx, None);
+        /// The flow's sessions are all gone within 5 s.
+        async fn emptied(registry: &WebrtcSessionRegistry) -> bool {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while registry.session_count("flow-w") > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .is_ok()
+        }
+
+        // A viewer that never connects: closed at the 1 s deadline.
+        registry
+            .handle_whep_offer("flow-w", CHROME_WHEP_OFFER)
+            .await
+            .expect("answered");
+        assert_eq!(registry.session_count("flow-w"), 1);
+        assert!(emptied(&registry).await, "the timed-out viewer is still listed");
+
+        // A viewer that connects, then closes its session.
+        let mut closing = viewer().await;
+        let (offer, pending) = closing.create_offer(true, true, false).unwrap();
+        let (answer, _session_id) = registry
+            .handle_whep_offer("flow-w", &offer)
+            .await
+            .expect("admitted");
+        closing.apply_answer(&answer, pending).unwrap();
+        let viewer_cancel = CancellationToken::new();
+        let connected = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !matches!(
+                closing.poll_event(&viewer_cancel).await,
+                super::super::webrtc::session::SessionEvent::Connected
+            ) {}
+        })
+        .await;
+        assert!(connected.is_ok(), "the viewer never connected");
+        assert_eq!(registry.session_count("flow-w"), 1);
+        closing.close().await;
+        assert!(emptied(&registry).await, "the closed viewer is still listed");
+
+        // A DELETE still ends one, and removes it.
+        let (_answer, session_id) = registry
+            .handle_whep_offer("flow-w", CHROME_WHEP_OFFER)
+            .await
+            .expect("answered");
+        registry.remove_session("flow-w", &session_id);
+        assert_eq!(registry.session_count("flow-w"), 0);
+
+        assert!(!task.is_finished());
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    /// While ICE is down — a viewer gone quiet, the grace running — nothing
+    /// is written to it: str0m keeps the last nominated address, and a
+    /// departed viewer was sent its full bitrate (2.3 Mbit/s, measured) for
+    /// the whole grace. Media flows while the viewer is heard from, and stops
+    /// once ICE has given up on it (15 s after its last check) — while the
+    /// session is still held for the grace, not only when it ends.
+    #[tokio::test]
+    async fn a_viewer_whose_ice_is_down_is_sent_nothing() {
+        use std::time::{Duration, Instant};
+        let (broadcast_tx, session_tx, mut raised, cancel, task, stats) =
+            whep_output_with_stats(serde_json::json!({}), WHEP_SETUP_DEADLINE);
+        let _feed = feed_opus(broadcast_tx.clone(), cancel.child_token());
+        let mut viewer = viewer().await;
+        join_and_listen(&session_tx, &mut viewer).await;
+        let sent = || stats.packets_sent.load(Ordering::Relaxed);
+
+        // The viewer stops being driven: no more checks, nothing read. Wait
+        // for the output to stop sending: 3 s without one packet.
+        let paused_at = Instant::now();
+        let (mut last, mut changed_at, mut grew) = (sent(), paused_at, false);
+        while changed_at.elapsed() < Duration::from_secs(3) {
+            assert!(
+                paused_at.elapsed() < Duration::from_secs(45),
+                "the output never stopped sending to the departed viewer"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if sent() != last {
+                (last, changed_at, grew) = (sent(), Instant::now(), true);
+            }
+        }
+        assert!(grew, "nothing was sent while ICE was up");
+        assert!(
+            changed_at - paused_at >= Duration::from_secs(5),
+            "stopped {:?} after the pause, before ICE could have given up",
+            changed_at - paused_at
+        );
+        // It stopped because ICE is down, while the grace runs: the viewer
+        // has not been let go. (It used to stop only then, at about 30 s.)
+        let mut gone = false;
+        while let Ok(ev) = raised.try_recv() {
+            gone |= ev.message == "WHEP viewer disconnected";
+        }
+        assert!(
+            !gone,
+            "sent to until it was let go, {:?} after the pause",
+            changed_at - paused_at
+        );
+        drop(viewer);
+        assert!(!task.is_finished());
+        cancel.cancel();
     }
 
     /// A viewer that leaves without a DELETE — its peer simply gone, as when
@@ -4275,5 +4627,43 @@ mod whip_client_tests {
             established >= 1 && lost >= 1,
             "{established} established, {lost} lost"
         );
+    }
+
+    /// An endpoint that accepts each publish and closes it as it connects is
+    /// published to again after a backoff that doubles, as for any other
+    /// failed attempt: the backoff starts over only after a session that
+    /// lasted (`BACKOFF_RESET_AFTER`). It was reset on every connect, so such
+    /// an endpoint was published to about once a second for good, two Info
+    /// events each time.
+    #[tokio::test]
+    async fn an_endpoint_that_closes_each_session_is_backed_off_from() {
+        let (addr, posts, _deleted, server) = webrtc_endpoint(Endpoint::ClosesOnConnect).await;
+        let (_source, cancel, mut raised, task) = whip_output(addr);
+
+        // When each publish was made.
+        let start = tokio::time::Instant::now();
+        let mut at = Vec::new();
+        while at.len() < 4 && start.elapsed() < std::time::Duration::from_secs(20) {
+            let n = posts.load(Ordering::SeqCst);
+            while at.len() < n {
+                at.push(start.elapsed());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+        server.abort();
+
+        assert_eq!(at.len(), 4, "published at {at:?} in 20 s");
+        let gaps: Vec<_> = at.windows(2).map(|w| w[1] - w[0]).collect();
+        // Waits of 1, 2 and 4 s (each plus the connect and the close's
+        // noticing); a backoff reset on connect waited 1 s every time.
+        assert!(gaps[1] >= std::time::Duration::from_millis(1_900), "gaps {gaps:?}");
+        assert!(gaps[2] >= std::time::Duration::from_millis(3_900), "gaps {gaps:?}");
+        let mut lost = 0;
+        while let Ok(ev) = raised.try_recv() {
+            lost += usize::from(ev.message == "WHIP client disconnected");
+        }
+        assert!(lost >= 3, "{lost} sessions lost: not the connected path");
     }
 }

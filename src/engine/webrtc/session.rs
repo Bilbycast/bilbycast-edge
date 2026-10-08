@@ -105,19 +105,38 @@ fn rtc_config(ice_lite: bool) -> RtcConfig {
     config
 }
 
-/// How long ICE may stay `Disconnected` before [`WebrtcSession::is_disconnected`]
-/// counts the session over.
+/// How long ICE may stay `Disconnected` on an ICE-Lite session before
+/// [`WebrtcSession::is_disconnected`] counts it over.
 ///
 /// str0m's ICE-Lite agent (the WHEP output's role) reports `Disconnected`
 /// 15 s after the peer's last STUN check (`is`'s `RECENT_BINDING_REQUEST`),
 /// and recovers on the peer's next nominating check: it re-creates the pair
-/// and goes back to `Completed`. A viewer whose checks pause for that long —
-/// a Wi-Fi or cellular hiccup, a suspended laptop, a backgrounded mobile tab —
-/// is still there, and a browser allows itself 30 s of lost consent (RFC 7675)
-/// before giving up. So a departed peer is let go 15 s + this grace after its
-/// last check — the browser's 30 s — and a returning one is kept. The grace
-/// costs no bandwidth: with no nominated pair, str0m has nowhere to send.
+/// and goes back to `Completed`. So a departed peer is let go 15 s + this
+/// grace after its last check (about 30 s), and one whose checks resume
+/// within it is kept: a viewer whose browser was suspended or backgrounded
+/// (measured up to 20 s), or whose network came back before the browser gave
+/// up. Chrome fails a connection about 15 s into unanswered checks and never
+/// recovers it (the WHEP flows do no ICE restart), so a longer network loss
+/// is not survived either way.
+///
+/// The grace is not free on its own: str0m keeps the last nominated address
+/// and goes on sending to it whatever the ICE state. The send loops therefore
+/// write nothing while ICE is down ([`WebrtcSession::ice_down`]), so a
+/// departed viewer costs no bandwidth past ICE's 15 s.
+///
+/// A full-ICE session (the WHIP output) gets no grace: its agent reports
+/// `Disconnected` only once its consent retransmits run out, about 24 s after
+/// the last answered check, by when an ICE-Lite endpoint (the relay, an
+/// edge's WHIP input) has pruned the pair and will never send the checks that
+/// would make a new one. There is nothing left to wait for.
 pub const ICE_DISCONNECT_GRACE: Duration = Duration::from_secs(15);
+
+/// How long a client mode's session (the WHIP output's, the WHEP input's)
+/// must stay connected before its reconnect backoff starts over from 1 s.
+/// One that ends sooner — an endpoint that accepts each session and then
+/// closes it — keeps doubling to 30 s like any other failure, rather than
+/// being reconnected to about once a second for good.
+pub const BACKOFF_RESET_AFTER: Duration = Duration::from_secs(10);
 
 /// A panic str0m raised while negotiating with one peer, caught so that it
 /// fails that peer alone (see [`isolate_negotiation`]).
@@ -306,6 +325,9 @@ pub struct WebrtcSession {
     /// state an ICE-Lite agent leaves on the peer's next nomination, so it is
     /// given [`ICE_DISCONNECT_GRACE`] rather than latched.
     ice_disconnected_since: Option<Instant>,
+    /// This end is an ICE-Lite agent (`SessionConfig::ice_lite`): only such
+    /// a session is given [`ICE_DISCONNECT_GRACE`].
+    ice_lite: bool,
     buf: Vec<u8>,
 }
 
@@ -373,6 +395,7 @@ impl WebrtcSession {
             audio_mid: None,
             disconnected: false,
             ice_disconnected_since: None,
+            ice_lite: config.ice_lite,
             buf: vec![0u8; 2048],
         })
     }
@@ -571,6 +594,12 @@ impl WebrtcSession {
         (video, audio)
     }
 
+    /// The kind of the m-line `mid` names — one of an offer this session
+    /// answered, say — read before any I/O, as [`Self::answered_pts`] reads.
+    pub fn media_kind(&self, mid: &str) -> Option<MediaKind> {
+        self.rtc.media(Mid::from(mid)).map(|m| m.kind())
+    }
+
     /// Drain all pending str0m events without blocking, populating
     /// `self.video_mid` / `self.audio_mid` from any queued
     /// `MediaAdded` events.
@@ -617,18 +646,29 @@ impl WebrtcSession {
     /// event goes through [`Self::handle_event`], which keeps what this
     /// needs, so nothing is lost however it was drained.
     ///
-    /// ICE `Disconnected` alone is not the end. An ICE-Lite agent recovers
-    /// from it on the peer's next nominating check, so a viewer whose checks
-    /// paused for 15 s (`is` prunes the pair then) is kept if it comes back
-    /// within the grace. [`Self::poll_event`] still returns `Disconnected`
-    /// for it at once, as it always has: its callers (the WHIP and WHEP
-    /// inputs, the setup waits) end there, unchanged.
+    /// ICE `Disconnected` alone is not the end of an ICE-Lite session. Its
+    /// agent recovers on the peer's next nominating check, so a viewer whose
+    /// checks paused for 15 s (`is` prunes the pair then) is kept if it comes
+    /// back within the grace. A full-ICE session (the WHIP output) ends at
+    /// its first `Disconnected` (see [`ICE_DISCONNECT_GRACE`]).
+    /// [`Self::poll_event`] returns `Disconnected` at once either way, as it
+    /// always has: its callers (the WHIP and WHEP inputs, the setup waits)
+    /// end there.
     pub fn is_disconnected(&self) -> bool {
         self.disconnected
             || !self.rtc.is_alive()
             || self
                 .ice_disconnected_since
                 .is_some_and(|since| since.elapsed() >= ICE_DISCONNECT_GRACE)
+    }
+
+    /// ICE is `Disconnected` and has not recovered — the peer has gone
+    /// quiet, and an ICE-Lite session's grace is running. A send loop writes
+    /// nothing meanwhile (str0m would send it to the last nominated address
+    /// all the same) and keeps driving the session, so a peer that comes
+    /// back is heard and sent the stream again.
+    pub fn ice_down(&self) -> bool {
+        self.ice_disconnected_since.is_some()
     }
 
     /// Latch a str0m error: the session is over (see [`Self::is_disconnected`]).
@@ -844,10 +884,14 @@ impl WebrtcSession {
                 match state {
                     IceConnectionState::Disconnected => {
                         // Kept here, the one place every drain goes through,
-                        // and timed rather than latched: an ICE-Lite agent
-                        // recovers on the peer's next nomination (see
-                        // `is_disconnected`).
+                        // and timed rather than latched on an ICE-Lite
+                        // session: its agent recovers on the peer's next
+                        // nomination (see `is_disconnected`). A full agent's
+                        // Disconnected is the end (`ICE_DISCONNECT_GRACE`).
                         self.ice_disconnected_since.get_or_insert_with(Instant::now);
+                        if !self.ice_lite {
+                            self.disconnected = true;
+                        }
                         Some(SessionEvent::Disconnected)
                     }
                     _ => {
@@ -2239,6 +2283,32 @@ mod liveness_tests {
         let mut s = session(true).await;
         s.rtc.disconnect();
         assert!(s.is_disconnected(), "a closed Rtc is over");
+    }
+
+    /// A full-ICE session (the WHIP output's) gets no grace: its agent
+    /// reports `Disconnected` only once its consent retransmits have run out,
+    /// by when an ICE-Lite endpoint has pruned the pair for good, so its
+    /// first `Disconnected` is the end — even if ICE later reports another
+    /// state. It used to be given the ICE-Lite grace too: 15 s more of
+    /// outage, the stream sent to a dead address throughout. Either kind is
+    /// `ice_down` from the report until it recovers.
+    #[tokio::test]
+    async fn a_full_ice_session_ends_at_its_first_disconnected() {
+        let ice = |state| Event::IceConnectionStateChange(state);
+        let mut full = session(false).await;
+        let mut lite = session(true).await;
+        for s in [&mut full, &mut lite] {
+            assert!(!s.ice_down());
+            let _ = s.handle_event(ice(IceConnectionState::Disconnected));
+            assert!(s.ice_down());
+        }
+        assert!(full.is_disconnected(), "a full agent's Disconnected is the end");
+        assert!(!lite.is_disconnected(), "an ICE-Lite one has its grace");
+
+        let _ = full.handle_event(ice(IceConnectionState::Checking));
+        assert!(full.is_disconnected(), "latched");
+        let _ = lite.handle_event(ice(IceConnectionState::Completed));
+        assert!(!lite.ice_down() && !lite.is_disconnected(), "recovered");
     }
 
     /// A viewer — `recvonly` H.264 + Opus, full ICE, as a browser is —
