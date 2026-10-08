@@ -1816,6 +1816,12 @@ impl ScaledVideoEncoder {
             .and_then(|e| e.extradata().map(|slice| slice.to_vec()))
     }
 
+    /// The backend the encoder opened on; `None` until the first
+    /// [`Self::encode`] opens it.
+    pub fn opened_codec(&self) -> Option<VideoEncoderCodec> {
+        self.encoder.as_ref().map(|e| e.codec())
+    }
+
     /// Force the encoder to mark the next frame as an IDR. No-op until
     /// the encoder has been opened by the first [`Self::encode`] call.
     pub fn force_next_keyframe(&mut self) {

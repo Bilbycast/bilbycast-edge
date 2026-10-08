@@ -342,18 +342,27 @@ fn open_webrtc_video_active(
 
 /// Answer a peer's keyframe request (PLI / FIR) — a viewer that lost
 /// packets, or one back from an outage, whose decoder waits for an IDR —
-/// by making the encoder's next frame one. `false` when this end does not
-/// encode the video (no `video_encode`, or not open yet): passed-through
-/// H.264 waits for the source's next IDR, there being nothing to make one
-/// from. The request used to be ignored either way.
+/// by making the encoder's next frame one, where the backend can.
+///
+/// libx264 and VAAPI code a forced picture as an IDR. NVENC and QSV code a
+/// non-IDR intra picture (the wrapper sets neither encoder's `forced-idr`),
+/// which a browser does not take as a keyframe, and RKMPP ignores the
+/// request — so on those, forcing would cost a full intra picture per PLI
+/// and end no wait; they are left to their next natural IDR, as before.
+/// `false` when nothing here can make one: passed-through H.264 waits for
+/// the source's next IDR. An encoder not open yet starts on an IDR anyway.
 #[cfg(feature = "webrtc")]
 fn force_video_keyframe(video_state: &mut WebrtcVideoEncoderState) -> bool {
     match video_state {
         #[cfg(feature = "media-codecs")]
-        WebrtcVideoEncoderState::Active(active) => {
-            active.pipeline.force_next_keyframe();
-            true
-        }
+        WebrtcVideoEncoderState::Active(active) => match active.pipeline.opened_codec() {
+            Some(video_codec::VideoEncoderCodec::X264 | video_codec::VideoEncoderCodec::H264Vaapi) => {
+                active.pipeline.force_next_keyframe();
+                true
+            }
+            None => true,
+            Some(_) => false,
+        },
         _ => false,
     }
 }
@@ -2215,7 +2224,7 @@ async fn whip_client_loop(
                 _ = idle.tick() => {
                     session.drive_udp_io().await;
                     if session.take_keyframe_request() && !force_video_keyframe(&mut video_encoder_state) {
-                        tracing::debug!("WHIP client '{}': received PLI/FIR (ignored, passthrough mode)", config.id);
+                        tracing::debug!("WHIP client '{}': received PLI/FIR (ignored: no encoder here can make an IDR)", config.id);
                     }
                 }
 
@@ -2510,7 +2519,7 @@ async fn whip_client_loop(
                             // is checked at the top of the loop.
                             session.drive_udp_io().await;
                             if session.take_keyframe_request() && !force_video_keyframe(&mut video_encoder_state) {
-                                tracing::debug!("WHIP client '{}': received PLI/FIR (ignored, passthrough mode)", config.id);
+                                tracing::debug!("WHIP client '{}': received PLI/FIR (ignored: no encoder here can make an IDR)", config.id);
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
