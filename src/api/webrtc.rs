@@ -421,7 +421,23 @@ mod tests {
             let text = body(resp).await;
             assert!(text.starts_with("WHEP offer refused: ") && text.contains(reason), "{text}");
             assert!(text.len() <= 257, "{} bytes", text.len());
+            // str0m's parse error names a heap address of this process
+            // (`PointerOffset(0x…)`) and spans several lines of parser
+            // internals: it stays in the log, and the body says what it is.
+            assert!(
+                !text.contains("0x") && !text.contains("PointerOffset"),
+                "{text}"
+            );
+            assert_eq!(text.lines().count(), 1, "{text}");
         }
+        let err = registry
+            .handle_whep_offer("flow-a", "v=0\r\nbogus\r\n")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            body(offer_failed("WHEP", "flow-a", &err)).await,
+            "WHEP offer refused: SDP parse error: the offer is not valid SDP\n"
+        );
         assert!(registry.handle_whep_offer("flow-a", CHROME_WHEP_OFFER).await.is_ok());
 
         // Not the offer's fault: no WHEP output on this flow.

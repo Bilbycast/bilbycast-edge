@@ -31,7 +31,10 @@ use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 #[cfg(feature = "webrtc")]
 use super::packet::RtpPacket;
 #[cfg(feature = "webrtc")]
-use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession, report_negotiation_panic};
+use super::webrtc::session::{
+    OfferRefused, SessionConfig, SessionEvent, WebrtcSession, rejected_bundle_tag,
+    report_negotiation_panic,
+};
 
 /// Spawn a WHIP server input task.
 ///
@@ -187,6 +190,31 @@ async fn whip_input_loop(
         // video) still reaches `video_mid` / `audio_mid` as a track, but
         // nothing is published on it: the layout must not count it.
         let (video_pt, audio_pt) = session.answered_pts(&answer);
+        // An offer this input cannot serve is refused now, 400, rather than
+        // answered 201 and then waited on for the setup deadline while every
+        // other publisher's POST queues behind it: one carrying nothing it
+        // takes, or one whose BUNDLE tag the answer rejects — no browser
+        // applies that answer (RFC 8843 §7.3.3), and browsers put video
+        // first, so a VP8-only publisher with Opus hit it.
+        let refusal = if video_pt.is_none() && audio_pt.is_none() {
+            Some(
+                "it offers no H.264 video and no Opus audio, the only media this input takes"
+                    .to_string(),
+            )
+        } else {
+            rejected_bundle_tag(&msg.offer_sdp, &answer).map(|mid| {
+                format!(
+                    "its BUNDLE tag (mid {mid}) offers nothing this input takes (H.264 video, Opus audio), \
+                     and an answer may not reject the tag (RFC 8843 section 7.3.3): offer H.264, or put \
+                     the audio m-line first"
+                )
+            })
+        };
+        if let Some(reason) = refusal {
+            tracing::warn!("WHIP publisher on flow '{}' refused: {}", flow_id, reason);
+            let _ = msg.reply.send(Err(OfferRefused(reason).into()));
+            continue;
+        }
         let tracks = |session: &WebrtcSession| {
             (
                 session.video_mid.is_some() && video_pt.is_some(),
@@ -891,13 +919,14 @@ mod tests {
     }
 
     /// A publisher whose video the answer refused — it offered VP8 alone, with
-    /// Opus — publishes its audio, laid out as the audio-only publish it is:
-    /// the PMT lists the Opus alone, as PCR_PID, and the Opus carries the
-    /// PCR. The refused video m-line still reaches the session as a track
-    /// (`MediaAdded`), so the layout took it for video: PCR_PID named a PID
-    /// nothing was sent on and no packet carried a PCR. (Its answer was not
-    /// SDP until 2026-10 — the refused m-line had no format — so no such
-    /// publisher got this far.)
+    /// Opus, its audio m-line first — publishes its audio, laid out as the
+    /// audio-only publish it is: the PMT lists the Opus alone, as PCR_PID,
+    /// and the Opus carries the PCR. The refused video m-line still reaches
+    /// the session as a track (`MediaAdded`), so the layout took it for
+    /// video: PCR_PID named a PID nothing was sent on and no packet carried a
+    /// PCR. (Its answer was not SDP until 2026-10 — the refused m-line had no
+    /// format — so no such publisher got this far. With its video first it is
+    /// refused: see `an_offer_the_input_cannot_serve_is_refused_at_once`.)
     #[cfg(feature = "webrtc")]
     #[tokio::test]
     async fn a_publish_whose_video_was_refused_is_laid_out_audio_only() {
@@ -928,11 +957,13 @@ mod tests {
             }
         });
 
-        // A publisher offering VP8 video and Opus audio.
+        // A publisher offering Opus audio, then VP8 video.
         let vp8 = str0m::Rtc::builder().clear_codecs().enable_vp8(true).enable_opus(true, false);
         let peer = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: false };
         let mut publisher = WebrtcSession::with_rtc_config(&peer, vp8).await.unwrap();
-        let (offer, pending) = publisher.create_offer(true, true, true).unwrap();
+        let (offer, pending) = publisher
+            .offer_media(&[str0m::media::MediaKind::Audio, str0m::media::MediaKind::Video], true)
+            .unwrap();
         let (reply, answer) = tokio::sync::oneshot::channel();
         session_tx.send(NewSessionMsg { offer_sdp: offer, reply }).await.unwrap();
         let (answer, _session, _cancel) = answer.await.unwrap().unwrap();
@@ -1108,6 +1139,96 @@ mod tests {
         assert_eq!(timeouts.len(), 1, "{timeouts:?}");
         assert_eq!(timeouts[0]["peer"], "WHIP publisher");
         assert_eq!(timeouts[0]["timeout_secs"], 1);
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// An offer the input cannot serve is refused at answer time — an error
+    /// its request is answered 400 on, with the reason — and the next
+    /// publisher is answered at once. Both real Chrome 124 publishes used to
+    /// be answered 201 with something Chrome could not apply, and the input
+    /// was then held for the whole setup deadline:
+    ///
+    /// * VP8 video alone: nothing this input takes (the answer's BUNDLE line
+    ///   was left empty, which Chrome rejects);
+    /// * VP8 video, then Opus: the video m-line is the BUNDLE tag, which an
+    ///   answer may not reject (RFC 8843 §7.3.3) — "Failed to setup RTCP mux".
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn an_offer_the_input_cannot_serve_is_refused_at_once() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::engine::webrtc::session::offer_was_at_fault;
+        use std::time::Duration;
+        const VP8_ONLY: &str = include_str!("webrtc/testdata/chrome124-whip-vp8-only-noaudio.sdp");
+        const VP8_VIDEO_FIRST: &str =
+            include_str!("webrtc/testdata/chrome124-whip-vp8-videofirst.sdp");
+        const CHROME_WHIP_OFFER: &str = include_str!("webrtc/testdata/chrome124-whip-sendonly.sdp");
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, _keep) = tokio::sync::broadcast::channel(16);
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config,
+                    "flow-w",
+                    broadcast_tx,
+                    stats,
+                    cancel,
+                    session_rx,
+                    &events,
+                    &mut transcoder,
+                    &mut post,
+                    Duration::from_secs(30),
+                )
+                .await;
+            }
+        });
+        let offer = |sdp: &str| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            (
+                NewSessionMsg {
+                    offer_sdp: sdp.to_string(),
+                    reply,
+                },
+                answer,
+            )
+        };
+
+        for (sdp, reason) in [
+            (VP8_ONLY, "no H.264 video and no Opus audio"),
+            (VP8_VIDEO_FIRST, "BUNDLE tag (mid 0)"),
+        ] {
+            let (msg, answer) = offer(sdp);
+            session_tx.send(msg).await.unwrap();
+            let err = tokio::time::timeout(Duration::from_secs(5), answer)
+                .await
+                .expect("no reply")
+                .unwrap()
+                .expect_err("this publish cannot be served");
+            assert!(offer_was_at_fault(&err), "{err}");
+            assert!(err.to_string().contains(reason), "{err}");
+        }
+
+        // The next publisher — a real one — is answered at once, not after
+        // the 30 s the refused ones would have held the input for.
+        let (msg, answer) = offer(CHROME_WHIP_OFFER);
+        session_tx.send(msg).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), answer).await;
+        assert!(
+            matches!(answered, Ok(Ok(Ok(_)))),
+            "the next publisher's POST went unanswered"
+        );
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
