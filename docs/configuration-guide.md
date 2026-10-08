@@ -1389,12 +1389,25 @@ Accepts WebRTC contributions from publishers (OBS, browsers) via the WHIP protoc
 }
 ```
 
-Publishers POST an SDP offer to `/api/v1/flows/{flow_id}/whip` and receive an SDP answer. The Bearer token (if configured) must be included in the `Authorization` header. The answer accepts H.264 and Opus only, on the publisher's own payload types, advertising H.264 level 5.1; VP8, VP9, AV1 and the rest are declined, so a browser publishes H.264 — see [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
+Publishers POST an SDP offer to `/api/v1/flows/{flow_id}/whip` and receive an SDP answer. The Bearer token (if configured) must be included in the `Authorization` header. The answer accepts H.264 and Opus only, on the publisher's own payload types, advertising H.264 level 5.1; VP8, VP9, AV1 and the rest are declined, so a browser publishes H.264 — see [supported-protocols.md](supported-protocols.md#webrtc-whipwhep). An offer that does not parse, or that the WebRTC stack cannot negotiate, is answered **400** with a short text reason; a bare 500 means the edge itself failed. So is an offer the input cannot serve: one with no H.264 video and no Opus audio, or one whose BUNDLE tag — the first m-line of its `a=group:BUNDLE`, the video in a browser's order — is the m-line the answer would refuse (VP8-only video beside Opus): RFC 8843 §7.3.3 forbids rejecting it, and Chrome cannot apply such an answer. A browser publishing without H.264 is taken only with its audio m-line first, and is then published audio-only. Until 2026-10 both were answered 201, and held the input for the setup deadline below.
+
+The input takes **one publisher at a time**, and an answered publisher has **15 s** to complete ICE + DTLS. One that does not — its offer answered, then no STUN at all — is dropped with a Warning `webrtc_setup_timeout`, and the next publisher's POST is answered. Until 2026-10 such a publisher held the input for good: every later POST hung unanswered until the flow restarted. (One whose ICE completed before it fell silent was already let go after about as long, when ICE reported it disconnected.)
+
+> **Upgrade order.** An edge whose **WHIP output** publishes into this input
+> must be upgraded first. An edge from before the 2026-10 codec set — any
+> tree before the codec-fix merge `5f71c4c` (main through `8f4bf2c`), and
+> every release up to v0.113.0 — panics on this input's answer and its output
+> stops until the flow restarts; a current WHIP output publishing into an old
+> edge works. The same holds for a relay's WHIP ingest. See
+> [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
 
 The H.264 and Opus are remuxed into an SPTS (program 1) laid out from the
 tracks the offer negotiated: video and Opus, video alone, or **Opus alone** —
 then the PMT lists the Opus alone, names it as PCR_PID, and the Opus carries
-the PCR, 100 ms behind each PES as on an audio-only RTMP publish. The muxer
+the PCR, 100 ms behind each PES as on an audio-only RTMP publish. A track the
+answer refused counts as none: a publisher offering VP8 video and Opus
+publishes an Opus-alone SPTS (since 2026-10; the refused video used to be
+counted, naming as PCR_PID a PID nothing was sent on, with no PCR at all). The muxer
 used to assume video and no audio: the Opus of an A/V publish never reached
 the PMT, and an audio-only publish named an absent video PID as PCR_PID and
 carried no PCR. Each track's RTP timestamps start at a random base of the
@@ -1459,6 +1472,11 @@ Pulls media from an external WHEP server. The edge acts as a WHEP client. The `w
 The insecure default is historical. It differs from the `manager` block
 documented at [Manager Configuration](#manager-configuration), which defaults
 `false` and refuses to start without the env guard.
+
+A pull that fails or ends — signaling, the ICE / DTLS handshake, or a session
+the server closes — is tried again after a backoff: 1 s, doubling to 30 s,
+starting over only after a session that lasted 10 s. Until 2026-10 a
+handshake that failed, or a session that ended, was retried at once.
 
 ### Media Player Input
 
@@ -2580,7 +2598,20 @@ Supports two modes: WHIP client (push to external endpoint) and WHEP server (ser
 }
 ```
 
-Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP answer carrying H.264 (level 5.1 advertised) and Opus only, on the viewer's own payload types; the viewer must offer H.264. A viewer whose negotiation fails gets an HTTP error and the output keeps serving the others — see [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
+Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP answer carrying H.264 (level 5.1 advertised) and Opus only, on the viewer's own payload types. A viewer that offers **no H.264** is settled before the answer goes back. It is admitted and **sent audio only** when it offers Opus, the output has Opus to send it — an `audio_encode`, or an Opus-in-TS source passed through — and its audio m-line leads the offer's BUNDLE group. Otherwise it is refused **400**: no Opus offered, a `video_only` output, no Opus to send (no `audio_encode`, and a source whose audio is not Opus), or its video m-line first. A viewer that comes before the output has read its source's PMT (at output start, after a flow restart, while the source is not flowing), with no `audio_encode`, is refused 400 `source_audio_unknown` and may retry a moment later. Browsers put video first, and that m-line is the offer's BUNDLE tag, which an answer may not reject (RFC 8843 §7.3.3): Chrome cannot apply such an answer. Each case raises a Warning `webrtc_no_h264`, a refusal's cause in `details.reason`. Such a viewer used to get a 201 and then nothing at all. A viewer whose offer does not parse, or that the WebRTC stack cannot negotiate, is answered 400 with a short text reason (a bare 500 means the edge itself failed), and the output keeps serving the others — see [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
+
+An answered viewer that does not complete ICE + DTLS is closed with a Warning `webrtc_setup_timeout` within **15–30 s**: at the 30 s deadline, or sooner when ICE gives up on the candidates its offer carried, 15 s after its answer (`details.reason` `ice_failed`). A viewer that leaves without a `DELETE` is let go when it closes its session (DTLS `close_notify`, which a browser's `pc.close()` sends) — at once — or, when it simply vanishes (a closed tab, a lost network), once ICE has not heard from it for 15 s and a 15 s grace has run: about 30 s. A viewer whose ICE checks resume within the grace is kept — a browser that was suspended or backgrounded, or a network back before the browser itself gave up (Chrome does so about 15 s into unanswered checks, for good) — and nothing is sent to a viewer while its ICE is down. Its audio and video are still encoded meanwhile, so one that comes back is sent both on one clock, and its keyframe request (PLI) is answered with an IDR when `video_encode` runs on libx264 or VAAPI; NVENC and QSV code a non-IDR intra picture, which a browser does not take as a keyframe, and RKMPP ignores the request (see [codec-matrix.md](codec-matrix.md)), so those viewers wait for the encoder's next natural IDR. Until 2026-10 a viewer that left without a `DELETE` was sent the stream, its task and socket held, until the flow stopped, and one that never connected was held the same way.
+
+In **WHIP client** mode the endpoint's answer must accept H.264, the only video the output sends. An answer that does not leaves nothing to publish: the output deletes the session's resource (`DELETE` to the answer's `Location`), raises a Warning `webrtc_no_h264`, and retries after its exponential backoff (1 s, doubling to 30 s). It used to connect over the audio alone and start over at once, without end. A handshake that fails (ICE or DTLS) is left the same way — resource deleted, publish retried after the backoff — where it used to go straight back to a new POST. A session that ends after connecting — the endpoint closes it, or the output's own ICE agent gives the endpoint up (a full agent, it does so about 24 s after the last answered check, and the session ends there: there is no grace on this side, since an ICE-Lite endpoint never re-creates the pair) — is published again after the backoff: 1 s after a session that lasted 10 s, doubling to 30 s across sessions that ended sooner, so an endpoint that accepts each publish and closes it is not published to once a second for good. Until 2026-10 an endpoint's close went unnoticed, and nothing was published again until the flow restarted.
+
+> **Upgrade order.** Upgrade every edge carrying a **WHIP client** output
+> *before* the relay or edge it publishes into. An edge from before the
+> 2026-10 codec set — any tree before the codec-fix merge `5f71c4c` (main
+> through `8f4bf2c`), and every release up to v0.113.0 — panics on a current
+> relay's or edge's answer (`Pt locked multiple times: 110`), and the output
+> stops publishing until the flow restarts. A current WHIP output publishing
+> into an old relay or edge works. See
+> [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|

@@ -595,6 +595,38 @@ impl TsDemuxer {
         self.opus_channel_config
     }
 
+    /// Whether the selected audio track is Opus (`stream_type` 0x06 with the
+    /// `Opus` registration descriptor) — the one audio a WebRTC output can
+    /// pass through without an `audio_encode`.
+    #[cfg(feature = "webrtc")]
+    pub fn audio_is_opus(&self) -> bool {
+        self.audio_pid
+            .and_then(|pid| self.pes_assemblers.get(&pid))
+            .is_some_and(|a| a.stream_type == STREAM_TYPE_PRIVATE)
+    }
+
+    /// Whether the selected program's PMT has been read. Until it has,
+    /// [`Self::audio_is_opus`] cannot know what the audio is: its `false`
+    /// then means "not known yet", not "not Opus".
+    #[cfg(feature = "webrtc")]
+    pub fn pmt_seen(&self) -> bool {
+        self.pmt_version.is_some()
+    }
+
+    /// Follow the stream's PAT and selected PMT, and nothing else: what
+    /// [`Self::audio_is_opus`] and [`Self::opus_channel_config`] read, kept
+    /// current at the cost of a PID check per TS packet. No elementary stream
+    /// is reassembled and no frame produced.
+    #[cfg(feature = "webrtc")]
+    pub fn observe_psi(&mut self, ts_data: &[u8]) {
+        for pkt in ts_data.chunks_exact(TS_PACKET_SIZE) {
+            let pid = ts_pid(pkt);
+            if pkt[0] == TS_SYNC_BYTE && (pid == PAT_PID || Some(pid) == self.selected_pmt_pid) {
+                self.process_ts_packet(pkt);
+            }
+        }
+    }
+
     /// Process TS payload bytes (from an RtpPacket, after RTP header stripping).
     /// Returns any completed frames.
     ///

@@ -18,9 +18,47 @@ pub mod handlers {
     use axum::body::Body;
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode, header};
-    use axum::response::Response;
+    use axum::response::{IntoResponse, Response};
 
     use crate::api::server::AppState;
+
+    /// The longest reason a refused offer's 400 carries in its body.
+    const REFUSAL_BODY_MAX: usize = 256;
+
+    /// The response to a WHIP / WHEP offer that could not be answered. An
+    /// offer at fault (`session::offer_was_at_fault`: it did not parse, str0m
+    /// refused it or panicked on it, or it carries nothing to send) gets 400
+    /// and a short text reason, as the relay answers; anything else is this
+    /// end's fault and stays a bare 500. Every failure used to be the bare
+    /// 500, so a client could not tell its own bad offer from an edge fault.
+    /// The `webrtc_negotiation_panic` Warning is raised where the offer was
+    /// negotiated, either way.
+    ///
+    /// Only this end's failure is logged at ERROR. An offer at fault is the
+    /// client's doing — a browser offering VP8, say — and is a WARN; it was
+    /// logged at ERROR too, so every such offer reached error-level alerting.
+    pub(crate) fn offer_failed(kind: &str, flow_id: &str, err: &anyhow::Error) -> Response {
+        if !crate::engine::webrtc::session::offer_was_at_fault(err) {
+            tracing::error!("{kind} offer error for flow '{flow_id}': {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        tracing::warn!("{kind} offer refused for flow '{flow_id}': {err}");
+        let mut reason = format!("{kind} offer refused: {err}");
+        if reason.len() > REFUSAL_BODY_MAX {
+            let mut end = REFUSAL_BODY_MAX;
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason.truncate(end);
+        }
+        reason.push('\n');
+        (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            reason,
+        )
+            .into_response()
+    }
 
     /// POST /api/v1/flows/{flow_id}/whip — WHIP ingest endpoint.
     ///
@@ -58,13 +96,11 @@ pub mod handlers {
 
         // Create WebRTC session and process SDP offer
         let registry = state.webrtc_sessions.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let (answer_sdp, session_id) = registry
-            .handle_whip_offer(&flow_id, &body)
-            .await
-            .map_err(|e| {
-                tracing::error!("WHIP offer error for flow '{}': {}", flow_id, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let (answer_sdp, session_id) = match registry.handle_whip_offer(&flow_id, &body).await {
+            Ok(answered) => answered,
+            // 400 with the reason for an offer at fault, else 500.
+            Err(e) => return Ok(offer_failed("WHIP", &flow_id, &e)),
+        };
 
         let location = format!("/api/v1/flows/{}/whip/{}", flow_id, session_id);
 
@@ -122,13 +158,11 @@ pub mod handlers {
             }
 
         let registry = state.webrtc_sessions.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        let (answer_sdp, session_id) = registry
-            .handle_whep_offer(&flow_id, &body)
-            .await
-            .map_err(|e| {
-                tracing::error!("WHEP offer error for flow '{}': {}", flow_id, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let (answer_sdp, session_id) = match registry.handle_whep_offer(&flow_id, &body).await {
+            Ok(answered) => answered,
+            // 400 with the reason for an offer at fault, else 500.
+            Err(e) => return Ok(offer_failed("WHEP", &flow_id, &e)),
+        };
 
         let location = format!("/api/v1/flows/{}/whep/{}", flow_id, session_id);
 
@@ -158,6 +192,8 @@ pub mod handlers {
 
 #[cfg(feature = "webrtc")]
 pub mod registry {
+    use std::sync::Arc;
+
     use anyhow::Result;
     use dashmap::DashMap;
     use tokio::sync::mpsc;
@@ -188,8 +224,9 @@ pub mod registry {
     ///
     /// Stored in `AppState` and shared between API handlers and engine tasks.
     pub struct WebrtcSessionRegistry {
-        /// Active sessions: key = "flow_id/session_id".
-        sessions: DashMap<String, WebrtcSessionHandle>,
+        /// Active sessions: key = "flow_id/session_id". Shared with the task
+        /// that removes a WHEP viewer's entry when the viewer ends.
+        sessions: Arc<DashMap<String, WebrtcSessionHandle>>,
         /// Channels for WHIP input: API handler → input task.
         /// Key = flow_id. Input tasks register their sender here on startup.
         whip_input_channels: DashMap<String, mpsc::Sender<NewSessionMsg>>,
@@ -205,7 +242,7 @@ pub mod registry {
     impl WebrtcSessionRegistry {
         pub fn new() -> Self {
             Self {
-                sessions: DashMap::new(),
+                sessions: Arc::new(DashMap::new()),
                 whip_input_channels: DashMap::new(),
                 whep_output_channels: DashMap::new(),
                 whip_tokens: DashMap::new(),
@@ -311,9 +348,21 @@ pub mod registry {
                 .map_err(|_| anyhow::anyhow!("WHEP output task dropped reply"))??;
 
             let key = format!("{}/{}", flow_id, session_id);
-            self.sessions.insert(key, WebrtcSessionHandle {
-                cancel: session_cancel,
+            self.sessions.insert(key.clone(), WebrtcSessionHandle {
+                cancel: session_cancel.clone(),
                 session_type: "whep",
+            });
+            // The viewer's task cancels this token however it ends — the
+            // setup deadline, ICE giving up, a DTLS close — so its entry
+            // goes with it. Only a DELETE removed one before, and departed
+            // viewers are the ones that send none: each was held until the
+            // flow stopped. (Cancelled already, the entry goes at once.)
+            let sessions = self.sessions.clone();
+            tokio::spawn(async move {
+                session_cancel.cancelled().await;
+                if sessions.remove(&key).is_some() {
+                    tracing::debug!("WHEP session {key} ended; removed");
+                }
             });
 
             Ok((answer, session_id))
@@ -335,5 +384,152 @@ pub mod registry {
             let prefix = format!("{}/", flow_id);
             self.sessions.iter().filter(|e| e.key().starts_with(&prefix)).count()
         }
+    }
+}
+
+#[cfg(all(test, feature = "webrtc"))]
+mod tests {
+    use super::handlers::offer_failed;
+    use super::registry::WebrtcSessionRegistry;
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+
+    const CHROME_WHEP_OFFER: &str = include_str!("../engine/webrtc/testdata/chrome124-whep-recvonly.sdp");
+    const RTX_REPAIRING_TWO_PTS: &str = include_str!("../engine/webrtc/testdata/rtx-repairing-two-pts.sdp");
+
+    async fn body(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// An offer the WHEP output could not answer for its own fault — it does
+    /// not parse, or str0m panics on it — comes back 400 with a short text
+    /// reason, as the relay answers it; one this end failed is still a bare
+    /// 500. Every failure used to be the bare 500, empty-bodied.
+    #[tokio::test]
+    async fn an_offer_at_fault_is_answered_400_with_its_reason() {
+        let config: crate::config::models::WebrtcOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "whep-out",
+            "name": "WHEP",
+            "mode": "whep_server",
+            "public_ip": "127.0.0.1",
+        }))
+        .unwrap();
+        let (broadcast_tx, _keep) = tokio::sync::broadcast::channel(16);
+        let stats = Arc::new(crate::stats::collector::OutputStatsAccumulator::new(
+            "whep-out".into(),
+            "WHEP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = crate::engine::output_webrtc::spawn_webrtc_output(
+            config, &broadcast_tx, stats, cancel.clone(), Some(session_rx), events, "flow-a".into(), false,
+        );
+        let registry = WebrtcSessionRegistry::new();
+        registry.register_whep_output("flow-a", session_tx, None);
+
+        for (offer, reason) in [
+            ("v=0\r\nnot an offer\r\n", "SDP parse error"),
+            (RTX_REPAIRING_TWO_PTS, "str0m panicked during SDP offer: Pt locked multiple times"),
+        ] {
+            let err = registry.handle_whep_offer("flow-a", offer).await.unwrap_err();
+            let resp = offer_failed("WHEP", "flow-a", &err);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{err}");
+            assert_eq!(resp.headers()["content-type"], "text/plain; charset=utf-8");
+            let text = body(resp).await;
+            assert!(text.starts_with("WHEP offer refused: ") && text.contains(reason), "{text}");
+            assert!(text.len() <= 257, "{} bytes", text.len());
+            // str0m's parse error names a heap address of this process
+            // (`PointerOffset(0x…)`) and spans several lines of parser
+            // internals: it stays in the log, and the body says what it is.
+            assert!(
+                !text.contains("0x") && !text.contains("PointerOffset"),
+                "{text}"
+            );
+            assert_eq!(text.lines().count(), 1, "{text}");
+        }
+        let err = registry
+            .handle_whep_offer("flow-a", "v=0\r\nbogus\r\n")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            body(offer_failed("WHEP", "flow-a", &err)).await,
+            "WHEP offer refused: SDP parse error: the offer is not valid SDP\n"
+        );
+        assert!(registry.handle_whep_offer("flow-a", CHROME_WHEP_OFFER).await.is_ok());
+
+        // Not the offer's fault: no WHEP output on this flow.
+        let err = registry.handle_whep_offer("flow-b", CHROME_WHEP_OFFER).await.unwrap_err();
+        let resp = offer_failed("WHEP", "flow-b", &err);
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body(resp).await.is_empty());
+
+        // A long reason is cut short, on a character boundary.
+        let long = anyhow::Error::from(crate::engine::webrtc::session::OfferRefused("é".repeat(400)));
+        let text = body(offer_failed("WHIP", "flow-a", &long)).await;
+        assert!(text.len() <= 257 && text.ends_with('\n'), "{} bytes", text.len());
+        cancel.cancel();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
+    }
+
+    /// Formatted `tracing` output, collected for a test to read.
+    #[derive(Clone)]
+    struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// An offer refused for its own fault — the client's doing, a browser
+    /// offering VP8 — is logged at WARN; a failure of this end's at ERROR.
+    /// Both were logged at ERROR, so every refused offer reached
+    /// error-level alerting.
+    #[test]
+    fn only_this_ends_failure_is_logged_as_an_error() {
+        let captured = Capture(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = || {
+            let writer = captured.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .finish(),
+            )
+        };
+        let refused = anyhow::Error::from(crate::engine::webrtc::session::OfferRefused(
+            "it accepts no H.264 video".into(),
+        ));
+        let ours = anyhow::anyhow!("WHEP output task dropped reply");
+
+        // A first pass registers both callsites against a subscriber: one
+        // first hit by a parallel test with none installed can cache "never"
+        // process-wide (see the RTMP server's stream-key log test).
+        drop({
+            let warm = subscriber();
+            let _ = offer_failed("WHEP", "flow-a", &refused);
+            let _ = offer_failed("WHEP", "flow-a", &ours);
+            warm
+        });
+        let _guard = subscriber();
+        let logged = |err: &anyhow::Error| {
+            captured.0.lock().unwrap().clear();
+            let _ = offer_failed("WHEP", "flow-a", err);
+            String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned()
+        };
+
+        let text = logged(&refused);
+        assert!(text.contains("WARN") && text.contains("it accepts no H.264 video"), "{text}");
+        assert!(!text.contains("ERROR"), "{text}");
+        let text = logged(&ours);
+        assert!(text.contains("ERROR") && text.contains("dropped reply"), "{text}");
     }
 }

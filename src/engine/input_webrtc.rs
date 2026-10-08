@@ -31,7 +31,10 @@ use super::input_transcode::{publish_input_packet_with_post, InputTranscoder};
 #[cfg(feature = "webrtc")]
 use super::packet::RtpPacket;
 #[cfg(feature = "webrtc")]
-use super::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession, report_negotiation_panic};
+use super::webrtc::session::{
+    BACKOFF_RESET_AFTER, OfferRefused, SessionConfig, SessionEvent, WebrtcSession,
+    rejected_bundle_tag, report_negotiation_panic,
+};
 
 /// Spawn a WHIP server input task.
 ///
@@ -94,10 +97,20 @@ pub fn spawn_whip_input(
         if let Some(ref _p) = post {
             tracing::info!("WHIP input: ingress post-process active");
         }
-        whip_input_loop(config, &flow_id, broadcast_tx, stats, cancel, session_rx, &event_sender, &mut transcoder, &mut post).await;
+        whip_input_loop(config, &flow_id, broadcast_tx, stats, cancel, session_rx, &event_sender, &mut transcoder, &mut post, WHIP_SETUP_DEADLINE).await;
         tracing::info!("WHIP input stopped for flow '{}'", flow_id);
     })
 }
+
+/// How long an answered WHIP publisher has to complete ICE + DTLS before the
+/// input gives up on it and waits for the next one. The input serves one
+/// publisher at a time, so a publisher that never connected — its offer
+/// answered, then not one STUN check — used to hold it for good: every later
+/// publisher's POST hung unanswered until the flow restarted. 15 s matches
+/// how long the input already took to let go of a publisher whose ICE
+/// completed before it fell silent (ICE reports it Disconnected).
+#[cfg(feature = "webrtc")]
+const WHIP_SETUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[cfg(feature = "webrtc")]
 async fn whip_input_loop(
@@ -110,6 +123,7 @@ async fn whip_input_loop(
     events: &EventSender,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
+    setup_deadline: std::time::Duration,
 ) {
     let public_ip: Option<std::net::IpAddr> =
         config.public_ip.as_ref().and_then(|ip| ip.parse().ok());
@@ -172,6 +186,47 @@ async fn whip_input_loop(
                 continue;
             }
         };
+        // The tracks the answer accepted. An m-line it refused (a VP8-only
+        // video) still reaches `video_mid` / `audio_mid` as a track, but
+        // nothing is published on it: the layout must not count it.
+        let (video_pt, audio_pt) = session.answered_pts(&answer);
+        // An offer this input cannot serve is refused now, 400, rather than
+        // answered 201 and then waited on for the setup deadline while every
+        // other publisher's POST queues behind it: one carrying nothing it
+        // takes, or one whose BUNDLE tag the answer rejects — no browser
+        // applies that answer (RFC 8843 §7.3.3), and browsers put video
+        // first, so a VP8-only publisher with Opus hit it.
+        let refusal = if video_pt.is_none() && audio_pt.is_none() {
+            Some(
+                "it offers no H.264 video and no Opus audio, the only media this input takes"
+                    .to_string(),
+            )
+        } else {
+            rejected_bundle_tag(&msg.offer_sdp, &answer).map(|mid| {
+                // The advice follows the m-line refused: a publisher whose
+                // audio leads (G.711, say, beside an accepted H.264) was told
+                // to put its audio first.
+                let advice = match session.media_kind(&mid) {
+                    Some(str0m::media::MediaKind::Audio) => "offer Opus, or put the video m-line first",
+                    _ => "offer H.264, or put the audio m-line first",
+                };
+                format!(
+                    "its BUNDLE tag (mid {mid}) offers nothing this input takes (H.264 video, Opus audio), \
+                     and an answer may not reject the tag (RFC 8843 section 7.3.3): {advice}"
+                )
+            })
+        };
+        if let Some(reason) = refusal {
+            tracing::warn!("WHIP publisher on flow '{}' refused: {}", flow_id, reason);
+            let _ = msg.reply.send(Err(OfferRefused(reason).into()));
+            continue;
+        }
+        let tracks = |session: &WebrtcSession| {
+            (
+                session.video_mid.is_some() && video_pt.is_some(),
+                session.audio_mid.is_some() && audio_pt.is_some(),
+            )
+        };
 
         let session_id = uuid::Uuid::new_v4().to_string();
         // Per-session cancel token, rooted at the input task's parent. The
@@ -204,10 +259,38 @@ async fn whip_input_loop(
         // carried no PCR at all, and an A/V publish's Opus never reached the
         // PMT.
         let mut layout = WhipLayout::default();
+        // Until it connects, the publisher is held to `setup_deadline`.
+        let setup_by = tokio::time::Instant::now() + setup_deadline;
+        let mut connected = false;
 
         // Receive media from the WebRTC session
         loop {
-            let event = session.poll_event(&child_cancel).await;
+            let event = if connected {
+                session.poll_event(&child_cancel).await
+            } else {
+                tokio::select! {
+                    event = session.poll_event(&child_cancel) => event,
+                    _ = tokio::time::sleep_until(setup_by) => {
+                        let secs = setup_deadline.as_secs();
+                        tracing::warn!(
+                            "WHIP publisher on flow '{}' did not connect within {} s of its answer, waiting for next",
+                            flow_id, secs,
+                        );
+                        events.emit_flow_with_details(
+                            EventSeverity::Warning,
+                            category::WEBRTC,
+                            format!("WHIP publisher did not connect within {secs} s of its answer; waiting for the next publisher"),
+                            flow_id,
+                            serde_json::json!({
+                                "error_code": "webrtc_setup_timeout",
+                                "peer": "WHIP publisher",
+                                "timeout_secs": secs,
+                            }),
+                        );
+                        break; // Go back to waiting for next publisher
+                    }
+                }
+            };
 
             match event {
                 SessionEvent::MediaData { mid, data, rtp_time, network_time, .. } => {
@@ -217,12 +300,8 @@ async fn whip_input_loop(
                     if !is_video && !is_audio_stream {
                         continue;
                     }
-                    layout.apply(
-                        &mut whip.muxer,
-                        session.video_mid.is_some(),
-                        session.audio_mid.is_some(),
-                        flow_id,
-                    );
+                    let (has_video, has_audio) = tracks(&session);
+                    layout.apply(&mut whip.muxer, has_video, has_audio, flow_id);
                     let Some((ts_chunks, pts_90khz)) = whip.frame(
                         !is_audio_stream,
                         &data,
@@ -259,14 +338,11 @@ async fn whip_input_loop(
                 SessionEvent::MediaAdded { .. } => {
                     // A track negotiated after media began: the layout
                     // follows (a PMT version bump, PCR moving with video).
-                    layout.renegotiated(
-                        &mut whip.muxer,
-                        session.video_mid.is_some(),
-                        session.audio_mid.is_some(),
-                        flow_id,
-                    );
+                    let (has_video, has_audio) = tracks(&session);
+                    layout.renegotiated(&mut whip.muxer, has_video, has_audio, flow_id);
                 }
                 SessionEvent::Connected => {
+                    connected = true;
                     tracing::info!("WHIP publisher connected on flow '{}'", flow_id);
                     events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHIP publisher connected", flow_id);
                 }
@@ -439,7 +515,6 @@ async fn whep_input_loop(
             continue;
         }
 
-        backoff_secs = 1; // Reset on successful connection
         tracing::info!("WHEP connected to {}", config.whep_url);
         events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP connected", flow_id);
 
@@ -465,8 +540,15 @@ async fn whep_input_loop(
             }
         }
         if !connected {
+            // Backed off like any other failed attempt: it used to retry at
+            // once, against a server whose handshake always fails, without
+            // end.
+            if !whep_back_off(&mut backoff_secs, &cancel).await {
+                return;
+            }
             continue;
         }
+        let connected_at = std::time::Instant::now();
 
         // str0m may emit MediaAdded *after* Connected. Flush any pending
         // events so video_mid is populated before media starts arriving.
@@ -525,7 +607,31 @@ async fn whep_input_loop(
                 _ => {}
             }
         }
+
+        // Reconnect after the backoff, which starts over only if the session
+        // lasted (`BACKOFF_RESET_AFTER`). It was reset as soon as the answer
+        // applied and nothing slept here, so a server that accepts each pull
+        // and closes it (DTLS close_notify) was POSTed to back to back.
+        if connected_at.elapsed() >= BACKOFF_RESET_AFTER {
+            backoff_secs = 1;
+        }
+        if !whep_back_off(&mut backoff_secs, &cancel).await {
+            return;
+        }
     }
+}
+
+/// Wait out the WHEP input's `backoff_secs` before its next attempt, then
+/// double it (to 30 s at most). `false` when `cancel` fired meanwhile — the
+/// input is stopping.
+#[cfg(feature = "webrtc")]
+async fn whep_back_off(backoff_secs: &mut u64, cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => return false,
+        _ = tokio::time::sleep(std::time::Duration::from_secs(*backoff_secs)) => {}
+    }
+    *backoff_secs = (*backoff_secs * 2).min(30);
+    true
 }
 
 /// Which tracks a WHIP publish carries, applied to its TS muxer once, on the
@@ -848,6 +954,92 @@ mod tests {
         assert_eq!(layout_of(&ts), ((0x0100, vec![(0x1B, 0x0100), (0x06, 0x0101)]), vec![0x0100]));
     }
 
+    /// A publisher whose video the answer refused — it offered VP8 alone, with
+    /// Opus, its audio m-line first — publishes its audio, laid out as the
+    /// audio-only publish it is: the PMT lists the Opus alone, as PCR_PID,
+    /// and the Opus carries the PCR. The refused video m-line still reaches
+    /// the session as a track (`MediaAdded`), so the layout took it for
+    /// video: PCR_PID named a PID nothing was sent on and no packet carried a
+    /// PCR. (Its answer was not SDP until 2026-10 — the refused m-line had no
+    /// format — so no such publisher got this far. With its video first it is
+    /// refused: see `an_offer_the_input_cannot_serve_is_refused_at_once`.)
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_publish_whose_video_was_refused_is_laid_out_audio_only() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+        use std::time::{Duration, Instant};
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(4096);
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config, "flow-w", broadcast_tx, stats, cancel, session_rx, &events,
+                    &mut transcoder, &mut post, Duration::from_secs(10),
+                )
+                .await;
+            }
+        });
+
+        // A publisher offering Opus audio, then VP8 video.
+        let vp8 = str0m::Rtc::builder().clear_codecs().enable_vp8(true).enable_opus(true, false);
+        let peer = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: false };
+        let mut publisher = WebrtcSession::with_rtc_config(&peer, vp8).await.unwrap();
+        let (offer, pending) = publisher
+            .offer_media(&[str0m::media::MediaKind::Audio, str0m::media::MediaKind::Video], true)
+            .unwrap();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        session_tx.send(NewSessionMsg { offer_sdp: offer, reply }).await.unwrap();
+        let (answer, _session, _cancel) = answer.await.unwrap().unwrap();
+        publisher.apply_answer(&answer, pending).unwrap();
+        let (audio_mid, audio_pt) = (publisher.audio_mid.unwrap(), {
+            let mid = publisher.audio_mid.unwrap();
+            publisher.get_pt(mid).expect("Opus accepted")
+        });
+        assert_eq!(publisher.get_pt(publisher.video_mid.unwrap()), None, "VP8 refused");
+        let connected = tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(publisher.poll_event(&cancel).await, SessionEvent::Connected) {}
+        })
+        .await;
+        assert!(connected.is_ok(), "the publisher never connected");
+
+        // Half a second of Opus (20 ms frames, TOC 0xFC), then the TS.
+        let mut ts = Vec::new();
+        for k in 0..25u64 {
+            let at = str0m::media::MediaTime::new(k * 960, str0m::media::Frequency::FORTY_EIGHT_KHZ);
+            publisher.write_media(audio_mid, audio_pt, Instant::now(), at, &[0xFC; 80]).unwrap();
+            publisher.drain_outputs().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = publisher.drive_udp_io().await;
+            while let Ok(pkt) = published.try_recv() {
+                ts.push(pkt.data);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while ts.len() < 20 && tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(pkt)) = tokio::time::timeout(Duration::from_millis(100), published.recv()).await {
+                ts.push(pkt.data);
+            }
+        }
+        let ts: Vec<bytes::Bytes> = ts.iter().flat_map(|c| c.chunks(188).map(bytes::Bytes::copy_from_slice).collect::<Vec<_>>()).collect();
+        assert!(!ts.is_empty(), "nothing was published");
+        assert_eq!(layout_of(&ts), ((0x0101, vec![(0x06, 0x0101)]), vec![0x0101]));
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
     /// A browser publisher's RTP padding-only packets — Chromium's bandwidth
     /// probes, three every 5 s on the audio SSRC — reach the input as empty
     /// media. Each was muxed as a zero-length Opus AU (33 of 2964 on the
@@ -921,5 +1113,282 @@ mod tests {
         let (au, key) = ps.access_unit(&[0x65, 0x11, 0x22]);
         assert!(key);
         assert_eq!(au, vec![0, 0, 0, 1, 0x65, 0x11, 0x22]);
+    }
+
+    /// A publisher whose offer is answered and which then never connects —
+    /// not one STUN check — holds the WHIP input only until the setup
+    /// deadline, with a Warning; the next publisher is answered. The input
+    /// takes one publisher at a time, and it used to wait on such a one for
+    /// good: every later POST hung unanswered until the flow restarted.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_publisher_that_never_connects_frees_the_input() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::manager::events::EventSeverity;
+        use std::time::Duration;
+        const CHROME_WHIP_OFFER: &str = include_str!("webrtc/testdata/chrome124-whip-sendonly.sdp");
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, _keep) = tokio::sync::broadcast::channel(16);
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, mut raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config, "flow-w", broadcast_tx, stats, cancel, session_rx, &events,
+                    &mut transcoder, &mut post, Duration::from_secs(1),
+                )
+                .await;
+            }
+        });
+
+        // The phantom: its Chrome peer is nowhere, so nothing ever reaches
+        // the session.
+        let offer = |reply| NewSessionMsg { offer_sdp: CHROME_WHIP_OFFER.to_string(), reply };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        session_tx.send(offer(reply)).await.unwrap();
+        assert!(answer.await.unwrap().is_ok(), "the phantom is answered");
+
+        // The next publisher is answered once the phantom's second is up.
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        session_tx.send(offer(reply)).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), answer).await;
+        assert!(matches!(answered, Ok(Ok(Ok(_)))), "the next publisher's POST went unanswered");
+
+        let mut timeouts = Vec::new();
+        while let Ok(ev) = raised.try_recv() {
+            if let Some(d) = ev.details.filter(|d| d["error_code"] == "webrtc_setup_timeout") {
+                assert_eq!(ev.severity, EventSeverity::Warning);
+                assert_eq!(ev.flow_id.as_deref(), Some("flow-w"));
+                timeouts.push(d);
+            }
+        }
+        assert_eq!(timeouts.len(), 1, "{timeouts:?}");
+        assert_eq!(timeouts[0]["peer"], "WHIP publisher");
+        assert_eq!(timeouts[0]["timeout_secs"], 1);
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// An offer the input cannot serve is refused at answer time — an error
+    /// its request is answered 400 on, with the reason — and the next
+    /// publisher is answered at once. Both real Chrome 124 publishes used to
+    /// be answered 201 with something Chrome could not apply, and the input
+    /// was then held for the whole setup deadline:
+    ///
+    /// * VP8 video alone: nothing this input takes (the answer's BUNDLE line
+    ///   was left empty, which Chrome rejects);
+    /// * VP8 video, then Opus: the video m-line is the BUNDLE tag, which an
+    ///   answer may not reject (RFC 8843 §7.3.3) — "Failed to setup RTCP mux".
+    ///
+    /// The refusal's advice follows the kind of the tag it rejects: a
+    /// publisher whose G.711 audio leads its H.264 video is told to offer
+    /// Opus or put its video first. It was told to offer H.264 or put the
+    /// audio first, whichever m-line was refused — its audio already was.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn an_offer_the_input_cannot_serve_is_refused_at_once() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::engine::webrtc::session::{SessionConfig, WebrtcSession, offer_was_at_fault};
+        use str0m::media::MediaKind;
+        use std::time::Duration;
+        const VP8_ONLY: &str = include_str!("webrtc/testdata/chrome124-whip-vp8-only-noaudio.sdp");
+        const VP8_VIDEO_FIRST: &str =
+            include_str!("webrtc/testdata/chrome124-whip-vp8-videofirst.sdp");
+        const CHROME_WHIP_OFFER: &str = include_str!("webrtc/testdata/chrome124-whip-sendonly.sdp");
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, _keep) = tokio::sync::broadcast::channel(16);
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config,
+                    "flow-w",
+                    broadcast_tx,
+                    stats,
+                    cancel,
+                    session_rx,
+                    &events,
+                    &mut transcoder,
+                    &mut post,
+                    Duration::from_secs(30),
+                )
+                .await;
+            }
+        });
+        let offer = |sdp: &str| {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            (
+                NewSessionMsg {
+                    offer_sdp: sdp.to_string(),
+                    reply,
+                },
+                answer,
+            )
+        };
+
+        // A publisher offering G.711 audio first, then H.264 video.
+        let g711 = str0m::Rtc::builder().clear_codecs().enable_pcmu(true, false).enable_h264(true);
+        let peer = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: false };
+        let g711_first = WebrtcSession::with_rtc_config(&peer, g711)
+            .await
+            .unwrap()
+            .offer_media(&[MediaKind::Audio, MediaKind::Video], true)
+            .unwrap()
+            .0;
+
+        for (sdp, reasons) in [
+            (VP8_ONLY, &["no H.264 video and no Opus audio"][..]),
+            (
+                VP8_VIDEO_FIRST,
+                &["BUNDLE tag (mid 0)", "offer H.264, or put the audio m-line first"][..],
+            ),
+            (
+                g711_first.as_str(),
+                &["BUNDLE tag (mid ", "offer Opus, or put the video m-line first"][..],
+            ),
+        ] {
+            let (msg, answer) = offer(sdp);
+            session_tx.send(msg).await.unwrap();
+            let err = tokio::time::timeout(Duration::from_secs(5), answer)
+                .await
+                .expect("no reply")
+                .unwrap()
+                .expect_err("this publish cannot be served");
+            assert!(offer_was_at_fault(&err), "{err}");
+            for reason in reasons {
+                assert!(err.to_string().contains(reason), "{err}");
+            }
+        }
+
+        // The next publisher — a real one — is answered at once, not after
+        // the 30 s the refused ones would have held the input for.
+        let (msg, answer) = offer(CHROME_WHIP_OFFER);
+        session_tx.send(msg).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(5), answer).await;
+        assert!(
+            matches!(answered, Ok(Ok(Ok(_)))),
+            "the next publisher's POST went unanswered"
+        );
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    /// A WHEP server that accepts each pull and closes the session as it
+    /// connects (DTLS close_notify) is pulled from again only after the
+    /// backoff — 1 s, then doubling, as for any other failed attempt. The
+    /// input re-POSTed it back to back: the backoff was reset as soon as the
+    /// answer applied, and nothing slept before a reconnect.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_server_that_closes_each_pull_is_backed_off_from() {
+        use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+        use axum::http::{StatusCode, header};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        // What `main` installs before any TLS client is built.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/whep",
+            axum::routing::post({
+                let posts = posts.clone();
+                move |offer: String| async move {
+                    let n = posts.fetch_add(1, Ordering::SeqCst);
+                    let config = SessionConfig {
+                        bind_addr: "127.0.0.1:0".parse().unwrap(),
+                        public_ip: None,
+                        ice_lite: true,
+                    };
+                    let mut server = WebrtcSession::new(&config).await.unwrap();
+                    let answer = server.accept_offer(&offer).unwrap();
+                    tokio::spawn(async move {
+                        let cancel = CancellationToken::new();
+                        let _ = tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                match server.poll_event(&cancel).await {
+                                    SessionEvent::Connected => server.close().await,
+                                    SessionEvent::Disconnected => break,
+                                    _ => {}
+                                }
+                            }
+                        })
+                        .await;
+                    });
+                    (
+                        StatusCode::CREATED,
+                        [
+                            (header::LOCATION, format!("/whep/res-{n}")),
+                            (header::CONTENT_TYPE, "application/sdp".to_string()),
+                        ],
+                        answer,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config: crate::config::models::WhepInputConfig =
+            serde_json::from_value(serde_json::json!({ "whep_url": format!("http://{addr}/whep") }))
+                .unwrap();
+        let (broadcast_tx, _keep) = tokio::sync::broadcast::channel(16);
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHEP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let (events, mut raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whep_input_loop(
+                    config, broadcast_tx, stats, cancel, &events, "flow-w", &mut transcoder, &mut post,
+                )
+                .await;
+            }
+        });
+
+        // Pulls at about 0, 1 and 3 s; the fourth would be at 7 s.
+        tokio::time::sleep(Duration::from_millis(4_500)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        server.abort();
+
+        let posts = posts.load(Ordering::SeqCst);
+        assert!((2..=3).contains(&posts), "{posts} pulls in 4.5 s");
+        // The pulls connected, and were then closed: the path that had no
+        // backoff at all, not only a failed handshake.
+        let mut lost = 0;
+        while let Ok(ev) = raised.try_recv() {
+            lost += usize::from(ev.message == "WHEP disconnected");
+        }
+        assert!(lost >= 1, "no pull was closed after it connected");
     }
 }

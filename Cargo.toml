@@ -770,7 +770,21 @@ optional = true
 # stops panicking on it, those tests say so. bilbycast-relay's
 # `distribution::webrtc::session` must register exactly the same set. Checked
 # against captured real SDP (Chrome 124 WHEP and WHIP offers) and FFmpeg's
-# own WHIP offer template in unit tests; not yet re-run live.
+# own WHIP offer template in unit tests, then live in the 2026-10 interop run
+# (headless Chromium 124 publishing and viewing, through the edge and the
+# relay, edge to edge).
+#
+# UPGRADE ORDER, from this codec set on. An edge built before it — any tree
+# before the codec-fix merge 5f71c4c (main through 8f4bf2c), and every
+# release up to v0.113.0 — panics in its WHIP output on the answer a relay or
+# an edge carrying this set gives it ("Pt locked multiple times: 110", in
+# `accept_answer`, which that build does not isolate), and the output's task
+# ends: nothing is published until the flow restarts. A fixed WHIP output
+# publishing into an old relay or edge works. So upgrade every edge that
+# carries a WHIP output FIRST, then the relays and the edges with WHIP inputs
+# it publishes into. Reproduced live in the 2026-10 interop run, edge to relay
+# and edge to edge. The release notes say so too (.github/release-notes/
+# edge.md, "Upgrading from v0.113.0 or earlier").
 #
 # The vendored `is` PRIORITY patch used to let a PRIORITY-less Binding Request
 # reach a panicking `expect`, in the media path after negotiation, where the

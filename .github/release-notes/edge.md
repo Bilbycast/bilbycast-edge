@@ -4,6 +4,11 @@ Release of bilbycast-edge version {{VERSION}}.
 
 {{CHANGES}}
 
+## Upgrading from v0.113.0 or earlier
+
+<!-- Static text: remove once no supported upgrade starts at v0.113.0 or earlier. -->
+Upgrade every edge that carries a **WebRTC WHIP output** first, then the relays and the edges with **WHIP inputs** it publishes into. A WHIP output on v0.113.0 or earlier panics on the answer a current relay or edge gives it and stops publishing until its flow restarts; a current WHIP output publishing into an older relay or edge works. See [supported-protocols.md](https://github.com/Bilbycast/bilbycast-edge/blob/main/docs/supported-protocols.md#webrtc-whipwhep).
+
 ## Binaries
 
 Asset filenames carry no version, so `https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/<asset>` always resolves to the latest release. Each tarball unpacks to a versioned directory, `bilbycast-edge-{{VERSION}}-<artefact>/`, where `<artefact>` is `x86_64-linux-full`, `aarch64-linux-full` or `aarch64-linux-rockchip`.
