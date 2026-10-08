@@ -120,8 +120,8 @@ fn rtc_config(ice_lite: bool) -> RtcConfig {
 /// is not survived either way.
 ///
 /// The grace is not free on its own: str0m keeps the last nominated address
-/// and goes on sending to it whatever the ICE state. The send loops therefore
-/// write nothing while ICE is down ([`WebrtcSession::ice_down`]), so a
+/// and goes on sending to it whatever the ICE state. So nothing is written
+/// while ICE is down ([`WebrtcSession::write_media`] drops it), and a
 /// departed viewer costs no bandwidth past ICE's 15 s.
 ///
 /// A full-ICE session (the WHIP output) gets no grace: its agent reports
@@ -328,6 +328,11 @@ pub struct WebrtcSession {
     /// This end is an ICE-Lite agent (`SessionConfig::ice_lite`): only such
     /// a session is given [`ICE_DISCONNECT_GRACE`].
     ice_lite: bool,
+    /// The peer asked for a keyframe (PLI / FIR) since the last
+    /// [`Self::take_keyframe_request`]. Kept, not only returned, because
+    /// `drain_outputs` returns no events and `drive_udp_io` only a batch's
+    /// first.
+    keyframe_requested: bool,
     buf: Vec<u8>,
 }
 
@@ -395,6 +400,7 @@ impl WebrtcSession {
             audio_mid: None,
             disconnected: false,
             ice_disconnected_since: None,
+            keyframe_requested: false,
             ice_lite: config.ice_lite,
             buf: vec![0u8; 2048],
         })
@@ -507,7 +513,19 @@ impl WebrtcSession {
         self.local_addr
     }
 
-    /// Write media data to a track.
+    /// Write media data to a track — or, while ICE is down
+    /// ([`Self::ice_down`]), drop it: str0m keeps the last nominated address
+    /// and sends to it whatever the ICE state, so a departed peer would be
+    /// sent its full bitrate for the whole grace.
+    ///
+    /// It is dropped here, not by the send loops, so that they go on
+    /// demuxing, decoding and encoding while ICE is down. An encoder's
+    /// timeline must stay continuous: one stopped for the outage resumed
+    /// where it left off (an Opus encoder runs on from its anchor, so its
+    /// audio was late by the whole outage for the rest of the session — 3.8 s
+    /// measured), and a video decoder resumed mid-GOP on references it never
+    /// decoded. A peer that comes back is sent the frame being encoded now,
+    /// on the RTP clock it would have had all along.
     pub fn write_media(
         &mut self,
         mid: Mid,
@@ -516,6 +534,9 @@ impl WebrtcSession {
         rtp_time: MediaTime,
         data: &[u8],
     ) -> Result<()> {
+        if self.ice_down() {
+            return Ok(());
+        }
         if let Some(writer) = self.rtc.writer(mid) {
             writer.write(pt, wallclock, rtp_time, data.to_vec())
                 .map_err(|e| anyhow::anyhow!("Write error: {}", e))?;
@@ -663,12 +684,21 @@ impl WebrtcSession {
     }
 
     /// ICE is `Disconnected` and has not recovered — the peer has gone
-    /// quiet, and an ICE-Lite session's grace is running. A send loop writes
-    /// nothing meanwhile (str0m would send it to the last nominated address
-    /// all the same) and keeps driving the session, so a peer that comes
-    /// back is heard and sent the stream again.
+    /// quiet, and an ICE-Lite session's grace is running. Nothing is written
+    /// meanwhile ([`Self::write_media`] drops it; str0m would send it to the
+    /// last nominated address all the same), and the send loops count
+    /// nothing as sent; they keep encoding and driving the session, so a
+    /// peer that comes back is heard and sent the stream again, on its
+    /// timeline.
     pub fn ice_down(&self) -> bool {
         self.ice_disconnected_since.is_some()
+    }
+
+    /// Whether the peer has asked for a keyframe (PLI / FIR) since the last
+    /// call, from whichever drain read it: a viewer that lost packets, or
+    /// one back from an outage, whose decoder waits for an IDR.
+    pub fn take_keyframe_request(&mut self) -> bool {
+        std::mem::take(&mut self.keyframe_requested)
     }
 
     /// Latch a str0m error: the session is over (see [`Self::is_disconnected`]).
@@ -942,6 +972,7 @@ impl WebrtcSession {
                 })
             }
             Event::KeyframeRequest(kf) => {
+                self.keyframe_requested = true;
                 Some(SessionEvent::KeyframeRequest { mid: kf.mid })
             }
             _ => None,
@@ -2401,5 +2432,101 @@ mod liveness_tests {
             server.ice_disconnected_since.is_none()
         );
         assert!(!server.is_disconnected());
+    }
+
+    /// What is written while ICE is down never reaches the peer — str0m
+    /// would send it to the last nominated address whatever the ICE state —
+    /// and what is written once ICE is back up does. (The send loops go on
+    /// encoding meanwhile, so it is `write_media` that must drop it.)
+    #[tokio::test]
+    async fn nothing_written_while_ice_is_down_reaches_the_peer() {
+        let (mut server, mut viewer) = connected().await;
+        let viewer_audio = viewer.audio_mid.unwrap();
+        let mut n = 0;
+        server.ice_disconnected_since = Some(Instant::now());
+        for _ in 0..10 {
+            send_frame(&mut server, &mut n, 0xCC).await;
+        }
+        server.ice_disconnected_since = None;
+        for _ in 0..10 {
+            send_frame(&mut server, &mut n, 0xBB).await;
+        }
+        let cancel = CancellationToken::new();
+        let (mut while_down, mut once_up) = (0, 0);
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let SessionEvent::MediaData { mid, data, .. } = viewer.poll_event(&cancel).await
+                    && mid == viewer_audio
+                {
+                    match data.first() {
+                        Some(0xCC) => while_down += 1,
+                        Some(0xBB) => once_up += 1,
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await;
+        assert_eq!(while_down, 0, "frames written while ICE was down were sent");
+        assert!(once_up > 0, "nothing written once ICE was back up was heard");
+    }
+
+    /// A viewer's keyframe request (PLI) is kept until the send loop takes
+    /// it, whichever drain read it: `drive_udp_io` returns only a batch's
+    /// first event, and the WHEP viewer loop dropped even that.
+    #[tokio::test]
+    async fn a_viewers_keyframe_request_is_kept_until_taken() {
+        let (mut server, mut viewer) = connected().await;
+        let (server_video, viewer_video) = (server.video_mid.unwrap(), viewer.video_mid.unwrap());
+        let pt = server.get_pt(server_video).unwrap();
+        let mut au = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1e, 0xd9, 0x01, 0x41, 0xfb, 0x01, 0x10];
+        au.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x84]);
+        au.extend(std::iter::repeat_n(0x5a, 600));
+        let cancel = CancellationToken::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(40));
+        let mut k = 0u64;
+
+        // Video flows, so the viewer has a stream to ask on.
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    e = viewer.poll_event(&cancel) => {
+                        if matches!(e, SessionEvent::MediaData { mid, .. } if mid == viewer_video) {
+                            break;
+                        }
+                    }
+                    _ = tick.tick() => {
+                        let at = MediaTime::new(k * 3600, str0m::media::Frequency::NINETY_KHZ);
+                        k += 1;
+                        server.write_media(server_video, pt, Instant::now(), at, &au).unwrap();
+                        server.drain_outputs().await;
+                        server.drive_udp_io().await;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(seen.is_ok(), "the viewer was sent no video");
+        assert!(!server.take_keyframe_request(), "a request before any was made");
+
+        viewer
+            .rtc
+            .writer(viewer_video)
+            .unwrap()
+            .request_keyframe(None, str0m::media::KeyframeRequestKind::Pli)
+            .unwrap();
+        let taken = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                viewer.drain_outputs().await;
+                server.drive_udp_io().await;
+                if server.take_keyframe_request() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(taken.is_ok(), "the viewer's PLI never reached the server's send loop");
+        assert!(!server.take_keyframe_request(), "taken, but still pending");
     }
 }

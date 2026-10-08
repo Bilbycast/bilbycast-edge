@@ -1946,10 +1946,12 @@ plugs in via those paths rather than the TS-stream replacer.
   removed) and wrote every RTP payload to str0m as a frame of its own:
   str0m fragmented the FU-A fragments again, so a receiver got type-28
   NAL units out of every IDR and large P slice and decoded nothing from
-  them — the frame loss a WHIP loopback showed in 2026-09. Remaining MVP limitation: PLI / FIR from the receiver
-  is still logged-and-ignored — the encoder's configured GOP
-  (default 2× fps) drives keyframe cadence. Force-IDR on PLI is tracked
-  under a follow-up.
+  them — the frame loss a WHIP loopback showed in 2026-09. A receiver's
+  PLI / FIR (a viewer that lost packets, or one back from an outage) makes
+  the encoder's next frame an IDR (`force_video_keyframe`); until 2026-10
+  it was logged and ignored, and the viewer waited out the configured GOP
+  (default two seconds). Passed-through H.264 still waits for the
+  source's next IDR.
 
 ### The `webrtc_compatible` output flag (browser-safe H.264)
 

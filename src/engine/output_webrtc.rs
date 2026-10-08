@@ -340,6 +340,24 @@ fn open_webrtc_video_active(
     }))
 }
 
+/// Answer a peer's keyframe request (PLI / FIR) — a viewer that lost
+/// packets, or one back from an outage, whose decoder waits for an IDR —
+/// by making the encoder's next frame one. `false` when this end does not
+/// encode the video (no `video_encode`, or not open yet): passed-through
+/// H.264 waits for the source's next IDR, there being nothing to make one
+/// from. The request used to be ignored either way.
+#[cfg(feature = "webrtc")]
+fn force_video_keyframe(video_state: &mut WebrtcVideoEncoderState) -> bool {
+    match video_state {
+        #[cfg(feature = "media-codecs")]
+        WebrtcVideoEncoderState::Active(active) => {
+            active.pipeline.force_next_keyframe();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Concatenate source NAL units (no start codes) back into an Annex-B
 /// byte stream suitable for `VideoDecoder::send_packet`.
 #[cfg(all(feature = "webrtc", feature = "media-codecs"))]
@@ -748,6 +766,29 @@ fn opus_through_audio_encode(
     }
 }
 
+/// Count one frame handed to `write_media` as sent — `packets` RTP packets
+/// of `bytes`, and its latency from `recv_time_us` when it came from the
+/// source — unless ICE was down as it was handed over (`on_wire` false):
+/// `WebrtcSession::write_media` then put nothing on the wire. The frame was
+/// still encoded, so the encoders keep their timelines (see there).
+#[cfg(feature = "webrtc")]
+fn count_sent(
+    stats: &OutputStatsAccumulator,
+    on_wire: bool,
+    packets: u64,
+    bytes: usize,
+    recv_time_us: Option<u64>,
+) {
+    if !on_wire {
+        return;
+    }
+    stats.packets_sent.fetch_add(packets, Ordering::Relaxed);
+    stats.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
+    if let Some(recv_time_us) = recv_time_us {
+        stats.record_latency(recv_time_us);
+    }
+}
+
 /// Pass one Opus-in-TS PES through to the session's audio track: each Opus
 /// packet it carries written as one frame on the 48 kHz RTP clock, as the
 /// re-encode writes its encoder's (`OpusTimeline` places them). Shared by the
@@ -770,14 +811,13 @@ async fn write_opus_passthrough(
 
     for (packet, rtp_time) in timeline.place(pes, pts) {
         let media_time = MediaTime::new(rtp_time, Frequency::FORTY_EIGHT_KHZ);
+        let on_wire = !session.ice_down();
         if let Err(e) = session.write_media(audio_mid, audio_pt, Instant::now(), media_time, packet) {
             tracing::debug!("WebRTC output '{}' Opus passthrough write error: {}", output_id, e);
         }
         // str0m requires poll_output between consecutive writes.
         session.drain_outputs().await;
-        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-        stats.bytes_sent.fetch_add(packet.len() as u64, Ordering::Relaxed);
-        stats.record_latency(recv_time_us);
+        count_sent(stats, on_wire, 1, packet.len(), Some(recv_time_us));
     }
 }
 
@@ -926,6 +966,7 @@ async fn handle_webrtc_video_frame(
         // each fragment arrived as its own frame, every one marker-bit.
         let au = annex_b_access_unit(send_nalus);
         let media_time = MediaTime::new(*frame_pts, Frequency::NINETY_KHZ);
+        let on_wire = !session.ice_down();
         if let Err(e) = session.write_media(video_mid, video_pt, Instant::now(), media_time, &au) {
             tracing::debug!("WebRTC output '{}' write error: {}", output_id, e);
         }
@@ -933,9 +974,7 @@ async fn handle_webrtc_video_frame(
         // drain or the next write_media is silently rejected.
         session.drain_outputs().await;
         // RTP packets, approximately: the 1200-byte payloads a frame splits into.
-        stats.packets_sent.fetch_add(au.len().div_ceil(1_200) as u64, Ordering::Relaxed);
-        stats.bytes_sent.fetch_add(au.len() as u64, Ordering::Relaxed);
-        stats.record_latency(recv_time_us);
+        count_sent(stats, on_wire, au.len().div_ceil(1_200) as u64, au.len(), Some(recv_time_us));
     }
 }
 
@@ -1511,19 +1550,20 @@ async fn whep_viewer_loop(
 
             _ = idle.tick() => {
                 session.drive_udp_io().await;
+                if session.take_keyframe_request() {
+                    force_video_keyframe(&mut video_encoder_state);
+                }
             }
 
             _ = silence_tick => {
-                if !session.ice_down() {
-                    emit_webrtc_silence_if_needed(
-                        &mut encoder_state,
-                        &mut session,
-                        audio_mid,
-                        audio_pt,
-                        &stats,
-                        output_id,
-                    ).await;
-                }
+                emit_webrtc_silence_if_needed(
+                    &mut encoder_state,
+                    &mut session,
+                    audio_mid,
+                    audio_pt,
+                    &stats,
+                    output_id,
+                ).await;
                 continue;
             }
 
@@ -1537,16 +1577,14 @@ async fn whep_viewer_loop(
                         let frames = demuxer.demux(payload);
                         for frame in frames {
                             // While ICE is down (the viewer has gone quiet;
-                            // the grace is running) nothing is encoded or
-                            // written: str0m would send it all to the last
-                            // nominated address, and a departed viewer was
-                            // sent its full bitrate for the whole grace. The
-                            // demuxer keeps up and the session is still
-                            // driven (below), so a viewer that comes back is
-                            // heard, and sent whole frames.
-                            if session.ice_down() {
-                                break;
-                            }
+                            // the grace is running) every frame is still
+                            // decoded and encoded, and `write_media` drops
+                            // it: str0m would send it to the last nominated
+                            // address. The encoders' timelines stay whole, so
+                            // a viewer that comes back is sent audio and video
+                            // on one clock. Frames used to be skipped here,
+                            // and an Opus encoder resumed where it had
+                            // stopped: audio late by the whole outage.
                             // Opus with an `audio_encode` is re-encoded
                             // through it like any other source.
                             #[cfg(feature = "media-codecs")]
@@ -1705,6 +1743,7 @@ async fn whep_viewer_loop(
                                                 frame.pts * 48_000 / 90_000,
                                                 str0m::media::Frequency::FORTY_EIGHT_KHZ,
                                             );
+                                            let on_wire = !session.ice_down();
                                             if let Err(e) = session.write_media(
                                                 audio_mid,
                                                 audio_pt,
@@ -1718,9 +1757,7 @@ async fn whep_viewer_loop(
                                                 );
                                             }
                                             session.drain_outputs().await;
-                                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                            stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
-                                            stats.record_latency(recv_time_us);
+                                            count_sent(&stats, on_wire, 1, frame.data.len(), Some(recv_time_us));
                                         }
                                     }
                                 }
@@ -1767,6 +1804,7 @@ async fn whep_viewer_loop(
                                             frame.pts * 48_000 / 90_000,
                                             str0m::media::Frequency::FORTY_EIGHT_KHZ,
                                         );
+                                        let on_wire = !session.ice_down();
                                         if let Err(e) = session.write_media(
                                             audio_mid,
                                             audio_pt,
@@ -1780,9 +1818,7 @@ async fn whep_viewer_loop(
                                             );
                                         }
                                         session.drain_outputs().await;
-                                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                        stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
-                                        stats.record_latency(recv_time_us);
+                                        count_sent(&stats, on_wire, 1, frame.data.len(), Some(recv_time_us));
                                     }
                                 }
                                 #[cfg(not(feature = "media-codecs"))]
@@ -1828,6 +1864,9 @@ async fn whep_viewer_loop(
                         // queued output. Whether that ended the session is
                         // checked at the top of the loop.
                         session.drive_udp_io().await;
+                        if session.take_keyframe_request() {
+                            force_video_keyframe(&mut video_encoder_state);
+                        }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
@@ -2175,19 +2214,20 @@ async fn whip_client_loop(
 
                 _ = idle.tick() => {
                     session.drive_udp_io().await;
+                    if session.take_keyframe_request() && !force_video_keyframe(&mut video_encoder_state) {
+                        tracing::debug!("WHIP client '{}': received PLI/FIR (ignored, passthrough mode)", config.id);
+                    }
                 }
 
                 _ = silence_tick => {
-                    if !session.ice_down() {
-                        emit_webrtc_silence_if_needed(
-                            &mut encoder_state,
-                            &mut session,
-                            audio_mid,
-                            audio_pt,
-                            &stats,
-                            &config.id,
-                        ).await;
-                    }
+                    emit_webrtc_silence_if_needed(
+                        &mut encoder_state,
+                        &mut session,
+                        audio_mid,
+                        audio_pt,
+                        &stats,
+                        &config.id,
+                    ).await;
                     continue;
                 }
 
@@ -2200,15 +2240,12 @@ async fn whip_client_loop(
 
                             let frames = demuxer.demux(payload);
                             for frame in frames {
-                                // Nothing is encoded or written while ICE is
-                                // down, as on the WHEP viewer loop. This
-                                // full-ICE session ends at that report (at
-                                // the top of the loop); what is left of the
-                                // batch does not go to the dead address
-                                // first.
-                                if session.ice_down() {
-                                    break;
-                                }
+                                // Nothing is written while ICE is down, as
+                                // on the WHEP viewer loop (`write_media`
+                                // drops it). This full-ICE session ends at
+                                // that report (at the top of the loop); what
+                                // is left of the batch does not go to the
+                                // dead address first.
                                 // Opus with an `audio_encode` is re-encoded
                                 // through it like any other source.
                                 #[cfg(feature = "media-codecs")]
@@ -2360,6 +2397,7 @@ async fn whip_client_loop(
                                                     frame.pts * 48_000 / 90_000,
                                                     str0m::media::Frequency::FORTY_EIGHT_KHZ,
                                                 );
+                                                let on_wire = !session.ice_down();
                                                 if let Err(e) = session.write_media(
                                                     audio_mid,
                                                     audio_pt,
@@ -2372,9 +2410,7 @@ async fn whip_client_loop(
                                                     );
                                                 }
                                                 session.drain_outputs().await;
-                                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                                stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
-                                                stats.record_latency(recv_time_us);
+                                                count_sent(&stats, on_wire, 1, frame.data.len(), Some(recv_time_us));
                                             }
                                         }
                                     }
@@ -2418,6 +2454,7 @@ async fn whip_client_loop(
                                                 frame.pts * 48_000 / 90_000,
                                                 str0m::media::Frequency::FORTY_EIGHT_KHZ,
                                             );
+                                            let on_wire = !session.ice_down();
                                             if let Err(e) = session.write_media(
                                                 audio_mid,
                                                 audio_pt,
@@ -2430,9 +2467,7 @@ async fn whip_client_loop(
                                                     config.id, e
                                                 );
                                             }
-                                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                            stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
-                                            stats.record_latency(recv_time_us);
+                                            count_sent(&stats, on_wire, 1, frame.data.len(), Some(recv_time_us));
                                         }
                                     }
                                     #[cfg(not(feature = "media-codecs"))]
@@ -2473,8 +2508,8 @@ async fn whip_client_loop(
                             // Drive str0m: process incoming RTCP/STUN + send
                             // queued output. Whether that ended the session
                             // is checked at the top of the loop.
-                            if let Some(SessionEvent::KeyframeRequest { .. }) = session.drive_udp_io().await {
-                                // We can't generate keyframes — log and ignore.
+                            session.drive_udp_io().await;
+                            if session.take_keyframe_request() && !force_video_keyframe(&mut video_encoder_state) {
                                 tracing::debug!("WHIP client '{}': received PLI/FIR (ignored, passthrough mode)", config.id);
                             }
                         }
@@ -2998,6 +3033,7 @@ async fn emit_webrtc_silence_if_needed(
             frame.pts * 48_000 / 90_000,
             str0m::media::Frequency::FORTY_EIGHT_KHZ,
         );
+        let on_wire = !session.ice_down();
         if let Err(e) = session.write_media(
             audio_mid,
             audio_pt,
@@ -3009,8 +3045,7 @@ async fn emit_webrtc_silence_if_needed(
             continue;
         }
         session.drain_outputs().await;
-        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-        stats.bytes_sent.fetch_add(frame.data.len() as u64, Ordering::Relaxed);
+        count_sent(stats, on_wire, 1, frame.data.len(), None);
     }
 }
 
@@ -3196,6 +3231,48 @@ mod stage_tests {
 #[cfg(all(test, feature = "webrtc", feature = "video-encoder-x264"))]
 mod rate_tests {
     use super::*;
+
+    /// A peer's keyframe request makes the encoder's next frame an IDR, deep
+    /// inside its GOP: a viewer that lost packets, or one back from an
+    /// outage, used to wait for the GOP to end (the request was ignored).
+    /// The same frame of the same source is not one unrequested.
+    #[test]
+    fn a_keyframe_request_makes_the_next_frame_an_idr() {
+        let idrs = |request_at: Option<usize>| {
+            let cfg: VideoEncodeConfig = serde_json::from_value(
+                serde_json::json!({"codec": "x264", "preset": "veryfast", "gop_size": 250}),
+            )
+            .unwrap();
+            let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "webrtc".into()));
+            let (events, _rx) = crate::manager::events::event_channel();
+            let aus = crate::engine::output_rtmp::x264_test_source(40, 3_600);
+            let mut state =
+                open_webrtc_video_active(&cfg, video_codec::VideoCodec::H264, &aus[0].0, "o", "f", &stats, &events);
+            let (mut idrs, mut out, mut requested) = (Vec::new(), 0usize, None);
+            for (k, (au, pts)) in aus.iter().enumerate() {
+                if Some(k) == request_at {
+                    assert!(force_video_keyframe(&mut state), "no encoder to ask");
+                    requested = Some(out);
+                }
+                let nalus = crate::engine::ts_demux::split_annex_b_nalus(au);
+                for (frame, _) in encode_one_video_frame_webrtc(&mut state, &nalus_to_annex_b_webrtc(&nalus), *pts, true, "o") {
+                    let idr = crate::engine::ts_demux::split_annex_b_nalus(&frame)
+                        .iter()
+                        .any(|n| n.first().is_some_and(|b| b & 0x1f == 5));
+                    if idr {
+                        idrs.push(out);
+                    }
+                    out += 1;
+                }
+            }
+            (idrs, requested)
+        };
+        let (unrequested, _) = idrs(None);
+        let (requested, at) = idrs(Some(12));
+        let at = at.unwrap();
+        assert!(at > 0 && !unrequested.contains(&at), "frame {at} is an IDR anyway: {unrequested:?}");
+        assert!(requested.contains(&at), "requested before frame {at}; IDRs {requested:?}");
+    }
 
     /// Unpinned, the WebRTC encoder opens at the source's measured rate — it
     /// used to open at a flat 30/1 — which needs the decoder to be handed
@@ -3548,6 +3625,41 @@ mod whep_server_tests {
         JoinHandle<()>,
         Arc<OutputStatsAccumulator>,
     ) {
+        spawn_whep_output(extra, setup_deadline, false)
+    }
+
+    /// [`whep_output_with_stats`] on a flow whose input carries TS audio
+    /// (`compressed_audio_input`), so an `audio_encode` opens: without it
+    /// the encoder state is `Failed` (a PCM-only source).
+    #[allow(clippy::type_complexity)]
+    fn whep_output_with_ts_audio(
+        extra: serde_json::Value,
+    ) -> (
+        broadcast::Sender<RtpPacket>,
+        tokio::sync::mpsc::Sender<NewSessionMsg>,
+        tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        CancellationToken,
+        JoinHandle<()>,
+        Arc<OutputStatsAccumulator>,
+    ) {
+        spawn_whep_output(extra, WHEP_SETUP_DEADLINE, true)
+    }
+
+    /// The WHEP output the helpers above describe, run as
+    /// `spawn_webrtc_output` runs it.
+    #[allow(clippy::type_complexity)]
+    fn spawn_whep_output(
+        extra: serde_json::Value,
+        setup_deadline: std::time::Duration,
+        compressed_audio_input: bool,
+    ) -> (
+        broadcast::Sender<RtpPacket>,
+        tokio::sync::mpsc::Sender<NewSessionMsg>,
+        tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        CancellationToken,
+        JoinHandle<()>,
+        Arc<OutputStatsAccumulator>,
+    ) {
         let mut config = serde_json::json!({
             "id": "whep-out",
             "name": "WHEP",
@@ -3573,7 +3685,7 @@ mod whep_server_tests {
                     session_rx,
                     &events,
                     "flow-w",
-                    false,
+                    compressed_audio_input,
                     setup_deadline,
                 )
                 .await;
@@ -4333,6 +4445,188 @@ mod whep_server_tests {
         );
         assert!(!task.is_finished());
         cancel.cancel();
+    }
+
+    /// A live source — H.264 and AAC-LC, an access unit every 40 ms with the
+    /// audio frames that cover it — whose PTS follows the wall clock, fed
+    /// into `tx` until `stop`. (`feed_aac` repeats its file every 50 ms, so
+    /// its PTS bears no relation to the clock.) The H.264 is an SPS, a PPS
+    /// and an IDR slice of filler: enough to be passed through, not decoded.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn feed_live_aac(tx: broadcast::Sender<RtpPacket>, stop: CancellationToken) -> JoinHandle<()> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_packets, pmt_section};
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let mut frames = Vec::new();
+        let mut off = 0usize;
+        while off + 7 <= ADTS.len() {
+            let len = (((ADTS[off + 3] as usize) & 0x03) << 11)
+                | ((ADTS[off + 4] as usize) << 3)
+                | ((ADTS[off + 5] as usize) >> 5);
+            if len < 7 || off + len > ADTS.len() {
+                break;
+            }
+            frames.push(ADTS[off..off + len].to_vec());
+            off += len;
+        }
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+        let mut au = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1e, 0xd9, 0x01, 0x41, 0xfb, 0x01, 0x10];
+        au.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80]);
+        au.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84]);
+        au.extend(std::iter::repeat_n(0x5a, 600));
+        tokio::spawn(async move {
+            let (mut cc_v, mut cc_a, mut cc_pat, mut cc_pmt) = (0u8, 0u8, 0u8, 0u8);
+            let (mut pts_v, mut pts_a) = (90_000u64, 90_000u64);
+            let (mut frame, mut seq, mut n) = (0usize, 0u16, 0u64);
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(40));
+            while !stop.is_cancelled() {
+                tick.tick().await;
+                let mut ts = Vec::new();
+                if n % 10 == 0 {
+                    ts.extend_from_slice(&pat_packet(&[(1, 0x1000)], 0, cc_pat));
+                    cc_pat = (cc_pat + 1) & 0x0F;
+                    ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], cc_pmt)[0]);
+                    cc_pmt = (cc_pmt + 1) & 0x0F;
+                }
+                n += 1;
+                ts.extend(pes_packets(0x100, 0xE0, &au, pts_v, &mut cc_v));
+                while pts_a < pts_v + 3600 {
+                    ts.extend(pes_packets(0x101, 0xC0, &frames[frame % frames.len()], pts_a, &mut cc_a));
+                    frame += 1;
+                    pts_a += 1920;
+                }
+                pts_v += 3600;
+                for chunk in ts.chunks(7 * 188) {
+                    let _ = tx.send(RtpPacket {
+                        data: bytes::Bytes::copy_from_slice(chunk),
+                        sequence_number: seq,
+                        rtp_timestamp: 0,
+                        recv_time_us: 0,
+                        is_raw_ts: true,
+                        upstream_seq: None,
+                        upstream_leg_id: None,
+                        sender_timestamp_us: None,
+                    });
+                    seq = seq.wrapping_add(1);
+                }
+            }
+        })
+    }
+
+    /// A viewer of a live AAC source re-encoded to Opus (`audio_encode`, the
+    /// output's config) pauses for 18 s — ICE goes down at 15 s — and comes
+    /// back. Each stream's lag (arrival time less RTP time) is measured over
+    /// the 2 s before the pause and from 5 s after it (once what the
+    /// viewer's socket held is read); both streams follow the source's PTS,
+    /// which follows the wall clock, so both lags should move by the same
+    /// amount. Returns how far audio's moved against video's, in seconds.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    async fn audio_slip_against_video_across_an_outage(audio_encode: serde_json::Value) -> f64 {
+        use super::super::webrtc::session::{SessionEvent, WebrtcSession};
+        use std::time::{Duration, Instant};
+
+        /// (arrival time, is audio, lag) of every media frame heard for `dur`.
+        async fn listen(
+            viewer: &mut WebrtcSession,
+            (audio_mid, video_mid): (str0m::media::Mid, str0m::media::Mid),
+            t0: Instant,
+            dur: Duration,
+        ) -> Vec<(f64, bool, f64)> {
+            let mut heard = Vec::new();
+            let cancel = CancellationToken::new();
+            let _ = tokio::time::timeout(dur, async {
+                loop {
+                    match viewer.poll_event(&cancel).await {
+                        SessionEvent::MediaData { mid, rtp_time, data, .. }
+                            if !data.is_empty() && (mid == audio_mid || mid == video_mid) =>
+                        {
+                            let t = t0.elapsed().as_secs_f64();
+                            heard.push((t, mid == audio_mid, t - rtp_time.as_seconds()));
+                        }
+                        SessionEvent::Disconnected => panic!("the viewer's own session ended"),
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+            heard
+        }
+        /// The median lag of one stream's frames heard between `from` and `to`.
+        fn lag(heard: &[(f64, bool, f64)], audio: bool, from: f64, to: f64) -> f64 {
+            let mut lags: Vec<f64> = heard
+                .iter()
+                .filter(|h| h.1 == audio && h.0 >= from && h.0 <= to)
+                .map(|h| h.2)
+                .collect();
+            assert!(
+                !lags.is_empty(),
+                "no {} heard {from:.1}-{to:.1} s",
+                if audio { "audio" } else { "video" }
+            );
+            lags.sort_by(f64::total_cmp);
+            lags[lags.len() / 2]
+        }
+
+        let (broadcast_tx, session_tx, mut raised, cancel, task, stats) =
+            whep_output_with_ts_audio(serde_json::json!({ "audio_encode": audio_encode }));
+        let _feed = feed_live_aac(broadcast_tx.clone(), cancel.child_token());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut viewer = viewer().await;
+        join_and_listen(&session_tx, &mut viewer).await;
+        let mids = (viewer.audio_mid.unwrap(), viewer.video_mid.unwrap());
+        let t0 = Instant::now();
+        let before = listen(&mut viewer, mids, t0, Duration::from_secs(4)).await;
+
+        // The viewer is not driven for 18 s: no checks, nothing read. From
+        // 15 s ICE is down, and nothing is sent.
+        let paused_at = t0.elapsed().as_secs_f64();
+        tokio::time::sleep(Duration::from_millis(16_500)).await;
+        let sent_at_16_5 = stats.packets_sent.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            stats.packets_sent.load(Ordering::Relaxed),
+            sent_at_16_5,
+            "sent to 16.5-18 s into the pause: ICE was not down, and the pause proves nothing"
+        );
+
+        let resumed_at = t0.elapsed().as_secs_f64();
+        let after = listen(&mut viewer, mids, t0, Duration::from_secs(10)).await;
+        let (audio_before, video_before) =
+            (lag(&before, true, paused_at - 2.0, paused_at), lag(&before, false, paused_at - 2.0, paused_at));
+        let (audio_after, video_after) =
+            (lag(&after, true, resumed_at + 5.0, f64::MAX), lag(&after, false, resumed_at + 5.0, f64::MAX));
+        let mut gone = false;
+        while let Ok(ev) = raised.try_recv() {
+            gone |= ev.message == "WHEP viewer disconnected";
+        }
+        assert!(!gone, "the viewer was let go");
+        assert!(!task.is_finished());
+        cancel.cancel();
+        (audio_after - audio_before) - (video_after - video_before)
+    }
+
+    /// A viewer of an `audio_encode` output that comes back from an outage
+    /// hears its audio on its video's clock. The send loop used to skip every
+    /// frame while ICE was down, and the Opus encoder — anchored on the
+    /// source's PTS once, then run on from there — resumed where it had
+    /// stopped: the viewer's audio was late by the whole outage for the rest
+    /// of the session (3.8 s, measured).
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[tokio::test]
+    async fn an_encoded_viewers_audio_keeps_time_with_its_video_across_an_outage() {
+        let slip = audio_slip_against_video_across_an_outage(serde_json::json!({ "codec": "opus" })).await;
+        assert!(slip.abs() < 0.5, "audio slipped {slip:.3} s against video across the outage");
+    }
+
+    /// The same with `silent_fallback`, whose encoder is opened at once and
+    /// fed silence whenever the source's audio stops.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[tokio::test]
+    async fn a_silent_fallback_viewers_audio_keeps_time_with_its_video_across_an_outage() {
+        let slip = audio_slip_against_video_across_an_outage(
+            serde_json::json!({ "codec": "opus", "silent_fallback": true }),
+        )
+        .await;
+        assert!(slip.abs() < 0.5, "audio slipped {slip:.3} s against video across the outage");
     }
 }
 
