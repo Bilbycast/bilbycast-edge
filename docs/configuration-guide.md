@@ -1394,11 +1394,11 @@ Publishers POST an SDP offer to `/api/v1/flows/{flow_id}/whip` and receive an SD
 The input takes **one publisher at a time**, and an answered publisher has **15 s** to complete ICE + DTLS. One that does not — its offer answered, then no STUN at all — is dropped with a Warning `webrtc_setup_timeout`, and the next publisher's POST is answered. Until 2026-10 such a publisher held the input for good: every later POST hung unanswered until the flow restarted. (One whose ICE completed before it fell silent was already let go after about as long, when ICE reported it disconnected.)
 
 > **Upgrade order.** An edge whose **WHIP output** publishes into this input
-> must be upgraded first. An edge from before the 2026-10 codec set — every
-> release through v0.113.0, and the 0.114.0 tree up to commit `0e8b8a6` —
-> panics on this input's answer and its output stops until the flow restarts;
-> a current WHIP output publishing into an old edge works. The same holds for
-> a relay's WHIP ingest. See
+> must be upgraded first. An edge from before the 2026-10 codec set — any
+> tree before the codec-fix merge `5f71c4c` (main through `8f4bf2c`), and
+> every release up to v0.113.0 — panics on this input's answer and its output
+> stops until the flow restarts; a current WHIP output publishing into an old
+> edge works. The same holds for a relay's WHIP ingest. See
 > [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
 
 The H.264 and Opus are remuxed into an SPTS (program 1) laid out from the
@@ -2601,11 +2601,12 @@ In **WHIP client** mode the endpoint's answer must accept H.264, the only video 
 
 > **Upgrade order.** Upgrade every edge carrying a **WHIP client** output
 > *before* the relay or edge it publishes into. An edge from before the
-> 2026-10 codec set — every release through v0.113.0, and the 0.114.0 tree up
-> to commit `0e8b8a6` — panics on a current relay's or edge's answer
-> (`Pt locked multiple times: 110`), and the output stops publishing until
-> the flow restarts. A current WHIP output publishing into an old relay or
-> edge works. See [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
+> 2026-10 codec set — any tree before the codec-fix merge `5f71c4c` (main
+> through `8f4bf2c`), and every release up to v0.113.0 — panics on a current
+> relay's or edge's answer (`Pt locked multiple times: 110`), and the output
+> stops publishing until the flow restarts. A current WHIP output publishing
+> into an old relay or edge works. See
+> [supported-protocols.md](supported-protocols.md#webrtc-whipwhep).
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
