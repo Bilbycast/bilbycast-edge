@@ -183,6 +183,16 @@ async fn whip_input_loop(
                 continue;
             }
         };
+        // The tracks the answer accepted. An m-line it refused (a VP8-only
+        // video) still reaches `video_mid` / `audio_mid` as a track, but
+        // nothing is published on it: the layout must not count it.
+        let (video_pt, audio_pt) = session.answered_pts(&answer);
+        let tracks = |session: &WebrtcSession| {
+            (
+                session.video_mid.is_some() && video_pt.is_some(),
+                session.audio_mid.is_some() && audio_pt.is_some(),
+            )
+        };
 
         let session_id = uuid::Uuid::new_v4().to_string();
         // Per-session cancel token, rooted at the input task's parent. The
@@ -256,12 +266,8 @@ async fn whip_input_loop(
                     if !is_video && !is_audio_stream {
                         continue;
                     }
-                    layout.apply(
-                        &mut whip.muxer,
-                        session.video_mid.is_some(),
-                        session.audio_mid.is_some(),
-                        flow_id,
-                    );
+                    let (has_video, has_audio) = tracks(&session);
+                    layout.apply(&mut whip.muxer, has_video, has_audio, flow_id);
                     let Some((ts_chunks, pts_90khz)) = whip.frame(
                         !is_audio_stream,
                         &data,
@@ -298,12 +304,8 @@ async fn whip_input_loop(
                 SessionEvent::MediaAdded { .. } => {
                     // A track negotiated after media began: the layout
                     // follows (a PMT version bump, PCR moving with video).
-                    layout.renegotiated(
-                        &mut whip.muxer,
-                        session.video_mid.is_some(),
-                        session.audio_mid.is_some(),
-                        flow_id,
-                    );
+                    let (has_video, has_audio) = tracks(&session);
+                    layout.renegotiated(&mut whip.muxer, has_video, has_audio, flow_id);
                 }
                 SessionEvent::Connected => {
                     connected = true;
@@ -886,6 +888,89 @@ mod tests {
         let mut ts = mux.mux_video(&[0, 0, 0, 1, 0x65, 0x88], 90_000, 90_000, true);
         ts.extend(mux.mux_audio_opus(&[0xFC; 80], 90_000));
         assert_eq!(layout_of(&ts), ((0x0100, vec![(0x1B, 0x0100), (0x06, 0x0101)]), vec![0x0100]));
+    }
+
+    /// A publisher whose video the answer refused — it offered VP8 alone, with
+    /// Opus — publishes its audio, laid out as the audio-only publish it is:
+    /// the PMT lists the Opus alone, as PCR_PID, and the Opus carries the
+    /// PCR. The refused video m-line still reaches the session as a track
+    /// (`MediaAdded`), so the layout took it for video: PCR_PID named a PID
+    /// nothing was sent on and no packet carried a PCR. (Its answer was not
+    /// SDP until 2026-10 — the refused m-line had no format — so no such
+    /// publisher got this far.)
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_publish_whose_video_was_refused_is_laid_out_audio_only() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+        use std::time::{Duration, Instant};
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(4096);
+        let stats = std::sync::Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config, "flow-w", broadcast_tx, stats, cancel, session_rx, &events,
+                    &mut transcoder, &mut post, Duration::from_secs(10),
+                )
+                .await;
+            }
+        });
+
+        // A publisher offering VP8 video and Opus audio.
+        let vp8 = str0m::Rtc::builder().clear_codecs().enable_vp8(true).enable_opus(true, false);
+        let peer = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: false };
+        let mut publisher = WebrtcSession::with_rtc_config(&peer, vp8).await.unwrap();
+        let (offer, pending) = publisher.create_offer(true, true, true).unwrap();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        session_tx.send(NewSessionMsg { offer_sdp: offer, reply }).await.unwrap();
+        let (answer, _session, _cancel) = answer.await.unwrap().unwrap();
+        publisher.apply_answer(&answer, pending).unwrap();
+        let (audio_mid, audio_pt) = (publisher.audio_mid.unwrap(), {
+            let mid = publisher.audio_mid.unwrap();
+            publisher.get_pt(mid).expect("Opus accepted")
+        });
+        assert_eq!(publisher.get_pt(publisher.video_mid.unwrap()), None, "VP8 refused");
+        let connected = tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(publisher.poll_event(&cancel).await, SessionEvent::Connected) {}
+        })
+        .await;
+        assert!(connected.is_ok(), "the publisher never connected");
+
+        // Half a second of Opus (20 ms frames, TOC 0xFC), then the TS.
+        let mut ts = Vec::new();
+        for k in 0..25u64 {
+            let at = str0m::media::MediaTime::new(k * 960, str0m::media::Frequency::FORTY_EIGHT_KHZ);
+            publisher.write_media(audio_mid, audio_pt, Instant::now(), at, &[0xFC; 80]).unwrap();
+            publisher.drain_outputs().await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = publisher.drive_udp_io().await;
+            while let Ok(pkt) = published.try_recv() {
+                ts.push(pkt.data);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while ts.len() < 20 && tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(pkt)) = tokio::time::timeout(Duration::from_millis(100), published.recv()).await {
+                ts.push(pkt.data);
+            }
+        }
+        let ts: Vec<bytes::Bytes> = ts.iter().flat_map(|c| c.chunks(188).map(bytes::Bytes::copy_from_slice).collect::<Vec<_>>()).collect();
+        assert!(!ts.is_empty(), "nothing was published");
+        assert_eq!(layout_of(&ts), ((0x0101, vec![(0x06, 0x0101)]), vec![0x0101]));
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     /// A browser publisher's RTP padding-only packets — Chromium's bandwidth

@@ -1404,7 +1404,10 @@ The input takes **one publisher at a time**, and an answered publisher has **15 
 The H.264 and Opus are remuxed into an SPTS (program 1) laid out from the
 tracks the offer negotiated: video and Opus, video alone, or **Opus alone** —
 then the PMT lists the Opus alone, names it as PCR_PID, and the Opus carries
-the PCR, 100 ms behind each PES as on an audio-only RTMP publish. The muxer
+the PCR, 100 ms behind each PES as on an audio-only RTMP publish. A track the
+answer refused counts as none: a publisher offering VP8 video and Opus
+publishes an Opus-alone SPTS (since 2026-10; the refused video used to be
+counted, naming as PCR_PID a PID nothing was sent on, with no PCR at all). The muxer
 used to assume video and no audio: the Opus of an A/V publish never reached
 the PMT, and an audio-only publish named an absent video PID as PCR_PID and
 carried no PCR. Each track's RTP timestamps start at a random base of the
