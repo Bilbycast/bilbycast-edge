@@ -4,6 +4,19 @@ Release of bilbycast-edge version {{VERSION}}.
 
 {{CHANGES}}
 
+## Upgrading from v0.114.0 or earlier
+
+<!-- Static text: remove once no supported upgrade starts at v0.114.0 or earlier. -->
+The manager's **Upgrade** button cannot move an edge on v0.114.0 or earlier onto this release. Those edges' upgrade check refuses every genuine release: v0.105.0 to v0.114.0 with `upgrade_identity_not_allowed` (it compared the wrong certificate field with its allowlist), older edges with `upgrade_signature_invalid`. It failed closed, so nothing unverified was ever installed, but the fix is in this binary, so move each such edge onto it **once** by hand:
+
+```bash
+curl -fsSL https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/install-edge.sh \
+  | sudo bash -s -- --upgrade-installer
+sudo systemctl restart bilbycast-edge
+```
+
+A plain re-run of `install-edge.sh` on an installed node changes nothing; `--upgrade-installer` installs the latest release and points `current` at it, leaving `config.json` and `secrets.json` alone. From then on the Upgrade button works. See [docs/upgrade.md](https://github.com/Bilbycast/bilbycast-edge/blob/main/docs/upgrade.md).
+
 ## Upgrading from v0.113.0 or earlier
 
 <!-- Static text: remove once no supported upgrade starts at v0.113.0 or earlier. -->
