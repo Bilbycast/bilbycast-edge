@@ -153,9 +153,14 @@ fn identity_matches_allowlist(claims: &CertIdentity, allowed: &[AllowedSigner]) 
             claims.ref_claim.as_deref(),
         ) {
             (Some(iss), Some(repo), Some(wf), Some(rf)) => {
+                // The SAN is `<workflow>@<ref>`, so the workflow path must end
+                // where the `@` begins: `nightly-release.yml.evil.yml@…` is a
+                // different workflow file that merely starts the same way.
                 iss == s.issuer
                     && repo == s.repo
-                    && wf.starts_with(s.workflow)
+                    && wf
+                        .strip_prefix(s.workflow)
+                        .is_some_and(|rest| rest.starts_with('@'))
                     && ref_matches(s.ref_pattern, rf)
             }
             _ => false,
@@ -460,19 +465,38 @@ pub(crate) mod sigstore_inner {
         };
 
         // Sigstore Fulcio extension OIDs (registered under 1.3.6.1.4.1.57264.1.x).
-        const OID_ISSUER: &str = "1.3.6.1.4.1.57264.1.1";
-        const OID_REPO: &str = "1.3.6.1.4.1.57264.1.5";
-        const OID_REF: &str = "1.3.6.1.4.1.57264.1.6";
+        // Fulcio writes each claim twice: the current extensions hold a
+        // DER-encoded UTF8String, the deprecated ones (.1.1 to .1.6) the raw
+        // bytes. Read the current one and fall back to the deprecated one,
+        // so a cert missing either still yields the claim.
+        //
+        // The repository is not the same string in the two. The current
+        // `source-repository-uri` (.1.12) is `https://github.com/<owner>/<repo>`,
+        // the form the allowlist holds; the deprecated `GitHub Workflow
+        // Repository` (.1.5) is bare `<owner>/<repo>`. Comparing .1.5 against
+        // the allowlist rejected every genuine release on v0.105.0 to v0.114.0
+        // (earlier edges failed before this check, parsing cosign's
+        // base64-of-PEM cert).
+        const OID_ISSUER: &str = "1.3.6.1.4.1.57264.1.8";
+        const OID_ISSUER_V1: &str = "1.3.6.1.4.1.57264.1.1";
+        const OID_REPO_URI: &str = "1.3.6.1.4.1.57264.1.12";
+        const OID_REPO_V1: &str = "1.3.6.1.4.1.57264.1.5";
+        const OID_REF: &str = "1.3.6.1.4.1.57264.1.14";
+        const OID_REF_V1: &str = "1.3.6.1.4.1.57264.1.6";
         // SAN URI carries the workflow + ref combined; we parse it below.
 
+        let (mut issuer_v1, mut repo_v1, mut ref_v1) = (None, None, None);
         if let Some(exts) = &cert.tbs_certificate.extensions {
             for e in exts {
                 let oid = e.extn_id.to_string();
                 let bytes = e.extn_value.as_bytes();
                 match oid.as_str() {
-                    OID_ISSUER => id.issuer = utf8_or_none(bytes),
-                    OID_REPO => id.repo = utf8_or_none(bytes),
-                    OID_REF => id.ref_claim = utf8_or_none(bytes),
+                    OID_ISSUER => id.issuer = der_utf8(bytes),
+                    OID_ISSUER_V1 => issuer_v1 = raw_utf8(bytes),
+                    OID_REPO_URI => id.repo = der_utf8(bytes),
+                    OID_REPO_V1 => repo_v1 = raw_utf8(bytes),
+                    OID_REF => id.ref_claim = der_utf8(bytes),
+                    OID_REF_V1 => ref_v1 = raw_utf8(bytes),
                     _ => {}
                 }
                 // SAN is OID 2.5.29.17. Cosign's keyless flow puts the
@@ -484,20 +508,30 @@ pub(crate) mod sigstore_inner {
             }
         }
 
+        id.issuer = id.issuer.or(issuer_v1);
+        // The issuer must be GitHub Actions to match at all, so a bare
+        // `<owner>/<repo>` is a github.com repository.
+        id.repo = id
+            .repo
+            .or_else(|| repo_v1.map(|r| format!("https://github.com/{r}")));
+        id.ref_claim = id.ref_claim.or(ref_v1);
+
         Ok(id)
     }
 
-    fn utf8_or_none(bytes: &[u8]) -> Option<String> {
-        // Fulcio extensions are typed `OCTET STRING` whose value is
-        // itself an `IA5String`/`UTF8String`. Skip any leading DER tag/
-        // length bytes by scanning to the first printable run.
-        let s = String::from_utf8_lossy(bytes).into_owned();
-        if s.is_empty() {
-            None
-        } else {
-            // Trim leading non-printable bytes from the DER prefix.
-            Some(s.trim_start_matches(|c: char| !c.is_ascii_graphic()).to_string())
-        }
+    /// A current Fulcio extension: the `OCTET STRING` holds a DER `UTF8String`.
+    fn der_utf8(bytes: &[u8]) -> Option<String> {
+        use x509_cert::der::{asn1::Utf8StringRef, Decode};
+        let s = Utf8StringRef::from_der(bytes).ok()?;
+        Some(s.as_str().to_owned()).filter(|s| !s.is_empty())
+    }
+
+    /// A deprecated Fulcio extension: the `OCTET STRING` holds the raw bytes.
+    fn raw_utf8(bytes: &[u8]) -> Option<String> {
+        std::str::from_utf8(bytes)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
     }
 
     fn first_san_uri(bytes: &[u8]) -> Option<String> {
@@ -755,5 +789,131 @@ mod tests {
             ..id.clone()
         };
         assert!(!identity_matches_allowlist(&bad_workflow, &allow));
+
+        let longer_workflow = CertIdentity {
+            workflow_uri: Some(
+                "https://github.com/Bilbycast/bilbycast-edge/.github/workflows/nightly-release.yml.evil.yml@refs/tags/v0.45.4"
+                    .to_string(),
+            ),
+            ..id.clone()
+        };
+        assert!(!identity_matches_allowlist(&longer_workflow, &allow));
+    }
+
+    // Real Fulcio certificates, decoded from published releases'
+    // `manifest.sig.bundle` (which carries them base64-of-PEM). They expired
+    // ten minutes after issue; claim extraction never reads the validity
+    // window, so that does not matter here.
+    const EDGE_RELEASE_CERT: &str = include_str!("testdata/fulcio-edge-v0.114.0.pem");
+    const RELAY_RELEASE_CERT: &str = include_str!("testdata/fulcio-relay-v0.16.0.pem");
+    // Self-signed with OpenSSL, the edge's identity in each: only the deprecated
+    // extensions (.1.1 / .1.5 / .1.6, raw bytes), only the current ones (.1.8 /
+    // .1.12 / .1.14, DER UTF8String), and both with every claim different in
+    // the current set (`https://issuer.example.com`, `attacker/bilbycast-edge`,
+    // `refs/heads/main`) — once with the deprecated extensions first, once with
+    // the current ones first, so neither first-wins nor last-wins passes.
+    const V1_ONLY_CERT: &str = include_str!("testdata/fulcio-synthetic-v1-only.pem");
+    const V2_ONLY_CERT: &str = include_str!("testdata/fulcio-synthetic-v2-only.pem");
+    const CONFLICT_V1_FIRST_CERT: &str =
+        include_str!("testdata/fulcio-synthetic-conflict-v1-first.pem");
+    const CONFLICT_V2_FIRST_CERT: &str =
+        include_str!("testdata/fulcio-synthetic-conflict-v2-first.pem");
+
+    /// The test that would have caught the defect: every earlier test built a
+    /// `CertIdentity` by hand, already holding the URL form, so none of them
+    /// ever read a certificate Fulcio had issued. Fed this one, the old reader
+    /// took the repository from .1.5 (`Bilbycast/bilbycast-edge`) and the
+    /// allowlist refused every genuine release.
+    #[test]
+    fn a_real_release_certificate_matches_the_compiled_in_allowlist() {
+        let id = sigstore_inner::extract_identity_claims(EDGE_RELEASE_CERT).unwrap();
+        assert_eq!(
+            id.issuer.as_deref(),
+            Some("https://token.actions.githubusercontent.com")
+        );
+        assert_eq!(
+            id.repo.as_deref(),
+            Some("https://github.com/Bilbycast/bilbycast-edge")
+        );
+        assert_eq!(id.ref_claim.as_deref(), Some("refs/tags/v0.114.0"));
+        assert_eq!(
+            id.workflow_uri.as_deref(),
+            Some(
+                "https://github.com/Bilbycast/bilbycast-edge/.github/workflows/nightly-release.yml@refs/tags/v0.114.0"
+            )
+        );
+        assert!(identity_matches_allowlist(
+            &id,
+            crate::upgrade::trust::ALLOWED_SIGNERS
+        ));
+    }
+
+    #[test]
+    fn another_repositorys_release_certificate_is_refused() {
+        let id = sigstore_inner::extract_identity_claims(RELAY_RELEASE_CERT).unwrap();
+        assert_eq!(
+            id.repo.as_deref(),
+            Some("https://github.com/Bilbycast/bilbycast-relay")
+        );
+        assert!(!identity_matches_allowlist(
+            &id,
+            crate::upgrade::trust::ALLOWED_SIGNERS
+        ));
+    }
+
+    #[test]
+    fn a_certificate_with_only_the_deprecated_extensions_still_matches() {
+        let id = sigstore_inner::extract_identity_claims(V1_ONLY_CERT).unwrap();
+        assert_eq!(
+            id.issuer.as_deref(),
+            Some("https://token.actions.githubusercontent.com")
+        );
+        assert_eq!(
+            id.repo.as_deref(),
+            Some("https://github.com/Bilbycast/bilbycast-edge")
+        );
+        assert_eq!(id.ref_claim.as_deref(), Some("refs/tags/v0.45.4"));
+        assert!(identity_matches_allowlist(
+            &id,
+            crate::upgrade::trust::ALLOWED_SIGNERS
+        ));
+    }
+
+    #[test]
+    fn a_certificate_with_only_the_current_extensions_matches() {
+        let id = sigstore_inner::extract_identity_claims(V2_ONLY_CERT).unwrap();
+        assert_eq!(
+            id.issuer.as_deref(),
+            Some("https://token.actions.githubusercontent.com")
+        );
+        assert_eq!(
+            id.repo.as_deref(),
+            Some("https://github.com/Bilbycast/bilbycast-edge")
+        );
+        assert_eq!(id.ref_claim.as_deref(), Some("refs/tags/v0.45.4"));
+        assert!(identity_matches_allowlist(
+            &id,
+            crate::upgrade::trust::ALLOWED_SIGNERS
+        ));
+    }
+
+    /// Each current extension is read in preference to its deprecated one, not
+    /// alongside it, whichever comes first in the certificate: a deprecated value
+    /// that would match cannot rescue a current one that does not.
+    #[test]
+    fn the_current_extensions_win_over_the_deprecated_ones() {
+        for cert in [CONFLICT_V1_FIRST_CERT, CONFLICT_V2_FIRST_CERT] {
+            let id = sigstore_inner::extract_identity_claims(cert).unwrap();
+            assert_eq!(id.issuer.as_deref(), Some("https://issuer.example.com"));
+            assert_eq!(
+                id.repo.as_deref(),
+                Some("https://github.com/attacker/bilbycast-edge")
+            );
+            assert_eq!(id.ref_claim.as_deref(), Some("refs/heads/main"));
+            assert!(!identity_matches_allowlist(
+                &id,
+                crate::upgrade::trust::ALLOWED_SIGNERS
+            ));
+        }
     }
 }

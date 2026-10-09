@@ -9,6 +9,16 @@ bilbycast-edge supports manager-driven remote upgrades. A customer's manager can
 5. Drain in-flight flows and exit for systemd respawn.
 6. If the new binary fails to authenticate to the manager within the configured health window, automatically roll the symlink back to the previous version.
 
+> **Edges up to and including v0.114.0 cannot be upgraded from the manager.** v0.105.0 to v0.114.0 read the repository from the deprecated Fulcio extension (OID `1.3.6.1.4.1.57264.1.5`, which holds `Bilbycast/bilbycast-edge`) and compared it with an allowlist that holds `https://github.com/Bilbycast/bilbycast-edge`, so every genuine release was refused with `upgrade_identity_not_allowed`; older edges failed earlier, with `upgrade_signature_invalid`, because they could not parse the certificate encoding cosign writes. Both failed closed — nothing unverified was ever installed — but the fix lives in the new binary, so each such edge has to be moved to the first release after v0.114.0 **once** by hand. A plain re-run of `install-edge.sh` on an installed node changes nothing; pass `--upgrade-installer`, which installs the latest release and points `current` at it, then restart:
+>
+> ```bash
+> curl -fsSL https://github.com/Bilbycast/bilbycast-edge/releases/latest/download/install-edge.sh \
+>   | sudo bash -s -- --upgrade-installer
+> sudo systemctl restart bilbycast-edge
+> ```
+>
+> Manager-driven upgrades work from then on.
+
 The trust model is described in [docs/security.md](security.md). This document is both the architecture reference and the operator runbook — start with [How it works](#how-it-works) for the design overview, then jump to [Configuration](#configuration) and [Triggering an upgrade](#triggering-an-upgrade) for day-to-day operations.
 
 ## How it works
@@ -63,8 +73,10 @@ GitHub Actions workflow run
    │     4. signing event uploaded to Rekor (public log)
    │     5. ephemeral keypair thrown away
    │
-   ├── cosign verify-blob (paranoid local re-check against the production
-   │     identity allowlist — catches a typo here, not in production)
+   ├── cosign verify-blob (re-checks the signature, issuer and SAN with
+   │     cosign's own matcher — not the edge's verify.rs, which it never
+   │     runs; the edge's reading of a real release certificate is pinned
+   │     by a unit test fed one)
    │
    └── publish manifest.json + manifest.sig.bundle alongside the tarballs
          on the GitHub release.
@@ -359,7 +371,7 @@ A third-party security auditor can independently verify any bilbycast-edge relea
 curl -fsSL -O https://github.com/Bilbycast/bilbycast-edge/releases/download/v0.45.4/manifest.json
 curl -fsSL -O https://github.com/Bilbycast/bilbycast-edge/releases/download/v0.45.4/manifest.sig.bundle
 
-# Verify with the same identity policy the edge enforces.
+# Verify with an identity policy equivalent to the edge's (cosign's matcher, not the edge's code).
 cosign verify-blob \
     --bundle manifest.sig.bundle \
     --certificate-identity-regexp 'https://github\.com/Bilbycast/bilbycast-edge/\.github/workflows/nightly-release\.yml@refs/tags/v.*' \

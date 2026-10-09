@@ -24,6 +24,8 @@
 .env
 .env.*
 *.pem
+# Public Fulcio certificates the upgrade-verify tests read with include_str!.
+!src/upgrade/testdata/*.pem
 *.key
 *.crt
 certs/

@@ -1008,7 +1008,7 @@ they are visible on the command result and in the node's log, nowhere else.
 | Error code | Trigger |
 |------------|---------|
 | `upgrade_signature_invalid` | Sigstore bundle signature did not verify against the manifest bytes. |
-| `upgrade_identity_not_allowed` | Bundle was signed but the cert's identity claims (issuer / repo / workflow / ref) do not match the compiled-in `ALLOWED_SIGNERS` allowlist. The actual identity claims are logged for forensic review. |
+| `upgrade_identity_not_allowed` | Bundle was signed but the cert's identity claims (issuer / repo / workflow / ref) do not match the compiled-in `ALLOWED_SIGNERS` allowlist. The actual identity claims are logged for forensic review. Every edge from v0.105.0 to v0.114.0 raises this against **every genuine release**: it read the repository from the wrong certificate extension (older edges fail earlier, with `upgrade_signature_invalid`). Move such an edge to a fixed release once by hand with `install-edge.sh --upgrade-installer`; see [upgrade.md](upgrade.md). |
 | `upgrade_rekor_invalid` | Rekor inclusion proof missing or malformed. |
 | `upgrade_disabled` | Edge received `upgrade_binary` while `upgrades.enabled = false`. The command is rejected. |
 | `upgrade_channel_not_allowed` | Edge received `upgrade_binary` for a channel not in `upgrades.allowed_channels`. |

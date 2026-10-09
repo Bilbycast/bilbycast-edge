@@ -27,19 +27,25 @@
 /// corresponding claim on the Fulcio-issued certificate's SAN extensions.
 #[derive(Debug, Clone, Copy)]
 pub struct AllowedSigner {
-    /// Required `oidc-issuer` extension (OID 1.3.6.1.4.1.57264.1.1).
+    /// Required OIDC issuer: the `Issuer (V2)` extension (OID
+    /// 1.3.6.1.4.1.57264.1.8), or the deprecated `Issuer` (.1.1) when the
+    /// certificate has no .1.8. Matched as exact string equality.
     pub issuer: &'static str,
-    /// Required `source-repository-uri` ext (OID 1.3.6.1.4.1.57264.1.5).
-    /// Matched as exact string equality.
+    /// Required repository, as `https://github.com/<owner>/<repo>`: the
+    /// `Source Repository URI` extension (OID 1.3.6.1.4.1.57264.1.12), or the
+    /// deprecated `GitHub Workflow Repository` (.1.5, bare `<owner>/<repo>`,
+    /// read with `https://github.com/` put in front) when the certificate has
+    /// no .1.12. Matched as exact string equality.
     pub repo: &'static str,
-    /// Required `source-repository-ref` ext (OID 1.3.6.1.4.1.57264.1.6).
+    /// Required ref: the `Source Repository Ref` extension (OID
+    /// 1.3.6.1.4.1.57264.1.14), or the deprecated `GitHub Workflow Ref` (.1.6).
     /// Glob-matched: `refs/tags/v*` accepts any release tag, `refs/tags/v0.45.*`
     /// would scope to the 0.45.x line. Today every entry is `refs/tags/v*`.
     pub ref_pattern: &'static str,
     /// Required `build-config-uri` / workflow path. Matched against the
     /// `Subject Alternative Name` URI claim
-    /// `https://github.com/<repo>/<workflow>@<ref>`. Today this is the
-    /// nightly-release workflow.
+    /// `https://github.com/<repo>/<workflow>@<ref>`, which must continue with
+    /// `@` straight after it. Today this is the nightly-release workflow.
     pub workflow: &'static str,
 }
 

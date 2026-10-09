@@ -83,8 +83,13 @@ following, so a standard node needs **no manual post-install steps**:
 **Re-running is safe.** A bare re-run on an already-installed node short-circuits
 (`Already installed … use --upgrade-installer`) and changes nothing. Pass
 `--upgrade-installer` to refresh the install script + systemd unit and
-re-reconcile the groups without touching `config.json`, `secrets.json`, or the
-installed binary; advance the *binary* from the manager UI's Upgrade button. One
+re-reconcile the groups without touching `config.json` or `secrets.json`. It
+also installs the **latest release** if this node does not have it yet and
+points `current` at it, so restart the service afterwards
+(`sudo systemctl restart bilbycast-edge`) to run it — this is the manual
+upgrade path, and the only one for an edge on v0.114.0 or older, whose
+manager-driven upgrade refuses every release (see [upgrade.md](upgrade.md)).
+Otherwise advance the binary from the manager UI's Upgrade button. One
 nuance on the `BILBYCAST_MEDIA_DIR` / `REPLAY_DIR` env pins: they're written on a
 **fresh** install, and a re-run via `--upgrade-installer` **adds** them only if
 your `edge.env` has no media/replay setting at all (healing a node installed

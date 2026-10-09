@@ -1022,11 +1022,14 @@ jobs:
       - name: Verify cosign signature locally (paranoid check)
         run: |
           cd artifacts
-          # Round-trip the signature via cosign verify-blob using the
-          # same identity allowlist the edge enforces. This catches any
-          # mismatch between the workflow path and the allowlist BEFORE
-          # we publish the release artefacts — better here than in
-          # production rollback territory.
+          # Round-trip the signature via cosign verify-blob before we
+          # publish. This is cosign's identity matcher, not the edge's: it
+          # checks the issuer and SAN against the regexp below and never
+          # runs src/upgrade/verify.rs, so it cannot catch a defect there
+          # — every edge from v0.105.0 to v0.114.0 refused every genuine
+          # release while this step passed. What pins the edge's own reading of a
+          # release certificate is the unit test fed a real one
+          # (a_real_release_certificate_matches_the_compiled_in_allowlist).
           cosign verify-blob \
               --bundle manifest.sig.bundle \
               --certificate-identity-regexp 'https://github\.com/Bilbycast/bilbycast-edge/\.github/workflows/nightly-release\.yml@refs/tags/v.*' \
