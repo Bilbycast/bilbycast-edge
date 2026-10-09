@@ -7443,7 +7443,9 @@ mod update_input_restart_tests {
     //!
     //! UDP on loopback, as in `config_diff_live_flow_tests`: a held port is a
     //! real EADDRINUSE at the input's own bind, which is the asynchronous
-    //! failure a flow start does not return.
+    //! failure a flow start does not return. The fixed ports sit below the
+    //! kernel's ephemeral range (32768–60999 on Linux), so a parallel test's
+    //! outbound socket can never be handed one and fake a bind failure.
     use super::*;
     use crate::config::models::ResourceLimitAction;
     use crate::stats::collector::StatsCollector;
@@ -7607,11 +7609,11 @@ mod update_input_restart_tests {
     /// and the ack says so — never success.
     #[tokio::test]
     async fn an_edit_the_flow_cannot_start_on_is_rolled_back_and_refused() {
-        let rig = running_flow(41861).await;
-        let _held = std::net::UdpSocket::bind("127.0.0.1:41862").expect("hold the port");
+        let rig = running_flow(29861).await;
+        let _held = std::net::UdpSocket::bind("127.0.0.1:29862").expect("hold the port");
 
         let err = rig
-            .update_input(41862)
+            .update_input(29862)
             .await
             .expect_err("a flow that failed to restart on the edit must not ack success");
 
@@ -7620,30 +7622,30 @@ mod update_input_restart_tests {
             Some("input_update_flow_restart_failed")
         );
         assert!(
-            err.message.contains("127.0.0.1:41862"),
+            err.message.contains("127.0.0.1:29862"),
             "the refusal must carry the edited input's own failure: {}",
             err.message
         );
         assert_eq!(
             rig.configured_bind().await,
-            "127.0.0.1:41861",
+            "127.0.0.1:29861",
             "the refused edit must not stay in config"
         );
         assert_eq!(
             rig.running_bind().as_deref(),
-            Some("127.0.0.1:41861"),
+            Some("127.0.0.1:29861"),
             "the flow must be running again on the previous definition"
         );
         assert!(
-            rig.listening_on(41861).await,
+            rig.listening_on(29861).await,
             "the restored input must bind its port again, not merely be registered"
         );
         assert!(
-            std::net::UdpSocket::bind("127.0.0.1:41861").is_err(),
+            std::net::UdpSocket::bind("127.0.0.1:29861").is_err(),
             "the restored input must hold its port"
         );
         assert!(
-            !rig.persisted().is_some_and(|c| c.contains("41862")),
+            !rig.persisted().is_some_and(|c| c.contains("29862")),
             "config.json must not record an edit that was refused"
         );
         let _ = rig.fm.destroy_flow("f1").await;
@@ -7657,21 +7659,21 @@ mod update_input_restart_tests {
     /// port held as well, neither input could be fixed by an edit at all.
     #[tokio::test]
     async fn another_members_bind_failure_does_not_refuse_the_edit() {
-        let _held = std::net::UdpSocket::bind("127.0.0.1:41868").expect("hold the port");
-        let rig = running_flow_with(41867, vec![udp_input("b", 41868)]).await;
+        let _held = std::net::UdpSocket::bind("127.0.0.1:29868").expect("hold the port");
+        let rig = running_flow_with(29867, vec![udp_input("b", 29868)]).await;
 
-        rig.update_input(41869)
+        rig.update_input(29869)
             .await
             .expect("the edited input came up; b's failure is not the edit's");
 
-        assert_eq!(rig.configured_bind().await, "127.0.0.1:41869");
-        assert_eq!(rig.running_bind().as_deref(), Some("127.0.0.1:41869"));
+        assert_eq!(rig.configured_bind().await, "127.0.0.1:29869");
+        assert_eq!(rig.running_bind().as_deref(), Some("127.0.0.1:29869"));
         assert!(
-            rig.persisted().is_some_and(|c| c.contains("41869")),
+            rig.persisted().is_some_and(|c| c.contains("29869")),
             "an applied edit is persisted"
         );
         assert!(
-            rig.listening_on(41869).await,
+            rig.listening_on(29869).await,
             "input 'a' must be on air on its new port"
         );
         let _ = rig.fm.destroy_flow("f1").await;
@@ -7718,17 +7720,17 @@ mod update_input_restart_tests {
     /// its own code, so it is not read as a harmless refusal.
     #[tokio::test]
     async fn a_flow_that_starts_on_neither_definition_is_reported_down() {
-        let rig = running_flow(41863).await;
-        let _held = std::net::UdpSocket::bind("127.0.0.1:41864").expect("hold the port");
+        let rig = running_flow(29863).await;
+        let _held = std::net::UdpSocket::bind("127.0.0.1:29864").expect("hold the port");
         let gate_shuts_mid_edit = async {
             assert!(
-                rig.saw_all(vec![port_conflict_of("a", 41864)]).await,
+                rig.saw_all(vec![port_conflict_of("a", 29864)]).await,
                 "the edited input never reported its own bind failure"
             );
             rig.resources.resources_critical.store(true, Ordering::Relaxed);
         };
 
-        let (result, ()) = tokio::join!(rig.update_input(41864), gate_shuts_mid_edit);
+        let (result, ()) = tokio::join!(rig.update_input(29864), gate_shuts_mid_edit);
         let err = result.expect_err("a flow left down by an edit must not ack success");
 
         assert_eq!(err.code.as_deref(), Some("input_update_rollback_failed"));
@@ -7738,7 +7740,7 @@ mod update_input_restart_tests {
         );
         assert_eq!(
             rig.configured_bind().await,
-            "127.0.0.1:41863",
+            "127.0.0.1:29863",
             "the refused edit must not replace the definition the flow last ran on"
         );
     }
@@ -7747,14 +7749,14 @@ mod update_input_restart_tests {
     /// persisted, and the ack is a success.
     #[tokio::test]
     async fn an_edit_the_flow_starts_on_is_applied() {
-        let rig = running_flow(41865).await;
+        let rig = running_flow(29865).await;
 
-        rig.update_input(41866).await.expect("the edit applies");
+        rig.update_input(29866).await.expect("the edit applies");
 
-        assert_eq!(rig.configured_bind().await, "127.0.0.1:41866");
-        assert_eq!(rig.running_bind().as_deref(), Some("127.0.0.1:41866"));
+        assert_eq!(rig.configured_bind().await, "127.0.0.1:29866");
+        assert_eq!(rig.running_bind().as_deref(), Some("127.0.0.1:29866"));
         assert!(
-            rig.persisted().is_some_and(|c| c.contains("41866")),
+            rig.persisted().is_some_and(|c| c.contains("29866")),
             "an applied edit is persisted"
         );
         let _ = rig.fm.destroy_flow("f1").await;
