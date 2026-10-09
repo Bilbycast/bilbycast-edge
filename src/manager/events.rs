@@ -61,7 +61,7 @@ pub struct Event {
 
 /// Snapshot of a recent critical event captured by the in-process recent-event
 /// tracker. Used by command handlers (`create_flow`, `update_flow`,
-/// `update_input`, `update_output`) to surface a runtime port-conflict or
+/// `update_input`, `add_input`) to surface a runtime port-conflict or
 /// bind-failure that happened just after the spawn returned `Ok` — so the
 /// `command_ack` reflects the real outcome.
 #[derive(Debug, Clone)]

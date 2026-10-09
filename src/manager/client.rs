@@ -2110,6 +2110,180 @@ impl From<&str> for CommandError {
     }
 }
 
+/// Start `resolved` and see its binds through, so `Ok` means the flow is
+/// running: create the runtime, register its WHIP/WHEP channels, and wait
+/// out [`FIRST_BIND_WAIT`] for the `port_conflict` / `bind_failed` a
+/// listener only reports after the spawn has returned. A flow that failed to
+/// bind is torn down again before the error is returned.
+async fn start_flow_awaiting_binds(
+    flow_manager: &Arc<FlowManager>,
+    resolved: ResolvedFlow,
+    _webrtc_sessions: &WebrtcRegistry,
+) -> Result<(), CommandError> {
+    let flow_id = resolved.config.id.clone();
+    let spawn_started_at = Instant::now();
+    let _runtime = flow_manager
+        .create_flow(resolved)
+        .await
+        .map_err(|e| CommandError::new(e.to_string()))?;
+    #[cfg(feature = "webrtc")]
+    register_whip_if_needed(_webrtc_sessions, &_runtime);
+    #[cfg(feature = "webrtc")]
+    register_whep_if_needed(_webrtc_sessions, &_runtime);
+    if let Some(err) =
+        wait_for_first_bind_failure(flow_manager.event_sender(), &flow_id, spawn_started_at).await
+    {
+        let _ = flow_manager.destroy_flow(&flow_id).await;
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Rebuild the running `flow` after `update_input` replaced one of its
+/// members. `cfg.inputs[idx]` already holds the edit; `previous` is the
+/// definition the flow is running on.
+///
+/// `Ok` only when the flow is running on the edit, bind window included. A
+/// flow that will not come up on it is put back on `previous` — in `cfg` too,
+/// so the refused edit is never persisted — and the command fails with
+/// `input_update_flow_restart_failed`. If the flow cannot be started on
+/// `previous` either, it is down and the command fails with
+/// `input_update_rollback_failed`; `cfg` keeps `previous`, the definition it
+/// last ran on. Before this a failed rebuild was logged, the edit persisted
+/// and the command acked success with the flow off air — which the manager,
+/// and its assistant's plan executor, took as applied.
+async fn restart_flow_for_input_update(
+    flow_manager: &Arc<FlowManager>,
+    cfg: &mut AppConfig,
+    flow: &FlowConfig,
+    idx: usize,
+    previous: InputDefinition,
+    webrtc_sessions: &WebrtcRegistry,
+) -> Result<(), CommandError> {
+    let flow_id = flow.id.as_str();
+    let input_id = previous.id.clone();
+    // Resolved before anything is stopped: a rebuild that cannot even be
+    // resolved leaves the flow running on what it has.
+    let resolved = match cfg.resolve_flow(flow) {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            cfg.inputs[idx] = previous;
+            let cause = CommandError::new(e.to_string());
+            return Err(refuse_input_update(
+                flow_manager,
+                flow_id,
+                &input_id,
+                &cause,
+            ));
+        }
+    };
+    let _ = flow_manager.destroy_flow(flow_id).await;
+    let Err(cause) = start_flow_awaiting_binds(flow_manager, resolved, webrtc_sessions).await
+    else {
+        tracing::info!("Restarted flow '{flow_id}' after input update");
+        return Ok(());
+    };
+    tracing::warn!(
+        "Flow '{flow_id}' did not restart on the edited input '{input_id}': {} — restoring the \
+         previous definition",
+        cause.message
+    );
+    cfg.inputs[idx] = previous;
+    // Not held to the bind window: this puts back the flow that was running,
+    // so whatever failed in it before the edit (an output's start-time
+    // Critical, say) fails the same way again and reports through its own
+    // events, as at any start. Tearing it down for that would take off air a
+    // flow the edit found running.
+    let restored = match cfg.resolve_flow(flow) {
+        Ok(resolved) => flow_manager
+            .create_flow(resolved)
+            .await
+            .map_err(|e| e.to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    let rollback = match restored {
+        Ok(_runtime) => {
+            #[cfg(feature = "webrtc")]
+            register_whip_if_needed(webrtc_sessions, &_runtime);
+            #[cfg(feature = "webrtc")]
+            register_whep_if_needed(webrtc_sessions, &_runtime);
+            return Err(refuse_input_update(
+                flow_manager,
+                flow_id,
+                &input_id,
+                &cause,
+            ));
+        }
+        Err(rollback) => rollback,
+    };
+    tracing::error!(
+        "Flow '{flow_id}' is down: it restarted on neither the edited nor the previous \
+         definition of input '{input_id}': {rollback}"
+    );
+    flow_manager.event_sender().emit_flow_with_details(
+        EventSeverity::Critical,
+        category::FLOW,
+        format!(
+            "Flow '{flow_id}' is down: it could not be restarted with the edited input \
+             '{input_id}' ({}) nor with that input's previous definition ({rollback})",
+            cause.message
+        ),
+        flow_id,
+        serde_json::json!({
+            "error_code": "input_update_rollback_failed",
+            "flow_id": flow_id,
+            "input_id": input_id,
+            "error": cause.message,
+            "cause_error_code": cause.code,
+            "rollback_error": rollback,
+        }),
+    );
+    Err(CommandError::with_code(
+        format!(
+            "Input '{input_id}' was not updated, and flow '{flow_id}' is DOWN: it could not be \
+             restarted with the new definition ({}) nor with the previous one ({rollback}). The \
+             previous definition is kept; restart the flow once the cause is cleared.",
+            cause.message
+        ),
+        "input_update_rollback_failed",
+    ))
+}
+
+/// The refusal `restart_flow_for_input_update` returns when the flow is on
+/// its previous definition: a Warning event, and the error for the ack.
+fn refuse_input_update(
+    flow_manager: &FlowManager,
+    flow_id: &str,
+    input_id: &str,
+    cause: &CommandError,
+) -> CommandError {
+    flow_manager.event_sender().emit_flow_with_details(
+        EventSeverity::Warning,
+        category::FLOW,
+        format!(
+            "Input '{input_id}' update refused: flow '{flow_id}' could not be restarted with it \
+             and is running on the previous definition: {}",
+            cause.message
+        ),
+        flow_id,
+        serde_json::json!({
+            "error_code": "input_update_flow_restart_failed",
+            "flow_id": flow_id,
+            "input_id": input_id,
+            "error": cause.message,
+            "cause_error_code": cause.code,
+        }),
+    );
+    CommandError::with_code(
+        format!(
+            "Input '{input_id}' was not updated: flow '{flow_id}' could not be restarted with the \
+             new definition ({}). It is running on the previous definition, which is kept.",
+            cause.message
+        ),
+        "input_update_flow_restart_failed",
+    )
+}
+
 async fn execute_command(
     action_type: &str,
     action: &serde_json::Value,
@@ -2932,13 +3106,17 @@ async fn execute_command(
             cfg.inputs[idx] = input.clone();
             if let Some(flow) = cfg.flow_using_input(input_id).cloned()
                 && flow.enabled && flow_manager.is_running(&flow.id) && config_or_meta_changed {
-                    let _ = flow_manager.destroy_flow(&flow.id).await;
-                    if let Ok(resolved) = cfg.resolve_flow(&flow) {
-                        match flow_manager.create_flow(resolved).await {
-                            Ok(_) => tracing::info!("Restarted flow '{}' after input update", flow.id),
-                            Err(e) => tracing::error!("Failed to restart flow '{}': {e}", flow.id),
-                        }
-                    }
+                    // Fails — and leaves `cfg` on `old` — whenever the flow
+                    // does not come back up on the edit.
+                    restart_flow_for_input_update(
+                        flow_manager,
+                        &mut cfg,
+                        &flow,
+                        idx,
+                        old,
+                        _webrtc_sessions,
+                    )
+                    .await?;
                 }
             persist_config(&cfg, config_path, secrets_path).await?;
             flow_manager.event_sender().emit_input(
@@ -7180,6 +7358,261 @@ mod config_diff_live_flow_tests {
         running.sort();
         assert_eq!(running, vec!["a".to_string(), "b".to_string()]);
         let _ = fm.destroy_flow("f1").await;
+    }
+}
+
+#[cfg(test)]
+mod update_input_restart_tests {
+    //! `update_input` on an input whose flow is running rebuilds that flow.
+    //! Driven end to end through `execute_command` against a live
+    //! `FlowManager`, so what is asserted is the ack the manager receives
+    //! and what is actually running afterwards. The two used to disagree: a
+    //! rebuild that failed was logged and acked as success, the edit
+    //! persisted, and the flow stayed down.
+    //!
+    //! UDP on loopback, as in `config_diff_live_flow_tests`: a held port is a
+    //! real EADDRINUSE at the input's own bind, which is the asynchronous
+    //! failure a flow start does not return.
+    use super::*;
+    use crate::config::models::ResourceLimitAction;
+    use crate::stats::collector::StatsCollector;
+
+    struct Rig {
+        fm: Arc<FlowManager>,
+        tm: Arc<TunnelManager>,
+        cfg: Arc<RwLock<AppConfig>>,
+        resources: Arc<SystemResourceState>,
+        events: mpsc::Receiver<Event>,
+        dir: tempfile::TempDir,
+    }
+
+    fn udp_input(id: &str, port: u16) -> InputDefinition {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "type": "udp",
+            "bind_addr": format!("127.0.0.1:{port}")
+        }))
+        .expect("input fixture")
+    }
+
+    fn bind_of(def: &InputDefinition) -> String {
+        serde_json::to_value(def).expect("serialise input")["bind_addr"]
+            .as_str()
+            .expect("udp input has a bind_addr")
+            .to_string()
+    }
+
+    /// Flow `f1` running on input `a` bound to `port`.
+    async fn running_flow(port: u16) -> Rig {
+        running_flow_with(port, Vec::new()).await
+    }
+
+    /// Flow `f1` running on input `a` bound to `port`, plus `standbys`. Flow
+    /// starts are gated on critical resources, so raising
+    /// `resources_critical` makes every later `create_flow` fail — the
+    /// rollback included.
+    async fn running_flow_with(port: u16, standbys: Vec<InputDefinition>) -> Rig {
+        let mut inputs = vec![udp_input("a", port)];
+        inputs.extend(standbys);
+        let (event_sender, events) = crate::manager::events::event_channel();
+        let resources = Arc::new(SystemResourceState::new());
+        let fm = Arc::new(FlowManager::new(
+            Arc::new(StatsCollector::new()),
+            false,
+            event_sender.clone(),
+            resources.clone(),
+            Some(ResourceLimitAction::GateFlows),
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ));
+        let flow: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f1", "name": "f1",
+            "input_ids": inputs.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+            "output_ids": [],
+        }))
+        .expect("flow fixture");
+        let cfg = AppConfig {
+            inputs,
+            flows: vec![flow],
+            ..Default::default()
+        };
+        let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
+        fm.create_flow(resolved).await.expect("create_flow");
+        let mut rig = Rig {
+            fm,
+            tm: Arc::new(TunnelManager::new(event_sender)),
+            cfg: Arc::new(RwLock::new(cfg)),
+            resources,
+            events,
+            dir: tempfile::tempdir().expect("tempdir"),
+        };
+        // Consumed here, so a later one can only come from the command.
+        assert!(rig.listening_on(port).await, "the flow's input never bound");
+        rig
+    }
+
+    impl Rig {
+        /// Whether input `a` reports itself bound to `port` within 2 s. The
+        /// input binds on its own task, after the flow start has returned.
+        async fn listening_on(&mut self, port: u16) -> bool {
+            let wanted = format!("UDP input listening on 127.0.0.1:{port}");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while let Some(event) = self.events.recv().await {
+                    if event.message == wanted {
+                        return true;
+                    }
+                }
+                false
+            })
+            .await
+            .unwrap_or(false)
+        }
+
+        async fn update_input(&self, port: u16) -> Result<Option<serde_json::Value>, CommandError> {
+            let action = serde_json::json!({ "input_id": "a", "input": udp_input("a", port) });
+            execute_command(
+                "update_input",
+                &action,
+                &self.fm,
+                &self.tm,
+                &self.cfg,
+                &self.dir.path().join("config.json"),
+                &self.dir.path().join("secrets.json"),
+                &WebrtcRegistry::default(),
+            )
+            .await
+        }
+
+        async fn configured_bind(&self) -> String {
+            bind_of(&self.cfg.read().await.inputs[0])
+        }
+
+        fn running_bind(&self) -> Option<String> {
+            self.fm
+                .get_runtime("f1")
+                .map(|rt| bind_of(&rt.config.inputs[0]))
+        }
+
+        fn persisted(&self) -> Option<String> {
+            std::fs::read_to_string(self.dir.path().join("config.json")).ok()
+        }
+    }
+
+    /// The edit asks for a port something else holds. The flow cannot come up
+    /// on it, so the previous definition goes back on air, stays the config,
+    /// and the ack says so — never success.
+    #[tokio::test]
+    async fn an_edit_the_flow_cannot_start_on_is_rolled_back_and_refused() {
+        let mut rig = running_flow(41861).await;
+        let _held = std::net::UdpSocket::bind("127.0.0.1:41862").expect("hold the port");
+
+        let err = rig
+            .update_input(41862)
+            .await
+            .expect_err("a flow that failed to restart on the edit must not ack success");
+
+        assert_eq!(
+            err.code.as_deref(),
+            Some("input_update_flow_restart_failed")
+        );
+        assert_eq!(
+            rig.configured_bind().await,
+            "127.0.0.1:41861",
+            "the refused edit must not stay in config"
+        );
+        assert_eq!(
+            rig.running_bind().as_deref(),
+            Some("127.0.0.1:41861"),
+            "the flow must be running again on the previous definition"
+        );
+        assert!(
+            rig.listening_on(41861).await,
+            "the restored input must bind its port again, not merely be registered"
+        );
+        assert!(
+            std::net::UdpSocket::bind("127.0.0.1:41861").is_err(),
+            "the restored input must hold its port"
+        );
+        assert!(
+            !rig.persisted().is_some_and(|c| c.contains("41862")),
+            "config.json must not record an edit that was refused"
+        );
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// A fault the flow already had recurs on every start: here a standby
+    /// member whose port something else holds. The rebuilt flow raises it
+    /// inside the bind window, so the edit is refused — the window's meaning
+    /// on every rebuild path. What is pinned is the rollback: it is not held
+    /// to the window, so the flow comes back as the edit found it rather than
+    /// being taken off air for a fault it was already running with.
+    #[tokio::test]
+    async fn a_fault_the_flow_already_had_does_not_take_it_down() {
+        let _held = std::net::UdpSocket::bind("127.0.0.1:41868").expect("hold the port");
+        let mut rig = running_flow_with(41867, vec![udp_input("b", 41868)]).await;
+
+        let err = rig
+            .update_input(41869)
+            .await
+            .expect_err("the rebuilt flow raised a bind failure inside the window");
+
+        assert_eq!(
+            err.code.as_deref(),
+            Some("input_update_flow_restart_failed"),
+            "the flow is back on the previous definition, so this is a refusal, not a flow down"
+        );
+        assert_eq!(rig.running_bind().as_deref(), Some("127.0.0.1:41867"));
+        assert!(
+            rig.listening_on(41867).await,
+            "input 'a' must be back on air on its previous port"
+        );
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// Neither definition starts (flow starts are gated). The flow is down and
+    /// the ack must say that, with its own code, so it is not read as a
+    /// harmless refusal.
+    #[tokio::test]
+    async fn a_flow_that_starts_on_neither_definition_is_reported_down() {
+        let rig = running_flow(41863).await;
+        rig.resources
+            .resources_critical
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let err = rig
+            .update_input(41864)
+            .await
+            .expect_err("a flow left down by an edit must not ack success");
+
+        assert_eq!(err.code.as_deref(), Some("input_update_rollback_failed"));
+        assert!(
+            !rig.fm.is_running("f1"),
+            "nothing could start, so nothing may claim to be running"
+        );
+        assert_eq!(
+            rig.configured_bind().await,
+            "127.0.0.1:41863",
+            "the refused edit must not replace the definition the flow last ran on"
+        );
+    }
+
+    /// The ordinary case: the flow restarts on the new definition, which is
+    /// persisted, and the ack is a success.
+    #[tokio::test]
+    async fn an_edit_the_flow_starts_on_is_applied() {
+        let rig = running_flow(41865).await;
+
+        rig.update_input(41866).await.expect("the edit applies");
+
+        assert_eq!(rig.configured_bind().await, "127.0.0.1:41866");
+        assert_eq!(rig.running_bind().as_deref(), Some("127.0.0.1:41866"));
+        assert!(
+            rig.persisted().is_some_and(|c| c.contains("41866")),
+            "an applied edit is persisted"
+        );
+        let _ = rig.fm.destroy_flow("f1").await;
     }
 }
 
