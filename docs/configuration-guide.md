@@ -3734,7 +3734,7 @@ RUST_LOG=bilbycast_edge=debug,tower_http=info bilbycast-edge --config config.jso
 
 bilbycast-edge automatically persists configuration changes to disk when inputs, outputs, or flows are modified through the API. Operational config (including user parameters like SRT passphrases, RTSP credentials, RTMP keys) goes to `config.json`, infrastructure secrets go to `secrets.json`:
 
-- **Create/Update/Delete input** (`POST/PUT/DELETE /api/v1/inputs[/{id}]`) -- Modifies the top-level `inputs` array and saves.
+- **Create/Update/Delete input** (`POST/PUT/DELETE /api/v1/inputs[/{id}]`) -- Modifies the top-level `inputs` array and saves. An update to an input of a running flow is saved only once the flow has restarted on it; a refused one (409 / 500) is not saved.
 - **Create/Update/Delete output** (`POST/PUT/DELETE /api/v1/outputs[/{id}]`) -- Modifies the top-level `outputs` array and saves.
 - **Create flow** (`POST /api/v1/flows`) -- Appends the new flow and saves.
 - **Update flow** (`PUT /api/v1/flows/{id}`) -- Replaces the flow in-place and saves.

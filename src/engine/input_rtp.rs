@@ -183,9 +183,9 @@ pub fn spawn_rtp_input(
             stats.clone(),
         );
         let result = if config.redundancy.is_some() {
-            rtp_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            rtp_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         } else {
-            rtp_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            rtp_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         };
         if let Err(e) = result {
             tracing::error!("RTP input task exited with error: {e}");
@@ -263,6 +263,7 @@ async fn rtp_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -286,7 +287,7 @@ async fn rtp_input_loop(
         }
         Err(e) => {
             use crate::manager::events::{BindProto, BindScope};
-            let scope = BindScope::flow(flow_id);
+            let scope = BindScope::flow_input(flow_id, input_id);
             if crate::util::port_error::anyhow_is_addr_in_use(&e) {
                 events.emit_port_conflict("RTP input", &config.bind_addr, BindProto::Udp, scope, &e);
             } else {
@@ -470,6 +471,7 @@ async fn rtp_input_redundant_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -498,7 +500,7 @@ async fn rtp_input_redundant_loop(
         }
         Err(e) => {
             use crate::manager::events::{BindProto, BindScope};
-            let scope = BindScope::flow(flow_id);
+            let scope = BindScope::flow_input(flow_id, input_id);
             if crate::util::port_error::anyhow_is_addr_in_use(&e) {
                 events.emit_port_conflict("RTP input leg 1", &config.bind_addr, BindProto::Udp, scope, &e);
             } else {
@@ -527,7 +529,7 @@ async fn rtp_input_redundant_loop(
         }
         Err(e) => {
             use crate::manager::events::{BindProto, BindScope};
-            let scope = BindScope::flow(flow_id);
+            let scope = BindScope::flow_input(flow_id, input_id);
             if crate::util::port_error::anyhow_is_addr_in_use(&e) {
                 events.emit_port_conflict("RTP input leg 2", &redundancy.bind_addr, BindProto::Udp, scope, &e);
             } else {

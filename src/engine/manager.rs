@@ -581,6 +581,16 @@ impl FlowManager {
             .collect()
     }
 
+    /// Whether [`Self::create_flow`] refuses every start right now: system
+    /// resources are critical and `resource_limits.critical_action` is
+    /// `gate_flows`. A caller about to stop a running flow in order to start
+    /// it again asks first, since the restart would be refused and leave the
+    /// flow down. [`Self::add_input`] is gated on the same condition.
+    pub fn flow_starts_gated(&self) -> bool {
+        self.resource_state.resources_critical.load(Ordering::Relaxed)
+            && matches!(self.resource_action, Some(ResourceLimitAction::GateFlows))
+    }
+
     /// Create and start a new media flow from the given configuration.
     ///
     /// This performs the full bring-up sequence:
@@ -596,8 +606,7 @@ impl FlowManager {
     /// bind failure, SRT connection error).
     pub async fn create_flow(self: &Arc<Self>, config: ResolvedFlow) -> Result<Arc<FlowRuntime>> {
         // Gate flow creation when system resources are critical
-        if self.resource_state.resources_critical.load(Ordering::Relaxed)
-            && matches!(self.resource_action, Some(ResourceLimitAction::GateFlows)) {
+        if self.flow_starts_gated() {
                 self.event_sender.emit_flow_with_details(
                     EventSeverity::Warning,
                     category::SYSTEM_RESOURCES,
@@ -923,9 +932,7 @@ impl FlowManager {
         // structured `input_resource_critical` `error_code` so the manager
         // UI shows the same banner it uses for the create path. Other
         // resource modes (alarm-only) fall through.
-        if self.resource_state.resources_critical.load(Ordering::Relaxed)
-            && matches!(self.resource_action, Some(ResourceLimitAction::GateFlows))
-        {
+        if self.flow_starts_gated() {
             self.event_sender.emit_flow_with_details(
                 EventSeverity::Warning,
                 category::SYSTEM_RESOURCES,

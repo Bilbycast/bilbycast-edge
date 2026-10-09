@@ -74,12 +74,13 @@ pub fn spawn_rtmp_input(
         let is_pub = is_publishing.clone();
         let server_event_sender = event_sender.clone();
         let server_flow_id = flow_id.clone();
+        let server_input_id = input_id.clone();
         let server_listen_addr = config.listen_addr.clone();
         tokio::spawn(async move {
             if let Err(e) = run_rtmp_server(server_config, media_tx, is_pub, cancel_server).await {
                 tracing::error!("RTMP server error: {e:#}");
                 use crate::manager::events::{BindProto, BindScope};
-                let scope = BindScope::flow(&server_flow_id);
+                let scope = BindScope::flow_input(&server_flow_id, &server_input_id);
                 if crate::util::port_error::anyhow_is_addr_in_use(&e) {
                     server_event_sender.emit_port_conflict(
                         "RTMP server",

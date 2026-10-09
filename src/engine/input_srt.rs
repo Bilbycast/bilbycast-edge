@@ -360,7 +360,7 @@ async fn srt_input_loop(
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_input_listener_loop(config, publisher, stats, cancel, events, flow_id, transcoder, post).await,
+        SrtMode::Listener => srt_input_listener_loop(config, publisher, stats, cancel, events, flow_id, input_id, transcoder, post).await,
         _ => srt_input_caller_loop(config, publisher, stats, cancel, events, flow_id, input_id, transcoder, post).await,
     }
 }
@@ -374,6 +374,7 @@ async fn srt_input_listener_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -382,7 +383,7 @@ async fn srt_input_listener_loop(
         Err(e) => {
             use crate::manager::events::{BindProto, BindScope};
             let addr = config.local_addr.as_deref().unwrap_or("auto");
-            let scope = BindScope::flow(flow_id);
+            let scope = BindScope::flow_input(flow_id, input_id);
             if crate::util::port_error::anyhow_is_addr_in_use(&e) {
                 events.emit_port_conflict("SRT input listener", addr, BindProto::Udp, scope, &e);
             } else {
@@ -821,7 +822,7 @@ async fn srt_input_redundant_loop(
             Err(e) => {
                 use crate::manager::events::{BindProto, BindScope};
                 let addr = config.local_addr.as_deref().unwrap_or("auto");
-                let scope = BindScope::flow(flow_id);
+                let scope = BindScope::flow_input(flow_id, input_id);
                 if crate::util::port_error::anyhow_is_addr_in_use(&e) {
                     events.emit_port_conflict("SRT input listener leg 1", addr, BindProto::Udp, scope, &e);
                 } else {
@@ -839,7 +840,7 @@ async fn srt_input_redundant_loop(
             Err(e) => {
                 use crate::manager::events::{BindProto, BindScope};
                 let addr = redundancy.local_addr.as_deref().unwrap_or("auto");
-                let scope = BindScope::flow(flow_id);
+                let scope = BindScope::flow_input(flow_id, input_id);
                 if crate::util::port_error::anyhow_is_addr_in_use(&e) {
                     events.emit_port_conflict("SRT input listener leg 2", addr, BindProto::Udp, scope, &e);
                 } else {

@@ -78,6 +78,13 @@ pub struct RecentCritical {
 #[derive(Debug, Default)]
 struct RecentCriticalTracker {
     by_flow: std::sync::RwLock<HashMap<String, RecentCritical>>,
+    /// The same, for each input of a flow — keyed `(flow_id, input_id)` and
+    /// filled only by events that name both. `by_flow` keeps one slot per
+    /// flow, so whichever member raised a Critical last owns it: one input's
+    /// bind failure can stand in for another's, or be overwritten by the
+    /// flow-scoped "input lost" that follows it. `update_input` has to know
+    /// whether the input it edited is the one that failed, so it reads this.
+    by_input: std::sync::RwLock<HashMap<(String, String), RecentCritical>>,
 }
 
 /// Clonable handle for sending events from any component.
@@ -150,9 +157,10 @@ impl EventSender {
             );
         }
         // Stash flow-scoped Critical events so the WS command handler can
-        // poll for a runtime bind failure that happened just after spawn.
-        // We only track the flow scope today — the input/output scope would
-        // need an eviction policy and isn't read by anything yet.
+        // poll for a runtime bind failure that happened just after spawn —
+        // per flow, and per input of the flow when the event names one. An
+        // input event with no flow (a standby listener's) is not kept: no
+        // command polls for it.
         if event.severity == EventSeverity::Critical
             && let Some(fid) = &event.flow_id
         {
@@ -165,6 +173,11 @@ impl EventSender {
                 error_code: code,
                 captured_at: Instant::now(),
             };
+            if let Some(iid) = &event.input_id
+                && let Ok(mut g) = self.recent.by_input.write()
+            {
+                g.insert((fid.clone(), iid.clone()), entry.clone());
+            }
             if let Ok(mut g) = self.recent.by_flow.write() {
                 g.insert(fid.clone(), entry);
             }
@@ -189,6 +202,26 @@ impl EventSender {
             && entry.captured_at >= since
         {
             g.remove(flow_id);
+            return Some(entry);
+        }
+        None
+    }
+
+    /// [`Self::take_recent_critical_for_flow`] narrowed to one input of the
+    /// flow: only a Critical that names both `flow_id` and `input_id` is
+    /// returned, so another member's failure never answers for this one.
+    pub fn take_recent_critical_for_input(
+        &self,
+        flow_id: &str,
+        input_id: &str,
+        since: Instant,
+    ) -> Option<RecentCritical> {
+        let mut g = self.recent.by_input.write().ok()?;
+        let key = (flow_id.to_string(), input_id.to_string());
+        if let Some(entry) = g.get(&key).cloned()
+            && entry.captured_at >= since
+        {
+            g.remove(&key);
             return Some(entry);
         }
         None
@@ -516,13 +549,10 @@ impl<'a> BindScope<'a> {
     pub fn input(input_id: &'a str) -> Self {
         Self { input_id: Some(input_id), ..Self::default() }
     }
-    pub fn flow(flow_id: &'a str) -> Self {
-        Self { flow_id: Some(flow_id), ..Self::default() }
-    }
-    /// Test-only convenience used by `emit_port_conflict_event_shape` to
-    /// pin both flow and input ids — the rest of the code paths populate
-    /// the struct directly.
-    #[cfg(test)]
+    /// A flow member's bind. Every input of a running flow reports its bind
+    /// failures in this scope, so the event lands on the input in the
+    /// manager and `update_input` can tell the input it edited from the
+    /// flow's other members.
     pub fn flow_input(flow_id: &'a str, input_id: &'a str) -> Self {
         Self { flow_id: Some(flow_id), input_id: Some(input_id), output_id: None }
     }
@@ -1034,6 +1064,41 @@ mod tests {
         assert_eq!(details["component"], "SRT input listener");
         assert_eq!(details["addr"], "0.0.0.0:9527");
         assert_eq!(details["protocol"], "UDP");
+    }
+
+    /// The per-input slot answers only for the input it names. The flow slot
+    /// holds whichever Critical came last — here the flow-scoped "input
+    /// lost" an input task raises after its bind failure — so it cannot say
+    /// which member failed.
+    #[test]
+    fn recent_critical_is_kept_per_input_of_a_flow() {
+        let (sender, _rx) = event_channel();
+        let since = Instant::now();
+        sender.emit_port_conflict(
+            "UDP input",
+            "127.0.0.1:5002",
+            BindProto::Udp,
+            BindScope::flow_input("f1", "b"),
+            "address already in use",
+        );
+        sender.emit_flow(EventSeverity::Critical, category::FLOW, "Flow input lost", "f1");
+
+        assert!(
+            sender.take_recent_critical_for_input("f1", "a", since).is_none(),
+            "b's failure must not answer for a"
+        );
+        let b = sender
+            .take_recent_critical_for_input("f1", "b", since)
+            .expect("b's own failure");
+        assert_eq!(b.error_code.as_deref(), Some("port_conflict"));
+        assert!(
+            sender.take_recent_critical_for_input("f1", "b", since).is_none(),
+            "taken on read"
+        );
+        let flow = sender
+            .take_recent_critical_for_flow("f1", since)
+            .expect("the flow slot");
+        assert_eq!(flow.event.message, "Flow input lost");
     }
 
     /// `emit_bind_failed` is the non-EADDRINUSE counterpart — same shape but

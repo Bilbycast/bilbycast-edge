@@ -154,10 +154,10 @@ pub fn spawn_rist_input(
             );
         }
         let result = if config.redundancy.is_some() {
-            rist_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post)
+            rist_input_redundant_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post)
                 .await
         } else {
-            rist_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await
+            rist_input_loop(config, broadcast_tx, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         };
         if let Err(e) = result {
             tracing::error!("RIST input task exited with error: {e}");
@@ -196,6 +196,7 @@ async fn rist_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -204,7 +205,7 @@ async fn rist_input_loop(
 
     let mut socket = RistSocket::receiver(sc).await.map_err(|e| {
         use crate::manager::events::{BindProto, BindScope};
-        let scope = BindScope::flow(flow_id);
+        let scope = BindScope::flow_input(flow_id, input_id);
         let component = "RIST input";
         let addr = config.bind_addr.clone();
         let err_str = format!("{e}");
@@ -326,6 +327,7 @@ async fn rist_input_redundant_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -341,7 +343,7 @@ async fn rist_input_redundant_loop(
         .await
         .map_err(|e| {
             use crate::manager::events::{BindProto, BindScope};
-            let scope = BindScope::flow(flow_id);
+            let scope = BindScope::flow_input(flow_id, input_id);
             let err_str = format!("{e}");
             if err_str.to_lowercase().contains("address") && err_str.to_lowercase().contains("use") {
                 events.emit_port_conflict("RIST input leg 1", &config.bind_addr, BindProto::Udp, scope, &err_str);
@@ -354,7 +356,7 @@ async fn rist_input_redundant_loop(
         .await
         .map_err(|e| {
             use crate::manager::events::{BindProto, BindScope};
-            let scope = BindScope::flow(flow_id);
+            let scope = BindScope::flow_input(flow_id, input_id);
             let err_str = format!("{e}");
             if err_str.to_lowercase().contains("address") && err_str.to_lowercase().contains("use") {
                 events.emit_port_conflict("RIST input leg 2", &redundancy.bind_addr, BindProto::Udp, scope, &err_str);

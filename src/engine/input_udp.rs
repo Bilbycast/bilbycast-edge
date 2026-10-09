@@ -108,7 +108,7 @@ pub fn spawn_udp_input(
             cancel.clone(),
             stats.clone(),
         );
-        if let Err(e) = udp_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &mut transcoder, &mut post).await {
+        if let Err(e) = udp_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await {
             tracing::error!("UDP input task exited with error: {e}");
             event_sender.emit_flow(EventSeverity::Critical, category::FLOW, format!("Flow input lost: {e}"), &flow_id);
         }
@@ -122,6 +122,7 @@ async fn udp_input_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -145,7 +146,7 @@ async fn udp_input_loop(
         }
         Err(e) => {
             use crate::manager::events::{BindProto, BindScope};
-            let scope = BindScope::flow(flow_id);
+            let scope = BindScope::flow_input(flow_id, input_id);
             if crate::util::port_error::anyhow_is_addr_in_use(&e) {
                 events.emit_port_conflict("UDP input", &config.bind_addr, BindProto::Udp, scope, &e);
             } else {

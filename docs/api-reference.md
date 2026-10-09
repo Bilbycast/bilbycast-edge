@@ -275,7 +275,7 @@ Create a new input definition. **Auth:** `admin`. Body is an `InputDefinition`. 
 
 ### PUT /api/v1/inputs/{input_id}
 
-Update an existing input. **Auth:** `admin`. The path `input_id` overrides the body `id`. If the input is assigned to a running flow, that flow is restarted. Returns 404 if not found, 400 on validation failure.
+Update an existing input. **Auth:** `admin`. The path `input_id` overrides the body `id`. If the input is assigned to a running flow, that flow is restarted on the edit — the same rebuild as the manager's `update_input` command — and the edit is saved only once the flow is running on it, the edited input's 600 ms bind window included. Returns 404 if not found, 400 on validation failure, **409** when the edit was refused and the flow is still running on the previous definition (the flow would not start on the edit — the edited input could not bind its port, say — or flow starts are gated by `resource_limits.critical_action: "gate_flows"`, in which case the flow is not touched), and **500** when the flow could be restarted on neither definition and is down. Nothing is saved on any of these. A bind failure of one of the flow's *other* inputs does not refuse the edit: it is a fault the flow already had, and it runs with it as before.
 
 ### DELETE /api/v1/inputs/{input_id}
 
