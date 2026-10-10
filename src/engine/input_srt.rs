@@ -437,7 +437,12 @@ async fn srt_input_listener_loop(
         );
 
         let poller_cancel = cancel.child_token();
-        spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
+        spawn_srt_stats_poller(
+            socket.clone(),
+            stats.input_srt_stats_cache.clone(),
+            Some(stats.input_srt_recv_dropped.clone()),
+            poller_cancel.clone(),
+        );
 
         let disconnected = srt_input_recv_loop(
             &socket, &publisher, &stats, &cancel,
@@ -608,7 +613,12 @@ async fn srt_input_caller_loop(
         );
 
         let poller_cancel = cancel.child_token();
-        spawn_srt_stats_poller(socket.clone(), stats.input_srt_stats_cache.clone(), poller_cancel.clone());
+        spawn_srt_stats_poller(
+            socket.clone(),
+            stats.input_srt_stats_cache.clone(),
+            Some(stats.input_srt_recv_dropped.clone()),
+            poller_cancel.clone(),
+        );
 
         let disconnected = srt_input_recv_loop(
             &socket, &publisher, &stats, &cancel,

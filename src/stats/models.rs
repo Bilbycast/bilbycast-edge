@@ -750,7 +750,9 @@ pub struct InputStats {
     pub bytes_received: u64,
     /// Estimated receive bitrate in bits per second.
     pub bitrate_bps: u64,
-    /// Number of RTP packets detected as lost (sequence gaps).
+    /// Packets that never reached the flow: RTP sequence gaps, plus the
+    /// packets an SRT input's receiver dropped for missing the TSBPD deadline
+    /// (libsrt `pktRcvDropTotal`, summed across reconnects).
     pub packets_lost: u64,
     /// Packets dropped by ingress filters (source IP, payload type, rate limit).
     pub packets_filtered: u64,

@@ -49,7 +49,7 @@ Emitted unconditionally at the top of every scrape.
 | `bilbycast_edge_flow_input_packets_total` | counter | `flow_id` | Packets received on the active input. |
 | `bilbycast_edge_flow_input_bytes_total` | counter | `flow_id` | Bytes received on the active input. |
 | `bilbycast_edge_flow_input_bitrate_bps` | gauge | `flow_id` | Input bitrate estimate (bits/sec). |
-| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Sequence gaps detected. |
+| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Packets that never reached the flow: sequence gaps, plus SRT receiver too-late drops (libsrt `pktRcvDropTotal`, summed across reconnects). |
 | `bilbycast_edge_flow_input_fec_recovered_total` | counter | `flow_id` | Packets recovered by 2022-1 FEC. |
 | `bilbycast_edge_flow_output_packets_total` | counter | `flow_id,output_id` | Packets emitted per output. |
 | `bilbycast_edge_flow_output_bytes_total` | counter | `flow_id,output_id` | Bytes emitted per output. |
