@@ -682,7 +682,7 @@ async fn srt_output_listener_loop(
         let mut rx = broadcast_tx.subscribe();
 
         let poller_cancel = cancel.child_token();
-        spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
+        spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), None, poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
         let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
@@ -836,7 +836,7 @@ async fn srt_output_caller_loop(
         let mut rx = broadcast_tx.subscribe();
 
         let poller_cancel = cancel.child_token();
-        spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), poller_cancel.clone());
+        spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), None, poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
         let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;

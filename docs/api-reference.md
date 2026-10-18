@@ -1065,10 +1065,10 @@ Every field from `active_input_id` down is `skip_serializing_if`-guarded: its **
 | `packets_received` | integer | Total RTP packets received |
 | `bytes_received` | integer | Total bytes received |
 | `bitrate_bps` | integer | Current bitrate in bits/sec |
-| `packets_lost` | integer | Packets lost (sequence gaps) |
+| `packets_lost` | integer | Packets that never reached the flow: sequence gaps on RTP-framed inputs, plus, on an SRT input, the packets libsrt dropped for missing the TSBPD deadline (`srt_stats.pkt_recv_drop_total`, summed across reconnects). A raw-TS SRT payload has no sequence the edge can see, so the SRT term is the only loss such an input can report. When it is non-zero the flow carries an `srt_recv_dropped` health reason quoting the negotiated latency and the RTT |
 | `packets_filtered` | integer | Packets dropped by ingress filters |
 | `packets_recovered_fec` | integer | Packets recovered via FEC |
-| `srt_stats` | object/null | SRT leg 1 stats (if SRT input) |
+| `srt_stats` | object/null | SRT leg 1 stats (if SRT input). Present while the socket is connected, absent while it is reconnecting |
 | `srt_leg2_stats` | object/null | SRT leg 2 stats (if redundancy enabled) |
 | `redundancy_switches` | integer | SMPTE 2022-7 leg switch count |
 

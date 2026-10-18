@@ -239,7 +239,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 /// - `bilbycast_edge_flow_input_packets_total` -- total RTP packets received
 /// - `bilbycast_edge_flow_input_bytes_total` -- total bytes received
 /// - `bilbycast_edge_flow_input_bitrate_bps` -- current input bitrate (bits/sec)
-/// - `bilbycast_edge_flow_input_packets_lost` -- total packets lost (sequence gaps)
+/// - `bilbycast_edge_flow_input_packets_lost` -- total packets lost (sequence gaps plus SRT too-late drops)
 /// - `bilbycast_edge_flow_input_fec_recovered_total` -- packets recovered via FEC
 /// - `bilbycast_edge_flow_input_redundancy_switches_total` -- SMPTE 2022-7 leg switches
 ///
@@ -415,7 +415,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             ));
         }
 
-        output.push_str("\n# HELP bilbycast_edge_flow_input_packets_lost Total packets lost (sequence gaps)\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_input_packets_lost Total packets lost (sequence gaps plus SRT too-late drops)\n");
         output.push_str("# TYPE bilbycast_edge_flow_input_packets_lost counter\n");
         for fs in &flow_snapshots {
             output.push_str(&format!(

@@ -3566,6 +3566,14 @@ pub struct FlowStatsAccumulator {
     pub input_packets: AtomicU64,
     pub input_bytes: AtomicU64,
     pub input_loss: AtomicU64,
+    /// Packets the SRT receiver dropped because they missed the TSBPD
+    /// deadline (libsrt `pktRcvDropTotal`), summed across reconnects by the
+    /// SRT input's stats poller. Kept apart from `input_loss` because the
+    /// two are measured differently — `input_loss` counts gaps in a sequence
+    /// the edge can see, and a raw-TS SRT payload carries no such sequence,
+    /// so before this counter an SRT input reported zero loss however much
+    /// libsrt threw away.
+    pub input_srt_recv_dropped: Arc<AtomicU64>,
     pub input_filtered: AtomicU64,
     pub fec_recovered: AtomicU64,
     pub redundancy_switches: AtomicU64,
@@ -3851,6 +3859,7 @@ impl FlowStatsAccumulator {
             input_packets: AtomicU64::new(0),
             input_bytes: AtomicU64::new(0),
             input_loss: AtomicU64::new(0),
+            input_srt_recv_dropped: Arc::new(AtomicU64::new(0)),
             input_filtered: AtomicU64::new(0),
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
@@ -4524,13 +4533,25 @@ impl FlowStatsAccumulator {
                 .as_ref()
                 .map(|s| s.packets_lost)
                 .unwrap_or(0);
-        let packets_lost = self.input_loss.load(Ordering::Relaxed).max(rist_loss);
+        let seq_loss = self.input_loss.load(Ordering::Relaxed).max(rist_loss);
+        let srt_recv_dropped = self.input_srt_recv_dropped.load(Ordering::Relaxed);
+        // What the operator sees as "lost" is everything that never reached
+        // the flow, whichever layer noticed. Health keeps the two apart so
+        // the reason can say which, and what to do about it.
+        let packets_lost = seq_loss.saturating_add(srt_recv_dropped);
+        let srt_latency = self
+            .input_srt_stats_cache
+            .borrow()
+            .as_ref()
+            .map(|s| (s.ms_recv_tsbpd_delay, s.rtt_ms));
         let bw_exceeded = self.bandwidth_exceeded.load(Ordering::Relaxed);
         let bw_blocked = self.bandwidth_blocked.load(Ordering::Relaxed);
         let assembly_health_snap = self.assembly_health.read().ok().and_then(|g| g.clone());
         let (health, health_reasons) = derive_flow_health(
             input_bitrate,
-            packets_lost,
+            seq_loss,
+            srt_recv_dropped,
+            srt_latency,
             &tr101290_snap,
             bw_exceeded,
             bw_blocked,
@@ -5601,6 +5622,8 @@ fn derive_output_state(
 fn derive_flow_health(
     bitrate_bps: u64,
     packets_lost: u64,
+    srt_recv_dropped: u64,
+    srt_latency: Option<(i32, f64)>,
     tr101290: &Option<Tr101290Stats>,
     bandwidth_exceeded: bool,
     bandwidth_blocked: bool,
@@ -5681,6 +5704,31 @@ fn derive_flow_health(
             code: "bandwidth_exceeded".to_string(),
             severity: FlowHealth::Warning,
             detail,
+        });
+    }
+
+    // ── SRT too-late drops: the receiver gave up waiting for these ──
+    //
+    // Same thresholds as sequence-gap loss below, but its own code: the
+    // remedy is different (more latency, or a path that loses less) and the
+    // generic "packet loss" wording sends people looking at the wrong thing.
+    if srt_recv_dropped > 0 {
+        let hint = match srt_latency {
+            Some((latency_ms, rtt_ms)) if latency_ms > 0 => format!(
+                " (latency {latency_ms} ms, RTT {rtt_ms:.0} ms — SRT needs roughly 4× RTT to recover a loss)"
+            ),
+            _ => String::new(),
+        };
+        reasons.push(HealthReason {
+            code: "srt_recv_dropped".to_string(),
+            severity: if srt_recv_dropped > 100 {
+                FlowHealth::Error
+            } else {
+                FlowHealth::Warning
+            },
+            detail: format!(
+                "SRT dropped {srt_recv_dropped} packets that arrived too late to play{hint}"
+            ),
         });
     }
 
@@ -5884,7 +5932,7 @@ mod input_state_tests {
         // The incident shape: 5 live-but-unwired inputs keep flow input
         // bitrate > 0 while the assembly's only sources are dead.
         let (h, reasons) =
-            derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(2, 2)));
+            derive_flow_health(10_000_000, 0, 0, None, &None, false, false, None, Some(&ah(2, 2)));
         assert_eq!(h, FlowHealth::Error);
         assert_eq!(reasons.len(), 1);
         assert_eq!(reasons[0].code, "assembly_all_stalled");
@@ -5894,7 +5942,7 @@ mod input_state_tests {
     #[test]
     fn flow_health_partial_stall_is_warning() {
         let (h, reasons) =
-            derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(3, 1)));
+            derive_flow_health(10_000_000, 0, 0, None, &None, false, false, None, Some(&ah(3, 1)));
         assert_eq!(h, FlowHealth::Warning);
         assert_eq!(reasons[0].code, "assembly_slot_stalled");
     }
@@ -5902,7 +5950,7 @@ mod input_state_tests {
     #[test]
     fn flow_health_assembly_clean_is_healthy() {
         let (h, reasons) =
-            derive_flow_health(10_000_000, 0, &None, false, false, None, Some(&ah(2, 0)));
+            derive_flow_health(10_000_000, 0, 0, None, &None, false, false, None, Some(&ah(2, 0)));
         assert_eq!(h, FlowHealth::Healthy);
         assert!(reasons.is_empty());
     }
@@ -5910,18 +5958,48 @@ mod input_state_tests {
     #[test]
     fn flow_health_partial_stall_does_not_mask_no_data_critical() {
         // bitrate 0 must stay Critical even with a partial assembly stall.
-        let (h, _) = derive_flow_health(0, 0, &None, false, false, None, Some(&ah(3, 1)));
+        let (h, _) = derive_flow_health(0, 0, 0, None, &None, false, false, None, Some(&ah(3, 1)));
         assert_eq!(h, FlowHealth::Critical);
+    }
+
+    #[test]
+    fn srt_too_late_drops_degrade_health_with_their_own_reason() {
+        // A handful is a warning and names the latency and RTT it was read at.
+        let (h, reasons) = derive_flow_health(
+            8_000_000, 0, 5, Some((120, 67.0)), &None, false, false, None, None,
+        );
+        assert_eq!(h, FlowHealth::Warning);
+        assert_eq!(reasons.len(), 1);
+        assert_eq!(reasons[0].code, "srt_recv_dropped");
+        assert!(reasons[0].detail.contains("5 packets"), "{}", reasons[0].detail);
+        assert!(reasons[0].detail.contains("latency 120 ms"), "{}", reasons[0].detail);
+        assert!(reasons[0].detail.contains("RTT 67 ms"), "{}", reasons[0].detail);
+
+        // Past the same threshold as sequence loss it is an error, and it does
+        // not also raise the generic packet-loss reason for the same packets.
+        let (h, reasons) =
+            derive_flow_health(8_000_000, 0, 19_978, None, &None, false, false, None, None);
+        assert_eq!(h, FlowHealth::Error);
+        assert_eq!(
+            reasons.iter().map(|r| r.code.as_str()).collect::<Vec<_>>(),
+            vec!["srt_recv_dropped"]
+        );
+
+        // No drops, no reason — a clean SRT input stays healthy.
+        let (h, reasons) =
+            derive_flow_health(8_000_000, 0, 0, Some((120, 67.0)), &None, false, false, None, None);
+        assert_eq!(h, FlowHealth::Healthy);
+        assert!(reasons.is_empty());
     }
 
     #[test]
     fn flow_health_passthrough_unchanged_without_assembly() {
         assert_eq!(
-            derive_flow_health(10_000_000, 0, &None, false, false, None, None).0,
+            derive_flow_health(10_000_000, 0, 0, None, &None, false, false, None, None).0,
             FlowHealth::Healthy
         );
         assert_eq!(
-            derive_flow_health(0, 0, &None, false, false, None, None).0,
+            derive_flow_health(0, 0, 0, None, &None, false, false, None, None).0,
             FlowHealth::Critical
         );
     }
@@ -5932,7 +6010,7 @@ mod input_state_tests {
         // together: the badge is the worst, but both reasons are surfaced,
         // most-severe first.
         let (h, reasons) =
-            derive_flow_health(24_100_000, 250, &None, true, false, Some(20.0), None);
+            derive_flow_health(24_100_000, 250, 0, None, &None, true, false, Some(20.0), None);
         assert_eq!(h, FlowHealth::Error);
         assert_eq!(reasons.len(), 2);
         assert_eq!(reasons[0].severity, FlowHealth::Error);
@@ -5959,7 +6037,7 @@ mod input_state_tests {
             missing_continuous_pids: 1,
             ..Default::default()
         });
-        let (h, reasons) = derive_flow_health(10_000_000, 0, &tr, false, false, None, None);
+        let (h, reasons) = derive_flow_health(10_000_000, 0, 0, None, &tr, false, false, None, None);
         assert_eq!(h, FlowHealth::Error);
         let p1 = reasons
             .iter()
@@ -5977,7 +6055,7 @@ mod input_state_tests {
     fn flow_health_blocked_suppresses_no_data_and_exceeded() {
         // A hard bandwidth block is the single dominant reason even when
         // bitrate has been throttled to zero and the exceed flag is set.
-        let (h, reasons) = derive_flow_health(0, 0, &None, true, true, Some(20.0), None);
+        let (h, reasons) = derive_flow_health(0, 0, 0, None, &None, true, true, Some(20.0), None);
         assert_eq!(h, FlowHealth::Error);
         assert_eq!(reasons.len(), 1);
         assert_eq!(reasons[0].code, "bandwidth_blocked");

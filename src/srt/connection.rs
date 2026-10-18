@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -722,26 +723,66 @@ pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
     }
 }
 
+/// Advance a "last seen" cumulative libsrt counter and return how far it moved.
+///
+/// libsrt's `pktRcvDropTotal` is cumulative **per socket**, so it restarts at
+/// zero on every reconnect. The caller keeps one `last` per socket and adds
+/// the returned delta to a flow-lifetime counter, which is what makes the
+/// total survive a reconnect instead of snapping back to zero with it. A
+/// counter that moves backwards (never observed, but it is an `i32` read
+/// across an FFI boundary) contributes nothing rather than a huge unsigned
+/// wrap.
+pub(crate) fn cumulative_delta(last: &mut i64, current: i32) -> u64 {
+    let current = current as i64;
+    let delta = (current - *last).max(0) as u64;
+    *last = current;
+    delta
+}
+
 /// Spawn a background task that polls SRT socket stats every second and
 /// publishes the result via the provided lock-free watch channel. Runs
 /// until the cancellation token fires.
+///
+/// `recv_dropped`, when given, accumulates the socket's receiver-side
+/// too-late drops (`pktRcvDropTotal`) across the life of the flow. Those are
+/// packets libsrt gave up on because they missed the TSBPD deadline — the
+/// only SRT loss the application never sees, since libsrt simply skips them
+/// and delivers the next packet. Inputs pass the flow's counter so the loss
+/// reaches `InputStats.packets_lost` and the flow health; outputs pass `None`.
+///
+/// Publishing uses `send_replace`, not `send`: every one of these caches is
+/// built as `watch::channel(None).0`, i.e. with its only receiver already
+/// dropped, and `watch::Sender::send` refuses to store a value when there
+/// are no receivers. With `send` the cache stayed `None` forever and
+/// `srt_stats` was absent from every SRT input and output on the node.
 pub fn spawn_srt_stats_poller(
     socket: Arc<SrtSocket>,
     cache: Arc<watch::Sender<Option<SrtLegStats>>>,
+    recv_dropped: Option<Arc<AtomicU64>>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut last_drop: i64 = 0;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
                     let stats = socket.stats().await;
                     let leg_stats = convert_srt_stats(&stats);
-                    let _ = cache.send(Some(leg_stats));
+                    if let Some(ref sink) = recv_dropped {
+                        let delta = cumulative_delta(&mut last_drop, leg_stats.pkt_recv_drop_total);
+                        if delta > 0 {
+                            sink.fetch_add(delta, Ordering::Relaxed);
+                        }
+                    }
+                    cache.send_replace(Some(leg_stats));
                 }
             }
         }
+        // The socket is gone. A snapshot that still says "connected" with a
+        // healthy RTT would be a lie for as long as the reconnect takes.
+        cache.send_replace(None);
     });
 }
 
@@ -973,7 +1014,7 @@ pub fn spawn_srt_group_stats_poller(
                     snapshot.aggregate = convert_srt_stats(&agg_raw);
                     snapshot.aggregate.state =
                         socket_status_str(group.status()).to_string();
-                    let _ = cache.send(Some(snapshot));
+                    cache.send_replace(Some(snapshot));
                 }
             }
         }
@@ -1027,7 +1068,7 @@ pub fn spawn_srt_socket_group_stats_poller(
                         aggregate,
                         members,
                     };
-                    let _ = cache.send(Some(snapshot));
+                    cache.send_replace(Some(snapshot));
                 }
             }
         }
@@ -1071,6 +1112,33 @@ fn parse_local_bind(p: &SrtConnectionParams) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    /// The stats caches are created with their receiver already dropped
+    /// (`watch::channel(None).0`). `send` stores nothing on such a channel,
+    /// which is why `srt_stats` never appeared; `send_replace` does.
+    #[test]
+    fn stats_cache_publish_survives_having_no_receiver() {
+        let cache: tokio::sync::watch::Sender<Option<u32>> = tokio::sync::watch::channel(None).0;
+        assert!(cache.send(Some(1)).is_err(), "send refuses without a receiver");
+        assert_eq!(*cache.borrow(), None, "and leaves the cache empty");
+        cache.send_replace(Some(2));
+        assert_eq!(*cache.borrow(), Some(2));
+    }
+
+    #[test]
+    fn cumulative_delta_survives_reconnect_and_never_wraps() {
+        let mut last = 0i64;
+        assert_eq!(super::cumulative_delta(&mut last, 0), 0);
+        assert_eq!(super::cumulative_delta(&mut last, 92), 92);
+        assert_eq!(super::cumulative_delta(&mut last, 93), 1);
+        assert_eq!(super::cumulative_delta(&mut last, 93), 0);
+        // A counter that goes backwards adds nothing and re-bases.
+        assert_eq!(super::cumulative_delta(&mut last, 10), 0);
+        assert_eq!(super::cumulative_delta(&mut last, 15), 5);
+        // A new socket starts a fresh `last`, so its first reading counts in full.
+        let mut fresh = 0i64;
+        assert_eq!(super::cumulative_delta(&mut fresh, 49), 49);
+    }
+
     use super::*;
 
     /// The listener filter is compared per the SRT Access Control spec, not
