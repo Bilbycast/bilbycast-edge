@@ -579,6 +579,29 @@ partner's connector**. Idle outputs emit NTSC black, so a looped input
 showing `signal=yes` proves nothing — check `detected_mode`. Full table and
 evidence: `bilbycast-decklink-rs/CLAUDE.md`.
 
+**The table above does not tell you which connector is physical 1.** That is
+the part that costs the day. "Physical 1–8" is the card's own ordering, and
+nothing in software says which end of the bracket — or which spigot on a
+breakout — it starts from. On `bilby-voyager` (DeckLink Quad 2) physical 1 is
+the **bottom** connector, so reading the bracket top-down gives
+`8, 4, 7, 3, 6, 2, 5, 1` and the documented interleave looks wrong until you
+turn it over. Do not assume that orientation holds for another chassis or a
+differently dressed breakout: establish it once per machine and write it down.
+
+Two things make that harder than it sounds, and both are worth knowing before
+you start:
+
+* **An idle port reports no signal**, at least on the original DeckLink Quad,
+  so walking a source along the breakout shows nothing unless every channel is
+  already open as an input. Open them all first, then walk (see
+  [#170](https://github.com/Bilbycast/bilbycast-edge/issues/170)).
+* **The mapping changes with the card's profile**, not only with the card. A
+  profile switch renumbers and re-roles the sub-devices, so a map taken before
+  one is void after it.
+
+A per-connector label in the manager is the place to keep the answer, since it
+survives the card being pulled and is carried in a backup.
+
 ## Verification techniques (what actually worked)
 
 * **Signal-loss test**: physically pull the cable. Anything less lies —
