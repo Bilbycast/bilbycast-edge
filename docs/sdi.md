@@ -10,7 +10,7 @@ crate. Upstream tracking issue:
 
 | Capability | Status |
 |------------|--------|
-| SDI input, video (UYVY422 8-bit, any raster the card detects) | **Verified on hardware** (1080i50, DeckLink Quad) |
+| SDI input, video (UYVY422 8-bit, any raster the card detects) | **Verified on hardware** (1080i50, DeckLink Quad 2) |
 | SDI input, embedded audio (2 ch → AAC) | **Verified on hardware** (8/16 ch untested) |
 | SCTE-104 VANC extraction → SCTE-35 PID | Implemented and unit-verified; live VANC source verification pending |
 | SMPTE 12M timecode / CEA-608/708 caption VANC extraction | Implemented and unit-verified (round-trip + presence-transition logic); live VANC source verification pending |
@@ -442,6 +442,12 @@ detected raster + colorimetry + field dominance, detected dynamic range
 slot is a classic invisible cause of capture drops). Every field is optional on
 the wire; **absent means "the card did not say", never "no"**.
 
+The original DeckLink Quad is the exception for idle ports: a port with no open
+capture reports `signal_locked: false` and no `detected_mode` even with a live
+source plugged in, so on that card an idle port's "no signal" is not an answer
+([#170](https://github.com/Bilbycast/bilbycast-edge/issues/170)). The Quad 2 on
+`bilby-z440` reports idle ports as described above.
+
 **Capability** — `sdi-decklink` on `HealthPayload.capabilities`, gated on the
 boot probe reaching the SDK. A card-less host with Desktop Video still
 advertises (the capability means "this edge can do SDI"; `sdi_devices` says
@@ -464,7 +470,7 @@ but still shown (soft, scheduling pressure), dropped means never presented
 (hard loss); callers should keep them distinct rather than summing them (the
 edge integration below does).
 
-Verified by physical loopback on a DeckLink Quad: colour bars
+Verified by physical loopback on a DeckLink Quad 2: colour bars
 (`examples/playout_bars.rs`) scheduled on one sub-device, emerging on its
 pair-partner connector, through a BNC loop into another port, captured
 through the full edge pipeline and photographed — correct colours, moving
@@ -579,28 +585,51 @@ partner's connector**. Idle outputs emit NTSC black, so a looped input
 showing `signal=yes` proves nothing — check `detected_mode`. Full table and
 evidence: `bilbycast-decklink-rs/CLAUDE.md`.
 
-**The table above does not tell you which connector is physical 1.** That is
-the part that costs the day. "Physical 1–8" is the card's own ordering, and
-nothing in software says which end of the bracket — or which spigot on a
-breakout — it starts from. On `bilby-voyager` (DeckLink Quad 2) physical 1 is
-the **bottom** connector, so reading the bracket top-down gives
-`8, 4, 7, 3, 6, 2, 5, 1` and the documented interleave looks wrong until you
-turn it over. Do not assume that orientation holds for another chassis or a
-differently dressed breakout: establish it once per machine and write it down.
+**Which connector is physical 1** is the part that costs the day. The table
+counts outward from the REF (genlock) connector, as Blackmagic's Desktop Video
+Utility diagram draws the card, so physical 1 is the SDI connector next to REF.
+Nothing the edge reports carries that: `sdi_devices[]` identifies a port only
+by its enumeration index, SDK name and software channel, and a breakout's
+spigots can be dressed in any order, REF's included. On `bilby-voyager`
+(DeckLink Quad 2 in its `2dhd` profile, eight half-duplex sub-devices) the
+walk put physical 1 at the **bottom** connector, so reading the bracket
+top-down gives `8, 4, 7, 3, 6, 2, 5, 1` and the documented interleave looks
+wrong until you turn it over. Do not assume that orientation holds for another
+card, another profile, another chassis or a differently dressed breakout — on
+voyager, replacing the original Quad with the Quad 2 behind the same breakout
+reversed the channel order. Establish the map per card and per profile, by
+walking a live source along the connectors, and again whenever either changes.
 
-Two things make that harder than it sounds, and both are worth knowing before
-you start:
+Two things make the walk harder than it sounds, and both are worth knowing
+before you start:
 
-* **An idle port reports no signal**, at least on the original DeckLink Quad,
-  so walking a source along the breakout shows nothing unless every channel is
-  already open as an input. Open them all first, then walk (see
-  [#170](https://github.com/Bilbycast/bilbycast-edge/issues/170)).
+* **An idle port can report no signal.** On the original DeckLink Quad, at
+  least, a port with no open capture reads `signal_locked: false` whatever is
+  plugged into it, so walking a source along the breakout shows nothing
+  ([#170](https://github.com/Bilbycast/bilbycast-edge/issues/170)). Make every
+  channel an input in an **enabled flow** first — an input in no flow, or in a
+  stopped one, never opens the card — then walk. Those captures open dark, and
+  a capture that opens dark keeps smeared thumbnails once the source arrives,
+  although its encoded output is clean
+  ([#169](https://github.com/Bilbycast/bilbycast-edge/issues/169)): restart
+  each flow once its real source is patched.
 * **The mapping changes with the card's profile**, not only with the card. A
-  profile switch renumbers and re-roles the sub-devices, so a map taken before
-  one is void after it.
+  profile switch renumbers and re-roles the sub-devices — the BNC that fed
+  channel 1 feeds a different channel afterwards — so a map taken before one is
+  void after it. In the Quad 2's four-sub-device full-duplex profile (`1dfd`)
+  channels 5–8 enumerate but will not open for capture at all, so only 1–4 can
+  be walked there
+  ([#175](https://github.com/Bilbycast/bilbycast-edge/issues/175)).
 
-A per-connector label in the manager is the place to keep the answer, since it
-survives the card being pulled and is carried in a backup.
+Write the answer down as a connector label in the manager (the node's **SDI
+Devices** panel → **Label connectors**): it is shown wherever an SDI device is
+picked, kept while the card is out for service, and carried in a backup. But a
+label belongs to the sub-device **name** (`DeckLink Quad (3)`), not to the BNC,
+and nothing in the edge or the manager notices when the two part company. After
+a profile switch or a card replacement, every label whose name the card still
+enumerates is shown against whatever connector now carries that name — so walk
+the connectors again after either, and re-enter the labels, or blank the ones
+that no longer apply, before anyone picks a port by them.
 
 ## Verification techniques (what actually worked)
 
@@ -629,7 +658,7 @@ survives the card being pulled and is carried in a backup.
 
 ## Production readiness
 
-**Verified on hardware** (bilby-z440, DeckLink Quad, live 1080i50 source):
+**Verified on hardware** (bilby-z440, DeckLink Quad 2, live 1080i50 source):
 capture → encode (x264 + NVENC) → A+V TS; signal-loss/reconnect by physically
 pulling the cable; per-port `HealthPayload.sdi_devices[]`; SDI→SDI loopback
 video (photographed clean) and audio (measured continuous, lip-synced by the
