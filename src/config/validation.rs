@@ -3880,7 +3880,7 @@ where
         SlotSource::Hitless {
             primary,
             backup,
-            mode: _,
+            mode,
             stall_ms,
             reorder_window,
             path_differential_ms,
@@ -3896,13 +3896,22 @@ where
                         "{context}: hitless stall_ms must be in 20..=5000 (got {ms})"
                     );
                 }
-            if let Some(w) = reorder_window
-                && (!(64..=4096).contains(w) || w % 64 != 0) {
+            if let Some(w) = reorder_window {
+                // The primary-preference merger forwards one leg and merges
+                // on no sequence number: there is no window for this to set.
+                if !matches!(mode, crate::config::models::HitlessMode::SeqAware) {
+                    bail!(
+                        "{context}: hitless reorder_window applies only to mode \"seq_aware\" \
+                         — the primary-preference merger has no reorder window (got {w})"
+                    );
+                }
+                if !(64..=4096).contains(w) || w % 64 != 0 {
                     bail!(
                         "{context}: hitless reorder_window must be a multiple of 64 in \
                          64..=4096 (got {w})"
                     );
                 }
+            }
             if let Some(ms) = path_differential_ms
                 && !(5..=2000).contains(ms) {
                     bail!(
@@ -4360,6 +4369,41 @@ pub(crate) fn validate_encoder_codec_name(codec: &str, context: &str) -> anyhow:
 /// shipped build's API and is sitting in configs now. Falling those back to the
 /// default and reporting them beats refusing to boot over a field that, until
 /// this release, selected nothing.
+/// Drop a persisted `reorder_window` from every Hitless slot that is not
+/// seq-aware, and say which flows had one.
+///
+/// [`validate_slot_source`] refuses the field on those slots: their
+/// primary-preference merger has no reorder window. Releases before that
+/// refusal accepted it and applied it nowhere — not even on a seq-aware
+/// slot, the defect that refusal came with — so it can be sitting in a
+/// config now. The load path turns a validation error into an exit, and a
+/// node that will not start has no manager WebSocket, so the field goes
+/// instead, like the mosaic codecs below: it never had an effect there.
+pub fn repair_hitless_reorder_windows(
+    config: &mut crate::config::models::AppConfig,
+) -> Vec<String> {
+    use crate::config::models::{HitlessMode, SlotSource};
+    let mut repaired = Vec::new();
+    for flow in &mut config.flows {
+        let Some(assembly) = flow.assembly.as_mut() else {
+            continue;
+        };
+        let mut dropped = false;
+        for stream in assembly.programs.iter_mut().flat_map(|p| p.streams.iter_mut()) {
+            if let SlotSource::Hitless { mode, reorder_window, .. } = &mut stream.source
+                && *mode != HitlessMode::SeqAware
+                && reorder_window.take().is_some()
+            {
+                dropped = true;
+            }
+        }
+        if dropped {
+            repaired.push(flow.id.clone());
+        }
+    }
+    repaired
+}
+
 #[cfg(feature = "multiviewer")]
 pub fn repair_legacy_mosaic_codecs(
     config: &mut crate::config::models::AppConfig,
@@ -9077,8 +9121,8 @@ mod tests {
     }
     use super::*;
     use crate::config::models::{
-        AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, PcrSource,
-        SlotSource, TsPidOverridesEntry, TsPidOverridesMap,
+        AssembledProgram, AssembledStream, AssemblyKind, EssenceKind, FlowAssembly, HitlessMode,
+        PcrSource, SlotSource, TsPidOverridesEntry, TsPidOverridesMap,
     };
 
     /// `server.nmos_browser_control` entries are compared verbatim against a
@@ -10170,6 +10214,81 @@ mod tests {
         };
         let err = validate_flow_assembly(&a, &["in-a".into()], "test").unwrap_err();
         assert!(err.to_string().contains("nest"));
+    }
+
+    fn hitless_assembly(mode: HitlessMode, reorder_window: Option<u16>) -> FlowAssembly {
+        let pid = |input_id: &str| {
+            Box::new(SlotSource::Pid { input_id: input_id.into(), source_pid: 0x100 })
+        };
+        let mut a = spts_assembly("in-a");
+        a.programs[0].streams[0].source = SlotSource::Hitless {
+            primary: pid("in-a"),
+            backup: pid("in-b"),
+            mode,
+            stall_ms: None,
+            reorder_window,
+            path_differential_ms: None,
+        };
+        a
+    }
+
+    /// The window sizes the seq-aware merger, any multiple of 64 in range;
+    /// the primary-preference merger has none to size.
+    #[test]
+    fn assembly_hitless_reorder_window_is_seq_aware_only() {
+        let inputs = ["in-a".to_string(), "in-b".to_string()];
+        for w in [64, 192, 1024, 4096] {
+            validate_flow_assembly(&hitless_assembly(HitlessMode::SeqAware, Some(w)), &inputs, "t")
+                .unwrap_or_else(|e| panic!("{w}: {e}"));
+        }
+        for w in [0, 100, 4160] {
+            let err = validate_flow_assembly(
+                &hitless_assembly(HitlessMode::SeqAware, Some(w)),
+                &inputs,
+                "t",
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("multiple of 64"), "{w}: {err}");
+        }
+        let err = validate_flow_assembly(
+            &hitless_assembly(HitlessMode::PrimaryPreference, Some(1024)),
+            &inputs,
+            "t",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("only to mode \"seq_aware\""), "{err}");
+        validate_flow_assembly(&hitless_assembly(HitlessMode::PrimaryPreference, None), &inputs, "t")
+            .expect("no window, no refusal");
+    }
+
+    /// A window persisted on a primary-preference slot, by a release that
+    /// accepted it and applied it nowhere, is dropped at load rather than
+    /// failing the boot; a seq-aware slot keeps its own.
+    #[test]
+    fn a_persisted_primary_preference_reorder_window_is_repaired_at_load() {
+        let flow = |id: &str, assembly: FlowAssembly| -> FlowConfig {
+            let mut f: FlowConfig = serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "input_ids": ["in-a", "in-b"], "output_ids": []
+            }))
+            .expect("flow fixture");
+            f.assembly = Some(assembly);
+            f
+        };
+        let mut config = AppConfig {
+            flows: vec![
+                flow("stale", hitless_assembly(HitlessMode::PrimaryPreference, Some(512))),
+                flow("sized", hitless_assembly(HitlessMode::SeqAware, Some(512))),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(repair_hitless_reorder_windows(&mut config), vec!["stale".to_string()]);
+        let window = |f: &FlowConfig| match &f.assembly.as_ref().unwrap().programs[0].streams[0].source {
+            SlotSource::Hitless { reorder_window, .. } => *reorder_window,
+            _ => unreachable!(),
+        };
+        assert_eq!(window(&config.flows[0]), None);
+        assert_eq!(window(&config.flows[1]), Some(512));
+        assert!(repair_hitless_reorder_windows(&mut config).is_empty(), "nothing left to repair");
     }
 
     #[test]

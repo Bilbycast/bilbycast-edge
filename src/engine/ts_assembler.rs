@@ -2988,8 +2988,9 @@ pub struct PendingHitlessSlot {
     /// dedup + gap-fill (driven by `EsPacket.upstream_seq`) instead of
     /// stall-timer-based primary preference.
     pub seq_aware: bool,
-    /// Reorder window for the seq-aware merger (multiple of 64 in
-    /// 64..=4096). Ignored when `seq_aware` is `false`.
+    /// Gap-fill window of the seq-aware merger, in sequence numbers
+    /// (multiple of 64 in 64..=4096). Validation refuses it on a slot
+    /// that is not seq-aware, whose merger has no window.
     pub reorder_window: u16,
     /// Path-differential / skew-accommodation buffer in milliseconds.
     /// `Some(ms)` enables the buffered SMPTE 2022-7 merger (industry
@@ -4685,6 +4686,7 @@ mod tests {
             bus.clone(),
             Duration::from_millis(50),
             false,
+            crate::redundancy::merger::REORDER_WINDOW,
             None,
             legs.forwarding_primary.clone(),
             cancel.child_token(),

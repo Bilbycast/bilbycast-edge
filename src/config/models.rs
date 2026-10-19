@@ -1307,9 +1307,11 @@ pub enum SlotSource {
         /// only — `SeqAware` ignores this). Range: 20..=5000 ms.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stall_ms: Option<u64>,
-        /// Reorder window for the seq-aware merger (`SeqAware` mode
-        /// only). Multiple of 64 in 64..=4096; default 1024 (≈ 0.4 s
-        /// at 2400 packets/s).
+        /// Gap-fill window of the seq-aware merger, in sequence numbers:
+        /// how far behind the newest packet a gap one leg left can still
+        /// be filled from the other. Multiple of 64 in 64..=4096; default
+        /// 1024 (≈ 0.4 s at 2400 packets/s). `SeqAware` mode only —
+        /// refused on a `PrimaryPreference` slot, whose merger has none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reorder_window: Option<u16>,
         /// Path-differential / skew-accommodation buffer in milliseconds

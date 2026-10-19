@@ -680,7 +680,7 @@ PCM / AES3-transparent inputs (ST 2110-30, ST 2110-31, `rtp_audio`) become TS ca
 
 ### Pre-bus Hitless merger (`engine/ts_es_hitless.rs`)
 
-A `SlotSource::Hitless { primary, backup }` spawns a merger task that subscribes to both legs on the bus and republishes onto a synthetic `hitless:<uid>` bus key the assembler's slot then points at. Strategy: **primary-preference with a 200 ms stall timer** (not sequence-aware 2022-7 dedup — `EsPacket` carries no upstream RTP sequence number today). Primary packets forward verbatim; no primary for 200 ms → flip to backup; primary traffic resumes → switch back after a short hold-off. Either leg must itself be `Pid` or `Essence`; nested Hitless is rejected at config-save time.
+A `SlotSource::Hitless { primary, backup }` spawns a merger task that subscribes to both legs on the bus and republishes onto a synthetic `hitless:<uid>` bus key the assembler's slot then points at. The default strategy is **primary-preference with a stall timer** (`stall_ms`, 200 ms by default): primary packets forward verbatim; no primary for the stall window → flip to backup; primary traffic resumes → switch back. `mode: seq_aware` instead runs the SMPTE 2022-7 dedup + gap-fill primitive (`redundancy::merger::HitlessMerger`) on `EsPacket.upstream_seq`, with a gap-fill window of `reorder_window` sequence numbers, optionally behind the `path_differential_ms` hold of `BufferedHitlessMerger`. Each leg must be `Pid` at flow start; nested Hitless is rejected at config-save time.
 
 ### Operator-driven Switch slot
 

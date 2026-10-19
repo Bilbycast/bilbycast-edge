@@ -48,9 +48,10 @@
 //! cross-leg jitter (the dual UDP sockets feeding `tokio::select!` can
 //! reorder by ~100 ms when one leg is briefly bursty) without growing the
 //! `[u64; N]` bitmap beyond the L1 cache. For 50+ Mbps streams the
-//! window is still well above the inter-leg jitter floor.
-
-use std::collections::VecDeque;
+//! window is still well above the inter-leg jitter floor. That is the
+//! default: any multiple of 64 up to 16384 is accepted, which is how ST
+//! 2110-20 ingest widens it and how a PID-bus Hitless slot's
+//! `reorder_window` sets it.
 
 /// Identifies which network leg a packet arrived on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,7 @@ pub enum ActiveLeg {
 /// at 146–580 kpps per leg, where 1024 slots is only 1.8–7 ms of
 /// wallclock — less than 2022-7 Class A's 10 ms path-differential
 /// budget) construct via [`HitlessMerger::with_window`] instead.
-const REORDER_WINDOW: u16 = 1024;
+pub const REORDER_WINDOW: u16 = 1024;
 
 /// Hitless merger state. Tracks emitted RTP sequence numbers in a sliding
 /// bitmap window so the merger can dedup duplicates *and* fill gaps left
@@ -75,23 +76,26 @@ pub struct HitlessMerger {
     /// Highest RTP sequence number we have ever observed across both legs
     /// (wrapping u16). Anchor for the sliding bitmap window.
     highest_seq: u16,
-    /// Bitmap of recently-emitted seq numbers, indexed by `seq mod
-    /// REORDER_WINDOW`. A `1` bit means "this seq has been emitted at
-    /// least once and any further arrival is a duplicate". A `0` bit
-    /// in the gap behind `highest_seq` means "this seq has not been
-    /// emitted yet — if it arrives, fill the gap".
+    /// The bitmap slot holding `highest_seq`. A seq `n` behind it sits `n`
+    /// slots behind this one, wrapping inside the window. Placing seqs
+    /// relative to the highest one rather than at `seq % window` is what
+    /// lets the window be any multiple of 64: `seq % window` stays
+    /// consistent across the u16 wrap only for a window that divides 65536.
+    highest_slot: u16,
+    /// Bitmap of recently-emitted seq numbers, one bit per window slot. A
+    /// `1` bit means "this seq has been emitted at least once and any
+    /// further arrival is a duplicate". A `0` bit in the gap behind
+    /// `highest_seq` means "this seq has not been emitted yet — if it
+    /// arrives, fill the gap".
     ///
-    /// `VecDeque<u64>` is sized to hold `REORDER_WINDOW / 64` words. We
-    /// rotate it lazily via `clear_gap_words` rather than shifting on
-    /// every advance.
-    emitted: VecDeque<u64>,
+    /// Sized once to `window / 64` words. An advance clears the slots it
+    /// uncovers rather than shifting.
+    emitted: Box<[u64]>,
     /// Which leg last provided the forwarded packet.
     active_leg: ActiveLeg,
     /// Whether we've forwarded at least one packet.
     initialized: bool,
-    /// Gap-fill window size in slots. Power of two in `[64, 16384]` so
-    /// `seq % window` stays consistent across the u16 sequence wrap
-    /// (65536 must be divisible by the window).
+    /// Gap-fill window size in slots: a multiple of 64 in `[64, 16384]`.
     window: u16,
 }
 
@@ -104,64 +108,80 @@ impl HitlessMerger {
 
     /// Create a merger with an explicit gap-fill window.
     ///
-    /// `window` must be a power of two in `[64, 16384]`: powers of two
-    /// keep `seq % window` consistent across the u16 wrap, 64 is the
+    /// `window` must be a multiple of 64 in `[64, 16384]`: 64 is the
     /// bitmap word granularity, and 16384 preserves a sane band between
     /// "behind the window" and "forward stream-reset" (both bounds are
     /// asserted). Used by ST 2110-20 ingest where 2022-7 Class A allows
     /// 10 ms of inter-leg path differential — at 580 kpps (2160p50)
-    /// the 1024-slot default covers only ~1.8 ms.
+    /// the 1024-slot default covers only ~1.8 ms — and by a PID-bus
+    /// Hitless slot's configured `reorder_window`.
     pub fn with_window(window: u16) -> Self {
         assert!(
-            (64..=16384).contains(&window) && window.is_power_of_two(),
-            "HitlessMerger window must be a power of two in [64, 16384], got {window}"
+            (64..=16384).contains(&window) && window.is_multiple_of(64),
+            "HitlessMerger window must be a multiple of 64 in [64, 16384], got {window}"
         );
-        let words = (window as usize) / 64;
-        let mut emitted = VecDeque::with_capacity(words);
-        for _ in 0..words {
-            emitted.push_back(0u64);
-        }
         Self {
             highest_seq: 0,
-            emitted,
+            highest_slot: 0,
+            emitted: vec![0u64; (window / 64) as usize].into_boxed_slice(),
             active_leg: ActiveLeg::None,
             initialized: false,
             window,
         }
     }
 
-    /// Test the bitmap for a given seq.
+    /// The slot `ahead` seqs past `highest_seq` (`ahead < window`).
     #[inline]
-    fn is_emitted(&self, seq: u16) -> bool {
-        let idx = (seq % self.window) as usize;
-        let word = idx / 64;
-        let bit = idx % 64;
-        (self.emitted[word] >> bit) & 1 == 1
+    fn slot_ahead(&self, ahead: u16) -> usize {
+        self.wrap(self.highest_slot as usize + ahead as usize)
     }
 
-    /// Set the bitmap bit for a given seq.
+    /// The slot `behind` seqs before `highest_seq` (`behind < window`).
     #[inline]
-    fn mark_emitted(&mut self, seq: u16) {
-        let idx = (seq % self.window) as usize;
-        let word = idx / 64;
-        let bit = idx % 64;
-        self.emitted[word] |= 1u64 << bit;
+    fn slot_behind(&self, behind: u16) -> usize {
+        self.wrap(self.highest_slot as usize + (self.window - behind) as usize)
     }
 
-    /// Clear `count` bitmap slots starting at the wrapping seq `start`.
-    /// Used when `highest_seq` advances: the newly-uncovered slots in the
-    /// sliding window need to be reset to "not yet emitted" before the
-    /// next packet from the other leg can fill them. `count == 0` is a
-    /// no-op (the common consecutive-advance case).
-    fn clear_slots(&mut self, start: u16, count: u16) {
-        let mut s = start;
-        for _ in 0..count {
-            let idx = (s % self.window) as usize;
-            let word = idx / 64;
-            let bit = idx % 64;
-            self.emitted[word] &= !(1u64 << bit);
-            s = s.wrapping_add(1);
+    /// Fold a slot index below `2 * window` back into the window.
+    #[inline]
+    fn wrap(&self, slot: usize) -> usize {
+        let window = self.window as usize;
+        if slot >= window { slot - window } else { slot }
+    }
+
+    #[inline]
+    fn is_emitted(&self, slot: usize) -> bool {
+        (self.emitted[slot / 64] >> (slot % 64)) & 1 == 1
+    }
+
+    #[inline]
+    fn set_emitted(&mut self, slot: usize, emitted: bool) {
+        let bit = 1u64 << (slot % 64);
+        if emitted {
+            self.emitted[slot / 64] |= bit;
+        } else {
+            self.emitted[slot / 64] &= !bit;
         }
+    }
+
+    /// Anchor the window on `seq`, as the only seq seen so far.
+    fn anchor(&mut self, seq: u16) {
+        self.emitted.fill(0);
+        self.highest_seq = seq;
+        self.highest_slot = 0;
+        self.set_emitted(0, true);
+    }
+
+    /// Advance `highest_seq` by `forward` (`0 < forward < window`) to
+    /// `seq`, emitted. The `forward - 1` seqs skipped are left clear so the
+    /// other leg can still fill them.
+    fn advance(&mut self, seq: u16, forward: u16) {
+        for ahead in 1..=forward {
+            let slot = self.slot_ahead(ahead);
+            self.set_emitted(slot, ahead == forward);
+        }
+        self.highest_slot = self.slot_ahead(forward) as u16;
+        self.highest_seq = seq;
     }
 
     /// Attempt to merge an incoming packet from the given leg.
@@ -173,10 +193,9 @@ impl HitlessMerger {
         if !self.initialized {
             // Anchor on the very first packet. Mark only this seq as
             // emitted; the rest of the bitmap stays zero so that the
-            // following ~`REORDER_WINDOW` seqs can be filled in any order
-            // by either leg.
-            self.highest_seq = seq;
-            self.mark_emitted(seq);
+            // following ~`window` seqs can be filled in any order by
+            // either leg.
+            self.anchor(seq);
             self.active_leg = leg;
             self.initialized = true;
             return Some(leg);
@@ -196,22 +215,10 @@ impl HitlessMerger {
             // stream reset (e.g. publisher restarted with a new ISN). Reset
             // the bitmap and re-anchor.
             if forward >= self.window {
-                for w in self.emitted.iter_mut() {
-                    *w = 0;
-                }
-                self.highest_seq = seq;
-                self.mark_emitted(seq);
-                self.active_leg = leg;
-                return Some(leg);
+                self.anchor(seq);
+            } else {
+                self.advance(seq, forward);
             }
-
-            // Normal forward jump: clear the (forward - 1) just-uncovered
-            // slots so the other leg can still fill them, then mark this
-            // seq emitted. `forward == 1` (consecutive advance) is a no-op.
-            let prev_highest = self.highest_seq;
-            self.clear_slots(prev_highest.wrapping_add(1), forward - 1);
-            self.highest_seq = seq;
-            self.mark_emitted(seq);
             self.active_leg = leg;
             Some(leg)
         } else if backward < self.window {
@@ -220,10 +227,11 @@ impl HitlessMerger {
             // Either a duplicate (bit already set — drop) or a missing
             // packet that the other leg has just delivered (bit clear —
             // fill the gap and emit).
-            if self.is_emitted(seq) {
+            let slot = self.slot_behind(backward);
+            if self.is_emitted(slot) {
                 None
             } else {
-                self.mark_emitted(seq);
+                self.set_emitted(slot, true);
                 self.active_leg = leg;
                 Some(leg)
             }
@@ -278,8 +286,7 @@ mod tests {
         assert_eq!(narrow.try_merge(1001, ActiveLeg::Leg2), None);
     }
 
-    /// Wide window stays consistent across the u16 sequence wrap
-    /// (window divides 65536, so `seq % window` indexing can't alias).
+    /// Wide window stays consistent across the u16 sequence wrap.
     #[test]
     fn test_wide_window_across_u16_wrap() {
         let mut merger = HitlessMerger::with_window(16384);
@@ -291,9 +298,45 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "power of two")]
-    fn test_window_rejects_non_power_of_two() {
+    #[should_panic(expected = "multiple of 64")]
+    fn test_window_rejects_a_non_multiple_of_64() {
         let _ = HitlessMerger::with_window(1000);
+    }
+
+    /// A window that does not divide 65536 keeps every seq on its own slot
+    /// across the u16 wrap. Placed at `seq % 192`, seq 0 shares a bit with
+    /// 65472, 64 seqs before it, so leg 2's copy of a 65472 leg 1 lost read
+    /// as a duplicate once leg 1 had moved past the wrap.
+    #[test]
+    fn test_a_non_power_of_two_window_gap_fills_across_the_u16_wrap() {
+        let mut merger = HitlessMerger::with_window(192);
+        let mut seq: u16 = 65_400;
+        while seq != 11 {
+            if seq != 65_472 {
+                assert_eq!(merger.try_merge(seq, ActiveLeg::Leg1), Some(ActiveLeg::Leg1));
+            }
+            seq = seq.wrapping_add(1);
+        }
+        assert_eq!(merger.try_merge(65_472, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
+        assert_eq!(merger.try_merge(65_472, ActiveLeg::Leg2), None);
+        assert_eq!(merger.try_merge(0, ActiveLeg::Leg2), None);
+        assert_eq!(merger.try_merge(65_535, ActiveLeg::Leg2), None);
+    }
+
+    /// The window decides how far behind a gap can still be filled.
+    #[test]
+    fn test_the_window_bounds_the_gap_fill() {
+        for (window, fillable) in [(64u16, false), (128, true)] {
+            let mut merger = HitlessMerger::with_window(window);
+            for seq in 0..=100u16 {
+                if seq != 20 {
+                    merger.try_merge(seq, ActiveLeg::Leg1);
+                }
+            }
+            // 80 behind: inside a 128-slot window, outside a 64-slot one.
+            let filled = merger.try_merge(20, ActiveLeg::Leg2).is_some();
+            assert_eq!(filled, fillable, "window {window}");
+        }
     }
 
     #[test]
@@ -635,14 +678,24 @@ const DEFAULT_MAX_BUFFER_PACKETS: usize = 12_000;
 const LEG_DOWN_THRESHOLD: Duration = Duration::from_millis(1000);
 
 impl<T: Clone> BufferedHitlessMerger<T> {
+    /// A merger over the default TS-class dedup window ([`REORDER_WINDOW`]).
     pub fn new(max_path_diff: Duration) -> Self {
+        Self::with_window(max_path_diff, REORDER_WINDOW)
+    }
+
+    /// A merger whose dedup primitive runs a `window`-slot gap-fill window
+    /// (see [`HitlessMerger::with_window`]). The window bounds the path
+    /// differential in packets as `max_path_diff` bounds it in time: a
+    /// slower leg's copy that arrives more than `window` seqs behind the
+    /// faster one is dropped as late, however long the hold.
+    pub fn with_window(max_path_diff: Duration, window: u16) -> Self {
         let bounded = if max_path_diff > MAX_PATH_DIFF_BOUND {
             MAX_PATH_DIFF_BOUND
         } else {
             max_path_diff
         };
         Self {
-            dedup: HitlessMerger::new(),
+            dedup: HitlessMerger::with_window(window),
             buffer: BTreeMap::new(),
             anchor_real: 0,
             anchor_virtual: 0,

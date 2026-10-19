@@ -541,11 +541,22 @@ async fn real_main() -> anyhow::Result<()> {
     // cannot be fixed remotely. Coerced to the default and reported below.
     #[cfg(feature = "multiviewer")]
     let repaired_mosaic_codecs = config::validation::repair_legacy_mosaic_codecs(&mut app_config);
+    // Same hazard: a primary-preference Hitless slot's `reorder_window` was
+    // accepted and applied nowhere until validation began refusing it.
+    let repaired_reorder_windows =
+        config::validation::repair_hitless_reorder_windows(&mut app_config);
 
     // Validate config
     if let Err(e) = validate_config(&app_config) {
         tracing::error!("Invalid configuration: {e}");
         return Err(e);
+    }
+    for flow_id in &repaired_reorder_windows {
+        tracing::warn!(
+            "flow '{flow_id}': dropped `reorder_window` from a Hitless slot whose mode is not \
+             \"seq_aware\" — the primary-preference merger has no reorder window, so it never \
+             had an effect. Set mode \"seq_aware\" to size the merge."
+        );
     }
     #[cfg(feature = "multiviewer")]
     for (input_id, was) in &repaired_mosaic_codecs {

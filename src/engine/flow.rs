@@ -1994,6 +1994,7 @@ impl FlowRuntime {
                 bus.clone(),
                 std::time::Duration::from_millis(hl.stall_ms),
                 hl.seq_aware,
+                hl.reorder_window,
                 hl.path_differential_ms,
                 hl.forwarding_primary.clone(),
                 self.cancel_token.child_token(),
@@ -5082,6 +5083,7 @@ async fn finalize_spts_assembler(
             bus.clone(),
             std::time::Duration::from_millis(hl.stall_ms),
             hl.seq_aware,
+            hl.reorder_window,
             hl.path_differential_ms,
             hl.forwarding_primary.clone(),
             cancel_token.child_token(),
@@ -5583,7 +5585,8 @@ fn build_assembly_plan(
                             crate::engine::ts_es_hitless::DEFAULT_STALL_MS,
                         ),
                         seq_aware,
-                        reorder_window: reorder_window.unwrap_or(1024),
+                        reorder_window: reorder_window
+                            .unwrap_or(crate::redundancy::merger::REORDER_WINDOW),
                         path_differential_ms: *path_differential_ms,
                         forwarding_primary: legs.forwarding_primary.clone(),
                     });

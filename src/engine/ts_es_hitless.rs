@@ -107,6 +107,11 @@ pub fn hitless_bus_key(uid: &str) -> (String, u16) {
 /// * `seq_aware = true, pd None`  → bare dedup (faster, no asym-path protection)
 /// * `seq_aware = true, pd Some(ms)` → buffered SMPTE 2022-7 (recommended)
 ///
+/// `reorder_window` is the seq-aware mergers' gap-fill window in sequence
+/// numbers (see [`crate::redundancy::merger::HitlessMerger::with_window`]);
+/// the primary-preference merger merges on no sequence number and has none,
+/// which is why validation refuses the field on its slots.
+///
 /// The primary-preference merger sets `forwarding_primary` on each flip, so
 /// the flow counts the SRT drops of the leg it forwards. The seq-aware
 /// mergers leave it on the primary: they merge on `upstream_seq`, which no
@@ -119,6 +124,7 @@ pub fn spawn_hitless_es_merger_full(
     bus: Arc<NodeEsBus>,
     stall: Duration,
     seq_aware: bool,
+    reorder_window: u16,
     path_differential_ms: Option<u32>,
     forwarding_primary: ForwardingPrimary,
     cancel: CancellationToken,
@@ -141,12 +147,13 @@ pub fn spawn_hitless_es_merger_full(
                     backup_rx,
                     out_tx,
                     Duration::from_millis(ms as u64),
+                    reorder_window,
                     cancel,
                 )
                 .await;
             }
             (true, None) => {
-                run_seq_aware(uid, primary_rx, backup_rx, out_tx, cancel).await;
+                run_seq_aware(uid, primary_rx, backup_rx, out_tx, reorder_window, cancel).await;
             }
             (false, _) => {
                 run_primary_preference(
@@ -170,11 +177,12 @@ async fn run_buffered(
     mut backup_rx: broadcast::Receiver<EsPacketAlias>,
     out_tx: broadcast::Sender<EsPacketAlias>,
     max_path_diff: Duration,
+    reorder_window: u16,
     cancel: CancellationToken,
 ) {
     use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger};
     let mut merger: BufferedHitlessMerger<EsPacketAlias> =
-        BufferedHitlessMerger::new(max_path_diff);
+        BufferedHitlessMerger::with_window(max_path_diff, reorder_window);
     // Far-future placeholder used when the buffer is empty so the
     // tokio::select! `sleep_until` arm doesn't fire spuriously.
     let far_future = std::time::Instant::now() + Duration::from_secs(86_400);
@@ -289,10 +297,11 @@ async fn run_seq_aware(
     mut primary_rx: broadcast::Receiver<EsPacketAlias>,
     mut backup_rx: broadcast::Receiver<EsPacketAlias>,
     out_tx: broadcast::Sender<EsPacketAlias>,
+    reorder_window: u16,
     cancel: CancellationToken,
 ) {
     use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
-    let mut merger = HitlessMerger::new();
+    let mut merger = HitlessMerger::with_window(reorder_window);
     let mut current_leg: Option<ActiveLeg> = None;
 
     loop {
@@ -389,6 +398,7 @@ mod tests {
             bus.clone(),
             Duration::from_millis(500),
             /* seq_aware */ false,
+            crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
             cancel.clone(),
@@ -430,6 +440,7 @@ mod tests {
             bus.clone(),
             Duration::from_millis(50),
             /* seq_aware */ false,
+            crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
             cancel.clone(),
@@ -469,6 +480,7 @@ mod tests {
             bus.clone(),
             Duration::from_millis(50),
             /* seq_aware */ false,
+            crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
             cancel.clone(),
@@ -508,6 +520,53 @@ mod tests {
         cancel.cancel();
     }
 
+    /// A seq-aware merger fills a gap from the backup only while the gap is
+    /// inside its configured `reorder_window`, buffered or not.
+    #[tokio::test]
+    async fn seq_aware_merges_within_the_configured_reorder_window() {
+        let seq_es = |pid: u16, seq: u16| EsPacket { upstream_seq: Some(seq), ..es(pid, 0) };
+        for path_differential_ms in [None, Some(500)] {
+            for (reorder_window, fills) in [(64u16, false), (128, true)] {
+                let bus = Arc::new(NodeEsBus::new());
+                let cancel = CancellationToken::new();
+                let _handle = spawn_hitless_es_merger_full(
+                    "slot_0_0".to_string(),
+                    ("in-a".to_string(), 0x100),
+                    ("in-b".to_string(), 0x200),
+                    bus.clone(),
+                    Duration::from_millis(50),
+                    /* seq_aware */ true,
+                    reorder_window,
+                    path_differential_ms,
+                    ForwardingPrimary::default(),
+                    cancel.clone(),
+                );
+                let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
+                let pri = bus.sender_for("in-a", 0x100, 0x1B);
+                let bak = bus.sender_for("in-b", 0x200, 0x1B);
+                // The primary loses 20; the backup's copy comes 80 seqs late.
+                for seq in (0..=100u16).filter(|&s| s != 20) {
+                    pri.send(seq_es(0x100, seq)).unwrap();
+                }
+                bak.send(seq_es(0x200, 20)).unwrap();
+
+                let quiet = Duration::from_millis(if path_differential_ms.is_some() { 900 } else { 200 });
+                let mut forwarded = Vec::new();
+                while let Ok(Ok(es)) = tokio::time::timeout(quiet, out_rx.recv()).await {
+                    forwarded.push(es.upstream_seq);
+                }
+                assert_eq!(
+                    forwarded.contains(&Some(20)),
+                    fills,
+                    "{path_differential_ms:?} window {reorder_window}: {} forwarded",
+                    forwarded.len()
+                );
+                assert_eq!(forwarded.len(), 100 + usize::from(fills));
+                cancel.cancel();
+            }
+        }
+    }
+
     /// SRT legs carry no `upstream_seq`, so a seq-aware merger forwards the
     /// primary verbatim and discards the backup, stalled primary or not: the
     /// primary is the leg on air.
@@ -524,6 +583,7 @@ mod tests {
                 bus.clone(),
                 Duration::from_millis(50),
                 /* seq_aware */ true,
+                crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
                 forwarding.clone(),
                 cancel.clone(),
