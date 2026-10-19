@@ -5,6 +5,12 @@
 //! That is what lets the manager answer "which SDI inputs have signal?" for the
 //! whole card rather than only for running flows.
 //!
+//! The original DeckLink Quad is the exception for idle ports: a port with no
+//! open capture reports `signal_locked: false` and no `detected_mode` even with
+//! a live source plugged in, so on that card an idle port's "no signal" is not
+//! an answer (#170). The `false` is the card's own and is passed through as
+//! given. The Quad 2 on `bilby-z440` reports idle ports as described above.
+//!
 //! A full 8-device sweep measures ~25 ms on a DeckLink Quad 2 (each
 //! `device_status` call walks the SDK's device iterator). That is far too much
 //! to run on the reactor during a health tick, so this mirrors
