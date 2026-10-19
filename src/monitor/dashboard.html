@@ -654,7 +654,7 @@ function renderInputSection(f) {
     liveBlock = `
       <details>
         <summary>All inputs (${f.inputs_live.length})</summary>
-        <table><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Pkts</th><th>Bitrate</th></tr></thead><tbody>
+        <table><thead><tr><th>ID</th><th>Type</th><th>State</th><th>Pkts</th><th>Bitrate</th><th>SRT drops</th></tr></thead><tbody>
           ${f.inputs_live.map(li => `
             <tr>
               <td class="mono">${escapeHtml(li.input_id)}${li.input_id === f.active_input_id ? ' <span class="tag tag-good">active</span>' : ''}</td>
@@ -662,6 +662,7 @@ function renderInputSection(f) {
               <td>${escapeHtml(li.state||'')}</td>
               <td>${fmtNum(li.packets_received||0)}</td>
               <td>${fmtBitrate(li.bitrate_bps||0)}</td>
+              <td>${li.srt_recv_dropped == null ? '' : `<span class="${li.srt_recv_dropped?'warn':''}">${fmtNum(li.srt_recv_dropped)}</span>`}</td>
             </tr>`).join('')}
         </tbody></table>
       </details>`;
@@ -749,18 +750,20 @@ function renderEgressSummary(s, label) {
   return `<div class="sub-card" style="margin-top:8px"><div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${label}</div><div class="row">${v.join(' · ')}</div>${pipe}</div>`;
 }
 
+// An input (receiver) leg, read by `SrtLegStats`' own field names — the
+// `monitor::dashboard` tests hold these readers to what the edge serialises.
 function renderLegSrt(label, s) {
   return `
     <div class="sub-card" style="margin-top:6px">
       <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">${label}</div>
       <div class="row">
         <span><b>RTT</b> ${(s.rtt_ms??0).toFixed(1)} ms</span>
-        <span><b>Latency</b> ${s.latency_ms??0} ms</span>
-        <span><b>Loss</b> ${fmtNum(s.pkt_loss||0)}</span>
-        <span><b>Recv</b> ${fmtNum(s.pkt_recv||0)}</span>
-        <span><b>Retrans</b> ${fmtNum(s.pkt_retrans||0)}</span>
-        <span><b>Drop</b> ${fmtNum(s.pkt_drop||0)}</span>
-        ${s.fec_packets_sent?`<span><b>FEC</b> ${fmtNum(s.fec_packets_sent)}</span>`:''}
+        <span><b>Latency</b> ${s.ms_recv_tsbpd_delay??0} ms</span>
+        <span><b>Loss</b> ${fmtNum(s.pkt_recv_loss_total||0)}</span>
+        <span><b>Recv</b> ${fmtNum(s.pkt_recv_total||0)}</span>
+        <span><b>Retrans</b> ${fmtNum(s.pkt_recv_retransmit_total||0)}</span>
+        <span><b>Too late</b> ${fmtNum(s.pkt_recv_drop_total||0)}</span>
+        ${s.pkt_recv_filter_supply_total?`<span><b>FEC rec.</b> ${fmtNum(s.pkt_recv_filter_supply_total)}</span>`:''}
       </div>
     </div>`;
 }
@@ -787,13 +790,20 @@ function renderBond(s) {
       <table><thead><tr><th>Path</th><th>State</th><th>Pkts</th><th>Bitrate</th><th>RTT</th></tr></thead><tbody>${paths}</tbody></table>
     </div>`;
 }
+// `SrtBondingStats`: RTT and packet counts live on each member's `stats`;
+// the aggregate carries the group's own too-late drops.
 function renderSrtBonding(s) {
-  const m = (s.members||[]).map(p => `
-    <tr><td class="mono">${escapeHtml(p.id||'')}</td><td>${escapeHtml(p.state||'')}</td>
-    <td>${fmtNum(p.pkt_recv||p.pkt_sent||0)}</td><td>${(p.rtt_ms??0).toFixed(1)} ms</td></tr>`).join('');
+  const agg = s.aggregate || {};
+  const m = (s.members||[]).map(p => {
+    const st = p.stats || {};
+    return `
+    <tr><td class="mono">${escapeHtml(p.endpoint||'')}</td><td>${escapeHtml(p.member_status||p.socket_status||'')}</td>
+    <td>${fmtNum(st.pkt_recv_total||st.pkt_sent_total||0)}</td><td>${(st.rtt_ms??0).toFixed(1)} ms</td></tr>`;
+  }).join('');
   return `
     <div class="sub-card" style="margin-top:6px">
       <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">SRT bonding (group ${escapeHtml(s.mode||'')})</div>
+      <div class="row"><span><b>Too late</b> ${fmtNum(agg.pkt_recv_drop_total||0)}</span></div>
       <table><thead><tr><th>Member</th><th>State</th><th>Pkts</th><th>RTT</th></tr></thead><tbody>${m}</tbody></table>
     </div>`;
 }

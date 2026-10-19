@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-use crate::stats::models::FlowStats;
+use crate::stats::models::{FlowStats, SrtLegStats};
 
 use super::errors::ApiError;
 use super::models::{
@@ -14,6 +14,21 @@ use super::models::{
     SystemStats,
 };
 use super::server::AppState;
+
+/// The SRT stats on a flow snapshot are its active input's socket, so only
+/// that input's inventory entry carries them: on a standby's entry they would
+/// show another input's link as its own.
+fn srt_stats_for_input(
+    live: Option<&FlowStats>,
+    input_id: &str,
+) -> (Option<SrtLegStats>, Option<SrtLegStats>) {
+    match live {
+        Some(fs) if fs.active_input_id.as_deref() == Some(input_id) => {
+            (fs.input.srt_stats.clone(), fs.input.srt_leg2_stats.clone())
+        }
+        _ => (None, None),
+    }
+}
 
 /// `GET /api/v1/stats` -- Retrieve aggregated system and per-flow statistics.
 ///
@@ -68,6 +83,7 @@ pub async fn gather_all_stats(state: &AppState) -> AllStatsResponse {
             // Check standby listener status for unassigned inputs
             let standby = state.standby_listeners.as_ref()
                 .and_then(|sl| sl.get_status(&inp_def.id));
+            let (srt_stats, srt_leg2_stats) = srt_stats_for_input(live, &inp_def.id);
 
             InputStatusEntry {
                 input_id: inp_def.id.clone(),
@@ -87,8 +103,8 @@ pub async fn gather_all_stats(state: &AppState) -> AllStatsResponse {
                 packets_lost: live.map(|fs| fs.input.packets_lost).unwrap_or(0),
                 packets_recovered_fec: live.map(|fs| fs.input.packets_recovered_fec).unwrap_or(0),
                 redundancy_switches: live.map(|fs| fs.input.redundancy_switches).unwrap_or(0),
-                srt_stats: live.and_then(|fs| fs.input.srt_stats.clone()),
-                srt_leg2_stats: live.and_then(|fs| fs.input.srt_leg2_stats.clone()),
+                srt_stats,
+                srt_leg2_stats,
             }
         })
         .collect();
@@ -239,7 +255,7 @@ pub async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
 /// - `bilbycast_edge_flow_input_packets_total` -- total RTP packets received
 /// - `bilbycast_edge_flow_input_bytes_total` -- total bytes received
 /// - `bilbycast_edge_flow_input_bitrate_bps` -- current input bitrate (bits/sec)
-/// - `bilbycast_edge_flow_input_packets_lost` -- total packets lost (sequence gaps plus SRT too-late drops)
+/// - `bilbycast_edge_flow_input_packets_lost` -- total packets lost since the flow started (sequence gaps plus the on-air SRT inputs' too-late drops, each packet once)
 /// - `bilbycast_edge_flow_input_fec_recovered_total` -- packets recovered via FEC
 /// - `bilbycast_edge_flow_input_redundancy_switches_total` -- SMPTE 2022-7 leg switches
 ///
@@ -415,7 +431,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
             ));
         }
 
-        output.push_str("\n# HELP bilbycast_edge_flow_input_packets_lost Total packets lost (sequence gaps plus SRT too-late drops)\n");
+        output.push_str("\n# HELP bilbycast_edge_flow_input_packets_lost Total packets lost since the flow started (sequence gaps plus on-air SRT too-late drops, each packet once)\n");
         output.push_str("# TYPE bilbycast_edge_flow_input_packets_lost counter\n");
         for fs in &flow_snapshots {
             output.push_str(&format!(
@@ -1008,4 +1024,24 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_active_input_entry_carries_the_flow_srt_stats() {
+        let mut fs = FlowStats {
+            active_input_id: Some("main".into()),
+            ..Default::default()
+        };
+        fs.input.srt_stats = Some(SrtLegStats { rtt_ms: 20.0, ..Default::default() });
+
+        let (main, _) = srt_stats_for_input(Some(&fs), "main");
+        assert_eq!(main.map(|s| s.rtt_ms), Some(20.0));
+        let (backup, _) = srt_stats_for_input(Some(&fs), "backup");
+        assert!(backup.is_none(), "a standby must not show the on-air link as its own");
+        assert!(srt_stats_for_input(None, "main").0.is_none());
+    }
 }

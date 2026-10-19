@@ -3547,6 +3547,77 @@ mod media_player_stats_tests {
     }
 }
 
+/// Receiver-side libsrt telemetry for one SRT input, keyed by `input_id` in
+/// [`FlowStatsAccumulator::srt_input_stats`]. Every input of a flow runs at
+/// once (warm passive), so each SRT input's stats poller writes its own
+/// entry and the snapshot reads the on-air one: with one flow-wide cache a
+/// warm standby's RTT, reconnects and drops landed on the on-air input.
+///
+/// Registered by `crate::engine::input_srt::spawn_srt_input` for
+/// single-socket and bonded SRT inputs. A SMPTE 2022-7 SRT input has no stats
+/// poller and registers nothing, so it reports neither stats nor drops.
+pub struct SrtInputStats {
+    /// Latest libsrt stats of a single-socket input's connection. Written by
+    /// `crate::srt::connection::spawn_srt_stats_poller`, cleared while the
+    /// input reconnects.
+    pub leg: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Latest group stats of a bonded input. Written by the group stats
+    /// pollers, cleared while the group reconnects.
+    pub bonding: Arc<watch::Sender<Option<SrtBondingStats>>>,
+    /// Packets the receiver dropped because they missed the TSBPD deadline
+    /// (libsrt `pktRcvDropTotal`; on a bonded input the group's own count of
+    /// packets no member delivered), summed across reconnects by the stats
+    /// poller. libsrt skips them and delivers the next packet, so nothing
+    /// downstream can see them.
+    pub recv_dropped: Arc<AtomicU64>,
+    /// Set once the payload is detected as RTP. A dropped packet then also
+    /// leaves a gap in the RTP sequence, which `input_loss` has counted
+    /// already.
+    pub rtp_framed: AtomicBool,
+}
+
+impl SrtInputStats {
+    fn new() -> Self {
+        Self {
+            leg: Arc::new(watch::channel(None).0),
+            bonding: Arc::new(watch::channel(None).0),
+            recv_dropped: Arc::new(AtomicU64::new(0)),
+            rtp_framed: AtomicBool::new(false),
+        }
+    }
+
+    /// Negotiated receiver latency and RTT, for the `srt_recv_dropped`
+    /// reason's hint. libsrt's group stats carry neither (`bstatsSocket`
+    /// zeroes them), so a bonded input reads the highest of its connected
+    /// members'.
+    fn latency_and_rtt(&self) -> Option<(i32, f64)> {
+        if let Some(s) = self.leg.borrow().as_ref() {
+            return Some((s.ms_recv_tsbpd_delay, s.rtt_ms));
+        }
+        let bonding = self.bonding.borrow();
+        bonding
+            .as_ref()?
+            .members
+            .iter()
+            .filter(|m| m.socket_status == "connected")
+            .map(|m| (m.stats.ms_recv_tsbpd_delay, m.stats.rtt_ms))
+            .reduce(|(l, r), (ml, mr)| (l.max(ml), r.max(mr)))
+    }
+}
+
+/// Too-late drops on the SRT inputs that are on air, as the snapshot reads
+/// them from [`FlowStatsAccumulator::srt_input_stats`].
+#[derive(Default)]
+struct OnAirSrtDrops {
+    /// Every drop: what the `srt_recv_dropped` health reason reports.
+    total: u64,
+    /// The share on RTP-framed inputs, which `input_loss` also counted as
+    /// sequence gaps.
+    in_seq_loss: u64,
+    /// Latency and RTT of the input that dropped the most.
+    latency: Option<(i32, f64)>,
+}
+
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
 ///
 /// Holds input-side counters (`input_packets`, `input_bytes`, `input_loss`,
@@ -3566,14 +3637,6 @@ pub struct FlowStatsAccumulator {
     pub input_packets: AtomicU64,
     pub input_bytes: AtomicU64,
     pub input_loss: AtomicU64,
-    /// Packets the SRT receiver dropped because they missed the TSBPD
-    /// deadline (libsrt `pktRcvDropTotal`), summed across reconnects by the
-    /// SRT input's stats poller. Kept apart from `input_loss` because the
-    /// two are measured differently — `input_loss` counts gaps in a sequence
-    /// the edge can see, and a raw-TS SRT payload carries no such sequence,
-    /// so before this counter an SRT input reported zero loss however much
-    /// libsrt threw away.
-    pub input_srt_recv_dropped: Arc<AtomicU64>,
     pub input_filtered: AtomicU64,
     pub fec_recovered: AtomicU64,
     pub redundancy_switches: AtomicU64,
@@ -3614,6 +3677,9 @@ pub struct FlowStatsAccumulator {
     /// model as `sdi_capture_stats`. Registered by
     /// `crate::engine::input_media_player::spawn_media_player_input`.
     pub media_player_stats: DashMap<String, Arc<MediaPlayerStats>>,
+    /// SRT receiver telemetry, keyed by `input_id`. Same per-input model as
+    /// `sdi_capture_stats`; see [`SrtInputStats`].
+    pub srt_input_stats: DashMap<String, Arc<SrtInputStats>>,
     // Per-output stats
     pub output_stats: DashMap<String, Arc<OutputStatsAccumulator>>,
     pub input_throughput: ThroughputEstimator,
@@ -3661,17 +3727,9 @@ pub struct FlowStatsAccumulator {
     pub input_config_meta: std::sync::RwLock<Option<InputConfigMeta>>,
     /// Per-output config metadata for topology display (set once per output).
     pub output_config_meta: DashMap<String, OutputConfigMeta>,
-    /// Cached SRT stats for primary input leg, updated by the SRT input polling task
-    /// via a lock-free watch channel.
-    pub input_srt_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
-    /// Cached SRT stats for redundancy input leg, updated by the SRT input polling task
-    /// via a lock-free watch channel.
+    /// Reserved for the SMPTE 2022-7 second SRT input leg. Nothing writes it
+    /// yet: the 2022-7 SRT path has no stats poller for either leg.
     pub input_srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
-    /// Cached native-libsrt bonding stats (aggregate + per-member) for an
-    /// SRT input whose config has a `bonding` block. Lock-free watch
-    /// channel, populated by `spawn_srt_group_stats_poller`.
-    pub input_srt_bonding_stats_cache:
-        Arc<watch::Sender<Option<crate::stats::models::SrtBondingStats>>>,
     /// Shared bond stats handle for bonded inputs — the only input
     /// type that aggregates N paths at the transport layer.
     /// Populated by `engine::input_bonded::spawn_bonded_input`.
@@ -3859,7 +3917,6 @@ impl FlowStatsAccumulator {
             input_packets: AtomicU64::new(0),
             input_bytes: AtomicU64::new(0),
             input_loss: AtomicU64::new(0),
-            input_srt_recv_dropped: Arc::new(AtomicU64::new(0)),
             input_filtered: AtomicU64::new(0),
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
@@ -3868,6 +3925,7 @@ impl FlowStatsAccumulator {
             ingress_dejitter_stats: DashMap::new(),
             sdi_capture_stats: DashMap::new(),
             media_player_stats: DashMap::new(),
+            srt_input_stats: DashMap::new(),
             output_stats: DashMap::new(),
             input_throughput: ThroughputEstimator::new(),
             tr101290: OnceLock::new(),
@@ -3882,9 +3940,7 @@ impl FlowStatsAccumulator {
             per_input_counters: DashMap::new(),
             input_config_meta: std::sync::RwLock::new(None),
             output_config_meta: DashMap::new(),
-            input_srt_stats_cache: Arc::new(watch::channel(None).0),
             input_srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
-            input_srt_bonding_stats_cache: Arc::new(watch::channel(None).0),
             input_bond_stats_handle: OnceLock::new(),
             input_rist_stats_handle: OnceLock::new(),
             input_rist_leg2_stats_handle: OnceLock::new(),
@@ -4302,6 +4358,38 @@ impl FlowStatsAccumulator {
         self.media_player_stats.insert(input_id.to_string(), stats);
     }
 
+    /// Register a fresh SRT telemetry handle for `input_id` and return it for
+    /// the input's stats pollers to write. Called once per single-socket or
+    /// bonded SRT input at spawn by `crate::engine::input_srt::spawn_srt_input`.
+    /// A re-added input replaces the entry, so its drops count from zero.
+    pub fn register_srt_input_stats(&self, input_id: &str) -> Arc<SrtInputStats> {
+        let stats = Arc::new(SrtInputStats::new());
+        self.srt_input_stats.insert(input_id.to_string(), stats.clone());
+        stats
+    }
+
+    /// Too-late drops on the SRT inputs in `on_air`. Ids that are not SRT
+    /// inputs (or are 2022-7 ones, which register nothing) contribute none.
+    fn on_air_srt_drops<'a>(&self, on_air: impl IntoIterator<Item = &'a str>) -> OnAirSrtDrops {
+        let mut drops = OnAirSrtDrops::default();
+        let mut worst: Option<u64> = None;
+        for input_id in on_air {
+            let Some(srt) = self.srt_input_stats.get(input_id) else {
+                continue;
+            };
+            let dropped = srt.recv_dropped.load(Ordering::Relaxed);
+            drops.total = drops.total.saturating_add(dropped);
+            if srt.rtp_framed.load(Ordering::Relaxed) {
+                drops.in_seq_loss = drops.in_seq_loss.saturating_add(dropped);
+            }
+            if worst.is_none_or(|w| dropped > w) {
+                worst = Some(dropped);
+                drops.latency = srt.latency_and_rtt();
+            }
+        }
+        drops
+    }
+
     /// Replace the header fields (`input_type` + `InputConfigMeta`) that the
     /// snapshot path reports to the manager. Called once at flow start and
     /// again on every `switch_active_input` so the UI sees the *live* input's
@@ -4533,37 +4621,55 @@ impl FlowStatsAccumulator {
                 .as_ref()
                 .map(|s| s.packets_lost)
                 .unwrap_or(0);
+        let active_input_id = self
+            .active_input_id
+            .read()
+            .ok()
+            .and_then(|g| if g.is_empty() { None } else { Some(g.clone()) });
+        // The assembler's `(input_id, source_pid) → out_pid` routing, read
+        // once: the SRT drops below and the per-ES snapshot both use it.
+        let routing = self
+            .pid_routing
+            .read()
+            .ok()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+
+        // SRT too-late drops count only on the inputs that are on air: the
+        // active one, or on an assembled flow every input the assembly
+        // routes from, since those all play at once. A warm standby's drops
+        // stay on its own `inputs_live[]` entry rather than turning the
+        // on-air flow Error.
+        let srt_drops = if routing.is_empty() {
+            self.on_air_srt_drops(active_input_id.as_deref())
+        } else {
+            let sources: std::collections::BTreeSet<&str> =
+                routing.keys().map(|(input_id, _)| input_id.as_str()).collect();
+            self.on_air_srt_drops(sources)
+        };
         let seq_loss = self.input_loss.load(Ordering::Relaxed).max(rist_loss);
-        let srt_recv_dropped = self.input_srt_recv_dropped.load(Ordering::Relaxed);
-        // What the operator sees as "lost" is everything that never reached
-        // the flow, whichever layer noticed. Health keeps the two apart so
-        // the reason can say which, and what to do about it.
-        let packets_lost = seq_loss.saturating_add(srt_recv_dropped);
-        let srt_latency = self
-            .input_srt_stats_cache
-            .borrow()
-            .as_ref()
-            .map(|s| (s.ms_recv_tsbpd_delay, s.rtt_ms));
+        // An RTP-framed SRT payload shows each dropped packet as a sequence
+        // gap as well, so `seq_loss` holds those drops already. What is left
+        // is the loss SRT's drops do not explain (upstream of SRT, or on
+        // another input), and that keeps the generic reason; the drops keep
+        // their own. `packets_lost` is the two together: everything that
+        // never reached the flow, each packet counted once.
+        let other_loss = seq_loss.saturating_sub(srt_drops.in_seq_loss);
+        let packets_lost = other_loss.saturating_add(srt_drops.total);
         let bw_exceeded = self.bandwidth_exceeded.load(Ordering::Relaxed);
         let bw_blocked = self.bandwidth_blocked.load(Ordering::Relaxed);
         let assembly_health_snap = self.assembly_health.read().ok().and_then(|g| g.clone());
         let (health, health_reasons) = derive_flow_health(
             input_bitrate,
-            seq_loss,
-            srt_recv_dropped,
-            srt_latency,
+            other_loss,
+            srt_drops.total,
+            srt_drops.latency,
             &tr101290_snap,
             bw_exceeded,
             bw_blocked,
             self.bandwidth_limit_mbps.get().copied(),
             assembly_health_snap.as_ref(),
         );
-
-        let active_input_id = self
-            .active_input_id
-            .read()
-            .ok()
-            .and_then(|g| if g.is_empty() { None } else { Some(g.clone()) });
 
         // Per-input liveness snapshot. One entry per registered input — lets
         // the manager UI surface NO SIGNAL / feed-present independently of the
@@ -4597,6 +4703,12 @@ impl FlowStatsAccumulator {
                     .sdi_capture_stats
                     .get(&input_id)
                     .map(|h| h.signal_present.load(Ordering::Relaxed));
+                // Per-input too, so a lossy warm standby shows before anyone
+                // cuts to it. Absent entry = not a counting SRT input.
+                let srt_recv_dropped = self
+                    .srt_input_stats
+                    .get(&input_id)
+                    .map(|h| h.recv_dropped.load(Ordering::Relaxed));
                 PerInputLive {
                     input_id,
                     input_type: c.input_type.clone(),
@@ -4612,6 +4724,7 @@ impl FlowStatsAccumulator {
                     rtsp_url: c.meta.rtsp_url.clone(),
                     whep_url: c.meta.whep_url.clone(),
                     signal_present,
+                    srt_recv_dropped,
                     psi_catalog,
                     psi_catalog_tick: if psi_tick == 0 { None } else { Some(psi_tick) },
                     thumbnail_alarm,
@@ -4625,14 +4738,7 @@ impl FlowStatsAccumulator {
             Some(inputs_live)
         };
 
-        // Per-ES snapshot. Read the routing map once so every entry gets a
-        // consistent `out_pid`.
-        let routing = self
-            .pid_routing
-            .read()
-            .ok()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        // Per-ES snapshot, every entry annotated from the one routing read.
         let per_es_vec: Vec<crate::stats::models::PerEsStats> = self
             .per_es_stats
             .iter()
@@ -4867,6 +4973,10 @@ impl FlowStatsAccumulator {
                     .get(active_key)
                     .map(|c| c.connect_failed())
                     .unwrap_or(false);
+                let active_srt = self
+                    .srt_input_stats
+                    .get(active_key)
+                    .map(|e| e.value().clone());
                 InputStats {
                     input_type,
                     state: derive_input_state(
@@ -4887,9 +4997,13 @@ impl FlowStatsAccumulator {
                     packets_lost,
                     packets_filtered: self.input_filtered.load(Ordering::Relaxed),
                     packets_recovered_fec: self.fec_recovered.load(Ordering::Relaxed),
-                    srt_stats: self.input_srt_stats_cache.borrow().clone(),
+                    srt_stats: active_srt
+                        .as_ref()
+                        .and_then(|h| h.leg.borrow().clone()),
                     srt_leg2_stats: self.input_srt_leg2_stats_cache.borrow().clone(),
-                    srt_bonding_stats: self.input_srt_bonding_stats_cache.borrow().clone(),
+                    srt_bonding_stats: active_srt
+                        .as_ref()
+                        .and_then(|h| h.bonding.borrow().clone()),
                     rist_stats: rist_input_stats,
                     rist_leg2_stats: rist_input_leg2_stats,
                     bond_stats: self
@@ -5712,6 +5826,10 @@ fn derive_flow_health(
     // Same thresholds as sequence-gap loss below, but its own code: the
     // remedy is different (more latency, or a path that loses less) and the
     // generic "packet loss" wording sends people looking at the wrong thing.
+    // Cumulative since the flow started, like sequence loss, and on purpose:
+    // packet loss raises no event, so this reason is the only lasting trace
+    // of a burst, and a windowed count would read green between bursts on a
+    // link that keeps losing.
     if srt_recv_dropped > 0 {
         let hint = match srt_latency {
             Some((latency_ms, rtt_ms)) if latency_ms > 0 => format!(
@@ -5727,7 +5845,7 @@ fn derive_flow_health(
                 FlowHealth::Warning
             },
             detail: format!(
-                "SRT dropped {srt_recv_dropped} packets that arrived too late to play{hint}"
+                "Since the flow started, SRT has dropped {srt_recv_dropped} packets that arrived too late to play{hint}"
             ),
         });
     }
@@ -5972,11 +6090,14 @@ mod input_state_tests {
         assert_eq!(reasons.len(), 1);
         assert_eq!(reasons[0].code, "srt_recv_dropped");
         assert!(reasons[0].detail.contains("5 packets"), "{}", reasons[0].detail);
+        assert!(reasons[0].detail.starts_with("Since the flow started"), "{}", reasons[0].detail);
         assert!(reasons[0].detail.contains("latency 120 ms"), "{}", reasons[0].detail);
         assert!(reasons[0].detail.contains("RTT 67 ms"), "{}", reasons[0].detail);
 
-        // Past the same threshold as sequence loss it is an error, and it does
-        // not also raise the generic packet-loss reason for the same packets.
+        // Past the same threshold as sequence loss it is an error. No other
+        // loss is passed (a raw-TS payload has no sequence to gap), so the
+        // generic reason stays away; an RTP payload's drops are taken out of
+        // the generic term by the snapshot, before it gets here.
         let (h, reasons) =
             derive_flow_health(8_000_000, 0, 19_978, None, &None, false, false, None, None);
         assert_eq!(h, FlowHealth::Error);
@@ -6356,5 +6477,173 @@ mod input_audio_replacer_stats_tests {
         flow.remove_av_skew_reporter("in-1");
         let e = flow.snapshot().input.audio_encode_stats.expect("the encode handle stays");
         assert_eq!(e.timeline_corrections, 0);
+    }
+}
+
+#[cfg(test)]
+mod srt_input_stats_tests {
+    use super::*;
+
+    fn flow_with_srt_inputs(ids: &[&str]) -> FlowStatsAccumulator {
+        let flow = FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into());
+        for id in ids {
+            let meta = InputConfigMeta {
+                mode: Some("listener".into()),
+                local_addr: None,
+                remote_addr: None,
+                listen_addr: None,
+                bind_addr: None,
+                rtsp_url: None,
+                whep_url: None,
+            };
+            flow.per_input_counters
+                .insert(id.to_string(), Arc::new(PerInputCounters::new("srt".into(), meta)));
+            flow.register_srt_input_stats(id);
+        }
+        flow.set_active_input_id(ids[0]);
+        flow
+    }
+
+    /// Publish one poll through the same helper the single-socket poller
+    /// uses, so the snapshot sees what a running input would.
+    fn poll(flow: &FlowStatsAccumulator, id: &str, dropped_total: i32, latency_ms: i32, rtt_ms: f64) {
+        let srt = flow.srt_input_stats.get(id).unwrap().value().clone();
+        crate::srt::connection::publish_leg_stats(
+            &srt.leg,
+            Some(&srt.recv_dropped),
+            &mut 0,
+            SrtLegStats {
+                pkt_recv_drop_total: dropped_total,
+                ms_recv_tsbpd_delay: latency_ms,
+                rtt_ms,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn codes(stats: &FlowStats) -> Vec<&str> {
+        stats.health_reasons.iter().map(|r| r.code.as_str()).collect()
+    }
+
+    #[test]
+    fn a_polled_input_publishes_its_stats_and_drops() {
+        let flow = flow_with_srt_inputs(&["main"]);
+        poll(&flow, "main", 42, 120, 30.0);
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.srt_stats.as_ref().map(|s| s.rtt_ms), Some(30.0));
+        assert_eq!(snap.input.packets_lost, 42);
+        let reason = snap
+            .health_reasons
+            .iter()
+            .find(|r| r.code == "srt_recv_dropped")
+            .expect("drops raise their own reason");
+        assert!(reason.detail.contains("latency 120 ms, RTT 30 ms"), "{}", reason.detail);
+    }
+
+    /// An RTP-framed payload's dropped packet is also a sequence gap: one
+    /// loss, one count, one reason.
+    #[test]
+    fn rtp_framed_drops_are_not_counted_twice() {
+        let flow = flow_with_srt_inputs(&["main"]);
+        flow.srt_input_stats.get("main").unwrap().rtp_framed.store(true, Ordering::Relaxed);
+        flow.input_loss.store(60, Ordering::Relaxed);
+        poll(&flow, "main", 60, 120, 30.0);
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.packets_lost, 60);
+        assert!(codes(&snap).contains(&"srt_recv_dropped"));
+        assert!(!codes(&snap).contains(&"packet_loss"), "{:?}", codes(&snap));
+
+        // Gaps SRT's drops do not explain (loss upstream of SRT) still are.
+        flow.input_loss.store(75, Ordering::Relaxed);
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.packets_lost, 75);
+        let generic = snap.health_reasons.iter().find(|r| r.code == "packet_loss").unwrap();
+        assert!(generic.detail.contains("15 packets"), "{}", generic.detail);
+    }
+
+    #[test]
+    fn raw_ts_drops_add_to_the_sequence_loss() {
+        let flow = flow_with_srt_inputs(&["main"]);
+        flow.input_loss.store(5, Ordering::Relaxed);
+        poll(&flow, "main", 60, 120, 30.0);
+        assert_eq!(flow.snapshot().input.packets_lost, 65);
+    }
+
+    /// A lossy warm standby is shown on its own entry, not on the on-air
+    /// flow, and the flow's `srt_stats` is always the on-air socket's.
+    #[test]
+    fn a_standby_inputs_drops_and_link_stay_its_own() {
+        let flow = flow_with_srt_inputs(&["main", "backup"]);
+        poll(&flow, "main", 0, 120, 20.0);
+        poll(&flow, "backup", 150, 120, 180.0);
+        let snap = flow.snapshot();
+        assert!(!codes(&snap).contains(&"srt_recv_dropped"), "{:?}", codes(&snap));
+        assert_eq!(snap.input.packets_lost, 0);
+        assert_eq!(snap.input.srt_stats.as_ref().map(|s| s.rtt_ms), Some(20.0));
+        let live = snap.inputs_live.expect("both inputs registered");
+        let dropped = |id: &str| live.iter().find(|l| l.input_id == id).unwrap().srt_recv_dropped;
+        assert_eq!(dropped("main"), Some(0));
+        assert_eq!(dropped("backup"), Some(150));
+
+        // The standby's reconnect clears its own stats, not the on-air one's.
+        flow.srt_input_stats.get("backup").unwrap().leg.send_replace(None);
+        assert_eq!(flow.snapshot().input.srt_stats.map(|s| s.rtt_ms), Some(20.0));
+
+        // Cut to it, and its drops are the flow's.
+        flow.set_active_input_id("backup");
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.packets_lost, 150);
+        assert!(codes(&snap).contains(&"srt_recv_dropped"));
+    }
+
+    /// Every input an assembly routes from is on air at once.
+    #[test]
+    fn an_assembled_flow_counts_every_routed_input() {
+        let flow = flow_with_srt_inputs(&["video", "audio", "spare"]);
+        poll(&flow, "video", 10, 120, 20.0);
+        poll(&flow, "audio", 30, 200, 90.0);
+        poll(&flow, "spare", 500, 120, 20.0);
+        flow.set_pid_routing(HashMap::from([
+            (("video".to_string(), 0x100), 0x100),
+            (("audio".to_string(), 0x101), 0x101),
+        ]));
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.packets_lost, 40);
+        let reason = snap.health_reasons.iter().find(|r| r.code == "srt_recv_dropped").unwrap();
+        assert!(reason.detail.contains("40 packets"), "{}", reason.detail);
+        // The hint is the link that dropped the most.
+        assert!(reason.detail.contains("latency 200 ms, RTT 90 ms"), "{}", reason.detail);
+    }
+
+    /// Group stats carry no latency or RTT; a bonded input's hint reads its
+    /// connected members'.
+    #[test]
+    fn a_bonded_inputs_hint_comes_from_its_members() {
+        let flow = flow_with_srt_inputs(&["bond"]);
+        let srt = flow.srt_input_stats.get("bond").unwrap().value().clone();
+        let member = |status: &str, latency: i32, rtt: f64| SrtBondingMemberStats {
+            socket_status: status.into(),
+            stats: SrtLegStats { ms_recv_tsbpd_delay: latency, rtt_ms: rtt, ..Default::default() },
+            ..Default::default()
+        };
+        crate::srt::connection::publish_bonding_stats(
+            &srt.bonding,
+            Some(&srt.recv_dropped),
+            &mut 0,
+            SrtBondingStats {
+                aggregate: SrtLegStats { pkt_recv_drop_total: 12, ..Default::default() },
+                members: vec![
+                    member("connected", 250, 40.0),
+                    member("connected", 250, 65.0),
+                    member("broken", 250, 900.0),
+                ],
+                ..Default::default()
+            },
+        );
+        let snap = flow.snapshot();
+        assert!(snap.input.srt_bonding_stats.is_some());
+        assert_eq!(snap.input.packets_lost, 12);
+        let reason = snap.health_reasons.iter().find(|r| r.code == "srt_recv_dropped").unwrap();
+        assert!(reason.detail.contains("latency 250 ms, RTT 65 ms"), "{}", reason.detail);
     }
 }

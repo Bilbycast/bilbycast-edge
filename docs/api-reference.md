@@ -1044,7 +1044,7 @@ Retrieve aggregated system-wide and per-flow statistics. Running flows include l
 | `ptp_state` | object | PTP clock state — `{ lock_state, domain?, grandmaster_id?, offset_ns?, mean_path_delay_ns?, steps_removed?, last_update_ms? }`. Populated by ST 2110 flows whose `clock_domain` is set |
 | `network_legs` | object | SMPTE 2022-7 Red/Blue per-leg counters — `{ red, blue, leg_switches }`, each leg carrying `packets_received` / `bytes_received` / `packets_forwarded` / `packets_duplicate`. Present only when the input has `redundancy` set |
 | `essence_flows` | array | Per-essence breakdown when the flow is part of a multi-essence ST 2110 flow group — `{ flow_id, essence_type, label? }` per entry |
-| `inputs_live` | array | Per-input liveness snapshot, one entry per configured input (including passive / non-switched ones) — `input_id`, `input_type`, `state`, byte/packet counters, endpoint fields and `signal_present`. This is what drives per-input "NO SIGNAL" rendering |
+| `inputs_live` | array | Per-input liveness snapshot, one entry per configured input (including passive / non-switched ones) — `input_id`, `input_type`, `state`, byte/packet counters, endpoint fields, `signal_present` and `srt_recv_dropped` (that SRT input's too-late drops since the flow started, on air or not; absent on non-SRT and SMPTE 2022-7 SRT inputs, which do not measure them). This is what drives per-input "NO SIGNAL" rendering |
 | `per_es` | array | Per-elementary-stream counters from the PID bus — `{ input_id, source_pid, out_pid?, stream_type, kind, packets, bytes, bitrate_bps, cc_errors, pcr_discontinuity_errors }`. Assembled flows only; passthrough flows use `media_analysis.program_bitrates` instead |
 | `pcr_trust_flow` | object | Flow-wide PCR-accuracy rollup over the union of every output's drift reservoir — `samples`, `cumulative_samples`, `avg_us`, `p50_us`, `p95_us`, `p99_us`, `max_us`, `window_samples`, `window_p95_us`. `p99_us` is the number broadcast quality gate 4 reads; see [metrics.md](metrics.md) |
 | `av_interleave_flow` | object | Flow-wide A/V **mux-interleave** rollup (worst-case p95 across outputs). Interleave bounds receiver buffering — it is not lip-sync |
@@ -1065,11 +1065,12 @@ Every field from `active_input_id` down is `skip_serializing_if`-guarded: its **
 | `packets_received` | integer | Total RTP packets received |
 | `bytes_received` | integer | Total bytes received |
 | `bitrate_bps` | integer | Current bitrate in bits/sec |
-| `packets_lost` | integer | Packets that never reached the flow: sequence gaps on RTP-framed inputs, plus, on an SRT input, the packets libsrt dropped for missing the TSBPD deadline (`srt_stats.pkt_recv_drop_total`, summed across reconnects). A raw-TS SRT payload has no sequence the edge can see, so the SRT term is the only loss such an input can report. When it is non-zero the flow carries an `srt_recv_dropped` health reason quoting the negotiated latency and the RTT |
+| `packets_lost` | integer | Packets that never reached the flow since it started, each counted once: sequence gaps on RTP-framed inputs (the larger of those and the legs' unrecovered loss on RIST), plus the packets libsrt dropped for missing the TSBPD deadline on the SRT input on air — `srt_stats.pkt_recv_drop_total`, or `srt_bonding_stats.aggregate.pkt_recv_drop_total` on a bonded input, summed across reconnects. On an assembled flow every input the assembly routes from is on air; a warm standby's drops stay on its `inputs_live[]` entry. An RTP-framed SRT payload shows each dropped packet as a sequence gap too, and it is not counted twice; a raw-TS SRT payload has no sequence the edge can see, so the SRT term is the only loss such an input can report. SMPTE 2022-7 redundant SRT inputs have no stats poller and report no SRT term yet. While the SRT term is non-zero the flow carries an `srt_recv_dropped` health reason — like the `packet_loss` reasons, cumulative since the flow started rather than windowed — quoting the negotiated latency and the RTT |
 | `packets_filtered` | integer | Packets dropped by ingress filters |
 | `packets_recovered_fec` | integer | Packets recovered via FEC |
-| `srt_stats` | object/null | SRT leg 1 stats (if SRT input). Present while the socket is connected, absent while it is reconnecting |
-| `srt_leg2_stats` | object/null | SRT leg 2 stats (if redundancy enabled) |
+| `srt_stats` | object/null | The active input's SRT stats, when it is a single-socket SRT input. Present while the socket is connected, absent while it is reconnecting. Absent on a bonded input (see `srt_bonding_stats`) and on a SMPTE 2022-7 one, which has no stats poller |
+| `srt_leg2_stats` | object/null | Reserved for the SMPTE 2022-7 second leg; no SRT input publishes it yet |
+| `srt_bonding_stats` | object/null | The active input's SRT socket-group stats, when it is a bonded SRT input — `{ mode, aggregate, members[] }`, see [configuration-guide.md](configuration-guide.md). Present while the group is connected, absent while it reconnects or waits for a caller |
 | `redundancy_switches` | integer | SMPTE 2022-7 leg switch count |
 
 **Output stats fields:**
@@ -1094,8 +1095,8 @@ Every field from `active_input_id` down is `skip_serializing_if`-guarded: its **
 |-------|------|-------------|
 | `state` | string | SRT socket state (e.g., `"connected"`, `"broken"`) |
 | `rtt_ms` | float | Round-trip time in milliseconds |
-| `send_rate_mbps` | float | Estimated send rate in Mbps |
-| `recv_rate_mbps` | float | Estimated receive rate in Mbps |
+| `send_rate_mbps` | float | Send rate over the last stats poll (about a second) in Mbps, SRT/UDP/IP headers included |
+| `recv_rate_mbps` | float | Receive rate over the last stats poll in Mbps, as above |
 | `pkt_loss_total` | integer | Total packets lost |
 | `pkt_retransmit_total` | integer | Total retransmitted packets |
 | `uptime_ms` | integer | Socket uptime in milliseconds |
@@ -1349,7 +1350,7 @@ Prometheus-compatible metrics endpoint. Returns metrics in the Prometheus text e
 | `bilbycast_edge_flow_input_packets_total` | counter | RTP packets received |
 | `bilbycast_edge_flow_input_bytes_total` | counter | Bytes received |
 | `bilbycast_edge_flow_input_bitrate_bps` | gauge | Input bitrate (bits/sec) |
-| `bilbycast_edge_flow_input_packets_lost` | counter | Packets lost |
+| `bilbycast_edge_flow_input_packets_lost` | counter | Packets lost since the flow started — the `packets_lost` field above |
 | `bilbycast_edge_flow_input_fec_recovered_total` | counter | Packets recovered via FEC |
 | `bilbycast_edge_flow_input_redundancy_switches_total` | counter | SMPTE 2022-7 leg switches |
 | `bilbycast_edge_flow_input_packets_filtered` | counter | Packets dropped by ingress filters |

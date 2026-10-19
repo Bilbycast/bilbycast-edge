@@ -26,7 +26,7 @@ use crate::srt::connection::{
     spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller,
     spawn_srt_stats_poller, SrtConnectionParams, CONNECT_FAILED_THRESHOLD,
 };
-use crate::stats::collector::FlowStatsAccumulator;
+use crate::stats::collector::{FlowStatsAccumulator, SrtInputStats};
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
 use crate::util::time::now_us;
 
@@ -54,6 +54,27 @@ enum SrtPayloadFormat {
     /// Raw MPEG-2 TS: one or more 188-byte packets with no RTP header.
     /// This is what OBS, Haivision, srt-live-transmit, and vMix send.
     RawTs,
+}
+
+/// What an SRT input's receive loop carries across reconnects: the payload
+/// format detected on the first packet and the sequence it numbers packets
+/// with, so a reconnect neither re-detects nor restarts the gap check.
+struct SrtRecvState {
+    format: SrtPayloadFormat,
+    last_seq: Option<u16>,
+    raw_ts_seq_counter: u16,
+    raw_ts_timestamp: u32,
+}
+
+impl SrtRecvState {
+    fn new() -> Self {
+        Self {
+            format: SrtPayloadFormat::Unknown,
+            last_seq: None,
+            raw_ts_seq_counter: 0,
+            raw_ts_timestamp: 0,
+        }
+    }
 }
 
 /// Detect the payload format of an SRT datagram.
@@ -330,12 +351,17 @@ pub fn spawn_srt_input(
             stats.clone(),
         );
 
+        // Single-socket and bonded inputs poll libsrt into their own stats
+        // entry; the 2022-7 path has no poller, so it registers none rather
+        // than report a zero it never measured.
         let result = if config.bonding.is_some() {
-            srt_input_bonded_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
+            let srt = stats.register_srt_input_stats(&input_id);
+            srt_input_bonded_loop(config, publisher, stats, &srt, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         } else if config.redundancy.is_some() {
             srt_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         } else {
-            srt_input_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
+            let srt = stats.register_srt_input_stats(&input_id);
+            srt_input_loop(config, publisher, stats, &srt, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         };
         if let Err(e) = result {
             tracing::error!("SRT input task exited with error: {e}");
@@ -352,6 +378,7 @@ async fn srt_input_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
+    srt: &SrtInputStats,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -360,8 +387,8 @@ async fn srt_input_loop(
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     match config.mode {
-        SrtMode::Listener => srt_input_listener_loop(config, publisher, stats, cancel, events, flow_id, input_id, transcoder, post).await,
-        _ => srt_input_caller_loop(config, publisher, stats, cancel, events, flow_id, input_id, transcoder, post).await,
+        SrtMode::Listener => srt_input_listener_loop(config, publisher, stats, srt, cancel, events, flow_id, input_id, transcoder, post).await,
+        _ => srt_input_caller_loop(config, publisher, stats, srt, cancel, events, flow_id, input_id, transcoder, post).await,
     }
 }
 
@@ -371,6 +398,7 @@ async fn srt_input_listener_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
+    srt: &SrtInputStats,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -392,10 +420,7 @@ async fn srt_input_listener_loop(
             return Err(e);
         }
     };
-    let mut format = SrtPayloadFormat::Unknown;
-    let mut last_seq: Option<u16> = None;
-    let mut raw_ts_seq_counter: u16 = 0;
-    let mut raw_ts_timestamp: u32 = 0;
+    let mut recv_state = SrtRecvState::new();
 
     loop {
         let socket = match accept_srt_connection(&mut listener, &cancel).await {
@@ -439,16 +464,13 @@ async fn srt_input_listener_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(
             socket.clone(),
-            stats.input_srt_stats_cache.clone(),
-            Some(stats.input_srt_recv_dropped.clone()),
+            srt.leg.clone(),
+            Some(srt.recv_dropped.clone()),
             poller_cancel.clone(),
         );
 
         let disconnected = srt_input_recv_loop(
-            &socket, &publisher, &stats, &cancel,
-            &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
-            transcoder,
-            post,
+            &socket, &publisher, &stats, srt, &cancel, &mut recv_state, transcoder, post,
         ).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
@@ -530,6 +552,7 @@ async fn srt_input_caller_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
+    srt: &SrtInputStats,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -537,10 +560,7 @@ async fn srt_input_caller_loop(
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
-    let mut format = SrtPayloadFormat::Unknown;
-    let mut last_seq: Option<u16> = None;
-    let mut raw_ts_seq_counter: u16 = 0;
-    let mut raw_ts_timestamp: u32 = 0;
+    let mut recv_state = SrtRecvState::new();
 
     // Per-input consecutive-connect-failure counter, registered by
     // `spawn_input_runtime` before this task starts. The snapshot path maps
@@ -615,16 +635,13 @@ async fn srt_input_caller_loop(
         let poller_cancel = cancel.child_token();
         spawn_srt_stats_poller(
             socket.clone(),
-            stats.input_srt_stats_cache.clone(),
-            Some(stats.input_srt_recv_dropped.clone()),
+            srt.leg.clone(),
+            Some(srt.recv_dropped.clone()),
             poller_cancel.clone(),
         );
 
         let disconnected = srt_input_recv_loop(
-            &socket, &publisher, &stats, &cancel,
-            &mut format, &mut last_seq, &mut raw_ts_seq_counter, &mut raw_ts_timestamp,
-            transcoder,
-            post,
+            &socket, &publisher, &stats, srt, &cancel, &mut recv_state, transcoder, post,
         ).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
@@ -664,14 +681,13 @@ async fn srt_input_recv_loop(
     socket: &Arc<srt_transport::SrtSocket>,
     publisher: &crate::engine::ingress_publisher::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
+    srt: &SrtInputStats,
     cancel: &CancellationToken,
-    format: &mut SrtPayloadFormat,
-    last_seq: &mut Option<u16>,
-    raw_ts_seq_counter: &mut u16,
-    raw_ts_timestamp: &mut u32,
+    state: &mut SrtRecvState,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<bool> {
+    let SrtRecvState { format, last_seq, raw_ts_seq_counter, raw_ts_timestamp } = state;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -704,6 +720,10 @@ async fn srt_input_recv_loop(
                                     *format = SrtPayloadFormat::RawTs;
                                 }
                             }
+                            // libsrt's too-late drops then also leave RTP
+                            // sequence gaps, which the stats must not count
+                            // a second time.
+                            srt.rtp_framed.store(*format == SrtPayloadFormat::RtpTs, Ordering::Relaxed);
                         }
 
                         let (seq, ts, is_raw) = match *format {
@@ -1367,6 +1387,7 @@ async fn srt_input_bonded_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
+    srt: &SrtInputStats,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -1377,13 +1398,13 @@ async fn srt_input_bonded_loop(
     match config.mode {
         SrtMode::Listener => {
             srt_input_bonded_listener_loop(
-                config, publisher, stats, cancel, events, flow_id, transcoder, post,
+                config, publisher, stats, srt, cancel, events, flow_id, transcoder, post,
             )
             .await
         }
         _ => {
             srt_input_bonded_caller_loop(
-                config, publisher, stats, cancel, events, flow_id, input_id, transcoder, post,
+                config, publisher, stats, srt, cancel, events, flow_id, input_id, transcoder, post,
             )
             .await
         }
@@ -1394,6 +1415,7 @@ async fn srt_input_bonded_caller_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
+    srt: &SrtInputStats,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -1402,10 +1424,7 @@ async fn srt_input_bonded_caller_loop(
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     let bond = config.bonding.as_ref().expect("bonding must be set").clone();
-    let mut format = SrtPayloadFormat::Unknown;
-    let mut last_seq: Option<u16> = None;
-    let mut raw_ts_seq_counter: u16 = 0;
-    let mut raw_ts_timestamp: u32 = 0;
+    let mut recv_state = SrtRecvState::new();
 
     // Group-connect consecutive-failure counter (contract C3 /
     // `connect_failed` state) — one counter per input, bumped per
@@ -1474,7 +1493,8 @@ async fn srt_input_bonded_caller_loop(
         spawn_srt_group_stats_poller(
             group.clone(),
             bond.mode,
-            stats.input_srt_bonding_stats_cache.clone(),
+            srt.bonding.clone(),
+            Some(srt.recv_dropped.clone()),
             poller_cancel.clone(),
         );
 
@@ -1482,11 +1502,9 @@ async fn srt_input_bonded_caller_loop(
             &group,
             &publisher,
             &stats,
+            srt,
             &cancel,
-            &mut format,
-            &mut last_seq,
-            &mut raw_ts_seq_counter,
-            &mut raw_ts_timestamp,
+            &mut recv_state,
             transcoder,
             post,
         )
@@ -1518,6 +1536,7 @@ async fn srt_input_bonded_listener_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
+    srt: &SrtInputStats,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -1526,10 +1545,7 @@ async fn srt_input_bonded_listener_loop(
 ) -> anyhow::Result<()> {
     let bond = config.bonding.as_ref().expect("bonding must be set").clone();
     let mut listener = bind_srt_listener_for_bonded_input(&config).await?;
-    let mut format = SrtPayloadFormat::Unknown;
-    let mut last_seq: Option<u16> = None;
-    let mut raw_ts_seq_counter: u16 = 0;
-    let mut raw_ts_timestamp: u32 = 0;
+    let mut recv_state = SrtRecvState::new();
 
     loop {
         let socket = match accept_srt_connection(&mut listener, &cancel).await {
@@ -1576,7 +1592,8 @@ async fn srt_input_bonded_listener_loop(
         spawn_srt_socket_group_stats_poller(
             socket.clone(),
             bond.mode,
-            stats.input_srt_bonding_stats_cache.clone(),
+            srt.bonding.clone(),
+            Some(srt.recv_dropped.clone()),
             poller_cancel.clone(),
         );
 
@@ -1584,11 +1601,9 @@ async fn srt_input_bonded_listener_loop(
             &socket,
             &publisher,
             &stats,
+            srt,
             &cancel,
-            &mut format,
-            &mut last_seq,
-            &mut raw_ts_seq_counter,
-            &mut raw_ts_timestamp,
+            &mut recv_state,
             transcoder,
             post,
         )
@@ -1621,19 +1636,17 @@ async fn srt_input_bonded_listener_loop(
 /// Receive loop for a bonded caller-side SRT group. Mirrors
 /// [`srt_input_recv_loop`] but reads from [`srt_transport::SrtGroup`]
 /// instead of an individual socket.
-#[allow(clippy::too_many_arguments)]
 async fn srt_bonded_group_recv_loop(
     group: &Arc<srt_transport::SrtGroup>,
     publisher: &crate::engine::ingress_publisher::IngressPublisher,
     stats: &Arc<FlowStatsAccumulator>,
+    srt: &SrtInputStats,
     cancel: &CancellationToken,
-    format: &mut SrtPayloadFormat,
-    last_seq: &mut Option<u16>,
-    raw_ts_seq_counter: &mut u16,
-    raw_ts_timestamp: &mut u32,
+    state: &mut SrtRecvState,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<bool> {
+    let SrtRecvState { format, last_seq, raw_ts_seq_counter, raw_ts_timestamp } = state;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(false),
@@ -1647,6 +1660,9 @@ async fn srt_bonded_group_recv_loop(
                             if *format == SrtPayloadFormat::Unknown {
                                 *format = SrtPayloadFormat::RawTs;
                             }
+                            // As in `srt_input_recv_loop`: an RTP payload's
+                            // drops are sequence gaps too.
+                            srt.rtp_framed.store(*format == SrtPayloadFormat::RtpTs, Ordering::Relaxed);
                         }
                         let (seq, ts, is_raw) = match *format {
                             SrtPayloadFormat::RtpTs => {

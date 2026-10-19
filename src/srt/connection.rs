@@ -1,10 +1,11 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::sync::watch;
@@ -739,22 +740,131 @@ pub(crate) fn cumulative_delta(last: &mut i64, current: i32) -> u64 {
     delta
 }
 
-/// Spawn a background task that polls SRT socket stats every second and
-/// publishes the result via the provided lock-free watch channel. Runs
-/// until the cancellation token fires.
-///
-/// `recv_dropped`, when given, accumulates the socket's receiver-side
-/// too-late drops (`pktRcvDropTotal`) across the life of the flow. Those are
-/// packets libsrt gave up on because they missed the TSBPD deadline — the
-/// only SRT loss the application never sees, since libsrt simply skips them
-/// and delivers the next packet. Inputs pass the flow's counter so the loss
-/// reaches `InputStats.packets_lost` and the flow health; outputs pass `None`.
+/// Fold a socket's (or group's) `pktRcvDropTotal` reading into the input's
+/// running total, through the poller's per-socket `last`.
+fn add_recv_drops(sink: &AtomicU64, last_drop: &mut i64, pkt_recv_drop_total: i32) {
+    let delta = cumulative_delta(last_drop, pkt_recv_drop_total);
+    if delta > 0 {
+        sink.fetch_add(delta, Ordering::Relaxed);
+    }
+}
+
+/// One tick of [`spawn_srt_stats_poller`] once the stats are read: count the
+/// socket's new too-late drops into `recv_dropped` and publish the stats.
 ///
 /// Publishing uses `send_replace`, not `send`: every one of these caches is
 /// built as `watch::channel(None).0`, i.e. with its only receiver already
 /// dropped, and `watch::Sender::send` refuses to store a value when there
 /// are no receivers. With `send` the cache stayed `None` forever and
 /// `srt_stats` was absent from every SRT input and output on the node.
+pub(crate) fn publish_leg_stats(
+    cache: &watch::Sender<Option<SrtLegStats>>,
+    recv_dropped: Option<&AtomicU64>,
+    last_drop: &mut i64,
+    leg_stats: SrtLegStats,
+) {
+    if let Some(sink) = recv_dropped {
+        add_recv_drops(sink, last_drop, leg_stats.pkt_recv_drop_total);
+    }
+    cache.send_replace(Some(leg_stats));
+}
+
+/// The group counterpart of [`publish_leg_stats`]. Drops are read off the
+/// group aggregate — libsrt's own count of packets no member delivered —
+/// never summed over members: on a broadcast group a member skips packets
+/// another member already delivered, which is no loss at all.
+pub(crate) fn publish_bonding_stats(
+    cache: &watch::Sender<Option<SrtBondingStats>>,
+    recv_dropped: Option<&AtomicU64>,
+    last_drop: &mut i64,
+    snapshot: SrtBondingStats,
+) {
+    if let Some(sink) = recv_dropped {
+        add_recv_drops(sink, last_drop, snapshot.aggregate.pkt_recv_drop_total);
+    }
+    cache.send_replace(Some(snapshot));
+}
+
+/// Turns libsrt's since-connect figures into per-poll ones.
+///
+/// The stats are read without clearing (`srt_bistats(.., clear = 0, ..)` in
+/// bilbycast-libsrt-rs), so libsrt's `mbpsSendRate` / `mbpsRecvRate` average
+/// everything since the socket connected and its "interval" FEC counters
+/// hold since-connect totals: a link that ran at 8 Mbps for ten hours still
+/// read over 7 Mbps an hour after its source fell to 1. Each poller keeps
+/// one sampler per socket and rewrites those fields as what moved since its
+/// previous tick. Clearing in libsrt instead would reset the counters under
+/// every other `stats()` caller.
+#[derive(Default)]
+struct IntervalSampler {
+    prev: Option<IntervalSample>,
+}
+
+#[derive(Clone, Copy)]
+struct IntervalSample {
+    at: Instant,
+    bytes_sent: u64,
+    bytes_recv: u64,
+    filter_extra: i32,
+    filter_supply: i32,
+    filter_loss: i32,
+}
+
+impl IntervalSampler {
+    /// Rewrite `leg`'s send / receive rates and interval FEC counters as what
+    /// moved since the previous call, the rates measured on `bytes_sent` /
+    /// `bytes_recv`. The first call keeps libsrt's figures, which then cover
+    /// the same span. A reading whose byte counters went backwards — a
+    /// failed read comes back zeroed — is left as read and does not move the
+    /// baseline, so the next good one is measured from the last good one.
+    fn apply(&mut self, leg: &mut SrtLegStats, bytes_sent: u64, bytes_recv: u64, now: Instant) {
+        let cur = IntervalSample {
+            at: now,
+            bytes_sent,
+            bytes_recv,
+            filter_extra: leg.pkt_send_filter_extra,
+            filter_supply: leg.pkt_recv_filter_supply,
+            filter_loss: leg.pkt_recv_filter_loss,
+        };
+        let Some(prev) = self.prev else {
+            self.prev = Some(cur);
+            return;
+        };
+        if bytes_sent < prev.bytes_sent || bytes_recv < prev.bytes_recv {
+            return;
+        }
+        let elapsed_us = now.saturating_duration_since(prev.at).as_micros() as f64;
+        if elapsed_us > 0.0 {
+            leg.send_rate_mbps = (bytes_sent - prev.bytes_sent) as f64 * 8.0 / elapsed_us;
+            leg.recv_rate_mbps = (bytes_recv - prev.bytes_recv) as f64 * 8.0 / elapsed_us;
+        }
+        leg.pkt_send_filter_extra = (cur.filter_extra - prev.filter_extra).max(0);
+        leg.pkt_recv_filter_supply = (cur.filter_supply - prev.filter_supply).max(0);
+        leg.pkt_recv_filter_loss = (cur.filter_loss - prev.filter_loss).max(0);
+        self.prev = Some(cur);
+    }
+}
+
+/// A 1 s poll interval that never fires back-to-back: after a stall the next
+/// tick waits a full period, so every interval the samplers measure is about
+/// a second long rather than a burst of near-zero ones.
+fn poll_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
+
+/// Spawn a background task that polls SRT socket stats every second and
+/// publishes the result via the provided lock-free watch channel. Runs
+/// until the cancellation token fires.
+///
+/// `recv_dropped`, when given, accumulates the socket's receiver-side
+/// too-late drops (`pktRcvDropTotal`) across reconnects. Those are packets
+/// libsrt gave up on because they missed the TSBPD deadline — the only SRT
+/// loss the application never sees, since libsrt simply skips them and
+/// delivers the next packet. Inputs pass their own counter
+/// ([`crate::stats::collector::SrtInputStats::recv_dropped`]) so the loss
+/// reaches `InputStats.packets_lost` and the flow health; outputs pass `None`.
 pub fn spawn_srt_stats_poller(
     socket: Arc<SrtSocket>,
     cache: Arc<watch::Sender<Option<SrtLegStats>>>,
@@ -762,21 +872,22 @@ pub fn spawn_srt_stats_poller(
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = poll_interval();
         let mut last_drop: i64 = 0;
+        let mut rates = IntervalSampler::default();
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
                     let stats = socket.stats().await;
-                    let leg_stats = convert_srt_stats(&stats);
-                    if let Some(ref sink) = recv_dropped {
-                        let delta = cumulative_delta(&mut last_drop, leg_stats.pkt_recv_drop_total);
-                        if delta > 0 {
-                            sink.fetch_add(delta, Ordering::Relaxed);
-                        }
-                    }
-                    cache.send_replace(Some(leg_stats));
+                    let mut leg_stats = convert_srt_stats(&stats);
+                    rates.apply(
+                        &mut leg_stats,
+                        stats.byte_sent_total,
+                        stats.byte_recv_total,
+                        Instant::now(),
+                    );
+                    publish_leg_stats(&cache, recv_dropped.as_deref(), &mut last_drop, leg_stats);
                 }
             }
         }
@@ -957,25 +1068,45 @@ pub async fn connect_srt_group_observed(
     }
 }
 
-fn build_bonding_stats_snapshot(
-    group: &SrtGroup,
-    member_stats: Vec<srt_transport::GroupMemberStats>,
+/// Assemble a group stats snapshot from the polled aggregate and members,
+/// every rate measured over the poll interval. `samplers` holds one
+/// [`IntervalSampler`] per member socket id and is pruned to the members
+/// present, so a member that leaves takes its baseline with it.
+fn bonding_snapshot(
     mode: &SrtBondingMode,
+    agg_raw: &srt_protocol::stats::SrtStats,
+    state: srt_protocol::config::SocketStatus,
+    members: Vec<srt_transport::GroupMemberStats>,
+    aggregate_rates: &mut IntervalSampler,
+    samplers: &mut HashMap<i32, IntervalSampler>,
+    now: Instant,
 ) -> SrtBondingStats {
-    // Pull aggregate group-level stats synchronously via a quick poll.
-    // We don't await inside because callers already awaited member_stats.
-    let aggregate = SrtLegStats {
-        state: socket_status_str(group.status()).to_string(),
-        ..Default::default()
-    };
-    let members = member_stats
+    let mut aggregate = convert_srt_stats(agg_raw);
+    aggregate.state = socket_status_str(state).to_string();
+    // libsrt's group stats (`bstatsSocket`) never fill `byteSent` /
+    // `byteRecv`, so their own rate is always 0: measure the group on the
+    // unique bytes it did count.
+    aggregate_rates.apply(
+        &mut aggregate,
+        agg_raw.byte_sent_unique_total,
+        agg_raw.byte_recv_unique_total,
+        now,
+    );
+    samplers.retain(|id, _| members.iter().any(|m| m.id == *id));
+    let members = members
         .into_iter()
         .map(|m| {
             let endpoint = m
                 .peer_addr
                 .map(|a| a.to_string())
                 .unwrap_or_else(String::new);
-            let stats = convert_srt_stats(&m.stats);
+            let mut stats = convert_srt_stats(&m.stats);
+            samplers.entry(m.id).or_default().apply(
+                &mut stats,
+                m.stats.byte_sent_total,
+                m.stats.byte_recv_total,
+                now,
+            );
             SrtBondingMemberStats {
                 endpoint,
                 socket_status: socket_status_str(m.socket_status).to_string(),
@@ -995,29 +1126,43 @@ fn build_bonding_stats_snapshot(
 /// Spawn a background task that polls per-member SRT group stats every
 /// second and publishes the snapshot via the provided lock-free watch
 /// channel. Runs until the cancellation token fires.
+///
+/// `recv_dropped` is [`spawn_srt_stats_poller`]'s, fed from the group's own
+/// drop count: inputs pass their counter, outputs `None`.
 pub fn spawn_srt_group_stats_poller(
     group: Arc<SrtGroup>,
     mode: SrtBondingMode,
     cache: Arc<watch::Sender<Option<SrtBondingStats>>>,
+    recv_dropped: Option<Arc<AtomicU64>>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = poll_interval();
+        let mut last_drop: i64 = 0;
+        let mut aggregate_rates = IntervalSampler::default();
+        let mut member_rates = HashMap::new();
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
                     let agg_raw = group.stats().await;
                     let members = group.member_stats().await;
-                    let mut snapshot = build_bonding_stats_snapshot(&group, members, &mode);
-                    // Overwrite aggregate with the real polled stats.
-                    snapshot.aggregate = convert_srt_stats(&agg_raw);
-                    snapshot.aggregate.state =
-                        socket_status_str(group.status()).to_string();
-                    cache.send_replace(Some(snapshot));
+                    let snapshot = bonding_snapshot(
+                        &mode,
+                        &agg_raw,
+                        group.status(),
+                        members,
+                        &mut aggregate_rates,
+                        &mut member_rates,
+                        Instant::now(),
+                    );
+                    publish_bonding_stats(&cache, recv_dropped.as_deref(), &mut last_drop, snapshot);
                 }
             }
         }
+        // The group is gone; its members' last "running" states and RTTs
+        // would stand for the whole reconnect.
+        cache.send_replace(None);
     });
 }
 
@@ -1026,52 +1171,42 @@ pub fn spawn_srt_group_stats_poller(
 /// An `SrtSocket` returned from a listener with `group_connect(true)` may
 /// be a group socket internally; `SrtSocket::member_stats()` returns the
 /// per-member data in that case and an empty vec for single-socket
-/// sessions (harmless for unbonded peers).
+/// sessions (harmless for unbonded peers). `recv_dropped` as for
+/// [`spawn_srt_group_stats_poller`].
 pub fn spawn_srt_socket_group_stats_poller(
     socket: Arc<SrtSocket>,
     mode: SrtBondingMode,
     cache: Arc<watch::Sender<Option<SrtBondingStats>>>,
+    recv_dropped: Option<Arc<AtomicU64>>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        let mut interval = poll_interval();
+        let mut last_drop: i64 = 0;
+        let mut aggregate_rates = IntervalSampler::default();
+        let mut member_rates = HashMap::new();
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
                     let agg_raw = socket.stats().await;
                     let members = socket.member_stats().await;
-                    let mut aggregate = convert_srt_stats(&agg_raw);
-                    aggregate.state =
-                        socket_status_str(socket.status()).to_string();
-                    let members = members
-                        .into_iter()
-                        .map(|m| {
-                            let endpoint = m
-                                .peer_addr
-                                .map(|a| a.to_string())
-                                .unwrap_or_else(String::new);
-                            let stats = convert_srt_stats(&m.stats);
-                            SrtBondingMemberStats {
-                                endpoint,
-                                socket_status:
-                                    socket_status_str(m.socket_status).to_string(),
-                                member_status:
-                                    member_status_str(m.member_status).to_string(),
-                                weight: m.weight,
-                                stats,
-                            }
-                        })
-                        .collect();
-                    let snapshot = SrtBondingStats {
-                        mode: bonding_mode_str(&mode).to_string(),
-                        aggregate,
+                    let snapshot = bonding_snapshot(
+                        &mode,
+                        &agg_raw,
+                        socket.status(),
                         members,
-                    };
-                    cache.send_replace(Some(snapshot));
+                        &mut aggregate_rates,
+                        &mut member_rates,
+                        Instant::now(),
+                    );
+                    publish_bonding_stats(&cache, recv_dropped.as_deref(), &mut last_drop, snapshot);
                 }
             }
         }
+        // As for the caller-side group: no stale "connected" while waiting
+        // for the next caller.
+        cache.send_replace(None);
     });
 }
 
@@ -1114,14 +1249,73 @@ fn parse_local_bind(p: &SrtConnectionParams) -> Result<SocketAddr> {
 mod tests {
     /// The stats caches are created with their receiver already dropped
     /// (`watch::channel(None).0`). `send` stores nothing on such a channel,
-    /// which is why `srt_stats` never appeared; `send_replace` does.
+    /// which is why `srt_stats` never appeared; the pollers' publish helpers
+    /// must store regardless, and count the drops on the way.
     #[test]
-    fn stats_cache_publish_survives_having_no_receiver() {
-        let cache: tokio::sync::watch::Sender<Option<u32>> = tokio::sync::watch::channel(None).0;
-        assert!(cache.send(Some(1)).is_err(), "send refuses without a receiver");
-        assert_eq!(*cache.borrow(), None, "and leaves the cache empty");
-        cache.send_replace(Some(2));
-        assert_eq!(*cache.borrow(), Some(2));
+    fn publishing_stores_into_a_cache_with_no_receiver() {
+        let cache: tokio::sync::watch::Sender<Option<SrtLegStats>> =
+            tokio::sync::watch::channel(None).0;
+        let dropped = AtomicU64::new(0);
+        let mut last = 0i64;
+        let leg = SrtLegStats { pkt_recv_drop_total: 7, rtt_ms: 21.0, ..Default::default() };
+        super::publish_leg_stats(&cache, Some(&dropped), &mut last, leg);
+        assert_eq!(cache.borrow().as_ref().map(|s| s.rtt_ms), Some(21.0));
+        assert_eq!(dropped.load(Ordering::Relaxed), 7);
+
+        let group: tokio::sync::watch::Sender<Option<SrtBondingStats>> =
+            tokio::sync::watch::channel(None).0;
+        let dropped = AtomicU64::new(0);
+        let mut last = 0i64;
+        // Members' own drop counters are not loss on a broadcast group: only
+        // the aggregate's count is taken.
+        let member = SrtBondingMemberStats {
+            stats: SrtLegStats { pkt_recv_drop_total: 500, ..Default::default() },
+            ..Default::default()
+        };
+        let snapshot = SrtBondingStats {
+            aggregate: SrtLegStats { pkt_recv_drop_total: 3, ..Default::default() },
+            members: vec![member],
+            ..Default::default()
+        };
+        super::publish_bonding_stats(&group, Some(&dropped), &mut last, snapshot);
+        assert!(group.borrow().is_some());
+        assert_eq!(dropped.load(Ordering::Relaxed), 3);
+    }
+
+    /// Rates and interval FEC counters are what moved since the last poll,
+    /// not libsrt's since-connect average.
+    #[test]
+    fn interval_sampler_measures_each_poll_not_the_connection() {
+        let t0 = Instant::now();
+        let mut sampler = super::IntervalSampler::default();
+        let read = |mbps: f64, extra: i32| SrtLegStats {
+            recv_rate_mbps: mbps,
+            pkt_send_filter_extra: extra,
+            ..Default::default()
+        };
+
+        // First sample: nothing to measure against, libsrt's figure stands.
+        let mut leg = read(8.0, 40);
+        sampler.apply(&mut leg, 0, 36_000_000_000, t0);
+        assert_eq!(leg.recv_rate_mbps, 8.0);
+        assert_eq!(leg.pkt_send_filter_extra, 40);
+
+        // Ten hours in, libsrt still says ~8 Mbps; the last second carried 1.
+        let mut leg = read(7.9, 45);
+        sampler.apply(&mut leg, 0, 36_000_125_000, t0 + Duration::from_secs(1));
+        assert!((leg.recv_rate_mbps - 1.0).abs() < 1e-9, "{}", leg.recv_rate_mbps);
+        assert_eq!(leg.send_rate_mbps, 0.0);
+        assert_eq!(leg.pkt_send_filter_extra, 5);
+
+        // A failed read comes back zeroed: left as read, baseline kept …
+        let mut leg = read(0.0, 0);
+        sampler.apply(&mut leg, 0, 0, t0 + Duration::from_secs(2));
+        assert_eq!(leg.recv_rate_mbps, 0.0);
+        // … so the next good read measures from the last good one, not from 0.
+        let mut leg = read(7.8, 45);
+        sampler.apply(&mut leg, 0, 36_000_375_000, t0 + Duration::from_secs(3));
+        assert!((leg.recv_rate_mbps - 1.0).abs() < 1e-9, "{}", leg.recv_rate_mbps);
+        assert_eq!(leg.pkt_send_filter_extra, 0);
     }
 
     #[test]

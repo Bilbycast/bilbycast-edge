@@ -547,6 +547,17 @@ pub struct PerInputLive {
     /// the two would paint NO SIGNAL onto every non-SDI input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_present: Option<bool>,
+    /// Packets this SRT input's receiver dropped for missing the TSBPD
+    /// deadline since the flow started (libsrt `pktRcvDropTotal`, the group's
+    /// own count on a bonded input, summed across reconnects). Reported for
+    /// every SRT input, on air or not, so a lossy warm standby shows before
+    /// anyone cuts to it; only the on-air inputs' drops reach
+    /// `InputStats.packets_lost` and the flow health.
+    ///
+    /// **`None` means "not measured"** — not an SRT input, or a SMPTE 2022-7
+    /// SRT input, which has no stats poller. It never means zero drops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub srt_recv_dropped: Option<u64>,
     /// Lightweight PAT/PMT catalogue observed on this input. `None` on
     /// non-TS inputs (RTMP / WebRTC / RTP-ES / ST 2110-30/-40) or when
     /// no PSI has arrived yet. Drives the manager UI's per-input "Programs
@@ -750,18 +761,24 @@ pub struct InputStats {
     pub bytes_received: u64,
     /// Estimated receive bitrate in bits per second.
     pub bitrate_bps: u64,
-    /// Packets that never reached the flow: RTP sequence gaps, plus the
-    /// packets an SRT input's receiver dropped for missing the TSBPD deadline
-    /// (libsrt `pktRcvDropTotal`, summed across reconnects).
+    /// Packets that never reached the flow since it started, each counted
+    /// once: RTP sequence gaps (or a RIST input's unrecovered loss, if
+    /// larger), plus the packets an on-air SRT input's receiver dropped for
+    /// missing the TSBPD deadline (libsrt `pktRcvDropTotal`, summed across
+    /// reconnects). An RTP-framed SRT payload's drops are sequence gaps as
+    /// well and are not added twice.
     pub packets_lost: u64,
     /// Packets dropped by ingress filters (source IP, payload type, rate limit).
     pub packets_filtered: u64,
     /// Number of lost packets successfully recovered via SMPTE 2022-1 FEC.
     pub packets_recovered_fec: u64,
-    /// SRT-level statistics for the primary input leg (if SRT transport).
+    /// SRT-level statistics of the active input's connection, when that is a
+    /// single-socket SRT input. Absent while it reconnects, and on a bonded
+    /// input (see `srt_bonding_stats`) or a SMPTE 2022-7 one (no poller).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srt_stats: Option<SrtLegStats>,
-    /// SRT-level statistics for the redundancy (second) input leg (if SMPTE 2022-7).
+    /// Reserved for the SMPTE 2022-7 second SRT input leg; no SRT input
+    /// publishes it yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srt_leg2_stats: Option<SrtLegStats>,
     /// RIST-level statistics for the primary input leg (if RIST transport).
@@ -775,8 +792,8 @@ pub struct InputStats {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bond_stats: Option<BondLegStats>,
     /// Native libsrt SRT bonding (socket-group) per-member stats.
-    /// Populated only when the SRT input has a `bonding` block and the
-    /// libsrt backend is active.
+    /// Populated only when the active SRT input has a `bonding` block and
+    /// the libsrt backend is active; absent while the group reconnects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srt_bonding_stats: Option<SrtBondingStats>,
     /// Number of times the active input leg switched between leg 1 and leg 2.
@@ -2028,9 +2045,11 @@ pub struct SrtLegStats {
     pub state: String,
     /// Smoothed round-trip time in milliseconds.
     pub rtt_ms: f64,
-    /// Estimated send rate in megabits per second.
+    /// Send rate over the last stats poll (about a second), in megabits per
+    /// second, SRT/UDP/IP headers included. A group aggregate measures the
+    /// unique bytes the group sent.
     pub send_rate_mbps: f64,
-    /// Estimated receive rate in megabits per second.
+    /// Receive rate over the last stats poll, as for `send_rate_mbps`.
     pub recv_rate_mbps: f64,
     /// Estimated link bandwidth in megabits per second.
     pub bandwidth_mbps: f64,
@@ -2144,11 +2163,11 @@ pub struct SrtLegStats {
     pub pkt_recv_filter_supply_total: i32,
     /// Unrecoverable FEC losses (total).
     pub pkt_recv_filter_loss_total: i32,
-    /// FEC packets sent (overhead, interval).
+    /// FEC packets sent (overhead) since the last stats poll.
     pub pkt_send_filter_extra: i32,
-    /// Packets recovered by FEC (interval).
+    /// Packets recovered by FEC since the last stats poll.
     pub pkt_recv_filter_supply: i32,
-    /// Unrecoverable FEC losses (interval).
+    /// Unrecoverable FEC losses since the last stats poll.
     pub pkt_recv_filter_loss: i32,
 
     /// Milliseconds since the SRT socket was connected (socket uptime).
@@ -2182,7 +2201,9 @@ pub struct SrtBondingStats {
     /// Bonding mode string — `"broadcast"` or `"backup"`.
     pub mode: String,
     /// Aggregate group-level stats (what libsrt reports on the group
-    /// socket itself).
+    /// socket itself). libsrt fills only the group's unique packet / byte
+    /// counters and `pkt_recv_drop_total` (packets no member delivered)
+    /// there; RTT and latency are reported per member.
     pub aggregate: SrtLegStats,
     /// One entry per member link.
     pub members: Vec<SrtBondingMemberStats>,

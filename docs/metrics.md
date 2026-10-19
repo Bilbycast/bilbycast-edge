@@ -49,7 +49,7 @@ Emitted unconditionally at the top of every scrape.
 | `bilbycast_edge_flow_input_packets_total` | counter | `flow_id` | Packets received on the active input. |
 | `bilbycast_edge_flow_input_bytes_total` | counter | `flow_id` | Bytes received on the active input. |
 | `bilbycast_edge_flow_input_bitrate_bps` | gauge | `flow_id` | Input bitrate estimate (bits/sec). |
-| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Packets that never reached the flow: sequence gaps, plus SRT receiver too-late drops (libsrt `pktRcvDropTotal`, summed across reconnects). |
+| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Packets that never reached the flow since it started, each counted once: sequence gaps, plus the too-late drops of the SRT input on air (libsrt `pktRcvDropTotal`, summed across reconnects; every routed input on an assembled flow). The SRT term is counted on single-socket and bonded SRT inputs — not on SMPTE 2022-7 redundant SRT inputs, which have no stats poller — and a warm standby's drops stay out of it, so a Take moves that term to the new input's. |
 | `bilbycast_edge_flow_input_fec_recovered_total` | counter | `flow_id` | Packets recovered by 2022-1 FEC. |
 | `bilbycast_edge_flow_output_packets_total` | counter | `flow_id,output_id` | Packets emitted per output. |
 | `bilbycast_edge_flow_output_bytes_total` | counter | `flow_id,output_id` | Bytes emitted per output. |
@@ -88,7 +88,11 @@ Two families only. Labels are `flow_id` plus `leg` — there is **no**
 
 `srt_loss_total` currently has no 2022-7 arm: it is emitted for the primary
 input leg and for `leg="leg1"` on outputs only, so a leg2 loss series does
-not exist even though `srt_rtt_ms` has one. Sender-retransmit and
+not exist even though `srt_rtt_ms` has one. `leg="input"` is the **active**
+input's socket, and only when that is a single-socket SRT input — a bonded
+or 2022-7 input emits neither series. `pkt_loss_total` is libsrt's per-socket
+total, so it restarts at every reconnect and at every Take to another SRT
+input, which `rate()` reads as a counter reset. Sender-retransmit and
 receiver-recovery counters are **not** on `/metrics` at all — they ride the
 WS `stats` message as `pkt_retransmit_total` / `pkt_recv_retransmit_total`
 on the SRT block of `FlowStats`.
