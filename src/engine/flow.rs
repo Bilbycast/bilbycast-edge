@@ -3369,6 +3369,11 @@ impl FlowRuntime {
             // incarnation's frozen deltas (adversarial review 2026-06-06).
             self.stats.remove_av_skew_reporter(input_id);
         }
+        // Likewise its SRT telemetry, which a re-add of another kind under
+        // the same id would otherwise report as its own. A stats poller still
+        // winding down writes only to the handle it holds, never to a
+        // successor's.
+        self.stats.remove_srt_input_stats(input_id);
 
         // Drop from live_inputs + registered_input_ids.
         let bonded_flipped;
@@ -5114,7 +5119,8 @@ async fn finalize_spts_assembler(
     //    its own muxer-mode rewriter on the assembled output (single
     //    shared anchor, master-clock PCR/PTS, TR 101 290 compliance).
     //    The health cell receives the 1 Hz per-slot stall snapshot for
-    //    `FlowStats.assembly_health`.
+    //    `FlowStats.assembly_health`; `on_air` what the assembler plays
+    //    from, on every change, for the SRT drop accounting.
     Ok(spawn_spts_assembler(
         build.plan,
         bus.clone(),
@@ -5124,6 +5130,7 @@ async fn finalize_spts_assembler(
         flow_id.to_string(),
         av_sync_pacer.clone(),
         Some(flow_stats.assembly_health.clone()),
+        Some(flow_stats.on_air.clone()),
         psi_catalogs,
     ))
 }
@@ -5419,15 +5426,16 @@ fn build_assembly_plan(
         let restart_active_id: Option<String> =
             flow.active_input().map(|d| d.id.clone());
         for stream in &program.streams {
-            let (input_id, source_pid, switch_legs, splice_mode, splice_budget_ms): (
+            let (input_id, source_pid, switch_legs, hitless_legs, splice_mode, splice_budget_ms): (
                 String,
                 u16,
                 Option<Vec<(String, u16)>>,
+                Option<[String; 2]>,
                 crate::config::models::SpliceMode,
                 Option<u32>,
             ) = match &stream.source {
                 SlotSource::Pid { input_id, source_pid } => {
-                    (input_id.clone(), *source_pid, None, Default::default(), None)
+                    (input_id.clone(), *source_pid, None, None, Default::default(), None)
                 }
                 SlotSource::Essence { input_id, kind } => {
                     let slot_idx = slots.len();
@@ -5439,7 +5447,7 @@ fn build_assembly_plan(
                         leg_idx: None,
                     });
                     // sentinel, patched after resolution
-                    (input_id.clone(), 0_u16, None, Default::default(), None)
+                    (input_id.clone(), 0_u16, None, None, Default::default(), None)
                 }
                 SlotSource::Switch {
                     legs,
@@ -5482,7 +5490,7 @@ fn build_assembly_plan(
                         .find(|(iid, _)| iid == &active_id)
                         .cloned()
                         .unwrap_or_else(|| leg_pairs[0].clone());
-                    (active_pair.0, active_pair.1, Some(leg_pairs), *splice_mode, *splice_budget_ms)
+                    (active_pair.0, active_pair.1, Some(leg_pairs), None, *splice_mode, *splice_budget_ms)
                 }
                 SlotSource::Hitless {
                     primary,
@@ -5550,6 +5558,7 @@ fn build_assembly_plan(
                         mode,
                         crate::config::models::HitlessMode::SeqAware
                     );
+                    let legs = [primary_pair.0.clone(), backup_pair.0.clone()];
                     pending_hitless.push(crate::engine::ts_assembler::PendingHitlessSlot {
                         uid: uid.clone(),
                         primary: primary_pair,
@@ -5565,7 +5574,7 @@ fn build_assembly_plan(
                     // output. The pre-bus merger task is responsible
                     // for keeping that key supplied.
                     let (iid, pid) = crate::engine::ts_es_hitless::hitless_bus_key(&uid);
-                    (iid, pid, None, Default::default(), None)
+                    (iid, pid, None, Some(legs), Default::default(), None)
                 }
             };
             // Phase 6.5 cross-check: when the slot's input is a PCM /
@@ -5617,6 +5626,7 @@ fn build_assembly_plan(
                 out_pid: stream.out_pid,
                 stream_type: stream.stream_type,
                 switch_legs,
+                hitless_legs,
                 splice_mode,
                 splice_budget_ms,
             });
@@ -7749,3 +7759,54 @@ mod input_membership_tests {
 }
 
 
+
+#[cfg(test)]
+mod assembly_plan_tests {
+    use super::*;
+
+    /// A Hitless slot reads its merger's synthetic bus key, and names the two
+    /// inputs behind it, so the assembler can say both are on air.
+    #[test]
+    fn a_hitless_slot_names_the_inputs_behind_its_merger() {
+        let input = |id: &str, port: u16| -> InputDefinition {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "type": "udp",
+                "bind_addr": format!("127.0.0.1:{port}")
+            }))
+            .expect("input fixture")
+        };
+        let flow: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f1", "name": "f1", "input_ids": ["in-a", "in-b"], "output_ids": [],
+            "assembly": {
+                "kind": "spts",
+                "pcr_source": { "input_id": "in-a", "pid": 256 },
+                "programs": [{
+                    "program_number": 1,
+                    "pmt_pid": 4096,
+                    "streams": [{
+                        "source": {
+                            "type": "hitless",
+                            "primary": { "type": "pid", "input_id": "in-a", "source_pid": 256 },
+                            "backup": { "type": "pid", "input_id": "in-b", "source_pid": 256 }
+                        },
+                        "out_pid": 257,
+                        "stream_type": 27
+                    }]
+                }]
+            }
+        }))
+        .expect("flow fixture");
+        let cfg = AppConfig {
+            inputs: vec![input("in-a", 41891), input("in-b", 41892)],
+            flows: vec![flow],
+            ..Default::default()
+        };
+        let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
+        let (events, _rx) = crate::manager::events::event_channel();
+        let assembly = resolved.config.assembly.as_ref().expect("assembly");
+        let build = build_assembly_plan(assembly, &resolved, &events).expect("plan");
+        let slot = &build.plan.programs[0].slots[0];
+        assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("slot_0_0"));
+        assert_eq!(slot.hitless_legs, Some(["in-a".to_string(), "in-b".to_string()]));
+    }
+}

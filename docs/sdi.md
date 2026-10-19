@@ -442,11 +442,18 @@ detected raster + colorimetry + field dominance, detected dynamic range
 slot is a classic invisible cause of capture drops). Every field is optional on
 the wire; **absent means "the card did not say", never "no"**.
 
-The original DeckLink Quad is the exception for idle ports: a port with no open
-capture reports `signal_locked: false` and no `detected_mode` even with a live
-source plugged in, so on that card an idle port's "no signal" is not an answer
-([#170](https://github.com/Bilbycast/bilbycast-edge/issues/170)). The Quad 2 on
-`bilby-z440` reports idle ports as described above.
+Idle-port status is not dependable on every card. On the original DeckLink
+Quad, at least, a port with no open capture reports `signal_locked: false` and
+no `detected_mode` even with a live source plugged in
+([#170](https://github.com/Bilbycast/bilbycast-edge/issues/170)). `bilby-voyager`'s
+Quad 2 in its `2dhd` profile was commissioned on the same assumption
+([#169](https://github.com/Bilbycast/bilbycast-edge/issues/169)), and
+[#175](https://github.com/Bilbycast/bilbycast-edge/issues/175) suspects the
+behaviour depends on whether the sub-device is active in the current profile
+rather than on the card model. The Quad 2 on `bilby-z440` is the one card
+verified to report idle ports as described above. Until #170 is fixed, treat an
+idle port's "no signal" as unknown rather than as an answer, and open the port
+in an enabled flow to get one.
 
 **Capability** — `sdi-decklink` on `HealthPayload.capabilities`, gated on the
 boot probe reaching the SDK. A card-less host with Desktop Video still
@@ -622,8 +629,12 @@ before you start:
   ([#175](https://github.com/Bilbycast/bilbycast-edge/issues/175)).
 
 Write the answer down as a connector label in the manager (the node's **SDI
-Devices** panel → **Label connectors**): it is shown wherever an SDI device is
-picked, kept while the card is out for service, and carried in a backup. But a
+Devices** panel → **Label connectors**): it is shown on that panel and leads
+each port in the **SDI Port** picker of the manager's input and output forms,
+is kept while the card is out for service, and is carried in a backup. The
+Visual Flow Editor's DeckLink device picker does not show it yet: it lists
+sub-devices by SDK name alone, so match a port there by the name the input and
+output forms show in brackets after its label. But a
 label belongs to the sub-device **name** (`DeckLink Quad (3)`), not to the BNC,
 and nothing in the edge or the manager notices when the two part company. After
 a profile switch or a card replacement, every label whose name the card still

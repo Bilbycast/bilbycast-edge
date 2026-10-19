@@ -1622,4 +1622,68 @@ mod tests {
             "fresh registration after unregister must allocate a new store"
         );
     }
+
+    fn input(value: serde_json::Value) -> crate::config::models::InputDefinition {
+        serde_json::from_value(value).expect("input fixture")
+    }
+
+    /// A removed SRT input takes its telemetry with it. Re-added under the
+    /// same id as a UDP input and taken to air, it must not report the
+    /// removed incarnation's drops as its own.
+    #[tokio::test]
+    async fn a_removed_srt_input_takes_its_drops_with_it() {
+        let fm = make_fm();
+        let main = serde_json::json!({
+            "id": "main", "name": "main", "active": true,
+            "type": "udp", "bind_addr": "127.0.0.1:41871"
+        });
+        let backup = |kind: &str| match kind {
+            "srt" => serde_json::json!({
+                "id": "backup", "name": "backup", "type": "srt",
+                "mode": "listener", "local_addr": "127.0.0.1:41872"
+            }),
+            _ => serde_json::json!({
+                "id": "backup", "name": "backup", "type": "udp",
+                "bind_addr": "127.0.0.1:41873"
+            }),
+        };
+        let cfg = crate::config::models::AppConfig {
+            inputs: vec![input(main), input(backup("srt"))],
+            flows: vec![serde_json::from_value(serde_json::json!({
+                "id": "f1", "name": "f1", "input_ids": ["main", "backup"], "output_ids": []
+            }))
+            .expect("flow fixture")],
+            ..Default::default()
+        };
+        let runtime = fm
+            .create_flow(cfg.resolve_flow(&cfg.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+        let mut srt = None;
+        for _ in 0..200 {
+            srt = runtime.stats.srt_input_stats.get("backup").map(|e| e.value().clone());
+            if srt.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // A lossy warm standby.
+        srt.expect("the SRT input registers its telemetry").count_recv_drops(300);
+
+        fm.remove_input("f1", "backup").await.expect("remove the standby");
+        assert!(runtime.stats.srt_input_stats.get("backup").is_none());
+        fm.add_input("f1", input(backup("udp"))).await.expect("re-add as UDP");
+        fm.switch_active_input("f1", "backup", None).await.expect("take it");
+
+        let snap = runtime.stats.snapshot();
+        let live = snap.inputs_live.as_ref().expect("inputs registered");
+        let entry = live.iter().find(|l| l.input_id == "backup").expect("re-added");
+        assert_eq!(entry.srt_recv_dropped, None, "a UDP input measures no SRT drops");
+        assert!(
+            snap.health_reasons.iter().all(|r| r.code != "srt_recv_dropped"),
+            "{:?}",
+            snap.health_reasons
+        );
+        let _ = fm.destroy_flow("f1").await;
+    }
 }
