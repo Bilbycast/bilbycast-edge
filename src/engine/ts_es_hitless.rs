@@ -55,7 +55,7 @@ use super::ts_es_bus::NodeEsBus;
 pub const DEFAULT_STALL_MS: u64 = 200;
 
 /// Namespace for synthetic bus keys used by Hitless slots. The merger
-/// publishes onto `(format!("{HITLESS_INPUT_PREFIX}{uid}"), 0)`. The
+/// publishes onto [`hitless_bus_key`] of its flow and slot. The
 /// assembler's slot points at the same key, so the assembler sees a
 /// single stream and stays PID-level.
 pub const HITLESS_INPUT_PREFIX: &str = "hitless:";
@@ -96,12 +96,19 @@ impl PartialEq for ForwardingPrimary {
 
 impl Eq for ForwardingPrimary {}
 
-/// Build the synthetic bus key `(input_id, source_pid)` for a Hitless
-/// slot. The `uid` should be unique per Hitless slot within the flow —
-/// convention is `"slot_{program_idx}_{slot_idx}"` so two Hitless slots
-/// on the same flow never collide.
-pub fn hitless_bus_key(uid: &str) -> (String, u16) {
-    (format!("{HITLESS_INPUT_PREFIX}{uid}"), 0)
+/// Build the synthetic bus key `(input_id, source_pid)` for the Hitless
+/// slot `uid` of flow `flow_id`: `("hitless:{flow_id}:{uid}", 0)`.
+///
+/// The bus is node-wide — every flow shares the [`NodeEsBus`] its
+/// `FlowManager` owns, and `sender_for` hands a second publisher the
+/// existing channel — so the key names the flow as well as the slot. Keyed
+/// on the slot alone, two assembled flows with a Hitless slot at the same
+/// position published onto one key and each assembler played both flows'
+/// packets. `uid` is unique per Hitless slot within the flow
+/// (`"slot_{program_idx}_{slot_idx}"`) and holds no `:`, so the last `:`
+/// separates the two and no two flows' slots share a key.
+pub fn hitless_bus_key(flow_id: &str, uid: &str) -> (String, u16) {
+    (format!("{HITLESS_INPUT_PREFIX}{flow_id}:{uid}"), 0)
 }
 
 /// The mergers running behind one assembled flow's Hitless slots, by slot
@@ -148,9 +155,8 @@ impl HitlessMergers {
         }
         for slot in slots {
             if let Some(running) = kept.get(&slot.uid) {
-                let key = hitless_bus_key(&slot.uid);
                 for planned in plan.programs.iter_mut().flat_map(|p| p.slots.iter_mut()) {
-                    if planned.source == key
+                    if planned.source == slot.bus_key
                         && let Some(legs) = planned.hitless_legs.as_mut()
                     {
                         legs.forwarding_primary = running.slot.forwarding_primary.clone();
@@ -160,7 +166,7 @@ impl HitlessMergers {
             }
             let cancel = parent.child_token();
             let task = spawn_hitless_es_merger_full(
-                slot.uid.clone(),
+                slot.bus_key.clone(),
                 slot.primary.clone(),
                 slot.backup.clone(),
                 bus.clone(),
@@ -190,13 +196,16 @@ impl HitlessMergers {
 /// the primary-preference merger merges on no sequence number and has none,
 /// which is why validation refuses the field on its slots.
 ///
+/// The merger publishes onto `output`, the slot's [`hitless_bus_key`], and
+/// names it in its logs.
+///
 /// The primary-preference merger sets `forwarding_primary` on each flip, so
 /// the flow counts the SRT drops of the leg it forwards. The seq-aware
 /// mergers leave it on the primary: they merge on `upstream_seq`, which no
 /// SRT input stamps, so of SRT legs they forward the primary verbatim and
 /// discard the backup.
 pub fn spawn_hitless_es_merger_full(
-    uid: String,
+    output: (String, u16),
     primary: (String, u16),
     backup: (String, u16),
     bus: Arc<NodeEsBus>,
@@ -209,12 +218,13 @@ pub fn spawn_hitless_es_merger_full(
 ) -> JoinHandle<()> {
     let mut primary_rx = bus.subscribe(&primary.0, primary.1);
     let mut backup_rx = bus.subscribe(&backup.0, backup.1);
-    let (out_input, out_pid) = hitless_bus_key(&uid);
+    let (out_input, out_pid) = output;
     // `stream_type = 0` (unknown) → bus channel sizes at the video-class
     // default (8192). Hitless mergers don't know the essence type up
     // front and we'd rather over-allocate by a few KB than truncate a
     // real video leg.
     let out_tx = bus.sender_for(&out_input, out_pid, 0);
+    let uid = out_input;
 
     tokio::spawn(async move {
         match (seq_aware, path_differential_ms) {
@@ -470,7 +480,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let forwarding = ForwardingPrimary::default();
         let _handle = spawn_hitless_es_merger_full(
-            "slot_0_0".to_string(),
+            hitless_bus_key("f1", "slot_0_0"),
             ("in-a".to_string(), 0x100),
             ("in-b".to_string(), 0x200),
             bus.clone(),
@@ -482,7 +492,7 @@ mod tests {
             cancel.clone(),
         );
 
-        let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
+        let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
         let pri = bus.sender_for("in-a", 0x100, 0x1B);
         let bak = bus.sender_for("in-b", 0x200, 0x03);
 
@@ -512,7 +522,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let forwarding = ForwardingPrimary::default();
         let _handle = spawn_hitless_es_merger_full(
-            "slot_0_0".to_string(),
+            hitless_bus_key("f1", "slot_0_0"),
             ("in-a".to_string(), 0x100),
             ("in-b".to_string(), 0x200),
             bus.clone(),
@@ -524,7 +534,7 @@ mod tests {
             cancel.clone(),
         );
 
-        let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
+        let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
         let pri = bus.sender_for("in-a", 0x100, 0x1B);
         let bak = bus.sender_for("in-b", 0x200, 0x03);
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -552,7 +562,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let forwarding = ForwardingPrimary::default();
         let _handle = spawn_hitless_es_merger_full(
-            "slot_0_0".to_string(),
+            hitless_bus_key("f1", "slot_0_0"),
             ("in-a".to_string(), 0x100),
             ("in-b".to_string(), 0x200),
             bus.clone(),
@@ -564,7 +574,7 @@ mod tests {
             cancel.clone(),
         );
 
-        let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
+        let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
         let pri = bus.sender_for("in-a", 0x100, 0x1B);
         let bak = bus.sender_for("in-b", 0x200, 0x03);
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -608,7 +618,7 @@ mod tests {
                 let bus = Arc::new(NodeEsBus::new());
                 let cancel = CancellationToken::new();
                 let _handle = spawn_hitless_es_merger_full(
-                    "slot_0_0".to_string(),
+                    hitless_bus_key("f1", "slot_0_0"),
                     ("in-a".to_string(), 0x100),
                     ("in-b".to_string(), 0x200),
                     bus.clone(),
@@ -619,7 +629,7 @@ mod tests {
                     ForwardingPrimary::default(),
                     cancel.clone(),
                 );
-                let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
+                let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
                 let pri = bus.sender_for("in-a", 0x100, 0x1B);
                 let bak = bus.sender_for("in-b", 0x200, 0x1B);
                 // The primary loses 20; the backup's copy comes 80 seqs late.
@@ -655,7 +665,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let forwarding = ForwardingPrimary::default();
             let _handle = spawn_hitless_es_merger_full(
-                "slot_0_0".to_string(),
+                hitless_bus_key("f1", "slot_0_0"),
                 ("in-a".to_string(), 0x100),
                 ("in-b".to_string(), 0x200),
                 bus.clone(),
@@ -666,7 +676,7 @@ mod tests {
                 forwarding.clone(),
                 cancel.clone(),
             );
-            let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
+            let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
             let pri = bus.sender_for("in-a", 0x100, 0x1B);
             let bak = bus.sender_for("in-b", 0x200, 0x03);
 

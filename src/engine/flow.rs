@@ -5428,7 +5428,7 @@ fn build_assembly_plan(
         // `source_pid = 0` and an entry in `pending_essence` so the
         // runtime can patch the slot in place after the resolver
         // returns. `Hitless` slots expand into a synthetic bus key
-        // (`hitless:slot_{P}_{S}`) and a `PendingHitlessSlot` entry
+        // (`hitless:{flow_id}:slot_{P}_{S}`) and a `PendingHitlessSlot` entry
         // that the runtime turns into a merger task before the
         // assembler starts.
         let mut slots: Vec<AssemblySlot> = Vec::with_capacity(program.streams.len());
@@ -5576,8 +5576,11 @@ fn build_assembly_plan(
                         backup: backup_pair.0.clone(),
                         forwarding_primary: Default::default(),
                     };
+                    // Flow-scoped: the bus is node-wide.
+                    let bus_key = crate::engine::ts_es_hitless::hitless_bus_key(flow_id, &uid);
                     pending_hitless.push(crate::engine::ts_assembler::PendingHitlessSlot {
-                        uid: uid.clone(),
+                        uid,
+                        bus_key: bus_key.clone(),
                         primary: primary_pair,
                         backup: backup_pair,
                         stall_ms: stall_ms.unwrap_or(
@@ -5592,7 +5595,7 @@ fn build_assembly_plan(
                     // The assembler reads from the synthetic merger
                     // output. The pre-bus merger task is responsible
                     // for keeping that key supplied.
-                    let (iid, pid) = crate::engine::ts_es_hitless::hitless_bus_key(&uid);
+                    let (iid, pid) = bus_key;
                     (iid, pid, None, Some(legs), Default::default(), None)
                 }
             };
@@ -7826,7 +7829,8 @@ mod assembly_plan_tests {
         let assembly = resolved.config.assembly.as_ref().expect("assembly");
         let build = build_assembly_plan(assembly, &resolved, &events).expect("plan");
         let slot = &build.plan.programs[0].slots[0];
-        assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("slot_0_0"));
+        assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("f1", "slot_0_0"));
+        assert_eq!(build.pending_hitless[0].bus_key, slot.source, "the merger feeds the slot");
         let legs = slot.hitless_legs.as_ref().expect("the slot names its legs");
         assert_eq!((legs.primary.as_str(), legs.backup.as_str()), ("in-a", "in-b"));
         assert_eq!(legs.on_air(), "in-a");

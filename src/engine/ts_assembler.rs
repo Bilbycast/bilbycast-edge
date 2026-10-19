@@ -2970,11 +2970,13 @@ pub struct PendingEssenceSlot {
 /// before bringing the assembler up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingHitlessSlot {
-    /// Stable identifier — `"slot_{program_idx}_{slot_idx}"` is the
-    /// convention so two Hitless slots on the same flow never collide.
-    /// Doubles as the synthetic bus key suffix
-    /// (`hitless:{uid}` is the bus input_id).
+    /// Stable identifier within the flow — `"slot_{program_idx}_{slot_idx}"`
+    /// is the convention so two Hitless slots on the same flow never collide.
     pub uid: String,
+    /// The synthetic bus key the merger publishes onto and the slot reads:
+    /// [`crate::engine::ts_es_hitless::hitless_bus_key`] of the flow and
+    /// `uid`, so no other flow's slot shares it.
+    pub bus_key: (String, u16),
     /// Concrete `(input_id, source_pid)` for the primary leg.
     pub primary: (String, u16),
     /// Concrete `(input_id, source_pid)` for the backup leg.
@@ -3011,7 +3013,7 @@ pub struct PendingHitlessSlot {
 /// patches them in place after the resolver returns. Slots in `plan`
 /// corresponding to entries in `pending_hitless` have already been
 /// pointed at the synthetic merger output, so the assembler treats them
-/// as a normal `(hitless:{uid}, 0)` source.
+/// as a normal `(hitless:{flow_id}:{uid}, 0)` source.
 #[derive(Debug, Clone)]
 pub struct SptsBuildResult {
     pub plan: AssemblyPlan,
@@ -4503,7 +4505,7 @@ mod tests {
         ]);
         switch.splice_mode = splice_mode;
         switch.splice_budget_ms = splice_budget_ms;
-        let (merged, merged_pid) = crate::engine::ts_es_hitless::hitless_bus_key("slot_0_1");
+        let (merged, merged_pid) = crate::engine::ts_es_hitless::hitless_bus_key("f1", "slot_0_1");
         let mut hitless = slot(&merged, merged_pid, 0x202, 0x1B);
         hitless.hitless_legs = Some(HitlessLegs {
             primary: "srt-pri".to_string(),
@@ -4680,7 +4682,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let _stop_on_failure = cancel.clone().drop_guard();
         let _merger = crate::engine::ts_es_hitless::spawn_hitless_es_merger_full(
-            "slot_0_1".to_string(),
+            crate::engine::ts_es_hitless::hitless_bus_key("f1", "slot_0_1"),
             ("srt-pri".to_string(), 0x102),
             ("srt-bak".to_string(), 0x102),
             bus.clone(),

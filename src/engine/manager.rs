@@ -1777,7 +1777,8 @@ mod tests {
             let bus = fm.node_es_bus();
             let runtime = runtime.clone();
             async move {
-                let (merged, merged_pid) = crate::engine::ts_es_hitless::hitless_bus_key("slot_0_1");
+                let (merged, merged_pid) =
+                    crate::engine::ts_es_hitless::hitless_bus_key("f1", "slot_0_1");
                 let primary = bus.sender_for("in-a", 257, 0x0F);
                 let backup = bus.sender_for("in-b", 257, 0x0F);
                 let packet = || EsPacket {
@@ -1841,6 +1842,151 @@ mod tests {
         });
         let outcome = checks.await;
         let _ = fm.destroy_flow("f1").await;
+        if let Err(failed) = outcome {
+            std::panic::resume_unwind(failed.into_panic());
+        }
+    }
+
+    /// The ES bus is node-wide, so a Hitless slot's bus key names its flow:
+    /// two assembled flows with a Hitless slot at the same position (program
+    /// 0, slot 0) each play only their own merger's packets. Keyed on the
+    /// slot alone, both mergers published onto one key and both assemblers
+    /// played both flows' packets.
+    #[tokio::test]
+    async fn two_flows_hitless_slots_at_one_position_do_not_cross_feed() {
+        use crate::engine::ts_es_bus::EsPacket;
+        use std::time::Duration;
+        let fm = make_fm();
+        let udp = |id: &str, port: u16| {
+            input(serde_json::json!({
+                "id": id, "name": id, "type": "udp",
+                "bind_addr": format!("127.0.0.1:{port}")
+            }))
+        };
+        // Slot 0 is the Hitless slot over `{flow}-a` / `{flow}-b`; slot 1
+        // carries PCR from `{flow}-c`.
+        let flow = |id: &str| {
+            let pid = |input: &str, pid: u16| {
+                serde_json::json!({
+                    "type": "pid", "input_id": format!("{id}-{input}"), "source_pid": pid
+                })
+            };
+            serde_json::from_value::<crate::config::models::FlowConfig>(serde_json::json!({
+                "id": id, "name": id,
+                "input_ids": [format!("{id}-a"), format!("{id}-b"), format!("{id}-c")],
+                "output_ids": [],
+                "assembly": {
+                    "kind": "spts",
+                    "pcr_source": { "input_id": format!("{id}-c"), "pid": 256 },
+                    "programs": [{
+                        "program_number": 1,
+                        "pmt_pid": 4096,
+                        "streams": [
+                            {
+                                "source": {
+                                    "type": "hitless",
+                                    "primary": pid("a", 257), "backup": pid("b", 257)
+                                },
+                                "out_pid": 257, "stream_type": 15
+                            },
+                            { "source": pid("c", 256), "out_pid": 256, "stream_type": 27 }
+                        ]
+                    }]
+                }
+            }))
+            .expect("flow fixture")
+        };
+        let cfg = crate::config::models::AppConfig {
+            inputs: vec![
+                udp("f1-a", 41971),
+                udp("f1-b", 41972),
+                udp("f1-c", 41973),
+                udp("f2-a", 41974),
+                udp("f2-b", 41975),
+                udp("f2-c", 41976),
+            ],
+            flows: vec![flow("f1"), flow("f2")],
+            ..Default::default()
+        };
+        let mut runtimes = Vec::new();
+        for flow in &cfg.flows {
+            match fm.create_flow(cfg.resolve_flow(flow).expect("resolve")).await {
+                Ok(runtime) => runtimes.push(runtime),
+                Err(e) => {
+                    let _ = fm.destroy_flow("f1").await;
+                    panic!("create_flow: {e}");
+                }
+            }
+        }
+
+        // A failed assertion must not leave the flows running: their input
+        // threads would hold the test runtime's shutdown forever.
+        let checks = tokio::spawn({
+            let bus = fm.node_es_bus();
+            let outputs: Vec<_> = runtimes.iter().map(|r| r.broadcast_tx.subscribe()).collect();
+            async move {
+                let packet = |marker: u8| {
+                    let mut payload = vec![marker; 188];
+                    payload[..4].copy_from_slice(&[0x47, 0x01, 0x01, 0x10]);
+                    EsPacket {
+                        source_pid: 257,
+                        stream_type: 0x0F,
+                        payload: bytes::Bytes::from(payload),
+                        is_pusi: false,
+                        has_pcr: false,
+                        pcr: None,
+                        recv_time_us: 0,
+                        upstream_seq: None,
+                    }
+                };
+                let primaries = [
+                    (bus.sender_for("f1-a", 257, 0x0F), 0xA1u8),
+                    (bus.sender_for("f2-a", 257, 0x0F), 0xA2u8),
+                ];
+                // Until both mergers subscribe, a send finds no receiver.
+                for _ in 0..300 {
+                    if primaries.iter().all(|(tx, _)| tx.receiver_count() > 0) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                for _ in 0..20 {
+                    for (tx, marker) in &primaries {
+                        tx.send(packet(*marker)).expect("the merger subscribes");
+                    }
+                }
+                // The assembler goes on emitting PSI, so each output is read
+                // for a while rather than until it falls quiet.
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+                for (mut rx, own) in outputs.into_iter().zip([0xA1u8, 0xA2]) {
+                    let mut markers = std::collections::BTreeMap::<u8, usize>::new();
+                    loop {
+                        match tokio::time::timeout_at(deadline, rx.recv()).await {
+                            Ok(Ok(bundle)) => {
+                                for ts in bundle.data.chunks_exact(188) {
+                                    let pid = (u16::from(ts[1] & 0x1F) << 8) | u16::from(ts[2]);
+                                    if pid == 257 {
+                                        *markers.entry(ts[187]).or_default() += 1;
+                                    }
+                                }
+                            }
+                            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(n))) => {
+                                panic!("output {own:#04X} lagged by {n} bundles")
+                            }
+                            Ok(Err(_)) | Err(_) => break,
+                        }
+                    }
+                    assert_eq!(
+                        markers,
+                        std::collections::BTreeMap::from([(own, 20)]),
+                        "flow {own:#04X}'s Hitless slot plays its own packets, once each"
+                    );
+                }
+            }
+        });
+        let outcome = checks.await;
+        let _ = fm.destroy_flow("f1").await;
+        let _ = fm.destroy_flow("f2").await;
         if let Err(failed) = outcome {
             std::panic::resume_unwind(failed.into_panic());
         }
