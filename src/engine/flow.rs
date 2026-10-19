@@ -729,6 +729,16 @@ impl FlowRuntime {
         // send() that does not disturb any running task.
         let (active_input_tx, active_input_watch_rx) = watch::channel(active_input_id.clone());
         flow_stats.set_active_input_id(&active_input_id);
+        // An assembled flow's on air is what its plan plays from, which the
+        // assembler publishes only once it starts — after Essence slots
+        // resolve, while the inputs below are already up and polled. Until
+        // then the flow's active input would stand in for it.
+        if let Some(build) = spts_build.as_ref() {
+            flow_stats.on_air.set_assembled(crate::engine::ts_assembler::on_air_inputs(
+                &build.plan,
+                &HashMap::new(),
+            ));
+        }
 
         // Populate input config metadata for topology display from the
         // currently active input. When there is no active input, we leave
@@ -1985,6 +1995,7 @@ impl FlowRuntime {
                 std::time::Duration::from_millis(hl.stall_ms),
                 hl.seq_aware,
                 hl.path_differential_ms,
+                hl.forwarding_primary.clone(),
                 self.cancel_token.child_token(),
             );
         }
@@ -5072,6 +5083,7 @@ async fn finalize_spts_assembler(
             std::time::Duration::from_millis(hl.stall_ms),
             hl.seq_aware,
             hl.path_differential_ms,
+            hl.forwarding_primary.clone(),
             cancel_token.child_token(),
         );
     }
@@ -5430,7 +5442,7 @@ fn build_assembly_plan(
                 String,
                 u16,
                 Option<Vec<(String, u16)>>,
-                Option<[String; 2]>,
+                Option<crate::engine::ts_assembler::HitlessLegs>,
                 crate::config::models::SpliceMode,
                 Option<u32>,
             ) = match &stream.source {
@@ -5558,7 +5570,11 @@ fn build_assembly_plan(
                         mode,
                         crate::config::models::HitlessMode::SeqAware
                     );
-                    let legs = [primary_pair.0.clone(), backup_pair.0.clone()];
+                    let legs = crate::engine::ts_assembler::HitlessLegs {
+                        primary: primary_pair.0.clone(),
+                        backup: backup_pair.0.clone(),
+                        forwarding_primary: Default::default(),
+                    };
                     pending_hitless.push(crate::engine::ts_assembler::PendingHitlessSlot {
                         uid: uid.clone(),
                         primary: primary_pair,
@@ -5569,6 +5585,7 @@ fn build_assembly_plan(
                         seq_aware,
                         reorder_window: reorder_window.unwrap_or(1024),
                         path_differential_ms: *path_differential_ms,
+                        forwarding_primary: legs.forwarding_primary.clone(),
                     });
                     // The assembler reads from the synthetic merger
                     // output. The pre-bus merger task is responsible
@@ -7764,8 +7781,9 @@ mod input_membership_tests {
 mod assembly_plan_tests {
     use super::*;
 
-    /// A Hitless slot reads its merger's synthetic bus key, and names the two
-    /// inputs behind it, so the assembler can say both are on air.
+    /// A Hitless slot reads its merger's synthetic bus key, names the two
+    /// inputs behind it and shares with the merger the flag that says which
+    /// of them is on air.
     #[test]
     fn a_hitless_slot_names_the_inputs_behind_its_merger() {
         let input = |id: &str, port: u16| -> InputDefinition {
@@ -7807,6 +7825,11 @@ mod assembly_plan_tests {
         let build = build_assembly_plan(assembly, &resolved, &events).expect("plan");
         let slot = &build.plan.programs[0].slots[0];
         assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("slot_0_0"));
-        assert_eq!(slot.hitless_legs, Some(["in-a".to_string(), "in-b".to_string()]));
+        let legs = slot.hitless_legs.as_ref().expect("the slot names its legs");
+        assert_eq!((legs.primary.as_str(), legs.backup.as_str()), ("in-a", "in-b"));
+        assert_eq!(legs.on_air(), "in-a");
+        // What the merger is handed to flip is what the on-air set reads.
+        build.pending_hitless[0].forwarding_primary.set(false);
+        assert_eq!(legs.on_air(), "in-b");
     }
 }

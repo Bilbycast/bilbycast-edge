@@ -1627,9 +1627,10 @@ mod tests {
         serde_json::from_value(value).expect("input fixture")
     }
 
-    /// A removed SRT input takes its telemetry with it. Re-added under the
-    /// same id as a UDP input and taken to air, it must not report the
-    /// removed incarnation's drops as its own.
+    /// A removed SRT input takes its telemetry with it. What it dropped on
+    /// air stays the flow's, but re-added under the same id as a UDP input
+    /// and taken to air, it must not report the removed incarnation's drops,
+    /// stats or link as its own.
     #[tokio::test]
     async fn a_removed_srt_input_takes_its_drops_with_it() {
         let fm = make_fm();
@@ -1667,8 +1668,16 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        // A lossy warm standby.
-        srt.expect("the SRT input registers its telemetry").count_recv_drops(300);
+        let srt = srt.expect("the SRT input registers its telemetry");
+        // On air for a while, on a lossy link, then cut away from.
+        fm.switch_active_input("f1", "backup", None).await.expect("take the SRT input");
+        srt.leg.send_replace(Some(crate::stats::models::SrtLegStats {
+            ms_recv_tsbpd_delay: 120,
+            rtt_ms: 180.0,
+            ..Default::default()
+        }));
+        srt.count_recv_drops(300);
+        fm.switch_active_input("f1", "main", None).await.expect("back to main");
 
         fm.remove_input("f1", "backup").await.expect("remove the standby");
         assert!(runtime.stats.srt_input_stats.get("backup").is_none());
@@ -1679,11 +1688,77 @@ mod tests {
         let live = snap.inputs_live.as_ref().expect("inputs registered");
         let entry = live.iter().find(|l| l.input_id == "backup").expect("re-added");
         assert_eq!(entry.srt_recv_dropped, None, "a UDP input measures no SRT drops");
+        assert!(snap.input.srt_stats.is_none(), "nor has SRT stats");
+        assert_eq!(snap.input.packets_lost, 300, "what it dropped on air stays counted");
+        let reason = snap
+            .health_reasons
+            .iter()
+            .find(|r| r.code == "srt_recv_dropped")
+            .expect("and so does its reason");
         assert!(
-            snap.health_reasons.iter().all(|r| r.code != "srt_recv_dropped"),
-            "{:?}",
-            snap.health_reasons
+            !reason.detail.contains("RTT 180 ms"),
+            "the hint names the removed link: {}",
+            reason.detail
         );
         let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// The assembler publishes what an assembled flow plays from only once
+    /// it starts, after the Essence slots resolve, while the inputs are
+    /// already up and polled. In that window the slot's source is on air
+    /// and the flow's active input, which no slot plays, is not.
+    #[tokio::test]
+    async fn an_assembled_flow_is_on_air_from_its_plan_before_the_assembler_starts() {
+        let fm = make_fm();
+        let srt = |id: &str, port: u16, active: bool| {
+            input(serde_json::json!({
+                "id": id, "name": id, "type": "srt", "active": active,
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port}")
+            }))
+        };
+        let cfg = crate::config::models::AppConfig {
+            inputs: vec![srt("spare", 41961, true), srt("cam", 41962, false)],
+            flows: vec![serde_json::from_value(serde_json::json!({
+                "id": "f1", "name": "f1", "input_ids": ["spare", "cam"], "output_ids": [],
+                "assembly": {
+                    "kind": "spts",
+                    "pcr_source": { "input_id": "cam", "pid": 256 },
+                    "programs": [{
+                        "program_number": 1,
+                        "pmt_pid": 4096,
+                        "streams": [{
+                            "source": { "type": "essence", "input_id": "cam", "kind": "video" },
+                            "out_pid": 257,
+                            "stream_type": 27
+                        }]
+                    }]
+                }
+            }))
+            .expect("flow fixture")],
+            ..Default::default()
+        };
+        let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
+        let start = tokio::spawn({
+            let fm = fm.clone();
+            async move { fm.create_flow(resolved).await.map(|_| ()) }
+        });
+        let mut handles = None;
+        for _ in 0..200 {
+            handles = fm.stats().flow_stats.get("f1").and_then(|flow| {
+                let srt = |id: &str| flow.srt_input_stats.get(id).map(|e| e.value().clone());
+                Some((flow.value().clone(), srt("spare")?, srt("cam")?))
+            });
+            if handles.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (flow, spare, cam) = handles.expect("both SRT inputs register their telemetry");
+        cam.count_recv_drops(40);
+        spare.count_recv_drops(9);
+        assert!(!start.is_finished(), "still resolving the Essence slot");
+        assert_eq!(flow.snapshot().input.packets_lost, 40);
+        // `cam` never sends a catalogue, so the start gives up.
+        assert!(start.await.expect("join").is_err());
     }
 }

@@ -48,11 +48,12 @@ use tokio_util::sync::CancellationToken;
 use super::master_clock::ClockIdentity;
 use super::packet::RtpPacket;
 use super::ts_es_bus::{EsPacket, NodeEsBus};
+use super::ts_es_hitless::ForwardingPrimary;
 use super::ts_parse::{
     extract_pcr, mpeg2_crc32, set_discontinuity_indicator, NULL_PID, PAT_PID, TS_PACKET_SIZE,
     TS_SYNC_BYTE,
 };
-use crate::stats::collector::OnAirInputs;
+use crate::stats::collector::{AssembledOnAir, OnAirInputs};
 
 /// TS packets per emitted bundle. 7 × 188 = 1316 bytes — fits comfortably
 /// inside a 1500-byte Ethernet MTU with headroom for IP+UDP headers.
@@ -207,25 +208,28 @@ fn slot_health_identity(
     slot.source.clone()
 }
 
-/// The inputs the assembled output plays from: each Pid / Essence slot's
-/// source, each Switch slot's active leg and both legs behind each Hitless
-/// slot's merger — never the merger's synthetic bus key.
-fn on_air_inputs(
+/// What the assembled output plays from: each Pid / Essence slot's source,
+/// each Switch slot's active leg and each Hitless slot's legs, of which the
+/// one its merger is forwarding is on air — never the merger's synthetic
+/// bus key.
+pub(crate) fn on_air_inputs(
     plan: &AssemblyPlan,
     active_leg_input: &HashMap<(usize, u16), String>,
-) -> std::collections::BTreeSet<String> {
-    let mut inputs = std::collections::BTreeSet::new();
+) -> AssembledOnAir {
+    let mut on_air = AssembledOnAir::default();
     for (pidx, prog) in plan.programs.iter().enumerate() {
         for slot in &prog.slots {
             match &slot.hitless_legs {
-                Some(legs) => inputs.extend(legs.iter().cloned()),
+                Some(legs) => on_air.hitless.push(legs.clone()),
                 None => {
-                    inputs.insert(slot_health_identity(slot, (pidx, slot.out_pid), active_leg_input).0);
+                    on_air.inputs.insert(
+                        slot_health_identity(slot, (pidx, slot.out_pid), active_leg_input).0,
+                    );
                 }
             }
         }
     }
-    inputs
+    on_air
 }
 
 /// Publish [`on_air_inputs`] for the flow's SRT drop accounting, which
@@ -233,7 +237,8 @@ fn on_air_inputs(
 /// on every change to the plan or to a Switch slot's active leg — a Take, a
 /// PES-aligned commit, a splice that fell back on timeout or codec mismatch
 /// — so a Take moves the attribution when the cut happens on air, not when
-/// it was asked for.
+/// it was asked for. A Hitless merger's failover needs no publication: the
+/// published legs carry the flag the merger flips.
 fn publish_on_air(
     on_air: Option<&OnAirInputs>,
     plan: &AssemblyPlan,
@@ -356,10 +361,11 @@ pub struct AssemblySlot {
     /// without re-tuning. `None` for non-switch slots.
     #[allow(dead_code)] // read by build_assembly_plan / SwitchActiveInput handler
     pub switch_legs: Option<Vec<(String, u16)>>,
-    /// When `Some([primary, backup])`, this slot is a [`SlotSource::Hitless`]
-    /// and `source` is its merger's synthetic bus key: these are the input
-    /// ids of the two legs behind it, both on air. `None` for other slots.
-    pub hitless_legs: Option<[String; 2]>,
+    /// When `Some(legs)`, this slot is a [`SlotSource::Hitless`] and
+    /// `source` is its merger's synthetic bus key: these are the two inputs
+    /// behind it, and which of them the merger is forwarding. `None` for
+    /// other slots.
+    pub hitless_legs: Option<HitlessLegs>,
     /// PES Switch Phase 4. For Switch slots, controls the splice
     /// behaviour at `SwitchActiveInput` time:
     /// - [`SpliceMode::PmtBump`] (default): today's PMT-version-bump
@@ -377,6 +383,28 @@ pub struct AssemblySlot {
     /// `PesAligned` mode. `None` falls back to the default
     /// (200 ms for audio). Ignored when `splice_mode = PmtBump`.
     pub splice_budget_ms: Option<u32>,
+}
+
+/// The two inputs behind a [`SlotSource::Hitless`] slot's merger, and which
+/// of them it is forwarding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitlessLegs {
+    pub primary: String,
+    pub backup: String,
+    /// Shared with the slot's merger, which flips it; read by the flow's SRT
+    /// stats pollers through [`OnAirInputs`].
+    pub forwarding_primary: ForwardingPrimary,
+}
+
+impl HitlessLegs {
+    /// The leg on air: the one the merger is forwarding.
+    pub fn on_air(&self) -> &str {
+        if self.forwarding_primary.get() {
+            &self.primary
+        } else {
+            &self.backup
+        }
+    }
 }
 
 /// Runtime commands the assembler accepts via its `mpsc` channel.
@@ -2969,6 +2997,9 @@ pub struct PendingHitlessSlot {
     /// within the window). `None` falls back to the stateless dedup-
     /// only path.
     pub path_differential_ms: Option<u32>,
+    /// The slot's [`HitlessLegs::forwarding_primary`], for the merger to
+    /// flip.
+    pub forwarding_primary: ForwardingPrimary,
 }
 
 /// Output of `build_spts_plan` (defined on the runtime side): the
@@ -4473,7 +4504,11 @@ mod tests {
         switch.splice_budget_ms = splice_budget_ms;
         let (merged, merged_pid) = crate::engine::ts_es_hitless::hitless_bus_key("slot_0_1");
         let mut hitless = slot(&merged, merged_pid, 0x202, 0x1B);
-        hitless.hitless_legs = Some(["srt-pri".to_string(), "srt-bak".to_string()]);
+        hitless.hitless_legs = Some(HitlessLegs {
+            primary: "srt-pri".to_string(),
+            backup: "srt-bak".to_string(),
+            forwarding_primary: Default::default(),
+        });
         AssemblyPlan {
             programs: vec![ProgramPlan {
                 program_number: 1,
@@ -4525,21 +4560,50 @@ mod tests {
         }
     }
 
+    fn hitless_legs(plan: &AssemblyPlan) -> &HitlessLegs {
+        plan.programs[0].slots[1].hitless_legs.as_ref().expect("the Hitless slot")
+    }
+
     #[test]
-    fn on_air_is_each_switch_slots_active_leg_and_both_hitless_legs() {
+    fn on_air_is_each_switch_slots_active_leg_and_the_hitless_leg_forwarded() {
         let plan = switch_and_hitless_plan(Default::default(), None);
-        let on_air = |legs: &HashMap<(usize, u16), String>| -> Vec<String> {
-            on_air_inputs(&plan, legs).into_iter().collect()
+        let published = |legs: &HashMap<(usize, u16), String>| {
+            let on_air = OnAirInputs::default();
+            on_air.set_assembled(on_air_inputs(&plan, legs));
+            on_air
         };
-        // Before any Take, the Switch slot plays the leg the plan names.
-        assert_eq!(on_air(&HashMap::new()), ["srt-bak", "srt-main", "srt-pri"]);
+        let playing = |on_air: &OnAirInputs| -> Vec<&str> {
+            ["srt-main", "srt-backup", "srt-pri", "srt-bak"]
+                .into_iter()
+                .filter(|id| on_air.contains(id))
+                .collect()
+        };
+        // Before any Take the Switch slot plays the leg the plan names, and
+        // the Hitless merger forwards its primary.
+        let on_air = published(&HashMap::new());
+        assert_eq!(playing(&on_air), ["srt-main", "srt-pri"]);
+        // A failover puts the backup on air in the primary's place, with no
+        // publication in between.
+        hitless_legs(&plan).forwarding_primary.set(false);
+        assert_eq!(playing(&on_air), ["srt-main", "srt-bak"]);
+        hitless_legs(&plan).forwarding_primary.set(true);
         let taken = HashMap::from([((0, 0x201), "srt-backup".to_string())]);
-        assert_eq!(on_air(&taken), ["srt-backup", "srt-bak", "srt-pri"]);
+        assert_eq!(playing(&published(&taken)), ["srt-backup", "srt-pri"]);
+    }
+
+    /// Which leg a Hitless merger forwards is not part of the plan: a swap
+    /// that keeps a slot's legs is no change to its program.
+    #[test]
+    fn a_hitless_failover_is_not_a_plan_change() {
+        let plan = switch_and_hitless_plan(Default::default(), None);
+        hitless_legs(&plan).forwarding_primary.set(false);
+        let fresh = switch_and_hitless_plan(Default::default(), None);
+        assert_eq!(plan.programs[0].slots, fresh.programs[0].slots);
     }
 
     /// A Take on a Switch slot moves which leg's SRT drops are the flow's,
-    /// and both legs behind a Hitless slot count, through a real assembler
-    /// and a real flow accumulator.
+    /// through a real assembler and a real flow accumulator; of a Hitless
+    /// slot's legs only the primary its merger forwards counts.
     #[tokio::test]
     async fn a_switch_slot_take_moves_srt_drop_attribution() {
         let flow = crate::stats::collector::FlowStatsAccumulator::new(
@@ -4575,7 +4639,7 @@ mod tests {
         srt["srt-backup"].count_recv_drops(100);
         srt["srt-pri"].count_recv_drops(5);
         srt["srt-bak"].count_recv_drops(7);
-        assert_eq!(flow.snapshot().input.packets_lost, 12, "the standby leg's drops are its own");
+        assert_eq!(flow.snapshot().input.packets_lost, 5, "the standby legs' drops are their own");
 
         handle
             .plan_tx
@@ -4589,7 +4653,88 @@ mod tests {
         assert!(!flow.on_air.contains("srt-main"));
         srt["srt-backup"].count_recv_drops(300);
         srt["srt-main"].count_recv_drops(50);
-        assert_eq!(flow.snapshot().input.packets_lost, 312);
+        assert_eq!(flow.snapshot().input.packets_lost, 305);
+
+        cancel.cancel();
+        handle.join.await.unwrap();
+    }
+
+    /// A Hitless merger's failover moves which leg's SRT drops are the
+    /// flow's, and its return to the primary moves them back, through the
+    /// real merger and assembler sharing the plan's flag as `FlowRuntime`
+    /// wires them.
+    #[tokio::test]
+    async fn a_hitless_failover_moves_srt_drop_attribution() {
+        let flow = crate::stats::collector::FlowStatsAccumulator::new(
+            "f1".into(),
+            "flow-1".into(),
+            "srt".into(),
+        );
+        let pri = flow.register_srt_input_stats("srt-pri");
+        let bak = flow.register_srt_input_stats("srt-bak");
+        let plan = switch_and_hitless_plan(Default::default(), None);
+        let legs = hitless_legs(&plan).clone();
+        let bus = Arc::new(NodeEsBus::new());
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(64);
+        let cancel = CancellationToken::new();
+        let _stop_on_failure = cancel.clone().drop_guard();
+        let _merger = crate::engine::ts_es_hitless::spawn_hitless_es_merger_full(
+            "slot_0_1".to_string(),
+            ("srt-pri".to_string(), 0x102),
+            ("srt-bak".to_string(), 0x102),
+            bus.clone(),
+            Duration::from_millis(50),
+            false,
+            None,
+            legs.forwarding_primary.clone(),
+            cancel.child_token(),
+        );
+        let handle = spawn_spts_assembler(
+            plan,
+            bus.clone(),
+            tx,
+            cancel.clone(),
+            None,
+            String::new(),
+            None,
+            None,
+            Some(flow.on_air.clone()),
+            Default::default(),
+        );
+        let primary = bus.sender_for("srt-pri", 0x102, 0x1B);
+        let es = || EsPacket {
+            source_pid: 0x102,
+            stream_type: 0x1B,
+            payload: ts_es(0x102, false, 0, 0xAA),
+            is_pusi: false,
+            has_pcr: false,
+            pcr: None,
+            recv_time_us: 0,
+            upstream_seq: None,
+        };
+        // The merger's stall timer runs from its spawn, so it may have
+        // failed over already.
+        until("the assembler's first publication", || {
+            flow.on_air.contains("srt-pri") || flow.on_air.contains("srt-bak")
+        })
+        .await;
+        primary.send(es()).unwrap();
+
+        // The primary stalls: the merger fails over to the backup.
+        until("the failover", || flow.on_air.contains("srt-bak")).await;
+        assert!(!flow.on_air.contains("srt-pri"));
+        pri.count_recv_drops(4);
+        bak.count_recv_drops(9);
+        assert_eq!(flow.snapshot().input.packets_lost, 9);
+
+        // The primary resumes. Nothing below yields, so the merger cannot
+        // fail over again before the drops are counted.
+        primary.send(es()).unwrap();
+        until("the return to the primary", || flow.on_air.contains("srt-pri")).await;
+        assert!(!flow.on_air.contains("srt-bak"));
+        pri.count_recv_drops(6);
+        bak.count_recv_drops(20);
+        assert_eq!(flow.snapshot().input.packets_lost, 15);
 
         cancel.cancel();
         handle.join.await.unwrap();
