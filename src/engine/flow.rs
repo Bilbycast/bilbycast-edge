@@ -250,20 +250,20 @@ pub struct FlowRuntime {
     #[allow(dead_code)]
     pub pid_bus_assembler_handle: Option<crate::engine::ts_assembler::AssemblerHandle>,
     /// PID-bus elementary-stream bus. `Some` whenever the assembler is
-    /// running. Kept on the runtime so `replace_assembly` (Phase 7) can
-    /// spawn the Hitless mergers a new plan needs.
+    /// running. Kept on the runtime so a plan swap (Phase 7) can spawn the
+    /// Hitless mergers a new plan needs.
     #[allow(dead_code)]
     pub es_bus: Option<Arc<NodeEsBus>>,
-    /// The mergers behind the running plan's Hitless slots. Locked by
-    /// `replace_assembly` across both its merger changes and the plan send,
-    /// so two swaps cannot leave the mergers matching one plan and the
-    /// assembler running the other.
+    /// The mergers behind the running plan's Hitless slots. Locked for a
+    /// whole plan swap ([`FlowRuntime::begin_assembly_swap`]) — its no-op
+    /// check, merger changes, plan send and persist — so two swaps cannot
+    /// leave the mergers matching one plan, the assembler running the other
+    /// and `config.json` naming either.
     pub hitless_mergers: tokio::sync::Mutex<crate::engine::ts_es_hitless::HitlessMergers>,
-    /// Live mutable copy of the flow's `assembly` block. Used by
-    /// `replace_assembly` to diff old → new and decide whether to
-    /// hot-swap or fall back to a full restart. Persisted form lives
-    /// in `config.config.assembly` and is also updated by the handler
-    /// after a successful in-place swap.
+    /// Live mutable copy of the flow's `assembly` block: the plan the
+    /// assembler runs, which a swap's no-op check compares against
+    /// ([`AssemblySwap::runs`]). Persisted form lives in `config.json`,
+    /// written by the swap's caller inside the same swap.
     #[allow(dead_code)]
     pub current_assembly: tokio::sync::Mutex<Option<crate::config::models::FlowAssembly>>,
     /// Replay-server recording handle. `Some` when the flow's config
@@ -1701,34 +1701,38 @@ impl FlowRuntime {
         usage
     }
 
-    /// Phase 7: replace this flow's PID-bus assembly plan in place.
-    ///
-    /// The caller has already validated `new_assembly` (shape + field
-    /// limits via `validate_flow`). This method:
-    ///
-    /// 1. Rejects the call if the flow has no running assembler (i.e.
-    ///    `assembly.kind == passthrough` or absent — a switch is
-    ///    meaningless).
-    /// 2. Builds a new [`SptsBuildResult`] via the same machinery as
-    ///    flow start-up (loud `pid_bus_*` errors via the `event_sender`).
-    /// 3. Resolves any `Essence` slots against the per-input PSI
-    ///    catalogues currently held on the flow's stats.
-    /// 4. Brings the Hitless mergers in line with the new plan
-    ///    ([`crate::engine::ts_es_hitless::HitlessMergers::apply`]): a slot
-    ///    the swap leaves alone keeps its merger and the flag that says
-    ///    which leg it forwards; a slot it changes or drops has its merger
-    ///    stopped; every slot left without one gets a new one. Each slot's
-    ///    bus key has one publisher, so no packet reaches the assembler
-    ///    twice.
-    /// 5. Sends [`crate::engine::ts_assembler::PlanCommand::ReplacePlan`]
-    ///    to the running assembler.
-    ///
-    /// On success the runtime's `current_assembly` is updated, under the
-    /// same lock as the mergers, so two concurrent swaps leave it naming
-    /// the plan that runs; the caller is responsible for persisting
-    /// `config.json`.
+    /// Swap to `new_assembly` in a swap of its own ([`AssemblySwap::replace`]):
+    /// the tests' shorthand.
+    #[cfg(test)]
     pub async fn replace_assembly(
         &self,
+        new_assembly: crate::config::models::FlowAssembly,
+        splice_mode_override: Option<crate::config::models::SpliceMode>,
+    ) -> Result<()> {
+        self.begin_assembly_swap()
+            .await
+            .replace(new_assembly, splice_mode_override)
+            .await
+    }
+
+    /// Start a plan swap: take the Hitless mergers' lock, which every swap
+    /// takes first and holds to its end. A caller's no-op check
+    /// ([`AssemblySwap::runs`]), the swap ([`AssemblySwap::replace`]) and
+    /// its persisting the plan to `config.json` all happen inside it, so two
+    /// swaps at once — one over REST, one over the manager WebSocket — run
+    /// one after the other: `config.json` ends on the plan the runtime runs,
+    /// and a re-send of the plan that lost is a swap, not a no-op.
+    ///
+    /// Lock order: the mergers, then `current_assembly`, then (persisting)
+    /// the node config. No path takes the config lock and then this one.
+    pub async fn begin_assembly_swap(&self) -> AssemblySwap<'_> {
+        AssemblySwap { runtime: self, mergers: self.hitless_mergers.lock().await }
+    }
+
+    /// [`AssemblySwap::replace`], with the swap's merger lock held.
+    async fn replace_assembly_locked(
+        &self,
+        hitless_mergers: &mut crate::engine::ts_es_hitless::HitlessMergers,
         new_assembly: crate::config::models::FlowAssembly,
         splice_mode_override: Option<crate::config::models::SpliceMode>,
     ) -> Result<()> {
@@ -1992,10 +1996,9 @@ impl FlowRuntime {
             bail!(msg);
         }
 
-        // The mergers behind the new plan's Hitless slots. Held until the
-        // plan is sent and recorded, so the assembler runs the plan they
-        // were set for and `current_assembly` names it.
-        let mut hitless_mergers = self.hitless_mergers.lock().await;
+        // The mergers behind the new plan's Hitless slots. Their lock is held
+        // for the whole swap, so the assembler runs the plan they were set
+        // for and `current_assembly` names it.
         hitless_mergers
             .apply(&build.pending_hitless, &mut build.plan, &bus, &self.cancel_token)
             .await;
@@ -2045,22 +2048,13 @@ impl FlowRuntime {
             })
             .await
             .map_err(|_| anyhow::anyhow!("flow '{}' assembler receiver closed", flow_id))?;
-        // Recorded before the merger lock goes, which a concurrent swap waits
-        // on: the plan recorded is then the one the assembler and the mergers
-        // run, and the callers' no-op check compares against it. Recorded
-        // after, the swap that lost the race could overwrite the winner's
-        // plan here, and the no-op check would refuse the operator's re-send
-        // of the plan actually wanted. Lock order: `hitless_mergers`, then
-        // `current_assembly`; nothing takes them the other way round.
+        // Recorded under the merger lock, which a concurrent swap waits on:
+        // the plan recorded is then the one the assembler and the mergers
+        // run, and the callers' no-op check compares against it. Lock order:
+        // `hitless_mergers`, then `current_assembly`; nothing takes them the
+        // other way round.
         *self.current_assembly.lock().await = Some(new_assembly);
-        drop(hitless_mergers);
         Ok(())
-    }
-
-    /// Snapshot the currently-running assembly. Used by the
-    /// `update_flow_assembly` handler to short-circuit no-op updates.
-    pub async fn current_assembly(&self) -> Option<crate::config::models::FlowAssembly> {
-        self.current_assembly.lock().await.clone()
     }
 
     /// Switch the currently active input of a running flow.
@@ -7277,6 +7271,56 @@ fn is_webrtc_like_input(input: &crate::config::models::InputConfig) -> bool {
     matches!(input, InputConfig::Webrtc(_) | InputConfig::Whep(_))
 }
 
+
+/// A PID-bus plan swap in progress on one flow, from
+/// [`FlowRuntime::begin_assembly_swap`]: it holds the flow's Hitless-merger
+/// lock until dropped.
+pub struct AssemblySwap<'a> {
+    runtime: &'a FlowRuntime,
+    mergers: tokio::sync::MutexGuard<'a, crate::engine::ts_es_hitless::HitlessMergers>,
+}
+
+impl AssemblySwap<'_> {
+    /// Whether the flow already runs `assembly`: a swap to it would be a
+    /// no-op.
+    pub async fn runs(&self, assembly: &crate::config::models::FlowAssembly) -> bool {
+        self.runtime.current_assembly.lock().await.as_ref() == Some(assembly)
+    }
+
+    /// Replace the flow's PID-bus assembly plan in place (Phase 7).
+    ///
+    /// The caller has already validated `new_assembly` (shape + field
+    /// limits via `validate_flow`). This method:
+    ///
+    /// 1. Rejects the call if the flow has no running assembler (i.e.
+    ///    `assembly.kind == passthrough` or absent — a switch is
+    ///    meaningless).
+    /// 2. Builds a new `SptsBuildResult` via the same machinery as
+    ///    flow start-up (loud `pid_bus_*` errors via the `event_sender`).
+    /// 3. Resolves any `Essence` slots against the per-input PSI
+    ///    catalogues currently held on the flow's stats.
+    /// 4. Brings the Hitless mergers in line with the new plan
+    ///    ([`crate::engine::ts_es_hitless::HitlessMergers::apply`]): a slot
+    ///    the swap leaves alone keeps its merger and the flag that says
+    ///    which leg it forwards; a slot it changes or drops has its merger
+    ///    stopped; every slot left without one gets a new one. Each slot's
+    ///    bus key has one publisher, so no packet reaches the assembler
+    ///    twice.
+    /// 5. Sends [`crate::engine::ts_assembler::PlanCommand::ReplacePlan`]
+    ///    to the running assembler.
+    ///
+    /// On success the runtime's `current_assembly` is updated; the caller
+    /// persists the plan before it drops the swap.
+    pub async fn replace(
+        &mut self,
+        new_assembly: crate::config::models::FlowAssembly,
+        splice_mode_override: Option<crate::config::models::SpliceMode>,
+    ) -> Result<()> {
+        self.runtime
+            .replace_assembly_locked(&mut self.mergers, new_assembly, splice_mode_override)
+            .await
+    }
+}
 #[cfg(test)]
 mod cost_plan_tests {
     //! Tests for `derive_cost_plan` + `output_resource_contribution`,

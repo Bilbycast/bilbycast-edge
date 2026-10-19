@@ -2747,15 +2747,18 @@ async fn execute_command(
                 }
             };
 
+            // The no-op check, the swap and the persist, under one swap: a
+            // concurrent swap over REST waits for this one to be persisted,
+            // so `config.json` ends on the plan the runtime runs.
+            let mut swap = runtime.begin_assembly_swap().await;
             // No-op short-circuit — preserves CC/PSI continuity by not
             // taking the merger/assembler through a transient state.
-            if let Some(cur) = runtime.current_assembly().await
-                && cur == new_assembly {
-                    tracing::info!(
-                        "update_flow_assembly '{flow_id}': no-op (assembly unchanged)"
-                    );
-                    return Ok(None);
-                }
+            if swap.runs(&new_assembly).await {
+                tracing::info!(
+                    "update_flow_assembly '{flow_id}': no-op (assembly unchanged)"
+                );
+                return Ok(None);
+            }
 
             // Hot-swap the running plan. `replace_assembly` validates,
             // resolves essence, keeps or replaces Hitless mergers, and
@@ -2768,10 +2771,7 @@ async fn execute_command(
             // a specific assembly-editor field. Without this, the UI
             // banner says the right thing but no field gets highlighted.
             let swap_start = std::time::Instant::now();
-            if let Err(e) = runtime
-                .replace_assembly(new_assembly.clone(), splice_mode_override)
-                .await
-            {
+            if let Err(e) = swap.replace(new_assembly.clone(), splice_mode_override).await {
                 let code = runtime
                     .event_sender
                     .take_recent_critical_for_flow(flow_id, swap_start)
@@ -2788,6 +2788,8 @@ async fn execute_command(
                 flow.assembly = Some(new_assembly);
             }
             persist_config(&cfg, config_path, secrets_path).await?;
+            drop(cfg);
+            drop(swap);
             Ok(None)
         }
         "delete_flow" => {

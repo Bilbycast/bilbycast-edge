@@ -1838,6 +1838,22 @@ mod tests {
                 assert_eq!(copies().await, 0, "a dropped slot keeps no merger");
                 wait_until("the swap is on air", || slots_on_air(2)).await;
                 assert!(!on_air("in-a") && !on_air("in-b"), "nor anything on air");
+
+                // A swap holds the next one off until it is dropped — the
+                // caller's persist included — and the next one's no-op check
+                // finds the plan the first left running.
+                let wanted = with_marker(assembly(50, true));
+                let mut first = runtime.begin_assembly_swap().await;
+                let second = tokio::spawn({
+                    let runtime = runtime.clone();
+                    let wanted = wanted.clone();
+                    async move { runtime.begin_assembly_swap().await.runs(&wanted).await }
+                });
+                first.replace(wanted, None).await.expect("swap");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(!second.is_finished(), "a second swap waits for the first");
+                drop(first);
+                assert!(second.await.expect("second swap"), "and finds the first's plan running");
             }
         });
         let outcome = checks.await;

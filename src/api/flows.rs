@@ -393,14 +393,15 @@ pub async fn update_flow_assembly(
     )
     .map_err(|e| ApiError::BadRequest(format!("Invalid assembly: {e}")))?;
 
-    if let Some(cur) = runtime.current_assembly().await
-        && cur == new_assembly {
-            tracing::info!("update_flow_assembly '{flow_id}': no-op (unchanged)");
-            return Ok(Json(ApiResponse::ok(())));
-        }
+    // The no-op check, the swap and the persist, under one swap: a concurrent
+    // swap over the manager WebSocket waits for this one to be persisted.
+    let mut swap = runtime.begin_assembly_swap().await;
+    if swap.runs(&new_assembly).await {
+        tracing::info!("update_flow_assembly '{flow_id}': no-op (unchanged)");
+        return Ok(Json(ApiResponse::ok(())));
+    }
 
-    runtime
-        .replace_assembly(new_assembly.clone(), None)
+    swap.replace(new_assembly.clone(), None)
         .await
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -420,6 +421,7 @@ pub async fn update_flow_assembly(
     {
         tracing::warn!("update_flow_assembly '{flow_id}': persist failed: {e}");
     }
+    drop(swap);
 
     tracing::info!("update_flow_assembly '{flow_id}': hot-swap complete");
     Ok(Json(ApiResponse::ok(())))
