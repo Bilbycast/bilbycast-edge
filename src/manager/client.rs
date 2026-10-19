@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 
 use super::events::{Event, EventSeverity, build_event_envelope, category};
@@ -34,6 +34,172 @@ use crate::tunnel::TunnelConfig;
 use crate::tunnel::manager::TunnelManager;
 
 use super::ManagerConfig;
+
+/// Hard deadline on the WebSocket dial (TCP + TLS + HTTP upgrade).
+///
+/// `tokio_tungstenite::connect_async*` has no deadline of its own. A peer that
+/// completes TCP and TLS and then never returns the 101 parks the future for
+/// ever, and because the reconnect loop is a single task that one `.await`
+/// ends all future reconnection: the node goes offline until the process is
+/// restarted, with no error logged. Two production edges did exactly that,
+/// 20 hours apart, and stayed dark for 36 and 29 hours while their media kept
+/// flowing — see bilbycast-edge#180.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadline on writing the auth frame. A stalled peer stops draining long
+/// before it closes, so this write can block just as the dial can.
+const AUTH_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deadline on the whole pre-session handshake: dial, TLS, upgrade, auth
+/// write and auth reply.
+///
+/// The per-step timeouts above cover the stalls we have actually observed.
+/// This one covers the ones we have not: it is armed before the attempt and
+/// disarmed the moment the session authenticates, so any pre-auth step that
+/// blocks for a reason nobody anticipated still ends in a retry rather than
+/// in a node that never comes back. Generous on purpose — it is a backstop,
+/// not the primary control.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A dial slower than this is logged even when it eventually succeeds, so the
+/// condition is visible before it becomes an outage.
+const SLOW_DIAL_WARN: Duration = Duration::from_secs(5);
+
+/// Inbound silence never tolerated for less than this, however fast the
+/// manager pings. It is only a floor: the real limit scales with the cadence
+/// the manager is actually using (see [`InboundCadence::silence_limit`]).
+const SILENCE_FLOOR: Duration = Duration::from_secs(90);
+
+/// How many ping intervals of silence end a session. Four, so one lost ping
+/// or one slow burst of our own writes cannot do it on its own.
+const SILENCE_PINGS: u32 = 4;
+
+/// How often the watchdog looks. Coarse on purpose: the limit is measured in
+/// minutes, and a check is a clock read.
+const SILENCE_CHECK: Duration = Duration::from_secs(5);
+
+/// What the live session has heard from the manager, and how often it pings.
+///
+/// The dial deadline (bilbycast-edge#180) covers a session that never starts.
+/// This covers one that dies after it started: nothing in the session loop
+/// noticed a manager that had gone quiet, and every write in it awaits with no
+/// deadline, so a peer that stops draining parks the loop on a full socket
+/// buffer exactly as the dial parked on a missing 101 — the node offline in
+/// the manager, nothing logged, media still flowing.
+///
+/// The manager pings every node on its `ws_keepalive_interval_secs` setting,
+/// which an operator can set anywhere from 1 to 300 s. So the edge learns the
+/// cadence from the pings themselves rather than assuming 15 s, and the
+/// watchdog stays **unarmed until it has seen two pings**: a manager that
+/// predates the keepalive never pings, and treating its quiet as death would
+/// drop a healthy session every few minutes.
+#[derive(Debug, Clone)]
+struct InboundCadence {
+    last_frame: tokio::time::Instant,
+    last_ping: Option<tokio::time::Instant>,
+    widest_ping_gap: Option<Duration>,
+}
+
+impl InboundCadence {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self { last_frame: now, last_ping: None, widest_ping_gap: None }
+    }
+
+    /// Any frame at all from the manager proves the session is alive.
+    fn on_frame(&mut self, now: tokio::time::Instant) {
+        self.last_frame = now;
+    }
+
+    /// A ping also teaches the cadence. The widest gap seen, not the latest,
+    /// so a manager whose keepalive was raised mid-session is never judged by
+    /// its old, shorter interval.
+    fn on_ping(&mut self, now: tokio::time::Instant) {
+        self.on_frame(now);
+        if let Some(prev) = self.last_ping {
+            let gap = now.saturating_duration_since(prev);
+            self.widest_ping_gap = Some(self.widest_ping_gap.map_or(gap, |w| w.max(gap)));
+        }
+        self.last_ping = Some(now);
+    }
+
+    /// The silence that ends the session, or `None` while the cadence is
+    /// unknown — the watchdog is unarmed until then.
+    fn silence_limit(&self) -> Option<Duration> {
+        self.widest_ping_gap
+            .map(|gap| SILENCE_FLOOR.max(gap.saturating_mul(SILENCE_PINGS)))
+    }
+
+    /// How long the manager has been silent, if that is past the limit.
+    fn dead_for(&self, now: tokio::time::Instant) -> Option<(Duration, Duration)> {
+        let limit = self.silence_limit()?;
+        let silent = now.saturating_duration_since(self.last_frame);
+        (silent > limit).then_some((silent, limit))
+    }
+}
+
+/// Resolves once the manager has been silent past its limit.
+///
+/// Raced against the session loop rather than run as one of its `select!`
+/// branches, which is the point: a write that never completes holds the loop
+/// inside one branch, where no other branch can run. Out here the timer still
+/// fires, and winning the race drops the session future — and the stuck write
+/// with it.
+async fn manager_silence_watchdog(
+    cadence: &std::sync::Mutex<InboundCadence>,
+) -> (Duration, Duration) {
+    let mut check = tokio::time::interval(SILENCE_CHECK);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        check.tick().await;
+        let dead = cadence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dead_for(tokio::time::Instant::now());
+        if let Some(dead) = dead {
+            return dead;
+        }
+    }
+}
+
+/// The stream type every dial path produces.
+type ManagerWsStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// Dial the manager, giving up after `deadline`.
+///
+/// One call site for every TLS variant: passing `None` as the connector is
+/// what `connect_async` does internally, so the default-TLS path is unchanged
+/// while gaining the deadline the others needed too.
+async fn dial_manager(
+    url: &str,
+    connector: Option<tokio_tungstenite::Connector>,
+    deadline: Duration,
+) -> Result<ManagerWsStream, String> {
+    let started = Instant::now();
+    let dial = tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector);
+
+    let (stream, _response) = match tokio::time::timeout(deadline, dial).await {
+        Ok(Ok(ok)) => ok,
+        Ok(Err(e)) => return Err(format!("WebSocket connect failed: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "WebSocket connect timed out after {}s (no response to the upgrade)",
+                deadline.as_secs()
+            ))
+        }
+    };
+
+    let took = started.elapsed();
+    if took >= SLOW_DIAL_WARN {
+        tracing::warn!(
+            "Manager dial took {:.1}s — slow handshake, watch for a stall",
+            took.as_secs_f64()
+        );
+    }
+    Ok(stream)
+}
+
 #[cfg(feature = "webrtc")]
 use crate::engine::flow::FlowRuntime;
 
@@ -230,6 +396,19 @@ pub fn start_manager_client(
     })
 }
 
+/// Resolves when an attempt has failed to authenticate in time.
+///
+/// If `authenticated` fires first the attempt got through, so this future
+/// pends for ever and the `select!` it sits in can only be resolved by the
+/// session itself ending. A dropped sender (the attempt returned early with
+/// an error) also counts as "no longer waiting": the attempt's own error is
+/// the better message, so this still pends and lets that one surface.
+async fn handshake_backstop(authenticated: oneshot::Receiver<()>, deadline: Duration) {
+    if tokio::time::timeout(deadline, authenticated).await.is_ok() {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn manager_client_loop(
     mut config: ManagerConfig,
     deps: ManagerClientDeps,
@@ -302,9 +481,38 @@ async fn manager_client_loop(
             start_time,
             manager_link: manager_link.clone(),
         };
-        match try_connect(&current_url, &config, &attempt_deps, &mut event_rx)
-        .await
-        {
+        // Arm the whole-handshake backstop. `handshake_backstop` resolves
+        // only if the attempt fails to authenticate within HANDSHAKE_TIMEOUT;
+        // once `try_connect` signals success it pends for ever, leaving the
+        // live session to run as long as it likes. Winning the select drops
+        // the connect future, which cancels it and closes its socket.
+        //
+        // The attempt is scoped so that the pinned future — and with it the
+        // borrows of `config` and `event_rx` — is released before the match
+        // below, which needs `config` mutably on the registration path.
+        let outcome = {
+            let (auth_tx, auth_rx) = oneshot::channel();
+            let attempt = try_connect(
+                &current_url,
+                &config,
+                &attempt_deps,
+                &mut event_rx,
+                Some(auth_tx),
+            );
+            tokio::pin!(attempt);
+
+            tokio::select! {
+                result = &mut attempt => result,
+                () = handshake_backstop(auth_rx, HANDSHAKE_TIMEOUT) => {
+                    Err(format!(
+                        "Handshake did not complete within {}s — abandoning the attempt",
+                        HANDSHAKE_TIMEOUT.as_secs()
+                    ))
+                }
+            }
+        };
+
+        match outcome {
             Ok(ConnectResult::Closed) => {
                 tracing::info!("Manager connection to {current_url} closed normally");
             }
@@ -372,6 +580,7 @@ async fn try_connect(
     config: &ManagerConfig,
     deps: &ManagerClientDeps,
     event_rx: &mut mpsc::Receiver<Event>,
+    auth_done: Option<oneshot::Sender<()>>,
 ) -> Result<ConnectResult, String> {
     // Same destructure-back trick: the body keeps its original bindings.
     let ManagerClientDeps {
@@ -404,7 +613,7 @@ async fn try_connect(
         );
     }
 
-    let (ws_stream, _response) = if config.accept_self_signed_cert {
+    let ws_stream = if config.accept_self_signed_cert {
         // SECURITY: Require explicit env var to allow insecure connections.
         // This prevents accidental use in production when left in config files.
         if std::env::var("BILBYCAST_ALLOW_INSECURE").as_deref() != Ok("1") {
@@ -427,14 +636,7 @@ async fn try_connect(
             .with_custom_certificate_verifier(std::sync::Arc::new(InsecureCertVerifier))
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
-        tokio_tungstenite::connect_async_tls_with_config(
-            current_url,
-            None,
-            false,
-            Some(connector),
-        )
-        .await
-        .map_err(|e| format!("WebSocket connect failed: {e}"))?
+        dial_manager(current_url, Some(connector), DIAL_TIMEOUT).await?
     } else if let Some(ref fingerprint) = config.cert_fingerprint {
         // Certificate pinning: validate CA chain AND check fingerprint
         tracing::info!("Certificate pinning enabled (fingerprint: {}...)", &fingerprint[..fingerprint.len().min(11)]);
@@ -453,18 +655,9 @@ async fn try_connect(
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
         let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
-        tokio_tungstenite::connect_async_tls_with_config(
-            current_url,
-            None,
-            false,
-            Some(connector),
-        )
-        .await
-        .map_err(|e| format!("WebSocket connect failed: {e}"))?
+        dial_manager(current_url, Some(connector), DIAL_TIMEOUT).await?
     } else {
-        tokio_tungstenite::connect_async(current_url)
-            .await
-            .map_err(|e| format!("WebSocket connect failed: {e}"))?
+        dial_manager(current_url, None, DIAL_TIMEOUT).await?
     };
 
     tracing::info!("WebSocket connected, sending auth...");
@@ -483,10 +676,20 @@ async fn try_connect(
     // Step 1: Send auth message as first frame
     let auth_msg = build_auth_message(config);
     if let Ok(json) = serde_json::to_string(&auth_msg) {
-        ws_write
-            .send(Message::Text(json.into()))
+        // A stalled peer stops draining long before it closes, so this write
+        // blocks as readily as the dial does.
+        match tokio::time::timeout(AUTH_SEND_TIMEOUT, ws_write.send(Message::Text(json.into())))
             .await
-            .map_err(|e| format!("Failed to send auth: {e}"))?;
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("Failed to send auth: {e}")),
+            Err(_) => {
+                return Err(format!(
+                    "Auth send timed out after {}s",
+                    AUTH_SEND_TIMEOUT.as_secs()
+                ))
+            }
+        }
     }
 
     // Step 2: Wait for auth response (auth_ok, register_ack, or auth_error)
@@ -568,6 +771,12 @@ async fn try_connect(
         Err(_) => return Err("Auth response timeout (10s)".into()),
     }
 
+    // Authenticated: disarm the handshake backstop. Everything from here is
+    // a live session, which is allowed to last for days.
+    if let Some(tx) = auth_done {
+        let _ = tx.send(());
+    }
+
     // Now in the authenticated session — run the main loop
     let mut stats_rx = ws_stats_tx.subscribe();
 
@@ -626,194 +835,220 @@ async fn try_connect(
     // Track last-sent generation per flow to avoid re-sending unchanged thumbnails
     let mut thumbnail_generations: HashMap<String, u64> = HashMap::new();
 
-    loop {
-        tokio::select! {
-            stats_result = stats_rx.recv() => {
-                match stats_result {
-                    Ok(stats_json) => {
-                        // Collect tunnel stats alongside flow stats
-                        let tunnel_statuses: Vec<serde_json::Value> = tunnel_manager
-                            .list_tunnels()
-                            .into_iter()
-                            .map(|ts| serde_json::to_value(ts).unwrap_or_default())
-                            .collect();
+    // The session loop races a watchdog on the manager's silence: see
+    // `InboundCadence` for why it cannot be one of the loop's own branches.
+    let cadence = std::sync::Mutex::new(InboundCadence::new(tokio::time::Instant::now()));
+    let session = async {
+        loop {
+            tokio::select! {
+                stats_result = stats_rx.recv() => {
+                    match stats_result {
+                        Ok(stats_json) => {
+                            // Collect tunnel stats alongside flow stats
+                            let tunnel_statuses: Vec<serde_json::Value> = tunnel_manager
+                                .list_tunnels()
+                                .into_iter()
+                                .map(|ts| serde_json::to_value(ts).unwrap_or_default())
+                                .collect();
 
-                        let flows_value = serde_json::from_str::<serde_json::Value>(&stats_json).unwrap_or_default();
-                        let total_flows = flows_value.as_array().map_or(0, |a| a.len());
+                            let flows_value = serde_json::from_str::<serde_json::Value>(&stats_json).unwrap_or_default();
+                            let total_flows = flows_value.as_array().map_or(0, |a| a.len());
 
-                        let standby = standby_listeners.as_ref()
-                            .map(|sl| sl.snapshot().into_iter()
-                                .map(|s| serde_json::to_value(s).unwrap_or_default())
-                                .collect::<Vec<_>>());
+                            let standby = standby_listeners.as_ref()
+                                .map(|sl| sl.snapshot().into_iter()
+                                    .map(|s| serde_json::to_value(s).unwrap_or_default())
+                                    .collect::<Vec<_>>());
 
-                        let mut payload = serde_json::json!({
-                            "flows": flows_value,
-                            "tunnels": tunnel_statuses,
-                            "uptime_secs": start_time.elapsed().as_secs(),
-                            "active_flows": flow_manager.active_flow_count(),
-                            "total_flows": total_flows,
-                            "system_resources": build_system_resources_payload(resource_state)
-                        });
-                        if let Some(sb) = standby {
-                            payload["standby_inputs"] = serde_json::Value::Array(sb);
-                        }
-                        let envelope = serde_json::json!({
-                            "type": "stats",
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                            "payload": payload
-                        });
-                        if let Ok(json) = serde_json::to_string(&envelope)
-                            && ws_write.send(Message::Text(json.into())).await.is_err() {
-                                break;
+                            let mut payload = serde_json::json!({
+                                "flows": flows_value,
+                                "tunnels": tunnel_statuses,
+                                "uptime_secs": start_time.elapsed().as_secs(),
+                                "active_flows": flow_manager.active_flow_count(),
+                                "total_flows": total_flows,
+                                "system_resources": build_system_resources_payload(resource_state)
+                            });
+                            if let Some(sb) = standby {
+                                payload["standby_inputs"] = serde_json::Value::Array(sb);
                             }
-                        // Reset the periodic timer since we just sent stats
-                        stats_interval.reset();
+                            let envelope = serde_json::json!({
+                                "type": "stats",
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                "payload": payload
+                            });
+                            if let Ok(json) = serde_json::to_string(&envelope)
+                                && ws_write.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
+                            // Reset the periodic timer since we just sent stats
+                            stats_interval.reset();
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::debug!("Manager client lagged {n} stats messages");
+                        }
+                        Err(_) => break,
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::debug!("Manager client lagged {n} stats messages");
+                }
+
+                // Periodic stats for tunnel-only nodes (no flows to trigger stats_rx)
+                _ = stats_interval.tick() => {
+                    let tunnel_statuses: Vec<serde_json::Value> = tunnel_manager
+                        .list_tunnels()
+                        .into_iter()
+                        .map(|ts| serde_json::to_value(ts).unwrap_or_default())
+                        .collect();
+
+                    let standby = standby_listeners.as_ref()
+                        .map(|sl| sl.snapshot().into_iter()
+                            .map(|s| serde_json::to_value(s).unwrap_or_default())
+                            .collect::<Vec<_>>());
+
+                    let mut payload = serde_json::json!({
+                        "flows": [],
+                        "tunnels": tunnel_statuses,
+                        "uptime_secs": start_time.elapsed().as_secs(),
+                        "active_flows": flow_manager.active_flow_count(),
+                        "total_flows": flow_manager.active_flow_count(),
+                        "system_resources": build_system_resources_payload(resource_state)
+                    });
+                    if let Some(sb) = standby {
+                        payload["standby_inputs"] = serde_json::Value::Array(sb);
                     }
-                    Err(_) => break,
+                    let envelope = serde_json::json!({
+                        "type": "stats",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "payload": payload
+                    });
+                    if let Ok(json) = serde_json::to_string(&envelope)
+                        && ws_write.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
                 }
-            }
 
-            // Periodic stats for tunnel-only nodes (no flows to trigger stats_rx)
-            _ = stats_interval.tick() => {
-                let tunnel_statuses: Vec<serde_json::Value> = tunnel_manager
-                    .list_tunnels()
-                    .into_iter()
-                    .map(|ts| serde_json::to_value(ts).unwrap_or_default())
-                    .collect();
-
-                let standby = standby_listeners.as_ref()
-                    .map(|sl| sl.snapshot().into_iter()
-                        .map(|s| serde_json::to_value(s).unwrap_or_default())
-                        .collect::<Vec<_>>());
-
-                let mut payload = serde_json::json!({
-                    "flows": [],
-                    "tunnels": tunnel_statuses,
-                    "uptime_secs": start_time.elapsed().as_secs(),
-                    "active_flows": flow_manager.active_flow_count(),
-                    "total_flows": flow_manager.active_flow_count(),
-                    "system_resources": build_system_resources_payload(resource_state)
-                });
-                if let Some(sb) = standby {
-                    payload["standby_inputs"] = serde_json::Value::Array(sb);
-                }
-                let envelope = serde_json::json!({
-                    "type": "stats",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "payload": payload
-                });
-                if let Ok(json) = serde_json::to_string(&envelope)
-                    && ws_write.send(Message::Text(json.into())).await.is_err() {
+                // Drain queued outbound frames produced by spawned per-command
+                // handler tasks. Keeping the socket writer single-owner here
+                // avoids interleaving partial Text frames from concurrent
+                // tasks.
+                Some(json) = out_rx.recv() => {
+                    if ws_write.send(Message::Text(json.into())).await.is_err() {
                         break;
                     }
-            }
-
-            // Drain queued outbound frames produced by spawned per-command
-            // handler tasks. Keeping the socket writer single-owner here
-            // avoids interleaving partial Text frames from concurrent
-            // tasks.
-            Some(json) = out_rx.recv() => {
-                if ws_write.send(Message::Text(json.into())).await.is_err() {
-                    break;
                 }
-            }
 
-            msg = ws_read.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        // Spawn per-message so a long-running command
-                        // (media upload chunk, update_config, etc.) can
-                        // never park the WS receive loop. Each handler
-                        // emits its reply via `out_tx` which the loop
-                        // drains alongside stats / health / thumbnails.
-                        let flow_manager = flow_manager.clone();
-                        let tunnel_manager = tunnel_manager.clone();
-                        let app_config = app_config.clone();
-                        let config_path = config_path.clone();
-                        let secrets_path = secrets_path.clone();
-                        let webrtc_sessions = webrtc_sessions.clone();
-                        let out_tx = out_tx.clone();
-                        tokio::spawn(async move {
-                            handle_manager_message(
-                                &text, &flow_manager, &tunnel_manager, &app_config,
-                                &config_path, &secrets_path, &webrtc_sessions, &out_tx,
-                            ).await;
-                        });
+                msg = ws_read.next() => {
+                    if let Some(Ok(ref frame)) = msg {
+                        let now = tokio::time::Instant::now();
+                        let mut heard = cadence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if matches!(frame, Message::Ping(_)) {
+                            heard.on_ping(now);
+                        } else {
+                            heard.on_frame(now);
+                        }
                     }
-                    Some(Ok(Message::Binary(bytes))) => {
-                        // Binary frames carry media-upload chunks with no
-                        // base64 inflation. Spawn per-frame like the Text arm
-                        // so a slow disk write never parks the receive loop;
-                        // the `command_ack` reply rides `out_tx` (single-owner
-                        // writer rule).
-                        let tunnel_manager = tunnel_manager.clone();
-                        let out_tx = out_tx.clone();
-                        tokio::spawn(async move {
-                            handle_manager_binary(&bytes, &tunnel_manager, &out_tx).await;
-                        });
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            // Spawn per-message so a long-running command
+                            // (media upload chunk, update_config, etc.) can
+                            // never park the WS receive loop. Each handler
+                            // emits its reply via `out_tx` which the loop
+                            // drains alongside stats / health / thumbnails.
+                            let flow_manager = flow_manager.clone();
+                            let tunnel_manager = tunnel_manager.clone();
+                            let app_config = app_config.clone();
+                            let config_path = config_path.clone();
+                            let secrets_path = secrets_path.clone();
+                            let webrtc_sessions = webrtc_sessions.clone();
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                handle_manager_message(
+                                    &text, &flow_manager, &tunnel_manager, &app_config,
+                                    &config_path, &secrets_path, &webrtc_sessions, &out_tx,
+                                ).await;
+                            });
+                        }
+                        Some(Ok(Message::Binary(bytes))) => {
+                            // Binary frames carry media-upload chunks with no
+                            // base64 inflation. Spawn per-frame like the Text arm
+                            // so a slow disk write never parks the receive loop;
+                            // the `command_ack` reply rides `out_tx` (single-owner
+                            // writer rule).
+                            let tunnel_manager = tunnel_manager.clone();
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                handle_manager_binary(&bytes, &tunnel_manager, &out_tx).await;
+                            });
+                        }
+                        Some(Ok(Message::Ping(data))) => {
+                            let _ = ws_write.send(Message::Pong(data)).await;
+                        }
+                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Err(e)) => {
+                            return Err(format!("WebSocket error: {e}"));
+                        }
+                        _ => {}
                     }
-                    Some(Ok(Message::Ping(data))) => {
-                        let _ = ws_write.send(Message::Pong(data)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(e)) => {
-                        return Err(format!("WebSocket error: {e}"));
-                    }
-                    _ => {}
                 }
-            }
 
-            _ = ping_interval.tick() => {
-                let pong = serde_json::json!({
-                    "type": "health",
-                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                    "payload": build_health_payload(
-                        flow_manager,
-                        api_addr,
-                        monitor_addr,
-                        resource_state,
-                        static_caps,
-                        live_gpu,
-                        Some(&mut network_sampler),
-                        Some(cellular_cache),
-                        Some(starlink_cache),
-                        start_time,
-                    )
-                });
-                if let Ok(json) = serde_json::to_string(&pong)
-                    && ws_write.send(Message::Text(json.into())).await.is_err() {
+                _ = ping_interval.tick() => {
+                    let pong = serde_json::json!({
+                        "type": "health",
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "payload": build_health_payload(
+                            flow_manager,
+                            api_addr,
+                            monitor_addr,
+                            resource_state,
+                            static_caps,
+                            live_gpu,
+                            Some(&mut network_sampler),
+                            Some(cellular_cache),
+                            Some(starlink_cache),
+                            start_time,
+                        )
+                    });
+                    if let Ok(json) = serde_json::to_string(&pong)
+                        && ws_write.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                }
+
+                // Thumbnail push — fires when any ThumbnailAccumulator stores a
+                // new JPEG (input switch / freeze detection / steady-state tick).
+                _ = thumbnail_notify.notified() => {
+                    if send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await.is_err() {
                         break;
                     }
-            }
-
-            // Thumbnail push — fires when any ThumbnailAccumulator stores a
-            // new JPEG (input switch / freeze detection / steady-state tick).
-            _ = thumbnail_notify.notified() => {
-                if send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await.is_err() {
-                    break;
                 }
-            }
 
-            // Safety-net fallback. Covers the cold-start case after reconnect
-            // (the notifier may have no permit waiting) and shields against
-            // any missed notification.
-            _ = thumbnail_fallback.tick() => {
-                if send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await.is_err() {
-                    break;
-                }
-            }
-
-            // Forward queued events to the manager
-            Some(event) = event_rx.recv() => {
-                let envelope = build_event_envelope(&event);
-                if let Ok(json) = serde_json::to_string(&envelope)
-                    && ws_write.send(Message::Text(json.into())).await.is_err() {
+                // Safety-net fallback. Covers the cold-start case after reconnect
+                // (the notifier may have no permit waiting) and shields against
+                // any missed notification.
+                _ = thumbnail_fallback.tick() => {
+                    if send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await.is_err() {
                         break;
                     }
+                }
+
+                // Forward queued events to the manager
+                Some(event) = event_rx.recv() => {
+                    let envelope = build_event_envelope(&event);
+                    if let Ok(json) = serde_json::to_string(&envelope)
+                        && ws_write.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                }
             }
+        }
+        Ok::<(), String>(())
+    };
+    tokio::select! {
+        ended = session => ended?,
+        (silent, limit) = manager_silence_watchdog(&cadence) => {
+            return Err(format!(
+                "Nothing heard from the manager for {}s (limit {}s from its ping cadence) \
+                 — treating the session as dead and reconnecting",
+                silent.as_secs(),
+                limit.as_secs()
+            ));
         }
     }
 
@@ -9711,5 +9946,203 @@ mod multiviewer_capability_gate {
             "the capability and the encoder must be the same condition; \
              caps = {caps:?}, backend resolved = {has_backend}"
         );
+    }
+}
+
+#[cfg(test)]
+mod dial_deadline_tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    /// A manager that has not pinged twice has told us nothing about its
+    /// cadence, and one that predates the keepalive never will. Either way
+    /// the watchdog must not fire, however long the quiet.
+    #[test]
+    fn the_watchdog_is_unarmed_until_the_cadence_is_known() {
+        let t0 = tokio::time::Instant::now();
+        let mut c = InboundCadence::new(t0);
+        assert_eq!(c.dead_for(t0 + secs(3600)), None, "no pings at all");
+        c.on_ping(t0 + secs(15));
+        assert_eq!(c.dead_for(t0 + secs(3600)), None, "one ping is not a cadence");
+    }
+
+    /// The default 15 s keepalive: four intervals is 60 s, under the floor,
+    /// so the floor rules.
+    #[test]
+    fn a_fast_cadence_is_held_to_the_floor() {
+        let t0 = tokio::time::Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0);
+        c.on_ping(t0 + secs(15));
+        assert_eq!(c.silence_limit(), Some(SILENCE_FLOOR));
+        assert_eq!(c.dead_for(t0 + secs(15) + secs(89)), None);
+        assert!(c.dead_for(t0 + secs(15) + secs(91)).is_some());
+    }
+
+    /// The keepalive is configurable to 300 s. A fixed limit would drop
+    /// every healthy session on such a manager; a learned one does not.
+    #[test]
+    fn a_slow_cadence_scales_the_limit() {
+        let t0 = tokio::time::Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0);
+        c.on_ping(t0 + secs(300));
+        assert_eq!(c.silence_limit(), Some(secs(1200)));
+        assert_eq!(c.dead_for(t0 + secs(300) + secs(1199)), None);
+    }
+
+    /// Any frame keeps the session alive, not only pings — a manager busy
+    /// sending commands is plainly there.
+    #[test]
+    fn any_frame_resets_the_silence() {
+        let t0 = tokio::time::Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0);
+        c.on_ping(t0 + secs(15));
+        c.on_frame(t0 + secs(80));
+        assert_eq!(c.dead_for(t0 + secs(160)), None);
+        assert!(c.dead_for(t0 + secs(171)).is_some());
+    }
+
+    /// The widest gap is kept, so a keepalive raised mid-session is not
+    /// judged by the old, shorter interval.
+    #[test]
+    fn the_widest_ping_gap_governs() {
+        let t0 = tokio::time::Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0);
+        c.on_ping(t0 + secs(60));
+        c.on_ping(t0 + secs(75));
+        assert_eq!(c.silence_limit(), Some(secs(240)));
+    }
+
+    /// The watchdog future itself must resolve on a manager already silent
+    /// past its limit. The pings are backdated rather than waited for, so the
+    /// test takes no wall-clock minutes (tokio's paused clock needs the
+    /// `test-util` feature, which this crate does not enable).
+    #[tokio::test]
+    async fn the_watchdog_fires_on_a_silent_manager() {
+        let t0 = tokio::time::Instant::now()
+            .checked_sub(secs(300))
+            .expect("the monotonic clock is past 300 s");
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0);
+        c.on_ping(t0 + secs(15));
+        let cadence = std::sync::Mutex::new(c);
+        let (silent, limit) = tokio::time::timeout(secs(10), manager_silence_watchdog(&cadence))
+            .await
+            .expect("a silent manager must end the session");
+        assert_eq!(limit, SILENCE_FLOOR);
+        assert!(silent > limit);
+    }
+
+    /// And it must not fire on a manager that is still talking: a session
+    /// can last for days.
+    #[tokio::test]
+    async fn the_watchdog_stays_quiet_while_the_manager_talks() {
+        let t0 = tokio::time::Instant::now();
+        let mut c = InboundCadence::new(t0);
+        c.on_ping(t0);
+        c.on_ping(t0);
+        let cadence = std::sync::Mutex::new(c);
+        let fired =
+            tokio::time::timeout(Duration::from_millis(200), manager_silence_watchdog(&cadence))
+                .await;
+        assert!(fired.is_err(), "the watchdog fired on a live session");
+    }
+
+    /// The exact shape of the stall behind bilbycast-edge#180: the peer
+    /// accepts the connection and then says nothing. Before the deadline this
+    /// parked the reconnect loop for ever and the node never came back.
+    #[tokio::test]
+    async fn a_dial_to_a_peer_that_never_answers_gives_up() {
+        // `main` installs the process-wide rustls provider; a test process has
+        // none, and the `wss://` dial below needs one to build its config.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            // Hold the accepted socket open and never write a byte.
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await
+        });
+
+        let started = Instant::now();
+        let err = dial_manager(
+            &format!("wss://{addr}/ws/node"),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("a peer that never answers must not hang for ever");
+
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "dial took {:?} — the deadline did not apply",
+            started.elapsed()
+        );
+    }
+
+    /// A refused connection must still come back as an ordinary error, not as
+    /// a timeout: the retry path depends on telling the two apart.
+    #[tokio::test]
+    async fn a_refused_dial_reports_the_connection_error() {
+        // Bind and drop, so the port is almost certainly closed.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = dial_manager(
+            &format!("wss://{addr}/ws/node"),
+            None,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("a closed port cannot connect");
+
+        assert!(
+            err.contains("connect failed"),
+            "expected a connect error, got: {err}"
+        );
+    }
+
+    /// Once a session authenticates it may run for days, so the backstop must
+    /// never fire behind it.
+    #[tokio::test]
+    async fn the_backstop_stays_quiet_once_authenticated() {
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).unwrap();
+
+        let fired = tokio::time::timeout(
+            Duration::from_millis(250),
+            handshake_backstop(rx, Duration::from_millis(50)),
+        )
+        .await;
+
+        assert!(
+            fired.is_err(),
+            "the backstop fired on an authenticated session"
+        );
+    }
+
+    /// And it must fire when authentication never arrives.
+    #[tokio::test]
+    async fn the_backstop_fires_when_auth_never_arrives() {
+        let (_tx, rx) = oneshot::channel::<()>();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            handshake_backstop(rx, Duration::from_millis(50)),
+        )
+        .await
+        .expect("the backstop should have fired when auth never completed");
     }
 }
