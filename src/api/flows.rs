@@ -407,13 +407,15 @@ pub async fn update_flow_assembly(
     )
     .map_err(|e| ApiError::BadRequest(format!("Invalid assembly: {e}")))?;
     // A seq-aware Hitless leg must carry an upstream sequence number, which
-    // depends on the leg inputs' own config: checked against the node's.
-    crate::config::validation::validate_hitless_seq_aware_legs(
-        &new_assembly,
-        &flow_id,
-        &*state.config.read().await,
-    )
-    .map_err(|e| ApiError::BadRequest(format!("Invalid assembly: {e}")))?;
+    // depends on the leg inputs' own config: checked against the node's,
+    // which also says how long each leg holds a packet, whichever flow owns
+    // its input.
+    let leg_holds = {
+        let cfg = state.config.read().await;
+        crate::config::validation::validate_hitless_seq_aware_legs(&new_assembly, &flow_id, &cfg)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid assembly: {e}")))?;
+        crate::engine::ts_es_hitless::LegHolds::of(&new_assembly, &cfg)
+    };
 
     // The no-op check, the swap and the persist, under one swap: a concurrent
     // swap over the manager WebSocket waits for this one to be persisted.
@@ -430,7 +432,8 @@ pub async fn update_flow_assembly(
             None => ApiError::BadRequest(e.to_string()),
         }
     };
-    let outcome = swap.replace(new_assembly.clone(), None).await.map_err(swap_failed)?;
+    let outcome =
+        swap.replace(new_assembly.clone(), leg_holds, None).await.map_err(swap_failed)?;
 
     // Saved — an unconfirmed swap too, since the stalled assembler runs it
     // when it resumes — unless the flow was restarted or stopped under it.

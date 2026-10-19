@@ -2745,18 +2745,23 @@ async fn execute_command(
             .map_err(|e| CommandError::from_validation("Invalid assembly", e))?;
             // A seq-aware Hitless leg must carry an upstream sequence number,
             // which depends on the leg inputs' own config: checked against
-            // the node's.
-            crate::config::validation::validate_hitless_seq_aware_legs(
-                &new_assembly,
-                flow_id,
-                &*app_config.read().await,
-            )
-            .map_err(|e| {
-                CommandError::with_code(
-                    format!("Invalid assembly: {e}"),
-                    "hitless_seq_aware_leg_unsequenced",
+            // the node's, which also says how long each leg holds a packet,
+            // whichever flow owns its input.
+            let leg_holds = {
+                let cfg = app_config.read().await;
+                crate::config::validation::validate_hitless_seq_aware_legs(
+                    &new_assembly,
+                    flow_id,
+                    &cfg,
                 )
-            })?;
+                .map_err(|e| {
+                    CommandError::with_code(
+                        format!("Invalid assembly: {e}"),
+                        "hitless_seq_aware_leg_unsequenced",
+                    )
+                })?;
+                crate::engine::ts_es_hitless::LegHolds::of(&new_assembly, &cfg)
+            };
             tracing::info!(
                 "Manager command: update_flow_assembly '{flow_id}' (kind={:?}, programs={})",
                 new_assembly.kind,
@@ -2816,7 +2821,7 @@ async fn execute_command(
                 }
             };
             let outcome = swap
-                .replace(new_assembly.clone(), splice_mode_override)
+                .replace(new_assembly.clone(), leg_holds, splice_mode_override)
                 .await
                 .map_err(swap_failed)?;
 

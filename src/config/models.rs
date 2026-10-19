@@ -409,6 +409,10 @@ pub struct ResolvedFlow {
     pub inputs: Vec<InputDefinition>,
     /// The resolved output configurations (all of them, including passive).
     pub outputs: Vec<OutputConfig>,
+    /// The receive hold of every leg of the assembly's Hitless slots, own
+    /// input or another flow's ([`crate::engine::ts_es_hitless::LegHolds`]):
+    /// `inputs` holds the flow's own only.
+    pub leg_holds: crate::engine::ts_es_hitless::LegHolds,
 }
 
 impl ResolvedFlow {
@@ -493,10 +497,16 @@ impl AppConfig {
             }
         }
 
+        let leg_holds = flow
+            .assembly
+            .as_ref()
+            .map(|assembly| crate::engine::ts_es_hitless::LegHolds::of(assembly, self))
+            .unwrap_or_default();
         Ok(ResolvedFlow {
             config: flow.clone(),
             inputs,
             outputs,
+            leg_holds,
         })
     }
 

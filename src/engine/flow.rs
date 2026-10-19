@@ -694,7 +694,13 @@ impl FlowRuntime {
         let spts_build: Option<SptsBuildResult> = match config.config.assembly.as_ref() {
             None => None,
             Some(a) if matches!(a.kind, AssemblyKind::Passthrough) => None,
-            Some(a) => Some(build_assembly_plan(a, &config, &hitless_scope, &event_sender)?),
+            Some(a) => Some(build_assembly_plan(
+                a,
+                &config,
+                &config.leg_holds,
+                &hitless_scope,
+                &event_sender,
+            )?),
         };
         // Node-wide ES bus reference. The bus instance is owned by
         // `FlowManager` and shared across every assembled flow on the
@@ -1749,8 +1755,8 @@ impl FlowRuntime {
         usage
     }
 
-    /// Swap to `new_assembly` in a swap of its own ([`AssemblySwap::replace`]):
-    /// the tests' shorthand.
+    /// Swap to `new_assembly` in a swap of its own ([`AssemblySwap::replace`]),
+    /// its legs holding nothing: the tests' shorthand.
     #[cfg(test)]
     pub async fn replace_assembly(
         &self,
@@ -1758,7 +1764,7 @@ impl FlowRuntime {
         splice_mode_override: Option<crate::config::models::SpliceMode>,
     ) -> Result<()> {
         let mut swap = self.begin_assembly_swap().await;
-        match swap.replace(new_assembly, splice_mode_override).await? {
+        match swap.replace(new_assembly, Default::default(), splice_mode_override).await? {
             SwapOutcome::OnAir => Ok(()),
             SwapOutcome::Unconfirmed(e) => Err(e),
         }
@@ -1789,6 +1795,7 @@ impl FlowRuntime {
         &self,
         hitless_mergers: &mut crate::engine::ts_es_hitless::HitlessMergers,
         new_assembly: crate::config::models::FlowAssembly,
+        leg_holds: crate::engine::ts_es_hitless::LegHolds,
         splice_mode_override: Option<crate::config::models::SpliceMode>,
     ) -> Result<SwapOutcome> {
         let flow_id = &self.config.config.id;
@@ -1883,12 +1890,18 @@ impl FlowRuntime {
                     );
                 }
 
-        // Build the new plan against the current `ResolvedFlow.inputs`.
+        // Build the new plan against the current `ResolvedFlow.inputs`, and
+        // the legs' holds the caller took from the node config.
         // `build_assembly_plan` emits Critical events on every failure
         // path (`pid_bus_spts_*`, `pid_bus_audio_encode_codec_*`, etc.)
         // so the manager UI has its field-level signals.
-        let mut build =
-            build_assembly_plan(&new_assembly, &self.config, &self.hitless_scope, &self.event_sender)?;
+        let mut build = build_assembly_plan(
+            &new_assembly,
+            &self.config,
+            &leg_holds,
+            &self.hitless_scope,
+            &self.event_sender,
+        )?;
 
         // Essence resolution against the flow's live PSI catalogues.
         // 3-second window matches start-up.
@@ -5500,11 +5513,15 @@ fn patch_essence_pid(slot: &mut AssemblySlot, leg_idx: Option<usize>, pid: u16) 
     }
 }
 
-/// `hitless_scope` is the flow run's scope for its Hitless slots' bus keys
+/// `leg_holds` are the receive holds of `assembly`'s Hitless legs, taken
+/// from the node config
+/// ([`crate::engine::ts_es_hitless::LegHolds`]). `hitless_scope` is the flow
+/// run's scope for its Hitless slots' bus keys
 /// ([`crate::engine::ts_es_hitless::hitless_scope`]).
 fn build_assembly_plan(
     assembly: &FlowAssembly,
     flow: &ResolvedFlow,
+    leg_holds: &crate::engine::ts_es_hitless::LegHolds,
     hitless_scope: &str,
     event_sender: &EventSender,
 ) -> Result<SptsBuildResult> {
@@ -5757,17 +5774,10 @@ fn build_assembly_plan(
                         crate::config::models::HitlessMode::SeqAware
                     );
                     // How far the legs lag each other by configuration, for
-                    // the seq-aware merger's stale time. Only this flow's
-                    // inputs are seen: a leg owned by another flow counts no
-                    // hold.
-                    let hold = |input_id: &str| {
-                        flow.inputs.iter().find(|d| d.id == input_id).map_or(
-                            std::time::Duration::ZERO,
-                            |d| crate::engine::ts_es_hitless::leg_receive_hold(&d.config),
-                        )
-                    };
+                    // the seq-aware merger's stale time: each leg's hold from
+                    // the node config, whichever flow owns its input.
                     let leg_lag = if seq_aware {
-                        hold(&primary_pair.0).abs_diff(hold(&backup_pair.0))
+                        leg_holds.get(&primary_pair.0).abs_diff(leg_holds.get(&backup_pair.0))
                     } else {
                         std::time::Duration::ZERO
                     };
@@ -7500,7 +7510,10 @@ impl AssemblySwap<'_> {
     /// Replace the flow's PID-bus assembly plan in place (Phase 7).
     ///
     /// The caller has already validated `new_assembly` (shape + field
-    /// limits via `validate_flow`). This method:
+    /// limits via `validate_flow`), and hands its Hitless legs' holds,
+    /// taken from the node config with it
+    /// ([`crate::engine::ts_es_hitless::LegHolds::of`]): the flow holds
+    /// only its own inputs' definitions, from its start. This method:
     ///
     /// 1. Rejects the call if the flow has no running assembler (i.e.
     ///    `assembly.kind == passthrough` or absent — a switch is
@@ -7528,10 +7541,16 @@ impl AssemblySwap<'_> {
     pub async fn replace(
         &mut self,
         new_assembly: crate::config::models::FlowAssembly,
+        leg_holds: crate::engine::ts_es_hitless::LegHolds,
         splice_mode_override: Option<crate::config::models::SpliceMode>,
     ) -> Result<SwapOutcome> {
         self.runtime
-            .replace_assembly_locked(&mut self.mergers, new_assembly, splice_mode_override)
+            .replace_assembly_locked(
+                &mut self.mergers,
+                new_assembly,
+                leg_holds,
+                splice_mode_override,
+            )
             .await
     }
 
@@ -7572,6 +7591,13 @@ impl AssemblySwap<'_> {
             flow.assembly = Some(assembly);
         }
         Ok(())
+    }
+
+    /// How far apart the merger behind Hitless slot `uid` was told its legs
+    /// are.
+    #[cfg(test)]
+    pub fn leg_lag(&self, uid: &str) -> Option<std::time::Duration> {
+        self.mergers.leg_lag(uid)
     }
 }
 #[cfg(test)]
@@ -7663,7 +7689,7 @@ mod cost_plan_tests {
             "output_ids": output_ids,
         }))
         .unwrap();
-        ResolvedFlow { config, inputs, outputs }
+        ResolvedFlow { config, inputs, outputs, leg_holds: Default::default() }
     }
 
     // The paired transcode decode session is now charged to the *resolved*
@@ -7804,7 +7830,7 @@ mod cost_plan_tests {
             j["thumbnail_interval_secs"] = serde_json::json!(s);
         }
         let config: FlowConfig = serde_json::from_value(j).unwrap();
-        ResolvedFlow { config, inputs, outputs }
+        ResolvedFlow { config, inputs, outputs, leg_holds: Default::default() }
     }
 
     #[test]
@@ -8124,7 +8150,8 @@ mod assembly_plan_tests {
         let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
         let (events, _rx) = crate::manager::events::event_channel();
         let assembly = resolved.config.assembly.as_ref().expect("assembly");
-        let build = build_assembly_plan(assembly, &resolved, "f1:0", &events).expect("plan");
+        let build = build_assembly_plan(assembly, &resolved, &resolved.leg_holds, "f1:0", &events)
+            .expect("plan");
         let slot = &build.plan.programs[0].slots[0];
         assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("f1:0", "slot_0_0"));
         assert_eq!(build.pending_hitless[0].bus_key, slot.source, "the merger feeds the slot");
@@ -8140,9 +8167,13 @@ mod assembly_plan_tests {
     /// other by configuration, so its stale time can exceed it: an RTP leg
     /// de-jittered 2 s against one de-jittered 100 ms lags 1.9 s, and a RIST
     /// leg's default 1 s buffer against an RTP leg's 200 ms 2022-7 hold and
-    /// 100 ms de-jitter lags 700 ms. A primary-preference slot merges on no
-    /// sequence and is told nothing. Each leg's de-jitter is its own, so the
-    /// node's default, which another test installs, decides none of them.
+    /// 100 ms de-jitter lags 700 ms — whether the slot's flow owns the legs'
+    /// inputs or two input-host flows do. Read from the slot's flow, which
+    /// holds only its own inputs' definitions, hosted legs held nothing, and
+    /// the slot kept the 1 s stale time a 1.9 s lag steps back past. A
+    /// primary-preference slot merges on no sequence and is told nothing.
+    /// Each leg's de-jitter is its own, so the node's default, which another
+    /// test installs, decides none of them.
     #[test]
     fn a_seq_aware_slots_merger_is_told_how_far_its_legs_lag() {
         let input = |v: serde_json::Value| -> InputDefinition {
@@ -8168,9 +8199,12 @@ mod assembly_plan_tests {
         ];
         let leg =
             |id: &str| serde_json::json!({ "type": "pid", "input_id": id, "source_pid": 256 });
-        let lag = |mode: &str, primary: &str, backup: &str| {
+        // `hosted`: each leg's input owned by an input-host flow of its own,
+        // the slot's flow owning neither.
+        let lag = |mode: &str, primary: &str, backup: &str, hosted: bool| {
+            let own = if hosted { vec![] } else { vec![primary, backup] };
             let flow: FlowConfig = serde_json::from_value(serde_json::json!({
-                "id": "f1", "name": "f1", "input_ids": [primary, backup], "output_ids": [],
+                "id": "f1", "name": "f1", "input_ids": own, "output_ids": [],
                 "assembly": {
                     "kind": "spts",
                     "pcr_source": { "input_id": primary, "pid": 256 },
@@ -8191,18 +8225,38 @@ mod assembly_plan_tests {
                 }
             }))
             .expect("flow fixture");
-            let cfg = AppConfig { inputs: inputs.clone(), flows: vec![flow], ..Default::default() };
+            let mut flows = vec![flow];
+            if hosted {
+                for (host, input_id) in [("host-p", primary), ("host-b", backup)] {
+                    flows.push(
+                        serde_json::from_value(serde_json::json!({
+                            "id": host, "name": host, "input_ids": [input_id], "output_ids": []
+                        }))
+                        .expect("host flow fixture"),
+                    );
+                }
+            }
+            let cfg = AppConfig { inputs: inputs.clone(), flows, ..Default::default() };
             let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
             let (events, _rx) = crate::manager::events::event_channel();
             let assembly = resolved.config.assembly.as_ref().expect("assembly");
-            let build = build_assembly_plan(assembly, &resolved, "f1:0", &events).expect("plan");
+            let build =
+                build_assembly_plan(assembly, &resolved, &resolved.leg_holds, "f1:0", &events)
+                    .expect("plan");
             build.pending_hitless[0].leg_lag
         };
         let ms = std::time::Duration::from_millis;
-        assert_eq!(lag("seq_aware", "rtp-100", "rtp-2000"), ms(1_900));
-        assert_eq!(lag("seq_aware", "rtp-2000", "rtp-100"), ms(1_900), "whichever leg lags");
-        assert_eq!(lag("seq_aware", "rist", "rtp-pd"), ms(700));
-        assert_eq!(lag("primary_preference", "rtp-100", "rtp-2000"), ms(0));
+        for hosted in [false, true] {
+            let legs = if hosted { "hosted legs" } else { "own legs" };
+            assert_eq!(lag("seq_aware", "rtp-100", "rtp-2000", hosted), ms(1_900), "{legs}");
+            assert_eq!(
+                lag("seq_aware", "rtp-2000", "rtp-100", hosted),
+                ms(1_900),
+                "whichever leg lags, {legs}"
+            );
+            assert_eq!(lag("seq_aware", "rist", "rtp-pd", hosted), ms(700), "{legs}");
+            assert_eq!(lag("primary_preference", "rtp-100", "rtp-2000", hosted), ms(0), "{legs}");
+        }
     }
 
     /// A plan swap gives its flow's assembler a bounded time — for room in

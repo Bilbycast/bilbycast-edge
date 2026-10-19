@@ -33,9 +33,11 @@
 //!
 //! Both seq-aware mergers' stale time (see "Re-anchoring" in
 //! [`crate::redundancy::merger`]) is a second past how far one leg lags the
-//! other by configuration — the difference of their [`leg_receive_hold`]s —
-//! or, buffered, past the hold when that is longer, so a leg that only lags
-//! is never taken for a moved stream while it is still a window behind.
+//! other by configuration — the difference of their [`leg_receive_hold`]s,
+//! each read from the node config whichever flow owns its input
+//! ([`LegHolds`]) — or, buffered, past the hold when that is longer, so a
+//! leg that only lags is never taken for a moved stream while it is still a
+//! window behind.
 //!
 //! A leg whose packets reach the bus with no sequence number — any input but
 //! RTP and RIST, or one whose ingress transcode or post-process stage
@@ -249,6 +251,46 @@ pub fn leg_receive_hold(input: &crate::config::models::InputConfig) -> Duration 
         InputConfig::Rtp(c) => crate::engine::input_rtp::receive_hold(c),
         InputConfig::Rist(c) => crate::engine::input_rist::receive_hold(c),
         _ => Duration::ZERO,
+    }
+}
+
+/// The [`leg_receive_hold`] of every leg of an assembly's Hitless slots, by
+/// input id, each leg's input looked up among the node's: a leg on an input
+/// another flow owns — an input-host flow's, a Node Bus Matrix layout's —
+/// counts its hold like one on the slot's own flow, which holds only its own
+/// inputs' definitions. Taken from the node config when a plan is built:
+/// for a flow's start by [`crate::config::models::AppConfig::resolve_flow`],
+/// for a plan swap by the swap's caller
+/// ([`crate::engine::flow::AssemblySwap::replace`]).
+#[derive(Debug, Clone, Default)]
+pub struct LegHolds(HashMap<String, Duration>);
+
+impl LegHolds {
+    pub fn of(
+        assembly: &crate::config::models::FlowAssembly,
+        config: &crate::config::models::AppConfig,
+    ) -> Self {
+        use crate::config::models::SlotSource;
+        let mut holds = HashMap::new();
+        for stream in assembly.programs.iter().flat_map(|p| &p.streams) {
+            let SlotSource::Hitless { primary, backup, .. } = &stream.source else {
+                continue;
+            };
+            for leg in [primary, backup] {
+                let SlotSource::Pid { input_id, .. } = leg.as_ref() else {
+                    continue;
+                };
+                if let Some(input) = config.inputs.iter().find(|i| i.id == *input_id) {
+                    holds.insert(input_id.clone(), leg_receive_hold(&input.config));
+                }
+            }
+        }
+        Self(holds)
+    }
+
+    /// `input_id`'s hold: none for an input the node does not define.
+    pub fn get(&self, input_id: &str) -> Duration {
+        self.0.get(input_id).copied().unwrap_or_default()
     }
 }
 
@@ -471,6 +513,12 @@ impl HitlessMergers {
     /// stops ([`HitlessOutputs::release_all`]).
     pub fn outputs(&self) -> Arc<HitlessOutputs> {
         self.outputs.clone()
+    }
+
+    /// How far apart the merger behind slot `uid` was told its legs are.
+    #[cfg(test)]
+    pub fn leg_lag(&self, uid: &str) -> Option<Duration> {
+        self.running.get(uid).map(|running| running.slot.leg_lag)
     }
 }
 

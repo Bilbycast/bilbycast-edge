@@ -1865,7 +1865,7 @@ mod tests {
                     let wanted = wanted.clone();
                     async move { runtime.begin_assembly_swap().await.runs(&wanted).await }
                 });
-                let on_air = first.replace(wanted, None).await.expect("swap");
+                let on_air = first.replace(wanted, Default::default(), None).await.expect("swap");
                 assert!(matches!(on_air, crate::engine::flow::SwapOutcome::OnAir));
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 assert!(!second.is_finished(), "a second swap waits for the first");
@@ -1943,7 +1943,8 @@ mod tests {
             let fm = fm.clone();
             async move {
                 let mut swap = first.begin_assembly_swap().await;
-                let on_air = swap.replace(assembly(true), None).await.expect("swap");
+                let on_air =
+                    swap.replace(assembly(true), Default::default(), None).await.expect("swap");
                 assert!(matches!(on_air, crate::engine::flow::SwapOutcome::OnAir));
                 let mut config = cfg.clone();
                 swap.record(&mut config, assembly(true)).expect("the run swapped runs");
@@ -2052,7 +2053,10 @@ mod tests {
                     .await
                     .expect("the assembler runs");
                 let mut swap = runtime.begin_assembly_swap().await;
-                let outcome = swap.replace(assembly(true), None).await.expect("the swap goes through");
+                let outcome = swap
+                    .replace(assembly(true), Default::default(), None)
+                    .await
+                    .expect("the swap goes through");
                 let SwapOutcome::Unconfirmed(err) = outcome else {
                     panic!("a stalled assembler confirms nothing");
                 };
@@ -2073,6 +2077,91 @@ mod tests {
                 wait_until("the swapped plan is on air", || slots_on_air(2)).await;
                 runtime.replace_assembly(assembly(false), None).await.expect("a swap back");
                 wait_until("the old plan is back on air", || slots_on_air(1)).await;
+            }
+        });
+        let outcome = checks.await;
+        let _ = fm.destroy_flow("f1").await;
+        if let Err(failed) = outcome {
+            std::panic::resume_unwind(failed.into_panic());
+        }
+    }
+
+    /// A plan swap's seq-aware Hitless merger is told how far its legs lag
+    /// from the holds the swap's caller read in the node config, which holds
+    /// an input-host flow's inputs too: two RTP legs de-jittered 100 ms and
+    /// 2 s, owned by host flows, lag 1.9 s. Read from the slot's flow, which
+    /// holds only its own inputs, they held nothing, and the merger kept the
+    /// 1 s stale time a 1.9 s lag steps back past.
+    #[tokio::test]
+    async fn a_plan_swaps_merger_is_told_how_far_its_hosted_legs_lag() {
+        use std::time::Duration;
+        let fm = make_fm();
+        let assembly = |hitless: bool| -> crate::config::models::FlowAssembly {
+            let pid = |input_id: &str, pid: u16| {
+                serde_json::json!({ "type": "pid", "input_id": input_id, "source_pid": pid })
+            };
+            let mut streams = vec![serde_json::json!({
+                "source": pid("in-c", 256), "out_pid": 256, "stream_type": 27
+            })];
+            if hitless {
+                streams.push(serde_json::json!({
+                    "source": {
+                        "type": "hitless", "mode": "seq_aware",
+                        "primary": pid("rtp-100", 257), "backup": pid("rtp-2000", 257)
+                    },
+                    "out_pid": 257, "stream_type": 15
+                }));
+            }
+            serde_json::from_value(serde_json::json!({
+                "kind": "spts",
+                "pcr_source": { "input_id": "in-c", "pid": 256 },
+                "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": streams }]
+            }))
+            .expect("assembly fixture")
+        };
+        let flow = |id: &str, input_id: &str, assembly: Option<_>| {
+            serde_json::from_value::<crate::config::models::FlowConfig>(serde_json::json!({
+                "id": id, "name": id, "input_ids": [input_id], "output_ids": [],
+                "assembly": assembly
+            }))
+            .expect("flow fixture")
+        };
+        let rtp = |id: &str, port: u16, dejitter_ms: u32| {
+            input(serde_json::json!({
+                "id": id, "name": id, "type": "rtp", "passthrough_clock": true,
+                "bind_addr": format!("127.0.0.1:{port}"), "ingress_dejitter_ms": dejitter_ms
+            }))
+        };
+        let cfg = crate::config::models::AppConfig {
+            inputs: vec![
+                input(serde_json::json!({
+                    "id": "in-c", "name": "in-c", "type": "udp", "bind_addr": "127.0.0.1:41939"
+                })),
+                rtp("rtp-100", 41940, 100),
+                rtp("rtp-2000", 41941, 2000),
+            ],
+            flows: vec![
+                flow("f1", "in-c", Some(assembly(false))),
+                flow("host-p", "rtp-100", None),
+                flow("host-b", "rtp-2000", None),
+            ],
+            ..Default::default()
+        };
+        let runtime = fm
+            .create_flow(cfg.resolve_flow(&cfg.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+        // A failed assertion must not leave the flow running: its input
+        // thread would hold the test runtime's shutdown forever.
+        let checks = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let wanted = assembly(true);
+                let leg_holds = crate::engine::ts_es_hitless::LegHolds::of(&wanted, &cfg);
+                let mut swap = runtime.begin_assembly_swap().await;
+                let on_air = swap.replace(wanted, leg_holds, None).await.expect("swap");
+                assert!(matches!(on_air, crate::engine::flow::SwapOutcome::OnAir));
+                assert_eq!(swap.leg_lag("slot_0_1"), Some(Duration::from_millis(1_900)));
             }
         });
         let outcome = checks.await;
