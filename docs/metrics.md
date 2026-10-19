@@ -93,7 +93,10 @@ input's socket when that is a single-socket SRT input, and its leg 1 when it
 is a 2022-7 one, whose leg 2 is `leg="input_leg2"`; a bonded input emits
 neither series. `pkt_loss_total` is libsrt's per-socket
 total, so it restarts at every reconnect and at every Take to another SRT
-input, which `rate()` reads as a counter reset. Sender-retransmit and
+input, which `rate()` reads as a counter reset. A stats read that fails
+(libsrt answers with zeros) is not published — the series keeps the last
+good reading rather than dropping to 0, which `increase()` would have read
+as a reset and counted the socket's whole loss again. Sender-retransmit and
 receiver-recovery counters are **not** on `/metrics` at all — they ride the
 WS `stats` message as `pkt_retransmit_total` / `pkt_recv_retransmit_total`
 on the SRT block of `FlowStats`.

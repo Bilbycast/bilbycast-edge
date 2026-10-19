@@ -8025,7 +8025,7 @@ mod srt_input_stats_tests {
         crate::srt::connection::publish_bonding_stats(
             &srt.bonding,
             Some(&srt),
-            &mut 0,
+            &mut LegCursor::default(),
             SrtBondingStats {
                 aggregate: SrtLegStats { pkt_recv_drop_total: 12, ..Default::default() },
                 members: vec![

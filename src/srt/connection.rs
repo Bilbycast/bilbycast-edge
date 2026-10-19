@@ -724,61 +724,43 @@ pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
     }
 }
 
-/// Advance a "last seen" cumulative libsrt counter and return how far it moved.
+/// A socket's or a group's cumulative counters as its stats poller last read
+/// them: one per poller, so one per socket or group.
 ///
-/// libsrt's `pktRcvDropTotal` is cumulative **per socket**, so it restarts at
-/// zero on every reconnect. The caller keeps one `last` per socket — each
-/// poller is one socket's or one group's — and adds the returned delta to
-/// the input's running total, which is what makes the total survive a
-/// reconnect instead of snapping back to zero with it. A reading below
-/// `last` is a failed read: `SrtSocket::stats` and `SrtGroup::stats` return
-/// all zeros when libsrt refuses the query. It is no sample — it adds
-/// nothing and leaves `last` alone. Taking it as the new baseline made the
-/// next good read add the socket's whole drop history again.
-pub(crate) fn cumulative_delta(last: &mut i64, current: i32) -> u64 {
-    let current = i64::from(current);
-    if current < *last {
-        return 0;
-    }
-    let delta = (current - *last) as u64;
-    *last = current;
-    delta
-}
-
-/// A socket's cumulative receive counters as its stats poller last read
-/// them: one per poller, so one per socket.
+/// libsrt's counters are cumulative **per socket**, so they restart at zero
+/// on every reconnect. The poller of the new socket starts a fresh cursor and
+/// hands on what moved, which the input adds to its running totals: that is
+/// what makes them survive a reconnect instead of snapping back to zero.
 #[derive(Default)]
 pub(crate) struct LegCursor {
-    drops: i64,
-    delivered: i64,
+    /// `pktRcvDropTotal`, `pktRecvUniqueTotal`, `pktSentTotal`,
+    /// `pktRecvTotal` and `msTimeStamp` of the last good reading.
+    last: [i64; 5],
 }
 
 impl LegCursor {
-    /// How far a reading moved the too-late drop and delivered-packet
-    /// counters (`pktRcvDropTotal`, `pktRecvUniqueTotal`) since the last one.
-    /// `None` when either went backwards: a failed read comes back zeroed,
-    /// and is no sample — the cursor stays, so the next good read is measured
-    /// from the last good one (see [`cumulative_delta`]).
-    fn advance(&mut self, drops: i32, delivered: i64) -> Option<(u64, u64)> {
-        let drops = i64::from(drops);
-        if drops < self.drops || delivered < self.delivered {
+    /// How far `reading` moved the too-late drop and delivered-packet
+    /// counters (`pktRcvDropTotal`, `pktRecvUniqueTotal`) since the last good
+    /// one. `None` for a failed read: `SrtSocket::stats` and `SrtGroup::stats`
+    /// answer all zeros when libsrt refuses the query, so any of the counters
+    /// it is read by going backwards is one. It is no sample — the cursor
+    /// stays, so the next good read is measured from the last good one;
+    /// taken as the new baseline, it made the next good read count the
+    /// socket's whole drop history again.
+    fn advance(&mut self, reading: &SrtLegStats) -> Option<(u64, u64)> {
+        let now = [
+            i64::from(reading.pkt_recv_drop_total),
+            reading.pkt_recv_unique_total,
+            reading.pkt_sent_total,
+            reading.pkt_recv_total,
+            reading.uptime_ms,
+        ];
+        if now.iter().zip(&self.last).any(|(now, last)| now < last) {
             return None;
         }
-        let moved = ((drops - self.drops) as u64, (delivered - self.delivered) as u64);
-        self.drops = drops;
-        self.delivered = delivered;
+        let moved = ((now[0] - self.last[0]) as u64, (now[1] - self.last[1]) as u64);
+        self.last = now;
         Some(moved)
-    }
-}
-
-/// Fold a group's `pktRcvDropTotal` reading into the input's drops, through
-/// the poller's `last`. The delta is counted when it is polled, which is
-/// what decides whether it is the flow's: see
-/// [`SrtInputStats::count_recv_drops`].
-fn add_recv_drops(input: &SrtInputStats, last_drop: &mut i64, pkt_recv_drop_total: i32) {
-    let delta = cumulative_delta(last_drop, pkt_recv_drop_total);
-    if delta > 0 {
-        input.count_recv_drops(delta);
     }
 }
 
@@ -790,37 +772,50 @@ fn add_recv_drops(input: &SrtInputStats, last_drop: &mut i64, pkt_recv_drop_tota
 /// dropped, and `watch::Sender::send` refuses to store a value when there
 /// are no receivers. With `send` the cache stayed `None` forever and
 /// `srt_stats` was absent from every SRT input and output on the node.
+///
+/// A failed read ([`LegCursor::advance`]) is not published: the cache keeps
+/// the last good reading. Published, its zeros read as a reset of
+/// `bilbycast_edge_srt_loss_total`, a Prometheus counter, which `increase()`
+/// then counted twice, and as a 0 ms latency and RTT in the drop reason.
 pub(crate) fn publish_leg_stats(
     cache: &watch::Sender<Option<SrtLegStats>>,
     input: Option<(&SrtInputStats, SrtInputSocket)>,
     cursor: &mut LegCursor,
     leg_stats: SrtLegStats,
 ) {
+    let Some((drops, delivered)) = cursor.advance(&leg_stats) else {
+        return;
+    };
     // Every good poll, drops or not: a 2022-7 leg's poll also takes the
     // merger's count of what neither leg delivered, and what the leg
     // delivered is whether its drops can explain that and how long they
-    // wait. A failed read is skipped whole.
-    if let Some((input, socket)) = input
-        && let Some((drops, delivered)) =
-            cursor.advance(leg_stats.pkt_recv_drop_total, leg_stats.pkt_recv_unique_total)
-    {
+    // wait.
+    if let Some((input, socket)) = input {
         input.count_socket_drops(socket, drops, delivered);
     }
     cache.send_replace(Some(leg_stats));
 }
 
-/// The group counterpart of [`publish_leg_stats`]. Drops are read off the
-/// group aggregate — libsrt's own count of packets no member delivered —
-/// never summed over members: on a broadcast group a member skips packets
-/// another member already delivered, which is no loss at all.
+/// The group counterpart of [`publish_leg_stats`], a failed read of the group
+/// published no more than a socket's. Drops are read off the group aggregate
+/// — libsrt's own count of packets no member delivered — never summed over
+/// members: on a broadcast group a member skips packets another member
+/// already delivered, which is no loss at all. They are counted when polled,
+/// which is what decides whether they are the flow's: see
+/// [`SrtInputStats::count_recv_drops`].
 pub(crate) fn publish_bonding_stats(
     cache: &watch::Sender<Option<SrtBondingStats>>,
     input: Option<&SrtInputStats>,
-    last_drop: &mut i64,
+    cursor: &mut LegCursor,
     snapshot: SrtBondingStats,
 ) {
-    if let Some(input) = input {
-        add_recv_drops(input, last_drop, snapshot.aggregate.pkt_recv_drop_total);
+    let Some((drops, _)) = cursor.advance(&snapshot.aggregate) else {
+        return;
+    };
+    if let Some(input) = input
+        && drops > 0
+    {
+        input.count_recv_drops(drops);
     }
     cache.send_replace(Some(snapshot));
 }
@@ -856,7 +851,8 @@ impl IntervalSampler {
     /// `bytes_recv`. The first call keeps libsrt's figures, which then cover
     /// the same span. A reading whose byte counters went backwards — a
     /// failed read comes back zeroed — is left as read and does not move the
-    /// baseline, so the next good one is measured from the last good one.
+    /// baseline, so the next good one is measured from the last good one;
+    /// the poller does not publish it ([`publish_leg_stats`]).
     fn apply(&mut self, leg: &mut SrtLegStats, bytes_sent: u64, bytes_recv: u64, now: Instant) {
         let cur = IntervalSample {
             at: now,
@@ -1187,7 +1183,7 @@ pub fn spawn_srt_group_stats_poller(
 ) {
     tokio::spawn(async move {
         let mut interval = poll_interval();
-        let mut last_drop: i64 = 0;
+        let mut cursor = LegCursor::default();
         let mut aggregate_rates = IntervalSampler::default();
         let mut member_rates = HashMap::new();
         loop {
@@ -1205,7 +1201,7 @@ pub fn spawn_srt_group_stats_poller(
                         &mut member_rates,
                         Instant::now(),
                     );
-                    publish_bonding_stats(&cache, input.as_deref(), &mut last_drop, snapshot);
+                    publish_bonding_stats(&cache, input.as_deref(), &mut cursor, snapshot);
                 }
             }
         }
@@ -1231,7 +1227,7 @@ pub fn spawn_srt_socket_group_stats_poller(
 ) {
     tokio::spawn(async move {
         let mut interval = poll_interval();
-        let mut last_drop: i64 = 0;
+        let mut cursor = LegCursor::default();
         let mut aggregate_rates = IntervalSampler::default();
         let mut member_rates = HashMap::new();
         loop {
@@ -1249,7 +1245,7 @@ pub fn spawn_srt_socket_group_stats_poller(
                         &mut member_rates,
                         Instant::now(),
                     );
-                    publish_bonding_stats(&cache, input.as_deref(), &mut last_drop, snapshot);
+                    publish_bonding_stats(&cache, input.as_deref(), &mut cursor, snapshot);
                 }
             }
         }
@@ -1319,7 +1315,7 @@ mod tests {
         let group: tokio::sync::watch::Sender<Option<SrtBondingStats>> =
             tokio::sync::watch::channel(None).0;
         let input = flow.register_srt_input_stats("bond");
-        let mut last = 0i64;
+        let mut cursor = super::LegCursor::default();
         // Members' own drop counters are not loss on a broadcast group: only
         // the aggregate's count is taken.
         let member = SrtBondingMemberStats {
@@ -1331,7 +1327,7 @@ mod tests {
             members: vec![member],
             ..Default::default()
         };
-        super::publish_bonding_stats(&group, Some(&input), &mut last, snapshot);
+        super::publish_bonding_stats(&group, Some(&input), &mut cursor, snapshot);
         assert!(group.borrow().is_some());
         assert_eq!(input.recv_dropped(), 3);
     }
@@ -1372,21 +1368,41 @@ mod tests {
         assert_eq!(leg.pkt_send_filter_extra, 0);
     }
 
+    /// A group poller's cursor: the aggregate's drops add up across polls,
+    /// and a failed read of the group is no sample, so the next good read
+    /// adds what moved since the last good one — not the group's whole drop
+    /// history again.
     #[test]
-    fn cumulative_delta_survives_reconnect_and_a_failed_read() {
-        let mut last = 0i64;
-        assert_eq!(super::cumulative_delta(&mut last, 0), 0);
-        assert_eq!(super::cumulative_delta(&mut last, 92), 92);
-        assert_eq!(super::cumulative_delta(&mut last, 93), 1);
-        assert_eq!(super::cumulative_delta(&mut last, 93), 0);
-        // A failed read comes back zeroed: no sample, the baseline kept, so
-        // the next good read adds what moved since the last good one — not
-        // the socket's whole drop history again.
-        assert_eq!(super::cumulative_delta(&mut last, 0), 0);
-        assert_eq!(super::cumulative_delta(&mut last, 95), 2);
-        // A new socket starts a fresh `last`, so its first reading counts in full.
-        let mut fresh = 0i64;
-        assert_eq!(super::cumulative_delta(&mut fresh, 49), 49);
+    fn a_groups_drops_survive_a_failed_read() {
+        let flow = crate::stats::collector::FlowStatsAccumulator::new(
+            "f1".into(),
+            "flow-1".into(),
+            "srt".into(),
+        );
+        let input = flow.register_srt_input_stats("bond");
+        let cache: tokio::sync::watch::Sender<Option<SrtBondingStats>> =
+            tokio::sync::watch::channel(None).0;
+        let mut cursor = super::LegCursor::default();
+        for (drops, delivered) in [(92, 1_000), (93, 2_000), (0, 0), (95, 3_000)] {
+            let snapshot = SrtBondingStats {
+                aggregate: SrtLegStats {
+                    pkt_recv_drop_total: drops,
+                    pkt_recv_unique_total: delivered,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            super::publish_bonding_stats(&cache, Some(&input), &mut cursor, snapshot);
+        }
+        assert_eq!(input.recv_dropped(), 95);
+        // A new group starts a fresh cursor, so its first reading counts in full.
+        let mut fresh = super::LegCursor::default();
+        let snapshot = SrtBondingStats {
+            aggregate: SrtLegStats { pkt_recv_drop_total: 49, ..Default::default() },
+            ..Default::default()
+        };
+        super::publish_bonding_stats(&cache, Some(&input), &mut fresh, snapshot);
+        assert_eq!(input.recv_dropped(), 144);
     }
 
     /// A leg poller's failed read is no sample for either counter: neither
@@ -1394,11 +1410,67 @@ mod tests {
     /// good read, and the failed one reaches the pair's ledger not at all.
     #[test]
     fn a_failed_read_is_no_sample_for_a_legs_counters() {
+        let read = |drops: i32, delivered: i64, uptime_ms: i64| SrtLegStats {
+            pkt_recv_drop_total: drops,
+            pkt_recv_unique_total: delivered,
+            pkt_recv_total: delivered,
+            uptime_ms,
+            ..Default::default()
+        };
         let mut cursor = super::LegCursor::default();
-        assert_eq!(cursor.advance(40, 1_000), Some((40, 1_000)));
-        assert_eq!(cursor.advance(0, 0), None, "zeroed");
-        assert_eq!(cursor.advance(42, 0), None, "either counter back is no sample");
-        assert_eq!(cursor.advance(42, 1_500), Some((2, 500)));
+        assert_eq!(cursor.advance(&read(40, 1_000, 5_000)), Some((40, 1_000)));
+        assert_eq!(cursor.advance(&read(0, 0, 0)), None, "zeroed");
+        assert_eq!(cursor.advance(&read(42, 0, 6_000)), None, "any counter back is no sample");
+        assert_eq!(cursor.advance(&read(42, 1_500, 7_000)), Some((2, 500)));
+        // A sender's socket moves none of the receive counters: its clock and
+        // its sent packets tell its failed reads.
+        let mut cursor = super::LegCursor::default();
+        let sent = SrtLegStats { pkt_sent_total: 900, uptime_ms: 9_000, ..Default::default() };
+        assert_eq!(cursor.advance(&sent), Some((0, 0)));
+        assert_eq!(cursor.advance(&SrtLegStats::default()), None);
+    }
+
+    /// A failed read is not published: the cache keeps the last good
+    /// reading, on an input's socket, an output's and a group. Published, its
+    /// zeros made `bilbycast_edge_srt_loss_total` — a Prometheus counter —
+    /// read 0, a reset that `increase()` counted twice, and the drop
+    /// reason's latency and RTT read 0 ms.
+    #[test]
+    fn a_failed_read_keeps_the_last_good_stats() {
+        let flow = crate::stats::collector::FlowStatsAccumulator::new(
+            "f1".into(),
+            "flow-1".into(),
+            "srt".into(),
+        );
+        let good = SrtLegStats {
+            pkt_loss_total: 50,
+            pkt_sent_total: 4_000,
+            pkt_recv_total: 4_000,
+            pkt_recv_unique_total: 3_950,
+            ms_recv_tsbpd_delay: 120,
+            rtt_ms: 21.0,
+            uptime_ms: 60_000,
+            ..Default::default()
+        };
+        let input = flow.register_srt_input_stats("main");
+        for socket in [Some((&*input, SrtInputSocket::Only)), None] {
+            let cache: tokio::sync::watch::Sender<Option<SrtLegStats>> =
+                tokio::sync::watch::channel(None).0;
+            let mut cursor = super::LegCursor::default();
+            super::publish_leg_stats(&cache, socket, &mut cursor, good.clone());
+            super::publish_leg_stats(&cache, socket, &mut cursor, SrtLegStats::default());
+            let kept = cache.borrow().clone().expect("published");
+            assert_eq!(kept.pkt_loss_total, 50);
+            assert_eq!((kept.ms_recv_tsbpd_delay, kept.rtt_ms), (120, 21.0));
+        }
+
+        let cache: tokio::sync::watch::Sender<Option<SrtBondingStats>> =
+            tokio::sync::watch::channel(None).0;
+        let mut cursor = super::LegCursor::default();
+        let snapshot = |aggregate: SrtLegStats| SrtBondingStats { aggregate, ..Default::default() };
+        super::publish_bonding_stats(&cache, Some(&input), &mut cursor, snapshot(good.clone()));
+        super::publish_bonding_stats(&cache, Some(&input), &mut cursor, snapshot(Default::default()));
+        assert_eq!(cache.borrow().as_ref().map(|s| s.aggregate.pkt_loss_total), Some(50));
     }
 
     use super::*;
