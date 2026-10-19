@@ -52,6 +52,7 @@ use super::ts_parse::{
     extract_pcr, mpeg2_crc32, set_discontinuity_indicator, NULL_PID, PAT_PID, TS_PACKET_SIZE,
     TS_SYNC_BYTE,
 };
+use crate::stats::collector::OnAirInputs;
 
 /// TS packets per emitted bundle. 7 × 188 = 1316 bytes — fits comfortably
 /// inside a 1500-byte Ethernet MTU with headroom for IP+UDP headers.
@@ -206,6 +207,43 @@ fn slot_health_identity(
     slot.source.clone()
 }
 
+/// The inputs the assembled output plays from: each Pid / Essence slot's
+/// source, each Switch slot's active leg and both legs behind each Hitless
+/// slot's merger — never the merger's synthetic bus key.
+fn on_air_inputs(
+    plan: &AssemblyPlan,
+    active_leg_input: &HashMap<(usize, u16), String>,
+) -> std::collections::BTreeSet<String> {
+    let mut inputs = std::collections::BTreeSet::new();
+    for (pidx, prog) in plan.programs.iter().enumerate() {
+        for slot in &prog.slots {
+            match &slot.hitless_legs {
+                Some(legs) => inputs.extend(legs.iter().cloned()),
+                None => {
+                    inputs.insert(slot_health_identity(slot, (pidx, slot.out_pid), active_leg_input).0);
+                }
+            }
+        }
+    }
+    inputs
+}
+
+/// Publish [`on_air_inputs`] for the flow's SRT drop accounting, which
+/// counts a drop against the flow only while its input is on air. Called
+/// on every change to the plan or to a Switch slot's active leg — a Take, a
+/// PES-aligned commit, a splice that fell back on timeout or codec mismatch
+/// — so a Take moves the attribution when the cut happens on air, not when
+/// it was asked for.
+fn publish_on_air(
+    on_air: Option<&OnAirInputs>,
+    plan: &AssemblyPlan,
+    active_leg_input: &HashMap<(usize, u16), String>,
+) {
+    if let Some(on_air) = on_air {
+        on_air.set_assembled(on_air_inputs(plan, active_leg_input));
+    }
+}
+
 /// 1 Hz stall scan. Advances `last_data` for slots whose forward counter
 /// moved since the previous scan, latches newly-stalled slots, and
 /// builds the [`AssemblyHealth`] wire snapshot. Returns the snapshot
@@ -318,6 +356,10 @@ pub struct AssemblySlot {
     /// without re-tuning. `None` for non-switch slots.
     #[allow(dead_code)] // read by build_assembly_plan / SwitchActiveInput handler
     pub switch_legs: Option<Vec<(String, u16)>>,
+    /// When `Some([primary, backup])`, this slot is a [`SlotSource::Hitless`]
+    /// and `source` is its merger's synthetic bus key: these are the input
+    /// ids of the two legs behind it, both on air. `None` for other slots.
+    pub hitless_legs: Option<[String; 2]>,
     /// PES Switch Phase 4. For Switch slots, controls the splice
     /// behaviour at `SwitchActiveInput` time:
     /// - [`SpliceMode::PmtBump`] (default): today's PMT-version-bump
@@ -584,6 +626,7 @@ pub fn spawn_spts_assembler(
     flow_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     health_cell: Option<Arc<AssemblyHealthCell>>,
+    on_air: Option<Arc<OnAirInputs>>,
     catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
 ) -> AssemblerHandle {
     // Channel depth 16: plan updates are rare (operator-triggered), so a
@@ -604,7 +647,7 @@ pub fn spawn_spts_assembler(
     let thread_handle = crate::engine::dedicated_runtime::spawn_dedicated(
         crate::engine::dedicated_runtime::DedicatedRuntimeConfig::new(who, "BILBYCAST_PID_BUS_CPUS"),
         async move {
-            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id, av_sync_pacer, health_cell, catalogs).await;
+            run_assembler(plan, bus, broadcast_tx, cancel, plan_rx, event_sender, flow_id, av_sync_pacer, health_cell, on_air, catalogs).await;
         },
     );
     // The original `AssemblerHandle.join` is a `tokio::task::JoinHandle<()>`.
@@ -660,6 +703,7 @@ async fn run_assembler(
     flow_id: String,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
     health_cell: Option<Arc<AssemblyHealthCell>>,
+    on_air: Option<Arc<OnAirInputs>>,
     mut catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
 ) {
     // Muxer-mode rewriter on the assembled output. Single shared
@@ -807,6 +851,7 @@ async fn run_assembler(
         &event_sender,
         &flow_id,
     );
+    publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
     sync_slot_vitals(&plan, &mut slot_vitals, assembler_start);
     let _ = refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, false);
 
@@ -850,6 +895,7 @@ async fn run_assembler(
                             catalogs = new_catalogs;
                         }
                         apply_plan_replacement(&mut plan, new_plan, PlanSwapState { bus: &bus, fanin_tx: &fanin_tx, cancel: &cancel, flat: &mut flat, slot_cancels: &mut slot_cancels, slot_tasks: &mut slot_tasks, pcr_out_pid_by_program: &mut pcr_out_pid_by_program, pat_version: &mut pat_version, pmt_versions: &mut pmt_versions, active_leg_input: &mut active_leg_input, event_sender: &event_sender, flow_id: &flow_id });
+                        publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
                         // Drop vitals for removed slots; fresh grace
                         // anchor for hot-swapped-in ones.
                         sync_slot_vitals(&plan, &mut slot_vitals, Instant::now());
@@ -1108,6 +1154,10 @@ async fn run_assembler(
                             }
                         }
                         if any_flipped {
+                            // A slot armed for a PES-aligned splice keeps
+                            // its old leg on air until the commit, which
+                            // publishes then.
+                            publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
                             // Push fresh PSI so receivers see new PMT
                             // versions before the first post-switch ES
                             // byte from the new active leg lands. For
@@ -1288,6 +1338,7 @@ async fn run_assembler(
                                 // PMT v+1 mod 32, DI=1 on next PCR.
                                 active_leg_input
                                     .insert(key, slot.source.0.clone());
+                                publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
                                 if let Some(v) = pmt_versions.get_mut(key.0) {
                                     *v = v.wrapping_add(1) & 0x1F;
                                 }
@@ -1351,6 +1402,7 @@ async fn run_assembler(
                                 // { kind: "video", ... }` with the full
                                 // SPS-field diff for operator triage.
                                 active_leg_input.insert(key, to_input_id.clone());
+                                publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
                                 if let Some(v) = pmt_versions.get_mut(key.0) {
                                     *v = v.wrapping_add(1) & 0x1F;
                                 }
@@ -1473,6 +1525,7 @@ async fn run_assembler(
                                 // PMT v+1 mod 32, DI=1 on next PCR.
                                 active_leg_input
                                     .insert(key, slot.source.0.clone());
+                                publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
                                 if let Some(v) = pmt_versions.get_mut(key.0) {
                                     *v = v.wrapping_add(1) & 0x1F;
                                 }
@@ -1540,6 +1593,7 @@ async fn run_assembler(
                                 // `pes_splice_codec_param_mismatch`
                                 // for operator visibility.
                                 active_leg_input.insert(key, to_input_id.clone());
+                                publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
                                 if let Some(v) = pmt_versions.get_mut(key.0) {
                                     *v = v.wrapping_add(1) & 0x1F;
                                 }
@@ -1848,6 +1902,7 @@ async fn run_assembler(
                         }
                     }
                     if any_flipped {
+                        publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
                         push_psi(
                             &mut buf,
                             &plan,
@@ -3057,6 +3112,7 @@ mod tests {
             out_pid,
             stream_type,
             switch_legs: None,
+            hitless_legs: None,
             splice_mode: Default::default(),
             splice_budget_ms: None,
         }
@@ -3444,7 +3500,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, None, Default::default()).join;
 
         // Drain one bundle — startup path emits PAT + PMT immediately.
         let bundle = tokio::time::timeout(Duration::from_millis(500), rx.recv())
@@ -3466,7 +3522,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, None, Default::default()).join;
 
         // Wait for startup PSI, then publish enough ES packets on each
         // slot to fill a full bundle.
@@ -3536,7 +3592,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default()).join;
+        let handle = spawn_spts_assembler(make_mpts_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, None, Default::default()).join;
 
         // Collect bundles for ~250 ms — long enough to see the startup
         // PSI emission plus at least one tick of the 100 ms PSI cadence.
@@ -3579,7 +3635,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, _rx) = broadcast::channel::<RtpPacket>(4);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default()).join;
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, None, Default::default()).join;
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();
         tokio::time::timeout(Duration::from_millis(500), handle)
@@ -3602,7 +3658,7 @@ mod tests {
 
         // Initial plan: in-a → out 0x200, in-b → out 0x201.
         let initial = make_plan();
-        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default());
+        let handle = spawn_spts_assembler(initial, bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, None, Default::default());
 
         // Capture startup PMT version (should be 0).
         let mut v0: Option<u8> = None;
@@ -3708,7 +3764,7 @@ mod tests {
         let bus = Arc::new(NodeEsBus::new());
         let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
         let cancel = CancellationToken::new();
-        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, Default::default());
+        let handle = spawn_spts_assembler(make_plan(), bus.clone(), tx.clone(), cancel.clone(), None, String::new(), None, None, None, Default::default());
 
         // Drain startup PMT.
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
@@ -4085,6 +4141,7 @@ mod tests {
                 ("in-a".to_string(), 0x200),
                 ("in-c".to_string(), 0x200),
             ]),
+            hitless_legs: None,
             splice_mode: Default::default(),
             splice_budget_ms: None,
         };
@@ -4378,6 +4435,7 @@ mod tests {
             String::new(),
             None,
             Some(cell.clone()),
+            None,
             Default::default(),
         );
         // The stall-scan interval's first tick fires shortly after
@@ -4398,5 +4456,199 @@ mod tests {
             h.stalled_slot_count, 0,
             "inside the start grace nothing may be reported stalled"
         );
+    }
+
+    /// A Switch slot whose legs are `srt-main` (active) and `srt-backup`,
+    /// next to a Hitless slot whose merger reads `srt-pri` and `srt-bak`.
+    fn switch_and_hitless_plan(
+        splice_mode: crate::config::models::SpliceMode,
+        splice_budget_ms: Option<u32>,
+    ) -> AssemblyPlan {
+        let mut switch = slot("srt-main", 0x101, 0x201, 0x03);
+        switch.switch_legs = Some(vec![
+            ("srt-main".to_string(), 0x101),
+            ("srt-backup".to_string(), 0x101),
+        ]);
+        switch.splice_mode = splice_mode;
+        switch.splice_budget_ms = splice_budget_ms;
+        let (merged, merged_pid) = crate::engine::ts_es_hitless::hitless_bus_key("slot_0_1");
+        let mut hitless = slot(&merged, merged_pid, 0x202, 0x1B);
+        hitless.hitless_legs = Some(["srt-pri".to_string(), "srt-bak".to_string()]);
+        AssemblyPlan {
+            programs: vec![ProgramPlan {
+                program_number: 1,
+                pmt_pid: 0x1000,
+                pcr_source: ("srt-main".to_string(), 0x101),
+                slots: vec![switch, hitless],
+            }],
+        }
+    }
+
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// One TS packet opening an audio PES stamped `pts`.
+    fn audio_pes(src_pid: u16, pts: u64) -> EsPacket {
+        let mut pkt = ts_es(src_pid, true, 0, 0xFF).to_vec();
+        pkt[4..18].copy_from_slice(&[
+            0x00,
+            0x00,
+            0x01,
+            0xC0,
+            0x00,
+            0x00,
+            0x80,
+            0x80, // PTS only
+            0x05,
+            0x21 | ((((pts >> 30) & 0x07) as u8) << 1),
+            (pts >> 22) as u8,
+            0x01 | ((((pts >> 15) & 0x7F) as u8) << 1),
+            (pts >> 7) as u8,
+            0x01 | (((pts & 0x7F) as u8) << 1),
+        ]);
+        EsPacket {
+            source_pid: src_pid,
+            stream_type: 0x03,
+            payload: Bytes::from(pkt),
+            is_pusi: true,
+            has_pcr: false,
+            pcr: None,
+            recv_time_us: 0,
+            upstream_seq: None,
+        }
+    }
+
+    #[test]
+    fn on_air_is_each_switch_slots_active_leg_and_both_hitless_legs() {
+        let plan = switch_and_hitless_plan(Default::default(), None);
+        let on_air = |legs: &HashMap<(usize, u16), String>| -> Vec<String> {
+            on_air_inputs(&plan, legs).into_iter().collect()
+        };
+        // Before any Take, the Switch slot plays the leg the plan names.
+        assert_eq!(on_air(&HashMap::new()), ["srt-bak", "srt-main", "srt-pri"]);
+        let taken = HashMap::from([((0, 0x201), "srt-backup".to_string())]);
+        assert_eq!(on_air(&taken), ["srt-backup", "srt-bak", "srt-pri"]);
+    }
+
+    /// A Take on a Switch slot moves which leg's SRT drops are the flow's,
+    /// and both legs behind a Hitless slot count, through a real assembler
+    /// and a real flow accumulator.
+    #[tokio::test]
+    async fn a_switch_slot_take_moves_srt_drop_attribution() {
+        let flow = crate::stats::collector::FlowStatsAccumulator::new(
+            "f1".into(),
+            "flow-1".into(),
+            "srt".into(),
+        );
+        let srt: HashMap<&str, _> = ["srt-main", "srt-backup", "srt-pri", "srt-bak"]
+            .into_iter()
+            .map(|id| (id, flow.register_srt_input_stats(id)))
+            .collect();
+        flow.set_active_input_id("srt-main");
+        let bus = Arc::new(NodeEsBus::new());
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(64);
+        let cancel = CancellationToken::new();
+        // A failed assertion must stop the assembler thread too, or the
+        // runtime waits on its join for ever.
+        let _stop_on_failure = cancel.clone().drop_guard();
+        let handle = spawn_spts_assembler(
+            switch_and_hitless_plan(Default::default(), None),
+            bus,
+            tx,
+            cancel.clone(),
+            None,
+            String::new(),
+            None,
+            None,
+            Some(flow.on_air.clone()),
+            Default::default(),
+        );
+        until("the assembler's first publication", || flow.on_air.contains("srt-pri")).await;
+
+        srt["srt-backup"].count_recv_drops(100);
+        srt["srt-pri"].count_recv_drops(5);
+        srt["srt-bak"].count_recv_drops(7);
+        assert_eq!(flow.snapshot().input.packets_lost, 12, "the standby leg's drops are its own");
+
+        handle
+            .plan_tx
+            .send(PlanCommand::SwitchActiveInput {
+                new_input_id: "srt-backup".to_string(),
+                splice_mode_override: None,
+            })
+            .await
+            .unwrap();
+        until("the Take to reach the on-air set", || flow.on_air.contains("srt-backup")).await;
+        assert!(!flow.on_air.contains("srt-main"));
+        srt["srt-backup"].count_recv_drops(300);
+        srt["srt-main"].count_recv_drops(50);
+        assert_eq!(flow.snapshot().input.packets_lost, 312);
+
+        cancel.cancel();
+        handle.join.await.unwrap();
+    }
+
+    /// A PES-aligned Take keeps the old leg on air until the splice
+    /// commits, then moves it.
+    #[tokio::test]
+    async fn a_pes_aligned_take_moves_on_air_when_the_splice_commits() {
+        let on_air = Arc::new(OnAirInputs::default());
+        let bus = Arc::new(NodeEsBus::new());
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(256);
+        let cancel = CancellationToken::new();
+        let _stop_on_failure = cancel.clone().drop_guard();
+        // A budget long enough that only the commit can move the leg.
+        let handle = spawn_spts_assembler(
+            switch_and_hitless_plan(crate::config::models::SpliceMode::PesAligned, Some(60_000)),
+            bus.clone(),
+            tx,
+            cancel.clone(),
+            None,
+            String::new(),
+            None,
+            None,
+            Some(on_air.clone()),
+            Default::default(),
+        );
+        until("the assembler's first publication", || on_air.contains("srt-main")).await;
+
+        // The active leg's PES gives the splice its alignment threshold.
+        bus.sender_for("srt-main", 0x101, 0x03).send(audio_pes(0x101, 90_000)).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut forwarded = false;
+        while !forwarded && tokio::time::Instant::now() < deadline {
+            if let Ok(Ok(bundle)) = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
+                forwarded = bundle.data.chunks_exact(TS_PACKET_SIZE).any(|p| ts_pid(p) == 0x201);
+            }
+        }
+        assert!(forwarded, "the active leg's PES reaches the output");
+
+        handle
+            .plan_tx
+            .send(PlanCommand::SwitchActiveInput {
+                new_input_id: "srt-backup".to_string(),
+                splice_mode_override: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            on_air.contains("srt-main") && !on_air.contains("srt-backup"),
+            "armed, not yet cut"
+        );
+
+        bus.sender_for("srt-backup", 0x101, 0x03).send(audio_pes(0x101, 180_000)).unwrap();
+        until("the commit to reach the on-air set", || on_air.contains("srt-backup")).await;
+        assert!(!on_air.contains("srt-main"));
+
+        cancel.cancel();
+        handle.join.await.unwrap();
     }
 }

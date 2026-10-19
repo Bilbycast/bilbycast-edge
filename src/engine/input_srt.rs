@@ -378,7 +378,7 @@ async fn srt_input_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
-    srt: &SrtInputStats,
+    srt: &Arc<SrtInputStats>,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -398,7 +398,7 @@ async fn srt_input_listener_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
-    srt: &SrtInputStats,
+    srt: &Arc<SrtInputStats>,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -465,7 +465,7 @@ async fn srt_input_listener_loop(
         spawn_srt_stats_poller(
             socket.clone(),
             srt.leg.clone(),
-            Some(srt.recv_dropped.clone()),
+            Some(srt.clone()),
             poller_cancel.clone(),
         );
 
@@ -552,7 +552,7 @@ async fn srt_input_caller_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
-    srt: &SrtInputStats,
+    srt: &Arc<SrtInputStats>,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -636,7 +636,7 @@ async fn srt_input_caller_loop(
         spawn_srt_stats_poller(
             socket.clone(),
             srt.leg.clone(),
-            Some(srt.recv_dropped.clone()),
+            Some(srt.clone()),
             poller_cancel.clone(),
         );
 
@@ -1387,7 +1387,7 @@ async fn srt_input_bonded_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
-    srt: &SrtInputStats,
+    srt: &Arc<SrtInputStats>,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -1415,7 +1415,7 @@ async fn srt_input_bonded_caller_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
-    srt: &SrtInputStats,
+    srt: &Arc<SrtInputStats>,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -1494,7 +1494,7 @@ async fn srt_input_bonded_caller_loop(
             group.clone(),
             bond.mode,
             srt.bonding.clone(),
-            Some(srt.recv_dropped.clone()),
+            Some(srt.clone()),
             poller_cancel.clone(),
         );
 
@@ -1536,7 +1536,7 @@ async fn srt_input_bonded_listener_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
-    srt: &SrtInputStats,
+    srt: &Arc<SrtInputStats>,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -1593,7 +1593,7 @@ async fn srt_input_bonded_listener_loop(
             socket.clone(),
             bond.mode,
             srt.bonding.clone(),
-            Some(srt.recv_dropped.clone()),
+            Some(srt.clone()),
             poller_cancel.clone(),
         );
 

@@ -548,10 +548,11 @@ pub struct PerInputLive {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_present: Option<bool>,
     /// Packets this SRT input's receiver dropped for missing the TSBPD
-    /// deadline since the flow started (libsrt `pktRcvDropTotal`, the group's
-    /// own count on a bonded input, summed across reconnects). Reported for
-    /// every SRT input, on air or not, so a lossy warm standby shows before
-    /// anyone cuts to it; only the on-air inputs' drops reach
+    /// deadline since the input started — with the flow, or when it was
+    /// added to the running flow (libsrt `pktRcvDropTotal`, the group's own
+    /// count on a bonded input, summed across reconnects). Reported for every
+    /// SRT input, on air or not, so a lossy warm standby shows before anyone
+    /// cuts to it; only the drops it makes while on air reach
     /// `InputStats.packets_lost` and the flow health.
     ///
     /// **`None` means "not measured"** — not an SRT input, or a SMPTE 2022-7
@@ -763,10 +764,12 @@ pub struct InputStats {
     pub bitrate_bps: u64,
     /// Packets that never reached the flow since it started, each counted
     /// once: RTP sequence gaps (or a RIST input's unrecovered loss, if
-    /// larger), plus the packets an on-air SRT input's receiver dropped for
-    /// missing the TSBPD deadline (libsrt `pktRcvDropTotal`, summed across
-    /// reconnects). An RTP-framed SRT payload's drops are sequence gaps as
-    /// well and are not added twice.
+    /// larger), plus the packets an SRT input's receiver dropped for missing
+    /// the TSBPD deadline while it was on air (libsrt `pktRcvDropTotal`,
+    /// summed across reconnects). An RTP-framed SRT payload's drops are
+    /// sequence gaps as well and are not added twice. Only ever grows: a
+    /// Take neither brings the new input's earlier drops in nor takes the old
+    /// input's out.
     pub packets_lost: u64,
     /// Packets dropped by ingress filters (source IP, payload type, rate limit).
     pub packets_filtered: u64,
