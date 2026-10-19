@@ -767,9 +767,10 @@ pub(crate) fn publish_leg_stats(
 ) {
     if let Some((input, socket)) = input {
         // Every poll, drops or not: a 2022-7 leg's poll also takes the
-        // merger's count of what neither leg delivered.
+        // merger's count of what neither leg delivered, and its delivered
+        // count is how long its drops wait to be matched to that.
         let delta = cumulative_delta(last_drop, leg_stats.pkt_recv_drop_total);
-        input.count_socket_drops(socket, delta);
+        input.count_socket_drops(socket, delta, leg_stats.pkt_recv_unique_total);
     }
     cache.send_replace(Some(leg_stats));
 }

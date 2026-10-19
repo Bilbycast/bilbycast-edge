@@ -960,8 +960,8 @@ async fn srt_input_redundant_loop(
         let leg2_poller = cancel.child_token();
 
         let mut merger = HitlessMerger::new();
-        // What of `merger.lost()` the pair's stats have been told.
-        let mut merger_lost: u64 = 0;
+        // What of the merger's counts the pair's stats have been told.
+        let mut merger_handoff = crate::stats::collector::MergerHandoff::default();
         let mut failover = RawTsFailover::new();
         let mut prev_active_leg = ActiveLeg::None;
         let mut leg1_alive = true;
@@ -1107,7 +1107,7 @@ async fn srt_input_redundant_loop(
                                 log_detected_format_redundant(format, events, flow_id);
                                 srt.pair.set_merged(format == SrtPayloadFormat::RtpTs);
                             }
-                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg1, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, merger_lost: &mut merger_lost, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
+                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg1, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, merger_handoff: &mut merger_handoff, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg1 connection lost");
@@ -1132,7 +1132,7 @@ async fn srt_input_redundant_loop(
                                 log_detected_format_redundant(format, events, flow_id);
                                 srt.pair.set_merged(format == SrtPayloadFormat::RtpTs);
                             }
-                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg2, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, merger_lost: &mut merger_lost, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
+                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg2, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, merger_handoff: &mut merger_handoff, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg2 connection lost");
@@ -1306,8 +1306,8 @@ struct RedundantPacketState<'a> {
     raw_ts_seq: &'a mut u16,
     raw_ts_timestamp: &'a mut u32,
     merger: &'a mut HitlessMerger,
-    /// What of `merger.lost()` has been handed to `srt.pair`.
-    merger_lost: &'a mut u64,
+    /// What of the merger's counts has been handed to `srt.pair`.
+    merger_handoff: &'a mut crate::stats::collector::MergerHandoff,
     failover: &'a mut RawTsFailover,
     prev_active_leg: &'a mut ActiveLeg,
     stats: &'a Arc<FlowStatsAccumulator>,
@@ -1329,7 +1329,7 @@ fn process_redundant_packet(
         raw_ts_seq,
         raw_ts_timestamp,
         merger,
-        merger_lost,
+        merger_handoff,
         failover,
         prev_active_leg,
         stats,
@@ -1347,13 +1347,9 @@ fn process_redundant_packet(
             let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
             let ts = parse_rtp_timestamp(&data).unwrap_or(0);
             let chosen = merger.try_merge(seq, leg);
-            // A seq leaving the window unfilled is rare: one compare per
-            // packet, an atomic add only when one did.
-            let lost = merger.lost();
-            if lost != *merger_lost {
-                srt.pair.add_lost(lost - *merger_lost);
-                *merger_lost = lost;
-            }
+            // A seq leaving the window unfilled, or a re-anchor, is rare: two
+            // compares per packet, an atomic add only when one happened.
+            srt.pair.hand_off(merger, merger_handoff);
             match chosen {
                 Some(chosen_leg) => (seq, ts, false, chosen_leg),
                 None => return,
@@ -1784,7 +1780,9 @@ mod tests {
 
     /// A SMPTE 2022-7 input over real SRT sockets: each leg has a stats
     /// poller, and the flow loses only the packets neither leg delivered —
-    /// one leg's gaps are filled from the other.
+    /// one leg's gaps are filled from the other. The senders never sent the
+    /// one both legs lack, so libsrt dropped nothing: the flow counts it as a
+    /// sequence gap, not an SRT drop.
     #[tokio::test]
     async fn a_2022_7_input_reports_both_legs_and_only_the_pairs_loss() {
         let free_port = || {
@@ -1833,8 +1831,8 @@ mod tests {
 
         // RTP/TS, six null packets a datagram: seven and the RTP header would
         // overflow SRT's 1316-byte live payload. Leg 1 misses 100 and 200,
-        // leg 2 misses 200 and 300: only 200 is lost, once it leaves the
-        // merger's 1024-seq window.
+        // leg 2 misses 200 and 300, upstream of SRT: only 200 is lost, once
+        // it leaves the merger's 1024-seq window.
         let datagram = |seq: u16| {
             let mut d = vec![0x80, 33];
             d.extend_from_slice(&seq.to_be_bytes());
@@ -1864,7 +1862,7 @@ mod tests {
             snap = flow.snapshot();
             if snap.input.srt_stats.is_some()
                 && snap.input.srt_leg2_stats.is_some()
-                && pair.recv_dropped() > 0
+                && snap.input.packets_lost > 0
             {
                 break;
             }
@@ -1875,8 +1873,11 @@ mod tests {
         // Past another poll of each leg, nothing more is counted.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert_eq!(flow.input_packets.load(Ordering::Relaxed), 1399, "each seq forwarded once");
-        assert_eq!(pair.recv_dropped(), 1, "only 200 is the pair's loss");
-        assert_eq!(flow.snapshot().input.packets_lost, 1);
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.packets_lost, 1, "only 200 is the pair's loss");
+        assert_eq!(pair.recv_dropped(), 0, "and SRT dropped none of it");
+        let codes: Vec<&str> = snap.health_reasons.iter().map(|r| r.code.as_str()).collect();
+        assert!(codes.contains(&"packet_loss") && !codes.contains(&"srt_recv_dropped"), "{codes:?}");
     }
 
     #[test]

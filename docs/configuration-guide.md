@@ -3548,7 +3548,7 @@ Both SRT input and SRT output support SMPTE 2022-7 hitless redundancy via a seco
 
 For input: packets from both legs are merged using RTP sequence numbers, providing seamless failover if one path fails. A raw-TS payload carries no sequence number the legs share, so it runs active-leg failover instead: the edge forwards one leg and switches to the other when the forwarded leg falls silent for 50 ms.
 
-Each leg reports its own SRT stats — `srt_stats` is leg 1, `srt_leg2_stats` leg 2, each with that leg's own `pkt_recv_drop_total`. A packet one leg drops is no loss while the other leg delivers it, so the input's `packets_lost` and `srt_recv_dropped` count what the pair lost: with RTP, the packets neither leg delivered (a gap still unfilled 1024 sequence numbers later); with raw TS, the drops of the leg being forwarded.
+Each leg reports its own SRT stats — `srt_stats` is leg 1, `srt_leg2_stats` leg 2, each with that leg's own `pkt_recv_drop_total`. A packet one leg drops is no loss while the other leg delivers it, so the input's `packets_lost` counts what the pair lost. With RTP that is the packets neither leg delivered (a gap still unfilled 1024 sequence numbers later), named by cause: what both legs' SRT dropped too late is reported as `srt_recv_dropped`, whose remedy is more latency; what was missing from both legs upstream of SRT is ordinary sequence loss (`packet_loss`), which latency will not fix — look at the source feeding both senders. A gap of a whole window or more counts the legs' shared drops, so a long burst on both paths is counted and a source restart is not. With raw TS, the drops of the leg being forwarded count, as `srt_recv_dropped`.
 
 For output: packets are duplicated and sent on both legs simultaneously.
 

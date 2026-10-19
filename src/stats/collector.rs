@@ -3599,12 +3599,13 @@ impl OnAirInputs {
     }
 }
 
-/// The SRT too-late drops a flow counts as its own: each one polled while its
-/// input was on air, split by whether the flow's sequence-gap count
-/// (`input_loss`) has it too. Shared by every [`SrtInputStats`] of the flow.
-/// Both counters only grow for the life of the flow, so neither a Take nor a
-/// removed input takes back a drop, and a standby's earlier drops never
-/// arrive with a cut to it.
+/// The SRT input loss a flow counts as its own, each packet polled while its
+/// input was on air: the SRT too-late drops, split by whether the flow's
+/// sequence-gap count (`input_loss`) has them too, and the sequence gaps of a
+/// merged SMPTE 2022-7 pair that SRT did not drop. Shared by every
+/// [`SrtInputStats`] of the flow. Every counter only grows for the life of
+/// the flow, so neither a Take nor a removed input takes back a loss, and a
+/// standby's earlier loss never arrives with a cut to it.
 #[derive(Default)]
 struct SrtOnAirDrops {
     /// Drops nothing else in the flow counts: a raw-TS input's, which carry no
@@ -3614,6 +3615,11 @@ struct SrtOnAirDrops {
     /// Drops on RTP-framed single-socket and bonded inputs. The recv loop
     /// counts each of these as an RTP sequence gap in `input_loss` as well.
     gapped: AtomicU64,
+    /// Not SRT drops: what a merged SMPTE 2022-7 pair lost that its legs'
+    /// drops do not explain — seqs missing from both legs upstream of SRT
+    /// ([`SrtPair`]). Sequence-gap loss, reported like a single-socket
+    /// input's `input_loss`; the pair's receive loop counts no gaps there.
+    pair_gaps: AtomicU64,
 }
 
 /// Which socket of an SRT input a stats poller reads.
@@ -3630,6 +3636,20 @@ pub enum SrtInputSocket {
 /// What a SMPTE 2022-7 SRT input's receive loop tells its stats pollers, so
 /// they count the packets the pair lost rather than its legs' drops. A packet
 /// one leg drops is no loss while the other leg delivers it.
+///
+/// When the legs merge ([`HitlessMerger`]), the pair's loss is what the
+/// merger counts — seqs that left its window with neither leg delivering
+/// them — and the pollers name each lost packet's cause from the legs' own
+/// too-late drops (`PairLedger`): the part both legs' libsrt drop counters
+/// explain is SRT's, counted as drops (`srt_recv_dropped`, whose remedy is
+/// more latency), and the rest was missing upstream of SRT on both legs,
+/// counted as sequence-gap loss (the generic `packet_loss`). A forward jump
+/// of a whole window or more re-anchors the merger, which cannot then tell a
+/// burst both legs lost from a source restarting on a new ISN; the poll that
+/// follows counts the legs' shared drops as the pair's loss instead — what a
+/// restart did not make libsrt drop counts nothing.
+///
+/// [`HitlessMerger`]: crate::redundancy::merger::HitlessMerger
 #[derive(Default)]
 pub struct SrtPair {
     /// Set while the payload is RTP: the legs then merge on the RTP sequence
@@ -3638,10 +3658,26 @@ pub struct SrtPair {
     /// Packets neither leg delivered, as the merger counted them, that no
     /// poll has taken yet.
     unpolled_lost: AtomicU64,
+    /// Re-anchors of the merger that no poll has taken yet.
+    unpolled_resets: AtomicU64,
     /// Raw TS carries no sequence the legs share, so they fail over instead
     /// of merging and what reaches air is one leg's packets: set while that
     /// is leg 2. Its drops are then the pair's.
     forwarding_leg2: AtomicBool,
+    /// The legs' pollers' account of a merged pair's loss. Taken by those
+    /// pollers once a second each, never by the receive loop, whose per-packet
+    /// hand-off goes through the atomics above.
+    ledger: Mutex<PairLedger>,
+}
+
+/// What of a [`HitlessMerger`]'s counts a receive loop has handed its
+/// [`SrtPair`] (see [`SrtPair::hand_off`]).
+///
+/// [`HitlessMerger`]: crate::redundancy::merger::HitlessMerger
+#[derive(Default)]
+pub struct MergerHandoff {
+    lost: u64,
+    resets: u64,
 }
 
 impl SrtPair {
@@ -3650,9 +3686,26 @@ impl SrtPair {
         self.merged.store(merged, Ordering::Relaxed);
     }
 
-    /// Add packets the merger found neither leg delivered.
-    pub fn add_lost(&self, lost: u64) {
-        self.unpolled_lost.fetch_add(lost, Ordering::Relaxed);
+    /// Hand the pair what `merger` counted since the previous call: seqs that
+    /// left its window unfilled, and re-anchors. Called per merged packet:
+    /// two compares, and an atomic add only when either count moved, which is
+    /// rare.
+    #[inline]
+    pub fn hand_off(
+        &self,
+        merger: &crate::redundancy::merger::HitlessMerger,
+        handed: &mut MergerHandoff,
+    ) {
+        let lost = merger.lost();
+        if lost != handed.lost {
+            self.unpolled_lost.fetch_add(lost - handed.lost, Ordering::Relaxed);
+            handed.lost = lost;
+        }
+        let resets = merger.resets();
+        if resets != handed.resets {
+            self.unpolled_resets.fetch_add(resets - handed.resets, Ordering::Relaxed);
+            handed.resets = resets;
+        }
     }
 
     /// Called on each raw-TS failover, never per packet.
@@ -3660,17 +3713,183 @@ impl SrtPair {
         self.forwarding_leg2.store(leg2, Ordering::Relaxed);
     }
 
-    /// What a poll of one leg that found `delta` new drops on its socket
-    /// counts as the pair's loss: the merger's count since the last poll of
-    /// either leg when the legs merge, else the leg's drops while it is the
-    /// one on air.
-    fn lost_at_poll(&self, leg2: bool, delta: u64) -> u64 {
+    /// What a poll of one leg that found `drops` new too-late drops on its
+    /// socket, and a delivered-packet count of `delivered`, counts as the
+    /// pair's loss, as `(srt_drops, upstream_gaps)`. When the legs merge, the
+    /// merger's count matched against both legs' drops ([`PairLedger::poll`]);
+    /// else the leg's drops while it is the one on air. `other_up` says
+    /// whether the other leg is connected and polled.
+    fn lost_at_poll(&self, leg2: bool, drops: u64, delivered: i64, other_up: bool) -> (u64, u64) {
         if self.merged.load(Ordering::Relaxed) {
-            self.unpolled_lost.swap(0, Ordering::Relaxed)
+            // Taken under the lock, so what a poll takes is matched in the
+            // order the two legs' polls take it.
+            let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            let lost = self.unpolled_lost.swap(0, Ordering::Relaxed);
+            let reset = self.unpolled_resets.swap(0, Ordering::Relaxed) > 0;
+            ledger.poll(usize::from(leg2), drops, delivered, other_up, lost, reset)
         } else if self.forwarding_leg2.load(Ordering::Relaxed) == leg2 {
-            delta
+            (drops, 0)
         } else {
-            0
+            (0, 0)
+        }
+    }
+}
+
+/// How long a leg's too-late drops wait to be matched to the pair's loss: at
+/// least this many of the leg's own polls …
+const PAIR_DROP_MIN_POLLS: u32 = 2;
+/// … and until the leg has delivered this many packets since. The merger
+/// counts a seq lost only once its window has moved past it — the SRT pair's
+/// [`crate::redundancy::merger::REORDER_WINDOW`] seqs later, about 0.2 s at
+/// 50 Mbps but ten seconds at 1 Mbps — while libsrt counts its drop at once.
+/// Half a window more absorbs the legs' skew.
+const PAIR_DROP_MIN_DELIVERED: u64 = crate::redundancy::merger::REORDER_WINDOW as u64 * 3 / 2;
+
+/// The legs' too-late drops and the merged pair's loss, as the legs' pollers
+/// match them up. libsrt counts a drop when it gives up on the packet; the
+/// merger counts the seq lost only when it leaves the window, later, and the
+/// two legs' pollers read their sockets at different moments. So each side
+/// waits for the other, boundedly:
+///
+/// - a leg's drops wait in [`LegDrops`] for the pair's loss they explain,
+///   for a merger window and a half of the leg's packets and two of its
+///   polls ([`PAIR_DROP_MIN_DELIVERED`], [`PAIR_DROP_MIN_POLLS`]) at least,
+///   then expire — a
+///   drop the sibling leg covered is no loss, and must not stay to name a
+///   later upstream gap SRT's;
+/// - the pair's loss taken at one leg's poll waits for the other leg's next
+///   poll before what the drops do not explain is called upstream, since
+///   that leg's drops for the same seqs may not have been read yet.
+///
+/// A seq is SRT's when both legs dropped one — the smaller of their pending
+/// drops, or the only connected leg's — and upstream otherwise. Every lost
+/// seq is counted once, as one or the other.
+#[derive(Default)]
+struct PairLedger {
+    legs: [LegDrops; 2],
+    /// Pair loss taken at one leg's poll, waiting for the next poll of the
+    /// leg it is indexed by.
+    awaiting: [u64; 2],
+    /// A merger re-anchor taken at one leg's poll, waiting for the next poll
+    /// of the leg it is indexed by.
+    reset_awaiting: [bool; 2],
+}
+
+impl PairLedger {
+    /// One poll of leg `leg` (0 or 1): add its new drops, take the pair's new
+    /// loss and re-anchor, and return `(srt_drops, upstream_gaps)` to count.
+    ///
+    /// The SRT share is the loss the legs' pending drops explain. After a
+    /// re-anchor it is all of their shared drops, the merger having counted
+    /// none of the seqs its jump skipped: the pair-level counterpart of a
+    /// single-socket RTP input's `max(sequence gaps, SRT drops)`, so a burst
+    /// of a whole window or more both legs dropped is counted, and a restart
+    /// on a new ISN, which made libsrt drop nothing, is not.
+    fn poll(
+        &mut self,
+        leg: usize,
+        drops: u64,
+        delivered: i64,
+        other_up: bool,
+        new_lost: u64,
+        new_reset: bool,
+    ) -> (u64, u64) {
+        let other = 1 - leg;
+        self.legs[leg].poll(drops, delivered);
+        if !other_up {
+            // Gone, or never connected: nothing of its to match or wait for.
+            self.legs[other].clear();
+        }
+        // Waited for this poll, or for the other leg's poll since this leg's
+        // previous one, which never came: neither waits any longer.
+        let ready = std::mem::take(&mut self.awaiting[leg])
+            + std::mem::take(&mut self.awaiting[other]);
+        let reset = new_reset
+            || std::mem::take(&mut self.reset_awaiting[leg])
+            || std::mem::take(&mut self.reset_awaiting[other]);
+        let explained = if other_up {
+            self.legs[leg].pending().min(self.legs[other].pending())
+        } else {
+            self.legs[leg].pending()
+        };
+        // The pair's loss the drops explain, what has waited first.
+        let srt_of_loss = (ready + new_lost).min(explained);
+        let srt = if reset { explained } else { srt_of_loss };
+        self.legs[leg].take(srt);
+        if other_up {
+            self.legs[other].take(srt);
+        }
+        let ready_left = ready - srt_of_loss.min(ready);
+        let new_left = new_lost - (srt_of_loss - srt_of_loss.min(ready));
+        let upstream = if other_up {
+            // New loss waits for the other leg's drops for the same seqs.
+            self.awaiting[other] = new_left;
+            self.reset_awaiting[other] = new_reset;
+            ready_left
+        } else {
+            ready_left + new_left
+        };
+        self.legs[leg].age();
+        (srt, upstream)
+    }
+}
+
+/// One leg's too-late drops not yet matched to the pair's loss, in two
+/// generations: `young` gathers this generation's drops, `old` the previous
+/// one's. A generation closes once it has lasted [`PAIR_DROP_MIN_POLLS`] of
+/// the leg's polls and [`PAIR_DROP_MIN_DELIVERED`] of its packets; `old` then
+/// expires and `young` takes its place, so every drop waits at least that
+/// long and at most twice it.
+#[derive(Default)]
+struct LegDrops {
+    young: u64,
+    old: u64,
+    /// The leg's polls and delivered packets since `young` opened.
+    polls: u32,
+    delivered: u64,
+    /// The leg socket's delivered-packet count at its previous poll.
+    last_delivered: i64,
+}
+
+impl LegDrops {
+    fn pending(&self) -> u64 {
+        self.young + self.old
+    }
+
+    fn poll(&mut self, drops: u64, delivered: i64) {
+        self.young += drops;
+        self.polls = self.polls.saturating_add(1);
+        // A count that went backwards is a new socket's, counting afresh.
+        let moved = if delivered >= self.last_delivered {
+            delivered - self.last_delivered
+        } else {
+            delivered.max(0)
+        };
+        self.delivered = self.delivered.saturating_add(moved as u64);
+        self.last_delivered = delivered;
+    }
+
+    /// Take `n` (at most [`Self::pending`]) of the drops, oldest first.
+    fn take(&mut self, n: u64) {
+        let from_old = n.min(self.old);
+        self.old -= from_old;
+        self.young -= (n - from_old).min(self.young);
+    }
+
+    fn clear(&mut self) {
+        self.young = 0;
+        self.old = 0;
+        self.polls = 0;
+        self.delivered = 0;
+    }
+
+    /// Close the generation once it has lasted long enough, which expires
+    /// the one before it.
+    fn age(&mut self) {
+        if self.polls >= PAIR_DROP_MIN_POLLS && self.delivered >= PAIR_DROP_MIN_DELIVERED {
+            self.old = std::mem::take(&mut self.young);
+            self.polls = 0;
+            self.delivered = 0;
         }
     }
 }
@@ -3700,10 +3919,11 @@ pub struct SrtInputStats {
     pub bonding: Arc<watch::Sender<Option<SrtBondingStats>>>,
     /// Packets the receiver dropped because they missed the TSBPD deadline
     /// (libsrt `pktRcvDropTotal`; on a bonded input the group's own count of
-    /// packets no member delivered; on a SMPTE 2022-7 input what the pair
-    /// lost, see [`SrtPair`]), summed across reconnects since the input
-    /// started, on air or not. libsrt skips them and delivers the next
-    /// packet, so nothing downstream can see them.
+    /// packets no member delivered; on a SMPTE 2022-7 input the share of
+    /// what the pair lost that both legs dropped, see [`SrtPair`]), summed
+    /// across reconnects since the input started, on air or not. libsrt
+    /// skips them and delivers the next packet, so nothing downstream can
+    /// see them.
     recv_dropped: AtomicU64,
     /// The share of `recv_dropped` counted against the flow, polled while the
     /// input was on air.
@@ -3711,7 +3931,8 @@ pub struct SrtInputStats {
     /// Set once the payload is detected as RTP. A dropped packet then also
     /// leaves a gap in the RTP sequence, which `input_loss` has counted
     /// already. Never set on a SMPTE 2022-7 input: its receive loop counts
-    /// no gaps, the pair's loss reaching the flow through its drops alone.
+    /// no gaps, the pair's loss reaching the flow through [`SrtPair`] alone,
+    /// as drops and pair gaps.
     pub rtp_framed: AtomicBool,
     on_air: Arc<OnAirInputs>,
     flow_dropped: Arc<SrtOnAirDrops>,
@@ -3719,16 +3940,27 @@ pub struct SrtInputStats {
 
 impl SrtInputStats {
     /// Count what a stats poll of `socket` that found `delta` new too-late
-    /// drops on it makes of them: all of them on a single-socket input, the
-    /// pair's loss on a leg of a SMPTE 2022-7 input ([`SrtPair`]).
-    pub fn count_socket_drops(&self, socket: SrtInputSocket, delta: u64) {
-        let lost = match socket {
-            SrtInputSocket::Only => delta,
-            SrtInputSocket::Leg1 => self.pair.lost_at_poll(false, delta),
-            SrtInputSocket::Leg2 => self.pair.lost_at_poll(true, delta),
+    /// drops on it, and a delivered-packet count of `delivered`
+    /// (`pktRecvUniqueTotal`), makes of them: all of them on a single-socket
+    /// input, the pair's loss on a leg of a SMPTE 2022-7 input ([`SrtPair`]),
+    /// as drops and as pair gaps.
+    pub fn count_socket_drops(&self, socket: SrtInputSocket, delta: u64, delivered: i64) {
+        let (dropped, gaps) = match socket {
+            SrtInputSocket::Only => (delta, 0),
+            SrtInputSocket::Leg1 => {
+                let other_up = self.leg2.borrow().is_some();
+                self.pair.lost_at_poll(false, delta, delivered, other_up)
+            }
+            SrtInputSocket::Leg2 => {
+                let other_up = self.leg.borrow().is_some();
+                self.pair.lost_at_poll(true, delta, delivered, other_up)
+            }
         };
-        if lost > 0 {
-            self.count_recv_drops(lost);
+        if dropped > 0 {
+            self.count_recv_drops(dropped);
+        }
+        if gaps > 0 && self.on_air.contains(&self.input_id) {
+            self.flow_dropped.pair_gaps.fetch_add(gaps, Ordering::Relaxed);
         }
     }
 
@@ -4823,7 +5055,11 @@ impl FlowStatsAccumulator {
         // the `max` keeping RTP drops whose gap the recv loop did not count
         // (it takes a gap of 1000 or more for a source restart). Every term
         // only grows, so `packets_lost` — a Prometheus counter — never falls.
-        let other_loss = seq_loss.saturating_sub(srt_rtp);
+        //
+        // A merged SMPTE 2022-7 pair's gaps that SRT did not drop join the
+        // loss the drops do not explain: `input_loss` has none of the pair's.
+        let pair_gaps = self.srt_on_air_drops.pair_gaps.load(Ordering::Relaxed);
+        let other_loss = seq_loss.saturating_sub(srt_rtp).saturating_add(pair_gaps);
         let packets_lost = other_loss.saturating_add(srt_dropped);
         let srt_latency = if srt_dropped > 0 { self.srt_drop_hint() } else { None };
         let bw_exceeded = self.bandwidth_exceeded.load(Ordering::Relaxed);
@@ -6939,6 +7175,18 @@ mod srt_input_stats_tests {
         drop_total: i32,
         rtt_ms: f64,
     ) {
+        poll_leg_delivered(flow, leg, last, drop_total, 0, rtt_ms);
+    }
+
+    /// [`poll_leg`] of a socket that has delivered `delivered` packets.
+    fn poll_leg_delivered(
+        flow: &FlowStatsAccumulator,
+        leg: SrtInputSocket,
+        last: &mut i64,
+        drop_total: i32,
+        delivered: i64,
+        rtt_ms: f64,
+    ) {
         let srt = flow.srt_input_stats.get("pair").unwrap().value().clone();
         let cache = if leg == SrtInputSocket::Leg2 { &srt.leg2 } else { &srt.leg };
         crate::srt::connection::publish_leg_stats(
@@ -6947,11 +7195,67 @@ mod srt_input_stats_tests {
             last,
             SrtLegStats {
                 pkt_recv_drop_total: drop_total,
+                pkt_recv_unique_total: delivered,
                 ms_recv_tsbpd_delay: 120,
                 rtt_ms,
                 ..Default::default()
             },
         );
+    }
+
+    /// A merged SMPTE 2022-7 pair "pair", on air, as its receive loop and
+    /// its two legs' pollers drive it: the loop's merger and what of its
+    /// counts the pair has been handed, and each leg's poller's drop cursor.
+    struct MergedPair {
+        flow: FlowStatsAccumulator,
+        srt: Arc<SrtInputStats>,
+        merger: crate::redundancy::merger::HitlessMerger,
+        handed: MergerHandoff,
+        last: [i64; 2],
+    }
+
+    impl MergedPair {
+        /// Both legs connected, and polled once with nothing dropped.
+        fn new() -> Self {
+            let flow = flow_with_srt_inputs(&["pair"]);
+            let srt = flow.srt_input_stats.get("pair").unwrap().value().clone();
+            srt.pair.set_merged(true);
+            let mut pair = Self {
+                flow,
+                srt,
+                merger: crate::redundancy::merger::HitlessMerger::new(),
+                handed: MergerHandoff::default(),
+                last: [0; 2],
+            };
+            pair.poll(SrtInputSocket::Leg1, 0, 0);
+            pair.poll(SrtInputSocket::Leg2, 0, 0);
+            pair
+        }
+
+        /// The packets of `seqs` reach the merger, from whichever leg.
+        fn merge(&mut self, seqs: impl IntoIterator<Item = u16>) {
+            for seq in seqs {
+                self.merger.try_merge(seq, crate::redundancy::merger::ActiveLeg::Leg1);
+                self.srt.pair.hand_off(&self.merger, &mut self.handed);
+            }
+        }
+
+        /// One poll of `leg`, whose socket has dropped `drop_total` and
+        /// delivered `delivered` packets since it connected.
+        fn poll(&mut self, leg: SrtInputSocket, drop_total: i32, delivered: i64) {
+            let i = usize::from(leg == SrtInputSocket::Leg2);
+            poll_leg_delivered(&self.flow, leg, &mut self.last[i], drop_total, delivered, 20.0);
+        }
+
+        /// What the flow reports: `(packets_lost, srt_recv_dropped)`, the
+        /// latter being both the flow's reason and the input's own count.
+        fn lost(&self) -> (u64, u64) {
+            let snap = self.flow.snapshot();
+            let reason = srt_reason(&snap).is_some();
+            let own = own_drops(&snap, "pair").unwrap();
+            assert_eq!(reason, own > 0, "the reason is the input's drops: {:?}", codes(&snap));
+            (snap.input.packets_lost, own)
+        }
     }
 
     /// RTP legs merge on the sequence number: a drop on one leg is filled
@@ -6973,9 +7277,15 @@ mod srt_input_stats_tests {
         assert_eq!(snap.input.srt_stats.as_ref().map(|s| s.pkt_recv_drop_total), Some(50));
         assert_eq!(snap.input.srt_leg2_stats.as_ref().map(|s| s.pkt_recv_drop_total), Some(30));
 
-        srt.pair.add_lost(4);
-        poll_leg(&flow, SrtInputSocket::Leg2, &mut last2, 31, 90.0);
-        poll_leg(&flow, SrtInputSocket::Leg1, &mut last1, 60, 20.0);
+        // Both legs drop 4 seqs, which then leave the merger's window.
+        let mut merger = crate::redundancy::merger::HitlessMerger::new();
+        let mut handed = MergerHandoff::default();
+        for seq in (0..3_000u16).filter(|s| !(500..504).contains(s)) {
+            merger.try_merge(seq, crate::redundancy::merger::ActiveLeg::Leg1);
+            srt.pair.hand_off(&merger, &mut handed);
+        }
+        poll_leg(&flow, SrtInputSocket::Leg2, &mut last2, 34, 90.0);
+        poll_leg(&flow, SrtInputSocket::Leg1, &mut last1, 54, 20.0);
         let snap = flow.snapshot();
         assert_eq!(snap.input.packets_lost, 4);
         assert_eq!(own_drops(&snap, "pair"), Some(4));
@@ -6983,6 +7293,118 @@ mod srt_input_stats_tests {
         assert!(reason.contains("4 packets"), "{reason}");
         // The hint is the slower of the two legs.
         assert!(reason.contains("RTT 90 ms"), "{reason}");
+    }
+
+    /// A burst of a whole merger window or more that both legs dropped
+    /// re-anchors the merger, which counts none of the seqs it skipped: the
+    /// legs' shared drops count instead, as SRT's.
+    #[test]
+    fn a_burst_of_a_whole_window_both_legs_dropped_is_the_pairs_loss() {
+        let mut pair = MergedPair::new();
+        pair.merge(0..1_000);
+        pair.merge(3_000..3_100);
+        pair.poll(SrtInputSocket::Leg1, 2_000, 1_100);
+        pair.poll(SrtInputSocket::Leg2, 2_000, 1_100);
+        assert_eq!(pair.lost(), (2_000, 2_000));
+
+        // The same with a leg down: its partner's drops are the pair's.
+        let flow = flow_with_srt_inputs(&["pair"]);
+        let srt = flow.srt_input_stats.get("pair").unwrap().value().clone();
+        srt.pair.set_merged(true);
+        let mut pair = MergedPair {
+            flow,
+            srt,
+            merger: crate::redundancy::merger::HitlessMerger::new(),
+            handed: MergerHandoff::default(),
+            last: [0; 2],
+        };
+        pair.merge(0..1_000);
+        pair.merge(3_000..3_100);
+        pair.poll(SrtInputSocket::Leg1, 2_000, 1_100);
+        assert_eq!(pair.lost(), (2_000, 2_000));
+    }
+
+    /// A source restarting on a new ISN re-anchors the merger as well, but
+    /// libsrt dropped nothing for it: no loss.
+    #[test]
+    fn a_new_isn_libsrt_dropped_nothing_for_is_no_loss() {
+        let mut pair = MergedPair::new();
+        pair.merge(0..1_000);
+        pair.merge(40_000..41_000);
+        pair.poll(SrtInputSocket::Leg1, 0, 2_000);
+        pair.poll(SrtInputSocket::Leg2, 0, 2_000);
+        assert_eq!(pair.lost(), (0, 0));
+    }
+
+    /// Seqs missing from both legs while their sockets dropped nothing were
+    /// lost upstream of SRT: sequence-gap loss, not SRT drops, whose remedy
+    /// (more latency) would not help.
+    #[test]
+    fn a_gap_both_legs_carried_from_upstream_is_not_an_srt_drop() {
+        let mut pair = MergedPair::new();
+        pair.merge((0..3_000).filter(|s| !(1_000..1_050).contains(s)));
+        pair.poll(SrtInputSocket::Leg1, 0, 2_950);
+        pair.poll(SrtInputSocket::Leg2, 0, 2_950);
+        assert_eq!(pair.lost(), (50, 0));
+        let snap = pair.flow.snapshot();
+        assert!(codes(&snap).contains(&"packet_loss"), "{:?}", codes(&snap));
+    }
+
+    /// Seqs both legs' sockets dropped are SRT's, whichever leg is polled
+    /// first, the other's drops read only at its own poll.
+    #[test]
+    fn seqs_both_legs_dropped_are_srt_drops() {
+        for first in [SrtInputSocket::Leg1, SrtInputSocket::Leg2] {
+            let second =
+                if first == SrtInputSocket::Leg1 { SrtInputSocket::Leg2 } else { SrtInputSocket::Leg1 };
+            let mut pair = MergedPair::new();
+            pair.merge((0..3_000).filter(|s| !(1_000..1_050).contains(s)));
+            pair.poll(first, 50, 2_950);
+            assert_eq!(pair.lost(), (0, 0), "{first:?}: waits for the other leg's drops");
+            pair.poll(second, 50, 2_950);
+            assert_eq!(pair.lost(), (50, 50), "{first:?}");
+        }
+    }
+
+    /// A leg's drops wait for the merger to count them, a window of packets
+    /// later, which on a low-rate stream is several polls.
+    #[test]
+    fn drops_wait_for_the_merger_on_a_low_rate_stream() {
+        let mut pair = MergedPair::new();
+        pair.merge((0..600).filter(|s| !(500..510).contains(s)));
+        for poll in 1..=5 {
+            pair.poll(SrtInputSocket::Leg1, 10, 100 * poll);
+            pair.poll(SrtInputSocket::Leg2, 10, 100 * poll);
+        }
+        assert_eq!(pair.lost(), (0, 0), "still inside the window");
+        pair.merge(600..1_600);
+        pair.poll(SrtInputSocket::Leg1, 10, 1_590);
+        pair.poll(SrtInputSocket::Leg2, 10, 1_590);
+        assert_eq!(pair.lost(), (10, 10));
+    }
+
+    /// Drops the sibling leg covered are no loss, and expire: they must not
+    /// name a later gap from upstream SRT's.
+    #[test]
+    fn drops_a_sibling_leg_covered_are_no_loss() {
+        let mut pair = MergedPair::new();
+        // Leg 1 drops 50 seqs leg 2 delivers; then leg 2 drops 30 leg 1 does.
+        pair.merge(0..3_000);
+        pair.poll(SrtInputSocket::Leg1, 50, 3_000);
+        pair.poll(SrtInputSocket::Leg2, 30, 3_000);
+        assert_eq!(pair.lost(), (0, 0));
+        // A merger window and two polls of each leg later, a gap of 20 from
+        // upstream: both legs delivered every packet libsrt got.
+        let mut delivered = 3_000;
+        for _ in 0..4 {
+            delivered += 2_000;
+            pair.poll(SrtInputSocket::Leg1, 50, delivered);
+            pair.poll(SrtInputSocket::Leg2, 30, delivered);
+        }
+        pair.merge((3_000..8_000).filter(|s| !(4_000..4_020).contains(s)));
+        pair.poll(SrtInputSocket::Leg1, 50, delivered + 2_000);
+        pair.poll(SrtInputSocket::Leg2, 30, delivered + 2_000);
+        assert_eq!(pair.lost(), (20, 0));
     }
 
     /// Raw TS carries no shared sequence, so the legs fail over rather than

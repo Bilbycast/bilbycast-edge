@@ -98,6 +98,8 @@ pub struct HitlessMerger {
     /// Seqs that left the window behind `highest_seq` without either leg
     /// delivering them.
     lost: u64,
+    /// Times a forward jump of a whole window or more re-anchored the window.
+    resets: u64,
     /// Which leg last provided the forwarded packet.
     active_leg: ActiveLeg,
     /// Whether we've forwarded at least one packet.
@@ -133,6 +135,7 @@ impl HitlessMerger {
             emitted: vec![0u64; (window / 64) as usize].into_boxed_slice(),
             covered: 0,
             lost: 0,
+            resets: 0,
             active_leg: ActiveLeg::None,
             initialized: false,
             window,
@@ -142,11 +145,24 @@ impl HitlessMerger {
     /// Seqs that left the gap-fill window without either leg delivering
     /// them, since the merger was created: the packets this pair lost.
     /// A packet that arrives after its seq has left the window is dropped
-    /// as too late, so it is counted too. A gap of a whole window or more
-    /// is a stream reset, not loss, and starts the count afresh from the
-    /// new anchor.
+    /// as too late, so it is counted too.
+    ///
+    /// A forward jump of a whole window or more re-anchors the window on
+    /// the new seq. The seqs still unfilled in the old window leave it
+    /// then, and are counted. The seqs the jump skips are not: from the
+    /// sequence numbers alone a burst both legs lost cannot be told from a
+    /// source restarting on a new ISN. [`Self::resets`] counts the
+    /// re-anchor instead, for a caller that can tell them apart from
+    /// elsewhere — an SRT pair from its legs' own drop counts.
     pub fn lost(&self) -> u64 {
         self.lost
+    }
+
+    /// Re-anchors since the merger was created: forward jumps of a whole
+    /// window or more, a burst both legs lost or a source restart. See
+    /// [`Self::lost`].
+    pub fn resets(&self) -> u64 {
+        self.resets
     }
 
     /// The slot `ahead` seqs past `highest_seq` (`ahead < window`).
@@ -181,6 +197,45 @@ impl HitlessMerger {
         } else {
             self.emitted[slot / 64] &= !bit;
         }
+    }
+
+    /// Re-anchor the window on `seq` after a forward jump of a whole window
+    /// or more. Each covered slot still clear holds a seq neither leg
+    /// delivered, which leaves the window now: lost. Counted a bitmap word
+    /// at a time, like the clear [`Self::anchor`] does next, so a stream of
+    /// jumps costs no more per packet than the re-anchors it already made.
+    fn reanchor(&mut self, seq: u16) {
+        self.lost += u64::from(self.covered) - u64::from(self.covered_emitted());
+        self.resets += 1;
+        self.anchor(seq);
+    }
+
+    /// Emitted seqs among the covered slots. Until the window fills,
+    /// `highest_slot` advances in step with `covered` from slot 0, so those
+    /// are the first `covered` slots; a slot past them can hold a set bit —
+    /// a seq from before the anchor filled — so the whole bitmap is not it.
+    fn covered_emitted(&self) -> u32 {
+        let covered = self.covered as usize;
+        if covered >= self.window as usize {
+            self.emitted.iter().map(|w| w.count_ones()).sum()
+        } else {
+            debug_assert_eq!(self.highest_slot as usize + 1, covered);
+            self.emitted_in(0, covered)
+        }
+    }
+
+    /// Set bits in slots `from..to` of the bitmap.
+    fn emitted_in(&self, from: usize, to: usize) -> u32 {
+        let mut count = 0;
+        let mut slot = from;
+        while slot < to {
+            let bit = slot % 64;
+            let span = (64 - bit).min(to - slot);
+            let mask = if span == 64 { u64::MAX } else { ((1u64 << span) - 1) << bit };
+            count += (self.emitted[slot / 64] & mask).count_ones();
+            slot += span;
+        }
+        count
     }
 
     /// Anchor the window on `seq`, as the only seq seen so far.
@@ -240,11 +295,11 @@ impl HitlessMerger {
         if forward > 0 && forward < 0x8000 {
             // ── Forward jump ──
             //
-            // If the gap is larger than the reorder window, treat it as a
-            // stream reset (e.g. publisher restarted with a new ISN). Reset
-            // the bitmap and re-anchor.
+            // A gap of a whole window or more: a burst both legs lost, or a
+            // stream reset (e.g. publisher restarted with a new ISN). Count
+            // what the old window still lacked, then re-anchor.
             if forward >= self.window {
-                self.anchor(seq);
+                self.reanchor(seq);
             } else {
                 self.advance(seq, forward);
             }
@@ -413,7 +468,43 @@ mod tests {
         assert_eq!(merger.lost(), 2);
     }
 
-    /// A jump of a whole window or more is a stream reset, not loss.
+    /// A jump of a whole window or more re-anchors the window. The seqs the
+    /// old window still lacked leave it then, lost, and the re-anchor is
+    /// counted; the seqs the jump skipped are not, a burst or a new ISN.
+    #[test]
+    fn test_a_reset_counts_the_old_windows_unfilled_seqs() {
+        // Partly covered: 51 slots since the anchor, two of them clear.
+        let mut merger = HitlessMerger::with_window(64);
+        for seq in (0..=50u16).filter(|&s| s != 40 && s != 45) {
+            merger.try_merge(seq, ActiveLeg::Leg1);
+        }
+        assert_eq!((merger.lost(), merger.resets()), (0, 0));
+        merger.try_merge(5_000, ActiveLeg::Leg1);
+        assert_eq!((merger.lost(), merger.resets()), (2, 1));
+        // A copy arriving now is too late, and lost once.
+        assert_eq!(merger.try_merge(40, ActiveLeg::Leg2), None);
+        for seq in 5_001..5_200u16 {
+            merger.try_merge(seq, ActiveLeg::Leg1);
+        }
+        assert_eq!((merger.lost(), merger.resets()), (2, 1));
+
+        // Fully covered, across the u16 wrap, one slot clear.
+        let mut merger = HitlessMerger::with_window(192);
+        let mut seq: u16 = 65_000;
+        while seq != 300 {
+            if seq != 200 {
+                merger.try_merge(seq, ActiveLeg::Leg1);
+            }
+            seq = seq.wrapping_add(1);
+        }
+        assert_eq!(merger.lost(), 0, "200 is still inside the window");
+        merger.try_merge(9_000, ActiveLeg::Leg1);
+        assert_eq!((merger.lost(), merger.resets()), (1, 1));
+    }
+
+    /// A jump of a whole window or more over a window with nothing unfilled
+    /// counts no loss of its own: from the seqs alone a new ISN looks the
+    /// same as a burst both legs lost. The re-anchor is counted instead.
     #[test]
     fn test_a_stream_reset_is_not_loss() {
         let mut merger = HitlessMerger::with_window(64);
@@ -424,7 +515,7 @@ mod tests {
         for seq in 5_001..5_200u16 {
             merger.try_merge(seq, ActiveLeg::Leg1);
         }
-        assert_eq!(merger.lost(), 0);
+        assert_eq!((merger.lost(), merger.resets()), (0, 1));
     }
 
     #[test]
