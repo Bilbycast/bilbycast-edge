@@ -2757,8 +2757,8 @@ async fn execute_command(
                 }
 
             // Hot-swap the running plan. `replace_assembly` validates,
-            // resolves essence, spawns Hitless mergers, and dispatches
-            // PlanCommand::ReplacePlan to the running assembler. On
+            // resolves essence, keeps or replaces Hitless mergers, and
+            // dispatches PlanCommand::ReplacePlan to the running assembler. On
             // failure it emits a Critical event carrying the structured
             // `pid_bus_*` `error_code` before bubbling the anyhow error
             // (see `build_assembly_plan` + `essence_error_to_event` in

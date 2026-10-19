@@ -1703,6 +1703,149 @@ mod tests {
         let _ = fm.destroy_flow("f1").await;
     }
 
+    /// A hot swap leaves one merger behind each Hitless slot: the one the
+    /// slot already had when the swap leaves the slot alone, a new one when
+    /// it changes the slot, none when it drops the slot. So every packet
+    /// reaches the slot's bus key once, and the on-air set follows the
+    /// merger that runs.
+    #[tokio::test]
+    async fn a_plan_swap_leaves_one_merger_per_hitless_slot() {
+        use crate::engine::ts_es_bus::EsPacket;
+        use std::time::Duration;
+        let fm = make_fm();
+        let udp = |id: &str, port: u16| {
+            input(serde_json::json!({
+                "id": id, "name": id, "type": "udp",
+                "bind_addr": format!("127.0.0.1:{port}")
+            }))
+        };
+        // Slot 0 carries PCR from `in-c`; slot 1 is the Hitless slot over
+        // `in-a` / `in-b`. A third slot, one more for the assembler to
+        // report, tells when a swap is on air.
+        let assembly = |stall_ms: u64, hitless: bool| -> serde_json::Value {
+            let pid = |input_id: &str, pid: u16| {
+                serde_json::json!({ "type": "pid", "input_id": input_id, "source_pid": pid })
+            };
+            let mut streams = vec![serde_json::json!({
+                "source": pid("in-c", 256), "out_pid": 256, "stream_type": 27
+            })];
+            if hitless {
+                streams.push(serde_json::json!({
+                    "source": {
+                        "type": "hitless", "stall_ms": stall_ms,
+                        "primary": pid("in-a", 257), "backup": pid("in-b", 257)
+                    },
+                    "out_pid": 257, "stream_type": 15
+                }));
+            }
+            serde_json::json!({
+                "kind": "spts",
+                "pcr_source": { "input_id": "in-c", "pid": 256 },
+                "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": streams }]
+            })
+        };
+        let with_marker = |mut asm: serde_json::Value| {
+            asm["programs"][0]["streams"].as_array_mut().unwrap().push(serde_json::json!({
+                "source": { "type": "pid", "input_id": "in-c", "source_pid": 258 },
+                "out_pid": 258, "stream_type": 15
+            }));
+            serde_json::from_value::<crate::config::models::FlowAssembly>(asm)
+                .expect("assembly fixture")
+        };
+        let flow = serde_json::json!({
+            "id": "f1", "name": "f1",
+            "input_ids": ["in-c", "in-a", "in-b"], "output_ids": [],
+            "assembly": assembly(50, true)
+        });
+        let cfg = crate::config::models::AppConfig {
+            inputs: vec![
+                udp("in-c", 41981),
+                udp("in-a", 41982),
+                udp("in-b", 41983),
+            ],
+            flows: vec![serde_json::from_value(flow).expect("flow fixture")],
+            ..Default::default()
+        };
+        let runtime = fm
+            .create_flow(cfg.resolve_flow(&cfg.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+
+        // A failed assertion must not leave the flow running: its input
+        // threads would hold the test runtime's shutdown forever.
+        let checks = tokio::spawn({
+            let bus = fm.node_es_bus();
+            let runtime = runtime.clone();
+            async move {
+                let (merged, merged_pid) = crate::engine::ts_es_hitless::hitless_bus_key("slot_0_1");
+                let primary = bus.sender_for("in-a", 257, 0x0F);
+                let backup = bus.sender_for("in-b", 257, 0x0F);
+                let packet = || EsPacket {
+                    source_pid: 257,
+                    stream_type: 0x0F,
+                    payload: bytes::Bytes::from_static(&[0x47; 188]),
+                    is_pusi: false,
+                    has_pcr: false,
+                    pcr: None,
+                    recv_time_us: 0,
+                    upstream_seq: None,
+                };
+                // How many copies of one primary packet reach the slot's bus key.
+                let copies = || async {
+                    let mut rx = bus.subscribe(&merged, merged_pid);
+                    // No receiver at all once no merger reads the leg.
+                    let _ = primary.send(packet());
+                    let mut n = 0;
+                    while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await {
+                        n += 1;
+                    }
+                    n
+                };
+                let on_air = |id: &str| runtime.stats.on_air.contains(id);
+                let slots_on_air = |n: u32| {
+                    let health = runtime.stats.assembly_health.read().unwrap();
+                    health.as_ref().is_some_and(|h| h.total_slots == n)
+                };
+                async fn wait_until(what: &str, ok: impl Fn() -> bool) {
+                    for _ in 0..300 {
+                        if ok() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    panic!("timed out waiting until {what}");
+                }
+                assert_eq!(copies().await, 1, "one merger at start");
+
+                // A swap that leaves the Hitless slot alone keeps its merger.
+                runtime.replace_assembly(with_marker(assembly(50, true)), None).await.expect("swap");
+                wait_until("the swap is on air", || slots_on_air(3)).await;
+                assert_eq!(copies().await, 1, "a kept slot keeps its one merger");
+                // Its failover still moves the on-air leg.
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                backup.send(packet()).expect("the merger subscribes");
+                wait_until("the backup is on air", || on_air("in-b") && !on_air("in-a")).await;
+
+                // A swap that changes the slot replaces its merger, which starts on
+                // the primary.
+                runtime.replace_assembly(with_marker(assembly(5000, true)), None).await.expect("swap");
+                wait_until("the new merger's primary is on air", || on_air("in-a")).await;
+                assert_eq!(copies().await, 1, "a changed slot gets one new merger");
+
+                // A swap that drops the slot stops its merger.
+                runtime.replace_assembly(with_marker(assembly(5000, false)), None).await.expect("swap");
+                assert_eq!(copies().await, 0, "a dropped slot keeps no merger");
+                wait_until("the swap is on air", || slots_on_air(2)).await;
+                assert!(!on_air("in-a") && !on_air("in-b"), "nor anything on air");
+            }
+        });
+        let outcome = checks.await;
+        let _ = fm.destroy_flow("f1").await;
+        if let Err(failed) = outcome {
+            std::panic::resume_unwind(failed.into_panic());
+        }
+    }
+
     /// The assembler publishes what an assembled flow plays from only once
     /// it starts, after the Essence slots resolve, while the inputs are
     /// already up and polled. In that window the slot's source is on air

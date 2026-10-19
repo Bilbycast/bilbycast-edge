@@ -31,7 +31,11 @@
 //!   the bus edge — same as every other bus publisher.
 //! - Cancellation propagates from the parent flow token via
 //!   `CancellationToken::child_token`.
+//! - One merger per Hitless slot: [`HitlessMergers`] keeps a slot's merger
+//!   across a plan swap that leaves the slot alone and stops it before
+//!   anything else publishes onto the slot's bus key.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -41,6 +45,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 use tokio_util::sync::CancellationToken;
 
+use super::ts_assembler::{AssemblyPlan, PendingHitlessSlot};
 use super::ts_es_bus::NodeEsBus;
 
 /// Default stall timer: if no primary packet arrives within this
@@ -97,6 +102,79 @@ impl Eq for ForwardingPrimary {}
 /// on the same flow never collide.
 pub fn hitless_bus_key(uid: &str) -> (String, u16) {
     (format!("{HITLESS_INPUT_PREFIX}{uid}"), 0)
+}
+
+/// The mergers running behind one assembled flow's Hitless slots, by slot
+/// uid. A slot's merger is the only publisher onto the slot's bus key, so
+/// the flow keeps exactly one per slot: [`Self::apply`] brings the set in
+/// line with each plan before it goes on air.
+#[derive(Default)]
+pub struct HitlessMergers(HashMap<String, RunningMerger>);
+
+struct RunningMerger {
+    slot: PendingHitlessSlot,
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl HitlessMergers {
+    /// Bring the running mergers in line with `slots`, the Hitless slots of
+    /// `plan`, before `plan` goes on air.
+    ///
+    /// A slot the plan leaves as it was keeps its merger, uninterrupted,
+    /// and `plan` takes that merger's [`ForwardingPrimary`] in place of the
+    /// fresh one it was built with, so the on-air set goes on following the
+    /// merger's failovers. A merger whose slot is gone or changed is
+    /// cancelled and awaited, so it is no longer publishing onto the slot's
+    /// bus key when its replacement starts there. Every slot without a
+    /// merger then gets one, under `parent`.
+    pub async fn apply(
+        &mut self,
+        slots: &[PendingHitlessSlot],
+        plan: &mut AssemblyPlan,
+        bus: &Arc<NodeEsBus>,
+        parent: &CancellationToken,
+    ) {
+        let mut kept = HashMap::with_capacity(slots.len());
+        for (uid, running) in std::mem::take(&mut self.0) {
+            // `ForwardingPrimary` compares equal whatever it holds, so this
+            // compares the slot's legs and settings only.
+            if slots.contains(&running.slot) {
+                kept.insert(uid, running);
+            } else {
+                running.cancel.cancel();
+                let _ = running.task.await;
+            }
+        }
+        for slot in slots {
+            if let Some(running) = kept.get(&slot.uid) {
+                let key = hitless_bus_key(&slot.uid);
+                for planned in plan.programs.iter_mut().flat_map(|p| p.slots.iter_mut()) {
+                    if planned.source == key
+                        && let Some(legs) = planned.hitless_legs.as_mut()
+                    {
+                        legs.forwarding_primary = running.slot.forwarding_primary.clone();
+                    }
+                }
+                continue;
+            }
+            let cancel = parent.child_token();
+            let task = spawn_hitless_es_merger_full(
+                slot.uid.clone(),
+                slot.primary.clone(),
+                slot.backup.clone(),
+                bus.clone(),
+                Duration::from_millis(slot.stall_ms),
+                slot.seq_aware,
+                slot.reorder_window,
+                slot.path_differential_ms,
+                slot.forwarding_primary.clone(),
+                cancel.clone(),
+            );
+            kept.insert(slot.uid.clone(), RunningMerger { slot: slot.clone(), cancel, task });
+        }
+        self.0 = kept;
+    }
 }
 
 /// Spawn a Hitless merger task. The seq-aware mode now supports a

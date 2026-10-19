@@ -251,9 +251,14 @@ pub struct FlowRuntime {
     pub pid_bus_assembler_handle: Option<crate::engine::ts_assembler::AssemblerHandle>,
     /// PID-bus elementary-stream bus. `Some` whenever the assembler is
     /// running. Kept on the runtime so `replace_assembly` (Phase 7) can
-    /// spawn fresh Hitless mergers when the new plan adds Hitless slots.
+    /// spawn the Hitless mergers a new plan needs.
     #[allow(dead_code)]
     pub es_bus: Option<Arc<NodeEsBus>>,
+    /// The mergers behind the running plan's Hitless slots. Locked by
+    /// `replace_assembly` across both its merger changes and the plan send,
+    /// so two swaps cannot leave the mergers matching one plan and the
+    /// assembler running the other.
+    pub hitless_mergers: tokio::sync::Mutex<crate::engine::ts_es_hitless::HitlessMergers>,
     /// Live mutable copy of the flow's `assembly` block. Used by
     /// `replace_assembly` to diff old → new and decide whether to
     /// hot-swap or fall back to a full restart. Persisted form lives
@@ -1044,25 +1049,25 @@ impl FlowRuntime {
             }
         }
 
-        let pid_bus_assembler_handle: Option<crate::engine::ts_assembler::AssemblerHandle> =
-            match (spts_build, &es_bus) {
-                (Some(build), Some(bus)) => Some(
-                    finalize_spts_assembler(
-                        build,
-                        bus,
-                        &broadcast_tx,
-                        &flow_stats,
-                        &cancel_token,
-                        &event_sender,
-                        &config.config.id,
-                        &input_clocks,
-                        &flow_manager,
-                        av_sync_pacer.clone(),
-                    )
-                    .await?,
-                ),
-                _ => None,
-            };
+        let (pid_bus_assembler_handle, hitless_mergers) = match (spts_build, &es_bus) {
+            (Some(build), Some(bus)) => {
+                let (handle, mergers) = finalize_spts_assembler(
+                    build,
+                    bus,
+                    &broadcast_tx,
+                    &flow_stats,
+                    &cancel_token,
+                    &event_sender,
+                    &config.config.id,
+                    &input_clocks,
+                    &flow_manager,
+                    av_sync_pacer.clone(),
+                )
+                .await?;
+                (Some(handle), mergers)
+            }
+            _ => (None, Default::default()),
+        };
 
         // Start TR-101290 analyzer (independent broadcast subscriber).
         //
@@ -1600,6 +1605,7 @@ impl FlowRuntime {
             frame_rate_rx,
             pid_bus_assembler_handle,
             es_bus,
+            hitless_mergers: tokio::sync::Mutex::new(hitless_mergers),
             current_assembly,
             #[cfg(feature = "replay")]
             recording_handle,
@@ -1707,12 +1713,13 @@ impl FlowRuntime {
     ///    flow start-up (loud `pid_bus_*` errors via the `event_sender`).
     /// 3. Resolves any `Essence` slots against the per-input PSI
     ///    catalogues currently held on the flow's stats.
-    /// 4. Spawns Hitless merger tasks for any new `SlotSource::Hitless`
-    ///    slots in the new plan. Mergers added by previous calls remain
-    ///    running — they keep publishing onto their synthetic bus key
-    ///    until the parent flow's `cancel_token` fires. (Mergers
-    ///    orphaned by removal of a Hitless slot stop being subscribed
-    ///    to by the assembler so their packets just go to /dev/null.)
+    /// 4. Brings the Hitless mergers in line with the new plan
+    ///    ([`crate::engine::ts_es_hitless::HitlessMergers::apply`]): a slot
+    ///    the swap leaves alone keeps its merger and the flag that says
+    ///    which leg it forwards; a slot it changes or drops has its merger
+    ///    stopped; every slot left without one gets a new one. Each slot's
+    ///    bus key has one publisher, so no packet reaches the assembler
+    ///    twice.
     /// 5. Sends [`crate::engine::ts_assembler::PlanCommand::ReplacePlan`]
     ///    to the running assembler.
     ///
@@ -1983,23 +1990,12 @@ impl FlowRuntime {
             bail!(msg);
         }
 
-        // Spawn any Hitless mergers the new plan introduced. The
-        // assembler picks up the synthetic bus key as soon as its
-        // `ReplacePlan` lands.
-        for hl in &build.pending_hitless {
-            let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger_full(
-                hl.uid.clone(),
-                hl.primary.clone(),
-                hl.backup.clone(),
-                bus.clone(),
-                std::time::Duration::from_millis(hl.stall_ms),
-                hl.seq_aware,
-                hl.reorder_window,
-                hl.path_differential_ms,
-                hl.forwarding_primary.clone(),
-                self.cancel_token.child_token(),
-            );
-        }
+        // The mergers behind the new plan's Hitless slots. Held until the
+        // plan is sent, so the assembler runs the plan they were set for.
+        let mut hitless_mergers = self.hitless_mergers.lock().await;
+        hitless_mergers
+            .apply(&build.pending_hitless, &mut build.plan, &bus, &self.cancel_token)
+            .await;
 
         // Phase 8: refresh the per-ES routing snapshot (so snapshots
         // pick up renumbered out_pids) and spawn analyzers for any
@@ -2046,6 +2042,7 @@ impl FlowRuntime {
             })
             .await
             .map_err(|_| anyhow::anyhow!("flow '{}' assembler receiver closed", flow_id))?;
+        drop(hitless_mergers);
 
         let mut current = self.current_assembly.lock().await;
         *current = Some(new_assembly);
@@ -4915,7 +4912,10 @@ async fn finalize_spts_assembler(
     input_clocks: &HashMap<String, crate::engine::master_clock::ClockIdentity>,
     flow_manager: &Arc<crate::engine::manager::FlowManager>,
     av_sync_pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
-) -> Result<crate::engine::ts_assembler::AssemblerHandle> {
+) -> Result<(
+    crate::engine::ts_assembler::AssemblerHandle,
+    crate::engine::ts_es_hitless::HitlessMergers,
+)> {
     // 1. Essence resolution.
     if !build.pending_essence.is_empty() {
         let mut catalogues: std::collections::HashMap<
@@ -5075,20 +5075,10 @@ async fn finalize_spts_assembler(
             build.pending_hitless.first().map(|h| h.stall_ms).unwrap_or(0),
         );
     }
-    for hl in &build.pending_hitless {
-        let _ = crate::engine::ts_es_hitless::spawn_hitless_es_merger_full(
-            hl.uid.clone(),
-            hl.primary.clone(),
-            hl.backup.clone(),
-            bus.clone(),
-            std::time::Duration::from_millis(hl.stall_ms),
-            hl.seq_aware,
-            hl.reorder_window,
-            hl.path_differential_ms,
-            hl.forwarding_primary.clone(),
-            cancel_token.child_token(),
-        );
-    }
+    let mut hitless_mergers = crate::engine::ts_es_hitless::HitlessMergers::default();
+    hitless_mergers
+        .apply(&build.pending_hitless, &mut build.plan, bus, cancel_token)
+        .await;
 
     let total_slots: usize = build.plan.programs.iter().map(|p| p.slots.len()).sum();
     tracing::info!(
@@ -5135,7 +5125,7 @@ async fn finalize_spts_assembler(
     //    The health cell receives the 1 Hz per-slot stall snapshot for
     //    `FlowStats.assembly_health`; `on_air` what the assembler plays
     //    from, on every change, for the SRT drop accounting.
-    Ok(spawn_spts_assembler(
+    let assembler = spawn_spts_assembler(
         build.plan,
         bus.clone(),
         broadcast_tx.clone(),
@@ -5146,7 +5136,8 @@ async fn finalize_spts_assembler(
         Some(flow_stats.assembly_health.clone()),
         Some(flow_stats.on_air.clone()),
         psi_catalogs,
-    ))
+    );
+    Ok((assembler, hitless_mergers))
 }
 
 /// Build the `input_id → PsiCatalogStore` map handed to the assembler
