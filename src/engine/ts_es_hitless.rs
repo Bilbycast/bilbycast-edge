@@ -33,6 +33,7 @@
 //!   `CancellationToken::child_token`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -54,6 +55,42 @@ pub const DEFAULT_STALL_MS: u64 = 200;
 /// single stream and stays PID-level.
 pub const HITLESS_INPUT_PREFIX: &str = "hitless:";
 
+/// Whether a Hitless slot's merger is forwarding its primary (`true`) or has
+/// failed over to its backup (`false`). One per slot, shared by the merger,
+/// which sets it once per flip, and the slot's
+/// [`crate::engine::ts_assembler::HitlessLegs`], through which the flow's SRT
+/// stats pollers read it.
+///
+/// Runtime state, not plan: any two compare equal, so a plan swap that keeps
+/// a slot's legs leaves its program's PMT version alone.
+#[derive(Debug, Clone)]
+pub struct ForwardingPrimary(Arc<AtomicBool>);
+
+/// Every merger starts on its primary.
+impl Default for ForwardingPrimary {
+    fn default() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl ForwardingPrimary {
+    pub fn get(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, primary: bool) {
+        self.0.store(primary, Ordering::Relaxed);
+    }
+}
+
+impl PartialEq for ForwardingPrimary {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ForwardingPrimary {}
+
 /// Build the synthetic bus key `(input_id, source_pid)` for a Hitless
 /// slot. The `uid` should be unique per Hitless slot within the flow —
 /// convention is `"slot_{program_idx}_{slot_idx}"` so two Hitless slots
@@ -69,6 +106,12 @@ pub fn hitless_bus_key(uid: &str) -> (String, u16) {
 /// * `seq_aware = false`        → primary-preference stall timer (legacy)
 /// * `seq_aware = true, pd None`  → bare dedup (faster, no asym-path protection)
 /// * `seq_aware = true, pd Some(ms)` → buffered SMPTE 2022-7 (recommended)
+///
+/// The primary-preference merger sets `forwarding_primary` on each flip, so
+/// the flow counts the SRT drops of the leg it forwards. The seq-aware
+/// mergers leave it on the primary: they merge on `upstream_seq`, which no
+/// SRT input stamps, so of SRT legs they forward the primary verbatim and
+/// discard the backup.
 pub fn spawn_hitless_es_merger_full(
     uid: String,
     primary: (String, u16),
@@ -77,6 +120,7 @@ pub fn spawn_hitless_es_merger_full(
     stall: Duration,
     seq_aware: bool,
     path_differential_ms: Option<u32>,
+    forwarding_primary: ForwardingPrimary,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     let mut primary_rx = bus.subscribe(&primary.0, primary.1);
@@ -111,6 +155,7 @@ pub fn spawn_hitless_es_merger_full(
                     &mut backup_rx,
                     out_tx,
                     stall,
+                    &forwarding_primary,
                     cancel,
                 )
                 .await;
@@ -190,6 +235,7 @@ async fn run_primary_preference(
     backup_rx: &mut broadcast::Receiver<EsPacketAlias>,
     out_tx: broadcast::Sender<EsPacketAlias>,
     stall: Duration,
+    forwarding_primary: &ForwardingPrimary,
     cancel: CancellationToken,
 ) {
     let mut using_primary = true;
@@ -209,6 +255,7 @@ async fn run_primary_preference(
                             "pid_bus hitless: primary resumed — switching from backup"
                         );
                         using_primary = true;
+                        forwarding_primary.set(true);
                     }
                     let _ = out_tx.send(es);
                 }
@@ -231,6 +278,7 @@ async fn run_primary_preference(
                     stall
                 );
                 using_primary = false;
+                forwarding_primary.set(false);
             }
         }
     }
@@ -333,6 +381,7 @@ mod tests {
     async fn primary_preference_when_primary_live() {
         let bus = Arc::new(NodeEsBus::new());
         let cancel = CancellationToken::new();
+        let forwarding = ForwardingPrimary::default();
         let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),
             ("in-a".to_string(), 0x100),
@@ -341,6 +390,7 @@ mod tests {
             Duration::from_millis(500),
             /* seq_aware */ false,
             /* path_differential_ms */ None,
+            forwarding.clone(),
             cancel.clone(),
         );
 
@@ -363,6 +413,7 @@ mod tests {
         // Backup packet must NOT be forwarded while primary is live.
         let second = tokio::time::timeout(Duration::from_millis(100), out_rx.recv()).await;
         assert!(second.is_err(), "backup must be suppressed while primary is live");
+        assert!(forwarding.get(), "the primary stays on air");
 
         cancel.cancel();
     }
@@ -371,6 +422,7 @@ mod tests {
     async fn failover_to_backup_on_stall() {
         let bus = Arc::new(NodeEsBus::new());
         let cancel = CancellationToken::new();
+        let forwarding = ForwardingPrimary::default();
         let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),
             ("in-a".to_string(), 0x100),
@@ -379,6 +431,7 @@ mod tests {
             Duration::from_millis(50),
             /* seq_aware */ false,
             /* path_differential_ms */ None,
+            forwarding.clone(),
             cancel.clone(),
         );
 
@@ -399,6 +452,7 @@ mod tests {
             .expect("merger emits backup packet after stall")
             .expect("channel open");
         assert_eq!(after.payload[4], 0xBB, "backup must forward after primary stall");
+        assert!(!forwarding.get(), "the failover puts the backup on air");
 
         cancel.cancel();
     }
@@ -407,6 +461,7 @@ mod tests {
     async fn switches_back_to_primary_on_resume() {
         let bus = Arc::new(NodeEsBus::new());
         let cancel = CancellationToken::new();
+        let forwarding = ForwardingPrimary::default();
         let _handle = spawn_hitless_es_merger_full(
             "slot_0_0".to_string(),
             ("in-a".to_string(), 0x100),
@@ -415,6 +470,7 @@ mod tests {
             Duration::from_millis(50),
             /* seq_aware */ false,
             /* path_differential_ms */ None,
+            forwarding.clone(),
             cancel.clone(),
         );
 
@@ -430,6 +486,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
         bak.send(es(0x200, 0xBB)).unwrap();
         let _ = tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await;
+        assert!(!forwarding.get());
 
         // Primary resumes; next primary packet must surface and the
         // subsequent backup packet must stop flowing.
@@ -439,6 +496,7 @@ mod tests {
             .expect("primary resume")
             .expect("channel open");
         assert_eq!(pc.payload[4], 0xCC);
+        assert!(forwarding.get(), "the resumed primary is back on air");
 
         bak.send(es(0x200, 0xDD)).unwrap();
         let blocked = tokio::time::timeout(Duration::from_millis(100), out_rx.recv()).await;
@@ -448,5 +506,47 @@ mod tests {
         );
 
         cancel.cancel();
+    }
+
+    /// SRT legs carry no `upstream_seq`, so a seq-aware merger forwards the
+    /// primary verbatim and discards the backup, stalled primary or not: the
+    /// primary is the leg on air.
+    #[tokio::test]
+    async fn seq_aware_keeps_an_srt_primary_on_air() {
+        for path_differential_ms in [None, Some(50)] {
+            let bus = Arc::new(NodeEsBus::new());
+            let cancel = CancellationToken::new();
+            let forwarding = ForwardingPrimary::default();
+            let _handle = spawn_hitless_es_merger_full(
+                "slot_0_0".to_string(),
+                ("in-a".to_string(), 0x100),
+                ("in-b".to_string(), 0x200),
+                bus.clone(),
+                Duration::from_millis(50),
+                /* seq_aware */ true,
+                path_differential_ms,
+                forwarding.clone(),
+                cancel.clone(),
+            );
+            let mut out_rx = bus.subscribe(&format!("{HITLESS_INPUT_PREFIX}slot_0_0"), 0);
+            let pri = bus.sender_for("in-a", 0x100, 0x1B);
+            let bak = bus.sender_for("in-b", 0x200, 0x03);
+
+            pri.send(es(0x100, 0xAA)).unwrap();
+            let first = tokio::time::timeout(Duration::from_millis(200), out_rx.recv())
+                .await
+                .expect("the primary is forwarded")
+                .expect("channel open");
+            assert_eq!(first.payload[4], 0xAA);
+
+            // Past any stall a primary-preference merger would act on.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            bak.send(es(0x200, 0xBB)).unwrap();
+            let backup = tokio::time::timeout(Duration::from_millis(100), out_rx.recv()).await;
+            assert!(backup.is_err(), "{path_differential_ms:?}: the backup is discarded");
+            assert!(forwarding.get(), "{path_differential_ms:?}: the primary stays on air");
+
+            cancel.cancel();
+        }
     }
 }

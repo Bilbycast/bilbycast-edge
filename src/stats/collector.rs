@@ -3552,24 +3552,40 @@ mod media_player_stats_tests {
 /// every input its assembler plays from. Read by the flow's SRT stats
 /// pollers, through [`SrtInputStats::count_recv_drops`], to tell whether a
 /// drop is the flow's. Written on the control plane only — by
-/// [`FlowStatsAccumulator::set_active_input_id`] and by the assembler
+/// [`FlowStatsAccumulator::set_active_input_id`], by `FlowRuntime::start`
+/// from the plan before the inputs start, and by the assembler
 /// (`crate::engine::ts_assembler`) — and read without a lock.
 #[derive(Default)]
 pub struct OnAirInputs {
     /// The flow's active input; empty while it has none.
     active: ArcSwap<String>,
-    /// What an assembled flow plays from, as its assembler publishes it on
-    /// every change: each Pid / Essence slot's source, each Switch slot's
-    /// current leg (a Take, a PES-aligned commit, a splice timeout) and both
-    /// legs behind each Hitless slot. `None` on a passthrough flow, whose one
-    /// input on air is `active`.
-    assembled: ArcSwapOption<BTreeSet<String>>,
+    /// What an assembled flow plays from. `None` on a passthrough flow,
+    /// whose one input on air is `active`.
+    assembled: ArcSwapOption<AssembledOnAir>,
+}
+
+/// What an assembled flow plays from, as its assembler publishes it on every
+/// change to the plan or to a Switch slot's leg.
+#[derive(Default)]
+pub struct AssembledOnAir {
+    /// Each Pid / Essence slot's source and each Switch slot's current leg
+    /// (a Take, a PES-aligned commit, a splice timeout).
+    pub inputs: BTreeSet<String>,
+    /// The legs behind each Hitless slot. Only the one its merger is
+    /// forwarding is on air, the primary or, after a failover, the backup:
+    /// the other is a warm standby. A seq-aware merger keeps the primary on
+    /// air: it merges on `upstream_seq`, which no SRT input stamps, so of
+    /// SRT legs it forwards the primary verbatim and discards the backup.
+    pub hitless: Vec<crate::engine::ts_assembler::HitlessLegs>,
 }
 
 impl OnAirInputs {
     pub fn contains(&self, input_id: &str) -> bool {
         match &*self.assembled.load() {
-            Some(inputs) => inputs.contains(input_id),
+            Some(on_air) => {
+                on_air.inputs.contains(input_id)
+                    || on_air.hitless.iter().any(|legs| legs.on_air() == input_id)
+            }
             None => self.active.load().as_str() == input_id,
         }
     }
@@ -3578,8 +3594,8 @@ impl OnAirInputs {
         self.active.store(Arc::new(input_id.to_string()));
     }
 
-    pub fn set_assembled(&self, inputs: BTreeSet<String>) {
-        self.assembled.store(Some(Arc::new(inputs)));
+    pub fn set_assembled(&self, on_air: AssembledOnAir) {
+        self.assembled.store(Some(Arc::new(on_air)));
     }
 }
 
@@ -3639,8 +3655,8 @@ impl SrtInputStats {
     /// Count `delta` new too-late drops, as a stats poll reads them: always on
     /// this input, and on the flow too when the input is on air at that
     /// moment. A poll's delta covers the second since the previous one, so
-    /// drops in the second before a Take land on whichever side of it the
-    /// poll falls.
+    /// drops in the second before a Take or a Hitless failover land on
+    /// whichever side of it the poll falls.
     pub fn count_recv_drops(&self, delta: u64) {
         self.recv_dropped.fetch_add(delta, Ordering::Relaxed);
         if !self.on_air.contains(&self.input_id) {
@@ -6775,7 +6791,10 @@ mod srt_input_stats_tests {
     #[test]
     fn an_assembled_flow_counts_every_input_it_plays() {
         let flow = flow_with_srt_inputs(&["video", "audio", "spare"]);
-        flow.on_air.set_assembled(BTreeSet::from(["video".to_string(), "audio".to_string()]));
+        flow.on_air.set_assembled(AssembledOnAir {
+            inputs: BTreeSet::from(["video".to_string(), "audio".to_string()]),
+            hitless: Vec::new(),
+        });
         poll(&flow, "video", 10, 120, 20.0);
         poll(&flow, "audio", 30, 200, 90.0);
         poll(&flow, "spare", 500, 120, 20.0);
@@ -6791,27 +6810,35 @@ mod srt_input_stats_tests {
         assert_eq!(flow.snapshot().input.packets_lost, 40);
     }
 
-    /// A removed input takes its telemetry with it. Re-added under the same
-    /// id as an input that does not measure SRT drops, then taken to air,
-    /// it reports none and hides none of its own sequence loss.
+    /// A removed input takes its telemetry with it. What it dropped on air
+    /// stays the flow's, but re-added under the same id as an input that
+    /// does not measure SRT drops it reports none, has no SRT stats on air
+    /// and is no longer the link the reason's hint names; re-added as an SRT
+    /// input it counts from zero.
     #[test]
     fn a_removed_input_does_not_resurrect_its_drops() {
         let flow = flow_with_srt_inputs(&["main", "backup"]);
-        flow.srt_input_stats.get("backup").unwrap().rtp_framed.store(true, Ordering::Relaxed);
+        flow.set_active_input_id("backup");
         poll(&flow, "backup", 300, 120, 180.0);
+        flow.set_active_input_id("main");
 
         flow.remove_srt_input_stats("backup");
-        flow.set_active_input_id("backup");
-        flow.input_loss.store(25, Ordering::Relaxed);
         let snap = flow.snapshot();
-        assert!(srt_reason(&snap).is_none(), "{:?}", codes(&snap));
         assert_eq!(own_drops(&snap, "backup"), None, "not measured, so not reported");
-        assert_eq!(snap.input.packets_lost, 25);
-        assert!(snap.input.srt_stats.is_none());
+        assert_eq!(snap.input.packets_lost, 300, "what it dropped on air stays counted");
+        let reason = srt_reason(&snap).expect("and so does its reason");
+        assert!(!reason.contains("RTT 180 ms"), "the hint names the removed link: {reason}");
+        flow.set_active_input_id("backup");
+        assert!(flow.snapshot().input.srt_stats.is_none());
 
         // Re-added as an SRT input again, it counts from zero.
         flow.register_srt_input_stats("backup");
-        assert_eq!(own_drops(&flow.snapshot(), "backup"), Some(0));
+        poll(&flow, "backup", 10, 200, 60.0);
+        let snap = flow.snapshot();
+        assert_eq!(own_drops(&snap, "backup"), Some(10));
+        assert_eq!(snap.input.packets_lost, 310);
+        let reason = srt_reason(&snap).unwrap();
+        assert!(reason.contains("latency 200 ms, RTT 60 ms"), "{reason}");
     }
 
     /// Group stats carry no latency or RTT; a bonded input's hint reads its
