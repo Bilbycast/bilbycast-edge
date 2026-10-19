@@ -18,7 +18,7 @@ use crate::config::models::{
     SrtBondingConfig, SrtBondingMode, SrtInputConfig, SrtMode, SrtOutputConfig,
     SrtRedundancyConfig,
 };
-use crate::stats::collector::SrtInputStats;
+use crate::stats::collector::{SrtInputSocket, SrtInputStats};
 use crate::stats::models::{SrtBondingMemberStats, SrtBondingStats, SrtLegStats};
 
 /// Common SRT connection parameters extracted from any SRT config type.
@@ -740,9 +740,9 @@ pub(crate) fn cumulative_delta(last: &mut i64, current: i32) -> u64 {
     delta
 }
 
-/// Fold a socket's (or group's) `pktRcvDropTotal` reading into the input's
-/// drops, through the poller's per-socket `last`. The delta is counted when
-/// it is polled, which is what decides whether it is the flow's: see
+/// Fold a group's `pktRcvDropTotal` reading into the input's drops, through
+/// the poller's `last`. The delta is counted when it is polled, which is
+/// what decides whether it is the flow's: see
 /// [`SrtInputStats::count_recv_drops`].
 fn add_recv_drops(input: &SrtInputStats, last_drop: &mut i64, pkt_recv_drop_total: i32) {
     let delta = cumulative_delta(last_drop, pkt_recv_drop_total);
@@ -751,8 +751,8 @@ fn add_recv_drops(input: &SrtInputStats, last_drop: &mut i64, pkt_recv_drop_tota
     }
 }
 
-/// One tick of [`spawn_srt_stats_poller`] once the stats are read: count the
-/// socket's new too-late drops on `input` and publish the stats.
+/// One tick of [`spawn_srt_stats_poller`] once the stats are read: hand the
+/// socket's new too-late drops to `input` and publish the stats.
 ///
 /// Publishing uses `send_replace`, not `send`: every one of these caches is
 /// built as `watch::channel(None).0`, i.e. with its only receiver already
@@ -761,12 +761,15 @@ fn add_recv_drops(input: &SrtInputStats, last_drop: &mut i64, pkt_recv_drop_tota
 /// `srt_stats` was absent from every SRT input and output on the node.
 pub(crate) fn publish_leg_stats(
     cache: &watch::Sender<Option<SrtLegStats>>,
-    input: Option<&SrtInputStats>,
+    input: Option<(&SrtInputStats, SrtInputSocket)>,
     last_drop: &mut i64,
     leg_stats: SrtLegStats,
 ) {
-    if let Some(input) = input {
-        add_recv_drops(input, last_drop, leg_stats.pkt_recv_drop_total);
+    if let Some((input, socket)) = input {
+        // Every poll, drops or not: a 2022-7 leg's poll also takes the
+        // merger's count of what neither leg delivered.
+        let delta = cumulative_delta(last_drop, leg_stats.pkt_recv_drop_total);
+        input.count_socket_drops(socket, delta);
     }
     cache.send_replace(Some(leg_stats));
 }
@@ -860,17 +863,20 @@ fn poll_interval() -> tokio::time::Interval {
 /// publishes the result via the provided lock-free watch channel. Runs
 /// until the cancellation token fires.
 ///
-/// `input`, when given, is the SRT input this socket serves: each poll
-/// counts the socket's new receiver-side too-late drops (`pktRcvDropTotal`)
-/// on it, so they add up across reconnects. Those are packets libsrt gave up
-/// on because they missed the TSBPD deadline — the only SRT loss the
-/// application never sees, since libsrt simply skips them and delivers the
-/// next packet. Counted while the input is on air, they reach
-/// `InputStats.packets_lost` and the flow health; outputs pass `None`.
+/// `input`, when given, is the SRT input this socket serves and which of its
+/// sockets it is: each poll hands it the socket's new receiver-side too-late
+/// drops (`pktRcvDropTotal`), so they add up across reconnects. Those are
+/// packets libsrt gave up on because they missed the TSBPD deadline — the
+/// only SRT loss the application never sees, since libsrt simply skips them
+/// and delivers the next packet. A single-socket input counts them all; a
+/// leg of a SMPTE 2022-7 input counts what the pair lost instead (see
+/// [`SrtInputStats::count_socket_drops`]). Counted while the input is on
+/// air, they reach `InputStats.packets_lost` and the flow health; outputs
+/// pass `None`.
 pub fn spawn_srt_stats_poller(
     socket: Arc<SrtSocket>,
     cache: Arc<watch::Sender<Option<SrtLegStats>>>,
-    input: Option<Arc<SrtInputStats>>,
+    input: Option<(Arc<SrtInputStats>, SrtInputSocket)>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -889,7 +895,12 @@ pub fn spawn_srt_stats_poller(
                         stats.byte_recv_total,
                         Instant::now(),
                     );
-                    publish_leg_stats(&cache, input.as_deref(), &mut last_drop, leg_stats);
+                    publish_leg_stats(
+                        &cache,
+                        input.as_ref().map(|(input, socket)| (input.as_ref(), *socket)),
+                        &mut last_drop,
+                        leg_stats,
+                    );
                 }
             }
         }
@@ -1129,8 +1140,9 @@ fn bonding_snapshot(
 /// second and publishes the snapshot via the provided lock-free watch
 /// channel. Runs until the cancellation token fires.
 ///
-/// `input` is [`spawn_srt_stats_poller`]'s, fed from the group's own drop
-/// count: inputs pass themselves, outputs `None`.
+/// `input` is the bonded SRT input the group serves, as on
+/// [`spawn_srt_stats_poller`], fed from the group's own drop count: inputs
+/// pass themselves, outputs `None`.
 pub fn spawn_srt_group_stats_poller(
     group: Arc<SrtGroup>,
     mode: SrtBondingMode,
@@ -1265,7 +1277,7 @@ mod tests {
         let input = flow.register_srt_input_stats("leg");
         let mut last = 0i64;
         let leg = SrtLegStats { pkt_recv_drop_total: 7, rtt_ms: 21.0, ..Default::default() };
-        super::publish_leg_stats(&cache, Some(&input), &mut last, leg);
+        super::publish_leg_stats(&cache, Some((&input, SrtInputSocket::Only)), &mut last, leg);
         assert_eq!(cache.borrow().as_ref().map(|s| s.rtt_ms), Some(21.0));
         assert_eq!(input.recv_dropped(), 7);
 

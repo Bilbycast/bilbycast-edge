@@ -26,7 +26,7 @@ use crate::srt::connection::{
     spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller,
     spawn_srt_stats_poller, SrtConnectionParams, CONNECT_FAILED_THRESHOLD,
 };
-use crate::stats::collector::{FlowStatsAccumulator, SrtInputStats};
+use crate::stats::collector::{FlowStatsAccumulator, SrtInputSocket, SrtInputStats};
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
 use crate::util::time::now_us;
 
@@ -351,16 +351,13 @@ pub fn spawn_srt_input(
             stats.clone(),
         );
 
-        // Single-socket and bonded inputs poll libsrt into their own stats
-        // entry; the 2022-7 path has no poller, so it registers none rather
-        // than report a zero it never measured.
+        // Every SRT input polls libsrt into its own stats entry.
+        let srt = stats.register_srt_input_stats(&input_id);
         let result = if config.bonding.is_some() {
-            let srt = stats.register_srt_input_stats(&input_id);
             srt_input_bonded_loop(config, publisher, stats, &srt, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         } else if config.redundancy.is_some() {
-            srt_input_redundant_loop(config, publisher, stats, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
+            srt_input_redundant_loop(config, publisher, stats, &srt, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         } else {
-            let srt = stats.register_srt_input_stats(&input_id);
             srt_input_loop(config, publisher, stats, &srt, cancel, &event_sender, &flow_id, &input_id, &mut transcoder, &mut post).await
         };
         if let Err(e) = result {
@@ -465,7 +462,7 @@ async fn srt_input_listener_loop(
         spawn_srt_stats_poller(
             socket.clone(),
             srt.leg.clone(),
-            Some(srt.clone()),
+            Some((srt.clone(), SrtInputSocket::Only)),
             poller_cancel.clone(),
         );
 
@@ -636,7 +633,7 @@ async fn srt_input_caller_loop(
         spawn_srt_stats_poller(
             socket.clone(),
             srt.leg.clone(),
-            Some(srt.clone()),
+            Some((srt.clone(), SrtInputSocket::Only)),
             poller_cancel.clone(),
         );
 
@@ -818,10 +815,17 @@ async fn srt_input_recv_loop(
 ///
 /// Listener-mode legs bind once and re-accept on disconnect; caller-mode legs
 /// reconnect with exponential back-off.
+///
+/// Each leg's socket has its own stats poller, into `srt.leg` and
+/// `srt.leg2`. What reaches `srt`'s drops is what the pair lost (see
+/// [`crate::stats::collector::SrtPair`]): with RTP, the packets neither leg
+/// delivered, as the merger counts them; with raw TS, the drops of the leg
+/// the failover forwards.
 async fn srt_input_redundant_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
+    srt: &Arc<SrtInputStats>,
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
@@ -944,7 +948,20 @@ async fn srt_input_redundant_loop(
             }),
         );
 
+        // Leg 1's stats until it is lost or the cycle ends; leg 2's from
+        // when it comes up.
+        let leg1_poller = cancel.child_token();
+        spawn_srt_stats_poller(
+            socket_leg1.clone(),
+            srt.leg.clone(),
+            Some((srt.clone(), SrtInputSocket::Leg1)),
+            leg1_poller.clone(),
+        );
+        let leg2_poller = cancel.child_token();
+
         let mut merger = HitlessMerger::new();
+        // What of `merger.lost()` the pair's stats have been told.
+        let mut merger_lost: u64 = 0;
         let mut failover = RawTsFailover::new();
         let mut prev_active_leg = ActiveLeg::None;
         let mut leg1_alive = true;
@@ -1069,6 +1086,12 @@ async fn srt_input_redundant_loop(
                         listener_leg2 = returned_listener;
                     }
                     if let Some(s) = sock {
+                        spawn_srt_stats_poller(
+                            s.clone(),
+                            srt.leg2.clone(),
+                            Some((srt.clone(), SrtInputSocket::Leg2)),
+                            leg2_poller.clone(),
+                        );
                         socket_leg2 = Some(s);
                         leg2_alive = true;
                     }
@@ -1082,13 +1105,15 @@ async fn srt_input_redundant_loop(
                             if format == SrtPayloadFormat::Unknown {
                                 format = detect_format(&data);
                                 log_detected_format_redundant(format, events, flow_id);
+                                srt.pair.set_merged(format == SrtPayloadFormat::RtpTs);
                             }
-                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg1, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, publisher: &publisher, transcoder, post });
+                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg1, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, merger_lost: &mut merger_lost, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg1 connection lost");
                             events.emit_flow(EventSeverity::Warning, category::REDUNDANCY, "Redundant leg 1 lost", flow_id);
                             leg1_alive = false;
+                            leg1_poller.cancel();
                             if !leg2_alive {
                                 tracing::warn!("SRT input (redundant) both legs lost, will reconnect");
                                 events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
@@ -1105,13 +1130,15 @@ async fn srt_input_redundant_loop(
                             if format == SrtPayloadFormat::Unknown {
                                 format = detect_format(&data);
                                 log_detected_format_redundant(format, events, flow_id);
+                                srt.pair.set_merged(format == SrtPayloadFormat::RtpTs);
                             }
-                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg2, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, publisher: &publisher, transcoder, post });
+                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg2, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, merger_lost: &mut merger_lost, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
                         }
                         Err(_) => {
                             tracing::warn!("SRT input leg2 connection lost");
                             events.emit_flow(EventSeverity::Warning, category::REDUNDANCY, "Redundant leg 2 lost", flow_id);
                             leg2_alive = false;
+                            leg2_poller.cancel();
                             if !leg1_alive {
                                 tracing::warn!("SRT input (redundant) both legs lost, will reconnect");
                                 events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
@@ -1124,6 +1151,8 @@ async fn srt_input_redundant_loop(
         }
 
         // Cleanup sockets (listeners stay open)
+        leg1_poller.cancel();
+        leg2_poller.cancel();
         let _ = socket_leg1.close().await;
         if let Some(ref s) = socket_leg2 {
             let _ = s.close().await;
@@ -1271,14 +1300,18 @@ impl RawTsFailover {
 ///   active-leg protection-switching. Real dedup is impossible without a
 ///   shared seq across legs.
 /// The dual-leg receive path's mutable state: sequence/timestamp counters,
-/// the hitless merger and failover, and the downstream publish chain.
+/// the hitless merger and failover, the pair's stats and the downstream
+/// publish chain.
 struct RedundantPacketState<'a> {
     raw_ts_seq: &'a mut u16,
     raw_ts_timestamp: &'a mut u32,
     merger: &'a mut HitlessMerger,
+    /// What of `merger.lost()` has been handed to `srt.pair`.
+    merger_lost: &'a mut u64,
     failover: &'a mut RawTsFailover,
     prev_active_leg: &'a mut ActiveLeg,
     stats: &'a Arc<FlowStatsAccumulator>,
+    srt: &'a SrtInputStats,
     publisher: &'a crate::engine::ingress_publisher::IngressPublisher,
     transcoder: &'a mut Option<InputTranscoder>,
     post: &'a mut Option<InputPostProcess>,
@@ -1296,9 +1329,11 @@ fn process_redundant_packet(
         raw_ts_seq,
         raw_ts_timestamp,
         merger,
+        merger_lost,
         failover,
         prev_active_leg,
         stats,
+        srt,
         publisher,
         transcoder,
         post,
@@ -1311,7 +1346,15 @@ fn process_redundant_packet(
             }
             let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
             let ts = parse_rtp_timestamp(&data).unwrap_or(0);
-            match merger.try_merge(seq, leg) {
+            let chosen = merger.try_merge(seq, leg);
+            // A seq leaving the window unfilled is rare: one compare per
+            // packet, an atomic add only when one did.
+            let lost = merger.lost();
+            if lost != *merger_lost {
+                srt.pair.add_lost(lost - *merger_lost);
+                *merger_lost = lost;
+            }
+            match chosen {
                 Some(chosen_leg) => (seq, ts, false, chosen_leg),
                 None => return,
             }
@@ -1319,6 +1362,11 @@ fn process_redundant_packet(
         SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => {
             if !failover.admit(leg) {
                 return;
+            }
+            // The failover's leg is the one on air; it changes only on a
+            // failover.
+            if leg != *prev_active_leg {
+                srt.pair.set_forwarding_leg2(leg == ActiveLeg::Leg2);
             }
             // Synthetic seq advances independently per leg; useful only as a
             // monotonic stamp on the published `RtpPacket` for downstream
@@ -1733,6 +1781,103 @@ async fn srt_bonded_group_recv_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A SMPTE 2022-7 input over real SRT sockets: each leg has a stats
+    /// poller, and the flow loses only the packets neither leg delivered —
+    /// one leg's gaps are filled from the other.
+    #[tokio::test]
+    async fn a_2022_7_input_reports_both_legs_and_only_the_pairs_loss() {
+        let free_port = || {
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+        };
+        let (port1, port2) = (free_port(), free_port());
+        let srt_config = |value: serde_json::Value| -> SrtInputConfig {
+            serde_json::from_value(value).expect("SRT config fixture")
+        };
+        // A latency well above loopback scheduling jitter on a loaded test
+        // host, so libsrt drops nothing of its own.
+        let config = srt_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{port1}"), "latency_ms": 500,
+            "redundancy": {
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port2}"), "latency_ms": 500
+            }
+        }));
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+        flow.set_active_input_id("pair");
+        let (tx, _rx) = broadcast::channel(4096);
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let _input = spawn_srt_input(
+            config,
+            tx,
+            flow.clone(),
+            cancel.child_token(),
+            events,
+            "f1".into(),
+            "pair".into(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        );
+        let caller = |port: u16| {
+            srt_config(serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 500
+            }))
+        };
+        let leg1 = crate::srt::connection::connect_srt_input(&caller(port1), &cancel)
+            .await
+            .expect("leg 1 connects");
+        let leg2 = crate::srt::connection::connect_srt_input(&caller(port2), &cancel)
+            .await
+            .expect("leg 2 connects");
+
+        // RTP/TS, six null packets a datagram: seven and the RTP header would
+        // overflow SRT's 1316-byte live payload. Leg 1 misses 100 and 200,
+        // leg 2 misses 200 and 300: only 200 is lost, once it leaves the
+        // merger's 1024-seq window.
+        let datagram = |seq: u16| {
+            let mut d = vec![0x80, 33];
+            d.extend_from_slice(&seq.to_be_bytes());
+            d.extend_from_slice(&(u32::from(seq) * 90).to_be_bytes());
+            d.extend_from_slice(&[0, 0, 0, 1]);
+            for _ in 0..6 {
+                d.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+                d.extend_from_slice(&[0xFF; 184]);
+            }
+            d
+        };
+        for seq in 0..1400u16 {
+            if seq != 100 && seq != 200 {
+                leg1.send(&datagram(seq)).await.expect("leg 1 sends");
+            }
+            if seq != 200 && seq != 300 {
+                leg2.send(&datagram(seq)).await.expect("leg 2 sends");
+            }
+            if seq % 20 == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let pair = flow.srt_input_stats.get("pair").expect("registered").value().clone();
+        let mut snap = flow.snapshot();
+        for _ in 0..500 {
+            snap = flow.snapshot();
+            if snap.input.srt_stats.is_some()
+                && snap.input.srt_leg2_stats.is_some()
+                && pair.recv_dropped() > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(snap.input.srt_stats.is_some(), "leg 1 publishes its stats");
+        assert!(snap.input.srt_leg2_stats.is_some(), "leg 2 publishes its stats");
+        // Past another poll of each leg, nothing more is counted.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(flow.input_packets.load(Ordering::Relaxed), 1399, "each seq forwarded once");
+        assert_eq!(pair.recv_dropped(), 1, "only 200 is the pair's loss");
+        assert_eq!(flow.snapshot().input.packets_lost, 1);
+    }
 
     #[test]
     fn connect_failure_threshold_fires_once_per_cycle() {

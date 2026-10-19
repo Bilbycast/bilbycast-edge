@@ -3600,18 +3600,79 @@ impl OnAirInputs {
 }
 
 /// The SRT too-late drops a flow counts as its own: each one polled while its
-/// input was on air, split by whether that input's payload is RTP-framed.
-/// Shared by every [`SrtInputStats`] of the flow. Both counters only grow for
-/// the life of the flow, so neither a Take nor a removed input takes back a
-/// drop, and a standby's earlier drops never arrive with a cut to it.
+/// input was on air, split by whether the flow's sequence-gap count
+/// (`input_loss`) has it too. Shared by every [`SrtInputStats`] of the flow.
+/// Both counters only grow for the life of the flow, so neither a Take nor a
+/// removed input takes back a drop, and a standby's earlier drops never
+/// arrive with a cut to it.
 #[derive(Default)]
 struct SrtOnAirDrops {
-    /// Drops on raw-TS inputs, which carry no sequence the edge can see: loss
-    /// nothing else in the flow counts.
-    raw_ts: AtomicU64,
-    /// Drops on RTP-framed inputs. The recv loop counts each of these as an
-    /// RTP sequence gap in `input_loss` as well.
-    rtp: AtomicU64,
+    /// Drops nothing else in the flow counts: a raw-TS input's, which carry no
+    /// sequence the edge can see, and a SMPTE 2022-7 input's, whose merged
+    /// stream is not gap-counted.
+    gapless: AtomicU64,
+    /// Drops on RTP-framed single-socket and bonded inputs. The recv loop
+    /// counts each of these as an RTP sequence gap in `input_loss` as well.
+    gapped: AtomicU64,
+}
+
+/// Which socket of an SRT input a stats poller reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SrtInputSocket {
+    /// The only socket of a single-socket input.
+    Only,
+    /// Leg 1 of a SMPTE 2022-7 input: the input's own config.
+    Leg1,
+    /// Leg 2 of a SMPTE 2022-7 input: its `redundancy` block.
+    Leg2,
+}
+
+/// What a SMPTE 2022-7 SRT input's receive loop tells its stats pollers, so
+/// they count the packets the pair lost rather than its legs' drops. A packet
+/// one leg drops is no loss while the other leg delivers it.
+#[derive(Default)]
+pub struct SrtPair {
+    /// Set while the payload is RTP: the legs then merge on the RTP sequence
+    /// number, and what the pair lost is what neither leg delivered.
+    merged: AtomicBool,
+    /// Packets neither leg delivered, as the merger counted them, that no
+    /// poll has taken yet.
+    unpolled_lost: AtomicU64,
+    /// Raw TS carries no sequence the legs share, so they fail over instead
+    /// of merging and what reaches air is one leg's packets: set while that
+    /// is leg 2. Its drops are then the pair's.
+    forwarding_leg2: AtomicBool,
+}
+
+impl SrtPair {
+    /// Called on each detection of the payload format.
+    pub fn set_merged(&self, merged: bool) {
+        self.merged.store(merged, Ordering::Relaxed);
+    }
+
+    /// Add packets the merger found neither leg delivered.
+    pub fn add_lost(&self, lost: u64) {
+        self.unpolled_lost.fetch_add(lost, Ordering::Relaxed);
+    }
+
+    /// Called on each raw-TS failover, never per packet.
+    pub fn set_forwarding_leg2(&self, leg2: bool) {
+        self.forwarding_leg2.store(leg2, Ordering::Relaxed);
+    }
+
+    /// What a poll of one leg that found `delta` new drops on its socket
+    /// counts as the pair's loss: the merger's count since the last poll of
+    /// either leg when the legs merge, else the leg's drops while it is the
+    /// one on air.
+    fn lost_at_poll(&self, leg2: bool, delta: u64) -> u64 {
+        if self.merged.load(Ordering::Relaxed) {
+            self.unpolled_lost.swap(0, Ordering::Relaxed)
+        } else if self.forwarding_leg2.load(Ordering::Relaxed) == leg2 {
+            delta
+        } else {
+            0
+        }
+    }
 }
 
 /// Receiver-side libsrt telemetry for one SRT input, keyed by `input_id` in
@@ -3620,23 +3681,27 @@ struct SrtOnAirDrops {
 /// entry: with one flow-wide cache a warm standby's RTT, reconnects and drops
 /// landed on the on-air input.
 ///
-/// Registered by `crate::engine::input_srt::spawn_srt_input` for
-/// single-socket and bonded SRT inputs, dropped by
-/// `crate::engine::flow::FlowRuntime::remove_input`. A SMPTE 2022-7 SRT input
-/// has no stats poller and registers nothing, so it reports neither stats nor
-/// drops.
+/// Registered by `crate::engine::input_srt::spawn_srt_input` for every SRT
+/// input, dropped by `crate::engine::flow::FlowRuntime::remove_input`.
 pub struct SrtInputStats {
     input_id: String,
-    /// Latest libsrt stats of a single-socket input's connection. Written by
+    /// Latest libsrt stats of a single-socket input's connection, or of leg 1
+    /// of a SMPTE 2022-7 input. Written by
     /// `crate::srt::connection::spawn_srt_stats_poller`, cleared while the
-    /// input reconnects.
+    /// socket reconnects.
     pub leg: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// Leg 2 of a SMPTE 2022-7 input, as `leg` is leg 1. Each leg's own
+    /// too-late drops are in its stats' `pkt_recv_drop_total` only.
+    pub leg2: Arc<watch::Sender<Option<SrtLegStats>>>,
+    /// How a SMPTE 2022-7 input's legs lose packets.
+    pub pair: SrtPair,
     /// Latest group stats of a bonded input. Written by the group stats
     /// pollers, cleared while the group reconnects.
     pub bonding: Arc<watch::Sender<Option<SrtBondingStats>>>,
     /// Packets the receiver dropped because they missed the TSBPD deadline
     /// (libsrt `pktRcvDropTotal`; on a bonded input the group's own count of
-    /// packets no member delivered), summed across reconnects since the input
+    /// packets no member delivered; on a SMPTE 2022-7 input what the pair
+    /// lost, see [`SrtPair`]), summed across reconnects since the input
     /// started, on air or not. libsrt skips them and delivers the next
     /// packet, so nothing downstream can see them.
     recv_dropped: AtomicU64,
@@ -3645,13 +3710,28 @@ pub struct SrtInputStats {
     on_air_dropped: AtomicU64,
     /// Set once the payload is detected as RTP. A dropped packet then also
     /// leaves a gap in the RTP sequence, which `input_loss` has counted
-    /// already.
+    /// already. Never set on a SMPTE 2022-7 input: its receive loop counts
+    /// no gaps, the pair's loss reaching the flow through its drops alone.
     pub rtp_framed: AtomicBool,
     on_air: Arc<OnAirInputs>,
     flow_dropped: Arc<SrtOnAirDrops>,
 }
 
 impl SrtInputStats {
+    /// Count what a stats poll of `socket` that found `delta` new too-late
+    /// drops on it makes of them: all of them on a single-socket input, the
+    /// pair's loss on a leg of a SMPTE 2022-7 input ([`SrtPair`]).
+    pub fn count_socket_drops(&self, socket: SrtInputSocket, delta: u64) {
+        let lost = match socket {
+            SrtInputSocket::Only => delta,
+            SrtInputSocket::Leg1 => self.pair.lost_at_poll(false, delta),
+            SrtInputSocket::Leg2 => self.pair.lost_at_poll(true, delta),
+        };
+        if lost > 0 {
+            self.count_recv_drops(lost);
+        }
+    }
+
     /// Count `delta` new too-late drops, as a stats poll reads them: always on
     /// this input, and on the flow too when the input is on air at that
     /// moment. A poll's delta covers the second since the previous one, so
@@ -3664,9 +3744,9 @@ impl SrtInputStats {
         }
         self.on_air_dropped.fetch_add(delta, Ordering::Relaxed);
         let flow = if self.rtp_framed.load(Ordering::Relaxed) {
-            &self.flow_dropped.rtp
+            &self.flow_dropped.gapped
         } else {
-            &self.flow_dropped.raw_ts
+            &self.flow_dropped.gapless
         };
         flow.fetch_add(delta, Ordering::Relaxed);
     }
@@ -3676,12 +3756,19 @@ impl SrtInputStats {
     }
 
     /// Negotiated receiver latency and RTT, for the `srt_recv_dropped`
-    /// reason's hint. libsrt's group stats carry neither (`bstatsSocket`
-    /// zeroes them), so a bonded input reads the highest of its connected
-    /// members'.
+    /// reason's hint: the higher of a SMPTE 2022-7 input's two legs'. libsrt's
+    /// group stats carry neither (`bstatsSocket` zeroes them), so a bonded
+    /// input reads the highest of its connected members'.
     fn latency_and_rtt(&self) -> Option<(i32, f64)> {
-        if let Some(s) = self.leg.borrow().as_ref() {
-            return Some((s.ms_recv_tsbpd_delay, s.rtt_ms));
+        let (leg, leg2) = (self.leg.borrow(), self.leg2.borrow());
+        let legs = leg
+            .as_ref()
+            .into_iter()
+            .chain(leg2.as_ref())
+            .map(|s| (s.ms_recv_tsbpd_delay, s.rtt_ms))
+            .reduce(|(l, r), (ml, mr)| (l.max(ml), r.max(mr)));
+        if legs.is_some() {
+            return legs;
         }
         let bonding = self.bonding.borrow();
         bonding
@@ -3809,9 +3896,6 @@ pub struct FlowStatsAccumulator {
     pub input_config_meta: std::sync::RwLock<Option<InputConfigMeta>>,
     /// Per-output config metadata for topology display (set once per output).
     pub output_config_meta: DashMap<String, OutputConfigMeta>,
-    /// Reserved for the SMPTE 2022-7 second SRT input leg. Nothing writes it
-    /// yet: the 2022-7 SRT path has no stats poller for either leg.
-    pub input_srt_leg2_stats_cache: Arc<watch::Sender<Option<SrtLegStats>>>,
     /// Shared bond stats handle for bonded inputs — the only input
     /// type that aggregates N paths at the transport layer.
     /// Populated by `engine::input_bonded::spawn_bonded_input`.
@@ -4024,7 +4108,6 @@ impl FlowStatsAccumulator {
             per_input_counters: DashMap::new(),
             input_config_meta: std::sync::RwLock::new(None),
             output_config_meta: DashMap::new(),
-            input_srt_leg2_stats_cache: Arc::new(watch::channel(None).0),
             input_bond_stats_handle: OnceLock::new(),
             input_rist_stats_handle: OnceLock::new(),
             input_rist_leg2_stats_handle: OnceLock::new(),
@@ -4444,13 +4527,15 @@ impl FlowStatsAccumulator {
     }
 
     /// Register a fresh SRT telemetry handle for `input_id` and return it for
-    /// the input's stats pollers to write. Called once per single-socket or
-    /// bonded SRT input at spawn by `crate::engine::input_srt::spawn_srt_input`,
-    /// so a re-added input's own drops count from zero.
+    /// the input's stats pollers to write. Called once per SRT input at spawn
+    /// by `crate::engine::input_srt::spawn_srt_input`, so a re-added input's
+    /// own drops count from zero.
     pub fn register_srt_input_stats(&self, input_id: &str) -> Arc<SrtInputStats> {
         let stats = Arc::new(SrtInputStats {
             input_id: input_id.to_string(),
             leg: Arc::new(watch::channel(None).0),
+            leg2: Arc::new(watch::channel(None).0),
+            pair: SrtPair::default(),
             bonding: Arc::new(watch::channel(None).0),
             recv_dropped: AtomicU64::new(0),
             on_air_dropped: AtomicU64::new(0),
@@ -4464,9 +4549,9 @@ impl FlowStatsAccumulator {
 
     /// Drop an input's SRT telemetry handle. Called by
     /// `FlowRuntime::remove_input`: an input re-added under the same id as
-    /// another kind (a 2022-7 SRT input, a UDP one) registers nothing, and
-    /// would go on reporting the removed incarnation's frozen drops, stats
-    /// and latency hint. What the flow counted while it was on air stays
+    /// another kind (a UDP one, say) registers nothing, and would go on
+    /// reporting the removed incarnation's frozen drops, stats and latency
+    /// hint. What the flow counted while it was on air stays
     /// counted.
     pub fn remove_srt_input_stats(&self, input_id: &str) {
         self.srt_input_stats.remove(input_id);
@@ -4723,8 +4808,9 @@ impl FlowStatsAccumulator {
         // its own `inputs_live[]` entry rather than turning the on-air flow
         // Error, and a Take neither brings a standby's history in nor takes
         // the old input's out.
-        let srt_rtp = self.srt_on_air_drops.rtp.load(Ordering::Relaxed);
-        let srt_dropped = srt_rtp.saturating_add(self.srt_on_air_drops.raw_ts.load(Ordering::Relaxed));
+        let srt_rtp = self.srt_on_air_drops.gapped.load(Ordering::Relaxed);
+        let srt_dropped =
+            srt_rtp.saturating_add(self.srt_on_air_drops.gapless.load(Ordering::Relaxed));
         let seq_loss = self.input_loss.load(Ordering::Relaxed).max(rist_loss);
         // An RTP-framed SRT payload shows each dropped packet as a sequence
         // gap as well, so `seq_loss` holds those drops already. What is left
@@ -5097,7 +5183,9 @@ impl FlowStatsAccumulator {
                     srt_stats: active_srt
                         .as_ref()
                         .and_then(|h| h.leg.borrow().clone()),
-                    srt_leg2_stats: self.input_srt_leg2_stats_cache.borrow().clone(),
+                    srt_leg2_stats: active_srt
+                        .as_ref()
+                        .and_then(|h| h.leg2.borrow().clone()),
                     srt_bonding_stats: active_srt
                         .as_ref()
                         .and_then(|h| h.bonding.borrow().clone()),
@@ -6608,7 +6696,7 @@ mod srt_input_stats_tests {
         let srt = flow.srt_input_stats.get(id).unwrap().value().clone();
         crate::srt::connection::publish_leg_stats(
             &srt.leg,
-            Some(&srt),
+            Some((&srt, SrtInputSocket::Only)),
             &mut 0,
             SrtLegStats {
                 pkt_recv_drop_total: new_drops,
@@ -6839,6 +6927,83 @@ mod srt_input_stats_tests {
         assert_eq!(snap.input.packets_lost, 310);
         let reason = srt_reason(&snap).unwrap();
         assert!(reason.contains("latency 200 ms, RTT 60 ms"), "{reason}");
+    }
+
+    /// One poll of a SMPTE 2022-7 leg whose socket's drop counter reads
+    /// `drop_total`, through the helper the leg pollers use, `last` being
+    /// that leg's poller's.
+    fn poll_leg(
+        flow: &FlowStatsAccumulator,
+        leg: SrtInputSocket,
+        last: &mut i64,
+        drop_total: i32,
+        rtt_ms: f64,
+    ) {
+        let srt = flow.srt_input_stats.get("pair").unwrap().value().clone();
+        let cache = if leg == SrtInputSocket::Leg2 { &srt.leg2 } else { &srt.leg };
+        crate::srt::connection::publish_leg_stats(
+            cache,
+            Some((&srt, leg)),
+            last,
+            SrtLegStats {
+                pkt_recv_drop_total: drop_total,
+                ms_recv_tsbpd_delay: 120,
+                rtt_ms,
+                ..Default::default()
+            },
+        );
+    }
+
+    /// RTP legs merge on the sequence number: a drop on one leg is filled
+    /// from the other, so the legs' drops stay in their own stats and the
+    /// flow counts only what neither leg delivered, once, whichever leg's
+    /// poll takes it.
+    #[test]
+    fn a_merged_2022_7_pair_counts_only_what_neither_leg_delivered() {
+        let flow = flow_with_srt_inputs(&["pair"]);
+        let srt = flow.srt_input_stats.get("pair").unwrap().value().clone();
+        srt.pair.set_merged(true);
+        let (mut last1, mut last2) = (0, 0);
+        poll_leg(&flow, SrtInputSocket::Leg1, &mut last1, 50, 20.0);
+        poll_leg(&flow, SrtInputSocket::Leg2, &mut last2, 30, 90.0);
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.packets_lost, 0, "the legs' drops were filled");
+        assert!(srt_reason(&snap).is_none(), "{:?}", codes(&snap));
+        assert_eq!(own_drops(&snap, "pair"), Some(0));
+        assert_eq!(snap.input.srt_stats.as_ref().map(|s| s.pkt_recv_drop_total), Some(50));
+        assert_eq!(snap.input.srt_leg2_stats.as_ref().map(|s| s.pkt_recv_drop_total), Some(30));
+
+        srt.pair.add_lost(4);
+        poll_leg(&flow, SrtInputSocket::Leg2, &mut last2, 31, 90.0);
+        poll_leg(&flow, SrtInputSocket::Leg1, &mut last1, 60, 20.0);
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.packets_lost, 4);
+        assert_eq!(own_drops(&snap, "pair"), Some(4));
+        let reason = srt_reason(&snap).expect("the pair's loss is SRT's");
+        assert!(reason.contains("4 packets"), "{reason}");
+        // The hint is the slower of the two legs.
+        assert!(reason.contains("RTT 90 ms"), "{reason}");
+    }
+
+    /// Raw TS carries no shared sequence, so the legs fail over rather than
+    /// merge: the drops of the leg forwarded reached air, the standby's did
+    /// not, and a failover moves which is which.
+    #[test]
+    fn a_failover_2022_7_pair_counts_the_forwarded_legs_drops() {
+        let flow = flow_with_srt_inputs(&["pair"]);
+        let srt = flow.srt_input_stats.get("pair").unwrap().value().clone();
+        srt.pair.set_merged(false);
+        let (mut last1, mut last2) = (0, 0);
+        poll_leg(&flow, SrtInputSocket::Leg1, &mut last1, 10, 20.0);
+        poll_leg(&flow, SrtInputSocket::Leg2, &mut last2, 99, 90.0);
+        assert_eq!(flow.snapshot().input.packets_lost, 10);
+
+        srt.pair.set_forwarding_leg2(true);
+        poll_leg(&flow, SrtInputSocket::Leg2, &mut last2, 104, 90.0);
+        poll_leg(&flow, SrtInputSocket::Leg1, &mut last1, 110, 20.0);
+        let snap = flow.snapshot();
+        assert_eq!(snap.input.packets_lost, 15);
+        assert_eq!(own_drops(&snap, "pair"), Some(15));
     }
 
     /// Group stats carry no latency or RTT; a bonded input's hint reads its

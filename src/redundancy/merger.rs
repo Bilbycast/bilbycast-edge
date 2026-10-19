@@ -91,6 +91,13 @@ pub struct HitlessMerger {
     /// Sized once to `window / 64` words. An advance clears the slots it
     /// uncovers rather than shifting.
     emitted: Box<[u64]>,
+    /// How many slots, counting back from `highest_seq`, hold a seq from
+    /// the current anchor on: the rest have held nothing yet, so a clear
+    /// bit there is no loss.
+    covered: u16,
+    /// Seqs that left the window behind `highest_seq` without either leg
+    /// delivering them.
+    lost: u64,
     /// Which leg last provided the forwarded packet.
     active_leg: ActiveLeg,
     /// Whether we've forwarded at least one packet.
@@ -124,10 +131,22 @@ impl HitlessMerger {
             highest_seq: 0,
             highest_slot: 0,
             emitted: vec![0u64; (window / 64) as usize].into_boxed_slice(),
+            covered: 0,
+            lost: 0,
             active_leg: ActiveLeg::None,
             initialized: false,
             window,
         }
+    }
+
+    /// Seqs that left the gap-fill window without either leg delivering
+    /// them, since the merger was created: the packets this pair lost.
+    /// A packet that arrives after its seq has left the window is dropped
+    /// as too late, so it is counted too. A gap of a whole window or more
+    /// is a stream reset, not loss, and starts the count afresh from the
+    /// new anchor.
+    pub fn lost(&self) -> u64 {
+        self.lost
     }
 
     /// The slot `ahead` seqs past `highest_seq` (`ahead < window`).
@@ -170,18 +189,28 @@ impl HitlessMerger {
         self.highest_seq = seq;
         self.highest_slot = 0;
         self.set_emitted(0, true);
+        self.covered = 1;
     }
 
     /// Advance `highest_seq` by `forward` (`0 < forward < window`) to
     /// `seq`, emitted. The `forward - 1` seqs skipped are left clear so the
-    /// other leg can still fill them.
+    /// other leg can still fill them. Each slot reused held the seq one
+    /// window earlier, which leaves the window now: if no leg delivered
+    /// it, it is lost.
     fn advance(&mut self, seq: u16, forward: u16) {
+        // Slots `ahead` of the old highest hold seqs from the anchor on
+        // only once `ahead` reaches past the slots not yet covered.
+        let uncovered = self.window - self.covered;
         for ahead in 1..=forward {
             let slot = self.slot_ahead(ahead);
+            if ahead > uncovered && !self.is_emitted(slot) {
+                self.lost += 1;
+            }
             self.set_emitted(slot, ahead == forward);
         }
         self.highest_slot = self.slot_ahead(forward) as u16;
         self.highest_seq = seq;
+        self.covered = self.covered.saturating_add(forward).min(self.window);
     }
 
     /// Attempt to merge an incoming packet from the given leg.
@@ -321,6 +350,7 @@ mod tests {
         assert_eq!(merger.try_merge(65_472, ActiveLeg::Leg2), None);
         assert_eq!(merger.try_merge(0, ActiveLeg::Leg2), None);
         assert_eq!(merger.try_merge(65_535, ActiveLeg::Leg2), None);
+        assert_eq!(merger.lost(), 0);
     }
 
     /// The window decides how far behind a gap can still be filled.
@@ -336,7 +366,65 @@ mod tests {
             // 80 behind: inside a 128-slot window, outside a 64-slot one.
             let filled = merger.try_merge(20, ActiveLeg::Leg2).is_some();
             assert_eq!(filled, fillable, "window {window}");
+            assert_eq!(merger.lost(), u64::from(!fillable), "window {window}");
         }
+    }
+
+    /// A seq is lost when it leaves the window with neither leg having
+    /// delivered it — not before, and not when the other leg filled it.
+    #[test]
+    fn test_lost_counts_only_what_neither_leg_delivered() {
+        let mut merger = HitlessMerger::with_window(64);
+        for seq in 0..=73u16 {
+            if seq != 10 && seq != 20 {
+                merger.try_merge(seq, ActiveLeg::Leg1);
+            }
+        }
+        // Leg 2 fills 20; 10 is still inside the window, so not yet lost.
+        assert_eq!(merger.try_merge(20, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
+        assert_eq!(merger.lost(), 0);
+        // 74 pushes 10 out of the window.
+        merger.try_merge(74, ActiveLeg::Leg1);
+        assert_eq!(merger.lost(), 1);
+        // Its copy arriving now is too late to forward, and lost once.
+        assert_eq!(merger.try_merge(10, ActiveLeg::Leg2), None);
+        for seq in 75..=200u16 {
+            merger.try_merge(seq, ActiveLeg::Leg1);
+        }
+        assert_eq!(merger.lost(), 1, "20 was filled by leg 2");
+    }
+
+    /// The bitmap's slots before the first packet held no seq: the first
+    /// window after the anchor is no loss, nor is a skip counted twice.
+    #[test]
+    fn test_lost_starts_at_the_anchor() {
+        let mut merger = HitlessMerger::with_window(64);
+        for seq in 1000..1200u16 {
+            merger.try_merge(seq, ActiveLeg::Leg1);
+        }
+        assert_eq!(merger.lost(), 0);
+        // A forward skip of 3 leaves 1200 and 1201 to the other leg …
+        merger.try_merge(1202, ActiveLeg::Leg1);
+        assert_eq!(merger.lost(), 0);
+        // … and once they leave the window unfilled, they are lost.
+        for seq in 1203..1300u16 {
+            merger.try_merge(seq, ActiveLeg::Leg1);
+        }
+        assert_eq!(merger.lost(), 2);
+    }
+
+    /// A jump of a whole window or more is a stream reset, not loss.
+    #[test]
+    fn test_a_stream_reset_is_not_loss() {
+        let mut merger = HitlessMerger::with_window(64);
+        for seq in 0..10u16 {
+            merger.try_merge(seq, ActiveLeg::Leg1);
+        }
+        merger.try_merge(5_000, ActiveLeg::Leg1);
+        for seq in 5_001..5_200u16 {
+            merger.try_merge(seq, ActiveLeg::Leg1);
+        }
+        assert_eq!(merger.lost(), 0);
     }
 
     #[test]

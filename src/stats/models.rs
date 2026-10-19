@@ -555,8 +555,11 @@ pub struct PerInputLive {
     /// cuts to it; only the drops it makes while on air reach
     /// `InputStats.packets_lost` and the flow health.
     ///
-    /// **`None` means "not measured"** — not an SRT input, or a SMPTE 2022-7
-    /// SRT input, which has no stats poller. It never means zero drops.
+    /// On a SMPTE 2022-7 SRT input this is what the pair lost, not the sum of
+    /// its legs' drops (see `InputStats.packets_lost`).
+    ///
+    /// **`None` means "not measured"** — not an SRT input. It never means
+    /// zero drops.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub srt_recv_dropped: Option<u64>,
     /// Lightweight PAT/PMT catalogue observed on this input. `None` on
@@ -767,21 +770,27 @@ pub struct InputStats {
     /// larger), plus the packets an SRT input's receiver dropped for missing
     /// the TSBPD deadline while it was on air (libsrt `pktRcvDropTotal`,
     /// summed across reconnects). An RTP-framed SRT payload's drops are
-    /// sequence gaps as well and are not added twice. Only ever grows: a
-    /// Take neither brings the new input's earlier drops in nor takes the old
-    /// input's out.
+    /// sequence gaps as well and are not added twice. On a SMPTE 2022-7 SRT
+    /// input a leg's drops are not loss while the other leg delivers the
+    /// packet: what counts is what the pair lost — with RTP the packets
+    /// neither leg delivered, with raw TS the drops of the leg its failover
+    /// forwards. Only ever grows: a Take neither brings the new input's
+    /// earlier drops in nor takes the old input's out.
     pub packets_lost: u64,
     /// Packets dropped by ingress filters (source IP, payload type, rate limit).
     pub packets_filtered: u64,
     /// Number of lost packets successfully recovered via SMPTE 2022-1 FEC.
     pub packets_recovered_fec: u64,
     /// SRT-level statistics of the active input's connection, when that is a
-    /// single-socket SRT input. Absent while it reconnects, and on a bonded
-    /// input (see `srt_bonding_stats`) or a SMPTE 2022-7 one (no poller).
+    /// single-socket SRT input, or of its leg 1 when it is a SMPTE 2022-7
+    /// one. Absent while it reconnects, and on a bonded input (see
+    /// `srt_bonding_stats`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srt_stats: Option<SrtLegStats>,
-    /// Reserved for the SMPTE 2022-7 second SRT input leg; no SRT input
-    /// publishes it yet.
+    /// SRT-level statistics of leg 2 (the `redundancy` leg) of the active
+    /// input, when that is a SMPTE 2022-7 SRT input whose leg 2 is
+    /// connected. Each leg's `pkt_recv_drop_total` is that leg's own; see
+    /// `packets_lost` for what the pair lost.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub srt_leg2_stats: Option<SrtLegStats>,
     /// RIST-level statistics for the primary input leg (if RIST transport).

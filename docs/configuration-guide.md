@@ -3546,7 +3546,9 @@ Common configurations:
 
 Both SRT input and SRT output support SMPTE 2022-7 hitless redundancy via a second SRT leg. The parent SRT config defines leg 1; the `redundancy` block defines leg 2.
 
-For input: packets from both legs are merged using RTP sequence numbers, providing seamless failover if one path fails.
+For input: packets from both legs are merged using RTP sequence numbers, providing seamless failover if one path fails. A raw-TS payload carries no sequence number the legs share, so it runs active-leg failover instead: the edge forwards one leg and switches to the other when the forwarded leg falls silent for 50 ms.
+
+Each leg reports its own SRT stats — `srt_stats` is leg 1, `srt_leg2_stats` leg 2, each with that leg's own `pkt_recv_drop_total`. A packet one leg drops is no loss while the other leg delivers it, so the input's `packets_lost` and `srt_recv_dropped` count what the pair lost: with RTP, the packets neither leg delivered (a gap still unfilled 1024 sequence numbers later); with raw TS, the drops of the leg being forwarded.
 
 For output: packets are duplicated and sent on both legs simultaneously.
 

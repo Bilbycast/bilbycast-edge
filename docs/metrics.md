@@ -49,7 +49,7 @@ Emitted unconditionally at the top of every scrape.
 | `bilbycast_edge_flow_input_packets_total` | counter | `flow_id` | Packets received on the active input. |
 | `bilbycast_edge_flow_input_bytes_total` | counter | `flow_id` | Bytes received on the active input. |
 | `bilbycast_edge_flow_input_bitrate_bps` | gauge | `flow_id` | Input bitrate estimate (bits/sec). |
-| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Packets that never reached the flow since it started, each counted once: sequence gaps, plus the too-late drops SRT inputs made while on air (libsrt `pktRcvDropTotal`, summed across reconnects; on an assembled flow, each of its own inputs the assembler plays from — a Switch slot's current leg, the leg a Hitless slot's merger is forwarding — while a slot sourced from another flow's input counts on the flow that owns it). The SRT term is counted on single-socket and bonded SRT inputs — not on SMPTE 2022-7 redundant SRT inputs, which have no stats poller. Each once-a-second stats poll counts its drops against the flow only while its input is on air, so a warm standby's drops stay out of it and a Take or a Hitless failover neither adds the new input's history nor removes the old input's: the counter never decreases. |
+| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Packets that never reached the flow since it started, each counted once: sequence gaps, plus the too-late drops SRT inputs made while on air (libsrt `pktRcvDropTotal`, summed across reconnects; on an assembled flow, each of its own inputs the assembler plays from — a Switch slot's current leg, the leg a Hitless slot's merger is forwarding — while a slot sourced from another flow's input counts on the flow that owns it). On a SMPTE 2022-7 redundant SRT input the SRT term is what the pair lost, not its legs' drops: with RTP the packets neither leg delivered, with raw TS the drops of the leg its failover forwards. Each once-a-second stats poll counts its drops against the flow only while its input is on air, so a warm standby's drops stay out of it and a Take or a Hitless failover neither adds the new input's history nor removes the old input's: the counter never decreases. |
 | `bilbycast_edge_flow_input_fec_recovered_total` | counter | `flow_id` | Packets recovered by 2022-1 FEC. |
 | `bilbycast_edge_flow_output_packets_total` | counter | `flow_id,output_id` | Packets emitted per output. |
 | `bilbycast_edge_flow_output_bytes_total` | counter | `flow_id,output_id` | Bytes emitted per output. |
@@ -89,8 +89,9 @@ Two families only. Labels are `flow_id` plus `leg` — there is **no**
 `srt_loss_total` currently has no 2022-7 arm: it is emitted for the primary
 input leg and for `leg="leg1"` on outputs only, so a leg2 loss series does
 not exist even though `srt_rtt_ms` has one. `leg="input"` is the **active**
-input's socket, and only when that is a single-socket SRT input — a bonded
-or 2022-7 input emits neither series. `pkt_loss_total` is libsrt's per-socket
+input's socket when that is a single-socket SRT input, and its leg 1 when it
+is a 2022-7 one, whose leg 2 is `leg="input_leg2"`; a bonded input emits
+neither series. `pkt_loss_total` is libsrt's per-socket
 total, so it restarts at every reconnect and at every Take to another SRT
 input, which `rate()` reads as a counter reset. Sender-retransmit and
 receiver-recovery counters are **not** on `/metrics` at all — they ride the
