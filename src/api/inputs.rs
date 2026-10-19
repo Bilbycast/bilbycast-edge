@@ -58,6 +58,7 @@ pub async fn create_input(
     Json(input): Json<InputDefinition>,
 ) -> Result<Json<ApiResponse<InputDefinition>>, ApiError> {
     validate_input_definition(&input)
+        .and_then(|()| crate::config::validation::validate_new_input_id(&input.id))
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
     let mut config = state.config.write().await;
@@ -225,7 +226,8 @@ mod update_input_tests {
     //! after even a successful edit. It now runs the `update_input` command's
     //! rebuild (`restart_flow_for_input_update`, whose outcomes are pinned by
     //! `update_input_restart_tests` in `manager::client`); these pin that the
-    //! REST mirror does.
+    //! REST mirror does. `post_refuses_a_reserved_input_id` borrows the same
+    //! state for `POST`.
     use super::*;
     use std::path::Path as FsPath;
     use std::sync::Arc;
@@ -335,6 +337,26 @@ mod update_input_tests {
         )
         .await
         .map(|Json(response)| response.data.expect("an update answers with the input"))
+    }
+
+    /// `POST /api/v1/inputs` refuses an id that takes the prefix of the
+    /// Hitless mergers' bus keys, and creates any other.
+    #[tokio::test]
+    async fn post_refuses_a_reserved_input_id() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = running_flow(dir.path(), vec![udp_input("a", 41877)]).await;
+        let post =
+            |id: &str| create_input(State(state.clone()), RequireAdmin, Json(udp_input(id, 41878)));
+
+        let refused = post("hitless:cam1").await;
+        assert!(
+            matches!(&refused, Err(ApiError::BadRequest(m)) if m.contains("input_id_reserved")),
+            "a reserved id must be refused with 400"
+        );
+        assert!(!state.config.read().await.inputs.iter().any(|i| i.id == "hitless:cam1"));
+        let created = post("cam1").await.unwrap_or_else(|_| panic!("any other id is created"));
+        assert_eq!(created.0.data.map(|i| i.id).as_deref(), Some("cam1"));
+        let _ = state.flow_manager.destroy_flow("f1").await;
     }
 
     /// The edit asks for a port something else holds, so the flow cannot run

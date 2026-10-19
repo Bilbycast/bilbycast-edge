@@ -3662,6 +3662,62 @@ mod tests {
         assert_eq!(audio_seen, 2, "both audio packets must surface on out_pid 0x201");
     }
 
+    /// A Pid slot on an input whose id starts with `hitless:`, the Hitless
+    /// mergers' key prefix: its fan-in subscribes before the input's first
+    /// packet, and the packets the input then publishes are assembled. The
+    /// bus judged its key a released merger output by the prefix alone and
+    /// handed the fan-in a closed channel, so the slot stayed dark for the
+    /// flow's life (`pid_bus_slot_source_closed`).
+    #[tokio::test]
+    async fn a_slot_on_an_input_named_like_a_merger_key_is_fed() {
+        let bus = Arc::new(NodeEsBus::new());
+        let (tx, mut rx) = broadcast::channel::<RtpPacket>(32);
+        let cancel = CancellationToken::new();
+        // A failed assertion still stops the assembler.
+        let _stop = cancel.clone().drop_guard();
+        let plan = AssemblyPlan {
+            programs: vec![ProgramPlan {
+                program_number: 1,
+                pmt_pid: 0x1000,
+                pcr_source: ("hitless:cam1".to_string(), 0x100),
+                slots: vec![slot("hitless:cam1", 0x100, 0x200, 0x1B)],
+            }],
+        };
+        let handle = spawn_spts_assembler(plan, bus.clone(), tx, cancel.clone(), None, String::new(), None, None, None, Default::default()).join;
+        // The startup PSI: the fan-in has subscribed, before any packet.
+        let _ = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
+
+        // The input's first packet makes its channel, as its demuxer does.
+        let video_tx = bus.sender_for("hitless:cam1", 0x100, 0x1B);
+        for i in 0..7u8 {
+            video_tx
+                .send(EsPacket {
+                    source_pid: 0x100,
+                    stream_type: 0x1B,
+                    payload: ts_es(0x100, i == 0, i, 0x10 + i),
+                    is_pusi: i == 0,
+                    has_pcr: false,
+                    pcr: None,
+                    recv_time_us: 0,
+                    upstream_seq: None,
+                })
+                .expect("the fan-in reads the input's channel");
+        }
+        let mut video_seen = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
+        while tokio::time::Instant::now() < deadline && video_seen < 7 {
+            if let Ok(Ok(bundle)) =
+                tokio::time::timeout(Duration::from_millis(30), rx.recv()).await
+            {
+                let video = bundle.data.chunks_exact(TS_PACKET_SIZE).filter(|p| ts_pid(p) == 0x200);
+                video_seen += video.count();
+            }
+        }
+        cancel.cancel();
+        handle.await.unwrap();
+        assert_eq!(video_seen, 7, "the slot forwards its input's packets on out_pid 0x200");
+    }
+
     #[tokio::test]
     async fn assembler_mpts_emits_pat_with_two_programs_and_two_pmts() {
         let bus = Arc::new(NodeEsBus::new());

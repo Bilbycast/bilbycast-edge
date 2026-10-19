@@ -271,7 +271,7 @@ Retrieve a single input's full `InputDefinition`. **Auth:** any role. Returns 40
 
 ### POST /api/v1/inputs
 
-Create a new input definition. **Auth:** `admin`. Body is an `InputDefinition`. Validated and persisted. Returns 400 on validation failure, 409 if the ID is already used by an input or an output.
+Create a new input definition. **Auth:** `admin`. Body is an `InputDefinition`. Validated and persisted. Returns 400 on validation failure — an `id` starting with `hitless:`, reserved for the Hitless mergers' PID-bus keys, included (`input_id_reserved`) — 409 if the ID is already used by an input or an output.
 
 ### PUT /api/v1/inputs/{input_id}
 
@@ -1226,7 +1226,7 @@ A complete `AppConfig` JSON object (see [Configuration Guide](configuration-guid
 
 Returns the new configuration with infrastructure secrets stripped (flow parameters preserved).
 
-A Hitless slot that validation refuses but an earlier release accepted is repaired rather than refused, as at load, and the response carries the repair: a `seq_aware` slot with a leg that reaches the PID bus without an upstream sequence number is switched to `primary_preference` (Warning `config` event `hitless_seq_aware_leg_unsequenced` — see [events-and-alarms.md](events-and-alarms.md)), and a primary-preference slot's `reorder_window` is dropped (a warning log line).
+A Hitless slot that validation refuses but an earlier release accepted is repaired rather than refused, as at load, and the response carries the repair: a `seq_aware` slot with a leg that reaches the PID bus without an upstream sequence number is switched to `primary_preference` (Warning `config` event `hitless_seq_aware_leg_unsequenced` — see [events-and-alarms.md](events-and-alarms.md)), and a primary-preference slot's `reorder_window` is dropped (a warning log line). An input whose `id` starts with `hitless:`, which a new input is refused, is kept, with a Warning `config` event `input_id_reserved`.
 
 **Error responses:**
 

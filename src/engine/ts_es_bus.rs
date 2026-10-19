@@ -244,15 +244,17 @@ impl NodeEsBus {
     /// exists and is reused (capacity is fixed at construction).
     ///
     /// A Hitless slot's merger output
-    /// ([`crate::engine::ts_es_hitless::hitless_bus_key`]) is the exception:
-    /// only its merger creates it, before anything reads it, so one that is
-    /// absent has been released — its flow stopped, or a plan swap dropped
-    /// the slot — and its subscriber gets a channel that is already closed.
-    /// Created again here, it would be held by nothing that releases it: an
-    /// analyzer or fan-in started as the flow stopped kept an 8 192-slot
-    /// ring for the life of the node.
+    /// ([`crate::engine::ts_es_hitless::hitless_bus_key`], told by its whole
+    /// shape — [`crate::engine::ts_es_hitless::is_hitless_bus_key`] — so an
+    /// input whose id merely starts with `hitless:` is an input key like any)
+    /// is the exception: only its merger creates it, before anything reads
+    /// it, so one that is absent has been released — its flow stopped, or a
+    /// plan swap dropped the slot — and its subscriber gets a channel that is
+    /// already closed. Created again here, it would be held by nothing that
+    /// releases it: an analyzer or fan-in started as the flow stopped kept an
+    /// 8 192-slot ring for the life of the node.
     pub fn subscribe(&self, input_id: &str, source_pid: u16) -> broadcast::Receiver<EsPacket> {
-        if input_id.starts_with(crate::engine::ts_es_hitless::HITLESS_INPUT_PREFIX) {
+        if crate::engine::ts_es_hitless::is_hitless_bus_key(input_id, source_pid) {
             return match self.channels.get(&(input_id.to_string(), source_pid)) {
                 Some(tx) => tx.value().subscribe(),
                 None => broadcast::channel(1).0.subscribe(),

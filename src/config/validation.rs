@@ -707,6 +707,30 @@ pub fn validate_input_definition(def: &InputDefinition) -> Result<()> {
     Ok(())
 }
 
+/// Refuse `id` for a new input when it starts with
+/// [`crate::engine::ts_es_hitless::HITLESS_INPUT_PREFIX`], the prefix of the
+/// PID-bus keys Hitless slots' mergers publish onto. An input id of their
+/// whole shape ([`crate::engine::ts_es_hitless::is_hitless_bus_key`]) is
+/// told from a merger's key by its PID alone, and a key of that shape is
+/// handed no bus channel before its first packet; reserving the prefix keeps
+/// input keys out of the shape altogether. Called where an input is
+/// created — `POST /api/v1/inputs`, the WS `create_input`, and the WS
+/// `add_input` of one the node does not have — and not by
+/// [`validate_input_definition`], which an edit of an existing input and a
+/// whole config go through too: an input an earlier release accepted keeps
+/// its id, and a whole config holding one is warned of instead
+/// ([`repair_hitless_slots`]).
+pub fn validate_new_input_id(id: &str) -> Result<()> {
+    let prefix = crate::engine::ts_es_hitless::HITLESS_INPUT_PREFIX;
+    if id.starts_with(prefix) {
+        bail!(
+            "Input ID '{id}' starts with '{prefix}', which is reserved for the PID-bus keys of \
+             Hitless slots' mergers — choose another (input_id_reserved)"
+        );
+    }
+    Ok(())
+}
+
 /// Reject `ingress_delay_ms` values outside the supported 0..=1000
 /// envelope. Per-input field, only meaningful on the input variants that
 /// expose it (UDP, RTP, SRT, RTMP, RTSP).
@@ -4656,7 +4680,8 @@ pub fn repair_hitless_seq_aware_legs(
     repaired
 }
 
-/// What [`repair_hitless_slots`] changed in a whole config.
+/// What [`repair_hitless_slots`] changed in a whole config, and what it
+/// found but left alone.
 #[derive(Default)]
 pub struct HitlessRepairs {
     /// Seq-aware slots switched to primary preference
@@ -4665,11 +4690,18 @@ pub struct HitlessRepairs {
     /// Flows a `reorder_window` was dropped from
     /// ([`repair_hitless_reorder_windows`]).
     pub reorder_windows: Vec<String>,
+    /// Inputs whose id takes the prefix [`validate_new_input_id`] reserves.
+    /// Reported, not repaired — an input's id is the operator's to change —
+    /// so not counted by [`HitlessRepairs::is_empty`], which decides whether
+    /// a repaired config is written back.
+    pub reserved_input_ids: Vec<String>,
 }
 
 /// Repair the Hitless slots of a whole config that validation refuses but
 /// earlier releases accepted — [`repair_hitless_reorder_windows`], then
-/// [`repair_hitless_seq_aware_legs`] — and say what changed.
+/// [`repair_hitless_seq_aware_legs`] — and say what changed, and which inputs
+/// hold an id [`validate_new_input_id`] would refuse a new input, which are
+/// left as they are and only reported.
 ///
 /// Every route that takes a whole config runs it before validating: the
 /// load, `POST /api/v1/config/reload`, `PUT /api/v1/config` and the WS
@@ -4682,10 +4714,14 @@ pub struct HitlessRepairs {
 pub fn repair_hitless_slots(config: &mut crate::config::models::AppConfig) -> HitlessRepairs {
     let reorder_windows = repair_hitless_reorder_windows(config);
     let seq_aware = repair_hitless_seq_aware_legs(config);
-    HitlessRepairs { seq_aware, reorder_windows }
+    let prefix = crate::engine::ts_es_hitless::HITLESS_INPUT_PREFIX;
+    let reserved_input_ids =
+        config.inputs.iter().filter(|i| i.id.starts_with(prefix)).map(|i| i.id.clone()).collect();
+    HitlessRepairs { seq_aware, reorder_windows, reserved_input_ids }
 }
 
 impl HitlessRepairs {
+    /// Whether nothing was repaired.
     pub fn is_empty(&self) -> bool {
         self.seq_aware.is_empty() && self.reorder_windows.is_empty()
     }
@@ -4717,6 +4753,22 @@ impl HitlessRepairs {
                 "flow '{flow_id}': dropped `reorder_window` from a Hitless slot whose mode is not \
                  \"seq_aware\" — the primary-preference merger has no reorder window, so it never \
                  had an effect. Set mode \"seq_aware\" to size the merge."
+            );
+        }
+        for input_id in &self.reserved_input_ids {
+            let prefix = crate::engine::ts_es_hitless::HITLESS_INPUT_PREFIX;
+            let message = format!(
+                "input '{input_id}': its id starts with '{prefix}', which is reserved for the \
+                 PID-bus keys of Hitless slots' mergers, so a new input is refused such an id. \
+                 This one is kept and runs as it is; rename it."
+            );
+            tracing::warn!("{message}");
+            events.emit_input_with_details(
+                crate::manager::events::EventSeverity::Warning,
+                crate::manager::events::category::CONFIG,
+                message,
+                input_id,
+                serde_json::json!({ "error_code": "input_id_reserved", "input_id": input_id }),
             );
         }
     }
@@ -10997,6 +11049,40 @@ mod tests {
         assert_eq!(details["repaired_to"], "primary_preference");
         assert_eq!((details["leg"].as_str(), details["input_id"].as_str()), (Some("backup"), Some("in-b")));
         assert!(repair_hitless_slots(&mut config).is_empty(), "nothing left to repair");
+    }
+
+    /// An input id that takes the Hitless mergers' key prefix is refused a
+    /// new input, but a whole config holding one — an earlier release
+    /// accepted it — validates, and is reported, as a Warning `config` event
+    /// naming the input, rather than refused or left unsaid; nothing is
+    /// repaired, so nothing is written back.
+    #[test]
+    fn a_reserved_input_id_is_refused_new_and_warned_of_in_a_whole_config() {
+        let err = validate_new_input_id("hitless:cam1").expect_err("a reserved id");
+        assert!(err.to_string().contains("input_id_reserved"), "{err}");
+        validate_new_input_id("cam1").expect("any other id");
+
+        let mut config = crate::config::models::AppConfig {
+            inputs: vec![serde_json::from_value(serde_json::json!({
+                "id": "hitless:cam1", "name": "cam1", "type": "udp", "bind_addr": "127.0.0.1:41879"
+            }))
+            .expect("input fixture")],
+            ..Default::default()
+        };
+        let repairs = repair_hitless_slots(&mut config);
+        validate_config(&config).expect("a whole config keeps it");
+        assert_eq!(repairs.reserved_input_ids, ["hitless:cam1"]);
+        assert!(repairs.is_empty(), "nothing repaired, nothing to write back");
+
+        let (sender, mut events) = crate::manager::events::event_channel();
+        repairs.report(&sender);
+        let reported: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(reported.len(), 1);
+        let event = &reported[0];
+        assert_eq!(event.severity, crate::manager::events::EventSeverity::Warning);
+        assert_eq!(event.category, "config");
+        assert_eq!(event.input_id.as_deref(), Some("hitless:cam1"));
+        assert_eq!(event.details.as_ref().unwrap()["error_code"], "input_id_reserved");
     }
 
     #[test]

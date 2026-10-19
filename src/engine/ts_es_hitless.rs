@@ -202,6 +202,37 @@ pub fn hitless_bus_key(scope: &str, uid: &str) -> (String, u16) {
     (format!("{HITLESS_INPUT_PREFIX}{scope}:{uid}"), 0)
 }
 
+/// Whether `(input_id, source_pid)` has the whole shape of a Hitless slot's
+/// merger output, as [`hitless_bus_key`] builds it from a flow run's
+/// [`hitless_scope`] and a slot uid —
+/// `("hitless:{flow_id}:{generation}:slot_{program_idx}_{slot_idx}", 0)`,
+/// the generation and both indexes decimal. [`NodeEsBus::subscribe`] mints
+/// no such key. Judged on the
+/// prefix alone, it minted none for an input whose id only starts with it
+/// (`hitless:cam1`): subscribed before the input's first packet, a Pid slot
+/// on it was handed a closed channel and stayed dark for the flow's life.
+/// An input id can still take the whole shape, and is then told from a
+/// merger's key by its PID alone — a merger's is 0, which no slot reads of an
+/// input, validation holding a slot's `source_pid` to 0x0010–0x1FFE — so
+/// validation refuses the prefix on a new input
+/// ([`crate::config::validation::validate_new_input_id`]).
+pub fn is_hitless_bus_key(input_id: &str, source_pid: u16) -> bool {
+    let decimal = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let Some((scope, uid)) =
+        input_id.strip_prefix(HITLESS_INPUT_PREFIX).and_then(|rest| rest.rsplit_once(':'))
+    else {
+        return false;
+    };
+    let Some((flow_id, generation)) = scope.rsplit_once(':') else {
+        return false;
+    };
+    let slot = uid.strip_prefix("slot_").and_then(|indexes| indexes.split_once('_'));
+    source_pid == 0
+        && !flow_id.is_empty()
+        && decimal(generation)
+        && slot.is_some_and(|(program, slot)| decimal(program) && decimal(slot))
+}
+
 /// How long a seq-aware Hitless leg's input holds each packet, by its
 /// configuration, before the packet reaches the bus: an RTP input's own
 /// 2022-7 hold and ingress buffering
@@ -1681,6 +1712,29 @@ mod tests {
         drain(&mut forwarded).await;
         assert_eq!(forwarded, every_packet(1172..1175));
         cancel.cancel();
+    }
+
+    /// A merger's key is told by its whole shape: a run's scope, a slot uid
+    /// and PID 0. An input id that only starts with the prefix is not one —
+    /// judged on the prefix, `hitless:cam1` was refused a channel before its
+    /// first packet — and neither is an input key of the shape at an ES PID.
+    #[test]
+    fn a_hitless_key_is_told_by_its_whole_shape() {
+        let (key, pid) = hitless_bus_key(&hitless_scope("f:1"), "slot_2_10");
+        assert!(is_hitless_bus_key(&key, pid), "{key}");
+        assert!(!is_hitless_bus_key(&key, 0x100), "an ES PID");
+        for id in [
+            "hitless:cam1",
+            "hitless:f1:slot_0_0",
+            "hitless::0:slot_0_0",
+            "hitless:f1:x:slot_0_0",
+            "hitless:f1:0:slot_0",
+            "hitless:f1:0:slot_0_a",
+            "hitless:f1:0:uid",
+            "cam1:0:slot_0_0",
+        ] {
+            assert!(!is_hitless_bus_key(id, 0), "{id}");
+        }
     }
 
     /// A primary-preference Hitless slot `uid` of the flow run `scope`, over

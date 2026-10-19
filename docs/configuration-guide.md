@@ -982,6 +982,8 @@ sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge
 
 Each entry in the top-level `inputs` array is an `InputDefinition` with `id`, `name`, and the protocol-specific fields flattened in (enum-tagged by `type`). Inputs are independent top-level entities that exist whether or not they are assigned to a flow. They are managed via REST at `/api/v1/inputs` (CRUD) and via manager WebSocket commands.
 
+An input `id` may not start with `hitless:`, the prefix of the PID-bus keys Hitless slots' mergers publish onto (`hitless:{flow_id}:{generation}:slot_{p}_{s}`): `POST /api/v1/inputs`, the WS `create_input` and an `add_input` of a new input refuse it (`input_id_reserved`). A whole config that already holds one — at load, on `POST /api/v1/config/reload` or `PUT /api/v1/config`, or in a manager `update_config` push — keeps it, with a Warning `config` event naming the input; it runs as any input does, a merger's key being told by its whole shape and PID 0.
+
 Every input also carries `active` (boolean, default `true`) and `group`
 (string, max 64 chars, default `null` — free-form tag for UI grouping). At most
 one input per flow is active — the rest run warm-passive — and the switch is

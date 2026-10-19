@@ -3055,11 +3055,20 @@ async fn execute_command(
                     .map_err(|e| format!("Invalid input config: {e}"))?;
             validate_input_definition(&input)
                 .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
-            // What the node's config must allow of the input: no port another
-            // entity holds, and, the flow taking it on, no seq-aware Hitless
-            // leg left without the sequence number it merges on — its own
-            // definition or the flow's clock regeneration could take it.
+            // What the node's config must allow of the input: an id that is
+            // not reserved, if the input is new; no port another entity holds;
+            // and, the flow taking it on, no seq-aware Hitless leg left without
+            // the sequence number it merges on — its own definition or the
+            // flow's clock regeneration could take it.
             let refusal = |cfg: &AppConfig| {
+                if !cfg.inputs.iter().any(|i| i.id == input.id) {
+                    crate::config::validation::validate_new_input_id(&input.id).map_err(|e| {
+                        CommandError::with_code(
+                            format!("Invalid input config: {e}"),
+                            "input_id_reserved",
+                        )
+                    })?;
+                }
                 validate_port_conflicts_with_input(cfg, &input)
                     .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
                 crate::config::validation::validate_add_input_hitless_legs(&flow_id, &input, cfg)
@@ -3198,6 +3207,9 @@ async fn execute_command(
             let input: InputDefinition = serde_json::from_value(action["input"].clone())
                 .map_err(|e| format!("Invalid input config: {e}"))?;
             validate_input_definition(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
+            crate::config::validation::validate_new_input_id(&input.id).map_err(|e| {
+                CommandError::with_code(format!("Invalid input: {e}"), "input_id_reserved")
+            })?;
             tracing::info!("Manager command: create input '{}' ({})", input.id, input.config.type_name());
             let mut cfg = app_config.write().await;
             validate_port_conflicts_with_input(&cfg, &input)
@@ -7957,6 +7969,69 @@ mod add_input_hitless_tests {
         assert_eq!(running, ["a", "in-b"]);
         assert_eq!(p_inputs().await, ["a", "in-b"]);
         let _ = fm.destroy_flow("p").await;
+    }
+}
+
+#[cfg(test)]
+mod reserved_input_id_tests {
+    //! The WS commands that create an input refuse an id taking the Hitless
+    //! mergers' bus-key prefix, as `POST /api/v1/inputs` does: `create_input`,
+    //! and `add_input` of an input the node does not have.
+    use super::*;
+    use crate::stats::collector::StatsCollector;
+
+    #[tokio::test]
+    async fn create_input_and_add_input_refuse_a_reserved_id() {
+        let (event_sender, _events) = crate::manager::events::event_channel();
+        let fm = Arc::new(FlowManager::new(
+            Arc::new(StatsCollector::new()),
+            false,
+            event_sender.clone(),
+            Arc::new(SystemResourceState::new()),
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ));
+        let tm = Arc::new(TunnelManager::new(event_sender));
+        let cfg = Arc::new(RwLock::new(AppConfig::default()));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = async |action: &str, body: serde_json::Value| {
+            execute_command(
+                action,
+                &body,
+                &fm,
+                &tm,
+                &cfg,
+                &dir.path().join("config.json"),
+                &dir.path().join("secrets.json"),
+                &WebrtcRegistry::default(),
+            )
+            .await
+        };
+        let input = serde_json::json!({
+            "id": "hitless:cam1", "name": "cam1", "type": "udp", "bind_addr": "127.0.0.1:29890"
+        });
+
+        let err = run("create_input", serde_json::json!({ "input": input }))
+            .await
+            .expect_err("a reserved id");
+        assert_eq!(err.code.as_deref(), Some("input_id_reserved"), "{}", err.message);
+        let err = run("add_input", serde_json::json!({ "flow_id": "f", "input": input }))
+            .await
+            .expect_err("a reserved id");
+        assert_eq!(err.code.as_deref(), Some("input_id_reserved"), "{}", err.message);
+        assert!(cfg.read().await.inputs.is_empty(), "nothing persisted");
+
+        // An input the node already has keeps its id: `add_input` goes on, to
+        // fail here only for want of the flow.
+        cfg.write().await.inputs.push(serde_json::from_value(input.clone()).expect("input"));
+        let err = run("add_input", serde_json::json!({ "flow_id": "f", "input": input }))
+            .await
+            .expect_err("no flow f");
+        assert_ne!(err.code.as_deref(), Some("input_id_reserved"), "{}", err.message);
     }
 }
 
