@@ -7,4 +7,9 @@ ignore = [
     # rustls-pemfile 2.2.0 — crate archived August 2025, code lives on
     # inside rustls-pki-types via the PemObject trait. Not a CVE.
     "RUSTSEC-2025-0134",
+    # zvariant / zbus_names — unmaintained since zbus 6.0.0 absorbed them;
+    # reached only through zbus 5 (util::cellular). Not a CVE.
+    # TODO: move to zbus 6, then drop both.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
 ]

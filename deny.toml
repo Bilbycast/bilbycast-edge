@@ -14,6 +14,14 @@ ignore = [
     # off rustls-pemfile onto rustls_pki_types::pem::PemObject, then drop
     # this ignore.
     "RUSTSEC-2025-0134",
+    # zvariant and zbus_names are unmaintained as standalone crates: zbus
+    # 6.0.0 absorbed them (as its `wire` and `names` modules). Not
+    # vulnerabilities, and neither has a patched release. They arrive only
+    # through zbus 5, the ModemManager D-Bus client behind util::cellular,
+    # and zbus 6.0.0 was released on 2026-10-16 — too new to take yet.
+    # TODO: move util::cellular to zbus 6, then drop these two ignores.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
 ]
 
 [licenses]
