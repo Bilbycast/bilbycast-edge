@@ -2212,6 +2212,7 @@ async fn srt_output_bonded_loop(
                     socket.clone(),
                     bond.mode,
                     stats.srt_bonding_stats_cache.clone(),
+                    None,
                     poller_cancel.clone(),
                 );
 
@@ -2287,6 +2288,7 @@ async fn srt_output_bonded_loop(
                     group.clone(),
                     bond.mode,
                     stats.srt_bonding_stats_cache.clone(),
+                    None,
                     poller_cancel.clone(),
                 );
 

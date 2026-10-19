@@ -3623,23 +3623,25 @@ SRT inputs and outputs also support **native libsrt socket-group bonding** via a
 - Every SRT option on the parent (latency, encryption, stream_id, packet_filter, MSS, payload_size, retransmit algo, etc.) applies to **all** members uniformly.
 - `rendezvous` mode does not support bonding (libsrt's group handshake has no rendezvous variant). Validation rejects the combination.
 
-**Per-leg stats** are surfaced via `srt_bonding_stats` on the input/output snapshot:
+**Per-leg stats** are surfaced via `srt_bonding_stats` on the input/output snapshot, present while the group is connected and absent while it reconnects or waits for a caller:
 ```json
 {
   "srt_bonding_stats": {
     "mode": "broadcast",
-    "aggregate": { "state": "connected", "rtt_ms": 18.2, "recv_rate_mbps": 9.7, ... },
+    "aggregate": { "state": "connected", "recv_rate_mbps": 9.7, "pkt_recv_drop_total": 0, ... },
     "members": [
       { "endpoint": "203.0.113.10:9000", "socket_status": "connected",
-        "member_status": "running", "weight": 0, "stats": { ... } },
+        "member_status": "running", "weight": 0, "stats": { "rtt_ms": 18.2, ... } },
       { "endpoint": "203.0.113.11:9000", "socket_status": "connected",
-        "member_status": "running", "weight": 0, "stats": { ... } }
+        "member_status": "running", "weight": 0, "stats": { "rtt_ms": 24.6, ... } }
     ]
   }
 }
 ```
 
 `member_status` values: `running` (active), `idle` (standby backup), `pending` (negotiating), `broken`.
+
+libsrt's group stats carry only the group's unique packet and byte counters and its drops, so RTT and latency are read per member; the aggregate's rates are measured on its unique bytes. On a bonded **input**, `aggregate.pkt_recv_drop_total` counts the packets no member delivered in time, and those reach `packets_lost` and the `srt_recv_dropped` health reason as a single-socket input's drops do. A member's own drop counter does not: on a broadcast group a member skips packets another member already delivered.
 
 **Testing interop:** see `testbed/flow-groups/srt-bonding.sh` (`./testbed/flows.sh srt-bonding`). Drives `srt-live-transmit` group callers against bonded edge listeners and vice versa.
 

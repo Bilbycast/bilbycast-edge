@@ -104,7 +104,7 @@ for TS-layer loss visibility.
 | State | `flow.input.state` | Matches | n/a | |
 | Packets / Bytes received | atomic counter on input task | Matches exactly | Wireshark IO graph | |
 | Media Bitrate / Aggregate RX | [`stats/throughput.rs:44–70`](../src/stats/throughput.rs) — counter delta over wall-clock, 1 s minimum window | Matches within ±1 s window | Wireshark "IO Graph (Bits/s, 1 s)", `tshark -q -z io,stat,1` | `Instant`-based monotonic clock; CAS-loop on 1 Hz cadence; sub-bit `f64→u64` cast at the end. |
-| Lost | `packets_lost` (MPEG-TS CC discontinuities or RTP seq gaps depending on input type) | Matches per the layer it measures | Wireshark RTP analysis (RTP) or `tsanalyze` (TS) | Mislabelled as "Seq Gaps" in some places — see issue #3. |
+| Lost | `packets_lost`: RTP sequence gaps (the larger of those and the legs' unrecovered loss on RIST), plus on an SRT input the packets libsrt dropped at the TSBPD deadline, each packet counted once, since the flow started. MPEG-TS CC discontinuities are not in it (they are TR-101290's `cc_errors`) | Matches per the layer it measures | Wireshark RTP analysis (RTP gaps); libsrt stats `pktRcvDropTotal` (`srt_stats.pkt_recv_drop_total`, summed across reconnects) for the SRT term — neither Wireshark nor `tsanalyze` can see a packet libsrt skipped | Mislabelled as "Seq Gaps" in some places — see issue #3. |
 | FEC Recovered | counter on the FEC decoder | Matches | librist `ristreceiver --status` (RIST), libsrt stats (SRT) | |
 | Redundancy Switches | 2022-7 merger counter | Matches | n/a | |
 

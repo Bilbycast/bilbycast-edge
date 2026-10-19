@@ -38,7 +38,7 @@ with its current status and a brief description of the implementation.
 | ID | Requirement | Status | Implementation |
 |----|-------------|--------|----------------|
 | U1 | SMPTE standard RTP payloads (ST 2022-2, ST 2022-6, ST 2110-20/-30) | **met** | The forwarding path is payload-agnostic. Any valid RTP packet (version 2) is accepted and forwarded regardless of payload type. |
-| U2 | Per-flow monitoring: seq gaps, IAT, PDV, bitrate | **met** | Sequence gaps tracked in the input loop (`packets_lost`). Bitrate computed via `ThroughputEstimator`. IAT (min/max/avg) and PDV jitter (RFC 3550) computed on the TR-101290 analyzer task, an independent broadcast subscriber that cannot affect the media path. All metrics exposed via REST API, WebSocket, Prometheus, and dashboard. |
+| U2 | Per-flow monitoring: seq gaps, IAT, PDV, bitrate | **met** | Sequence gaps tracked in the input loop (`packets_lost`; see M1 for what else that field holds on RIST and SRT inputs). Bitrate computed via `ThroughputEstimator`. IAT (min/max/avg) and PDV jitter (RFC 3550) computed on the TR-101290 analyzer task, an independent broadcast subscriber that cannot affect the media path. All metrics exposed via REST API, WebSocket, Prometheus, and dashboard. |
 | U3 | DPP Live IP flow profiles | missing | No DPP-specific profile validation. |
 | U4 | RTP payload type filtering | **met** | `allowed_payload_types` on `RtpInputConfig` accepts a list of PT values (0-127). Packets with non-matching PTs are dropped. The check is a single byte comparison (`data[1] & 0x7F`) performed after the `is_likely_rtp` validation. |
 | U5 | ST 2110 essence timing adjustment | missing | Would require per-packet timestamp manipulation on the hot path. |
@@ -72,7 +72,7 @@ with its current status and a brief description of the implementation.
 
 | ID | Metric | Status | Implementation |
 |----|--------|--------|----------------|
-| M1 | RTP sequence gaps | **met** | `packets_lost` in `InputStats`. Computed via wrapping arithmetic on 16-bit sequence numbers in the input loop. Gaps > 1000 are ignored (source restart heuristic). |
+| M1 | RTP sequence gaps | **met** | `packets_lost` in `InputStats`. On an RTP input it is the sequence-gap count, computed via wrapping arithmetic on 16-bit sequence numbers in the input loop; gaps > 1000 are ignored (source restart heuristic). The field is that exact metric only on RTP inputs that are not carried over SRT: a RIST input reports its legs' unrecovered loss (the flow takes the larger of that and any sequence gaps), and an SRT input adds the packets libsrt dropped at the TSBPD deadline (`srt_stats.pkt_recv_drop_total`, summed across reconnects) — on an RTP-over-SRT payload those drops are sequence gaps already and are counted once. |
 | M2 | RTP inter-arrival time (IAT) | **met** | `iat` in `FlowStats` provides `min_us`, `max_us`, `avg_us` over a running window. Computed on the TR-101290 analyzer task using `recv_time_us` deltas between consecutive packets. |
 | M3 | Packet delivery variation (PDV) | **met** | `pdv_jitter_us` in `FlowStats`. Implements the RFC 3550 exponential moving average: `J = J + (\|D\| - J) / 16`. Computed on the TR-101290 analyzer task. |
 | M4 | Packet/bit rate | **met** | `bitrate_bps` per flow and per output. Computed by `ThroughputEstimator` using 1-second sampling intervals with caching. |
