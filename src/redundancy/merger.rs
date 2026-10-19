@@ -37,17 +37,24 @@
 //! where it reorders — while a moved stream breaks every leg's sequence: its
 //! first packet on a leg is a window or more behind that leg's previous one.
 //! So a too-far-behind packet re-anchors the window on itself only when its
-//! leg's sequence has broken since a packet was last accepted, and either
+//! leg's sequence has broken since one of that leg's packets was last
+//! accepted, and either
 //!
 //! - nothing has been accepted for its stale time
 //!   ([`HitlessMerger::with_stale_after_us`], [`DEFAULT_STALE_AFTER_US`] by
 //!   default; the caller's arrival clock) — the rule that always applies, or
 //! - it is where its leg's sequence broke, at the seq where the other leg's
-//!   last broke, with nothing accepted since: both legs carry the stream it
-//!   belongs to. A fast path, however far apart the legs: it needs both
-//!   legs' first packets of the moved stream to be the same seq, so a leg
-//!   that lost that packet, or a gap filled meanwhile, leaves it to the
-//!   stale time.
+//!   last broke, with none of the other leg's packets accepted since: both
+//!   legs carry the stream it belongs to. A fast path, however far apart the
+//!   legs: it needs both legs' first packets of the moved stream to be the
+//!   same seq, so a leg that lost that packet leaves it to the stale time.
+//!
+//! A leg's break is kept until one of its own packets is accepted, not
+//! dropped at the other leg's: the leading leg's first packet of a moved
+//! stream breaks its sequence while the lagging leg, still on the old
+//! stream, fills the gaps it left, and once the lagging leg stops, the new
+//! stream, running on from that break, follows the stale time rather than
+//! waiting for its seqs to come back into the window — up to 32 767 packets.
 //!
 //! A leg that only lags never moves the window, however long the lag,
 //! wherever its own sequence can be followed: when the other leg fails it
@@ -55,13 +62,13 @@
 //! twice. Two of its packets read as breaks all the same: its first, which
 //! has no sequence to judge and is taken as a break for that packet alone,
 //! and its first after an outage of its own of half the sequence space or
-//! more (3.4 s at 100 Mbps). Neither moves anything while the other leg's
-//! packets are being accepted, and a break is forgotten at the next one
-//! accepted. Only once the other leg has been silent for the stale time is
-//! either taken for a moved stream, and only a leg lagging by more than the
-//! stale time is still a window or more behind then, to step the output
-//! back. A first packet taken as a break is how a leg whose first packet
-//! comes after an outage the other leg went into carries the stream on.
+//! more (3.4 s at 100 Mbps), kept until one of its packets is accepted.
+//! Neither moves anything while the other leg's packets are being accepted.
+//! Only once the other leg has been silent for the stale time is either
+//! taken for a moved stream, and only a leg lagging by more than the stale
+//! time is still a window or more behind then, to step the output back. A
+//! first packet taken as a break is how a leg whose first packet comes after
+//! an outage the other leg went into carries the stream on.
 //!
 //! The stale time also decides which moved streams are followed cleanly. A
 //! leg lagging the other by more than it still carries the old stream when
@@ -178,11 +185,11 @@ pub struct HitlessMerger {
     /// Per leg ([`leg_idx`]), the seq of its last packet, `None` before its
     /// first: what tells a leg that lags from one whose stream has moved.
     leg_seq: [Option<u16>; 2],
-    /// Per leg ([`leg_bit`]), whether its sequence has broken since a packet
-    /// was last accepted.
+    /// Per leg ([`leg_bit`]), whether its sequence has broken since one of
+    /// its packets was last accepted.
     moved: u8,
-    /// The last packet since a packet was accepted that broke its leg's
-    /// sequence: its seq and its leg.
+    /// The last packet that broke its leg's sequence, while none of that
+    /// leg's has been accepted since: its seq and its leg.
     last_break: Option<(u16, ActiveLeg)>,
     /// Which leg last provided the forwarded packet.
     active_leg: ActiveLeg,
@@ -410,13 +417,17 @@ impl HitlessMerger {
         self.covered = self.covered.saturating_add(forward).min(self.window);
     }
 
-    /// Record that a packet arriving at `now_us` from `leg` is forwarded.
+    /// Record that a packet arriving at `now_us` from `leg` is forwarded:
+    /// `leg`'s own sequence break is forgotten, and the other leg's kept (see
+    /// "Re-anchoring" in the module doc).
     #[inline]
     fn accept(&mut self, leg: ActiveLeg, now_us: u64) -> Option<ActiveLeg> {
         self.active_leg = leg;
         self.last_accept_us = now_us;
-        self.moved = 0;
-        self.last_break = None;
+        self.moved &= !leg_bit(leg);
+        if matches!(self.last_break, Some((_, l)) if l == leg) {
+            self.last_break = None;
+        }
         Some(leg)
     }
 
@@ -1055,6 +1066,81 @@ mod tests {
         // filled from it after them, as any gap is.
         sent.sort_unstable();
         assert_eq!(sent, (0..2_000).collect::<Vec<_>>());
+    }
+
+    /// Both legs moving to a new stream behind the old, the lagging one 10
+    /// packets behind at 4 750 packets a second, but the leading one lost the
+    /// last three of the old stream: the lagging leg fills them after the
+    /// leading leg's sequence broke onto the new stream, then stops. The
+    /// leading leg's break outlives those gap fills, so its new stream is
+    /// followed once nothing has been accepted for the stale time. Dropped at
+    /// the gap fills, its packets ran on from it and never broke again: the
+    /// new stream was discarded until its seqs came back into the window,
+    /// 19 000 packets, 4 s.
+    #[test]
+    fn test_a_moved_streams_break_outlives_the_other_legs_gap_fills() {
+        let mut merger = HitlessMerger::new();
+        let period = 210;
+        let lag = 10u64;
+        let mut arrivals: Vec<(u64, u64, ActiveLeg)> = Vec::new();
+        for k in 0..40_000u64 {
+            if !(997..1_000).contains(&k) {
+                arrivals.push((k * period, k, ActiveLeg::Leg1));
+            }
+            if k < 1_000 {
+                arrivals.push(((k + lag) * period, k, ActiveLeg::Leg2));
+            }
+        }
+        arrivals.sort_by_key(|&(t, k, _)| (t, k));
+        let mut sent = Vec::new();
+        for (t, k, leg) in arrivals {
+            // From packet 1 000 the stream restarts 20 000 seqs back.
+            let seq = (if k < 1_000 { 40_000 + k } else { 20_000 + k }) as u16;
+            if merger.try_merge(seq, leg, t).is_some() {
+                sent.push(k);
+            }
+        }
+        assert_eq!(merger.resets(), 1);
+        // The lagging leg's last packet, 999, came at (999 + 10) * 210 us.
+        let first = 1 + ((999 + lag) * period + DEFAULT_STALE_AFTER_US) / period;
+        let (old, new): (Vec<u64>, Vec<u64>) = sent.into_iter().partition(|&k| k < 1_000);
+        assert_eq!(old, (0..1_000).collect::<Vec<_>>(), "the old stream whole");
+        assert_eq!(new, (first..40_000).collect::<Vec<_>>(), "the new one a stale time in");
+    }
+
+    /// A leg lagging past the window but within the stale time — 2 000
+    /// packets at 9 500 a second, 210 ms — loses 33 001 of its own, half the
+    /// sequence space, so its first packet after the outage breaks its
+    /// sequence. That break is kept while only the other leg's packets are
+    /// accepted, but when the other leg goes, the lagging one has passed the
+    /// newest seq before the stale time runs out: it carries the stream on,
+    /// every seq once. A leg lagging by more than the stale time would step
+    /// the output back here, which is why a caller whose legs lag by
+    /// configuration sets the stale time above that lag.
+    #[test]
+    fn test_a_lagging_legs_own_outage_moves_nothing_within_the_stale_time() {
+        let mut merger = HitlessMerger::new();
+        let period = 105;
+        let lag = 2_000u64;
+        let mut arrivals: Vec<(u64, u16, ActiveLeg)> = Vec::new();
+        for k in 0..80_000u64 {
+            // Leg 1 goes at packet 60 000.
+            if k < 60_000 {
+                arrivals.push((k * period, k as u16, ActiveLeg::Leg1));
+            }
+            if !(10_000..43_001).contains(&k) {
+                arrivals.push(((k + lag) * period, k as u16, ActiveLeg::Leg2));
+            }
+        }
+        arrivals.sort_by_key(|&(t, seq, _)| (t, seq));
+        let mut sent = Vec::new();
+        for (t, seq, leg) in arrivals {
+            if merger.try_merge(seq, leg, t).is_some() {
+                sent.push(seq);
+            }
+        }
+        assert_eq!(merger.resets(), 0);
+        assert_eq!(sent, (0..80_000u64).map(|k| k as u16).collect::<Vec<_>>());
     }
 
     /// A sparse PID with one leg up: its cues' datagram seqs 40 000 apart,
