@@ -1057,6 +1057,28 @@ mod tests {
         assert_eq!(sent, (0..2_000).collect::<Vec<_>>());
     }
 
+    /// A sparse PID with one leg up: its cues' datagram seqs 40 000 apart,
+    /// too far behind the window, each a break of the leg's sequence. With
+    /// no second copy to agree, a cue is forwarded only once nothing has been
+    /// accepted for the stale time: cues 1 s apart all go out, cues 0.5 s
+    /// apart only every other one — the limitation the configuration guide
+    /// states for a Hitless slot.
+    #[test]
+    fn test_one_leg_forwards_a_sparse_cue_too_far_behind_only_past_the_stale_time() {
+        for (gap_us, expected) in [(1_000_000u64, 8usize), (500_000, 4)] {
+            let mut merger = HitlessMerger::new();
+            let mut seq = 100u16;
+            let mut forwarded = 0;
+            for i in 0..8u64 {
+                if merger.try_merge(seq, ActiveLeg::Leg1, i * gap_us).is_some() {
+                    forwarded += 1;
+                }
+                seq = seq.wrapping_add(40_000);
+            }
+            assert_eq!(forwarded, expected, "cues {gap_us} us apart");
+        }
+    }
+
     #[test]
     fn test_ascending_sequence() {
         let mut merger = HitlessMerger::new();
