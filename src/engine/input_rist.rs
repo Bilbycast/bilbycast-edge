@@ -309,15 +309,12 @@ fn publish(
     publish_input_packet_with_post(transcoder, post, broadcast_tx, packet);
 }
 
-/// Reconstruct a packet's true UDP-arrival time in the edge's `now_us()`
-/// epoch from the pre-reorder-hold `arrival` Instant the RIST delivery
-/// thread surfaced: `now_us() - (now - arrival)`.
+/// A packet's true UDP-arrival time in the edge's `now_us()` epoch: the
+/// pre-reorder-hold `arrival` Instant the RIST delivery thread surfaced, on
+/// that epoch, with no clock read of its own.
 #[inline]
 fn recv_time_from_arrival(arrival: Instant) -> u64 {
-    let age_us = Instant::now()
-        .saturating_duration_since(arrival)
-        .as_micros() as u64;
-    now_us().saturating_sub(age_us)
+    crate::util::time::us_at(arrival)
 }
 
 async fn rist_input_redundant_loop(
