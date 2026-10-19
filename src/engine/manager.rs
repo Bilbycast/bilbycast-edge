@@ -1789,8 +1789,7 @@ mod tests {
             let bus = fm.node_es_bus();
             let runtime = runtime.clone();
             async move {
-                let (merged, merged_pid) =
-                    crate::engine::ts_es_hitless::hitless_bus_key("f1", "slot_0_1");
+                let (merged, merged_pid) = runtime.hitless_bus_key("slot_0_1");
                 let primary = bus.sender_for("in-a", 257, 0x0F);
                 let backup = bus.sender_for("in-b", 257, 0x0F);
                 let packet = || EsPacket {

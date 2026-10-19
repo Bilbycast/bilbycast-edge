@@ -264,6 +264,11 @@ pub struct FlowRuntime {
     /// node-wide bus when the flow stops ([`Self::stop`]) — reachable without
     /// the mergers' lock, which a stop must not wait on.
     hitless_outputs: Arc<crate::engine::ts_es_hitless::HitlessOutputs>,
+    /// This run's scope for its Hitless slots' bus keys
+    /// ([`crate::engine::ts_es_hitless::hitless_scope`]): the flow id and a
+    /// generation no other run of the flow shares, so a run never takes over,
+    /// or releases, a channel of another.
+    hitless_scope: String,
     /// Live mutable copy of the flow's `assembly` block: the plan the
     /// assembler runs, which a swap's no-op check compares against
     /// ([`AssemblySwap::runs`]). Persisted form lives in `config.json`,
@@ -649,10 +654,13 @@ impl FlowRuntime {
         //      polls each catalogue until every `Essence` slot resolves
         //      (up to `ESSENCE_RESOLVE_TIMEOUT`). On success, the plan
         //      is patched in place and the assembler is spawned.
+        //
+        // This run's Hitless bus keys are its own: see `hitless_scope`.
+        let hitless_scope = crate::engine::ts_es_hitless::hitless_scope(&config.config.id);
         let spts_build: Option<SptsBuildResult> = match config.config.assembly.as_ref() {
             None => None,
             Some(a) if matches!(a.kind, AssemblyKind::Passthrough) => None,
-            Some(a) => Some(build_assembly_plan(a, &config, &event_sender)?),
+            Some(a) => Some(build_assembly_plan(a, &config, &hitless_scope, &event_sender)?),
         };
         // Node-wide ES bus reference. The bus instance is owned by
         // `FlowManager` and shared across every assembled flow on the
@@ -1611,6 +1619,7 @@ impl FlowRuntime {
             es_bus,
             hitless_outputs: hitless_mergers.outputs(),
             hitless_mergers: tokio::sync::Mutex::new(hitless_mergers),
+            hitless_scope,
             current_assembly,
             #[cfg(feature = "replay")]
             recording_handle,
@@ -1718,6 +1727,12 @@ impl FlowRuntime {
             .await
             .replace(new_assembly, splice_mode_override)
             .await
+    }
+
+    /// The bus key of this run's Hitless slot `uid`.
+    #[cfg(test)]
+    pub fn hitless_bus_key(&self, uid: &str) -> (String, u16) {
+        crate::engine::ts_es_hitless::hitless_bus_key(&self.hitless_scope, uid)
     }
 
     /// Start a plan swap: take the Hitless mergers' lock, which every swap
@@ -1837,7 +1852,8 @@ impl FlowRuntime {
         // `build_assembly_plan` emits Critical events on every failure
         // path (`pid_bus_spts_*`, `pid_bus_audio_encode_codec_*`, etc.)
         // so the manager UI has its field-level signals.
-        let mut build = build_assembly_plan(&new_assembly, &self.config, &self.event_sender)?;
+        let mut build =
+            build_assembly_plan(&new_assembly, &self.config, &self.hitless_scope, &self.event_sender)?;
 
         // Essence resolution against the flow's live PSI catalogues.
         // 3-second window matches start-up.
@@ -5341,9 +5357,12 @@ fn patch_essence_pid(slot: &mut AssemblySlot, leg_idx: Option<usize>, pid: u16) 
     }
 }
 
+/// `hitless_scope` is the flow run's scope for its Hitless slots' bus keys
+/// ([`crate::engine::ts_es_hitless::hitless_scope`]).
 fn build_assembly_plan(
     assembly: &FlowAssembly,
     flow: &ResolvedFlow,
+    hitless_scope: &str,
     event_sender: &EventSender,
 ) -> Result<SptsBuildResult> {
     let flow_id = &flow.config.id;
@@ -5600,8 +5619,8 @@ fn build_assembly_plan(
                         forwarding_primary: Default::default(),
                         seq_fallback: Default::default(),
                     };
-                    // Flow-scoped: the bus is node-wide.
-                    let bus_key = crate::engine::ts_es_hitless::hitless_bus_key(flow_id, &uid);
+                    // Scoped to the flow's run: the bus is node-wide.
+                    let bus_key = crate::engine::ts_es_hitless::hitless_bus_key(hitless_scope, &uid);
                     pending_hitless.push(crate::engine::ts_assembler::PendingHitlessSlot {
                         uid,
                         bus_key: bus_key.clone(),
@@ -7902,9 +7921,9 @@ mod assembly_plan_tests {
         let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
         let (events, _rx) = crate::manager::events::event_channel();
         let assembly = resolved.config.assembly.as_ref().expect("assembly");
-        let build = build_assembly_plan(assembly, &resolved, &events).expect("plan");
+        let build = build_assembly_plan(assembly, &resolved, "f1:0", &events).expect("plan");
         let slot = &build.plan.programs[0].slots[0];
-        assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("f1", "slot_0_0"));
+        assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("f1:0", "slot_0_0"));
         assert_eq!(build.pending_hitless[0].bus_key, slot.source, "the merger feeds the slot");
         let legs = slot.hitless_legs.as_ref().expect("the slot names its legs");
         assert_eq!((legs.primary.as_str(), legs.backup.as_str()), ("in-a", "in-b"));

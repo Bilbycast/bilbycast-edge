@@ -2998,8 +2998,8 @@ pub struct PendingHitlessSlot {
     /// is the convention so two Hitless slots on the same flow never collide.
     pub uid: String,
     /// The synthetic bus key the merger publishes onto and the slot reads:
-    /// [`crate::engine::ts_es_hitless::hitless_bus_key`] of the flow and
-    /// `uid`, so no other flow's slot shares it.
+    /// [`crate::engine::ts_es_hitless::hitless_bus_key`] of the flow's run
+    /// and `uid`, so no other flow's slot, nor another run's, shares it.
     pub bus_key: (String, u16),
     /// Concrete `(input_id, source_pid)` for the primary leg.
     pub primary: (String, u16),
@@ -3040,7 +3040,7 @@ pub struct PendingHitlessSlot {
 /// patches them in place after the resolver returns. Slots in `plan`
 /// corresponding to entries in `pending_hitless` have already been
 /// pointed at the synthetic merger output, so the assembler treats them
-/// as a normal `(hitless:{flow_id}:{uid}, 0)` source.
+/// as a normal `(hitless:{flow_id}:{generation}:{uid}, 0)` source.
 #[derive(Debug, Clone)]
 pub struct SptsBuildResult {
     pub plan: AssemblyPlan,

@@ -55,7 +55,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -164,8 +164,24 @@ impl PartialEq for SeqFallback {
 
 impl Eq for SeqFallback {}
 
+/// The scope of one run of flow `flow_id` — one `FlowRuntime` — for its
+/// Hitless slots' bus keys ([`hitless_bus_key`]): `"{flow_id}:{generation}"`,
+/// the generation counted node-wide, so no two runs of a flow share it.
+///
+/// Keyed by flow and slot alone, a restarted flow's merger took over a
+/// channel its previous run had retired but not yet released (that run's
+/// swap was waiting on its assembler), and the old swap's release then
+/// took the new run's channel off the bus: the next fan-in or analyzer to
+/// subscribe found nothing on the key and the slot stalled. Scoped by run,
+/// each run only ever touches its own channels.
+pub fn hitless_scope(flow_id: &str) -> String {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    format!("{flow_id}:{}", GENERATION.fetch_add(1, Ordering::Relaxed))
+}
+
 /// Build the synthetic bus key `(input_id, source_pid)` for the Hitless
-/// slot `uid` of flow `flow_id`: `("hitless:{flow_id}:{uid}", 0)`.
+/// slot `uid` of the flow run `scope` ([`hitless_scope`]):
+/// `("hitless:{flow_id}:{generation}:{uid}", 0)`.
 ///
 /// The bus is node-wide — every flow shares the [`NodeEsBus`] its
 /// `FlowManager` owns, and `sender_for` hands a second publisher the
@@ -173,10 +189,11 @@ impl Eq for SeqFallback {}
 /// on the slot alone, two assembled flows with a Hitless slot at the same
 /// position published onto one key and each assembler played both flows'
 /// packets. `uid` is unique per Hitless slot within the flow
-/// (`"slot_{program_idx}_{slot_idx}"`) and holds no `:`, so the last `:`
-/// separates the two and no two flows' slots share a key.
-pub fn hitless_bus_key(flow_id: &str, uid: &str) -> (String, u16) {
-    (format!("{HITLESS_INPUT_PREFIX}{flow_id}:{uid}"), 0)
+/// (`"slot_{program_idx}_{slot_idx}"`) and, like the generation, holds no
+/// `:`, so the last two `:` separate the three and no two flows' slots, nor
+/// two runs of one flow, share a key.
+pub fn hitless_bus_key(scope: &str, uid: &str) -> (String, u16) {
+    (format!("{HITLESS_INPUT_PREFIX}{scope}:{uid}"), 0)
 }
 
 /// The mergers running behind one assembled flow's Hitless slots, by slot
@@ -211,8 +228,18 @@ struct RunningMerger {
 /// the bus by identity once its merger is gone for good
 /// ([`NodeEsBus::remove_if_same`]). A `std` mutex, taken for an insert or a
 /// drain on the control plane and never held across an `await`.
+///
+/// Closed for good by the flow's stop ([`Self::release_all`]); a channel
+/// handed in after that ([`Self::register`]) is released there and then.
 #[derive(Default)]
-pub struct HitlessOutputs(std::sync::Mutex<HashMap<(String, u16), broadcast::Sender<EsPacketAlias>>>);
+pub struct HitlessOutputs(std::sync::Mutex<OutputChannels>);
+
+#[derive(Default)]
+struct OutputChannels {
+    channels: HashMap<(String, u16), broadcast::Sender<EsPacketAlias>>,
+    /// The flow has stopped and released them.
+    closed: bool,
+}
 
 /// A Hitless slot's bus channel whose merger a plan swap stopped for good:
 /// the new plan has no slot on its key. Released once the assembler runs the
@@ -238,16 +265,45 @@ impl RetiredOutput {
 }
 
 impl HitlessOutputs {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, u16), broadcast::Sender<EsPacketAlias>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, OutputChannels> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Take every channel off the bus: the flow has stopped. Called after
-    /// its cancel, which every merger and fan-in watches first.
+    /// Take every channel off the bus, and every one handed in from now on:
+    /// the flow has stopped. Called after its cancel, which every merger and
+    /// fan-in watches first.
     pub fn release_all(&self, bus: &NodeEsBus) {
-        for (key, sender) in self.lock().drain() {
+        let mut outputs = self.lock();
+        outputs.closed = true;
+        for (key, sender) in outputs.channels.drain() {
             bus.remove_if_same(&key, &sender);
         }
+    }
+
+    /// Hold `sender`, the channel at `key` a merger just took, for release
+    /// when the flow stops — or, if it has already stopped, release it now
+    /// and say so (`false`). A plan swap racing the flow's stop starts its
+    /// new mergers after the stop drained the rest, and nothing would ever
+    /// release theirs; checked and held under one lock, so a channel is
+    /// either drained by the stop or refused after it.
+    pub fn register(
+        &self,
+        key: (String, u16),
+        sender: broadcast::Sender<EsPacketAlias>,
+        bus: &NodeEsBus,
+    ) -> bool {
+        let mut outputs = self.lock();
+        if outputs.closed {
+            bus.remove_if_same(&key, &sender);
+            return false;
+        }
+        outputs.channels.insert(key, sender);
+        true
+    }
+
+    /// Stop holding the channel at `key`, and hand it over.
+    fn take(&self, key: &(String, u16)) -> Option<broadcast::Sender<EsPacketAlias>> {
+        self.lock().channels.remove(key)
     }
 }
 
@@ -270,7 +326,10 @@ impl HitlessMergers {
     /// health its fallback. A merger whose slot is gone or changed is
     /// cancelled and awaited, so it is no longer publishing onto the slot's
     /// bus key when its replacement starts there. Every slot without a
-    /// merger then gets one, under `parent`.
+    /// merger then gets one, under `parent` — until the flow is found to
+    /// have stopped meanwhile ([`HitlessOutputs::register`]), whose stop
+    /// has released every channel but the one just taken: that one is
+    /// released, and the rest of the slots get none.
     ///
     /// Returns the bus channels of the mergers it stopped whose key the plan
     /// has no slot on: the caller releases them once the assembler runs the
@@ -294,7 +353,7 @@ impl HitlessMergers {
                 let _ = running.task.await;
                 let key = running.slot.bus_key;
                 if !slots.iter().any(|slot| slot.bus_key == key)
-                    && let Some(sender) = self.outputs.lock().remove(&key)
+                    && let Some(sender) = self.outputs.take(&key)
                 {
                     retired.push(RetiredOutput { key, sender });
                 }
@@ -327,10 +386,14 @@ impl HitlessMergers {
                 cancel.clone(),
                 self.events.clone(),
             );
-            // The channel the merger just took, for releasing it later.
-            self.outputs
-                .lock()
-                .insert(slot.bus_key.clone(), bus.sender_for(&slot.bus_key.0, slot.bus_key.1, 0));
+            // The channel the merger just took, for releasing it later. A
+            // flow that stopped under the swap has released the others and
+            // refuses it: released here, and no further merger started.
+            let sender = bus.sender_for(&slot.bus_key.0, slot.bus_key.1, 0);
+            if !self.outputs.register(slot.bus_key.clone(), sender, bus) {
+                cancel.cancel();
+                break;
+            }
             kept.insert(slot.uid.clone(), RunningMerger { slot: slot.clone(), cancel, task });
         }
         self.running = kept;
@@ -1498,5 +1561,108 @@ mod tests {
         drain(&mut forwarded).await;
         assert_eq!(forwarded, every_packet(1172..1175));
         cancel.cancel();
+    }
+
+    /// A primary-preference Hitless slot `uid` of the flow run `scope`, over
+    /// `in-a` / `in-b`.
+    fn pending(scope: &str, uid: &str) -> PendingHitlessSlot {
+        PendingHitlessSlot {
+            uid: uid.to_string(),
+            bus_key: hitless_bus_key(scope, uid),
+            primary: ("in-a".to_string(), 0x100),
+            backup: ("in-b".to_string(), 0x200),
+            stall_ms: DEFAULT_STALL_MS,
+            seq_aware: false,
+            reorder_window: crate::redundancy::merger::REORDER_WINDOW,
+            path_differential_ms: None,
+            forwarding_primary: ForwardingPrimary::default(),
+            seq_fallback: SeqFallback::default(),
+        }
+    }
+
+    /// A plan swap the flow's stop overtakes — the stop runs while the swap
+    /// waits on the mergers it stops — starts its new mergers after the stop
+    /// released the flow's channels. Theirs are released too, and nothing
+    /// that subscribes to a released key afterwards (an analyzer or fan-in
+    /// started on the swap's way out) brings it back: each such channel was
+    /// held by nothing that releases it, an 8 192-slot ring for the life of
+    /// the node.
+    #[tokio::test]
+    async fn a_swap_its_flows_stop_overtakes_leaves_no_channel_on_the_bus() {
+        let bus = Arc::new(NodeEsBus::new());
+        let flow = CancellationToken::new();
+        let scope = hitless_scope("f1");
+        let mut mergers = HitlessMergers::default();
+        let outputs = mergers.outputs();
+        let mut plan = AssemblyPlan { programs: Vec::new() };
+        mergers.apply(&[pending(&scope, "slot_0_0")], &mut plan, &bus, &flow).await;
+
+        // The flow stops: its cancel, then its channels.
+        flow.cancel();
+        outputs.release_all(&bus);
+        // The swap goes on, onto a plan with another slot.
+        let retired = mergers.apply(&[pending(&scope, "slot_0_1")], &mut plan, &bus, &flow).await;
+        assert!(retired.is_empty(), "the stop took the old slot's channel");
+        // On its way out the swap starts the new slot's analyzer, and the
+        // assembler a fan-in on the old one.
+        let mut analyzer = bus.subscribe(&hitless_bus_key(&scope, "slot_0_1").0, 0);
+        let _fanin = bus.subscribe(&hitless_bus_key(&scope, "slot_0_0").0, 0);
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_millis(500), analyzer.recv()).await,
+                Ok(Err(broadcast::error::RecvError::Closed))
+            ),
+            "a released channel subscribes closed"
+        );
+        let left: Vec<_> =
+            bus.keys().into_iter().filter(|(k, _)| k.starts_with(HITLESS_INPUT_PREFIX)).collect();
+        assert!(left.is_empty(), "the stopped flow's channels are all released: {left:?}");
+    }
+
+    /// A flow restarted while a swap of its previous run waits on that run's
+    /// assembler: the new run's merger on the same slot publishes onto a
+    /// channel of its own, which the old swap's release of the slot's
+    /// channel, once its assembler answers, leaves on the bus. Keyed by flow
+    /// and slot alone, the new merger took over the retired channel, the
+    /// release took it off the bus, and the next fan-in or analyzer to
+    /// subscribe found nothing on the key: the slot stalled.
+    #[tokio::test]
+    async fn a_restarted_flow_keeps_its_channel_when_its_old_run_releases_its_own() {
+        let bus = Arc::new(NodeEsBus::new());
+        let mut plan = AssemblyPlan { programs: Vec::new() };
+        // The old run, and a swap that drops the slot: its channel retired,
+        // to be released once the run's assembler answers.
+        let old_flow = CancellationToken::new();
+        let old = hitless_scope("f1");
+        let mut old_mergers = HitlessMergers::default();
+        old_mergers.apply(&[pending(&old, "slot_0_0")], &mut plan, &bus, &old_flow).await;
+        let retired = old_mergers.apply(&[], &mut plan, &bus, &old_flow).await;
+        assert_eq!(retired.len(), 1, "the dropped slot's channel is retired");
+
+        // The flow restarts, onto a plan with the slot.
+        old_flow.cancel();
+        old_mergers.outputs().release_all(&bus);
+        let new_flow = CancellationToken::new();
+        let _stop = new_flow.clone().drop_guard();
+        let new = hitless_scope("f1");
+        let mut new_mergers = HitlessMergers::default();
+        new_mergers.apply(&[pending(&new, "slot_0_0")], &mut plan, &bus, &new_flow).await;
+
+        // The old run's assembler answers, and its swap releases the channel
+        // it retired.
+        for output in retired {
+            output.release(&bus);
+        }
+        // A fan-in subscribing now still reads the new run's merger.
+        let (key, pid) = hitless_bus_key(&new, "slot_0_0");
+        let mut fanin = bus.subscribe(&key, pid);
+        bus.sender_for("in-a", 0x100, 0x1B)
+            .send(es(0x100, 0xAA))
+            .expect("the new merger reads its primary");
+        let got = tokio::time::timeout(Duration::from_millis(500), fanin.recv())
+            .await
+            .expect("the merger forwards its primary")
+            .expect("onto the slot's channel, still on the bus");
+        assert_eq!(got.payload[4], 0xAA);
     }
 }

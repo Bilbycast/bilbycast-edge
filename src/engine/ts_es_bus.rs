@@ -188,7 +188,8 @@ pub struct UpstreamSeq {
 /// the node (top-level config entities), so the key shape already
 /// scopes correctly without further qualification. Channels are
 /// created lazily on first observation of a new PID and kept for the
-/// life of the node.
+/// life of the node — but for a Hitless slot's merger output, which goes
+/// with its merger ([`Self::remove_if_same`]).
 ///
 /// Owned by [`crate::engine::manager::FlowManager`]; cloned into every
 /// assembled flow's runtime via `Arc`. Passthrough flows never touch
@@ -241,20 +242,36 @@ impl NodeEsBus {
     /// default (8192) because the stream type isn't known yet; once the
     /// publisher arrives with a real `stream_type`, the channel already
     /// exists and is reused (capacity is fixed at construction).
+    ///
+    /// A Hitless slot's merger output
+    /// ([`crate::engine::ts_es_hitless::hitless_bus_key`]) is the exception:
+    /// only its merger creates it, before anything reads it, so one that is
+    /// absent has been released — its flow stopped, or a plan swap dropped
+    /// the slot — and its subscriber gets a channel that is already closed.
+    /// Created again here, it would be held by nothing that releases it: an
+    /// analyzer or fan-in started as the flow stopped kept an 8 192-slot
+    /// ring for the life of the node.
     pub fn subscribe(&self, input_id: &str, source_pid: u16) -> broadcast::Receiver<EsPacket> {
+        if input_id.starts_with(crate::engine::ts_es_hitless::HITLESS_INPUT_PREFIX) {
+            return match self.channels.get(&(input_id.to_string(), source_pid)) {
+                Some(tx) => tx.value().subscribe(),
+                None => broadcast::channel(1).0.subscribe(),
+            };
+        }
         self.sender_for(input_id, source_pid, 0).subscribe()
     }
 
     /// Remove the channel at `key` if it is still `sender`'s, and say
     /// whether it was. A Hitless slot's merger output
     /// ([`crate::engine::ts_es_hitless::hitless_bus_key`]) is the only kind
-    /// of key removed: its channel is the flow's own, and once its merger is
-    /// gone for good — the flow stopped, or a plan swap dropped the slot —
-    /// it would otherwise keep its 8 192-slot ring, and the payloads pinned
-    /// in it, for the life of the node. Checked by identity, so a slot
-    /// re-added meanwhile, whose new merger made a new channel, keeps it.
-    /// Input keys are never removed; see the sender cache in
-    /// [`TsEsDemuxer`].
+    /// of key removed: its channel is the flow run's own — the key names the
+    /// run ([`crate::engine::ts_es_hitless::hitless_scope`]), so no other
+    /// run can hold it — and once its merger is gone for good — the flow
+    /// stopped, or a plan swap dropped the slot — it would otherwise keep
+    /// its 8 192-slot ring, and the payloads pinned in it, for the life of
+    /// the node. Checked by identity, so a slot re-added meanwhile, whose
+    /// new merger made a new channel, keeps it. Input keys are never
+    /// removed; see the sender cache in [`TsEsDemuxer`].
     pub fn remove_if_same(&self, key: &(String, u16), sender: &broadcast::Sender<EsPacket>) -> bool {
         self.channels
             .remove_if(key, |_, existing| existing.same_channel(sender))
