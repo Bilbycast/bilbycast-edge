@@ -4418,11 +4418,10 @@ pub(crate) fn upstream_seq_missing(
 }
 
 /// The seq-aware Hitless slots of `assembly` and, of each, every leg whose
-/// input reaches the bus without an upstream sequence number: `(stream
-/// index, which leg, input id, why)`.
+/// input reaches the bus without an upstream sequence number: `(program
+/// number, out PID, which leg, input id, why)`.
 /// `config`'s flows read with `flow` in place of the one of its id, or
-/// beside them when it is new, and its inputs with `input` in place of the
-/// one of its id.
+/// beside them when it is new, and its inputs likewise with `input`.
 fn unsequenced_seq_aware_legs(
     assembly: &crate::config::models::FlowAssembly,
     config: &crate::config::models::AppConfig,
@@ -4489,36 +4488,76 @@ pub(crate) fn validate_hitless_seq_aware_legs(
 /// `config` in place of the input of its id: an input edit — a program
 /// filter, a transcode — must not take the sequence number from a leg a
 /// seq-aware slot merges on. An input edit validates the input alone
-/// otherwise.
+/// otherwise. Only the legs on `input` are judged: a leg the edit leaves
+/// alone is no reason to refuse it.
 pub(crate) fn validate_input_hitless_legs(
     input: &InputDefinition,
     config: &crate::config::models::AppConfig,
 ) -> Result<()> {
-    for flow in &config.flows {
-        if let Some(assembly) = &flow.assembly {
-            refuse_unsequenced_legs(
-                unsequenced_seq_aware_legs(assembly, config, None, Some(input)),
-                &flow.id,
-            )?;
-        }
-    }
-    Ok(())
+    refuse_unsequencing_edit(config, None, Some(input), |_, leg_input| leg_input == input.id)
 }
 
 /// [`validate_hitless_seq_aware_legs`] for a flow being created or
-/// replaced: its legs' owners read with `flow` in `config` in place of the
-/// flow of its id. A create or update validates the flow alone otherwise.
+/// replaced: `flow` in `config` in place of the flow of its id, or beside
+/// them when it is new. A create or update validates the flow alone
+/// otherwise. Every flow's slots are judged, not only `flow`'s own: a leg's
+/// owning flow decides whether its clock is regenerated, so a host flow that
+/// drops its `assembly`, or a passthrough flow that takes a leg input on,
+/// unsequences another flow's legs. Of those, only the legs the edit
+/// involves: every leg of `flow`'s own slots, and any leg on an input `flow`
+/// owns.
 pub(crate) fn validate_flow_hitless_legs(
     flow: &FlowConfig,
     config: &crate::config::models::AppConfig,
 ) -> Result<()> {
-    match &flow.assembly {
-        Some(assembly) => refuse_unsequenced_legs(
-            unsequenced_seq_aware_legs(assembly, config, Some(flow), None),
-            &flow.id,
-        ),
-        None => Ok(()),
+    refuse_unsequencing_edit(config, Some(flow), None, |slot_flow, leg_input| {
+        slot_flow == flow.id || flow.input_ids.iter().any(|id| id == leg_input)
+    })
+}
+
+/// [`validate_hitless_seq_aware_legs`] for `input` hot-added to flow
+/// `flow_id` (`add_input`): its definition in `config` in place of the input
+/// of its id, and that flow its owner. Only the legs on `input` are judged.
+pub(crate) fn validate_add_input_hitless_legs(
+    flow_id: &str,
+    input: &InputDefinition,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
+    let owner = config.flows.iter().find(|f| f.id == flow_id).map(|f| {
+        let mut owner = f.clone();
+        if !owner.input_ids.contains(&input.id) {
+            owner.input_ids.push(input.id.clone());
+        }
+        owner
+    });
+    refuse_unsequencing_edit(config, owner.as_ref(), Some(input), |_, leg_input| {
+        leg_input == input.id
+    })
+}
+
+/// Refuse an edit — `flow` and `input` in `config` in place of the flow and
+/// input of their ids, or beside them when new — that leaves a leg of a
+/// seq-aware Hitless slot, of any flow, without an upstream sequence number,
+/// when `involved(slot's flow id, leg's input id)` says the edit is what
+/// touched it.
+fn refuse_unsequencing_edit(
+    config: &crate::config::models::AppConfig,
+    flow: Option<&FlowConfig>,
+    input: Option<&InputDefinition>,
+    involved: impl Fn(&str, &str) -> bool,
+) -> Result<()> {
+    let flows = config.flows.iter().filter(|f| flow.is_none_or(|new| new.id != f.id)).chain(flow);
+    for f in flows {
+        let Some(assembly) = &f.assembly else {
+            continue;
+        };
+        let found = unsequenced_seq_aware_legs(assembly, config, flow, input)
+            .into_iter()
+            .filter(|(_, _, _, leg_input, _)| involved(&f.id, leg_input))
+            .collect();
+        refuse_unsequenced_legs(found, &f.id)?;
     }
+    Ok(())
 }
 
 fn refuse_unsequenced_legs(
@@ -10681,18 +10720,122 @@ mod tests {
         validate_input_hitless_legs(&untouched, &config).expect("an edit that keeps the seq");
         // The flow's legs moved onto a passthrough host flow's input, its
         // own assembly dropped: its clock is regenerated.
-        let mut host: FlowConfig = serde_json::from_value(json!({
+        let host: FlowConfig = serde_json::from_value(json!({
             "id": "host", "name": "host", "input_ids": ["in-a", "in-b"], "output_ids": []
         }))
         .unwrap();
-        validate_flow_hitless_legs(&host, &config).expect("no assembly, nothing to merge");
-        host.assembly = None;
         let mut f = config.flows[0].clone();
         f.input_ids.clear();
         let mut both = config.clone();
         both.flows.push(host);
         let err = validate_flow_hitless_legs(&f, &both).unwrap_err();
         assert!(err.to_string().contains("`passthrough_clock: true`"), "{err}");
+    }
+
+    /// A leg's owning flow decides whether its clock is regenerated, so a
+    /// flow create or update is judged on every flow's seq-aware slots, not
+    /// only its own: a host flow that drops its `assembly`, or a passthrough
+    /// flow created on a leg input no flow owned, unsequences another
+    /// flow's legs. Both were accepted — only the edited flow's own
+    /// assembly was read, and a flow without one passed outright.
+    #[test]
+    fn a_flow_edit_cannot_unsequence_another_flows_seq_aware_leg() {
+        use serde_json::json;
+        // "host" owns both legs and assembles them itself; "f"'s seq-aware
+        // slot reads them across flows.
+        let host = || -> FlowConfig {
+            let mut host: FlowConfig = serde_json::from_value(json!({
+                "id": "host", "name": "host", "input_ids": ["in-a", "in-b"], "output_ids": []
+            }))
+            .unwrap();
+            host.assembly = Some(spts_assembly("in-a"));
+            host
+        };
+        let legs = || vec![rtp_leg("in-a", json!({})), rtp_leg("in-b", json!({}))];
+        let mut config = seq_aware_config(&[], legs(), vec![]);
+        config.flows.push(host());
+        validate_flow_hitless_legs(&host(), &config).expect("an assembled host claims their clock");
+        let mut passthrough = host();
+        passthrough.assembly = None;
+        let err = validate_flow_hitless_legs(&passthrough, &config).unwrap_err().to_string();
+        assert!(err.starts_with("Flow 'f'"), "{err}");
+        assert!(err.contains("primary leg") && err.contains("`passthrough_clock: true`"), "{err}");
+
+        // A passthrough flow created on a leg input no flow owns.
+        let mut config = seq_aware_config(&[], legs(), vec![]);
+        let new: FlowConfig = serde_json::from_value(json!({
+            "id": "new", "name": "new", "input_ids": ["in-b"], "output_ids": []
+        }))
+        .unwrap();
+        let err = validate_flow_hitless_legs(&new, &config).unwrap_err().to_string();
+        assert!(err.starts_with("Flow 'f'") && err.contains("backup leg"), "{err}");
+        config.inputs[1] =
+            serde_json::from_value(rtp_leg("in-b", json!({ "passthrough_clock": true }))).unwrap();
+        validate_flow_hitless_legs(&new, &config).expect("a leg that passes its clock through");
+    }
+
+    /// An input hot-added to a flow (`add_input`) is judged on its own
+    /// definition and on the flow that takes it on, like an input edit and a
+    /// flow edit together. Nothing judged it: it was spawned as sent.
+    #[test]
+    fn a_hot_added_input_cannot_unsequence_a_seq_aware_leg() {
+        use serde_json::json;
+        // "f"'s slot reads its own in-a and in-b, which no flow owns yet;
+        // "p" is a passthrough flow, "asm" an assembled one.
+        let mut asm: FlowConfig = serde_json::from_value(json!({
+            "id": "asm", "name": "asm", "input_ids": [], "output_ids": []
+        }))
+        .unwrap();
+        asm.assembly = Some(spts_assembly("in-a"));
+        let mut config = seq_aware_config(
+            &["in-a"],
+            vec![rtp_leg("in-a", json!({})), rtp_leg("in-b", json!({}))],
+            vec![json!({ "id": "p", "name": "p", "input_ids": [], "output_ids": [] })],
+        );
+        config.flows.push(asm);
+        let in_b = |extra| serde_json::from_value::<InputDefinition>(rtp_leg("in-b", extra)).unwrap();
+        validate_add_input_hitless_legs("asm", &in_b(json!({})), &config)
+            .expect("an assembled flow claims its clock");
+        let err = validate_add_input_hitless_legs("p", &in_b(json!({})), &config).unwrap_err().to_string();
+        assert!(err.starts_with("Flow 'f'") && err.contains("`passthrough_clock: true`"), "{err}");
+        let err = validate_add_input_hitless_legs("asm", &in_b(json!({ "program_number": 2 })), &config)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`program_number`"), "{err}");
+        let other: InputDefinition = serde_json::from_value(rtp_leg("in-c", json!({}))).unwrap();
+        validate_add_input_hitless_legs("p", &other, &config).expect("no leg");
+    }
+
+    /// A targeted edit is refused over the seq-aware legs it involves only:
+    /// a slot already unsequenced elsewhere on the node blocked every edit,
+    /// with an error naming a flow the edit never touched. It is judged on an
+    /// edit to its own flow or legs.
+    #[test]
+    fn a_targeted_edit_is_judged_only_on_the_legs_it_involves() {
+        use serde_json::json;
+        // "f"'s backup is SRT: unsequenced already. "g" owns in-c, no leg.
+        let config = seq_aware_config(
+            &["in-a", "in-b"],
+            vec![
+                rtp_leg("in-a", json!({})),
+                json!({ "id": "in-b", "name": "in-b", "type": "srt", "mode": "listener",
+                        "local_addr": "127.0.0.1:9000" }),
+                rtp_leg("in-c", json!({})),
+            ],
+            vec![json!({ "id": "g", "name": "g", "input_ids": ["in-c"], "output_ids": [] })],
+        );
+        let in_c: InputDefinition =
+            serde_json::from_value(rtp_leg("in-c", json!({ "program_number": 4 }))).unwrap();
+        validate_input_hitless_legs(&in_c, &config).expect("an input that is no leg");
+        let mut g = config.flows[1].clone();
+        g.name = "renamed".into();
+        validate_flow_hitless_legs(&g, &config).expect("a flow that owns no leg");
+        let in_d: InputDefinition = serde_json::from_value(rtp_leg("in-d", json!({}))).unwrap();
+        validate_add_input_hitless_legs("g", &in_d, &config).expect("an input that is no leg");
+        let err = validate_flow_hitless_legs(&config.flows[0], &config).unwrap_err().to_string();
+        assert!(err.contains("backup leg"), "the slot's own flow: {err}");
+        let err = validate_input_hitless_legs(&config.inputs[1], &config).unwrap_err().to_string();
+        assert!(err.contains("backup leg"), "the leg itself: {err}");
     }
 
     /// Such a slot persisted by a release that accepted it is switched to

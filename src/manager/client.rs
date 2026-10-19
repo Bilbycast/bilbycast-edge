@@ -3036,10 +3036,24 @@ async fn execute_command(
                     .map_err(|e| format!("Invalid input config: {e}"))?;
             validate_input_definition(&input)
                 .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
+            // What the node's config must allow of the input: no port another
+            // entity holds, and, the flow taking it on, no seq-aware Hitless
+            // leg left without the sequence number it merges on — its own
+            // definition or the flow's clock regeneration could take it.
+            let refusal = |cfg: &AppConfig| {
+                validate_port_conflicts_with_input(cfg, &input)
+                    .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
+                crate::config::validation::validate_add_input_hitless_legs(&flow_id, &input, cfg)
+                    .map_err(|e| {
+                        CommandError::with_code(
+                            format!("Invalid input config: {e}"),
+                            "hitless_seq_aware_leg_unsequenced",
+                        )
+                    })
+            };
             // Cheap pre-check so an obviously-clashing input never reaches the
             // runtime at all. NOT authoritative — see the re-check below.
-            validate_port_conflicts_with_input(&*app_config.read().await, &input)
-                .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
+            refusal(&*app_config.read().await)?;
             let input_id = input.id.clone();
             tracing::info!(
                 "Manager command: add input '{input_id}' to flow '{flow_id}' (hot-add)"
@@ -3103,16 +3117,16 @@ async fn execute_command(
             // runs under the same write guard — see the equivalent comment in
             // `add_output`. The pre-check released its read guard before
             // `add_input().await`, so on its own it cannot stop two concurrent
-            // hot-adds from both persisting a conflicting config.
-            if let Err(e) = validate_port_conflicts_with_input(&cfg, &input) {
+            // edits from both persisting a conflicting config.
+            if let Err(e) = refusal(&cfg) {
                 drop(cfg);
                 if let Err(rollback) = flow_manager.remove_input(&flow_id, &input_id).await {
                     tracing::warn!(
-                        "Failed to roll back input '{input_id}' after a losing \
-                         port-conflict race on flow '{flow_id}': {rollback}"
+                        "Failed to roll back input '{input_id}' after losing a race \
+                         to a conflicting edit on flow '{flow_id}': {rollback}"
                     );
                 }
-                return Err(CommandError::with_code(e.to_string(), "port_conflict"));
+                return Err(e);
             }
             if !cfg.inputs.iter().any(|i| i.id == input_id) {
                 cfg.inputs.push(input);
@@ -7793,6 +7807,132 @@ mod update_input_restart_tests {
             "an applied edit is persisted"
         );
         let _ = rig.fm.destroy_flow("f1").await;
+    }
+}
+
+#[cfg(test)]
+mod add_input_hitless_tests {
+    //! `add_input` against a running flow, end to end through
+    //! `execute_command`: an input that would leave a seq-aware Hitless leg
+    //! without its sequence number is refused before the runtime sees it.
+    //! Ports below the kernel's ephemeral range, as in
+    //! `update_input_restart_tests`.
+    use super::*;
+    use crate::config::models::{
+        AssembledProgram, AssembledStream, AssemblyKind, HitlessMode, ResourceLimitAction, SlotSource,
+    };
+    use crate::stats::collector::StatsCollector;
+
+    fn input(value: serde_json::Value) -> InputDefinition {
+        serde_json::from_value(value).expect("input fixture")
+    }
+
+    /// Flow "f"'s seq-aware slot reads `in-a` and `in-b`, which no flow owns
+    /// yet; passthrough flow "p" is running on a UDP input. `add_input` of
+    /// `in-b` to "p" puts it under "p"'s clock regeneration, which strips
+    /// the sequence number: refused, nothing spawned, nothing persisted. It
+    /// was spawned and persisted as sent. Passing its clock through, it is
+    /// added.
+    #[tokio::test]
+    async fn add_input_refuses_a_leg_its_flow_would_unsequence() {
+        let (event_sender, _events) = crate::manager::events::event_channel();
+        let fm = Arc::new(FlowManager::new(
+            Arc::new(StatsCollector::new()),
+            false,
+            event_sender.clone(),
+            Arc::new(SystemResourceState::new()),
+            Some(ResourceLimitAction::GateFlows),
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ));
+        let leg = |input_id: &str| {
+            Box::new(SlotSource::Pid { input_id: input_id.into(), source_pid: 0x100 })
+        };
+        let mut f: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f", "name": "f", "input_ids": [], "output_ids": [], "enabled": false
+        }))
+        .expect("flow fixture");
+        f.assembly = Some(FlowAssembly {
+            kind: AssemblyKind::Spts,
+            pcr_source: None,
+            programs: vec![AssembledProgram {
+                program_number: 1,
+                service_name: None,
+                pmt_pid: 0x1000,
+                pcr_source: None,
+                streams: vec![AssembledStream {
+                    source: SlotSource::Hitless {
+                        primary: leg("in-a"),
+                        backup: leg("in-b"),
+                        mode: HitlessMode::SeqAware,
+                        stall_ms: None,
+                        reorder_window: None,
+                        path_differential_ms: None,
+                    },
+                    out_pid: 0x100,
+                    stream_type: 0x1B,
+                    label: None,
+                }],
+            }],
+        });
+        let p: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "p", "name": "p", "input_ids": ["a"], "output_ids": []
+        }))
+        .expect("flow fixture");
+        let cfg = AppConfig {
+            inputs: vec![
+                input(serde_json::json!({
+                    "id": "a", "name": "a", "type": "udp", "bind_addr": "127.0.0.1:29881"
+                })),
+                input(serde_json::json!({
+                    "id": "in-a", "name": "in-a", "type": "rtp", "bind_addr": "127.0.0.1:29883"
+                })),
+            ],
+            flows: vec![p.clone(), f],
+            ..Default::default()
+        };
+        fm.create_flow(cfg.resolve_flow(&p).expect("resolve")).await.expect("create_flow");
+        let tm = Arc::new(TunnelManager::new(event_sender));
+        let cfg = Arc::new(RwLock::new(cfg));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let add = async |extra: serde_json::Value| {
+            let mut in_b = serde_json::json!({
+                "id": "in-b", "name": "in-b", "type": "rtp", "bind_addr": "127.0.0.1:29882"
+            });
+            in_b.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            execute_command(
+                "add_input",
+                &serde_json::json!({ "flow_id": "p", "input": in_b }),
+                &fm,
+                &tm,
+                &cfg,
+                &dir.path().join("config.json"),
+                &dir.path().join("secrets.json"),
+                &WebrtcRegistry::default(),
+            )
+            .await
+        };
+        let p_inputs = async || {
+            let cfg = cfg.read().await;
+            cfg.flows.iter().find(|f| f.id == "p").expect("flow p").input_ids.clone()
+        };
+
+        let err = add(serde_json::json!({})).await.expect_err("an input that unsequences a leg");
+        assert_eq!(err.code.as_deref(), Some("hitless_seq_aware_leg_unsequenced"), "{}", err.message);
+        assert!(err.message.contains("`passthrough_clock: true`"), "{}", err.message);
+        assert_eq!(fm.running_input_ids("p").await.unwrap(), ["a"], "nothing spawned");
+        assert_eq!(p_inputs().await, ["a"], "nothing persisted");
+        assert!(!cfg.read().await.inputs.iter().any(|i| i.id == "in-b"));
+
+        add(serde_json::json!({ "passthrough_clock": true })).await.expect("a leg that keeps its clock");
+        let mut running = fm.running_input_ids("p").await.unwrap();
+        running.sort();
+        assert_eq!(running, ["a", "in-b"]);
+        assert_eq!(p_inputs().await, ["a", "in-b"]);
+        let _ = fm.destroy_flow("p").await;
     }
 }
 
