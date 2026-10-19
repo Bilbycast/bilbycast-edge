@@ -801,8 +801,9 @@ them on re-open).
 
 One entry per DeckLink port, refreshed by a 10 s background poller
 (`engine::decklink::status`). `IDeckLinkStatus` needs no open handle, so
-this covers **all** ports — idle ones and ports held by other processes
-— without disturbing live flows, and reads correctly while another
+this covers **all** ports — idle ones (with one exception on the
+original DeckLink Quad, below) and ports held by other processes —
+without disturbing live flows, and reads correctly while another
 process captures from the same port (`busy: true`).
 
 | Field | Meaning |
@@ -822,6 +823,13 @@ say" — never "no".** On an unlocked input every `Detected*` field returns
 `E_FAIL` and several return `bmdModeUnknown` rather than an error, so
 each maps to `Option`. Rendering a missing answer as `false` would
 invent a fact the hardware refused to state.
+
+The original DeckLink Quad is the exception for idle ports: a port with
+no open capture reports `signal_locked: false` and no `detected_mode`
+even with a live source plugged in, so on that card an idle port's "no
+signal" is not an answer (#170). The card itself states the `false`, and
+the edge passes it through as given. The Quad 2 on `bilby-z440` reports
+idle ports as described above.
 
 ### Capability
 
