@@ -5598,6 +5598,7 @@ fn build_assembly_plan(
                         primary: primary_pair.0.clone(),
                         backup: backup_pair.0.clone(),
                         forwarding_primary: Default::default(),
+                        seq_fallback: Default::default(),
                     };
                     // Flow-scoped: the bus is node-wide.
                     let bus_key = crate::engine::ts_es_hitless::hitless_bus_key(flow_id, &uid);
@@ -5614,6 +5615,7 @@ fn build_assembly_plan(
                             .unwrap_or(crate::redundancy::merger::REORDER_WINDOW),
                         path_differential_ms: *path_differential_ms,
                         forwarding_primary: legs.forwarding_primary.clone(),
+                        seq_fallback: legs.seq_fallback.clone(),
                     });
                     // The assembler reads from the synthetic merger
                     // output. The pre-bus merger task is responsible

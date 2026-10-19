@@ -3574,9 +3574,10 @@ pub struct AssembledOnAir {
     /// The legs behind each Hitless slot. Only the one its merger is
     /// forwarding is on air, the primary or, after a failover, the backup:
     /// the other is a warm standby. A seq-aware merger keeps the primary on
-    /// air: it merges on `upstream_seq`, which no SRT input stamps —
+    /// air while it merges, on `upstream_seq`, which no SRT input stamps —
     /// validation refuses SRT legs on such a slot, and should one reach it
-    /// anyway it forwards the primary alone.
+    /// anyway the merger falls back to primary preference, and fails over
+    /// like one.
     pub hitless: Vec<crate::engine::ts_assembler::HitlessLegs>,
 }
 
@@ -6448,6 +6449,32 @@ fn derive_flow_health(
                 detail,
             });
         }
+        // A seq-aware Hitless slot that fell back to primary preference
+        // still carries media, but merges nothing: the protection it was
+        // configured for is gone for as long as its merger runs.
+        if !ah.unsequenced_hitless_slots.is_empty() {
+            let slots: Vec<String> = ah
+                .unsequenced_hitless_slots
+                .iter()
+                .take(4)
+                .map(|s| {
+                    format!(
+                        "program {} (PID 0x{:04X}), {} leg '{}'",
+                        s.program_number, s.out_pid, s.leg, s.input_id
+                    )
+                })
+                .collect();
+            reasons.push(HealthReason {
+                code: "hitless_seq_aware_leg_unsequenced".to_string(),
+                severity: FlowHealth::Warning,
+                detail: format!(
+                    "{} seq-aware Hitless slot(s) fell back to primary preference — a leg carries \
+                     no upstream sequence number to merge on: {}",
+                    ah.unsequenced_hitless_slots.len(),
+                    slots.join(", ")
+                ),
+            });
+        }
     }
 
     // ── TR-101290 Priority 2 — PCR/PTS accuracy, CRC, TEI ──
@@ -6581,6 +6608,7 @@ mod input_state_tests {
             total_slots: total,
             stalled_slot_count: stalled,
             stalled_slots: Vec::new(),
+            unsequenced_hitless_slots: Vec::new(),
         }
     }
 

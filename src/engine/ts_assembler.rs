@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 use super::master_clock::ClockIdentity;
 use super::packet::RtpPacket;
 use super::ts_es_bus::{EsPacket, NodeEsBus};
-use super::ts_es_hitless::ForwardingPrimary;
+use super::ts_es_hitless::{ForwardingPrimary, SeqFallback};
 use super::ts_parse::{
     extract_pcr, mpeg2_crc32, set_discontinuity_indicator, NULL_PID, PAT_PID, TS_PACKET_SIZE,
     TS_SYNC_BYTE,
@@ -265,12 +265,24 @@ fn scan_slot_stalls(
     crate::stats::models::AssemblyHealth,
     Vec<crate::stats::models::StalledSlotStats>,
 ) {
-    use crate::stats::models::{AssemblyHealth, StalledSlotStats};
+    use crate::stats::models::{AssemblyHealth, StalledSlotStats, UnsequencedHitlessSlot};
     let mut health = AssemblyHealth::default();
     let mut newly_stalled: Vec<StalledSlotStats> = Vec::new();
     for (pidx, prog) in plan.programs.iter().enumerate() {
         for slot in &prog.slots {
             health.total_slots += 1;
+            // Ahead of the liveness checks, which skip a slot that is
+            // moving: a merger that fell back still forwards.
+            if let Some(legs) = &slot.hitless_legs
+                && let Some(leg) = legs.seq_fallback.leg()
+            {
+                health.unsequenced_hitless_slots.push(UnsequencedHitlessSlot {
+                    program_number: prog.program_number,
+                    out_pid: slot.out_pid,
+                    leg: leg.to_string(),
+                    input_id: if leg == "primary" { &legs.primary } else { &legs.backup }.clone(),
+                });
+            }
             let Some(v) = vitals.get_mut(&(prog.program_number, slot.out_pid)) else {
                 continue; // unsynced entry — next sync_slot_vitals heals it
             };
@@ -394,6 +406,10 @@ pub struct HitlessLegs {
     /// Shared with the slot's merger, which flips it; read by the flow's SRT
     /// stats pollers through [`OnAirInputs`].
     pub forwarding_primary: ForwardingPrimary,
+    /// Shared with the slot's merger, which sets it if a seq-aware merge
+    /// falls back to primary preference; read by the 1 Hz stall scan into
+    /// `AssemblyHealth::unsequenced_hitless_slots`.
+    pub seq_fallback: SeqFallback,
 }
 
 impl HitlessLegs {
@@ -2992,7 +3008,8 @@ pub struct PendingHitlessSlot {
     /// Stall window in milliseconds before the merger flips primary →
     /// backup. Defaults to
     /// [`crate::engine::ts_es_hitless::DEFAULT_STALL_MS`] when the
-    /// operator hasn't set it. Ignored when `seq_aware` is `true`.
+    /// operator hasn't set it. A seq-aware merger reads it only if it falls
+    /// back to primary preference.
     pub stall_ms: u64,
     /// When `true`, the merger uses true SMPTE 2022-7 seq-aware
     /// dedup + gap-fill (driven by `EsPacket.upstream_seq`) instead of
@@ -3011,6 +3028,8 @@ pub struct PendingHitlessSlot {
     /// The slot's [`HitlessLegs::forwarding_primary`], for the merger to
     /// flip.
     pub forwarding_primary: ForwardingPrimary,
+    /// The slot's [`HitlessLegs::seq_fallback`], for the merger to set.
+    pub seq_fallback: SeqFallback,
 }
 
 /// Output of `build_spts_plan` (defined on the runtime side): the
@@ -4519,6 +4538,7 @@ mod tests {
             primary: "srt-pri".to_string(),
             backup: "srt-bak".to_string(),
             forwarding_primary: Default::default(),
+            seq_fallback: Default::default(),
         });
         AssemblyPlan {
             programs: vec![ProgramPlan {
@@ -4699,6 +4719,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             None,
             legs.forwarding_primary.clone(),
+            legs.seq_fallback.clone(),
             cancel.child_token(), None
         );
         let handle = spawn_spts_assembler(
@@ -4747,6 +4768,95 @@ mod tests {
         pri.count_recv_drops(6);
         bak.count_recv_drops(20);
         assert_eq!(flow.snapshot().input.packets_lost, 15);
+
+        cancel.cancel();
+        handle.join.await.unwrap();
+    }
+
+    /// A seq-aware merger that falls back to primary preference — its
+    /// primary brings a packet with no upstream sequence number — shows on
+    /// the flow's stats for as long as it runs: the slot in
+    /// `assembly_health.unsequenced_hitless_slots` and a Warning health
+    /// reason, through the real merger, assembler and flow accumulator
+    /// sharing the plan's flag as `FlowRuntime` wires them. A one-off event
+    /// was all it raised, beside a Hitless slot that looked healthy.
+    #[tokio::test]
+    async fn a_seq_aware_fallback_holds_a_health_reason() {
+        let flow = crate::stats::collector::FlowStatsAccumulator::new(
+            "f1".into(),
+            "flow-1".into(),
+            "srt".into(),
+        );
+        let plan = switch_and_hitless_plan(Default::default(), None);
+        let legs = hitless_legs(&plan).clone();
+        let bus = Arc::new(NodeEsBus::new());
+        let (tx, _rx) = broadcast::channel::<RtpPacket>(64);
+        let cancel = CancellationToken::new();
+        let _stop_on_failure = cancel.clone().drop_guard();
+        let _merger = crate::engine::ts_es_hitless::spawn_hitless_es_merger_full(
+            crate::engine::ts_es_hitless::hitless_bus_key("f1", "slot_0_1"),
+            ("srt-pri".to_string(), 0x102),
+            ("srt-bak".to_string(), 0x102),
+            bus.clone(),
+            Duration::from_millis(200),
+            /* seq_aware */ true,
+            crate::redundancy::merger::REORDER_WINDOW,
+            None,
+            legs.forwarding_primary.clone(),
+            legs.seq_fallback.clone(),
+            cancel.child_token(),
+            None,
+        );
+        let handle = spawn_spts_assembler(
+            plan,
+            bus.clone(),
+            tx,
+            cancel.clone(),
+            None,
+            String::new(),
+            None,
+            Some(flow.assembly_health.clone()),
+            Some(flow.on_air.clone()),
+            Default::default(),
+        );
+        let reason = || {
+            flow.snapshot()
+                .health_reasons
+                .into_iter()
+                .find(|r| r.code == "hitless_seq_aware_leg_unsequenced")
+        };
+        until("the assembler's first publication", || flow.on_air.contains("srt-pri")).await;
+        assert!(reason().is_none(), "merging");
+
+        bus.sender_for("srt-pri", 0x102, 0x1B)
+            .send(EsPacket {
+                source_pid: 0x102,
+                stream_type: 0x1B,
+                payload: ts_es(0x102, false, 0, 0xAA),
+                is_pusi: false,
+                has_pcr: false,
+                pcr: None,
+                recv_time_us: 0,
+                upstream_seq: None,
+            })
+            .unwrap();
+        // The scan runs once a second.
+        for _ in 0..300 {
+            if reason().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let reason = reason().expect("the fallback raises a health reason");
+        assert_eq!(reason.severity, crate::stats::models::FlowHealth::Warning);
+        assert!(reason.detail.contains("primary leg 'srt-pri'"), "{}", reason.detail);
+        let health = flow.snapshot().assembly_health.expect("an assembled flow");
+        assert_eq!(health.unsequenced_hitless_slots.len(), 1);
+        let slot = &health.unsequenced_hitless_slots[0];
+        assert_eq!(
+            (slot.program_number, slot.out_pid, slot.leg.as_str(), slot.input_id.as_str()),
+            (1, 0x202, "primary", "srt-pri")
+        );
 
         cancel.cancel();
         handle.join.await.unwrap();

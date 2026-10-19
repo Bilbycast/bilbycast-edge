@@ -159,6 +159,27 @@ pub struct AssemblyHealth {
     /// One entry per currently-stalled slot. Empty when every slot is
     /// receiving ES data (the healthy steady state).
     pub stalled_slots: Vec<StalledSlotStats>,
+    /// One entry per seq-aware Hitless slot whose merger has fallen back to
+    /// primary preference: a leg brought a packet with no upstream sequence
+    /// number to merge on. Set for the rest of that merger's life, and
+    /// omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsequenced_hitless_slots: Vec<UnsequencedHitlessSlot>,
+}
+
+/// A seq-aware Hitless slot within [`AssemblyHealth`] whose merger fell back
+/// to primary preference.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UnsequencedHitlessSlot {
+    /// MPEG-TS program number the slot belongs to.
+    pub program_number: u16,
+    /// Egress PID the slot rewrites onto.
+    pub out_pid: u16,
+    /// `"primary"` or `"backup"`: the leg that brought a packet with no
+    /// upstream sequence number.
+    pub leg: String,
+    /// That leg's input.
+    pub input_id: String,
 }
 
 /// One stalled assembly slot within [`AssemblyHealth`].

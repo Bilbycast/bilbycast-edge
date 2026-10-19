@@ -1305,8 +1305,10 @@ pub enum SlotSource {
         /// validation refuses any other (`hitless_seq_aware_leg_unsequenced`).
         #[serde(default, skip_serializing_if = "HitlessMode::is_default")]
         mode: HitlessMode,
-        /// Override for the stall timer (`PrimaryPreference` mode
-        /// only — `SeqAware` ignores this). Range: 20..=5000 ms.
+        /// Override for the stall timer (`PrimaryPreference` mode, and
+        /// a `SeqAware` merger that falls back to it on a leg with no
+        /// sequence number — merging, it ignores this). Range:
+        /// 20..=5000 ms.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stall_ms: Option<u64>,
         /// Gap-fill window of the seq-aware merger, in sequence numbers:

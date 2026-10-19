@@ -34,10 +34,12 @@
 //! A leg whose packets reach the bus with no sequence number — any input but
 //! RTP and RIST, or one whose ingress transcode or post-process stage
 //! rewrote its stream — gives a seq-aware merger nothing to merge on.
-//! Validation refuses such a slot (`hitless_seq_aware_leg_unsequenced`); one
-//! that reaches the runtime regardless forwards such a primary alone,
-//! dropping the backup, and discards such a backup, raising a Warning once
-//! per leg.
+//! Validation refuses such a slot (`hitless_seq_aware_leg_unsequenced`). A
+//! merger that meets such a packet regardless falls back to primary
+//! preference for the rest of its life — its stall timer and failover, which
+//! is all such a pair can do — raises a Warning and sets the slot's
+//! [`SeqFallback`], which keeps the flow's health on that reason while it
+//! lasts.
 //!
 //! # Invariants
 //!
@@ -53,7 +55,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use tokio::sync::broadcast;
@@ -111,6 +113,56 @@ impl PartialEq for ForwardingPrimary {
 }
 
 impl Eq for ForwardingPrimary {}
+
+/// A Hitless slot's leg: index into a merger's `[primary, backup]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leg {
+    Primary = 0,
+    Backup = 1,
+}
+
+impl Leg {
+    fn name(self) -> &'static str {
+        ["primary", "backup"][self as usize]
+    }
+}
+
+/// Whether a seq-aware Hitless slot's merger has fallen back to primary
+/// preference, and which leg made it: one brought a packet with no upstream
+/// sequence number to merge on. One per slot, shared like
+/// [`ForwardingPrimary`]: the merger sets it once, and keeps primary
+/// preference from then on; the assembler's 1 Hz scan reads it through the
+/// slot's [`crate::engine::ts_assembler::HitlessLegs`] into
+/// `assembly_health.unsequenced_hitless_slots`, which holds the flow's
+/// `hitless_seq_aware_leg_unsequenced` health reason while it is set.
+///
+/// Runtime state, not plan: any two compare equal.
+#[derive(Debug, Clone, Default)]
+pub struct SeqFallback(Arc<AtomicU8>);
+
+impl SeqFallback {
+    /// The leg that made the merger fall back, `"primary"` or `"backup"`;
+    /// `None` while it merges.
+    pub fn leg(&self) -> Option<&'static str> {
+        match self.0.load(Ordering::Relaxed) {
+            0 => None,
+            1 => Some(Leg::Primary.name()),
+            _ => Some(Leg::Backup.name()),
+        }
+    }
+
+    fn set(&self, leg: Leg) {
+        self.0.store(leg as u8 + 1, Ordering::Relaxed);
+    }
+}
+
+impl PartialEq for SeqFallback {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for SeqFallback {}
 
 /// Build the synthetic bus key `(input_id, source_pid)` for the Hitless
 /// slot `uid` of flow `flow_id`: `("hitless:{flow_id}:{uid}", 0)`.
@@ -212,9 +264,10 @@ impl HitlessMergers {
     /// `plan`, before `plan` goes on air.
     ///
     /// A slot the plan leaves as it was keeps its merger, uninterrupted,
-    /// and `plan` takes that merger's [`ForwardingPrimary`] in place of the
-    /// fresh one it was built with, so the on-air set goes on following the
-    /// merger's failovers. A merger whose slot is gone or changed is
+    /// and `plan` takes that merger's [`ForwardingPrimary`] and
+    /// [`SeqFallback`] in place of the fresh ones it was built with, so the
+    /// on-air set goes on following the merger's failovers and the flow's
+    /// health its fallback. A merger whose slot is gone or changed is
     /// cancelled and awaited, so it is no longer publishing onto the slot's
     /// bus key when its replacement starts there. Every slot without a
     /// merger then gets one, under `parent`.
@@ -254,6 +307,7 @@ impl HitlessMergers {
                         && let Some(legs) = planned.hitless_legs.as_mut()
                     {
                         legs.forwarding_primary = running.slot.forwarding_primary.clone();
+                        legs.seq_fallback = running.slot.seq_fallback.clone();
                     }
                 }
                 continue;
@@ -269,6 +323,7 @@ impl HitlessMergers {
                 slot.reorder_window,
                 slot.path_differential_ms,
                 slot.forwarding_primary.clone(),
+                slot.seq_fallback.clone(),
                 cancel.clone(),
                 self.events.clone(),
             );
@@ -307,12 +362,16 @@ impl HitlessMergers {
 ///
 /// The primary-preference merger sets `forwarding_primary` on each flip, so
 /// the flow counts the SRT drops of the leg it forwards. The seq-aware
-/// mergers leave it on the primary: they merge on `upstream_seq`, which no
-/// SRT input stamps — validation refuses such legs, and should one reach a
-/// seq-aware merger anyway it forwards such a primary alone.
+/// mergers leave it on the primary while they merge: they merge on
+/// `upstream_seq`, which no SRT input stamps — validation refuses such legs.
 ///
-/// `events`, when given, is where a seq-aware merger raises its Warning
-/// about a leg with no sequence number.
+/// A seq-aware merger that meets a packet with no `upstream_seq` on either
+/// leg has nothing to merge on: it sets `seq_fallback` and runs primary
+/// preference, with `stall`, from then on, so it still fails over. It used
+/// to forward an unsequenced primary alone and drop the backup for good, so
+/// the slot went dark with the primary, or never fail over to an
+/// unsequenced backup. `events`, when given, is where it raises its Warning
+/// about that.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_hitless_es_merger_full(
     output: (String, u16),
@@ -324,10 +383,16 @@ pub fn spawn_hitless_es_merger_full(
     reorder_window: u16,
     path_differential_ms: Option<u32>,
     forwarding_primary: ForwardingPrimary,
+    seq_fallback: SeqFallback,
     cancel: CancellationToken,
     events: Option<MergerEvents>,
 ) -> JoinHandle<()> {
-    let unsequenced = Unsequenced::new(&output.0, &primary, &backup, events);
+    let notice = FallbackNotice {
+        uid: output.0.clone(),
+        legs: [primary.clone(), backup.clone()],
+        fallback: seq_fallback,
+        events,
+    };
     let mut primary_rx = bus.subscribe(&primary.0, primary.1);
     let mut backup_rx = bus.subscribe(&backup.0, backup.1);
     let (out_input, out_pid) = output;
@@ -339,60 +404,88 @@ pub fn spawn_hitless_es_merger_full(
     let uid = out_input;
 
     tokio::spawn(async move {
-        match (seq_aware, path_differential_ms) {
-            (true, Some(ms)) => {
-                run_buffered(
-                    primary_rx,
-                    backup_rx,
-                    out_tx,
-                    Duration::from_millis(ms as u64),
-                    reorder_window,
-                    unsequenced,
-                    cancel,
-                )
-                .await;
-            }
-            (true, None) => {
-                run_seq_aware(uid, primary_rx, backup_rx, out_tx, reorder_window, unsequenced, cancel)
-                    .await;
-            }
-            (false, _) => {
-                run_primary_preference(
-                    uid,
-                    &mut primary_rx,
-                    &mut backup_rx,
-                    out_tx,
-                    stall,
-                    &forwarding_primary,
-                    cancel,
-                )
-                .await;
+        if seq_aware {
+            let fell_back = match path_differential_ms {
+                Some(ms) => {
+                    run_buffered(
+                        &mut primary_rx,
+                        &mut backup_rx,
+                        &out_tx,
+                        Duration::from_millis(ms as u64),
+                        reorder_window,
+                        &cancel,
+                    )
+                    .await
+                }
+                None => {
+                    run_seq_aware(&uid, &mut primary_rx, &mut backup_rx, &out_tx, reorder_window, &cancel)
+                        .await
+                }
+            };
+            // `None`: cancelled, or a leg's channel closed.
+            let Some(Unsequenced { leg, packet }) = fell_back else {
+                return;
+            };
+            notice.raise(leg, stall);
+            // Primary preference starts on the primary: a primary packet goes
+            // out, a backup one is dropped.
+            if leg == Leg::Primary {
+                let _ = out_tx.send(packet);
             }
         }
+        run_primary_preference(
+            uid,
+            &mut primary_rx,
+            &mut backup_rx,
+            out_tx,
+            stall,
+            &forwarding_primary,
+            cancel,
+        )
+        .await;
     })
 }
 
+/// The packet with no `upstream_seq` that ended a seq-aware merge, and the
+/// leg that brought it.
+struct Unsequenced {
+    leg: Leg,
+    packet: EsPacketAlias,
+}
+
+/// Merge behind a hold of `max_path_diff` until a packet comes with no
+/// `upstream_seq` (returned), or the merger is cancelled or a leg's channel
+/// closes (`None`).
 async fn run_buffered(
-    mut primary_rx: broadcast::Receiver<EsPacketAlias>,
-    mut backup_rx: broadcast::Receiver<EsPacketAlias>,
-    out_tx: broadcast::Sender<EsPacketAlias>,
+    primary_rx: &mut broadcast::Receiver<EsPacketAlias>,
+    backup_rx: &mut broadcast::Receiver<EsPacketAlias>,
+    out_tx: &broadcast::Sender<EsPacketAlias>,
     max_path_diff: Duration,
     reorder_window: u16,
-    mut unsequenced: Unsequenced,
-    cancel: CancellationToken,
-) {
+    cancel: &CancellationToken,
+) -> Option<Unsequenced> {
     use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HeldRuns};
     let mut merger: BufferedHitlessMerger<EsPacketAlias, HeldRuns> =
         BufferedHitlessMerger::with_runs(max_path_diff, reorder_window);
     // Far-future placeholder used when the buffer is empty so the
     // tokio::select! `sleep_until` arm doesn't fire spuriously.
     let far_future = std::time::Instant::now() + Duration::from_secs(86_400);
+    // Primary preference, which takes over, starts on the primary: what the
+    // hold has of the primary's goes out now, in order, and of the backup's
+    // is dropped, as primary preference drops the backup's.
+    let hand_over = |merger: &mut BufferedHitlessMerger<EsPacketAlias, HeldRuns>| {
+        for (leg, es) in merger.drain_expired(far_future) {
+            if leg == ActiveLeg::Leg1 {
+                let _ = out_tx.send(es);
+            }
+        }
+    };
 
     loop {
         let drain_at = merger.next_deadline().unwrap_or(far_future);
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => return None,
             _ = sleep_until(tokio::time::Instant::from_std(drain_at)) => {
                 for (_, es) in merger.drain_expired(std::time::Instant::now()) {
                     let _ = out_tx.send(es);
@@ -401,10 +494,8 @@ async fn run_buffered(
             res = primary_rx.recv() => match res {
                 Ok(es) => {
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
-                        // Nothing to merge on: the primary alone, unbuffered.
-                        unsequenced.primary();
-                        let _ = out_tx.send(es);
-                        continue;
+                        hand_over(&mut merger);
+                        return Some(Unsequenced { leg: Leg::Primary, packet: es });
                     };
                     let now = std::time::Instant::now();
                     for (_, es) in merger.ingest_run(seq, index, ActiveLeg::Leg1, es, now) {
@@ -412,18 +503,13 @@ async fn run_buffered(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Closed) => return None,
             },
             res = backup_rx.recv() => match res {
                 Ok(es) => {
-                    if unsequenced.primary_seen {
-                        // The primary is forwarded on its own: nothing of the
-                        // backup may join it, or each packet goes out twice.
-                        continue;
-                    }
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
-                        unsequenced.backup();
-                        continue;
+                        hand_over(&mut merger);
+                        return Some(Unsequenced { leg: Leg::Backup, packet: es });
                     };
                     let now = std::time::Instant::now();
                     for (_, es) in merger.ingest_run(seq, index, ActiveLeg::Leg2, es, now) {
@@ -431,7 +517,7 @@ async fn run_buffered(
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Closed) => return None,
             },
         }
     }
@@ -492,15 +578,17 @@ async fn run_primary_preference(
     }
 }
 
+/// Merge, unbuffered, until a packet comes with no `upstream_seq`
+/// (returned), or the merger is cancelled or a leg's channel closes
+/// (`None`).
 async fn run_seq_aware(
-    uid: String,
-    mut primary_rx: broadcast::Receiver<EsPacketAlias>,
-    mut backup_rx: broadcast::Receiver<EsPacketAlias>,
-    out_tx: broadcast::Sender<EsPacketAlias>,
+    uid: &str,
+    primary_rx: &mut broadcast::Receiver<EsPacketAlias>,
+    backup_rx: &mut broadcast::Receiver<EsPacketAlias>,
+    out_tx: &broadcast::Sender<EsPacketAlias>,
     reorder_window: u16,
-    mut unsequenced: Unsequenced,
-    cancel: CancellationToken,
-) {
+    cancel: &CancellationToken,
+) -> Option<Unsequenced> {
     use crate::redundancy::merger::{ActiveLeg, HitlessRunMerger};
     let mut merger = HitlessRunMerger::with_window(reorder_window);
     let mut leg_log = LegLog::default();
@@ -510,43 +598,34 @@ async fn run_seq_aware(
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => return,
+            _ = cancel.cancelled() => return None,
             res = primary_rx.recv() => match res {
                 Ok(es) => {
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
-                        // Nothing to merge on: the primary alone.
-                        unsequenced.primary();
-                        let _ = out_tx.send(es);
-                        continue;
+                        return Some(Unsequenced { leg: Leg::Primary, packet: es });
                     };
                     let now_us = primary_clock.now_us(seq);
                     if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg1, now_us) {
-                        let _ = leg_log.forwarded(&uid, chosen);
+                        let _ = leg_log.forwarded(uid, chosen);
                         let _ = out_tx.send(es);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Closed) => return None,
             },
             res = backup_rx.recv() => match res {
                 Ok(es) => {
-                    if unsequenced.primary_seen {
-                        // The primary is forwarded on its own: nothing of the
-                        // backup may join it, or each packet goes out twice.
-                        continue;
-                    }
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
-                        unsequenced.backup();
-                        continue;
+                        return Some(Unsequenced { leg: Leg::Backup, packet: es });
                     };
                     let now_us = backup_clock.now_us(seq);
                     if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg2, now_us) {
-                        let _ = leg_log.forwarded(&uid, chosen);
+                        let _ = leg_log.forwarded(uid, chosen);
                         let _ = out_tx.send(es);
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return,
+                Err(broadcast::error::RecvError::Closed) => return None,
             },
         }
     }
@@ -576,51 +655,30 @@ impl DatagramClock {
     }
 }
 
-/// A seq-aware merger's legs that brought a packet with no sequence number,
-/// each reported once: a Warning event when the merger has somewhere to
-/// raise it, a log line either way. Validation refuses such a leg
+/// What a seq-aware merger says when it falls back to primary preference: it
+/// sets the slot's [`SeqFallback`], logs, and raises a Warning event when it
+/// has somewhere to. Validation refuses a leg that would bring it here
 /// (`hitless_seq_aware_leg_unsequenced`); this is the runtime's word on one
 /// that got here regardless.
-struct Unsequenced {
-    /// A primary packet came without one: the primary is forwarded alone
-    /// from then on, and the backup dropped.
-    primary_seen: bool,
-    backup_seen: bool,
+struct FallbackNotice {
     uid: String,
     legs: [(String, u16); 2],
+    fallback: SeqFallback,
     events: Option<MergerEvents>,
 }
 
-impl Unsequenced {
-    fn new(uid: &str, primary: &(String, u16), backup: &(String, u16), events: Option<MergerEvents>) -> Self {
-        Self {
-            primary_seen: false,
-            backup_seen: false,
-            uid: uid.to_string(),
-            legs: [primary.clone(), backup.clone()],
-            events,
-        }
-    }
-
-    fn primary(&mut self) {
-        if !std::mem::replace(&mut self.primary_seen, true) {
-            self.report(0, "forwarding the primary alone; the backup is not used");
-        }
-    }
-
-    fn backup(&mut self) {
-        if !std::mem::replace(&mut self.backup_seen, true) {
-            self.report(1, "the backup cannot fill the primary's gaps or take over from it");
-        }
-    }
-
-    fn report(&self, leg: usize, consequence: &str) {
-        let (name, (input_id, pid)) = (["primary", "backup"][leg], &self.legs[leg]);
+impl FallbackNotice {
+    fn raise(&self, leg: Leg, stall: Duration) {
+        self.fallback.set(leg);
+        let (name, (input_id, pid)) = (leg.name(), &self.legs[leg as usize]);
+        let stall_ms = stall.as_millis();
         let message = format!(
             "Hitless slot {}: the {name} leg (input '{input_id}', PID 0x{pid:04X}) brings packets \
-             with no upstream sequence number, so the seq-aware merge cannot run — {consequence}. \
-             Use mode \"primary_preference\", or a leg that carries one: an RTP or RIST input with \
-             no ingress transcode, program filter, PID rewrite or clock regeneration",
+             with no upstream sequence number, so the seq-aware merge cannot run — the slot has \
+             fallen back to primary preference: it forwards the primary, fails over to the backup \
+             after {stall_ms} ms without it, and merges nothing. Use mode \"primary_preference\", \
+             or a leg that carries one: an RTP or RIST input with no ingress transcode, program \
+             filter, PID rewrite or clock regeneration",
             self.uid
         );
         tracing::warn!("{message}");
@@ -636,6 +694,8 @@ impl Unsequenced {
                     "leg": name,
                     "input_id": input_id,
                     "source_pid": pid,
+                    "fallback": "primary_preference",
+                    "stall_ms": stall_ms,
                 }),
             );
         }
@@ -724,6 +784,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
+            SeqFallback::default(),
             cancel.clone(), None
         );
 
@@ -766,6 +827,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
+            SeqFallback::default(),
             cancel.clone(), None
         );
 
@@ -806,6 +868,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
+            SeqFallback::default(),
             cancel.clone(), None
         );
 
@@ -865,6 +928,7 @@ mod tests {
                     reorder_window,
                     path_differential_ms,
                     ForwardingPrimary::default(),
+                    SeqFallback::default(),
                     cancel.clone(), None
                 );
                 let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
@@ -943,6 +1007,7 @@ mod tests {
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
                 ForwardingPrimary::default(),
+                SeqFallback::default(),
                 cancel.clone(), None
             );
             let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
@@ -996,6 +1061,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             ForwardingPrimary::default(),
+            SeqFallback::default(),
             cancel.clone(),
             None,
         );
@@ -1026,53 +1092,98 @@ mod tests {
         cancel.cancel();
     }
 
-    /// SRT legs carry no `upstream_seq`, so a seq-aware merger forwards the
-    /// primary verbatim and discards the backup, stalled primary or not: the
-    /// primary is the leg on air.
+    /// A leg with no `upstream_seq` — an SRT input, or one whose stream an
+    /// ingress stage rewrote — gives a seq-aware merger nothing to merge on,
+    /// so it falls back to primary preference: it forwards the primary,
+    /// fails over to the backup once the primary has stalled, and returns
+    /// to the primary when it resumes, with the slot's [`SeqFallback`] set
+    /// and one Warning raised. It used to forward an unsequenced primary
+    /// alone and discard the backup for the merger's life, so the slot went
+    /// dark when the primary did — and never failed over to an unsequenced
+    /// backup either.
     #[tokio::test]
-    async fn seq_aware_keeps_an_srt_primary_on_air() {
-        for path_differential_ms in [None, Some(50)] {
-            let bus = Arc::new(NodeEsBus::new());
-            let cancel = CancellationToken::new();
-            let forwarding = ForwardingPrimary::default();
-            let _handle = spawn_hitless_es_merger_full(
-                hitless_bus_key("f1", "slot_0_0"),
-                ("in-a".to_string(), 0x100),
-                ("in-b".to_string(), 0x200),
-                bus.clone(),
-                Duration::from_millis(50),
-                /* seq_aware */ true,
-                crate::redundancy::merger::REORDER_WINDOW,
-                path_differential_ms,
-                forwarding.clone(),
-                cancel.clone(), None
-            );
-            let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
-            let pri = bus.sender_for("in-a", 0x100, 0x1B);
-            let bak = bus.sender_for("in-b", 0x200, 0x03);
+    async fn seq_aware_falls_back_to_primary_preference_on_an_unsequenced_leg() {
+        let packet = |pid: u16, byte: u8, seq: Option<u16>| EsPacket {
+            upstream_seq: seq.map(|seq| UpstreamSeq { seq, index: 0 }),
+            ..es(pid, byte)
+        };
+        // (which leg is unsequenced, primary has a seq, backup has a seq)
+        for (unsequenced, primary_seq, backup_seq) in
+            [("primary", false, true), ("backup", true, false), ("primary", false, false)]
+        {
+            for path_differential_ms in [None, Some(50)] {
+                let case = format!("{unsequenced} {primary_seq}/{backup_seq} {path_differential_ms:?}");
+                let bus = Arc::new(NodeEsBus::new());
+                let cancel = CancellationToken::new();
+                let forwarding = ForwardingPrimary::default();
+                let fallback = SeqFallback::default();
+                let (sender, mut events) = crate::manager::events::event_channel();
+                let _handle = spawn_hitless_es_merger_full(
+                    hitless_bus_key("f1", "slot_0_0"),
+                    ("in-a".to_string(), 0x100),
+                    ("in-b".to_string(), 0x200),
+                    bus.clone(),
+                    Duration::from_millis(200),
+                    /* seq_aware */ true,
+                    crate::redundancy::merger::REORDER_WINDOW,
+                    path_differential_ms,
+                    forwarding.clone(),
+                    fallback.clone(),
+                    cancel.clone(),
+                    Some(MergerEvents { sender, flow_id: "f1".into() }),
+                );
+                let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+                let pri = bus.sender_for("in-a", 0x100, 0x1B);
+                let bak = bus.sender_for("in-b", 0x200, 0x1B);
+                let next = async |out_rx: &mut broadcast::Receiver<EsPacket>| {
+                    tokio::time::timeout(Duration::from_millis(100), out_rx.recv())
+                        .await
+                        .ok()
+                        .map(|res| res.expect("channel open").payload[4])
+                };
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert_eq!(fallback.leg(), None, "{case}: merging");
 
-            pri.send(es(0x100, 0xAA)).unwrap();
-            let first = tokio::time::timeout(Duration::from_millis(200), out_rx.recv())
-                .await
-                .expect("the primary is forwarded")
-                .expect("channel open");
-            assert_eq!(first.payload[4], 0xAA);
+                // Each leg's first packet, the primary's first: the merge
+                // ends at the unsequenced one, and what follows is primary
+                // preference on the primary.
+                pri.send(packet(0x100, 0xA0, primary_seq.then_some(1))).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                bak.send(packet(0x200, 0xB0, backup_seq.then_some(1))).unwrap();
+                assert_eq!(next(&mut out_rx).await, Some(0xA0), "{case}: the primary");
+                assert_eq!(next(&mut out_rx).await, None, "{case}: not the backup with it");
+                assert_eq!(fallback.leg(), Some(unsequenced), "{case}");
+                assert!(forwarding.get(), "{case}");
 
-            // Past any stall a primary-preference merger would act on.
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            bak.send(es(0x200, 0xBB)).unwrap();
-            let backup = tokio::time::timeout(Duration::from_millis(100), out_rx.recv()).await;
-            assert!(backup.is_err(), "{path_differential_ms:?}: the backup is discarded");
-            assert!(forwarding.get(), "{path_differential_ms:?}: the primary stays on air");
+                // The primary stops: past the stall the backup goes out.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                bak.send(packet(0x200, 0xB1, backup_seq.then_some(2))).unwrap();
+                assert_eq!(next(&mut out_rx).await, Some(0xB1), "{case}: the failover");
+                assert!(!forwarding.get(), "{case}: the backup on air");
 
-            cancel.cancel();
+                // And back to the primary when it resumes.
+                pri.send(packet(0x100, 0xA1, primary_seq.then_some(3))).unwrap();
+                assert_eq!(next(&mut out_rx).await, Some(0xA1), "{case}: the return");
+                assert!(forwarding.get(), "{case}: the primary on air");
+                assert_eq!(fallback.leg(), Some(unsequenced), "{case}: for the merger's life");
+
+                let warned: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                    .filter_map(|e| e.details)
+                    .filter(|d| d["error_code"] == "hitless_seq_aware_leg_unsequenced")
+                    .collect();
+                assert_eq!(warned.len(), 1, "{case}: one Warning");
+                assert_eq!(warned[0]["leg"], unsequenced, "{case}");
+                assert_eq!(warned[0]["fallback"], "primary_preference", "{case}");
+                cancel.cancel();
+            }
         }
     }
 
     /// A primary with no sequence number beside a backup that has one: the
-    /// merger forwards the primary on its own and drops the backup, raising
-    /// one Warning. It forwarded the primary on its bypass and merged the
-    /// backup as well, so every packet reached the output twice.
+    /// merger falls back to primary preference, which forwards the live
+    /// primary on its own and drops the backup, raising one Warning. It
+    /// forwarded the primary on its bypass and merged the backup as well, so
+    /// every packet reached the output twice.
     #[tokio::test]
     async fn seq_aware_forwards_an_unsequenced_primary_alone() {
         for path_differential_ms in [None, Some(50)] {
@@ -1089,6 +1200,7 @@ mod tests {
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
                 ForwardingPrimary::default(),
+                SeqFallback::default(),
                 cancel.clone(),
                 Some(MergerEvents { sender, flow_id: "f1".into() }),
             );
@@ -1192,6 +1304,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             path_differential_ms,
             ForwardingPrimary::default(),
+            SeqFallback::default(),
             cancel.clone(), None
         );
         let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
@@ -1289,6 +1402,7 @@ mod tests {
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
                 ForwardingPrimary::default(),
+                SeqFallback::default(),
                 cancel.clone(), None
             );
             let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
@@ -1344,6 +1458,7 @@ mod tests {
             4096,
             /* path_differential_ms */ None,
             ForwardingPrimary::default(),
+            SeqFallback::default(),
             cancel.clone(), None
         );
         let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
