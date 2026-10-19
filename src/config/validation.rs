@@ -4348,27 +4348,6 @@ pub(crate) fn validate_encoder_codec_name(codec: &str, context: &str) -> anyhow:
     }
 }
 
-/// The Cargo feature a codec name needs, when this build lacks it.
-///
-/// Extracted alongside [`validate_encoder_codec_name`] so the mosaic gets the
-/// same refusal an output gets. Naming `h264_qsv` on a build without
-/// `video-encoder-qsv` has to fail at save time with a message naming the
-/// rebuild — at flow start it is a wall that will not come up, and the operator
-/// has no way to tell that from a bad address.
-/// Coerce a persisted mosaic codec this build no longer accepts, and say so.
-///
-/// The refusals above are right for a *mutation*: `UpdateConfig` and the REST
-/// flow routes validate before they persist, so a bad value is rejected with a
-/// clean `command_ack` and never reaches disk. The **load** path has no such
-/// luxury — `main.rs` turns a validation error into `return Err(e)` and the
-/// process exits, and a node that will not start has no manager WebSocket, so
-/// it cannot be repaired remotely.
-///
-/// Releases through v0.105.0 length-checked this field only — the value reached
-/// nothing, which was the defect — so `"banana"` could be written through a
-/// shipped build's API and is sitting in configs now. Falling those back to the
-/// default and reporting them beats refusing to boot over a field that, until
-/// this release, selected nothing.
 /// Drop a persisted `reorder_window` from every Hitless slot that is not
 /// seq-aware, and say which flows had one.
 ///
@@ -4404,6 +4383,27 @@ pub fn repair_hitless_reorder_windows(
     repaired
 }
 
+/// The Cargo feature a codec name needs, when this build lacks it.
+///
+/// Extracted alongside [`validate_encoder_codec_name`] so the mosaic gets the
+/// same refusal an output gets. Naming `h264_qsv` on a build without
+/// `video-encoder-qsv` has to fail at save time with a message naming the
+/// rebuild — at flow start it is a wall that will not come up, and the operator
+/// has no way to tell that from a bad address.
+/// Coerce a persisted mosaic codec this build no longer accepts, and say so.
+///
+/// The refusals above are right for a *mutation*: `UpdateConfig` and the REST
+/// flow routes validate before they persist, so a bad value is rejected with a
+/// clean `command_ack` and never reaches disk. The **load** path has no such
+/// luxury — `main.rs` turns a validation error into `return Err(e)` and the
+/// process exits, and a node that will not start has no manager WebSocket, so
+/// it cannot be repaired remotely.
+///
+/// Releases through v0.105.0 length-checked this field only — the value reached
+/// nothing, which was the defect — so `"banana"` could be written through a
+/// shipped build's API and is sitting in configs now. Falling those back to the
+/// default and reporting them beats refusing to boot over a field that, until
+/// this release, selected nothing.
 #[cfg(feature = "multiviewer")]
 pub fn repair_legacy_mosaic_codecs(
     config: &mut crate::config::models::AppConfig,
