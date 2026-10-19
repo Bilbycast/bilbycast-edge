@@ -443,7 +443,9 @@ fn handle_redundant_leg(
     stats.input_packets.fetch_add(1, Ordering::Relaxed);
     stats.input_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
 
-    if merger.try_merge(seq, leg).is_none() {
+    // Delivery time, the merger's clock for telling a moved stream from a
+    // lagging leg: the legs' delivery skew is what it must tolerate.
+    if merger.try_merge(seq, leg, now_us()).is_none() {
         return;
     }
 

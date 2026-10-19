@@ -3701,10 +3701,10 @@ impl SrtPair {
             self.unpolled_lost.fetch_add(lost - handed.lost, Ordering::Relaxed);
             handed.lost = lost;
         }
-        let resets = merger.resets();
-        if resets != handed.resets {
-            self.unpolled_resets.fetch_add(resets - handed.resets, Ordering::Relaxed);
-            handed.resets = resets;
+        let skipped = merger.skipped();
+        if skipped != handed.resets {
+            self.unpolled_resets.fetch_add(skipped - handed.resets, Ordering::Relaxed);
+            handed.resets = skipped;
         }
     }
 
@@ -7235,7 +7235,7 @@ mod srt_input_stats_tests {
         /// The packets of `seqs` reach the merger, from whichever leg.
         fn merge(&mut self, seqs: impl IntoIterator<Item = u16>) {
             for seq in seqs {
-                self.merger.try_merge(seq, crate::redundancy::merger::ActiveLeg::Leg1);
+                self.merger.try_merge(seq, crate::redundancy::merger::ActiveLeg::Leg1, 0);
                 self.srt.pair.hand_off(&self.merger, &mut self.handed);
             }
         }
@@ -7281,7 +7281,7 @@ mod srt_input_stats_tests {
         let mut merger = crate::redundancy::merger::HitlessMerger::new();
         let mut handed = MergerHandoff::default();
         for seq in (0..3_000u16).filter(|s| !(500..504).contains(s)) {
-            merger.try_merge(seq, crate::redundancy::merger::ActiveLeg::Leg1);
+            merger.try_merge(seq, crate::redundancy::merger::ActiveLeg::Leg1, 0);
             srt.pair.hand_off(&merger, &mut handed);
         }
         poll_leg(&flow, SrtInputSocket::Leg2, &mut last2, 34, 90.0);
@@ -7330,7 +7330,9 @@ mod srt_input_stats_tests {
     fn a_new_isn_libsrt_dropped_nothing_for_is_no_loss() {
         let mut pair = MergedPair::new();
         pair.merge(0..1_000);
-        pair.merge(40_000..41_000);
+        // A forward jump of a window or more: re-anchored at once.
+        pair.merge(20_000..21_000);
+        assert_eq!(pair.merger.resets(), 1);
         pair.poll(SrtInputSocket::Leg1, 0, 2_000);
         pair.poll(SrtInputSocket::Leg2, 0, 2_000);
         assert_eq!(pair.lost(), (0, 0));

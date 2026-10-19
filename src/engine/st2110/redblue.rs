@@ -240,7 +240,7 @@ impl RedBluePair {
                             self.stats.red.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
                             if let Some(seq) = parse_rtp_seq(&red_buf[..n]) {
                                 // Red is leg 1.
-                                if let Some(active) = merger.try_merge(seq, ActiveLeg::Leg1) {
+                                if let Some(active) = merger.try_merge(seq, ActiveLeg::Leg1, crate::util::time::now_us()) {
                                     self.stats.red.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                                     if !red_first_seen {
                                         red_first_seen = true;
@@ -286,7 +286,7 @@ impl RedBluePair {
                             self.stats.blue.bytes_received.fetch_add(n as u64, Ordering::Relaxed);
                             if let Some(seq) = parse_rtp_seq(&blue_buf[..n]) {
                                 // Blue is leg 2.
-                                if let Some(active) = merger.try_merge(seq, ActiveLeg::Leg2) {
+                                if let Some(active) = merger.try_merge(seq, ActiveLeg::Leg2, crate::util::time::now_us()) {
                                     self.stats.blue.packets_forwarded.fetch_add(1, Ordering::Relaxed);
                                     if !blue_first_seen {
                                         blue_first_seen = true;
@@ -549,6 +549,10 @@ impl RedBluePair {
                         leg_ready[li] = false;
                     }
                     let batch_t0 = std::time::Instant::now();
+                    // One arrival time for the batch: the merger's clock for
+                    // telling a moved stream from a lagging leg, whose
+                    // resolution needs no finer.
+                    let batch_us = crate::util::time::now_us();
                     let (leg_stats, leg_name, first_seen, up_msg, switch_msg) =
                         if leg == ActiveLeg::Leg1 {
                             (
@@ -577,7 +581,7 @@ impl RedBluePair {
                         let Some(seq) = parse_rtp_seq(payload) else {
                             continue;
                         };
-                        if let Some(active) = merger.try_merge(seq, leg) {
+                        if let Some(active) = merger.try_merge(seq, leg, batch_us) {
                             forwarded += 1;
                             if !*first_seen {
                                 *first_seen = true;

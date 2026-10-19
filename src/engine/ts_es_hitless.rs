@@ -280,8 +280,8 @@ async fn run_buffered(
     reorder_window: u16,
     cancel: CancellationToken,
 ) {
-    use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HitlessRunMerger};
-    let mut merger: BufferedHitlessMerger<EsPacketAlias, HitlessRunMerger> =
+    use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HeldRuns};
+    let mut merger: BufferedHitlessMerger<EsPacketAlias, HeldRuns> =
         BufferedHitlessMerger::with_runs(max_path_diff, reorder_window);
     // Far-future placeholder used when the buffer is empty so the
     // tokio::select! `sleep_until` arm doesn't fire spuriously.
@@ -398,7 +398,7 @@ async fn run_seq_aware(
 ) {
     use crate::redundancy::merger::{ActiveLeg, HitlessRunMerger};
     let mut merger = HitlessRunMerger::with_window(reorder_window);
-    let mut current_leg: Option<ActiveLeg> = None;
+    let mut leg_log = LegLog::default();
 
     loop {
         tokio::select! {
@@ -415,11 +415,8 @@ async fn run_seq_aware(
                         let _ = out_tx.send(es);
                         continue;
                     };
-                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg1) {
-                        if Some(chosen) != current_leg {
-                            tracing::info!(uid = %uid, "pid_bus hitless seq_aware: leg = {:?}", chosen);
-                            current_leg = Some(chosen);
-                        }
+                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg1, es.recv_time_us) {
+                        let _ = leg_log.forwarded(&uid, chosen);
                         let _ = out_tx.send(es);
                     }
                 }
@@ -431,11 +428,8 @@ async fn run_seq_aware(
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
                         continue;
                     };
-                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg2) {
-                        if Some(chosen) != current_leg {
-                            tracing::info!(uid = %uid, "pid_bus hitless seq_aware: leg = {:?}", chosen);
-                            current_leg = Some(chosen);
-                        }
+                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg2, es.recv_time_us) {
+                        let _ = leg_log.forwarded(&uid, chosen);
                         let _ = out_tx.send(es);
                     }
                 }
@@ -443,6 +437,41 @@ async fn run_seq_aware(
                 Err(broadcast::error::RecvError::Closed) => return,
             },
         }
+    }
+}
+
+/// Packets a leg must forward in a row before a seq-aware merger logs that
+/// it has taken over. A run split between the legs, or a gap filled, moves
+/// the forwarding leg for a packet or two, which can happen thousands of
+/// times a second on a video PID; only a leg that stays is worth a line.
+const LEG_LOG_SUSTAIN: u32 = 256;
+
+/// Logs which leg a seq-aware merger forwards, once a change has lasted
+/// [`LEG_LOG_SUSTAIN`] packets. A compare and an add per packet.
+#[derive(Default)]
+struct LegLog {
+    /// The leg last logged as forwarding.
+    logged: Option<crate::redundancy::merger::ActiveLeg>,
+    /// Packets in a row forwarded from another leg than `logged`.
+    run: u32,
+}
+
+impl LegLog {
+    /// A packet forwarded from `leg`; returns whether that was logged.
+    #[inline]
+    fn forwarded(&mut self, uid: &str, leg: crate::redundancy::merger::ActiveLeg) -> bool {
+        if Some(leg) == self.logged {
+            self.run = 0;
+            return false;
+        }
+        self.run += 1;
+        if self.run < LEG_LOG_SUSTAIN && self.logged.is_some() {
+            return false;
+        }
+        tracing::info!(uid = %uid, "pid_bus hitless seq_aware: leg = {:?}", leg);
+        self.logged = Some(leg);
+        self.run = 0;
+        true
     }
 }
 
@@ -659,6 +688,93 @@ mod tests {
                 assert_eq!(forwarded.len(), 100 + usize::from(fills));
                 cancel.cancel();
             }
+        }
+    }
+
+    /// The forwarding leg is logged once at the start and again only when a
+    /// change lasts: a run split between the legs, or a gap filled, moves it
+    /// for a packet at a time, thousands of times a second on a video PID.
+    #[test]
+    fn a_leg_change_is_logged_only_once_it_lasts() {
+        use crate::redundancy::merger::ActiveLeg;
+        let mut log = LegLog::default();
+        assert!(log.forwarded("u", ActiveLeg::Leg1));
+        let mut lines = 0;
+        for i in 0..10_000 {
+            let leg = if i % 3 == 0 { ActiveLeg::Leg2 } else { ActiveLeg::Leg1 };
+            lines += usize::from(log.forwarded("u", leg));
+        }
+        assert_eq!(lines, 0, "a leg that keeps coming back is no change");
+        let logged = (0..LEG_LOG_SUSTAIN).filter(|_| log.forwarded("u", ActiveLeg::Leg2)).count();
+        assert_eq!(logged, 1, "a change that lasts is logged once");
+    }
+
+    /// SCTE-35 on a PID-bus Hitless slot: one TS packet a cue, a few seconds
+    /// apart, so consecutive cues' datagram seqs can be half the sequence
+    /// space or more apart, which reads as "too far behind". Nothing was
+    /// accepted between them, so each cue re-anchors the window and is
+    /// forwarded once, bare or buffered; cues closer together than the stale
+    /// time are re-anchored by the backup's copy agreeing with the
+    /// primary's. (A buffered merger reads its own clock rather than the
+    /// packets' arrival stamps, so here, its packets sent milliseconds apart,
+    /// the backup's copy re-anchors it; its stale time is covered in
+    /// `redundancy::merger`.) Half the cues used to be dropped: lost ad cues.
+    #[tokio::test]
+    async fn seq_aware_forwards_every_cue_of_a_sparse_pid() {
+        let cue = |pid: u16, seq: u16, at_us: u64| EsPacket {
+            upstream_seq: Some(UpstreamSeq { seq, index: 0 }),
+            recv_time_us: at_us,
+            ..es(pid, 0)
+        };
+        // Seq steps between cues: four in the too-far-behind band, one a
+        // forward jump of a window or more, one an ordinary step.
+        let steps: [u16; 7] = [40_000, 35_000, 20_000, 50_000, 33_000, 900, 61_000];
+        for (gap_us, path_differential_ms) in
+            [(3_000_000u64, None), (3_000_000, Some(50)), (500_000, None), (500_000, Some(50))]
+        {
+            let bus = Arc::new(NodeEsBus::new());
+            let cancel = CancellationToken::new();
+            let _handle = spawn_hitless_es_merger_full(
+                hitless_bus_key("f1", "slot_0_0"),
+                ("in-a".to_string(), 0x1F0),
+                ("in-b".to_string(), 0x1F0),
+                bus.clone(),
+                Duration::from_millis(50),
+                /* seq_aware */ true,
+                crate::redundancy::merger::REORDER_WINDOW,
+                path_differential_ms,
+                ForwardingPrimary::default(),
+                cancel.clone(),
+            );
+            let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+            let pri = bus.sender_for("in-a", 0x1F0, 0x86);
+            let bak = bus.sender_for("in-b", 0x1F0, 0x86);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let mut seq: u16 = 100;
+            let mut at_us = 1_000_000u64;
+            let mut cues = vec![seq];
+            for step in steps {
+                seq = seq.wrapping_add(step);
+                cues.push(seq);
+            }
+            for &seq in &cues {
+                pri.send(cue(0x1F0, seq, at_us)).unwrap();
+                bak.send(cue(0x1F0, seq, at_us + 30_000)).unwrap();
+                // In order through the merger task, primary before backup.
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                at_us += gap_us;
+            }
+            let quiet = Duration::from_millis(if path_differential_ms.is_some() { 300 } else { 100 });
+            let mut forwarded = Vec::new();
+            while let Ok(Ok(es)) = tokio::time::timeout(quiet, out_rx.recv()).await {
+                forwarded.push(es.upstream_seq.map(|u| u.seq).unwrap());
+            }
+            assert_eq!(
+                forwarded, cues,
+                "cues {gap_us} us apart, path differential {path_differential_ms:?}"
+            );
+            cancel.cancel();
         }
     }
 

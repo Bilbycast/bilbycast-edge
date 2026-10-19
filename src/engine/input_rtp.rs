@@ -27,6 +27,9 @@ enum RedundantMerger {
     Bare {
         merger: HitlessMerger,
         prev_active_leg: ActiveLeg,
+        /// What the last packet released, reused from packet to packet so
+        /// the per-packet path allocates nothing.
+        out: Vec<(ActiveLeg, RtpPacket)>,
     },
     /// Buffered SMPTE 2022-7 (`BufferedHitlessMerger`). Constant
     /// `max_path_diff` emission latency in exchange for proper
@@ -41,21 +44,23 @@ impl RedundantMerger {
         leg: ActiveLeg,
         now: std::time::Instant,
         stats: &FlowStatsAccumulator,
-    ) -> Vec<(ActiveLeg, RtpPacket)> {
+    ) -> std::vec::Drain<'_, (ActiveLeg, RtpPacket)> {
         match self {
             Self::Bare {
                 merger,
                 prev_active_leg,
+                out,
             } => {
-                if let Some(chosen) = merger.try_merge(packet.sequence_number, leg) {
+                out.clear();
+                let seq = packet.sequence_number;
+                if let Some(chosen) = merger.try_merge(seq, leg, packet.recv_time_us) {
                     if *prev_active_leg != ActiveLeg::None && chosen != *prev_active_leg {
                         stats.redundancy_switches.fetch_add(1, Ordering::Relaxed);
                     }
                     *prev_active_leg = chosen;
-                    vec![(chosen, packet)]
-                } else {
-                    Vec::new()
+                    out.push((chosen, packet));
                 }
+                out.drain(..)
             }
             Self::Buffered(m) => {
                 let seq = packet.sequence_number;
@@ -64,9 +69,12 @@ impl RedundantMerger {
         }
     }
 
-    fn drain_expired(&mut self, now: std::time::Instant) -> Vec<(ActiveLeg, RtpPacket)> {
+    fn drain_expired(&mut self, now: std::time::Instant) -> std::vec::Drain<'_, (ActiveLeg, RtpPacket)> {
         match self {
-            Self::Bare { .. } => Vec::new(),
+            Self::Bare { out, .. } => {
+                out.clear();
+                out.drain(..)
+            }
             Self::Buffered(m) => m.drain_expired(now),
         }
     }
@@ -602,6 +610,7 @@ async fn rtp_input_redundant_loop(
         None => RedundantMerger::Bare {
             merger: HitlessMerger::new(),
             prev_active_leg: ActiveLeg::None,
+            out: Vec::with_capacity(1),
         },
     };
 

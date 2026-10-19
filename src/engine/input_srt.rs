@@ -1339,6 +1339,9 @@ fn process_redundant_packet(
         post,
     } = params;
 
+    // The arrival time stamped on the packet, read once: it is also the
+    // merger's clock for telling a moved stream from a lagging leg.
+    let recv_time_us = now_us();
     let (seq, ts, is_raw, accepted_leg) = match format {
         SrtPayloadFormat::RtpTs => {
             if !is_likely_rtp(&data) {
@@ -1346,7 +1349,7 @@ fn process_redundant_packet(
             }
             let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
             let ts = parse_rtp_timestamp(&data).unwrap_or(0);
-            let chosen = merger.try_merge(seq, leg);
+            let chosen = merger.try_merge(seq, leg, recv_time_us);
             // A seq leaving the window unfilled, or a re-anchor, is rare: two
             // compares per packet, an atomic add only when one happened.
             srt.pair.hand_off(merger, merger_handoff);
@@ -1407,7 +1410,7 @@ fn process_redundant_packet(
         data,
         sequence_number: seq,
         rtp_timestamp: ts,
-        recv_time_us: now_us(),
+        recv_time_us,
         is_raw_ts: is_raw,
         upstream_seq: None,
         upstream_leg_id: None,
