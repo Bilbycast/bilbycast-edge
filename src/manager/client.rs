@@ -2797,12 +2797,19 @@ async fn execute_command(
             // recent-critical tracker so the manager UI can map it onto
             // a specific assembly-editor field. Without this, the UI
             // banner says the right thing but no field gets highlighted.
+            // A failure that raises no Critical — an unresponsive assembler
+            // — carries its code on the error itself (`AssemblySwapError`).
             let swap_start = std::time::Instant::now();
             if let Err(e) = swap.replace(new_assembly.clone(), splice_mode_override).await {
-                let code = runtime
-                    .event_sender
-                    .take_recent_critical_for_flow(flow_id, swap_start)
-                    .and_then(|c| c.error_code);
+                let code = e
+                    .downcast_ref::<crate::engine::flow::AssemblySwapError>()
+                    .map(|swap_error| swap_error.code.to_string())
+                    .or_else(|| {
+                        runtime
+                            .event_sender
+                            .take_recent_critical_for_flow(flow_id, swap_start)
+                            .and_then(|c| c.error_code)
+                    });
                 return Err(match code {
                     Some(c) => CommandError::with_code(e.to_string(), c),
                     None => CommandError::new(e.to_string()),

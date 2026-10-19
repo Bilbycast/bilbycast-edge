@@ -740,7 +740,7 @@ curl -X POST http://localhost:8080/api/v1/flows/main-feed/activate-input \
 
 ### PUT /api/v1/flows/{flow_id}/assembly
 
-Hot-swap a flow's PID-bus assembly plan in place. **Auth:** `admin`. The body is a `FlowAssembly` JSON object (the same shape as `FlowConfig.assembly`). No-op if the incoming assembly is byte-equal to the current one; otherwise the assembly is validated, the Essence references resolved, each Hitless slot's merger kept (slot unchanged), replaced (slot changed) or stopped (slot dropped), the new plan pushed to the assembler, and the change persisted to `config.json`. Transitions across the passthrough ⇄ assembled boundary are rejected. Returns 404 if the flow is not found, 400 on validation failure.
+Hot-swap a flow's PID-bus assembly plan in place. **Auth:** `admin`. The body is a `FlowAssembly` JSON object (the same shape as `FlowConfig.assembly`). No-op if the incoming assembly is byte-equal to the current one; otherwise the assembly is validated, the Essence references resolved, each Hitless slot's merger kept (slot unchanged), replaced (slot changed) or stopped (slot dropped), the new plan pushed to the assembler, and the change persisted to `config.json`. Transitions across the passthrough ⇄ assembled boundary are rejected. Returns 404 if the flow is not found, 400 on validation failure, and 500 when the flow's assembler does not take the plan, or put it on air, within 3 s (Warning `pid_bus_assembler_unresponsive`): the swap is then not saved, and re-sending it is a swap again.
 
 This is the REST mirror of the manager's `update_flow_assembly` WS command.
 

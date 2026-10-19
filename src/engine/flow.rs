@@ -563,6 +563,24 @@ impl InputMembershipError {
     }
 }
 
+/// A plan swap ([`AssemblySwap`]) that failed for a reason the caller
+/// reports by its stable `code` rather than by a Critical event — attached
+/// to the `anyhow::Error` like [`InputMembershipError`], and recovered by
+/// the handlers with `downcast_ref`.
+#[derive(Debug, Clone)]
+pub struct AssemblySwapError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for AssemblySwapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AssemblySwapError {}
+
 /// Success output of [`FlowRuntime::add_input`]. Carries the registered
 /// input id so callers can persist it, plus — when `feature = "webrtc"`
 /// is on AND the new input is a WHIP server — the session channel that
@@ -2017,6 +2035,11 @@ impl FlowRuntime {
             bail!(msg);
         }
 
+        // Room for the plan in the assembler's queue before anything changes.
+        let permit =
+            reserve_plan_slot(&handle.plan_tx, flow_id, &self.event_sender, ASSEMBLER_ACK_TIMEOUT)
+                .await?;
+
         // The mergers behind the new plan's Hitless slots. Their lock is held
         // for the whole swap, so the assembler runs the plan they were set
         // for and `current_assembly` names it.
@@ -2061,29 +2084,33 @@ impl FlowRuntime {
             .unwrap_or_default();
 
         let (applied, on_air) = tokio::sync::oneshot::channel();
-        let sent = handle
-            .plan_tx
-            .send(crate::engine::ts_assembler::PlanCommand::ReplacePlan {
-                plan: build.plan,
-                splice_mode_override,
-                catalogs,
-                applied: Some(applied),
-            })
-            .await;
+        permit.send(crate::engine::ts_assembler::PlanCommand::ReplacePlan {
+            plan: build.plan,
+            splice_mode_override,
+            catalogs,
+            applied: Some(applied),
+        });
         // Once the assembler runs the new plan — or has gone — nothing reads
         // the bus channels of the Hitless slots the plan dropped: their
         // mergers are stopped and the assembler's fan-ins for them
         // cancelled. Release them now rather than keep their rings for the
         // life of the node, and their per-ES stats with them, so a slot
-        // added back later gets a fresh analyzer on its fresh channel.
-        if sent.is_ok() {
-            let _ = on_air.await;
-        }
+        // added back later gets a fresh analyzer on its fresh channel. A
+        // stalled assembler fails the swap, unrecorded, with them kept.
+        let retired = await_plan_on_air(
+            on_air,
+            retired,
+            &self.hitless_outputs,
+            &bus,
+            flow_id,
+            &self.event_sender,
+            ASSEMBLER_ACK_TIMEOUT,
+        )
+        .await?;
         for output in retired {
             self.stats.per_es_stats.remove(output.key());
             output.release(&bus);
         }
-        sent.map_err(|_| anyhow::anyhow!("flow '{}' assembler receiver closed", flow_id))?;
         // Recorded under the merger lock, which a concurrent swap waits on:
         // the plan recorded is then the one the assembler and the mergers
         // run, and the callers' no-op check compares against it. Lock order:
@@ -4889,6 +4916,97 @@ fn spawn_input_forwarder(
             }
         }
     })
+}
+
+/// How long a plan swap waits on its flow's assembler — for room in its
+/// command queue, then for its word that the new plan is on air — before
+/// it gives the assembler up as stalled. The assembler takes a plan within
+/// a turn of its loop, so a wait this long is a stall, not load; the swap
+/// holds the flow's merger lock for it, and every later swap of the flow
+/// waits behind.
+const ASSEMBLER_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Room for one command in the assembler's queue (`plan_tx`), waited for at
+/// most `timeout` (production: [`ASSEMBLER_ACK_TIMEOUT`]). Taken before a
+/// swap changes anything, so a stalled assembler refuses the swap with the
+/// flow as it was: a Warning `pid_bus_assembler_unresponsive`
+/// (`awaiting: "queue"`) and an [`AssemblySwapError`] of that code.
+async fn reserve_plan_slot<'a>(
+    plan_tx: &'a tokio::sync::mpsc::Sender<crate::engine::ts_assembler::PlanCommand>,
+    flow_id: &str,
+    events: &EventSender,
+    timeout: std::time::Duration,
+) -> Result<tokio::sync::mpsc::Permit<'a, crate::engine::ts_assembler::PlanCommand>> {
+    match tokio::time::timeout(timeout, plan_tx.reserve()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => bail!("flow '{flow_id}' assembler receiver closed"),
+        Err(_) => Err(assembler_unresponsive(flow_id, "queue", timeout, events)),
+    }
+}
+
+/// Wait at most `timeout` (production: [`ASSEMBLER_ACK_TIMEOUT`]) for the
+/// assembler's word that the plan it was handed is on air, its fan-ins on
+/// the dropped slots cancelled — or for the assembler to go, dropping the
+/// word with it — and hand back `retired`, the dropped Hitless slots'
+/// channels, for the caller to release. A stalled assembler still holds the
+/// plan, and its fan-ins read those channels until it gets to it: they are
+/// kept in `outputs`, for the flow's stop to release, and the swap fails
+/// with a Warning `pid_bus_assembler_unresponsive` (`awaiting: "applied"`)
+/// and an [`AssemblySwapError`] of that code. Unbounded, the wait held the
+/// REST call or WS command, and the flow's merger lock, for as long as the
+/// assembler stalled.
+async fn await_plan_on_air(
+    on_air: tokio::sync::oneshot::Receiver<()>,
+    retired: Vec<crate::engine::ts_es_hitless::RetiredOutput>,
+    outputs: &crate::engine::ts_es_hitless::HitlessOutputs,
+    bus: &NodeEsBus,
+    flow_id: &str,
+    events: &EventSender,
+    timeout: std::time::Duration,
+) -> Result<Vec<crate::engine::ts_es_hitless::RetiredOutput>> {
+    if tokio::time::timeout(timeout, on_air).await.is_ok() {
+        return Ok(retired);
+    }
+    outputs.keep(retired, bus);
+    Err(assembler_unresponsive(flow_id, "applied", timeout, events))
+}
+
+/// Raise the Warning `pid_bus_assembler_unresponsive` for a swap that gave
+/// the flow's assembler up while `awaiting` room in its queue (`"queue"`:
+/// nothing was changed) or its word that the plan is on air (`"applied"`:
+/// the mergers and the queued plan are the new plan's, `config.json` and
+/// the no-op check still the old), and hand back the error to report.
+fn assembler_unresponsive(
+    flow_id: &str,
+    awaiting: &'static str,
+    timeout: std::time::Duration,
+    events: &EventSender,
+) -> anyhow::Error {
+    let ms = timeout.as_millis();
+    let message = if awaiting == "queue" {
+        format!(
+            "flow '{flow_id}': assembly swap refused — the assembler took no command for \
+             {ms} ms; the flow runs its plan as it was"
+        )
+    } else {
+        format!(
+            "flow '{flow_id}': assembly swap unconfirmed — the assembler did not put the \
+             new plan on air within {ms} ms; it holds the plan for when it resumes, and the \
+             swap was not saved: send it again, or restart the flow"
+        )
+    };
+    events.emit_flow_with_details(
+        EventSeverity::Warning,
+        category::FLOW,
+        message.clone(),
+        flow_id,
+        serde_json::json!({
+            "error_code": "pid_bus_assembler_unresponsive",
+            "awaiting": awaiting,
+            "timeout_ms": ms,
+        }),
+    );
+    AssemblySwapError { code: "pid_bus_assembler_unresponsive", message }.into()
 }
 
 /// How long `FlowRuntime::start` waits for every pending `Essence`
@@ -7931,5 +8049,98 @@ mod assembly_plan_tests {
         // What the merger is handed to flip is what the on-air set reads.
         build.pending_hitless[0].forwarding_primary.set(false);
         assert_eq!(legs.on_air(), "in-b");
+    }
+
+    /// A plan swap gives its flow's assembler a bounded time — for room in
+    /// its queue, then to put the plan on air — and then gives it up with a
+    /// Warning and an error of code `pid_bus_assembler_unresponsive`,
+    /// keeping the Hitless channels it retired for the flow's stop to
+    /// release, since the stalled assembler's fan-ins still read them.
+    /// Unbounded, a stalled assembler held the swap — the REST call or WS
+    /// command — and the flow's merger lock, and every later swap with it.
+    #[tokio::test]
+    async fn a_plan_swap_gives_a_stalled_assembler_up() {
+        use crate::engine::ts_assembler::PlanCommand;
+        use crate::engine::ts_es_hitless::{hitless_bus_key, HitlessMergers};
+        use std::time::Duration;
+        let wait = Duration::from_millis(50);
+        let bounded = Duration::from_secs(5);
+        let (events, mut raised) = crate::manager::events::event_channel();
+        let code = |e: &anyhow::Error| e.downcast_ref::<AssemblySwapError>().map(|e| e.code);
+
+        // A swap that drops a Hitless slot.
+        let bus = Arc::new(NodeEsBus::new());
+        let flow = CancellationToken::new();
+        let _stop = flow.clone().drop_guard();
+        let key = hitless_bus_key("f1:0", "slot_0_0");
+        let slot = crate::engine::ts_assembler::PendingHitlessSlot {
+            uid: "slot_0_0".to_string(),
+            bus_key: key.clone(),
+            primary: ("in-a".to_string(), 256),
+            backup: ("in-b".to_string(), 256),
+            stall_ms: crate::engine::ts_es_hitless::DEFAULT_STALL_MS,
+            seq_aware: false,
+            reorder_window: crate::redundancy::merger::REORDER_WINDOW,
+            path_differential_ms: None,
+            forwarding_primary: Default::default(),
+            seq_fallback: Default::default(),
+        };
+        let mut mergers = HitlessMergers::default();
+        let outputs = mergers.outputs();
+        let mut plan = AssemblyPlan { programs: Vec::new() };
+        mergers.apply(&[slot], &mut plan, &bus, &flow).await;
+        let retired = mergers.apply(&[], &mut plan, &bus, &flow).await;
+
+        // An assembler that takes the plan and stalls: it holds the plan's
+        // word, and its one queue slot is full.
+        let (plan_tx, stalled) = tokio::sync::mpsc::channel(1);
+        let permit = reserve_plan_slot(&plan_tx, "f1", &events, wait).await.expect("room in the queue");
+        let (applied, on_air) = tokio::sync::oneshot::channel();
+        permit.send(PlanCommand::ReplacePlan {
+            plan,
+            splice_mode_override: None,
+            catalogs: Default::default(),
+            applied: Some(applied),
+        });
+        let Err(err) = tokio::time::timeout(
+            bounded,
+            await_plan_on_air(on_air, retired, &outputs, &bus, "f1", &events, wait),
+        )
+        .await
+        .expect("the wait for the plan to go on air is bounded") else {
+            panic!("a stalled assembler fails the swap");
+        };
+        assert_eq!(code(&err), Some("pid_bus_assembler_unresponsive"));
+        assert!(bus.keys().contains(&key), "the dropped slot's channel is kept for its fan-in");
+        let err = tokio::time::timeout(bounded, reserve_plan_slot(&plan_tx, "f1", &events, wait))
+            .await
+            .expect("the wait for room in the queue is bounded")
+            .expect_err("a full queue refuses the swap");
+        assert_eq!(code(&err), Some("pid_bus_assembler_unresponsive"));
+        let warnings: Vec<_> = std::iter::from_fn(|| raised.try_recv().ok())
+            .filter(|e| e.severity == EventSeverity::Warning)
+            .filter_map(|e| e.details)
+            .filter(|d| d["error_code"] == "pid_bus_assembler_unresponsive")
+            .map(|d| d["awaiting"].clone())
+            .collect();
+        assert_eq!(warnings, ["applied", "queue"], "each a Warning");
+        outputs.release_all(&bus);
+        assert!(!bus.keys().contains(&key), "the flow's stop releases the kept channel");
+
+        // An assembler that answers puts the plan on air, and so does one
+        // that has gone; a gone one refuses the next swap, unstalled.
+        let (applied, on_air) = tokio::sync::oneshot::channel();
+        applied.send(()).expect("the swap waits");
+        await_plan_on_air(on_air, Vec::new(), &outputs, &bus, "f1", &events, wait)
+            .await
+            .expect("an answered plan is on air");
+        drop(stalled);
+        let (applied, on_air) = tokio::sync::oneshot::channel();
+        drop(applied);
+        await_plan_on_air(on_air, Vec::new(), &outputs, &bus, "f1", &events, wait)
+            .await
+            .expect("nothing reads the channels of a gone assembler");
+        let err = reserve_plan_slot(&plan_tx, "f1", &events, wait).await.expect_err("a gone assembler");
+        assert_eq!(code(&err), None, "is not a stall");
     }
 }

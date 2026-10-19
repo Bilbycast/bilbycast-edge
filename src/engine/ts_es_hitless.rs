@@ -301,6 +301,16 @@ impl HitlessOutputs {
         true
     }
 
+    /// Hold `retired` again, for the flow's stop to release: a swap whose
+    /// assembler has not put its plan on air — whose fan-ins read these
+    /// channels until it does — keeps the channels it retired rather than
+    /// release them under a reader.
+    pub fn keep(&self, retired: Vec<RetiredOutput>, bus: &NodeEsBus) {
+        for RetiredOutput { key, sender } in retired {
+            self.register(key, sender, bus);
+        }
+    }
+
     /// Stop holding the channel at `key`, and hand it over.
     fn take(&self, key: &(String, u16)) -> Option<broadcast::Sender<EsPacketAlias>> {
         self.lock().channels.remove(key)

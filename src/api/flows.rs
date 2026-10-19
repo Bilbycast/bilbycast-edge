@@ -378,6 +378,9 @@ pub async fn stop_flow(
 /// - [`ApiError::BadRequest`] (400) when the assembly body fails
 ///   validation, when essence resolution can't find a matching ES, or
 ///   when the input shape forbids the requested switch.
+/// - [`ApiError::Internal`] (500) when the flow's assembler does not take
+///   the plan, or put it on air, within a few seconds
+///   (`pid_bus_assembler_unresponsive`); the swap is not saved.
 pub async fn update_flow_assembly(
     _admin: RequireAdmin,
     State(state): State<AppState>,
@@ -413,9 +416,13 @@ pub async fn update_flow_assembly(
         return Ok(Json(ApiResponse::ok(())));
     }
 
-    swap.replace(new_assembly.clone(), None)
-        .await
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // An unresponsive assembler is the node's failure, not the request's.
+    swap.replace(new_assembly.clone(), None).await.map_err(|e| {
+        match e.downcast_ref::<crate::engine::flow::AssemblySwapError>() {
+            Some(_) => ApiError::Internal(e.to_string()),
+            None => ApiError::BadRequest(e.to_string()),
+        }
+    })?;
 
     let cfg_clone = {
         let mut cfg = state.config.write().await;

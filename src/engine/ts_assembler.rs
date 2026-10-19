@@ -455,9 +455,10 @@ pub enum PlanCommand {
         /// Empty in tests (descriptor-less PMTs, yesterday's shape).
         catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
         /// Told once the new plan is in place: every fan-in it no longer
-        /// reads is cancelled. The swap waits for it before it releases the
-        /// bus channels of the Hitless slots the plan dropped, so no fan-in
-        /// still reading one sees it close.
+        /// reads is cancelled. The swap waits for it — a few seconds at most
+        /// (`ASSEMBLER_ACK_TIMEOUT` in `engine/flow.rs`), past which it keeps
+        /// them — before it releases the bus channels of the Hitless slots
+        /// the plan dropped, so no fan-in still reading one sees it close.
         applied: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Operator-driven switch-slot retarget. Sent by
