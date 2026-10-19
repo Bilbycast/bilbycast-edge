@@ -325,6 +325,97 @@ impl HitlessMerger {
             None
         }
     }
+
+    /// The slot holding `seq`, when `seq` is at or behind `highest_seq`
+    /// inside the window: where a [`HitlessRunMerger`] keeps its state for
+    /// the seq beside the emitted bit.
+    #[inline]
+    fn slot_of(&self, seq: u16) -> Option<usize> {
+        let behind = self.highest_seq.wrapping_sub(seq);
+        (self.initialized && behind < self.window).then(|| self.slot_behind(behind))
+    }
+}
+
+/// SMPTE 2022-7 merge where a sequence number names a run of packets rather
+/// than one: the TS packets of one PID that one datagram carried, which the
+/// PID bus delivers one by one, each with the datagram's seq and its `index`
+/// in the run ([`crate::engine::ts_es_bus::UpstreamSeq`]). A video PID has
+/// seven to a 1316-byte datagram.
+///
+/// Both legs of a 2022-7 pair carry identical datagrams, so packet `index` of
+/// seq `seq` is the same packet on either leg. A [`HitlessMerger`] over the
+/// seqs keeps the window — what is new, what fills a gap, what is too late —
+/// and beside each of its slots sits the index of the next packet of that
+/// seq to forward. A packet is forwarded when it is that next one, from
+/// whichever leg; one already forwarded is a duplicate. One past it is
+/// dropped as well: the packets before it in its run have not come, and
+/// forwarding it would put the run out of order. The leg that delivers them
+/// brings the rest. So a leg that lost the start of a run — its channel
+/// lagged, or it subscribed mid-datagram — leaves the run to the other leg
+/// from the packet it is missing, and a repeat of a datagram is a duplicate
+/// packet by packet.
+///
+/// Each seq's first packet decides the seq as the transport merger decides a
+/// datagram, so the window, gap fills and too-late drops work in datagrams as
+/// they do there. Cost per packet over [`HitlessMerger::try_merge`]: a slot
+/// lookup, a compare and a store, on one `u16` per window slot allocated
+/// once.
+pub struct HitlessRunMerger {
+    seqs: HitlessMerger,
+    /// Per window slot, the index of the next packet to forward of the seq
+    /// [`Self::seqs`] holds there. Reset when that seq first arrives, and
+    /// read only while the slot's emitted bit is set — which only that
+    /// arrival sets.
+    next: Box<[u16]>,
+}
+
+impl HitlessRunMerger {
+    /// A run merger whose seqs have a `window`-seq gap-fill window (see
+    /// [`HitlessMerger::with_window`]).
+    pub fn with_window(window: u16) -> Self {
+        Self {
+            seqs: HitlessMerger::with_window(window),
+            next: vec![0u16; usize::from(window)].into_boxed_slice(),
+        }
+    }
+
+    /// Merge packet `index` of seq `seq`'s run, from `leg`. Returns
+    /// `Some(leg)` to forward it, or `None` to drop it: a duplicate, a
+    /// packet ahead of its run, or a seq too late to merge.
+    pub fn try_merge(&mut self, seq: u16, index: u16, leg: ActiveLeg) -> Option<ActiveLeg> {
+        let first = self.seqs.try_merge(seq, leg).is_some();
+        let slot = self.seqs.slot_of(seq)?;
+        if first {
+            self.next[slot] = 0;
+        }
+        if index != self.next[slot] {
+            return None;
+        }
+        self.next[slot] = index.saturating_add(1);
+        Some(leg)
+    }
+}
+
+/// How a [`BufferedHitlessMerger`] tells a new packet from a duplicate.
+pub trait SeqDedup {
+    /// Whether packet `index` of seq `seq`, from `leg`, is new: `Some(leg)`
+    /// to hold it for release, `None` for a duplicate or a packet too late.
+    fn admit(&mut self, seq: u16, index: u16, leg: ActiveLeg) -> Option<ActiveLeg>;
+}
+
+/// One packet per seq, so `index` is always 0.
+impl SeqDedup for HitlessMerger {
+    #[inline]
+    fn admit(&mut self, seq: u16, _index: u16, leg: ActiveLeg) -> Option<ActiveLeg> {
+        self.try_merge(seq, leg)
+    }
+}
+
+impl SeqDedup for HitlessRunMerger {
+    #[inline]
+    fn admit(&mut self, seq: u16, index: u16, leg: ActiveLeg) -> Option<ActiveLeg> {
+        self.try_merge(seq, index, leg)
+    }
 }
 
 #[cfg(test)]
@@ -679,6 +770,185 @@ mod tests {
         assert_eq!(merger.try_merge(102, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
         assert_eq!(merger.try_merge(103, ActiveLeg::Leg2), Some(ActiveLeg::Leg2));
     }
+
+    /// TS packets of a video PID in a 1316-byte datagram.
+    const RUN: u16 = 7;
+
+    /// Feed `leg`'s packets `indices` of seq `seq` to `merger`; returns
+    /// the indices it forwards.
+    fn run(
+        merger: &mut HitlessRunMerger,
+        seq: u16,
+        indices: std::ops::Range<u16>,
+        leg: ActiveLeg,
+    ) -> Vec<u16> {
+        indices
+            .filter(|&i| merger.try_merge(seq, i, leg).is_some())
+            .collect()
+    }
+
+    /// Every packet of a run is forwarded once, from whichever leg brings
+    /// it first: a `HitlessMerger` on the seq alone forwarded the first
+    /// packet of each datagram and dropped the other six as duplicates.
+    #[test]
+    fn test_run_merger_forwards_every_packet_of_a_run_once() {
+        let mut merger = HitlessRunMerger::with_window(1024);
+        for seq in 100..120u16 {
+            let (first, second) = if seq % 2 == 0 {
+                (ActiveLeg::Leg1, ActiveLeg::Leg2)
+            } else {
+                (ActiveLeg::Leg2, ActiveLeg::Leg1)
+            };
+            assert_eq!(
+                run(&mut merger, seq, 0..RUN, first),
+                (0..RUN).collect::<Vec<_>>()
+            );
+            assert!(
+                run(&mut merger, seq, 0..RUN, second).is_empty(),
+                "seq {seq}"
+            );
+        }
+    }
+
+    /// A datagram one leg lost comes whole from the other, a gap fill like
+    /// the transport merger's.
+    #[test]
+    fn test_run_merger_fills_a_lost_datagram_from_the_other_leg() {
+        let mut merger = HitlessRunMerger::with_window(1024);
+        for seq in (0..10u16).filter(|&s| s != 4) {
+            assert_eq!(run(&mut merger, seq, 0..RUN, ActiveLeg::Leg1).len(), 7);
+        }
+        for seq in 0..10u16 {
+            let filled = run(&mut merger, seq, 0..RUN, ActiveLeg::Leg2);
+            let expected: Vec<u16> = if seq == 4 { (0..RUN).collect() } else { vec![] };
+            assert_eq!(filled, expected, "seq {seq}");
+        }
+    }
+
+    /// Leg 2 brings part of a run before leg 1 brings any: leg 1 forwards
+    /// the rest, in order, and leg 2's rest is a duplicate.
+    #[test]
+    fn test_run_merger_takes_a_run_part_from_each_leg() {
+        let mut merger = HitlessRunMerger::with_window(1024);
+        assert_eq!(run(&mut merger, 7, 0..RUN, ActiveLeg::Leg1).len(), 7);
+        assert_eq!(run(&mut merger, 8, 0..3, ActiveLeg::Leg2), vec![0, 1, 2]);
+        assert_eq!(
+            run(&mut merger, 8, 0..RUN, ActiveLeg::Leg1),
+            vec![3, 4, 5, 6]
+        );
+        assert!(run(&mut merger, 8, 3..RUN, ActiveLeg::Leg2).is_empty());
+        assert!(run(&mut merger, 7, 0..RUN, ActiveLeg::Leg2).is_empty());
+    }
+
+    /// A leg that missed packets of a run — its channel lagged, or it
+    /// subscribed mid-datagram — forwards none past the hole: they would
+    /// leave the run out of order. The other leg brings the run from the
+    /// hole on, and the next run is merged as usual.
+    #[test]
+    fn test_run_merger_leaves_the_rest_of_a_holed_run_to_the_other_leg() {
+        let mut merger = HitlessRunMerger::with_window(1024);
+        // Leg 1's first run starts at its fourth packet.
+        assert!(run(&mut merger, 50, 3..RUN, ActiveLeg::Leg1).is_empty());
+        // Leg 1's next run lags after its third packet.
+        assert_eq!(run(&mut merger, 51, 0..3, ActiveLeg::Leg1), vec![0, 1, 2]);
+        assert!(run(&mut merger, 51, 5..RUN, ActiveLeg::Leg1).is_empty());
+        assert_eq!(run(&mut merger, 52, 0..RUN, ActiveLeg::Leg1).len(), 7);
+        assert_eq!(
+            run(&mut merger, 50, 0..RUN, ActiveLeg::Leg2),
+            (0..RUN).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            run(&mut merger, 51, 0..RUN, ActiveLeg::Leg2),
+            vec![3, 4, 5, 6]
+        );
+        assert!(run(&mut merger, 52, 0..RUN, ActiveLeg::Leg2).is_empty());
+        assert_eq!(run(&mut merger, 53, 0..RUN, ActiveLeg::Leg1).len(), 7);
+    }
+
+    /// A repeat of a datagram on the same leg — the network duplicated it
+    /// — is numbered from 0 again, so it is a duplicate packet by packet,
+    /// back to back or not.
+    #[test]
+    fn test_run_merger_drops_a_repeated_datagram() {
+        let mut merger = HitlessRunMerger::with_window(1024);
+        assert_eq!(run(&mut merger, 9, 0..RUN, ActiveLeg::Leg1).len(), 7);
+        assert!(run(&mut merger, 9, 0..RUN, ActiveLeg::Leg1).is_empty());
+        assert_eq!(run(&mut merger, 10, 0..RUN, ActiveLeg::Leg1).len(), 7);
+        assert!(run(&mut merger, 9, 0..RUN, ActiveLeg::Leg1).is_empty());
+    }
+
+    /// Runs merge across the u16 wrap, in a window that does not divide
+    /// 65536, and a run that has left the window is dropped whole.
+    #[test]
+    fn test_run_merger_across_the_u16_wrap() {
+        let mut merger = HitlessRunMerger::with_window(192);
+        let mut seq: u16 = 65_400;
+        while seq != 40 {
+            if seq != 65_520 && seq != 65_530 {
+                assert_eq!(
+                    run(&mut merger, seq, 0..RUN, ActiveLeg::Leg1).len(),
+                    7,
+                    "seq {seq}"
+                );
+            }
+            seq = seq.wrapping_add(1);
+        }
+        // 45 behind the newest seq: filled, once.
+        assert_eq!(run(&mut merger, 65_530, 0..RUN, ActiveLeg::Leg2).len(), 7);
+        assert!(run(&mut merger, 65_530, 0..RUN, ActiveLeg::Leg2).is_empty());
+        assert!(run(&mut merger, 3, 0..RUN, ActiveLeg::Leg2).is_empty());
+        for seq in 40..=300u16 {
+            assert_eq!(
+                run(&mut merger, seq, 0..RUN, ActiveLeg::Leg1).len(),
+                7,
+                "seq {seq}"
+            );
+        }
+        // 316 behind: too late, though no leg delivered it.
+        assert!(run(&mut merger, 65_520, 0..RUN, ActiveLeg::Leg2).is_empty());
+        assert_eq!(merger.seqs.lost(), 1);
+    }
+
+    /// With one packet per seq a run merger decides every packet as the
+    /// transport merger does: same window, same gap fills, same too-late
+    /// drops and re-anchors.
+    #[test]
+    fn test_run_merger_with_one_packet_per_seq_decides_as_the_seq_merger() {
+        for window in [64u16, 192, 1024] {
+            let mut runs = HitlessRunMerger::with_window(window);
+            let mut seqs = HitlessMerger::with_window(window);
+            let mut state: u32 = 0x2545_F491;
+            let mut seq: u16 = 65_000;
+            for _ in 0..20_000 {
+                // xorshift: mostly steps of one, some reordering and
+                // repeats, an occasional jump of a window or more.
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let step = match state % 100 {
+                    0 => 3 * window,
+                    1..=9 => 0u16.wrapping_sub((state % 300) as u16),
+                    10..=19 => 0,
+                    _ => 1,
+                };
+                seq = seq.wrapping_add(step);
+                let leg = if state & 0x100 == 0 {
+                    ActiveLeg::Leg1
+                } else {
+                    ActiveLeg::Leg2
+                };
+                assert_eq!(
+                    runs.try_merge(seq, 0, leg),
+                    seqs.try_merge(seq, leg),
+                    "window {window} seq {seq}"
+                );
+            }
+            assert_eq!(
+                (runs.seqs.lost(), runs.seqs.resets()),
+                (seqs.lost(), seqs.resets())
+            );
+        }
+    }
 }
 
 // ─── Buffered SMPTE 2022-7 merger ────────────────────────────────────
@@ -715,8 +985,9 @@ mod tests {
 //   3. Test the dedup bitmap. If duplicate, update the buffered
 //      entry's `legs_seen` mask + path-diff measurement, drop the
 //      payload.
-//   4. Insert into a `BTreeMap<i64, BufferedEntry>` keyed by virtual
-//      seq, stamping `release_at = now + max_path_diff`.
+//   4. Insert into a `BTreeMap<(i64, u16), BufferedEntry>` keyed by
+//      virtual seq and the packet's index in the seq's run (0 with one
+//      packet per seq), stamping `release_at = now + max_path_diff`.
 //   5. Drain ready entries from the map in seq order.
 //
 // Algorithm (per `drain_expired` / wake-up):
@@ -746,19 +1017,27 @@ use std::time::{Duration, Instant};
 /// `T` is the per-packet payload (e.g. `RtpPacket`, `EsPacket`). The
 /// merger only inspects the wire-level seq + the leg id; `T` rides
 /// through opaquely.
-pub struct BufferedHitlessMerger<T: Clone> {
+///
+/// `D` decides what is new. The transport layer's [`HitlessMerger`] (the
+/// default) takes one packet per seq, through [`Self::ingest`]; the PID
+/// bus's [`HitlessRunMerger`] takes a run of them, each with its index in
+/// the run, through [`Self::ingest_run`]. Either way a packet is held under
+/// its `(seq, index)` and released in that order.
+pub struct BufferedHitlessMerger<T: Clone, D = HitlessMerger> {
     /// Dedup primitive (rules duplicates / stream resets).
-    dedup: HitlessMerger,
+    dedup: D,
     /// Skew-accommodation buffer keyed by virtual (u16-wrap-resolved)
-    /// seq number. Entries drain in seq order at `release_at`.
-    buffer: BTreeMap<i64, BufferedEntry<T>>,
+    /// seq number and the packet's index in the seq's run (always 0 with
+    /// one packet per seq). Entries drain in key order at `release_at`.
+    buffer: BTreeMap<(i64, u16), BufferedEntry<T>>,
     /// Anchors that project `u16` wire seq → `i64` virtual seq.
     anchor_real: u16,
     anchor_virtual: i64,
     anchor_set: bool,
-    /// Cursor — the next virtual seq we expect to emit. None until the
-    /// first packet has been emitted.
-    cursor: Option<i64>,
+    /// Cursor — just past the key last emitted: that virtual seq, and the
+    /// index after the packet's. Every key below it has been passed. None
+    /// until the first packet has been emitted.
+    cursor: Option<(i64, u16)>,
     /// Path-differential window. Every accepted packet is held this
     /// long from first arrival before release. Constant emission
     /// latency.
@@ -852,6 +1131,11 @@ pub const MAX_PATH_DIFF_BOUND: Duration = Duration::from_millis(2000);
 /// differential or burst.
 const DEFAULT_MAX_BUFFER_PACKETS: usize = 12_000;
 
+/// The same bound for a [`HitlessRunMerger`]'s buffer, which holds TS
+/// packets rather than datagrams: the same 12 000 datagrams of a PID that
+/// fills them, seven 188-byte packets to a 1316-byte datagram.
+const RUN_MAX_BUFFER_PACKETS: usize = DEFAULT_MAX_BUFFER_PACKETS * 7;
+
 /// "Down" threshold: how long a leg can be silent before we flip its
 /// health to Down. Below this, missing packets only count as Degraded.
 const LEG_DOWN_THRESHOLD: Duration = Duration::from_millis(1000);
@@ -868,20 +1152,67 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     /// slower leg's copy that arrives more than `window` seqs behind the
     /// faster one is dropped as late, however long the hold.
     pub fn with_window(max_path_diff: Duration, window: u16) -> Self {
+        Self::build(
+            HitlessMerger::with_window(window),
+            max_path_diff,
+            DEFAULT_MAX_BUFFER_PACKETS,
+        )
+    }
+
+    /// Ingest a packet. Returns the (leg, payload) pairs that are now
+    /// ready to forward, in seq order.
+    pub fn ingest(
+        &mut self,
+        seq: u16,
+        leg: ActiveLeg,
+        payload: T,
+        now: Instant,
+    ) -> Vec<(ActiveLeg, T)> {
+        self.ingest_at(seq, 0, leg, payload, now)
+    }
+}
+
+impl<T: Clone> BufferedHitlessMerger<T, HitlessRunMerger> {
+    /// A merger over runs of packets per seq (see [`HitlessRunMerger`]), its
+    /// seqs in a `window`-seq gap-fill window as [`Self::with_window`]'s are.
+    pub fn with_runs(max_path_diff: Duration, window: u16) -> Self {
+        Self::build(
+            HitlessRunMerger::with_window(window),
+            max_path_diff,
+            RUN_MAX_BUFFER_PACKETS,
+        )
+    }
+
+    /// Ingest packet `index` of seq `seq`'s run. Returns the (leg, payload)
+    /// pairs that are now ready to forward, in `(seq, index)` order.
+    pub fn ingest_run(
+        &mut self,
+        seq: u16,
+        index: u16,
+        leg: ActiveLeg,
+        payload: T,
+        now: Instant,
+    ) -> Vec<(ActiveLeg, T)> {
+        self.ingest_at(seq, index, leg, payload, now)
+    }
+}
+
+impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
+    fn build(dedup: D, max_path_diff: Duration, max_buffer_packets: usize) -> Self {
         let bounded = if max_path_diff > MAX_PATH_DIFF_BOUND {
             MAX_PATH_DIFF_BOUND
         } else {
             max_path_diff
         };
         Self {
-            dedup: HitlessMerger::with_window(window),
+            dedup,
             buffer: BTreeMap::new(),
             anchor_real: 0,
             anchor_virtual: 0,
             anchor_set: false,
             cursor: None,
             max_path_diff: bounded,
-            max_buffer_packets: DEFAULT_MAX_BUFFER_PACKETS,
+            max_buffer_packets,
             leg_state: [LegState::default(), LegState::default()],
             stats: BufferedHitlessStats::default(),
         }
@@ -933,11 +1264,11 @@ impl<T: Clone> BufferedHitlessMerger<T> {
         }
     }
 
-    /// Ingest a packet. Returns the (leg, payload) pairs that are now
-    /// ready to forward, in seq order.
-    pub fn ingest(
+    /// Ingest packet `index` of seq `seq` (0 with one packet per seq).
+    fn ingest_at(
         &mut self,
         seq: u16,
+        index: u16,
         leg: ActiveLeg,
         payload: T,
         now: Instant,
@@ -969,13 +1300,13 @@ impl<T: Clone> BufferedHitlessMerger<T> {
         }
 
         // ── Dedup decision ──
-        let virt = self.project(seq);
+        let key = (self.project(seq), index);
         let leg_bit = leg_bit(leg);
 
-        // If we already have an entry at this virtual seq, we just
-        // observed the slower leg. Update the legs_seen mask + path-
-        // diff measurement; drop the duplicate payload.
-        if let Some(entry) = self.buffer.get_mut(&virt) {
+        // If we already have an entry at this key, we just observed the
+        // slower leg. Update the legs_seen mask + path-diff measurement;
+        // drop the duplicate payload.
+        if let Some(entry) = self.buffer.get_mut(&key) {
             if entry.legs_seen & leg_bit == 0 && leg_bit != 0 {
                 entry.legs_seen |= leg_bit;
                 let diff = now.duration_since(entry.first_seen);
@@ -995,7 +1326,7 @@ impl<T: Clone> BufferedHitlessMerger<T> {
         }
 
         // Run the dedup primitive — this catches old / wrap / reset.
-        match self.dedup.try_merge(seq, leg) {
+        match self.dedup.admit(seq, index, leg) {
             None => {
                 // Outside the dedup window. Late or stale. Drop.
                 self.stats.late_dropped.fetch_add(1, Ordering::Relaxed);
@@ -1015,7 +1346,7 @@ impl<T: Clone> BufferedHitlessMerger<T> {
                 // decoder hiccups. The right behaviour is to drop the late
                 // gap-fill — the receiver has already moved on.
                 if let Some(c) = self.cursor
-                    && virt < c {
+                    && key < c {
                         self.stats.late_dropped.fetch_add(1, Ordering::Relaxed);
                         return self.drain_ready(now);
                     }
@@ -1026,7 +1357,7 @@ impl<T: Clone> BufferedHitlessMerger<T> {
                     return self.drain_ready(now);
                 }
                 self.buffer.insert(
-                    virt,
+                    key,
                     BufferedEntry {
                         payload,
                         first_leg: leg,
@@ -1053,20 +1384,22 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     fn drain_ready(&mut self, now: Instant) -> Vec<(ActiveLeg, T)> {
         let mut out = Vec::new();
         let mut last_emit_leg: Option<ActiveLeg> = None;
-        while let Some((&virt, entry)) = self.buffer.iter().next() {
+        while let Some((&key, entry)) = self.buffer.iter().next() {
             if now < entry.release_at {
                 break;
             }
-            // Account for any seq gap relative to the cursor.
-            if let Some(c) = self.cursor
-                && virt > c {
-                    let gap = (virt - c) as u64;
+            let (virt, index) = key;
+            // Account for any seq gap relative to the cursor: the seqs
+            // between the last one emitted and this one.
+            if let Some((last, _)) = self.cursor
+                && virt > last + 1 {
+                    let gap = (virt - last - 1) as u64;
                     self.stats.gap_lost.fetch_add(gap, Ordering::Relaxed);
                 }
             // Emit. Update gap_filled / failover stats based on which
             // leg actually carried this packet first.
-            let entry = self.buffer.remove(&virt).unwrap();
-            self.cursor = Some(virt + 1);
+            let entry = self.buffer.remove(&key).unwrap();
+            self.cursor = Some((virt, index.saturating_add(1)));
             self.stats.packets_emitted.fetch_add(1, Ordering::Relaxed);
             match entry.first_leg {
                 ActiveLeg::Leg1 => {
@@ -1441,5 +1774,97 @@ mod buffered_tests {
         assert_eq!(out[1].1, 65535);
         assert_eq!(out[2].1, 0);
         assert_eq!(out[3].1, 1);
+    }
+
+    /// A run merger over seven packets a seq, each payload its `(seq, index)`.
+    fn runs() -> BufferedHitlessMerger<(u16, u16), HitlessRunMerger> {
+        BufferedHitlessMerger::with_runs(Duration::from_millis(50), REORDER_WINDOW)
+    }
+
+    /// Feed `leg`'s packets `indices` of seq `seq` at `now`; returns what
+    /// is released.
+    fn feed(
+        m: &mut BufferedHitlessMerger<(u16, u16), HitlessRunMerger>,
+        seq: u16,
+        indices: std::ops::Range<u16>,
+        leg: ActiveLeg,
+        now: Instant,
+    ) -> Vec<(u16, u16)> {
+        indices
+            .flat_map(|i| m.ingest_run(seq, i, leg, (seq, i), now))
+            .map(|(_, p)| p)
+            .collect()
+    }
+
+    fn every_packet(seqs: std::ops::Range<u16>) -> Vec<(u16, u16)> {
+        seqs.flat_map(|s| (0..7).map(move |i| (s, i))).collect()
+    }
+
+    /// Every packet of every run is released once and in order, the
+    /// datagrams one leg lost filled whole from the other.
+    #[test]
+    fn runs_release_every_packet_once_in_order() {
+        let mut m = runs();
+        let t0 = Instant::now();
+        for seq in 0..30u16 {
+            if seq % 7 != 3 {
+                assert!(feed(&mut m, seq, 0..7, ActiveLeg::Leg1, t0).is_empty());
+            }
+            assert!(feed(&mut m, seq, 0..7, ActiveLeg::Leg2, t0).is_empty());
+        }
+        assert_eq!(
+            m.drain_expired(t0 + Duration::from_millis(60))
+                .into_iter()
+                .map(|(_, p)| p)
+                .collect::<Vec<_>>(),
+            every_packet(0..30)
+        );
+        assert_eq!(m.stats.packets_emitted.load(Ordering::Relaxed), 210);
+        assert_eq!(m.stats.gap_lost.load(Ordering::Relaxed), 0);
+    }
+
+    /// Leg 2 brings part of a run before leg 1 brings any, and leg 1 a run
+    /// whose start its channel dropped: each run is released whole, in
+    /// order, once.
+    #[test]
+    fn runs_take_a_run_part_from_each_leg() {
+        let mut m = runs();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(5);
+        feed(&mut m, 8, 0..3, ActiveLeg::Leg2, t0);
+        feed(&mut m, 8, 0..7, ActiveLeg::Leg1, t1);
+        feed(&mut m, 8, 3..7, ActiveLeg::Leg2, t1);
+        feed(&mut m, 9, 4..7, ActiveLeg::Leg1, t1);
+        feed(&mut m, 9, 0..7, ActiveLeg::Leg2, t1);
+        let out: Vec<_> = m
+            .drain_expired(t1 + Duration::from_millis(60))
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(out, every_packet(8..10));
+    }
+
+    /// A run's rest that arrives once the hold has released its start is
+    /// still in order, so it is released; the packets past a hole are not,
+    /// and the next run is merged as usual.
+    #[test]
+    fn runs_released_part_way_take_the_rest_in_order() {
+        let mut m = runs();
+        let t0 = Instant::now();
+        feed(&mut m, 20, 0..3, ActiveLeg::Leg1, t0);
+        let t1 = t0 + Duration::from_millis(60);
+        assert_eq!(m.drain_expired(t1).len(), 3);
+        // Leg 1 lagged past packets 3 and 4.
+        assert!(feed(&mut m, 20, 5..7, ActiveLeg::Leg1, t1).is_empty());
+        feed(&mut m, 20, 0..7, ActiveLeg::Leg2, t1);
+        feed(&mut m, 21, 0..7, ActiveLeg::Leg1, t1);
+        let out: Vec<_> = m
+            .drain_expired(t1 + Duration::from_millis(60))
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect();
+        let mut expected: Vec<_> = (3..7).map(|i| (20, i)).collect();
+        expected.extend(every_packet(21..22));
+        assert_eq!(out, expected);
     }
 }

@@ -157,12 +157,28 @@ pub struct EsPacket {
     /// — lets downstream PCR-accuracy monitors measure jitter.
     #[allow(dead_code)]
     pub recv_time_us: u64,
-    /// Upstream RTP / SRT sequence number when known. `None` for inputs
-    /// that don't carry a wire-level seq (raw TS over UDP, RIST raw TS).
-    /// Stamped by `input_rtp` / `input_srt` so the pre-bus 2022-7
-    /// seq-aware Hitless merger can dedup + gap-fill against the same
-    /// algorithm used at the transport layer in `redundancy/merger.rs`.
-    pub upstream_seq: Option<u16>,
+    /// Where this packet sat on the wire, when its input knows: the
+    /// sequence number of the datagram that carried it and its place among
+    /// that datagram's packets of its PID. `input_rtp` and `input_rist`
+    /// stamp the sequence number on the `RtpPacket` and [`TsEsDemuxer`]
+    /// counts the place; `None` from every other input — SRT, UDP, ST 2110
+    /// among them.
+    ///
+    /// The pre-bus seq-aware Hitless merger merges on it. Both legs of a
+    /// 2022-7 pair carry identical datagrams, so the pair names the same TS
+    /// packet on either leg. The sequence number alone does not: every
+    /// packet of the PID in the datagram shares it — seven of a video PID's
+    /// in a 1316-byte datagram.
+    pub upstream_seq: Option<UpstreamSeq>,
+}
+
+/// An [`EsPacket`]'s position on the wire: see [`EsPacket::upstream_seq`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamSeq {
+    /// The upstream datagram's sequence number.
+    pub seq: u16,
+    /// 0 for the datagram's first TS packet of this PID, 1 for its second, …
+    pub index: u16,
 }
 
 /// Node-wide elementary-stream bus. Read-shared across every consumer
@@ -293,6 +309,16 @@ const MAX_UNDECLARED_PIDS_PER_INPUT: usize = 32;
 /// every realistic configuration and caps worst-case retention at ~22×.
 const MAX_SLICE_REF_PARENT: usize = 4096;
 
+/// A PID's cached bus sender, and its count of packets in the datagram it
+/// last published from: [`UpstreamSeq::index`].
+struct PidSender {
+    tx: broadcast::Sender<EsPacket>,
+    /// The [`TsEsDemuxer::datagrams`] count of that datagram.
+    datagram: u64,
+    /// The index the PID's next packet in that datagram takes.
+    next_index: u16,
+}
+
 pub struct TsEsDemuxer {
     /// Node-globally-unique input ID — used as the bus key together with the PID.
     input_id: String,
@@ -313,7 +339,10 @@ pub struct TsEsDemuxer {
     /// rejected during the pre-PMT window rejected for the life of the
     /// demuxer — and that life is the *input's*, not the flow's — which is
     /// a session-long silent ES drop.
-    senders: std::collections::HashMap<u16, broadcast::Sender<EsPacket>>,
+    senders: std::collections::HashMap<u16, PidSender>,
+    /// Datagrams fed to [`Self::process`]: names the current one, so each
+    /// PID can count its packets in it.
+    datagrams: u64,
     /// Count of cached PIDs that no PMT had declared when first seen.
     undeclared_pids: usize,
     /// Latch so a sustained cap breach reports once, not per packet.
@@ -338,6 +367,7 @@ impl TsEsDemuxer {
             input_id: input_id.into(),
             bus,
             senders: std::collections::HashMap::new(),
+            datagrams: 0,
             undeclared_pids: 0,
             pid_cap_reported: false,
             events: None,
@@ -416,6 +446,10 @@ impl TsEsDemuxer {
     /// re-emitted (the assembler synthesises fresh PAT/PMT from its
     /// own plan). Null packets are dropped.
     ///
+    /// `pkt` is one datagram: each PID's packets in it are numbered from 0
+    /// on [`EsPacket::upstream_seq`] — a repeat of the datagram is numbered
+    /// from 0 again.
+    ///
     /// Returns the number of ES packets published. Useful for metrics.
     pub fn process(&mut self, pkt: &RtpPacket) -> usize {
         let data: &[u8] = if pkt.is_raw_ts {
@@ -425,6 +459,8 @@ impl TsEsDemuxer {
         } else {
             return 0;
         };
+        self.datagrams += 1;
+        let datagram = self.datagrams;
         let mut published = 0;
         let mut off = 0;
         while off + TS_PACKET_SIZE <= data.len() {
@@ -461,7 +497,14 @@ impl TsEsDemuxer {
                     continue;
                 }
                 let tx = self.bus.sender_for(&self.input_id, pid, stream_type);
-                self.senders.insert(pid, tx);
+                self.senders.insert(
+                    pid,
+                    PidSender {
+                        tx,
+                        datagram: 0,
+                        next_index: 0,
+                    },
+                );
             }
 
             let is_pusi = ts_pusi(ts);
@@ -475,21 +518,27 @@ impl TsEsDemuxer {
             } else {
                 Bytes::copy_from_slice(ts)
             };
-            let es = EsPacket {
-                source_pid: pid,
-                stream_type,
-                payload,
-                is_pusi,
-                has_pcr: pcr.is_some(),
-                pcr,
-                recv_time_us: pkt.recv_time_us,
-                upstream_seq: pkt.upstream_seq,
-            };
-            // `send` returns `Err` only when there are no active
-            // subscribers — that's fine, we don't hold packets for the
-            // future. Count attempts, not actual receivers.
-            if let Some(tx) = self.senders.get(&pid) {
-                let _ = tx.send(es);
+            if let Some(sender) = self.senders.get_mut(&pid) {
+                if sender.datagram != datagram {
+                    sender.datagram = datagram;
+                    sender.next_index = 0;
+                }
+                let index = sender.next_index;
+                sender.next_index = index.saturating_add(1);
+                let es = EsPacket {
+                    source_pid: pid,
+                    stream_type,
+                    payload,
+                    is_pusi,
+                    has_pcr: pcr.is_some(),
+                    pcr,
+                    recv_time_us: pkt.recv_time_us,
+                    upstream_seq: pkt.upstream_seq.map(|seq| UpstreamSeq { seq, index }),
+                };
+                // `send` returns `Err` only when there are no active
+                // subscribers — that's fine, we don't hold packets for the
+                // future. Count attempts, not actual receivers.
+                let _ = sender.tx.send(es);
                 published += 1;
             }
         }
@@ -643,6 +692,46 @@ mod tests {
             sender_timestamp_us: None,
             is_raw_ts: true,
         }
+    }
+
+    /// Each PID's packets in a datagram are numbered from 0 beside the
+    /// datagram's sequence number, counted afresh in the next datagram and
+    /// in a repeat of the same one; an input with no sequence number gets
+    /// neither.
+    #[test]
+    fn demuxer_numbers_each_pids_packets_in_a_datagram() {
+        let bus = Arc::new(NodeEsBus::new());
+        let mut demux = TsEsDemuxer::new("in-a", bus.clone());
+        let mut rx_video = bus.subscribe("in-a", 0x101);
+        let mut rx_audio = bus.subscribe("in-a", 0x102);
+        let pids = [0x101, 0x102, 0x101, 0x1FFF, 0x101, 0x102, 0x101];
+        let datagram = |seq: Option<u16>| {
+            let mut buf = Vec::new();
+            for (cc, pid) in pids.iter().enumerate() {
+                buf.extend_from_slice(&build_es(*pid, cc as u8));
+            }
+            RtpPacket {
+                upstream_seq: seq,
+                ..wrap(buf)
+            }
+        };
+        let numbered = |rx: &mut broadcast::Receiver<EsPacket>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|es| es.upstream_seq)
+                .collect::<Vec<_>>()
+        };
+        let at = |seq, index| Some(UpstreamSeq { seq, index });
+
+        for seq in [500, 501, 501] {
+            assert_eq!(demux.process(&datagram(Some(seq))), 6);
+            assert_eq!(
+                numbered(&mut rx_video),
+                [at(seq, 0), at(seq, 1), at(seq, 2), at(seq, 3)]
+            );
+            assert_eq!(numbered(&mut rx_audio), [at(seq, 0), at(seq, 1)]);
+        }
+        demux.process(&datagram(None));
+        assert_eq!(numbered(&mut rx_video), [None; 4]);
     }
 
     #[test]

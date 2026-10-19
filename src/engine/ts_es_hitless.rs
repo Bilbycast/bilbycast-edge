@@ -9,19 +9,31 @@
 //! points at. The assembler itself stays PID-level — zero changes to
 //! `run_assembler`.
 //!
-//! # Dedup strategy — Phase 7 first-light
+//! # Merge strategies
 //!
-//! Primary-preference failover with a configurable stall timer.
-//! Primary packets are forwarded verbatim. If no primary packet arrives
-//! for `stall_ms` (default 200 ms) the merger flips to backup. When
-//! primary traffic resumes the merger switches back after a brief
-//! hold-off to avoid flapping on bursty feeds.
+//! [`spawn_hitless_es_merger_full`] runs one of three per slot:
 //!
-//! This is **not** SMPTE 2022-7 sequence-aware dedup — [`EsPacket`]
-//! carries no upstream RTP sequence number today. Seq-aware dedup is a
-//! follow-up that requires augmenting the bus shape. Failover semantics
-//! are the common operator intent for "hot standby" and robust without
-//! seq plumbing.
+//! - **Primary preference** (the default): primary packets are forwarded
+//!   verbatim. If no primary packet arrives for `stall_ms` (default
+//!   200 ms) the merger flips to the backup, and back to the primary on its
+//!   next packet.
+//! - **Seq-aware** (`mode: seq_aware`): SMPTE 2022-7 merging on
+//!   [`EsPacket::upstream_seq`] — the sequence number of the datagram that
+//!   carried the packet, which RTP and RIST inputs stamp, and the packet's
+//!   index among that datagram's packets of its PID, which
+//!   [`super::ts_es_bus::TsEsDemuxer`] counts. A datagram carries seven TS
+//!   packets of a video PID, all with its sequence number, so the merger
+//!   merges each datagram's run packet by packet
+//!   ([`HitlessRunMerger`](crate::redundancy::merger::HitlessRunMerger)):
+//!   each forwarded once and in order within its run, from either leg, and
+//!   a run one leg lost or cut short completed from the other.
+//! - **Buffered seq-aware** (`path_differential_ms` set): the same merge
+//!   behind a hold of that long, released in `(seq, index)` order at
+//!   constant latency.
+//!
+//! A leg with no sequence number — SRT, UDP — gives a seq-aware merger
+//! nothing to merge on: it forwards such a primary verbatim and discards
+//! such a backup.
 //!
 //! # Invariants
 //!
@@ -46,7 +58,7 @@ use tokio::time::{sleep_until, Instant};
 use tokio_util::sync::CancellationToken;
 
 use super::ts_assembler::{AssemblyPlan, PendingHitlessSlot};
-use super::ts_es_bus::NodeEsBus;
+use super::ts_es_bus::{NodeEsBus, UpstreamSeq};
 
 /// Default stall timer: if no primary packet arrives within this
 /// window the merger flips to backup. Tight enough that standby cuts
@@ -268,9 +280,9 @@ async fn run_buffered(
     reorder_window: u16,
     cancel: CancellationToken,
 ) {
-    use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger};
-    let mut merger: BufferedHitlessMerger<EsPacketAlias> =
-        BufferedHitlessMerger::with_window(max_path_diff, reorder_window);
+    use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HitlessRunMerger};
+    let mut merger: BufferedHitlessMerger<EsPacketAlias, HitlessRunMerger> =
+        BufferedHitlessMerger::with_runs(max_path_diff, reorder_window);
     // Far-future placeholder used when the buffer is empty so the
     // tokio::select! `sleep_until` arm doesn't fire spuriously.
     let far_future = std::time::Instant::now() + Duration::from_secs(86_400);
@@ -287,20 +299,17 @@ async fn run_buffered(
             }
             res = primary_rx.recv() => match res {
                 Ok(es) => {
-                    let seq = match es.upstream_seq {
-                        Some(s) => s,
-                        None => {
-                            tracing::warn!(
-                                uid = %uid,
-                                "pid_bus hitless buffered: primary leg has no upstream_seq — \
-                                 forwarding without buffer (bypass path)"
-                            );
-                            let _ = out_tx.send(es);
-                            continue;
-                        }
+                    let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
+                        tracing::warn!(
+                            uid = %uid,
+                            "pid_bus hitless buffered: primary leg has no upstream_seq — \
+                             forwarding without buffer (bypass path)"
+                        );
+                        let _ = out_tx.send(es);
+                        continue;
                     };
                     let now = std::time::Instant::now();
-                    for (_, es) in merger.ingest(seq, ActiveLeg::Leg1, es, now) {
+                    for (_, es) in merger.ingest_run(seq, index, ActiveLeg::Leg1, es, now) {
                         let _ = out_tx.send(es);
                     }
                 }
@@ -309,12 +318,11 @@ async fn run_buffered(
             },
             res = backup_rx.recv() => match res {
                 Ok(es) => {
-                    let seq = match es.upstream_seq {
-                        Some(s) => s,
-                        None => continue,
+                    let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
+                        continue;
                     };
                     let now = std::time::Instant::now();
-                    for (_, es) in merger.ingest(seq, ActiveLeg::Leg2, es, now) {
+                    for (_, es) in merger.ingest_run(seq, index, ActiveLeg::Leg2, es, now) {
                         let _ = out_tx.send(es);
                     }
                 }
@@ -388,8 +396,8 @@ async fn run_seq_aware(
     reorder_window: u16,
     cancel: CancellationToken,
 ) {
-    use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
-    let mut merger = HitlessMerger::with_window(reorder_window);
+    use crate::redundancy::merger::{ActiveLeg, HitlessRunMerger};
+    let mut merger = HitlessRunMerger::with_window(reorder_window);
     let mut current_leg: Option<ActiveLeg> = None;
 
     loop {
@@ -398,19 +406,16 @@ async fn run_seq_aware(
             _ = cancel.cancelled() => return,
             res = primary_rx.recv() => match res {
                 Ok(es) => {
-                    let seq = match es.upstream_seq {
-                        Some(s) => s,
-                        None => {
-                            tracing::warn!(
-                                uid = %uid,
-                                "pid_bus hitless seq_aware: primary leg has no upstream_seq — \
-                                 falling back to forward (this should be rejected at config validation)"
-                            );
-                            let _ = out_tx.send(es);
-                            continue;
-                        }
+                    let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
+                        tracing::warn!(
+                            uid = %uid,
+                            "pid_bus hitless seq_aware: primary leg has no upstream_seq — \
+                             falling back to forward (this should be rejected at config validation)"
+                        );
+                        let _ = out_tx.send(es);
+                        continue;
                     };
-                    if let Some(chosen) = merger.try_merge(seq, ActiveLeg::Leg1) {
+                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg1) {
                         if Some(chosen) != current_leg {
                             tracing::info!(uid = %uid, "pid_bus hitless seq_aware: leg = {:?}", chosen);
                             current_leg = Some(chosen);
@@ -423,11 +428,10 @@ async fn run_seq_aware(
             },
             res = backup_rx.recv() => match res {
                 Ok(es) => {
-                    let seq = match es.upstream_seq {
-                        Some(s) => s,
-                        None => continue,
+                    let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
+                        continue;
                     };
-                    if let Some(chosen) = merger.try_merge(seq, ActiveLeg::Leg2) {
+                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg2) {
                         if Some(chosen) != current_leg {
                             tracing::info!(uid = %uid, "pid_bus hitless seq_aware: leg = {:?}", chosen);
                             current_leg = Some(chosen);
@@ -612,7 +616,10 @@ mod tests {
     /// inside its configured `reorder_window`, buffered or not.
     #[tokio::test]
     async fn seq_aware_merges_within_the_configured_reorder_window() {
-        let seq_es = |pid: u16, seq: u16| EsPacket { upstream_seq: Some(seq), ..es(pid, 0) };
+        let seq_es = |pid: u16, seq: u16| EsPacket {
+            upstream_seq: Some(UpstreamSeq { seq, index: 0 }),
+            ..es(pid, 0)
+        };
         for path_differential_ms in [None, Some(500)] {
             for (reorder_window, fills) in [(64u16, false), (128, true)] {
                 let bus = Arc::new(NodeEsBus::new());
@@ -641,7 +648,7 @@ mod tests {
                 let quiet = Duration::from_millis(if path_differential_ms.is_some() { 900 } else { 200 });
                 let mut forwarded = Vec::new();
                 while let Ok(Ok(es)) = tokio::time::timeout(quiet, out_rx.recv()).await {
-                    forwarded.push(es.upstream_seq);
+                    forwarded.push(es.upstream_seq.map(|u| u.seq));
                 }
                 assert_eq!(
                     forwarded.contains(&Some(20)),
@@ -696,5 +703,265 @@ mod tests {
 
             cancel.cancel();
         }
+    }
+
+    /// TS packets a 1316-byte datagram carries.
+    const RUN: usize = 7;
+
+    /// Datagram `seq` of a feed carrying nothing but video PID `pid`: `RUN`
+    /// TS packets, packet `i` tagged `(seq, i)` in its payload so the merged
+    /// output names each packet it forwards.
+    fn datagram(pid: u16, seq: u16) -> crate::engine::packet::RtpPacket {
+        let mut data = Vec::with_capacity(RUN * 188);
+        for i in 0..RUN {
+            let mut ts = [0u8; 188];
+            ts[0] = 0x47;
+            ts[1] = ((pid >> 8) & 0x1F) as u8;
+            ts[2] = (pid & 0xFF) as u8;
+            ts[3] = 0x10 | ((usize::from(seq) * RUN + i) & 0x0F) as u8;
+            ts[4..6].copy_from_slice(&seq.to_be_bytes());
+            ts[6] = i as u8;
+            data.extend_from_slice(&ts);
+        }
+        crate::engine::packet::RtpPacket {
+            data: Bytes::from(data),
+            sequence_number: seq,
+            rtp_timestamp: 0,
+            recv_time_us: 0,
+            is_raw_ts: true,
+            upstream_seq: Some(seq),
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        }
+    }
+
+    /// The `(seq, index)` tag [`datagram`] wrote into a packet.
+    fn tag(es: &EsPacket) -> (u16, u8) {
+        (
+            u16::from_be_bytes([es.payload[4], es.payload[5]]),
+            es.payload[6],
+        )
+    }
+
+    /// Every packet of datagrams `seqs`, in order.
+    fn every_packet(seqs: impl IntoIterator<Item = u16>) -> Vec<(u16, u8)> {
+        seqs.into_iter()
+            .flat_map(|s| (0..RUN as u8).map(move |i| (s, i)))
+            .collect()
+    }
+
+    /// A seq-aware merger over two RTP inputs' demuxers, each publishing
+    /// video PID 0x100. Feeds `leg1` and `leg2`'s datagrams through the
+    /// demuxers, which is where a datagram's packets get its sequence
+    /// number, and returns the merged output once it goes quiet.
+    async fn merge_demuxed(
+        path_differential_ms: Option<u32>,
+        leg1: &[u16],
+        leg2: &[u16],
+    ) -> Vec<(u16, u8)> {
+        use crate::engine::ts_es_bus::TsEsDemuxer;
+        let bus = Arc::new(NodeEsBus::new());
+        let cancel = CancellationToken::new();
+        let _handle = spawn_hitless_es_merger_full(
+            hitless_bus_key("f1", "slot_0_0"),
+            ("in-a".to_string(), 0x100),
+            ("in-b".to_string(), 0x100),
+            bus.clone(),
+            Duration::from_millis(50),
+            /* seq_aware */ true,
+            crate::redundancy::merger::REORDER_WINDOW,
+            path_differential_ms,
+            ForwardingPrimary::default(),
+            cancel.clone(),
+        );
+        let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+        let mut demux_a = TsEsDemuxer::new("in-a", bus.clone());
+        let mut demux_b = TsEsDemuxer::new("in-b", bus.clone());
+        for &seq in leg1 {
+            demux_a.process(&datagram(0x100, seq));
+        }
+        for &seq in leg2 {
+            demux_b.process(&datagram(0x100, seq));
+        }
+        let quiet = Duration::from_millis(if path_differential_ms.is_some() {
+            300
+        } else {
+            100
+        });
+        let mut forwarded = Vec::new();
+        while let Ok(Ok(es)) = tokio::time::timeout(quiet, out_rx.recv()).await {
+            forwarded.push(tag(&es));
+        }
+        cancel.cancel();
+        forwarded
+    }
+
+    /// Both legs deliver every datagram: the merged video PID carries every
+    /// TS packet once, in order — not just the first of each datagram's
+    /// seven, which share its sequence number.
+    #[tokio::test]
+    async fn seq_aware_forwards_every_packet_of_a_datagram() {
+        let seqs: Vec<u16> = (0..20).collect();
+        for path_differential_ms in [None, Some(50)] {
+            let forwarded = merge_demuxed(path_differential_ms, &seqs, &seqs).await;
+            assert_eq!(forwarded, every_packet(0..20), "{path_differential_ms:?}");
+        }
+    }
+
+    /// The primary loses three datagrams and the backup fills them, whole:
+    /// still every packet once. The buffered merger releases them in order;
+    /// the bare one forwards a fill as it arrives, so only each datagram's
+    /// own packets are in order.
+    #[tokio::test]
+    async fn seq_aware_fills_a_lost_datagram_from_the_other_leg() {
+        let lossy: Vec<u16> = (0..20).filter(|s| ![3, 7, 8].contains(s)).collect();
+        let whole: Vec<u16> = (0..20).collect();
+        for path_differential_ms in [None, Some(50)] {
+            let forwarded = merge_demuxed(path_differential_ms, &lossy, &whole).await;
+            if path_differential_ms.is_some() {
+                assert_eq!(forwarded, every_packet(0..20));
+            } else {
+                let mut sorted = forwarded.clone();
+                sorted.sort();
+                assert_eq!(sorted, every_packet(0..20), "every packet once");
+                for seq in [3, 7, 8] {
+                    let run: Vec<u8> = forwarded
+                        .iter()
+                        .filter(|(s, _)| *s == seq)
+                        .map(|&(_, i)| i)
+                        .collect();
+                    assert_eq!(
+                        run,
+                        (0..RUN as u8).collect::<Vec<_>>(),
+                        "datagram {seq} in order"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Packet `index` of datagram `seq`'s run on PID 0x100, tagged as
+    /// [`datagram`] tags it, as the demuxer publishes it.
+    fn run_packet(seq: u16, index: u16) -> EsPacket {
+        let at = usize::from(index) * 188;
+        EsPacket {
+            stream_type: 0x1B,
+            payload: Bytes::copy_from_slice(&datagram(0x100, seq).data[at..at + 188]),
+            upstream_seq: Some(UpstreamSeq { seq, index }),
+            ..es(0x100, 0)
+        }
+    }
+
+    /// Leg 2 delivers part of a datagram's run before leg 1 delivers any of
+    /// it: the run is forwarded once and in order, part from each leg.
+    #[tokio::test]
+    async fn seq_aware_merges_a_run_part_from_each_leg() {
+        for path_differential_ms in [None, Some(50)] {
+            let bus = Arc::new(NodeEsBus::new());
+            let cancel = CancellationToken::new();
+            let _handle = spawn_hitless_es_merger_full(
+                hitless_bus_key("f1", "slot_0_0"),
+                ("in-a".to_string(), 0x100),
+                ("in-b".to_string(), 0x100),
+                bus.clone(),
+                Duration::from_millis(50),
+                /* seq_aware */ true,
+                crate::redundancy::merger::REORDER_WINDOW,
+                path_differential_ms,
+                ForwardingPrimary::default(),
+                cancel.clone(),
+            );
+            let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+            let pri = bus.sender_for("in-a", 0x100, 0x1B);
+            let bak = bus.sender_for("in-b", 0x100, 0x1B);
+            let settle = || tokio::time::sleep(Duration::from_millis(20));
+
+            for index in 0..3 {
+                bak.send(run_packet(10, index)).unwrap();
+            }
+            settle().await;
+            for index in 0..RUN as u16 {
+                pri.send(run_packet(10, index)).unwrap();
+            }
+            settle().await;
+            for index in 3..RUN as u16 {
+                bak.send(run_packet(10, index)).unwrap();
+            }
+            for seq in 11..13 {
+                for index in 0..RUN as u16 {
+                    pri.send(run_packet(seq, index)).unwrap();
+                    bak.send(run_packet(seq, index)).unwrap();
+                }
+            }
+
+            let mut forwarded = Vec::new();
+            while let Ok(Ok(es)) =
+                tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await
+            {
+                forwarded.push(tag(&es));
+            }
+            assert_eq!(forwarded, every_packet(10..13), "{path_differential_ms:?}");
+            cancel.cancel();
+        }
+    }
+
+    /// The primary's channel lags in the middle of a datagram's run: the
+    /// merger forwards none of that run past the hole, the backup's copy
+    /// fills it whole, and later datagrams merge as before — the lag
+    /// wedges nothing.
+    #[tokio::test]
+    async fn seq_aware_survives_a_leg_lagging_mid_run() {
+        use crate::engine::ts_es_bus::TsEsDemuxer;
+        let bus = Arc::new(NodeEsBus::new());
+        let cancel = CancellationToken::new();
+        let _handle = spawn_hitless_es_merger_full(
+            hitless_bus_key("f1", "slot_0_0"),
+            ("in-a".to_string(), 0x100),
+            ("in-b".to_string(), 0x100),
+            bus.clone(),
+            Duration::from_millis(50),
+            /* seq_aware */ true,
+            4096,
+            /* path_differential_ms */ None,
+            ForwardingPrimary::default(),
+            cancel.clone(),
+        );
+        let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+        let mut demux_a = TsEsDemuxer::new("in-a", bus.clone());
+        let mut demux_b = TsEsDemuxer::new("in-b", bus.clone());
+        // 1172 datagrams overrun the 8192-packet channel by 12 packets
+        // before the merger reads it: datagram 0 and five of datagram 1's
+        // seven are gone, so the primary resumes at packet 5 of datagram 1.
+        for seq in 0..1172 {
+            demux_a.process(&datagram(0x100, seq));
+        }
+        let mut forwarded = Vec::new();
+        let mut drain = async |forwarded: &mut Vec<(u16, u8)>| {
+            while let Ok(res) =
+                tokio::time::timeout(Duration::from_millis(100), out_rx.recv()).await
+            {
+                forwarded.push(tag(&res.expect("the test keeps up with the merger")));
+            }
+        };
+        drain(&mut forwarded).await;
+        assert_eq!(forwarded, every_packet(2..1172));
+        forwarded.clear();
+
+        demux_b.process(&datagram(0x100, 1));
+        drain(&mut forwarded).await;
+        assert_eq!(
+            forwarded,
+            every_packet(1..2),
+            "the backup fills the holed run"
+        );
+        forwarded.clear();
+
+        for seq in 1172..1175 {
+            demux_a.process(&datagram(0x100, seq));
+            demux_b.process(&datagram(0x100, seq));
+        }
+        drain(&mut forwarded).await;
+        assert_eq!(forwarded, every_packet(1172..1175));
+        cancel.cancel();
     }
 }

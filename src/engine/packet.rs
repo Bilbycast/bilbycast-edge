@@ -50,13 +50,13 @@ pub struct RtpPacket {
     /// True when the data is raw TS (no RTP header). Outputs that strip RTP
     /// headers should skip stripping when this is set.
     pub is_raw_ts: bool,
-    /// Upstream wire sequence number when known. Set on the source leg
-    /// of a 2022-7 dual-leg RTP / SRT input so the seq-aware hitless
-    /// merger (both transport-layer `redundancy::merger` and pre-bus
-    /// `engine::ts_es_hitless`) can dedup + gap-fill against the
-    /// authoritative wire-level seq instead of relying on a 200 ms
-    /// stall timer. `None` for raw TS over UDP and any input that does
-    /// not carry a wire seq.
+    /// Upstream wire sequence number when known. Stamped by `input_rtp`
+    /// and `input_rist` so the pre-bus seq-aware hitless merger
+    /// (`engine::ts_es_hitless`) can dedup + gap-fill against the
+    /// authoritative wire-level seq instead of relying on a 200 ms stall
+    /// timer; the PID bus carries it onto each TS packet of the datagram
+    /// with that packet's place in it. `None` for SRT, raw TS over UDP
+    /// and any other input that does not carry a wire seq.
     pub upstream_seq: Option<u16>,
     /// 2022-7 leg identity (0 = primary, 1 = backup). `None` for
     /// single-leg inputs. Used by the seq-aware merger to attribute

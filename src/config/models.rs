@@ -1298,9 +1298,9 @@ pub enum SlotSource {
         /// Failover algorithm. Defaults to `PrimaryPreference` so
         /// existing configs keep their stall-timer-based failover. Set
         /// to `SeqAware` for true SMPTE 2022-7 hitless: the merger
-        /// dedups + gap-fills against the upstream RTP / SRT sequence
-        /// number on each leg, switching legs sub-frame instead of
-        /// after a 200 ms stall.
+        /// dedups + gap-fills against the upstream sequence number each
+        /// leg's RTP or RIST input stamps, switching legs sub-frame
+        /// instead of after a 200 ms stall.
         #[serde(default, skip_serializing_if = "HitlessMode::is_default")]
         mode: HitlessMode,
         /// Override for the stall timer (`PrimaryPreference` mode
@@ -1310,7 +1310,7 @@ pub enum SlotSource {
         /// Gap-fill window of the seq-aware merger, in sequence numbers:
         /// how far behind the newest packet a gap one leg left can still
         /// be filled from the other. Multiple of 64 in 64..=4096; default
-        /// 1024 (≈ 0.4 s at 2400 packets/s). `SeqAware` mode only —
+        /// 1024 (≈ 0.4 s at 2400 datagrams/s). `SeqAware` mode only —
         /// refused on a `PrimaryPreference` slot, whose merger has none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reorder_window: Option<u16>,
@@ -1426,8 +1426,9 @@ pub enum HitlessMode {
     PrimaryPreference,
     /// True SMPTE 2022-7 seq-aware hitless. Both legs are observed
     /// continuously; the merger dedups + gap-fills against the
-    /// upstream wire-level sequence number. Requires both legs'
-    /// inputs to carry an `upstream_seq` (RTP / SRT — not raw TS).
+    /// upstream wire-level sequence number, packet by packet within a
+    /// datagram. Requires both legs' inputs to stamp an `upstream_seq`,
+    /// which only RTP and RIST inputs do — not SRT, UDP or ST 2110.
     SeqAware,
 }
 

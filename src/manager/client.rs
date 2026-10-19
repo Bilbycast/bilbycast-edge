@@ -1267,8 +1267,9 @@ pub fn edge_capabilities() -> Vec<&'static str> {
         // surface they always have.
         "tr101290_full",
         // SMPTE 2022-7 seq-aware hitless on the PID-bus pre-bus path —
-        // EsPacket now carries upstream_seq + upstream_leg_id, and the
-        // assembly Hitless variant accepts a `mode = seq_aware` selector.
+        // EsPacket carries upstream_seq (the datagram's sequence number
+        // and the packet's place in it), and the assembly Hitless variant
+        // accepts a `mode = seq_aware` selector.
         // Manager UI gates the SeqAware option on this capability.
         "hitless_2022_7",
         // Operator-driven N-input switch slot in Flow Assembly. The
