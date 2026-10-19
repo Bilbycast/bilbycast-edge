@@ -1723,8 +1723,10 @@ impl FlowRuntime {
     /// 5. Sends [`crate::engine::ts_assembler::PlanCommand::ReplacePlan`]
     ///    to the running assembler.
     ///
-    /// On success the runtime's `current_assembly` is updated; the
-    /// caller is responsible for persisting `config.json`.
+    /// On success the runtime's `current_assembly` is updated, under the
+    /// same lock as the mergers, so two concurrent swaps leave it naming
+    /// the plan that runs; the caller is responsible for persisting
+    /// `config.json`.
     pub async fn replace_assembly(
         &self,
         new_assembly: crate::config::models::FlowAssembly,
@@ -1991,7 +1993,8 @@ impl FlowRuntime {
         }
 
         // The mergers behind the new plan's Hitless slots. Held until the
-        // plan is sent, so the assembler runs the plan they were set for.
+        // plan is sent and recorded, so the assembler runs the plan they
+        // were set for and `current_assembly` names it.
         let mut hitless_mergers = self.hitless_mergers.lock().await;
         hitless_mergers
             .apply(&build.pending_hitless, &mut build.plan, &bus, &self.cancel_token)
@@ -2042,10 +2045,15 @@ impl FlowRuntime {
             })
             .await
             .map_err(|_| anyhow::anyhow!("flow '{}' assembler receiver closed", flow_id))?;
+        // Recorded before the merger lock goes, which a concurrent swap waits
+        // on: the plan recorded is then the one the assembler and the mergers
+        // run, and the callers' no-op check compares against it. Recorded
+        // after, the swap that lost the race could overwrite the winner's
+        // plan here, and the no-op check would refuse the operator's re-send
+        // of the plan actually wanted. Lock order: `hitless_mergers`, then
+        // `current_assembly`; nothing takes them the other way round.
+        *self.current_assembly.lock().await = Some(new_assembly);
         drop(hitless_mergers);
-
-        let mut current = self.current_assembly.lock().await;
-        *current = Some(new_assembly);
         Ok(())
     }
 
