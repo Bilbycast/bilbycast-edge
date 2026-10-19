@@ -727,17 +727,48 @@ pub fn convert_srt_stats(stats: &srt_protocol::stats::SrtStats) -> SrtLegStats {
 /// Advance a "last seen" cumulative libsrt counter and return how far it moved.
 ///
 /// libsrt's `pktRcvDropTotal` is cumulative **per socket**, so it restarts at
-/// zero on every reconnect. The caller keeps one `last` per socket and adds
-/// the returned delta to the input's running total, which is what makes the
-/// total survive a reconnect instead of snapping back to zero with it. A
-/// counter that moves backwards (never observed, but it is an `i32` read
-/// across an FFI boundary) contributes nothing rather than a huge unsigned
-/// wrap.
+/// zero on every reconnect. The caller keeps one `last` per socket — each
+/// poller is one socket's or one group's — and adds the returned delta to
+/// the input's running total, which is what makes the total survive a
+/// reconnect instead of snapping back to zero with it. A reading below
+/// `last` is a failed read: `SrtSocket::stats` and `SrtGroup::stats` return
+/// all zeros when libsrt refuses the query. It is no sample — it adds
+/// nothing and leaves `last` alone. Taking it as the new baseline made the
+/// next good read add the socket's whole drop history again.
 pub(crate) fn cumulative_delta(last: &mut i64, current: i32) -> u64 {
-    let current = current as i64;
-    let delta = (current - *last).max(0) as u64;
+    let current = i64::from(current);
+    if current < *last {
+        return 0;
+    }
+    let delta = (current - *last) as u64;
     *last = current;
     delta
+}
+
+/// A socket's cumulative receive counters as its stats poller last read
+/// them: one per poller, so one per socket.
+#[derive(Default)]
+pub(crate) struct LegCursor {
+    drops: i64,
+    delivered: i64,
+}
+
+impl LegCursor {
+    /// How far a reading moved the too-late drop and delivered-packet
+    /// counters (`pktRcvDropTotal`, `pktRecvUniqueTotal`) since the last one.
+    /// `None` when either went backwards: a failed read comes back zeroed,
+    /// and is no sample — the cursor stays, so the next good read is measured
+    /// from the last good one (see [`cumulative_delta`]).
+    fn advance(&mut self, drops: i32, delivered: i64) -> Option<(u64, u64)> {
+        let drops = i64::from(drops);
+        if drops < self.drops || delivered < self.delivered {
+            return None;
+        }
+        let moved = ((drops - self.drops) as u64, (delivered - self.delivered) as u64);
+        self.drops = drops;
+        self.delivered = delivered;
+        Some(moved)
+    }
 }
 
 /// Fold a group's `pktRcvDropTotal` reading into the input's drops, through
@@ -762,15 +793,18 @@ fn add_recv_drops(input: &SrtInputStats, last_drop: &mut i64, pkt_recv_drop_tota
 pub(crate) fn publish_leg_stats(
     cache: &watch::Sender<Option<SrtLegStats>>,
     input: Option<(&SrtInputStats, SrtInputSocket)>,
-    last_drop: &mut i64,
+    cursor: &mut LegCursor,
     leg_stats: SrtLegStats,
 ) {
-    if let Some((input, socket)) = input {
-        // Every poll, drops or not: a 2022-7 leg's poll also takes the
-        // merger's count of what neither leg delivered, and its delivered
-        // count is how long its drops wait to be matched to that.
-        let delta = cumulative_delta(last_drop, leg_stats.pkt_recv_drop_total);
-        input.count_socket_drops(socket, delta, leg_stats.pkt_recv_unique_total);
+    // Every good poll, drops or not: a 2022-7 leg's poll also takes the
+    // merger's count of what neither leg delivered, and what the leg
+    // delivered is whether its drops can explain that and how long they
+    // wait. A failed read is skipped whole.
+    if let Some((input, socket)) = input
+        && let Some((drops, delivered)) =
+            cursor.advance(leg_stats.pkt_recv_drop_total, leg_stats.pkt_recv_unique_total)
+    {
+        input.count_socket_drops(socket, drops, delivered);
     }
     cache.send_replace(Some(leg_stats));
 }
@@ -882,7 +916,7 @@ pub fn spawn_srt_stats_poller(
 ) {
     tokio::spawn(async move {
         let mut interval = poll_interval();
-        let mut last_drop: i64 = 0;
+        let mut cursor = LegCursor::default();
         let mut rates = IntervalSampler::default();
         loop {
             tokio::select! {
@@ -899,7 +933,7 @@ pub fn spawn_srt_stats_poller(
                     publish_leg_stats(
                         &cache,
                         input.as_ref().map(|(input, socket)| (input.as_ref(), *socket)),
-                        &mut last_drop,
+                        &mut cursor,
                         leg_stats,
                     );
                 }
@@ -1276,9 +1310,9 @@ mod tests {
         let cache: tokio::sync::watch::Sender<Option<SrtLegStats>> =
             tokio::sync::watch::channel(None).0;
         let input = flow.register_srt_input_stats("leg");
-        let mut last = 0i64;
+        let mut cursor = super::LegCursor::default();
         let leg = SrtLegStats { pkt_recv_drop_total: 7, rtt_ms: 21.0, ..Default::default() };
-        super::publish_leg_stats(&cache, Some((&input, SrtInputSocket::Only)), &mut last, leg);
+        super::publish_leg_stats(&cache, Some((&input, SrtInputSocket::Only)), &mut cursor, leg);
         assert_eq!(cache.borrow().as_ref().map(|s| s.rtt_ms), Some(21.0));
         assert_eq!(input.recv_dropped(), 7);
 
@@ -1339,18 +1373,32 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_delta_survives_reconnect_and_never_wraps() {
+    fn cumulative_delta_survives_reconnect_and_a_failed_read() {
         let mut last = 0i64;
         assert_eq!(super::cumulative_delta(&mut last, 0), 0);
         assert_eq!(super::cumulative_delta(&mut last, 92), 92);
         assert_eq!(super::cumulative_delta(&mut last, 93), 1);
         assert_eq!(super::cumulative_delta(&mut last, 93), 0);
-        // A counter that goes backwards adds nothing and re-bases.
-        assert_eq!(super::cumulative_delta(&mut last, 10), 0);
-        assert_eq!(super::cumulative_delta(&mut last, 15), 5);
+        // A failed read comes back zeroed: no sample, the baseline kept, so
+        // the next good read adds what moved since the last good one — not
+        // the socket's whole drop history again.
+        assert_eq!(super::cumulative_delta(&mut last, 0), 0);
+        assert_eq!(super::cumulative_delta(&mut last, 95), 2);
         // A new socket starts a fresh `last`, so its first reading counts in full.
         let mut fresh = 0i64;
         assert_eq!(super::cumulative_delta(&mut fresh, 49), 49);
+    }
+
+    /// A leg poller's failed read is no sample for either counter: neither
+    /// its drops nor its delivered packets are counted again by the next
+    /// good read, and the failed one reaches the pair's ledger not at all.
+    #[test]
+    fn a_failed_read_is_no_sample_for_a_legs_counters() {
+        let mut cursor = super::LegCursor::default();
+        assert_eq!(cursor.advance(40, 1_000), Some((40, 1_000)));
+        assert_eq!(cursor.advance(0, 0), None, "zeroed");
+        assert_eq!(cursor.advance(42, 0), None, "either counter back is no sample");
+        assert_eq!(cursor.advance(42, 1_500), Some((2, 500)));
     }
 
     use super::*;
