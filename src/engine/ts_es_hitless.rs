@@ -31,6 +31,12 @@
 //!   behind a hold of that long, released in `(seq, index)` order at
 //!   constant latency.
 //!
+//! Both seq-aware mergers' stale time (see "Re-anchoring" in
+//! [`crate::redundancy::merger`]) is a second past how far one leg lags the
+//! other by configuration — the difference of their [`leg_receive_hold`]s —
+//! or, buffered, past the hold when that is longer, so a leg that only lags
+//! is never taken for a moved stream while it is still a window behind.
+//!
 //! A leg whose packets reach the bus with no sequence number — any input but
 //! RTP and RIST, or one whose ingress transcode or post-process stage
 //! rewrote its stream — gives a seq-aware merger nothing to merge on.
@@ -194,6 +200,25 @@ pub fn hitless_scope(flow_id: &str) -> String {
 /// two runs of one flow, share a key.
 pub fn hitless_bus_key(scope: &str, uid: &str) -> (String, u16) {
     (format!("{HITLESS_INPUT_PREFIX}{scope}:{uid}"), 0)
+}
+
+/// How long a seq-aware Hitless leg's input holds each packet, by its
+/// configuration, before the packet reaches the bus: an RTP input's own
+/// 2022-7 hold and ingress buffering
+/// ([`crate::engine::input_rtp::receive_hold`]), a RIST input's receive
+/// buffer ([`crate::engine::input_rist::receive_hold`]). Nothing for any
+/// other input, which carries no sequence number to merge on. The two legs'
+/// holds differ by how far one lags the other by configuration — 2 s of
+/// de-jitter against none, up to 30 s of RIST buffer — which a slot's merger
+/// sizes its stale time to ([`spawn_hitless_es_merger_full`]'s `leg_lag`).
+/// What a leg's network adds is not configuration, and is not counted.
+pub fn leg_receive_hold(input: &crate::config::models::InputConfig) -> Duration {
+    use crate::config::models::InputConfig;
+    match input {
+        InputConfig::Rtp(c) => crate::engine::input_rtp::receive_hold(c),
+        InputConfig::Rist(c) => crate::engine::input_rist::receive_hold(c),
+        _ => Duration::ZERO,
+    }
 }
 
 /// The mergers running behind one assembled flow's Hitless slots, by slot
@@ -391,6 +416,7 @@ impl HitlessMergers {
                 slot.seq_aware,
                 slot.reorder_window,
                 slot.path_differential_ms,
+                slot.leg_lag,
                 slot.forwarding_primary.clone(),
                 slot.seq_fallback.clone(),
                 cancel.clone(),
@@ -430,6 +456,14 @@ impl HitlessMergers {
 /// the primary-preference merger merges on no sequence number and has none,
 /// which is why validation refuses the field on its slots.
 ///
+/// `leg_lag` is how far one leg's packets reach a seq-aware merger behind
+/// the other's by configuration (the difference of their
+/// [`leg_receive_hold`]s): its stale time is a second past it — past the
+/// larger of it and the hold, buffered — rather than the second of
+/// [`crate::redundancy::merger::DEFAULT_STALE_AFTER_US`], so a lagging leg
+/// is never taken for a moved stream while it is still a window behind (see
+/// "Re-anchoring" in [`crate::redundancy::merger`]).
+///
 /// The merger publishes onto `output`, the slot's [`hitless_bus_key`], and
 /// names it in its logs.
 ///
@@ -455,6 +489,7 @@ pub fn spawn_hitless_es_merger_full(
     seq_aware: bool,
     reorder_window: u16,
     path_differential_ms: Option<u32>,
+    leg_lag: Duration,
     forwarding_primary: ForwardingPrimary,
     seq_fallback: SeqFallback,
     cancel: CancellationToken,
@@ -486,12 +521,16 @@ pub fn spawn_hitless_es_merger_full(
                         &out_tx,
                         Duration::from_millis(ms as u64),
                         reorder_window,
+                        leg_lag,
                         &cancel,
                     )
                     .await
                 }
                 None => {
-                    run_seq_aware(&uid, &mut primary_rx, &mut backup_rx, &out_tx, reorder_window, &cancel)
+                    use crate::redundancy::merger::{stale_after_lag_us, HitlessRunMerger};
+                    let merger = HitlessRunMerger::with_window(reorder_window)
+                        .with_stale_after_us(stale_after_lag_us(leg_lag));
+                    run_seq_aware(&uid, &mut primary_rx, &mut backup_rx, &out_tx, merger, &cancel)
                         .await
                 }
             };
@@ -526,20 +565,21 @@ struct Unsequenced {
     packet: EsPacketAlias,
 }
 
-/// Merge behind a hold of `max_path_diff` until a packet comes with no
-/// `upstream_seq` (returned), or the merger is cancelled or a leg's channel
-/// closes (`None`).
+/// Merge behind a hold of `max_path_diff`, the legs `leg_lag` apart by
+/// configuration, until a packet comes with no `upstream_seq` (returned), or
+/// the merger is cancelled or a leg's channel closes (`None`).
 async fn run_buffered(
     primary_rx: &mut broadcast::Receiver<EsPacketAlias>,
     backup_rx: &mut broadcast::Receiver<EsPacketAlias>,
     out_tx: &broadcast::Sender<EsPacketAlias>,
     max_path_diff: Duration,
     reorder_window: u16,
+    leg_lag: Duration,
     cancel: &CancellationToken,
 ) -> Option<Unsequenced> {
     use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HeldRuns};
     let mut merger: BufferedHitlessMerger<EsPacketAlias, HeldRuns> =
-        BufferedHitlessMerger::with_runs(max_path_diff, reorder_window);
+        BufferedHitlessMerger::with_runs(max_path_diff, reorder_window, leg_lag);
     // Far-future placeholder used when the buffer is empty so the
     // tokio::select! `sleep_until` arm doesn't fire spuriously.
     let far_future = std::time::Instant::now() + Duration::from_secs(86_400);
@@ -651,19 +691,18 @@ async fn run_primary_preference(
     }
 }
 
-/// Merge, unbuffered, until a packet comes with no `upstream_seq`
-/// (returned), or the merger is cancelled or a leg's channel closes
-/// (`None`).
+/// Merge on `merger`, unbuffered, until a packet comes with no
+/// `upstream_seq` (returned), or the merger is cancelled or a leg's channel
+/// closes (`None`).
 async fn run_seq_aware(
     uid: &str,
     primary_rx: &mut broadcast::Receiver<EsPacketAlias>,
     backup_rx: &mut broadcast::Receiver<EsPacketAlias>,
     out_tx: &broadcast::Sender<EsPacketAlias>,
-    reorder_window: u16,
+    mut merger: crate::redundancy::merger::HitlessRunMerger,
     cancel: &CancellationToken,
 ) -> Option<Unsequenced> {
-    use crate::redundancy::merger::{ActiveLeg, HitlessRunMerger};
-    let mut merger = HitlessRunMerger::with_window(reorder_window);
+    use crate::redundancy::merger::ActiveLeg;
     let mut leg_log = LegLog::default();
     let mut primary_clock = DatagramClock::default();
     let mut backup_clock = DatagramClock::default();
@@ -856,6 +895,7 @@ mod tests {
             /* seq_aware */ false,
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
+            /* leg_lag */ Duration::ZERO,
             forwarding.clone(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -899,6 +939,7 @@ mod tests {
             /* seq_aware */ false,
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
+            /* leg_lag */ Duration::ZERO,
             forwarding.clone(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -940,6 +981,7 @@ mod tests {
             /* seq_aware */ false,
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
+            /* leg_lag */ Duration::ZERO,
             forwarding.clone(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -1000,6 +1042,7 @@ mod tests {
                     /* seq_aware */ true,
                     reorder_window,
                     path_differential_ms,
+                    /* leg_lag */ Duration::ZERO,
                     ForwardingPrimary::default(),
                     SeqFallback::default(),
                     cancel.clone(), None
@@ -1079,6 +1122,7 @@ mod tests {
                 /* seq_aware */ true,
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
+                /* leg_lag */ Duration::ZERO,
                 ForwardingPrimary::default(),
                 SeqFallback::default(),
                 cancel.clone(), None
@@ -1110,6 +1154,66 @@ mod tests {
         }
     }
 
+    /// A seq-aware slot whose backup lags the primary by 2 s of
+    /// configuration — de-jittered 2 s against a plain RTP primary — and
+    /// whose backup's first packet comes after the primary has gone quiet
+    /// for more than a second, 2 000 datagrams behind. That first packet is
+    /// taken for a break, and the merger's stale time is a second past the
+    /// lag, so it moves nothing: the backup carries the stream on from the
+    /// newest datagram, bare or buffered, nothing forwarded twice. On the
+    /// default second it re-anchored the window there, and the output
+    /// stepped back 2 000 datagrams and aired them again.
+    #[tokio::test]
+    async fn seq_aware_sizes_its_stale_time_to_the_legs_configured_lag() {
+        let packet = |seq: u16| EsPacket {
+            upstream_seq: Some(UpstreamSeq { seq, index: 0 }),
+            ..es(0x100, 0)
+        };
+        for path_differential_ms in [None, Some(50)] {
+            let bus = Arc::new(NodeEsBus::new());
+            let cancel = CancellationToken::new();
+            let _handle = spawn_hitless_es_merger_full(
+                hitless_bus_key("f1", "slot_0_0"),
+                ("in-a".to_string(), 0x100),
+                ("in-b".to_string(), 0x100),
+                bus.clone(),
+                Duration::from_millis(50),
+                /* seq_aware */ true,
+                crate::redundancy::merger::REORDER_WINDOW,
+                path_differential_ms,
+                /* leg_lag */ Duration::from_secs(2),
+                ForwardingPrimary::default(),
+                SeqFallback::default(),
+                cancel.clone(),
+                None,
+            );
+            let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+            let pri = bus.sender_for("in-a", 0x100, 0x1B);
+            let bak = bus.sender_for("in-b", 0x100, 0x1B);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let mut forwarded = Vec::new();
+            let quiet = Duration::from_millis(200);
+            for seq in 0..2_000u16 {
+                pri.send(packet(seq)).unwrap();
+            }
+            while let Ok(Ok(es)) = tokio::time::timeout(quiet, out_rx.recv()).await {
+                forwarded.push(es.upstream_seq.map(|u| u.seq).unwrap());
+            }
+            // Past the default stale time, buffered (a second past the hold)
+            // or not.
+            tokio::time::sleep(Duration::from_millis(1_100)).await;
+            for seq in 0..2_100u16 {
+                bak.send(packet(seq)).unwrap();
+            }
+            while let Ok(Ok(es)) = tokio::time::timeout(quiet, out_rx.recv()).await {
+                forwarded.push(es.upstream_seq.map(|u| u.seq).unwrap());
+            }
+            assert_eq!(forwarded, (0..2_100).collect::<Vec<u16>>(), "{path_differential_ms:?}");
+            cancel.cancel();
+        }
+    }
+
     /// A bare seq-aware merger over a RIST primary, whose packets are stamped
     /// at their arrival ahead of a 1.5 s hold, and an RTP backup with ingress
     /// de-jitter, stamped at its release and 2 000 datagrams behind. The
@@ -1133,6 +1237,7 @@ mod tests {
             /* seq_aware */ true,
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
+            /* leg_lag */ Duration::ZERO,
             ForwardingPrimary::default(),
             SeqFallback::default(),
             cancel.clone(),
@@ -1200,6 +1305,7 @@ mod tests {
                     /* seq_aware */ true,
                     crate::redundancy::merger::REORDER_WINDOW,
                     path_differential_ms,
+                    /* leg_lag */ Duration::ZERO,
                     forwarding.clone(),
                     fallback.clone(),
                     cancel.clone(),
@@ -1272,6 +1378,7 @@ mod tests {
                 /* seq_aware */ true,
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
+                /* leg_lag */ Duration::ZERO,
                 ForwardingPrimary::default(),
                 SeqFallback::default(),
                 cancel.clone(),
@@ -1376,6 +1483,7 @@ mod tests {
             /* seq_aware */ true,
             crate::redundancy::merger::REORDER_WINDOW,
             path_differential_ms,
+            /* leg_lag */ Duration::ZERO,
             ForwardingPrimary::default(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -1474,6 +1582,7 @@ mod tests {
                 /* seq_aware */ true,
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
+                /* leg_lag */ Duration::ZERO,
                 ForwardingPrimary::default(),
                 SeqFallback::default(),
                 cancel.clone(), None
@@ -1530,6 +1639,7 @@ mod tests {
             /* seq_aware */ true,
             4096,
             /* path_differential_ms */ None,
+            /* leg_lag */ Duration::ZERO,
             ForwardingPrimary::default(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -1585,6 +1695,7 @@ mod tests {
             seq_aware: false,
             reorder_window: crate::redundancy::merger::REORDER_WINDOW,
             path_differential_ms: None,
+            leg_lag: Duration::ZERO,
             forwarding_primary: ForwardingPrimary::default(),
             seq_fallback: SeqFallback::default(),
         }

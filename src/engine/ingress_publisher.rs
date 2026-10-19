@@ -110,6 +110,37 @@ pub struct IngressBuffering {
     pub honours_node_defaults: bool,
 }
 
+impl IngressBuffering {
+    /// The setpoint that runs the de-jitter buffer, if one does: the input's
+    /// own, else — for a transport that takes part — the node's.
+    fn enabled_dejitter_ms(&self) -> Option<u32> {
+        if self.honours_node_defaults {
+            self.dejitter_ms.or(crate::engine::ingress_dejitter::node_defaults().dejitter_ms)
+        } else {
+            self.dejitter_ms
+        }
+        .filter(|v| *v > 0)
+    }
+
+    /// How long, by configuration, the publisher [`IngressPublisher::new`]
+    /// builds from this holds each packet: the de-jitter setpoint, which the
+    /// servo holds of content, when the de-jitter buffer runs; else the fixed
+    /// delay; else nothing. Read on the control plane.
+    pub fn hold(&self) -> std::time::Duration {
+        let ms = match self.enabled_dejitter_ms() {
+            Some(_) => {
+                crate::engine::ingress_dejitter::IngressDejitterConfig::resolve(
+                    self.dejitter_ms,
+                    self.residence_ms,
+                )
+                .setpoint_ms
+            }
+            None => u64::from(self.delay_ms.unwrap_or(0)),
+        };
+        std::time::Duration::from_millis(ms)
+    }
+}
+
 impl IngressPublisher {
     /// Build an `IngressPublisher`. Mode precedence:
     ///
@@ -132,12 +163,6 @@ impl IngressPublisher {
         cancel: CancellationToken,
         stats: Arc<FlowStatsAccumulator>,
     ) -> Self {
-        let IngressBuffering {
-            delay_ms,
-            dejitter_ms,
-            residence_ms,
-            honours_node_defaults,
-        } = buffering;
         // Enablement, not just the setpoint. The node-wide default has to be
         // able to switch the buffer ON for an input that names no setpoint —
         // gating this branch on the per-input field alone made
@@ -147,12 +172,14 @@ impl IngressPublisher {
         // RAW per-input value, not this one, is what goes to `resolve` below:
         // that keeps the "per-input → node → built-in" layering inside the
         // resolver where it is unit-tested, instead of pre-flattening it here.
-        let effective_dejitter_ms = if honours_node_defaults {
-            dejitter_ms.or(crate::engine::ingress_dejitter::node_defaults().dejitter_ms)
-        } else {
-            dejitter_ms
-        };
-        if let Some(dj) = effective_dejitter_ms.filter(|v| *v > 0) {
+        let enabled_dejitter_ms = buffering.enabled_dejitter_ms();
+        let IngressBuffering {
+            delay_ms,
+            dejitter_ms,
+            residence_ms,
+            ..
+        } = buffering;
+        if let Some(dj) = enabled_dejitter_ms {
             if delay_ms.filter(|v| *v > 0).is_some() {
                 tracing::warn!(
                     "input '{input_id}': both ingress_dejitter_ms={dj} and ingress_delay_ms \
@@ -353,9 +380,18 @@ mod tests {
     /// node-wide value unreachable in every configuration.
     ///
     /// The three cases share one test because `install_node_defaults` writes
-    /// process-wide statics: split across `#[test]` fns they would race.
+    /// process-wide statics: split across `#[test]` fns they would race. So
+    /// does [`IngressBuffering::hold`], which must follow the same rule: it
+    /// is what a seq-aware Hitless slot sizes its merger's stale time to.
     #[tokio::test]
     async fn the_node_default_enables_dejitter_and_a_per_input_value_still_wins() {
+        let ms = std::time::Duration::from_millis;
+        let delayed = |honours_node_defaults| IngressBuffering {
+            delay_ms: Some(40),
+            honours_node_defaults,
+            ..Default::default()
+        };
+        assert_eq!(delayed(true).hold(), ms(40), "no de-jitter: the fixed delay");
         assert_eq!(
             publisher(IngressBuffering {
                 honours_node_defaults: true,
@@ -380,6 +416,9 @@ mod tests {
             "dejitter",
             "the node default must enable the buffer for a UDP/RTP input"
         );
+        assert_eq!(delayed(true).hold(), ms(150), "the node's de-jitter supersedes the delay");
+        let own = IngressBuffering { dejitter_ms: Some(300), ..delayed(true) };
+        assert_eq!(own.hold(), ms(300), "the input's own setpoint wins");
 
         // SRT/RTSP/RTMP/bonded pass `..Default::default()`, so they must be
         // untouched by a node-wide setpoint: SRT already de-jitters via TSBPD
@@ -389,6 +428,7 @@ mod tests {
             "direct",
             "a transport that opted out must not be enrolled by the node default"
         );
+        assert_eq!(delayed(false).hold(), ms(40), "nor held by it");
 
         install_node_defaults(IngressDejitterDefaults::default());
     }

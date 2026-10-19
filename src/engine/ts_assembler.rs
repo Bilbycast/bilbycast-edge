@@ -3034,6 +3034,11 @@ pub struct PendingHitlessSlot {
     /// within the window). `None` falls back to the stateless dedup-
     /// only path.
     pub path_differential_ms: Option<u32>,
+    /// How far one leg's packets reach a seq-aware merger behind the
+    /// other's by configuration: the difference of the legs'
+    /// [`crate::engine::ts_es_hitless::leg_receive_hold`]s, which the
+    /// merger's stale time is sized to. Zero on a primary-preference slot.
+    pub leg_lag: std::time::Duration,
     /// The slot's [`HitlessLegs::forwarding_primary`], for the merger to
     /// flip.
     pub forwarding_primary: ForwardingPrimary,
@@ -4727,6 +4732,7 @@ mod tests {
             false,
             crate::redundancy::merger::REORDER_WINDOW,
             None,
+            /* leg_lag */ Duration::ZERO,
             legs.forwarding_primary.clone(),
             legs.seq_fallback.clone(),
             cancel.child_token(), None
@@ -4811,6 +4817,7 @@ mod tests {
             /* seq_aware */ true,
             crate::redundancy::merger::REORDER_WINDOW,
             None,
+            /* leg_lag */ Duration::ZERO,
             legs.forwarding_primary.clone(),
             legs.seq_fallback.clone(),
             cancel.child_token(),

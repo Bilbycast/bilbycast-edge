@@ -171,14 +171,22 @@ pub fn spawn_rist_input(
     })
 }
 
+/// How long, by its configuration, a RIST input holds each packet before
+/// publishing it: its receive buffer, which releases each packet that long
+/// after it arrived (`buffer_ms`, else the socket's default).
+pub fn receive_hold(config: &RistInputConfig) -> Duration {
+    config.buffer_ms.map_or_else(
+        || RistSocketConfig::default().buffer_size,
+        |ms| Duration::from_millis(ms.into()),
+    )
+}
+
 fn socket_config_for(config: &RistInputConfig, local_addr: SocketAddr) -> RistSocketConfig {
     let mut sc = RistSocketConfig {
         local_addr,
+        buffer_size: receive_hold(config),
         ..Default::default()
     };
-    if let Some(ms) = config.buffer_ms {
-        sc.buffer_size = Duration::from_millis(ms as u64);
-    }
     if let Some(r) = config.max_nack_retries {
         sc.max_nack_retries = r;
     }

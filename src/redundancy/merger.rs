@@ -75,9 +75,13 @@
 //! the stale time has run out on the other leg's new one; the merger follows
 //! the new one, and the lagging leg's last packets of the old stream,
 //! ahead of it, then move it forward again and go out a second time. A
-//! caller whose legs lag by configuration sets the stale time above that
-//! lag: an SRT pair its legs' latency difference plus 1 s, a buffered
-//! merger its path differential plus 1 s.
+//! caller whose legs lag by configuration sets the stale time a second past
+//! that lag ([`stale_after_lag_us`]): an SRT pair its legs' latency
+//! difference, a PID-bus Hitless slot the difference between its legs'
+//! receive holds ([`crate::engine::ts_es_hitless::leg_receive_hold`]), a
+//! buffered merger its path differential — or the slot's difference, when
+//! that is larger. What the legs' networks add on top is left to the
+//! second.
 //!
 //! ## Why a gap-fill window
 //!
@@ -594,6 +598,12 @@ impl HitlessRunMerger {
             seqs: HitlessMerger::with_window(window),
             next: vec![0u16; usize::from(window)].into_boxed_slice(),
         }
+    }
+
+    /// Set its seqs' stale time ([`HitlessMerger::with_stale_after_us`]).
+    pub fn with_stale_after_us(mut self, stale_after_us: u64) -> Self {
+        self.seqs = self.seqs.with_stale_after_us(stale_after_us);
+        self
     }
 
     /// Merge packet `index` of seq `seq`'s run, from `leg`, arriving at
@@ -1720,7 +1730,8 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     pub fn with_window(max_path_diff: Duration, window: u16) -> Self {
         let max_path_diff = bounded_path_diff(max_path_diff);
         Self::build(
-            HitlessMerger::with_window(window).with_stale_after_us(stale_after_us(max_path_diff)),
+            HitlessMerger::with_window(window)
+                .with_stale_after_us(stale_after_lag_us(max_path_diff)),
             max_path_diff,
             DEFAULT_MAX_BUFFER_PACKETS,
         )
@@ -1742,13 +1753,16 @@ impl<T: Clone> BufferedHitlessMerger<T> {
 impl<T: Clone> BufferedHitlessMerger<T, HeldRuns> {
     /// A merger over runs of packets per seq (see [`HitlessRunMerger`] and
     /// [`HeldRuns`]), its seqs in a `window`-seq gap-fill window as
-    /// [`Self::with_window`]'s are.
-    pub fn with_runs(max_path_diff: Duration, window: u16) -> Self {
+    /// [`Self::with_window`]'s are. `leg_lag` is how far one leg's packets
+    /// reach it behind the other's by configuration: its dedup's stale time
+    /// is a second past the larger of that and the hold, which a slower leg
+    /// lagging past the hold outruns.
+    pub fn with_runs(max_path_diff: Duration, window: u16, leg_lag: Duration) -> Self {
         let max_path_diff = bounded_path_diff(max_path_diff);
         Self::build(
             HeldRuns(
                 HitlessMerger::with_window(window)
-                    .with_stale_after_us(stale_after_us(max_path_diff)),
+                    .with_stale_after_us(stale_after_lag_us(max_path_diff.max(leg_lag))),
             ),
             max_path_diff,
             RUN_MAX_BUFFER_PACKETS,
@@ -1774,13 +1788,14 @@ fn bounded_path_diff(max_path_diff: Duration) -> Duration {
     max_path_diff.min(MAX_PATH_DIFF_BOUND)
 }
 
-/// How long a buffered merger's dedup accepts nothing before a packet too
-/// far behind, from a leg whose sequence broke, re-anchors it
-/// ([`HitlessMerger::with_stale_after_us`]): a second past the path
-/// differential the legs are allowed, so a stream that moves while one leg
-/// lags the other within it is followed cleanly.
-fn stale_after_us(max_path_diff: Duration) -> u64 {
-    max_path_diff.as_micros() as u64 + DEFAULT_STALE_AFTER_US
+/// The stale time ([`HitlessMerger::with_stale_after_us`]) of a merger one
+/// of whose legs may reach it up to `lag` behind the other: a second past
+/// it, so a stream that moves while one leg lags the other that far is
+/// followed cleanly, and a lagging leg's break is never taken for a moved
+/// stream while it is still a window behind. A buffered merger's legs may
+/// lag by its path differential.
+pub fn stale_after_lag_us(lag: Duration) -> u64 {
+    u64::try_from(lag.as_micros()).unwrap_or(u64::MAX).saturating_add(DEFAULT_STALE_AFTER_US)
 }
 
 impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
@@ -2444,7 +2459,7 @@ mod buffered_tests {
 
     /// A run merger over seven packets a seq, each payload its `(seq, index)`.
     fn runs() -> BufferedHitlessMerger<(u16, u16), HeldRuns> {
-        BufferedHitlessMerger::with_runs(Duration::from_millis(50), REORDER_WINDOW)
+        BufferedHitlessMerger::with_runs(Duration::from_millis(50), REORDER_WINDOW, Duration::ZERO)
     }
 
     /// Feed `leg`'s packets `indices` of seq `seq` at `now`; returns what

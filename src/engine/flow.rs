@@ -5756,6 +5756,21 @@ fn build_assembly_plan(
                         mode,
                         crate::config::models::HitlessMode::SeqAware
                     );
+                    // How far the legs lag each other by configuration, for
+                    // the seq-aware merger's stale time. Only this flow's
+                    // inputs are seen: a leg owned by another flow counts no
+                    // hold.
+                    let hold = |input_id: &str| {
+                        flow.inputs.iter().find(|d| d.id == input_id).map_or(
+                            std::time::Duration::ZERO,
+                            |d| crate::engine::ts_es_hitless::leg_receive_hold(&d.config),
+                        )
+                    };
+                    let leg_lag = if seq_aware {
+                        hold(&primary_pair.0).abs_diff(hold(&backup_pair.0))
+                    } else {
+                        std::time::Duration::ZERO
+                    };
                     let legs = crate::engine::ts_assembler::HitlessLegs {
                         primary: primary_pair.0.clone(),
                         backup: backup_pair.0.clone(),
@@ -5776,6 +5791,7 @@ fn build_assembly_plan(
                         reorder_window: reorder_window
                             .unwrap_or(crate::redundancy::merger::REORDER_WINDOW),
                         path_differential_ms: *path_differential_ms,
+                        leg_lag,
                         forwarding_primary: legs.forwarding_primary.clone(),
                         seq_fallback: legs.seq_fallback.clone(),
                     });
@@ -8120,6 +8136,75 @@ mod assembly_plan_tests {
         assert_eq!(legs.on_air(), "in-b");
     }
 
+    /// A seq-aware Hitless slot's merger is told how far its legs lag each
+    /// other by configuration, so its stale time can exceed it: an RTP leg
+    /// de-jittered 2 s against one de-jittered 100 ms lags 1.9 s, and a RIST
+    /// leg's default 1 s buffer against an RTP leg's 200 ms 2022-7 hold and
+    /// 100 ms de-jitter lags 700 ms. A primary-preference slot merges on no
+    /// sequence and is told nothing. Each leg's de-jitter is its own, so the
+    /// node's default, which another test installs, decides none of them.
+    #[test]
+    fn a_seq_aware_slots_merger_is_told_how_far_its_legs_lag() {
+        let input = |v: serde_json::Value| -> InputDefinition {
+            serde_json::from_value(v).expect("input fixture")
+        };
+        let inputs = vec![
+            input(serde_json::json!({
+                "id": "rtp-100", "name": "rtp-100", "type": "rtp",
+                "bind_addr": "127.0.0.1:41893", "ingress_dejitter_ms": 100
+            })),
+            input(serde_json::json!({
+                "id": "rtp-2000", "name": "rtp-2000", "type": "rtp",
+                "bind_addr": "127.0.0.1:41894", "ingress_dejitter_ms": 2000
+            })),
+            input(serde_json::json!({
+                "id": "rist", "name": "rist", "type": "rist", "bind_addr": "127.0.0.1:41896"
+            })),
+            input(serde_json::json!({
+                "id": "rtp-pd", "name": "rtp-pd", "type": "rtp",
+                "bind_addr": "127.0.0.1:41898", "ingress_dejitter_ms": 100,
+                "redundancy": { "bind_addr": "127.0.0.1:41899", "path_differential_ms": 200 }
+            })),
+        ];
+        let leg =
+            |id: &str| serde_json::json!({ "type": "pid", "input_id": id, "source_pid": 256 });
+        let lag = |mode: &str, primary: &str, backup: &str| {
+            let flow: FlowConfig = serde_json::from_value(serde_json::json!({
+                "id": "f1", "name": "f1", "input_ids": [primary, backup], "output_ids": [],
+                "assembly": {
+                    "kind": "spts",
+                    "pcr_source": { "input_id": primary, "pid": 256 },
+                    "programs": [{
+                        "program_number": 1,
+                        "pmt_pid": 4096,
+                        "streams": [{
+                            "source": {
+                                "type": "hitless",
+                                "primary": leg(primary),
+                                "backup": leg(backup),
+                                "mode": mode
+                            },
+                            "out_pid": 257,
+                            "stream_type": 27
+                        }]
+                    }]
+                }
+            }))
+            .expect("flow fixture");
+            let cfg = AppConfig { inputs: inputs.clone(), flows: vec![flow], ..Default::default() };
+            let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
+            let (events, _rx) = crate::manager::events::event_channel();
+            let assembly = resolved.config.assembly.as_ref().expect("assembly");
+            let build = build_assembly_plan(assembly, &resolved, "f1:0", &events).expect("plan");
+            build.pending_hitless[0].leg_lag
+        };
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(lag("seq_aware", "rtp-100", "rtp-2000"), ms(1_900));
+        assert_eq!(lag("seq_aware", "rtp-2000", "rtp-100"), ms(1_900), "whichever leg lags");
+        assert_eq!(lag("seq_aware", "rist", "rtp-pd"), ms(700));
+        assert_eq!(lag("primary_preference", "rtp-100", "rtp-2000"), ms(0));
+    }
+
     /// A plan swap gives its flow's assembler a bounded time — for room in
     /// its queue, then to put the plan on air — and then gives it up with a
     /// Warning and an error of code `pid_bus_assembler_unresponsive`,
@@ -8151,6 +8236,7 @@ mod assembly_plan_tests {
             seq_aware: false,
             reorder_window: crate::redundancy::merger::REORDER_WINDOW,
             path_differential_ms: None,
+            leg_lag: Duration::ZERO,
             forwarding_primary: Default::default(),
             seq_fallback: Default::default(),
         };

@@ -101,6 +101,27 @@ use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
 use super::input_transcode::InputTranscoder;
 use super::packet::{MAX_RTP_PACKET_SIZE, RtpPacket};
 
+/// The ingress buffering of an RTP input's publisher.
+pub(crate) fn ingress_buffering(
+    config: &RtpInputConfig,
+) -> crate::engine::ingress_publisher::IngressBuffering {
+    crate::engine::ingress_publisher::IngressBuffering {
+        delay_ms: config.ingress_delay_ms,
+        dejitter_ms: config.ingress_dejitter_ms,
+        residence_ms: config.ingress_residence_ms,
+        honours_node_defaults: true,
+    }
+}
+
+/// How long, by its configuration, an RTP input holds each packet before
+/// publishing it: its 2022-7 merger's `path_differential_ms`, then its
+/// ingress buffering, which runs after the merger.
+pub fn receive_hold(config: &RtpInputConfig) -> std::time::Duration {
+    let path_differential = config.redundancy.as_ref().and_then(|r| r.path_differential_ms);
+    std::time::Duration::from_millis(path_differential.unwrap_or(0).into())
+        + ingress_buffering(config).hold()
+}
+
 /// Spawn a task that receives RTP packets from a UDP socket and
 /// publishes them to a broadcast channel for fan-out to outputs.
 /// If FEC decode is configured, lost packets may be recovered.
@@ -179,12 +200,7 @@ pub fn spawn_rtp_input(
         // `dejitter_ms` may also be answered by the node's
         // `tuning.ingress_dejitter_ms` — see `honours_node_defaults`.
         let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
-            crate::engine::ingress_publisher::IngressBuffering {
-                delay_ms: config.ingress_delay_ms,
-                dejitter_ms: config.ingress_dejitter_ms,
-                residence_ms: config.ingress_residence_ms,
-                honours_node_defaults: true,
-            },
+            ingress_buffering(&config),
             broadcast_tx,
             &input_id,
             cancel.clone(),
