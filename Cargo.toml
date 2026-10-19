@@ -359,7 +359,7 @@ bonding-protocol = { path = "../bilbycast-bonding/bonding-protocol" }
 # QUIC transport for IP tunneling (relay and direct modes)
 quinn = "0.11.12"
 # rustls and rustls-pemfile are always needed (tunnel subsystem uses QUIC/TLS)
-rustls = { version = "0.23.45", features = ["ring"] }
+rustls = { version = "0.23.46", features = ["ring"] }
 # AEAD encryption for end-to-end tunnel encryption (ChaCha20-Poly1305)
 ring = "0.17.14"
 rustls-pemfile = "2.2.0"
