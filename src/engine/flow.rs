@@ -270,7 +270,8 @@ pub struct FlowRuntime {
     /// or releases, a channel of another.
     hitless_scope: String,
     /// Live mutable copy of the flow's `assembly` block: the plan the
-    /// assembler runs, which a swap's no-op check compares against
+    /// assembler runs — or, after a swap it has not confirmed, holds to run
+    /// when it resumes — which a swap's no-op check compares against
     /// ([`AssemblySwap::runs`]). Persisted form lives in `config.json`,
     /// written by the swap's caller inside the same swap.
     #[allow(dead_code)]
@@ -580,6 +581,21 @@ impl std::fmt::Display for AssemblySwapError {
 }
 
 impl std::error::Error for AssemblySwapError {}
+
+/// Whether a plan swap that went through ([`AssemblySwap::replace`]) is on
+/// air. Either way the plan is the flow's from then on — its mergers run and
+/// the assembler holds it, and nothing withdraws it — so the caller saves it
+/// ([`AssemblySwap::record`]) before it reports an unconfirmed one.
+#[must_use = "an unconfirmed swap is saved, then reported"]
+#[derive(Debug)]
+pub enum SwapOutcome {
+    /// The assembler put the plan on air.
+    OnAir,
+    /// The assembler did not say so within its bound, and puts the plan on
+    /// air when it resumes. Carries the error to report, an
+    /// [`AssemblySwapError`] `pid_bus_assembler_unresponsive`.
+    Unconfirmed(anyhow::Error),
+}
 
 /// Success output of [`FlowRuntime::add_input`]. Carries the registered
 /// input id so callers can persist it, plus — when `feature = "webrtc"`
@@ -1741,10 +1757,11 @@ impl FlowRuntime {
         new_assembly: crate::config::models::FlowAssembly,
         splice_mode_override: Option<crate::config::models::SpliceMode>,
     ) -> Result<()> {
-        self.begin_assembly_swap()
-            .await
-            .replace(new_assembly, splice_mode_override)
-            .await
+        let mut swap = self.begin_assembly_swap().await;
+        match swap.replace(new_assembly, splice_mode_override).await? {
+            SwapOutcome::OnAir => Ok(()),
+            SwapOutcome::Unconfirmed(e) => Err(e),
+        }
     }
 
     /// The bus key of this run's Hitless slot `uid`.
@@ -1773,7 +1790,7 @@ impl FlowRuntime {
         hitless_mergers: &mut crate::engine::ts_es_hitless::HitlessMergers,
         new_assembly: crate::config::models::FlowAssembly,
         splice_mode_override: Option<crate::config::models::SpliceMode>,
-    ) -> Result<()> {
+    ) -> Result<SwapOutcome> {
         let flow_id = &self.config.config.id;
         let handle = self
             .pid_bus_assembler_handle
@@ -2096,8 +2113,8 @@ impl FlowRuntime {
         // cancelled. Release them now rather than keep their rings for the
         // life of the node, and their per-ES stats with them, so a slot
         // added back later gets a fresh analyzer on its fresh channel. A
-        // stalled assembler fails the swap, unrecorded, with them kept.
-        let retired = await_plan_on_air(
+        // stalled assembler leaves the swap unconfirmed, with them kept.
+        let on_air = await_plan_on_air(
             on_air,
             retired,
             &self.hitless_outputs,
@@ -2106,18 +2123,25 @@ impl FlowRuntime {
             &self.event_sender,
             ASSEMBLER_ACK_TIMEOUT,
         )
-        .await?;
-        for output in retired {
-            self.stats.per_es_stats.remove(output.key());
-            output.release(&bus);
-        }
+        .await;
         // Recorded under the merger lock, which a concurrent swap waits on:
         // the plan recorded is then the one the assembler and the mergers
-        // run, and the callers' no-op check compares against it. Lock order:
-        // `hitless_mergers`, then `current_assembly`; nothing takes them the
-        // other way round.
+        // run, and the callers' no-op check compares against it. Confirmed
+        // or not: a stalled assembler holds the plan and runs it when it
+        // resumes, so a swap back to the old one must be a swap, not a
+        // no-op. Lock order: `hitless_mergers`, then `current_assembly`;
+        // nothing takes them the other way round.
         *self.current_assembly.lock().await = Some(new_assembly);
-        Ok(())
+        match on_air {
+            Ok(retired) => {
+                for output in retired {
+                    self.stats.per_es_stats.remove(output.key());
+                    output.release(&bus);
+                }
+                Ok(SwapOutcome::OnAir)
+            }
+            Err(unconfirmed) => Ok(SwapOutcome::Unconfirmed(unconfirmed)),
+        }
     }
 
     /// Switch the currently active input of a running flow.
@@ -4950,11 +4974,11 @@ async fn reserve_plan_slot<'a>(
 /// word with it — and hand back `retired`, the dropped Hitless slots'
 /// channels, for the caller to release. A stalled assembler still holds the
 /// plan, and its fan-ins read those channels until it gets to it: they are
-/// kept in `outputs`, for the flow's stop to release, and the swap fails
-/// with a Warning `pid_bus_assembler_unresponsive` (`awaiting: "applied"`)
-/// and an [`AssemblySwapError`] of that code. Unbounded, the wait held the
-/// REST call or WS command, and the flow's merger lock, for as long as the
-/// assembler stalled.
+/// kept in `outputs`, for the flow's stop to release, and the swap stands
+/// unconfirmed: a Warning `pid_bus_assembler_unresponsive` (`awaiting:
+/// "applied"`) and an [`AssemblySwapError`] of that code for the caller to
+/// report. Unbounded, the wait held the REST call or WS command, and the
+/// flow's merger lock, for as long as the assembler stalled.
 async fn await_plan_on_air(
     on_air: tokio::sync::oneshot::Receiver<()>,
     retired: Vec<crate::engine::ts_es_hitless::RetiredOutput>,
@@ -4974,8 +4998,8 @@ async fn await_plan_on_air(
 /// Raise the Warning `pid_bus_assembler_unresponsive` for a swap that gave
 /// the flow's assembler up while `awaiting` room in its queue (`"queue"`:
 /// nothing was changed) or its word that the plan is on air (`"applied"`:
-/// the mergers and the queued plan are the new plan's, `config.json` and
-/// the no-op check still the old), and hand back the error to report.
+/// the mergers, the queued plan, the no-op check and — saved by the caller
+/// — `config.json` are the new plan's), and hand back the error to report.
 fn assembler_unresponsive(
     flow_id: &str,
     awaiting: &'static str,
@@ -4991,8 +5015,9 @@ fn assembler_unresponsive(
     } else {
         format!(
             "flow '{flow_id}': assembly swap unconfirmed — the assembler did not put the \
-             new plan on air within {ms} ms; it holds the plan for when it resumes, and the \
-             swap was not saved: send it again, or restart the flow"
+             new plan on air within {ms} ms; it holds the plan and puts it on air when it \
+             resumes, so the plan stands as the flow's: to undo it, send the previous plan; to \
+             clear the stall, restart the flow"
         )
     };
     events.emit_flow_with_details(
@@ -7449,7 +7474,8 @@ pub struct AssemblySwap<'a> {
 }
 
 impl AssemblySwap<'_> {
-    /// Whether the flow already runs `assembly`: a swap to it would be a
+    /// Whether the flow already runs `assembly` — or, after a swap its
+    /// assembler has not confirmed, holds it to run: a swap to it would be a
     /// no-op.
     pub async fn runs(&self, assembly: &crate::config::models::FlowAssembly) -> bool {
         self.runtime.current_assembly.lock().await.as_ref() == Some(assembly)
@@ -7477,14 +7503,17 @@ impl AssemblySwap<'_> {
     /// 5. Sends [`crate::engine::ts_assembler::PlanCommand::ReplacePlan`]
     ///    to the running assembler.
     ///
-    /// On success the runtime's `current_assembly` is updated; the caller
-    /// records the plan ([`Self::record`]) and persists it before it drops
-    /// the swap.
+    /// Once the plan is sent nothing withdraws it, so the swap goes through
+    /// whether or not the assembler says it is on air within its bound
+    /// ([`SwapOutcome`]): the runtime's `current_assembly` is updated, and
+    /// the caller records the plan ([`Self::record`]) and persists it before
+    /// it drops the swap — and only then reports an unconfirmed one. An
+    /// error is a swap refused, with the flow on its plan as it was.
     pub async fn replace(
         &mut self,
         new_assembly: crate::config::models::FlowAssembly,
         splice_mode_override: Option<crate::config::models::SpliceMode>,
-    ) -> Result<()> {
+    ) -> Result<SwapOutcome> {
         self.runtime
             .replace_assembly_locked(&mut self.mergers, new_assembly, splice_mode_override)
             .await

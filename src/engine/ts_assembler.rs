@@ -499,6 +499,10 @@ pub enum PlanCommand {
         /// handler.
         splice_mode_override: Option<crate::config::models::SpliceMode>,
     },
+    /// Tests: hold the assembler, as a host too starved to run it would,
+    /// until `release` is sent or dropped.
+    #[cfg(test)]
+    Stall { release: tokio::sync::oneshot::Receiver<()> },
 }
 
 /// Structured description of an assembly plan whose slots in one
@@ -1230,6 +1234,10 @@ async fn run_assembler(
                                 pts_rewriter.as_mut(),
                             );
                         }
+                    }
+                    #[cfg(test)]
+                    PlanCommand::Stall { release } => {
+                        let _ = release.await;
                     }
                 }
             }

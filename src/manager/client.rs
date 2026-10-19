@@ -2800,7 +2800,7 @@ async fn execute_command(
             // A failure that raises no Critical — an unresponsive assembler
             // — carries its code on the error itself (`AssemblySwapError`).
             let swap_start = std::time::Instant::now();
-            if let Err(e) = swap.replace(new_assembly.clone(), splice_mode_override).await {
+            let swap_failed = |e: anyhow::Error| {
                 let code = e
                     .downcast_ref::<crate::engine::flow::AssemblySwapError>()
                     .map(|swap_error| swap_error.code.to_string())
@@ -2810,14 +2810,19 @@ async fn execute_command(
                             .take_recent_critical_for_flow(flow_id, swap_start)
                             .and_then(|c| c.error_code)
                     });
-                return Err(match code {
+                match code {
                     Some(c) => CommandError::with_code(e.to_string(), c),
                     None => CommandError::new(e.to_string()),
-                });
-            }
+                }
+            };
+            let outcome = swap
+                .replace(new_assembly.clone(), splice_mode_override)
+                .await
+                .map_err(swap_failed)?;
 
-            // Persist to config.json so the change survives restart — unless
-            // the flow was restarted or stopped under the swap.
+            // Persist to config.json so the change survives restart — an
+            // unconfirmed swap too, since the stalled assembler runs it when it
+            // resumes — unless the flow was restarted or stopped under the swap.
             let mut cfg = app_config.write().await;
             swap.record(&mut cfg, new_assembly).map_err(|e| {
                 match e.downcast_ref::<crate::engine::flow::AssemblySwapError>() {
@@ -2828,7 +2833,10 @@ async fn execute_command(
             persist_config(&cfg, config_path, secrets_path).await?;
             drop(cfg);
             drop(swap);
-            Ok(None)
+            match outcome {
+                crate::engine::flow::SwapOutcome::OnAir => Ok(None),
+                crate::engine::flow::SwapOutcome::Unconfirmed(e) => Err(swap_failed(e)),
+            }
         }
         "delete_flow" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;

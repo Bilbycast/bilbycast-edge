@@ -382,7 +382,9 @@ pub async fn stop_flow(
 ///   when the input shape forbids the requested switch.
 /// - [`ApiError::Internal`] (500) when the flow's assembler does not take
 ///   the plan, or put it on air, within a few seconds
-///   (`pid_bus_assembler_unresponsive`); the swap is not saved.
+///   (`pid_bus_assembler_unresponsive`). One it did not take is not saved;
+///   one it took and did not put on air is, since it runs it when it
+///   resumes, so re-sending the previous plan is a swap back.
 /// - [`ApiError::Conflict`] (409) when the flow was restarted or stopped
 ///   while the swap ran (`pid_bus_assembly_swap_superseded`); the swap is
 ///   not saved, so `config.json` keeps the plan the flow runs.
@@ -422,14 +424,16 @@ pub async fn update_flow_assembly(
     }
 
     // An unresponsive assembler is the node's failure, not the request's.
-    swap.replace(new_assembly.clone(), None).await.map_err(|e| {
+    let swap_failed = |e: anyhow::Error| {
         match e.downcast_ref::<crate::engine::flow::AssemblySwapError>() {
             Some(_) => ApiError::Internal(e.to_string()),
             None => ApiError::BadRequest(e.to_string()),
         }
-    })?;
+    };
+    let outcome = swap.replace(new_assembly.clone(), None).await.map_err(swap_failed)?;
 
-    // Unless the flow was restarted or stopped under the swap.
+    // Saved — an unconfirmed swap too, since the stalled assembler runs it
+    // when it resumes — unless the flow was restarted or stopped under it.
     let cfg_clone = {
         let mut cfg = state.config.write().await;
         swap.record(&mut cfg, new_assembly)
@@ -446,6 +450,9 @@ pub async fn update_flow_assembly(
         tracing::warn!("update_flow_assembly '{flow_id}': persist failed: {e}");
     }
     drop(swap);
+    if let crate::engine::flow::SwapOutcome::Unconfirmed(e) = outcome {
+        return Err(swap_failed(e));
+    }
 
     tracing::info!("update_flow_assembly '{flow_id}': hot-swap complete");
     Ok(Json(ApiResponse::ok(())))

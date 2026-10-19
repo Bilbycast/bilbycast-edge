@@ -1865,7 +1865,8 @@ mod tests {
                     let wanted = wanted.clone();
                     async move { runtime.begin_assembly_swap().await.runs(&wanted).await }
                 });
-                first.replace(wanted, None).await.expect("swap");
+                let on_air = first.replace(wanted, None).await.expect("swap");
+                assert!(matches!(on_air, crate::engine::flow::SwapOutcome::OnAir));
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 assert!(!second.is_finished(), "a second swap waits for the first");
                 drop(first);
@@ -1942,7 +1943,8 @@ mod tests {
             let fm = fm.clone();
             async move {
                 let mut swap = first.begin_assembly_swap().await;
-                swap.replace(assembly(true), None).await.expect("swap");
+                let on_air = swap.replace(assembly(true), None).await.expect("swap");
+                assert!(matches!(on_air, crate::engine::flow::SwapOutcome::OnAir));
                 let mut config = cfg.clone();
                 swap.record(&mut config, assembly(true)).expect("the run swapped runs");
                 assert_eq!(saved(&config), Some(assembly(true)));
@@ -1966,6 +1968,111 @@ mod tests {
                 let err = swap.record(&mut config, assembly(true)).expect_err("a stopped flow");
                 assert_eq!(code(&err), Some("pid_bus_assembly_swap_superseded"));
                 assert_eq!(saved(&config), Some(assembly(false)));
+            }
+        });
+        let outcome = checks.await;
+        let _ = fm.destroy_flow("f1").await;
+        if let Err(failed) = outcome {
+            std::panic::resume_unwind(failed.into_panic());
+        }
+    }
+
+    /// A plan swap its flow's assembler does not confirm still stands: the
+    /// mergers run the new plan and the stalled assembler holds it, to put on
+    /// air when it resumes, so it is the flow's plan and saved as such. Left
+    /// on the old plan, a re-send of the old plan — what an operator told the
+    /// swap failed sends — was answered as a no-op, and the new plan went on
+    /// air while `config.json` and `GetConfig` named the old.
+    #[tokio::test]
+    async fn a_plan_swap_its_assembler_has_not_confirmed_stands() {
+        use crate::engine::flow::SwapOutcome;
+        use crate::engine::ts_assembler::PlanCommand;
+        use std::time::Duration;
+        let fm = make_fm();
+        let assembly = |marker: bool| -> crate::config::models::FlowAssembly {
+            let mut streams = vec![serde_json::json!({
+                "source": { "type": "pid", "input_id": "in-c", "source_pid": 256 },
+                "out_pid": 256, "stream_type": 27
+            })];
+            if marker {
+                streams.push(serde_json::json!({
+                    "source": { "type": "pid", "input_id": "in-c", "source_pid": 258 },
+                    "out_pid": 258, "stream_type": 15
+                }));
+            }
+            serde_json::from_value(serde_json::json!({
+                "kind": "spts",
+                "pcr_source": { "input_id": "in-c", "pid": 256 },
+                "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": streams }]
+            }))
+            .expect("assembly fixture")
+        };
+        let flow = serde_json::json!({
+            "id": "f1", "name": "f1", "input_ids": ["in-c"], "output_ids": [],
+            "assembly": assembly(false)
+        });
+        let cfg = crate::config::models::AppConfig {
+            inputs: vec![input(serde_json::json!({
+                "id": "in-c", "name": "in-c", "type": "udp", "bind_addr": "127.0.0.1:41938"
+            }))],
+            flows: vec![serde_json::from_value(flow).expect("flow fixture")],
+            ..Default::default()
+        };
+        let runtime = fm
+            .create_flow(cfg.resolve_flow(&cfg.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+        // A failed assertion must not leave the flow running: its input
+        // thread would hold the test runtime's shutdown forever.
+        let checks = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let slots_on_air = |n: u32| {
+                    let health = runtime.stats.assembly_health.read().unwrap();
+                    health.as_ref().is_some_and(|h| h.total_slots == n)
+                };
+                async fn wait_until(what: &str, ok: impl Fn() -> bool) {
+                    for _ in 0..300 {
+                        if ok() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    panic!("timed out waiting until {what}");
+                }
+                wait_until("the plan is on air", || slots_on_air(1)).await;
+
+                // The assembler stalls, and a swap to the marker plan goes
+                // through unconfirmed: it is recorded, and saved.
+                let (release, stalled) = tokio::sync::oneshot::channel();
+                let assembler = runtime.pid_bus_assembler_handle.as_ref().expect("an assembler");
+                assembler
+                    .plan_tx
+                    .send(PlanCommand::Stall { release: stalled })
+                    .await
+                    .expect("the assembler runs");
+                let mut swap = runtime.begin_assembly_swap().await;
+                let outcome = swap.replace(assembly(true), None).await.expect("the swap goes through");
+                let SwapOutcome::Unconfirmed(err) = outcome else {
+                    panic!("a stalled assembler confirms nothing");
+                };
+                let code = err.downcast_ref::<crate::engine::flow::AssemblySwapError>().map(|e| e.code);
+                assert_eq!(code, Some("pid_bus_assembler_unresponsive"));
+                let mut config = cfg.clone();
+                swap.record(&mut config, assembly(true)).expect("the run swapped runs");
+                assert_eq!(config.flows[0].assembly, Some(assembly(true)), "the plan is saved");
+                drop(swap);
+                let swap = runtime.begin_assembly_swap().await;
+                assert!(swap.runs(&assembly(true)).await, "the flow's plan is the swapped one");
+                assert!(!swap.runs(&assembly(false)).await, "so the old one is a swap, not a no-op");
+                drop(swap);
+
+                // Resumed, the assembler puts the swapped plan on air, and a
+                // swap back puts the old one on again.
+                drop(release);
+                wait_until("the swapped plan is on air", || slots_on_air(2)).await;
+                runtime.replace_assembly(assembly(false), None).await.expect("a swap back");
+                wait_until("the old plan is back on air", || slots_on_air(1)).await;
             }
         });
         let outcome = checks.await;
