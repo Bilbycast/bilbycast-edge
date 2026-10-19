@@ -541,29 +541,18 @@ async fn real_main() -> anyhow::Result<()> {
     // cannot be fixed remotely. Coerced to the default and reported below.
     #[cfg(feature = "multiviewer")]
     let repaired_mosaic_codecs = config::validation::repair_legacy_mosaic_codecs(&mut app_config);
-    // Same hazard: a primary-preference Hitless slot's `reorder_window` was
-    // accepted and applied nowhere until validation began refusing it.
-    let repaired_reorder_windows =
-        config::validation::repair_hitless_reorder_windows(&mut app_config);
-    // And a seq-aware Hitless slot with a leg that carries no upstream
-    // sequence number, accepted until validation began refusing it: it never
-    // merged (both legs reached the output, or it never failed over).
-    let repaired_seq_legs = config::validation::repair_hitless_seq_aware_legs(&mut app_config);
+    // Same hazard for the Hitless slots validation began refusing: a
+    // primary-preference slot's `reorder_window`, applied nowhere, and a
+    // seq-aware slot with a leg that carries no upstream sequence number,
+    // which never merged (both legs reached the output, or it never failed
+    // over). Every route that takes a whole config repairs these; reported
+    // below, once the event sender exists.
+    let hitless_repairs = config::validation::repair_hitless_slots(&mut app_config);
 
     // Validate config
     if let Err(e) = validate_config(&app_config) {
         tracing::error!("Invalid configuration: {e}");
         return Err(e);
-    }
-    for slot in &repaired_seq_legs {
-        tracing::warn!("{}", seq_aware_repair_message(slot));
-    }
-    for flow_id in &repaired_reorder_windows {
-        tracing::warn!(
-            "flow '{flow_id}': dropped `reorder_window` from a Hitless slot whose mode is not \
-             \"seq_aware\" — the primary-preference merger has no reorder window, so it never \
-             had an effect. Set mode \"seq_aware\" to size the merge."
-        );
     }
     #[cfg(feature = "multiviewer")]
     for (input_id, was) in &repaired_mosaic_codecs {
@@ -571,6 +560,19 @@ async fn real_main() -> anyhow::Result<()> {
             "mosaic input '{input_id}': codec '{was}' is not one this build can encode with; \
              using '{}' instead. Set a codec this edge supports, or rebuild with its backend.",
             config::models::default_mosaic_codec(),
+        );
+    }
+    // A repair is written back at once, so config.json says what runs from
+    // the boot that reported it, rather than changing under the next
+    // unrelated save. A failed write leaves the node running on the repair.
+    let repaired = !hitless_repairs.is_empty();
+    #[cfg(feature = "multiviewer")]
+    let repaired = repaired || !repaired_mosaic_codecs.is_empty();
+    if repaired && let Err(e) = save_config_split(&cli.config, &secrets_path, &app_config) {
+        tracing::warn!(
+            "could not write the repaired configuration back to {}: {e} — it runs repaired, and \
+             the file keeps the old values until the next save",
+            cli.config.display()
         );
     }
 
@@ -767,26 +769,8 @@ async fn real_main() -> anyhow::Result<()> {
     // and a manager event for the fleet operator who never logs in. The
     // event queue flushes on the first manager auth, so this reaches the
     // Events page even though it is raised before the WS connects.
-    // The repaired seq-aware slots too, once each, for the operator who
-    // reads the Events page rather than the journal.
-    for slot in &repaired_seq_legs {
-        event_sender.send(manager::events::Event {
-            severity: manager::events::EventSeverity::Warning,
-            category: "config".to_string(),
-            message: seq_aware_repair_message(slot),
-            details: Some(serde_json::json!({
-                "error_code": "hitless_seq_aware_leg_unsequenced",
-                "program_number": slot.program_number,
-                "out_pid": slot.out_pid,
-                "leg": slot.leg,
-                "input_id": slot.input_id,
-                "repaired_to": "primary_preference",
-            })),
-            flow_id: Some(slot.flow_id.clone()),
-            input_id: None,
-            output_id: None,
-        });
-    }
+    // The repaired Hitless slots too.
+    hitless_repairs.report(&event_sender);
     for stale in &stale_env {
         tracing::warn!("{}", stale.message());
         event_sender.send(manager::events::Event {
@@ -1553,16 +1537,4 @@ async fn run_multi_listener_plain(
         res??;
     }
     Ok(())
-}
-
-/// What the load path says about a seq-aware Hitless slot it switched to
-/// primary preference ([`config::validation::repair_hitless_seq_aware_legs`]).
-fn seq_aware_repair_message(slot: &config::validation::RepairedSeqAwareSlot) -> String {
-    format!(
-        "flow '{}': program {} stream 0x{:04X}: switched a seq_aware Hitless slot to \
-         \"primary_preference\" — its {} leg, input '{}', carries no upstream sequence number \
-         to merge on ({}), so it never merged. Give it a leg that does, then set mode \
-         \"seq_aware\" again.",
-        slot.flow_id, slot.program_number, slot.out_pid, slot.leg, slot.input_id, slot.why,
-    )
 }

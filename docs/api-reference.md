@@ -1226,6 +1226,8 @@ A complete `AppConfig` JSON object (see [Configuration Guide](configuration-guid
 
 Returns the new configuration with infrastructure secrets stripped (flow parameters preserved).
 
+A Hitless slot that validation refuses but an earlier release accepted is repaired rather than refused, as at load, and the response carries the repair: a `seq_aware` slot with a leg that reaches the PID bus without an upstream sequence number is switched to `primary_preference` (Warning `config` event `hitless_seq_aware_leg_unsequenced` — see [events-and-alarms.md](events-and-alarms.md)), and a primary-preference slot's `reorder_window` is dropped (a warning log line).
+
 **Error responses:**
 
 | Status | Condition |
@@ -1255,6 +1257,8 @@ Reload configuration from disk (`config.json` + `secrets.json`). Stops all runni
 **Response (200):**
 
 Returns the reloaded configuration with secrets stripped.
+
+The Hitless slots of the loaded config are repaired as `PUT /api/v1/config` repairs them, and a repair is written back to `config.json` before the flows restart (a failed write is logged, and the node runs the repair).
 
 **Error responses:**
 

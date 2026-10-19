@@ -3698,7 +3698,12 @@ async fn execute_command(
             // Same rule for the recorder, which `configure_recording` owns.
             hold_recording(&old_config, &mut new_config, &action["config"]);
 
+            // A whole config repairs the Hitless slots earlier releases
+            // accepted rather than being refused for them, as at load: the
+            // manager may be replaying what it cached before the upgrade.
+            let hitless_repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
             validate_config(&new_config).map_err(|e| CommandError::from_validation("Invalid config", e))?;
+            hitless_repairs.report(flow_manager.event_sender());
             tracing::info!("Manager command: update_config (diff-based)");
 
             tracing::info!("Config diff: old={} flows/{} tunnels, new={} flows/{} tunnels",
@@ -7933,6 +7938,100 @@ mod add_input_hitless_tests {
         assert_eq!(running, ["a", "in-b"]);
         assert_eq!(p_inputs().await, ["a", "in-b"]);
         let _ = fm.destroy_flow("p").await;
+    }
+}
+
+#[cfg(test)]
+mod update_config_hitless_repair_tests {
+    //! A whole-config push carrying a Hitless slot an earlier release
+    //! accepted is repaired, as at load, not refused whole.
+    use super::*;
+    use crate::stats::collector::StatsCollector;
+
+    /// The manager replays the config it cached before the upgrade — here
+    /// with a new device name — whose seq-aware slot has an SRT backup. The
+    /// push is applied with the slot on primary preference, persisted so,
+    /// and reported with a Warning `config` event. It was refused whole,
+    /// rename and all.
+    #[tokio::test]
+    async fn update_config_repairs_an_unsequenced_seq_aware_slot() {
+        let (event_sender, mut events) = crate::manager::events::event_channel();
+        let fm = Arc::new(FlowManager::new(
+            Arc::new(StatsCollector::new()),
+            false,
+            event_sender.clone(),
+            Arc::new(SystemResourceState::new()),
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ));
+        let tm = Arc::new(TunnelManager::new(event_sender));
+        let cfg = Arc::new(RwLock::new(AppConfig::default()));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid = |input_id: &str| serde_json::json!({ "type": "pid", "input_id": input_id, "source_pid": 256 });
+        let mut push = serde_json::to_value(AppConfig::default()).expect("serialise");
+        let fields = serde_json::json!({
+            "device_name": "renamed",
+            "inputs": [
+                { "id": "in-a", "name": "in-a", "type": "rtp", "bind_addr": "127.0.0.1:29891" },
+                { "id": "in-b", "name": "in-b", "type": "srt", "mode": "listener",
+                  "local_addr": "127.0.0.1:29892" }
+            ],
+            "flows": [{
+                "id": "f", "name": "f", "enabled": false,
+                "input_ids": ["in-a", "in-b"], "output_ids": [],
+                "assembly": {
+                    "kind": "spts",
+                    "pcr_source": { "input_id": "in-a", "pid": 256 },
+                    "programs": [{
+                        "program_number": 1, "pmt_pid": 4096,
+                        "streams": [{
+                            "out_pid": 256, "stream_type": 27,
+                            "source": { "type": "hitless", "mode": "seq_aware",
+                                        "primary": pid("in-a"), "backup": pid("in-b"),
+                                        "path_differential_ms": 50 }
+                        }]
+                    }]
+                }
+            }]
+        });
+        push.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+
+        execute_command(
+            "update_config",
+            &serde_json::json!({ "config": push }),
+            &fm,
+            &tm,
+            &cfg,
+            &dir.path().join("config.json"),
+            &dir.path().join("secrets.json"),
+            &WebrtcRegistry::default(),
+        )
+        .await
+        .expect("a whole config is repaired, not refused");
+
+        let applied = cfg.read().await.clone();
+        assert_eq!(applied.device_name.as_deref(), Some("renamed"));
+        match &applied.flows[0].assembly.as_ref().unwrap().programs[0].streams[0].source {
+            crate::config::models::SlotSource::Hitless { mode, path_differential_ms, .. } => {
+                assert_eq!(*mode, crate::config::models::HitlessMode::PrimaryPreference);
+                assert_eq!(*path_differential_ms, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        let saved = std::fs::read_to_string(dir.path().join("config.json")).expect("persisted");
+        assert!(saved.contains("\"hitless\"") && !saved.contains("seq_aware"), "{saved}");
+        let reported = std::iter::from_fn(|| events.try_recv().ok()).any(|e| {
+            e.category == "config"
+                && e.details.as_ref().is_some_and(|d| {
+                    d["error_code"] == "hitless_seq_aware_leg_unsequenced"
+                        && d["repaired_to"] == "primary_preference"
+                })
+        });
+        assert!(reported, "the repair is reported");
     }
 }
 

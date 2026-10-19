@@ -4576,9 +4576,9 @@ fn refuse_unsequenced_legs(
     Ok(())
 }
 
-/// A seq-aware Hitless slot the load path switched to primary preference,
-/// one of its legs carrying no upstream sequence number: see
-/// [`repair_hitless_seq_aware_legs`].
+/// A seq-aware Hitless slot a whole config was repaired of, switched to
+/// primary preference since one of its legs carries no upstream sequence
+/// number: see [`repair_hitless_seq_aware_legs`].
 pub struct RepairedSeqAwareSlot {
     pub flow_id: String,
     pub program_number: u16,
@@ -4586,6 +4586,19 @@ pub struct RepairedSeqAwareSlot {
     pub leg: &'static str,
     pub input_id: String,
     pub why: String,
+}
+
+impl RepairedSeqAwareSlot {
+    /// What the repair says of the slot.
+    pub fn message(&self) -> String {
+        format!(
+            "flow '{}': program {} stream 0x{:04X}: switched a seq_aware Hitless slot to \
+             \"primary_preference\" — its {} leg, input '{}', carries no upstream sequence number \
+             to merge on ({}), so it never merged. Give it a leg that does, then set mode \
+             \"seq_aware\" again.",
+            self.flow_id, self.program_number, self.out_pid, self.leg, self.input_id, self.why,
+        )
+    }
 }
 
 /// Switch every seq-aware Hitless slot with a leg that reaches the bus
@@ -4598,7 +4611,8 @@ pub struct RepairedSeqAwareSlot {
 /// to be repaired over. The slot never merged anyway: its merger forwarded
 /// an unsequenced primary and the backup both, or never failed over to an
 /// unsequenced backup. Primary preference forwards the primary and fails
-/// over on a stall, which is what such a pair can do.
+/// over on a stall, which is what such a pair can do. Run on every whole
+/// config through [`repair_hitless_slots`].
 pub fn repair_hitless_seq_aware_legs(
     config: &mut crate::config::models::AppConfig,
 ) -> Vec<RepairedSeqAwareSlot> {
@@ -4642,6 +4656,72 @@ pub fn repair_hitless_seq_aware_legs(
     repaired
 }
 
+/// What [`repair_hitless_slots`] changed in a whole config.
+#[derive(Default)]
+pub struct HitlessRepairs {
+    /// Seq-aware slots switched to primary preference
+    /// ([`repair_hitless_seq_aware_legs`]).
+    pub seq_aware: Vec<RepairedSeqAwareSlot>,
+    /// Flows a `reorder_window` was dropped from
+    /// ([`repair_hitless_reorder_windows`]).
+    pub reorder_windows: Vec<String>,
+}
+
+/// Repair the Hitless slots of a whole config that validation refuses but
+/// earlier releases accepted — [`repair_hitless_reorder_windows`], then
+/// [`repair_hitless_seq_aware_legs`] — and say what changed.
+///
+/// Every route that takes a whole config runs it before validating: the
+/// load, `POST /api/v1/config/reload`, `PUT /api/v1/config` and the WS
+/// `update_config`. Without it one such slot refused the whole config — a
+/// reload, or a manager replaying the config it cached before the upgrade,
+/// with a device rename riding on it — and only the load repaired it. The
+/// edits that name a flow, input or assembly still refuse: a slot they
+/// would make is the operator's to fix, not one persisted by a release that
+/// knew no better.
+pub fn repair_hitless_slots(config: &mut crate::config::models::AppConfig) -> HitlessRepairs {
+    let reorder_windows = repair_hitless_reorder_windows(config);
+    let seq_aware = repair_hitless_seq_aware_legs(config);
+    HitlessRepairs { seq_aware, reorder_windows }
+}
+
+impl HitlessRepairs {
+    pub fn is_empty(&self) -> bool {
+        self.seq_aware.is_empty() && self.reorder_windows.is_empty()
+    }
+
+    /// Say what was repaired: a warning log line each, and for each
+    /// seq-aware slot a Warning `config` event naming its flow, for the
+    /// operator who reads the Events page rather than the journal.
+    pub fn report(&self, events: &crate::manager::events::EventSender) {
+        for slot in &self.seq_aware {
+            let message = slot.message();
+            tracing::warn!("{message}");
+            events.emit_flow_with_details(
+                crate::manager::events::EventSeverity::Warning,
+                crate::manager::events::category::CONFIG,
+                message,
+                &slot.flow_id,
+                serde_json::json!({
+                    "error_code": "hitless_seq_aware_leg_unsequenced",
+                    "program_number": slot.program_number,
+                    "out_pid": slot.out_pid,
+                    "leg": slot.leg,
+                    "input_id": slot.input_id,
+                    "repaired_to": "primary_preference",
+                }),
+            );
+        }
+        for flow_id in &self.reorder_windows {
+            tracing::warn!(
+                "flow '{flow_id}': dropped `reorder_window` from a Hitless slot whose mode is not \
+                 \"seq_aware\" — the primary-preference merger has no reorder window, so it never \
+                 had an effect. Set mode \"seq_aware\" to size the merge."
+            );
+        }
+    }
+}
+
 /// Drop a persisted `reorder_window` from every Hitless slot that is not
 /// seq-aware, and say which flows had one.
 ///
@@ -4651,7 +4731,8 @@ pub fn repair_hitless_seq_aware_legs(
 /// slot, the defect that refusal came with — so it can be sitting in a
 /// config now. The load path turns a validation error into an exit, and a
 /// node that will not start has no manager WebSocket, so the field goes
-/// instead, like the mosaic codecs below: it never had an effect there.
+/// instead, like the mosaic codecs below: it never had an effect there. Run
+/// on every whole config through [`repair_hitless_slots`].
 pub fn repair_hitless_reorder_windows(
     config: &mut crate::config::models::AppConfig,
 ) -> Vec<String> {
@@ -10871,6 +10952,51 @@ mod tests {
         validate_hitless_seq_aware_legs(config.flows[0].assembly.as_ref().unwrap(), "f", &config)
             .expect("nothing left to refuse");
         assert!(repair_hitless_seq_aware_legs(&mut config).is_empty(), "nothing left to repair");
+    }
+
+    /// Every route that takes a whole config runs `repair_hitless_slots`:
+    /// both refusals earlier releases knew nothing of are repaired —
+    /// a seq-aware slot with an unsequenced leg switched to primary
+    /// preference, a primary-preference slot's `reorder_window` dropped —
+    /// the result validates, and each seq-aware slot is reported as a
+    /// Warning `config` event naming its flow. Only the load repaired them;
+    /// a reload, `PUT /api/v1/config` or a manager push of such a config was
+    /// refused whole.
+    #[test]
+    fn a_whole_config_has_its_hitless_slots_repaired_and_reported() {
+        use serde_json::json;
+        let mut config = seq_aware_config(
+            &["in-a", "in-b"],
+            vec![
+                rtp_leg("in-a", json!({})),
+                json!({ "id": "in-b", "name": "in-b", "type": "srt", "mode": "listener",
+                        "local_addr": "127.0.0.1:9000" }),
+            ],
+            vec![json!({ "id": "g", "name": "g", "input_ids": [], "output_ids": [] })],
+        );
+        config.flows[1].assembly = Some(hitless_assembly(HitlessMode::PrimaryPreference, Some(1024)));
+        let repairs = repair_hitless_slots(&mut config);
+        assert_eq!(repairs.reorder_windows, ["g"]);
+        assert_eq!(repairs.seq_aware.len(), 1);
+        for flow in &config.flows {
+            let assembly = flow.assembly.as_ref().unwrap();
+            validate_hitless_seq_aware_legs(assembly, &flow.id, &config).expect("nothing to refuse");
+            validate_flow_assembly(assembly, &["in-a".into(), "in-b".into()], &flow.id)
+                .expect("no reorder_window left on primary preference");
+        }
+
+        let (sender, mut events) = crate::manager::events::event_channel();
+        repairs.report(&sender);
+        let reported: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(reported.len(), 1, "one event per seq-aware slot");
+        let event = &reported[0];
+        assert_eq!(event.category, "config");
+        assert_eq!(event.flow_id.as_deref(), Some("f"));
+        let details = event.details.as_ref().unwrap();
+        assert_eq!(details["error_code"], "hitless_seq_aware_leg_unsequenced");
+        assert_eq!(details["repaired_to"], "primary_preference");
+        assert_eq!((details["leg"].as_str(), details["input_id"].as_str()), (Some("backup"), Some("in-b")));
+        assert!(repair_hitless_slots(&mut config).is_empty(), "nothing left to repair");
     }
 
     #[test]

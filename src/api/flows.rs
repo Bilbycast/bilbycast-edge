@@ -698,7 +698,9 @@ pub async fn get_config(
 /// Accepts a full [`AppConfig`] JSON body, validates it, stops all currently running
 /// flows, replaces the in-memory config, persists it to disk, and starts all flows
 /// that have `enabled: true` in the new config. This is an atomic swap of the entire
-/// configuration.
+/// configuration. A Hitless slot an earlier release accepted and validation now
+/// refuses is repaired first, as at load
+/// ([`crate::config::validation::repair_hitless_slots`]), and reported.
 ///
 /// # Errors
 ///
@@ -709,9 +711,13 @@ pub async fn get_config(
 pub async fn replace_config(
     _admin: RequireAdmin,
     State(state): State<AppState>,
-    Json(new_config): Json<AppConfig>,
+    Json(mut new_config): Json<AppConfig>,
 ) -> Result<Json<ApiResponse<AppConfig>>, ApiError> {
+    // A whole config repairs the Hitless slots earlier releases accepted
+    // rather than being refused for them, as at load.
+    let repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
     validate_config(&new_config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    repairs.report(state.flow_manager.event_sender());
 
     // Stop all running flows
     state.flow_manager.stop_all().await;
@@ -753,6 +759,9 @@ pub async fn replace_config(
 /// currently running flows, replaces the in-memory config with the disk version,
 /// and starts all flows that have `enabled: true`. This is useful after manual
 /// edits to the config file or after deploying a new config via external tooling.
+/// Its Hitless slots are repaired as at load
+/// ([`crate::config::validation::repair_hitless_slots`]), the repair written back
+/// to the file and reported.
 ///
 /// # Errors
 ///
@@ -765,10 +774,27 @@ pub async fn reload_config(
     _admin: RequireAdmin,
     State(state): State<AppState>,
 ) -> Result<Json<ApiResponse<AppConfig>>, ApiError> {
-    let new_config = crate::config::persistence::load_config_split(&state.config_path, &state.secrets_path)
+    let mut new_config = crate::config::persistence::load_config_split(&state.config_path, &state.secrets_path)
         .map_err(|e| ApiError::Internal(e.to_string()))?;
 
+    // Repaired, and the repair written back, as at load.
+    let repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
     validate_config(&new_config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if !repairs.is_empty()
+        && let Err(e) = save_config_split_async(
+            state.config_path.clone(),
+            state.secrets_path.clone(),
+            new_config.clone(),
+        )
+        .await
+    {
+        tracing::warn!(
+            "could not write the repaired configuration back to {}: {e} — it runs repaired, and \
+             the file keeps the old values until the next save",
+            state.config_path.display()
+        );
+    }
+    repairs.report(state.flow_manager.event_sender());
 
     // Stop all running flows
     state.flow_manager.stop_all().await;
@@ -911,4 +937,157 @@ pub async fn set_output_active(
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
         }
     Ok(Json(ApiResponse::ok(())))
+}
+
+#[cfg(test)]
+mod whole_config_tests {
+    //! The two REST routes that take a whole config repair a Hitless slot an
+    //! earlier release accepted, as the load does, instead of refusing it.
+    use super::*;
+
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use tokio::sync::{RwLock, broadcast, mpsc};
+
+    use crate::api::nmos_is05::Is05State;
+    use crate::api::nmos_is08::Is08State;
+    use crate::config::models::{HitlessMode, SlotSource};
+    use crate::engine::manager::FlowManager;
+    use crate::engine::resource_monitor::SystemResourceState;
+    use crate::manager::events::Event;
+    use crate::tunnel::manager::TunnelManager;
+
+    /// The API's state over an empty config, its files in `dir`; the event
+    /// receiver is returned.
+    fn state(dir: &std::path::Path) -> (AppState, mpsc::Receiver<Event>) {
+        let (event_sender, events) = crate::manager::events::event_channel();
+        let resource_state = Arc::new(SystemResourceState::new());
+        let flow_manager = Arc::new(FlowManager::new(
+            Arc::new(crate::stats::collector::StatsCollector::new()),
+            false,
+            event_sender.clone(),
+            resource_state.clone(),
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ));
+        let (ws_stats_tx, _) = broadcast::channel(4);
+        let state = AppState {
+            config: Arc::new(RwLock::new(AppConfig::default())),
+            config_path: dir.join("config.json"),
+            secrets_path: dir.join("secrets.json"),
+            flow_manager,
+            tunnel_manager: Arc::new(TunnelManager::new(event_sender.clone())),
+            start_time: Instant::now(),
+            ws_stats_tx,
+            auth_state: None,
+            is05_state: Arc::new(Is05State::new()),
+            is08_state: Is08State::load_or_default(dir.join("nmos_channel_map.json")),
+            #[cfg(feature = "webrtc")]
+            webrtc_sessions: None,
+            event_sender: Some(event_sender),
+            resource_state,
+            standby_listeners: None,
+            token_rate_limiter: None,
+            manager_link: crate::manager::link_state::ManagerLinkState::new(false),
+            ptp_node_state: crate::engine::st2110::ptp::PtpStateHandle::new(0),
+        };
+        (state, events)
+    }
+
+    /// A config an earlier release accepted: flow "f"'s seq-aware slot has
+    /// an SRT backup, which carries no sequence number.
+    fn pre_upgrade_config() -> AppConfig {
+        let pid = |input_id: &str| serde_json::json!({ "type": "pid", "input_id": input_id, "source_pid": 256 });
+        let mut config = serde_json::to_value(AppConfig::default()).expect("serialise");
+        config.as_object_mut().unwrap().extend(
+            serde_json::json!({
+                "inputs": [
+                    { "id": "in-a", "name": "in-a", "type": "rtp", "bind_addr": "127.0.0.1:29895" },
+                    { "id": "in-b", "name": "in-b", "type": "srt", "mode": "listener",
+                      "local_addr": "127.0.0.1:29896" }
+                ],
+                "flows": [{
+                    "id": "f", "name": "f", "enabled": false,
+                    "input_ids": ["in-a", "in-b"], "output_ids": [],
+                    "assembly": {
+                        "kind": "spts",
+                        "pcr_source": { "input_id": "in-a", "pid": 256 },
+                        "programs": [{
+                            "program_number": 1, "pmt_pid": 4096,
+                            "streams": [{
+                                "out_pid": 256, "stream_type": 27,
+                                "source": { "type": "hitless", "mode": "seq_aware",
+                                            "primary": pid("in-a"), "backup": pid("in-b") }
+                            }]
+                        }]
+                    }
+                }]
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        serde_json::from_value(config).expect("config fixture")
+    }
+
+    /// What a refused request answered.
+    fn refusal<T>(result: Result<T, ApiError>) -> String {
+        match result {
+            Ok(_) => String::new(),
+            Err(ApiError::NotFound(e) | ApiError::BadRequest(e) | ApiError::Conflict(e) | ApiError::Internal(e)) => e,
+        }
+    }
+
+    /// The slot is on primary preference in memory and on disk, and the
+    /// repair was reported.
+    async fn assert_repaired(state: &AppState, events: &mut mpsc::Receiver<Event>) {
+        match &state.config.read().await.flows[0].assembly.as_ref().unwrap().programs[0].streams[0]
+            .source
+        {
+            SlotSource::Hitless { mode, .. } => assert_eq!(*mode, HitlessMode::PrimaryPreference),
+            other => panic!("{other:?}"),
+        }
+        let saved = std::fs::read_to_string(&state.config_path).expect("persisted");
+        assert!(saved.contains("\"hitless\"") && !saved.contains("seq_aware"), "{saved}");
+        let reported = std::iter::from_fn(|| events.try_recv().ok()).any(|e| {
+            e.details.as_ref().is_some_and(|d| {
+                d["error_code"] == "hitless_seq_aware_leg_unsequenced"
+                    && d["repaired_to"] == "primary_preference"
+            })
+        });
+        assert!(reported, "the repair is reported");
+    }
+
+    /// `POST /api/v1/config/reload` of such a config on disk: repaired,
+    /// written back and reported. It was refused with 400.
+    #[tokio::test]
+    async fn reload_repairs_an_unsequenced_seq_aware_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, mut events) = state(dir.path());
+        crate::config::persistence::save_config_split(
+            &state.config_path,
+            &state.secrets_path,
+            &pre_upgrade_config(),
+        )
+        .expect("write the config to reload");
+        let reloaded = reload_config(RequireAdmin, State(state.clone())).await;
+        assert!(reloaded.is_ok(), "a whole config is repaired, not refused: {}", refusal(reloaded));
+        assert_repaired(&state, &mut events).await;
+    }
+
+    /// `PUT /api/v1/config` of such a config: repaired, saved and reported.
+    /// It was refused with 400.
+    #[tokio::test]
+    async fn put_config_repairs_an_unsequenced_seq_aware_slot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, mut events) = state(dir.path());
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(pre_upgrade_config())).await;
+        assert!(replaced.is_ok(), "a whole config is repaired, not refused: {}", refusal(replaced));
+        assert_repaired(&state, &mut events).await;
+    }
 }
