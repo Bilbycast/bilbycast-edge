@@ -245,6 +245,22 @@ impl NodeEsBus {
         self.sender_for(input_id, source_pid, 0).subscribe()
     }
 
+    /// Remove the channel at `key` if it is still `sender`'s, and say
+    /// whether it was. A Hitless slot's merger output
+    /// ([`crate::engine::ts_es_hitless::hitless_bus_key`]) is the only kind
+    /// of key removed: its channel is the flow's own, and once its merger is
+    /// gone for good — the flow stopped, or a plan swap dropped the slot —
+    /// it would otherwise keep its 8 192-slot ring, and the payloads pinned
+    /// in it, for the life of the node. Checked by identity, so a slot
+    /// re-added meanwhile, whose new merger made a new channel, keeps it.
+    /// Input keys are never removed; see the sender cache in
+    /// [`TsEsDemuxer`].
+    pub fn remove_if_same(&self, key: &(String, u16), sender: &broadcast::Sender<EsPacket>) -> bool {
+        self.channels
+            .remove_if(key, |_, existing| existing.same_channel(sender))
+            .is_some()
+    }
+
     /// Snapshot the currently-registered `(input_id, source_pid)` keys.
     /// Useful for debug logging / stats.
     #[allow(dead_code)]
@@ -328,12 +344,13 @@ pub struct TsEsDemuxer {
     /// Per-PID sender cache, so the hot path touches the node-wide
     /// `DashMap` once per PID instead of once per 188-byte TS packet.
     ///
-    /// Sound because [`NodeEsBus::channels`] is append-only: it has no
-    /// `remove`, `clear`, `retain` or bare `insert` anywhere in the tree,
-    /// and [`NodeEsBus::subscribe`] resolves through the same
-    /// [`NodeEsBus::sender_for`], so a cached `Sender` is the very
-    /// instance any later subscriber attaches to. **If an eviction path is
-    /// ever added to that map, this cache must be invalidated with it.**
+    /// Sound because [`NodeEsBus::channels`] is append-only for input keys:
+    /// the only removal, [`NodeEsBus::remove_if_same`], takes Hitless merger
+    /// outputs, which no demuxer publishes; there is no `clear`, `retain` or
+    /// bare `insert`; and [`NodeEsBus::subscribe`] resolves through the same
+    /// [`NodeEsBus::sender_for`], so a cached `Sender` is the very instance
+    /// any later subscriber attaches to. **If input keys are ever evicted,
+    /// this cache must be invalidated with them.**
     ///
     /// Positive resolutions only. Caching a refusal would make a PID
     /// rejected during the pre-PMT window rejected for the life of the

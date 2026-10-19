@@ -128,12 +128,62 @@ pub fn hitless_bus_key(flow_id: &str, uid: &str) -> (String, u16) {
 /// the flow keeps exactly one per slot: [`Self::apply`] brings the set in
 /// line with each plan before it goes on air.
 #[derive(Default)]
-pub struct HitlessMergers(HashMap<String, RunningMerger>);
+pub struct HitlessMergers {
+    running: HashMap<String, RunningMerger>,
+    /// The bus channels the mergers publish onto, shared with the flow so it
+    /// can release them when it stops without taking the mergers' lock.
+    outputs: Arc<HitlessOutputs>,
+}
 
 struct RunningMerger {
     slot: PendingHitlessSlot,
     cancel: CancellationToken,
     task: JoinHandle<()>,
+}
+
+/// The bus channels a flow's Hitless mergers publish onto, by bus key: each
+/// a clone of the merger's own sender, so the channel can be removed from
+/// the bus by identity once its merger is gone for good
+/// ([`NodeEsBus::remove_if_same`]). A `std` mutex, taken for an insert or a
+/// drain on the control plane and never held across an `await`.
+#[derive(Default)]
+pub struct HitlessOutputs(std::sync::Mutex<HashMap<(String, u16), broadcast::Sender<EsPacketAlias>>>);
+
+/// A Hitless slot's bus channel whose merger a plan swap stopped for good:
+/// the new plan has no slot on its key. Released once the assembler runs the
+/// new plan ([`RetiredOutput::release`]).
+pub struct RetiredOutput {
+    key: (String, u16),
+    sender: broadcast::Sender<EsPacketAlias>,
+}
+
+impl RetiredOutput {
+    /// Take the channel off the bus. Nothing reads it any more: its merger
+    /// is gone and the assembler, on the new plan, has cancelled its
+    /// fan-in. The per-ES analyzer still subscribed sees it close and ends,
+    /// and the ring goes with the last receiver.
+    pub fn release(self, bus: &NodeEsBus) {
+        bus.remove_if_same(&self.key, &self.sender);
+    }
+
+    /// The slot's bus key.
+    pub fn key(&self) -> &(String, u16) {
+        &self.key
+    }
+}
+
+impl HitlessOutputs {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<(String, u16), broadcast::Sender<EsPacketAlias>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take every channel off the bus: the flow has stopped. Called after
+    /// its cancel, which every merger and fan-in watches first.
+    pub fn release_all(&self, bus: &NodeEsBus) {
+        for (key, sender) in self.lock().drain() {
+            bus.remove_if_same(&key, &sender);
+        }
+    }
 }
 
 impl HitlessMergers {
@@ -147,15 +197,20 @@ impl HitlessMergers {
     /// cancelled and awaited, so it is no longer publishing onto the slot's
     /// bus key when its replacement starts there. Every slot without a
     /// merger then gets one, under `parent`.
+    ///
+    /// Returns the bus channels of the mergers it stopped whose key the plan
+    /// has no slot on: the caller releases them once the assembler runs the
+    /// plan.
     pub async fn apply(
         &mut self,
         slots: &[PendingHitlessSlot],
         plan: &mut AssemblyPlan,
         bus: &Arc<NodeEsBus>,
         parent: &CancellationToken,
-    ) {
+    ) -> Vec<RetiredOutput> {
         let mut kept = HashMap::with_capacity(slots.len());
-        for (uid, running) in std::mem::take(&mut self.0) {
+        let mut retired = Vec::new();
+        for (uid, running) in std::mem::take(&mut self.running) {
             // `ForwardingPrimary` compares equal whatever it holds, so this
             // compares the slot's legs and settings only.
             if slots.contains(&running.slot) {
@@ -163,6 +218,12 @@ impl HitlessMergers {
             } else {
                 running.cancel.cancel();
                 let _ = running.task.await;
+                let key = running.slot.bus_key;
+                if !slots.iter().any(|slot| slot.bus_key == key)
+                    && let Some(sender) = self.outputs.lock().remove(&key)
+                {
+                    retired.push(RetiredOutput { key, sender });
+                }
             }
         }
         for slot in slots {
@@ -189,9 +250,20 @@ impl HitlessMergers {
                 slot.forwarding_primary.clone(),
                 cancel.clone(),
             );
+            // The channel the merger just took, for releasing it later.
+            self.outputs
+                .lock()
+                .insert(slot.bus_key.clone(), bus.sender_for(&slot.bus_key.0, slot.bus_key.1, 0));
             kept.insert(slot.uid.clone(), RunningMerger { slot: slot.clone(), cancel, task });
         }
-        self.0 = kept;
+        self.running = kept;
+        retired
+    }
+
+    /// The bus channels of these mergers, for the flow to release when it
+    /// stops ([`HitlessOutputs::release_all`]).
+    pub fn outputs(&self) -> Arc<HitlessOutputs> {
+        self.outputs.clone()
     }
 }
 

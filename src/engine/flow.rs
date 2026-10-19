@@ -260,6 +260,10 @@ pub struct FlowRuntime {
     /// leave the mergers matching one plan, the assembler running the other
     /// and `config.json` naming either.
     pub hitless_mergers: tokio::sync::Mutex<crate::engine::ts_es_hitless::HitlessMergers>,
+    /// The bus channels those mergers publish onto, released from the
+    /// node-wide bus when the flow stops ([`Self::stop`]) — reachable without
+    /// the mergers' lock, which a stop must not wait on.
+    hitless_outputs: Arc<crate::engine::ts_es_hitless::HitlessOutputs>,
     /// Live mutable copy of the flow's `assembly` block: the plan the
     /// assembler runs, which a swap's no-op check compares against
     /// ([`AssemblySwap::runs`]). Persisted form lives in `config.json`,
@@ -1605,6 +1609,7 @@ impl FlowRuntime {
             frame_rate_rx,
             pid_bus_assembler_handle,
             es_bus,
+            hitless_outputs: hitless_mergers.outputs(),
             hitless_mergers: tokio::sync::Mutex::new(hitless_mergers),
             current_assembly,
             #[cfg(feature = "replay")]
@@ -1999,7 +2004,7 @@ impl FlowRuntime {
         // The mergers behind the new plan's Hitless slots. Their lock is held
         // for the whole swap, so the assembler runs the plan they were set
         // for and `current_assembly` names it.
-        hitless_mergers
+        let retired = hitless_mergers
             .apply(&build.pending_hitless, &mut build.plan, &bus, &self.cancel_token)
             .await;
 
@@ -2039,15 +2044,30 @@ impl FlowRuntime {
             .map(|fm| collect_psi_catalogs_for_plan(&build.plan, &self.stats, &fm))
             .unwrap_or_default();
 
-        handle
+        let (applied, on_air) = tokio::sync::oneshot::channel();
+        let sent = handle
             .plan_tx
             .send(crate::engine::ts_assembler::PlanCommand::ReplacePlan {
                 plan: build.plan,
                 splice_mode_override,
                 catalogs,
+                applied: Some(applied),
             })
-            .await
-            .map_err(|_| anyhow::anyhow!("flow '{}' assembler receiver closed", flow_id))?;
+            .await;
+        // Once the assembler runs the new plan — or has gone — nothing reads
+        // the bus channels of the Hitless slots the plan dropped: their
+        // mergers are stopped and the assembler's fan-ins for them
+        // cancelled. Release them now rather than keep their rings for the
+        // life of the node, and their per-ES stats with them, so a slot
+        // added back later gets a fresh analyzer on its fresh channel.
+        if sent.is_ok() {
+            let _ = on_air.await;
+        }
+        for output in retired {
+            self.stats.per_es_stats.remove(output.key());
+            output.release(&bus);
+        }
+        sent.map_err(|_| anyhow::anyhow!("flow '{}' assembler receiver closed", flow_id))?;
         // Recorded under the merger lock, which a concurrent swap waits on:
         // the plan recorded is then the one the assembler and the mergers
         // run, and the callers' no-op check compares against it. Lock order:
@@ -3440,6 +3460,15 @@ impl FlowRuntime {
                 }
             }
         self.cancel_token.cancel();
+        // The flow's Hitless slots' bus channels go with it: keyed by the
+        // flow, nothing else publishes onto them or reads them, and the
+        // node-wide bus would otherwise keep each one's ring for the life of
+        // the node. After the cancel, which the mergers and the assembler's
+        // fan-ins watch before anything else, so no fan-in reports the
+        // channel closing as a source that disappeared.
+        if let Some(bus) = &self.es_bus {
+            self.hitless_outputs.release_all(bus);
+        }
         // Await all output task handles so sockets (especially SRT listeners)
         // are fully closed and ports released before the flow is considered stopped.
         let output_handles: Vec<_> = {

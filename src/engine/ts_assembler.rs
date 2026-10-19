@@ -438,6 +438,11 @@ pub enum PlanCommand {
         /// targets unknown at spawn time resolve their ES descriptors.
         /// Empty in tests (descriptor-less PMTs, yesterday's shape).
         catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+        /// Told once the new plan is in place: every fan-in it no longer
+        /// reads is cancelled. The swap waits for it before it releases the
+        /// bus channels of the Hitless slots the plan dropped, so no fan-in
+        /// still reading one sees it close.
+        applied: Option<tokio::sync::oneshot::Sender<()>>,
     },
     /// Operator-driven switch-slot retarget. Sent by
     /// `engine::manager::FlowManager::switch_active_input` when an
@@ -915,7 +920,7 @@ async fn run_assembler(
             }
             Some(cmd) = plan_rx.recv() => {
                 match cmd {
-                    PlanCommand::ReplacePlan { plan: new_plan, splice_mode_override, catalogs: new_catalogs } => {
+                    PlanCommand::ReplacePlan { plan: new_plan, splice_mode_override, catalogs: new_catalogs, applied } => {
                         // Adopt the new plan's catalogue handles so
                         // retargeted slots resolve descriptors from
                         // their (possibly brand-new) sources.
@@ -992,6 +997,9 @@ async fn run_assembler(
                             &es_info_by_slot,
                             pts_rewriter.as_mut(),
                         );
+                        if let Some(applied) = applied {
+                            let _ = applied.send(());
+                        }
                     }
                     PlanCommand::SwitchActiveInput {
                         new_input_id,
@@ -3726,7 +3734,7 @@ mod tests {
         };
         handle
             .plan_tx
-            .send(PlanCommand::ReplacePlan { plan: new_plan, splice_mode_override: None, catalogs: Default::default() })
+            .send(PlanCommand::ReplacePlan { plan: new_plan, splice_mode_override: None, catalogs: Default::default(), applied: None })
             .await
             .expect("plan_tx send");
 
@@ -3819,7 +3827,7 @@ mod tests {
         // Replace with a structurally identical plan.
         handle
             .plan_tx
-            .send(PlanCommand::ReplacePlan { plan: make_plan(), splice_mode_override: None, catalogs: Default::default() })
+            .send(PlanCommand::ReplacePlan { plan: make_plan(), splice_mode_override: None, catalogs: Default::default(), applied: None })
             .await
             .expect("plan_tx send");
 

@@ -1383,10 +1383,18 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     fn make_fm() -> Arc<FlowManager> {
+        make_fm_with_events().0
+    }
+
+    /// [`make_fm`], with the events it raises.
+    fn make_fm_with_events() -> (
+        Arc<FlowManager>,
+        tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+    ) {
         let stats = Arc::new(StatsCollector::new());
-        let (event_sender, _rx) = crate::manager::events::event_channel();
+        let (event_sender, rx) = crate::manager::events::event_channel();
         let resource_state = Arc::new(crate::engine::resource_monitor::SystemResourceState::new());
-        Arc::new(FlowManager::new(
+        let fm = Arc::new(FlowManager::new(
             stats,
             false,
             event_sender,
@@ -1397,7 +1405,8 @@ mod tests {
             crate::display::claim_registry::DisplayClaimRegistry::new(),
             #[cfg(feature = "webrtc")]
             None,
-        ))
+        ));
+        (fm, rx)
     }
 
     #[tokio::test]
@@ -1707,12 +1716,15 @@ mod tests {
     /// slot already had when the swap leaves the slot alone, a new one when
     /// it changes the slot, none when it drops the slot. So every packet
     /// reaches the slot's bus key once, and the on-air set follows the
-    /// merger that runs.
+    /// merger that runs. A dropped slot's bus channel leaves the node-wide
+    /// bus with its merger, and every Hitless channel of the flow when the
+    /// flow stops — the bus kept each one's ring for the life of the node —
+    /// with no fan-in reporting a source that disappeared.
     #[tokio::test]
     async fn a_plan_swap_leaves_one_merger_per_hitless_slot() {
         use crate::engine::ts_es_bus::EsPacket;
         use std::time::Duration;
-        let fm = make_fm();
+        let (fm, mut events) = make_fm_with_events();
         let udp = |id: &str, port: u16| {
             input(serde_json::json!({
                 "id": id, "name": id, "type": "udp",
@@ -1833,8 +1845,13 @@ mod tests {
                 wait_until("the new merger's primary is on air", || on_air("in-a")).await;
                 assert_eq!(copies().await, 1, "a changed slot gets one new merger");
 
-                // A swap that drops the slot stops its merger.
+                // A swap that drops the slot stops its merger, and takes its
+                // channel off the bus.
                 runtime.replace_assembly(with_marker(assembly(5000, false)), None).await.expect("swap");
+                assert!(
+                    !bus.keys().contains(&(merged.clone(), merged_pid)),
+                    "a dropped slot's channel is released"
+                );
                 assert_eq!(copies().await, 0, "a dropped slot keeps no merger");
                 wait_until("the swap is on air", || slots_on_air(2)).await;
                 assert!(!on_air("in-a") && !on_air("in-b"), "nor anything on air");
@@ -1860,6 +1877,15 @@ mod tests {
         let _ = fm.destroy_flow("f1").await;
         if let Err(failed) = outcome {
             std::panic::resume_unwind(failed.into_panic());
+        }
+        let left: Vec<_> =
+            fm.node_es_bus().keys().into_iter().filter(|(k, _)| k.starts_with("hitless:f1:")).collect();
+        assert!(left.is_empty(), "a stopped flow's Hitless channels are released: {left:?}");
+        // Let any fan-in that saw a channel close report it.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        while let Ok(event) = events.try_recv() {
+            let code = event.details.as_ref().and_then(|d| d["error_code"].as_str());
+            assert_ne!(code, Some("pid_bus_slot_source_closed"), "{}", event.message);
         }
     }
 
