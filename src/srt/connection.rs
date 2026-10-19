@@ -783,17 +783,20 @@ pub(crate) fn publish_leg_stats(
     cursor: &mut LegCursor,
     leg_stats: SrtLegStats,
 ) {
-    let Some((drops, delivered)) = cursor.advance(&leg_stats) else {
-        return;
-    };
-    // Every good poll, drops or not: a 2022-7 leg's poll also takes the
-    // merger's count of what neither leg delivered, and what the leg
-    // delivered is whether its drops can explain that and how long they
-    // wait.
+    let moved = cursor.advance(&leg_stats);
+    // Every poll, drops or not, and a failed read as one that found and
+    // delivered nothing: a 2022-7 leg's poll also takes the merger's count
+    // of what neither leg delivered, what the leg delivered is whether its
+    // drops can explain that, and the pair's loss waits for the leg's polls.
+    // Skipped, a leg whose reads kept failing held that loss back for good,
+    // its cache still up.
     if let Some((input, socket)) = input {
+        let (drops, delivered) = moved.unwrap_or_default();
         input.count_socket_drops(socket, drops, delivered);
     }
-    cache.send_replace(Some(leg_stats));
+    if moved.is_some() {
+        cache.send_replace(Some(leg_stats));
+    }
 }
 
 /// The group counterpart of [`publish_leg_stats`], a failed read of the group
@@ -1407,7 +1410,8 @@ mod tests {
 
     /// A leg poller's failed read is no sample for either counter: neither
     /// its drops nor its delivered packets are counted again by the next
-    /// good read, and the failed one reaches the pair's ledger not at all.
+    /// good read, and the failed one reaches the pair's ledger as a poll that
+    /// found and delivered nothing.
     #[test]
     fn a_failed_read_is_no_sample_for_a_legs_counters() {
         let read = |drops: i32, delivered: i64, uptime_ms: i64| SrtLegStats {
