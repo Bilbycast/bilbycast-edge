@@ -3574,8 +3574,9 @@ pub struct AssembledOnAir {
     /// The legs behind each Hitless slot. Only the one its merger is
     /// forwarding is on air, the primary or, after a failover, the backup:
     /// the other is a warm standby. A seq-aware merger keeps the primary on
-    /// air: it merges on `upstream_seq`, which no SRT input stamps, so of
-    /// SRT legs it forwards the primary verbatim and discards the backup.
+    /// air: it merges on `upstream_seq`, which no SRT input stamps —
+    /// validation refuses SRT legs on such a slot, and should one reach it
+    /// anyway it forwards the primary alone.
     pub hitless: Vec<crate::engine::ts_assembler::HitlessLegs>,
 }
 

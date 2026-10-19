@@ -4699,7 +4699,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             None,
             legs.forwarding_primary.clone(),
-            cancel.child_token(),
+            cancel.child_token(), None
         );
         let handle = spawn_spts_assembler(
             plan,

@@ -1299,8 +1299,10 @@ pub enum SlotSource {
         /// existing configs keep their stall-timer-based failover. Set
         /// to `SeqAware` for true SMPTE 2022-7 hitless: the merger
         /// dedups + gap-fills against the upstream sequence number each
-        /// leg's RTP or RIST input stamps, switching legs sub-frame
-        /// instead of after a 200 ms stall.
+        /// leg's packets carry, switching legs sub-frame instead of after
+        /// a 200 ms stall. Each leg must carry one at the bus — an RTP or
+        /// RIST input no ingress transcode or post-process stage rewrites;
+        /// validation refuses any other (`hitless_seq_aware_leg_unsequenced`).
         #[serde(default, skip_serializing_if = "HitlessMode::is_default")]
         mode: HitlessMode,
         /// Override for the stall timer (`PrimaryPreference` mode
@@ -1427,8 +1429,10 @@ pub enum HitlessMode {
     /// True SMPTE 2022-7 seq-aware hitless. Both legs are observed
     /// continuously; the merger dedups + gap-fills against the
     /// upstream wire-level sequence number, packet by packet within a
-    /// datagram. Requires both legs' inputs to stamp an `upstream_seq`,
-    /// which only RTP and RIST inputs do — not SRT, UDP or ST 2110.
+    /// datagram. Requires both legs to reach the bus with an
+    /// `upstream_seq`: RTP or RIST inputs (not SRT, UDP or ST 2110) that
+    /// no ingress transcode, program filter, PID rewrite or clock
+    /// regeneration rewrites. Validation refuses any other leg.
     SeqAware,
 }
 

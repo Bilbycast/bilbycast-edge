@@ -31,9 +31,13 @@
 //!   behind a hold of that long, released in `(seq, index)` order at
 //!   constant latency.
 //!
-//! A leg with no sequence number — SRT, UDP — gives a seq-aware merger
-//! nothing to merge on: it forwards such a primary verbatim and discards
-//! such a backup.
+//! A leg whose packets reach the bus with no sequence number — any input but
+//! RTP and RIST, or one whose ingress transcode or post-process stage
+//! rewrote its stream — gives a seq-aware merger nothing to merge on.
+//! Validation refuses such a slot (`hitless_seq_aware_leg_unsequenced`); one
+//! that reaches the runtime regardless forwards such a primary alone,
+//! dropping the backup, and discards such a backup, raising a Warning once
+//! per leg.
 //!
 //! # Invariants
 //!
@@ -133,6 +137,15 @@ pub struct HitlessMergers {
     /// The bus channels the mergers publish onto, shared with the flow so it
     /// can release them when it stops without taking the mergers' lock.
     outputs: Arc<HitlessOutputs>,
+    /// Where the mergers raise their events; `None` in tests.
+    events: Option<MergerEvents>,
+}
+
+/// Where a flow's Hitless mergers raise their events.
+#[derive(Clone)]
+pub struct MergerEvents {
+    pub sender: crate::manager::events::EventSender,
+    pub flow_id: String,
 }
 
 struct RunningMerger {
@@ -187,6 +200,14 @@ impl HitlessOutputs {
 }
 
 impl HitlessMergers {
+    /// The mergers of flow `flow_id`, raising their events on `sender`.
+    pub fn new(sender: crate::manager::events::EventSender, flow_id: &str) -> Self {
+        Self {
+            events: Some(MergerEvents { sender, flow_id: flow_id.to_string() }),
+            ..Self::default()
+        }
+    }
+
     /// Bring the running mergers in line with `slots`, the Hitless slots of
     /// `plan`, before `plan` goes on air.
     ///
@@ -249,6 +270,7 @@ impl HitlessMergers {
                 slot.path_differential_ms,
                 slot.forwarding_primary.clone(),
                 cancel.clone(),
+                self.events.clone(),
             );
             // The channel the merger just took, for releasing it later.
             self.outputs
@@ -286,8 +308,12 @@ impl HitlessMergers {
 /// The primary-preference merger sets `forwarding_primary` on each flip, so
 /// the flow counts the SRT drops of the leg it forwards. The seq-aware
 /// mergers leave it on the primary: they merge on `upstream_seq`, which no
-/// SRT input stamps, so of SRT legs they forward the primary verbatim and
-/// discard the backup.
+/// SRT input stamps — validation refuses such legs, and should one reach a
+/// seq-aware merger anyway it forwards such a primary alone.
+///
+/// `events`, when given, is where a seq-aware merger raises its Warning
+/// about a leg with no sequence number.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_hitless_es_merger_full(
     output: (String, u16),
     primary: (String, u16),
@@ -299,7 +325,9 @@ pub fn spawn_hitless_es_merger_full(
     path_differential_ms: Option<u32>,
     forwarding_primary: ForwardingPrimary,
     cancel: CancellationToken,
+    events: Option<MergerEvents>,
 ) -> JoinHandle<()> {
+    let unsequenced = Unsequenced::new(&output.0, &primary, &backup, events);
     let mut primary_rx = bus.subscribe(&primary.0, primary.1);
     let mut backup_rx = bus.subscribe(&backup.0, backup.1);
     let (out_input, out_pid) = output;
@@ -314,18 +342,19 @@ pub fn spawn_hitless_es_merger_full(
         match (seq_aware, path_differential_ms) {
             (true, Some(ms)) => {
                 run_buffered(
-                    uid,
                     primary_rx,
                     backup_rx,
                     out_tx,
                     Duration::from_millis(ms as u64),
                     reorder_window,
+                    unsequenced,
                     cancel,
                 )
                 .await;
             }
             (true, None) => {
-                run_seq_aware(uid, primary_rx, backup_rx, out_tx, reorder_window, cancel).await;
+                run_seq_aware(uid, primary_rx, backup_rx, out_tx, reorder_window, unsequenced, cancel)
+                    .await;
             }
             (false, _) => {
                 run_primary_preference(
@@ -344,12 +373,12 @@ pub fn spawn_hitless_es_merger_full(
 }
 
 async fn run_buffered(
-    uid: String,
     mut primary_rx: broadcast::Receiver<EsPacketAlias>,
     mut backup_rx: broadcast::Receiver<EsPacketAlias>,
     out_tx: broadcast::Sender<EsPacketAlias>,
     max_path_diff: Duration,
     reorder_window: u16,
+    mut unsequenced: Unsequenced,
     cancel: CancellationToken,
 ) {
     use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HeldRuns};
@@ -372,11 +401,8 @@ async fn run_buffered(
             res = primary_rx.recv() => match res {
                 Ok(es) => {
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
-                        tracing::warn!(
-                            uid = %uid,
-                            "pid_bus hitless buffered: primary leg has no upstream_seq — \
-                             forwarding without buffer (bypass path)"
-                        );
+                        // Nothing to merge on: the primary alone, unbuffered.
+                        unsequenced.primary();
                         let _ = out_tx.send(es);
                         continue;
                     };
@@ -390,7 +416,13 @@ async fn run_buffered(
             },
             res = backup_rx.recv() => match res {
                 Ok(es) => {
+                    if unsequenced.primary_seen {
+                        // The primary is forwarded on its own: nothing of the
+                        // backup may join it, or each packet goes out twice.
+                        continue;
+                    }
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
+                        unsequenced.backup();
                         continue;
                     };
                     let now = std::time::Instant::now();
@@ -466,6 +498,7 @@ async fn run_seq_aware(
     mut backup_rx: broadcast::Receiver<EsPacketAlias>,
     out_tx: broadcast::Sender<EsPacketAlias>,
     reorder_window: u16,
+    mut unsequenced: Unsequenced,
     cancel: CancellationToken,
 ) {
     use crate::redundancy::merger::{ActiveLeg, HitlessRunMerger};
@@ -479,11 +512,8 @@ async fn run_seq_aware(
             res = primary_rx.recv() => match res {
                 Ok(es) => {
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
-                        tracing::warn!(
-                            uid = %uid,
-                            "pid_bus hitless seq_aware: primary leg has no upstream_seq — \
-                             falling back to forward (this should be rejected at config validation)"
-                        );
+                        // Nothing to merge on: the primary alone.
+                        unsequenced.primary();
                         let _ = out_tx.send(es);
                         continue;
                     };
@@ -497,7 +527,13 @@ async fn run_seq_aware(
             },
             res = backup_rx.recv() => match res {
                 Ok(es) => {
+                    if unsequenced.primary_seen {
+                        // The primary is forwarded on its own: nothing of the
+                        // backup may join it, or each packet goes out twice.
+                        continue;
+                    }
                     let Some(UpstreamSeq { seq, index }) = es.upstream_seq else {
+                        unsequenced.backup();
                         continue;
                     };
                     if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg2, es.recv_time_us) {
@@ -508,6 +544,72 @@ async fn run_seq_aware(
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return,
             },
+        }
+    }
+}
+
+/// A seq-aware merger's legs that brought a packet with no sequence number,
+/// each reported once: a Warning event when the merger has somewhere to
+/// raise it, a log line either way. Validation refuses such a leg
+/// (`hitless_seq_aware_leg_unsequenced`); this is the runtime's word on one
+/// that got here regardless.
+struct Unsequenced {
+    /// A primary packet came without one: the primary is forwarded alone
+    /// from then on, and the backup dropped.
+    primary_seen: bool,
+    backup_seen: bool,
+    uid: String,
+    legs: [(String, u16); 2],
+    events: Option<MergerEvents>,
+}
+
+impl Unsequenced {
+    fn new(uid: &str, primary: &(String, u16), backup: &(String, u16), events: Option<MergerEvents>) -> Self {
+        Self {
+            primary_seen: false,
+            backup_seen: false,
+            uid: uid.to_string(),
+            legs: [primary.clone(), backup.clone()],
+            events,
+        }
+    }
+
+    fn primary(&mut self) {
+        if !std::mem::replace(&mut self.primary_seen, true) {
+            self.report(0, "forwarding the primary alone; the backup is not used");
+        }
+    }
+
+    fn backup(&mut self) {
+        if !std::mem::replace(&mut self.backup_seen, true) {
+            self.report(1, "the backup cannot fill the primary's gaps or take over from it");
+        }
+    }
+
+    fn report(&self, leg: usize, consequence: &str) {
+        let (name, (input_id, pid)) = (["primary", "backup"][leg], &self.legs[leg]);
+        let message = format!(
+            "Hitless slot {}: the {name} leg (input '{input_id}', PID 0x{pid:04X}) brings packets \
+             with no upstream sequence number, so the seq-aware merge cannot run — {consequence}. \
+             Use mode \"primary_preference\", or a leg that carries one: an RTP or RIST input with \
+             no ingress transcode, program filter, PID rewrite or clock regeneration",
+            self.uid
+        );
+        tracing::warn!("{message}");
+        if let Some(events) = &self.events {
+            events.sender.emit_flow_with_details(
+                crate::manager::events::EventSeverity::Warning,
+                crate::manager::events::category::FLOW,
+                format!("Flow '{}': {message}", events.flow_id),
+                &events.flow_id,
+                serde_json::json!({
+                    "error_code": "hitless_seq_aware_leg_unsequenced",
+                    "slot": self.uid,
+                    "leg": name,
+                    "input_id": input_id,
+                    "source_pid": pid,
+                }),
+            );
         }
     }
 }
@@ -594,7 +696,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
-            cancel.clone(),
+            cancel.clone(), None
         );
 
         let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
@@ -636,7 +738,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
-            cancel.clone(),
+            cancel.clone(), None
         );
 
         let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
@@ -676,7 +778,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
             forwarding.clone(),
-            cancel.clone(),
+            cancel.clone(), None
         );
 
         let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
@@ -735,7 +837,7 @@ mod tests {
                     reorder_window,
                     path_differential_ms,
                     ForwardingPrimary::default(),
-                    cancel.clone(),
+                    cancel.clone(), None
                 );
                 let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
                 let pri = bus.sender_for("in-a", 0x100, 0x1B);
@@ -816,7 +918,7 @@ mod tests {
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
                 ForwardingPrimary::default(),
-                cancel.clone(),
+                cancel.clone(), None
             );
             let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
             let pri = bus.sender_for("in-a", 0x1F0, 0x86);
@@ -869,7 +971,7 @@ mod tests {
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
                 forwarding.clone(),
-                cancel.clone(),
+                cancel.clone(), None
             );
             let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
             let pri = bus.sender_for("in-a", 0x100, 0x1B);
@@ -889,6 +991,62 @@ mod tests {
             assert!(backup.is_err(), "{path_differential_ms:?}: the backup is discarded");
             assert!(forwarding.get(), "{path_differential_ms:?}: the primary stays on air");
 
+            cancel.cancel();
+        }
+    }
+
+    /// A primary with no sequence number beside a backup that has one: the
+    /// merger forwards the primary on its own and drops the backup, raising
+    /// one Warning. It forwarded the primary on its bypass and merged the
+    /// backup as well, so every packet reached the output twice.
+    #[tokio::test]
+    async fn seq_aware_forwards_an_unsequenced_primary_alone() {
+        for path_differential_ms in [None, Some(50)] {
+            let bus = Arc::new(NodeEsBus::new());
+            let cancel = CancellationToken::new();
+            let (sender, mut events) = crate::manager::events::event_channel();
+            let _handle = spawn_hitless_es_merger_full(
+                hitless_bus_key("f1", "slot_0_0"),
+                ("in-a".to_string(), 0x100),
+                ("in-b".to_string(), 0x200),
+                bus.clone(),
+                Duration::from_millis(50),
+                /* seq_aware */ true,
+                crate::redundancy::merger::REORDER_WINDOW,
+                path_differential_ms,
+                ForwardingPrimary::default(),
+                cancel.clone(),
+                Some(MergerEvents { sender, flow_id: "f1".into() }),
+            );
+            let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+            let pri = bus.sender_for("in-a", 0x100, 0x1B);
+            let bak = bus.sender_for("in-b", 0x200, 0x1B);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            for seq in 0..20u16 {
+                pri.send(es(0x100, seq as u8)).unwrap();
+                bak.send(EsPacket {
+                    upstream_seq: Some(UpstreamSeq { seq, index: 0 }),
+                    ..es(0x200, 0x80 | seq as u8)
+                })
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let mut forwarded = Vec::new();
+            while let Ok(Ok(es)) = tokio::time::timeout(Duration::from_millis(200), out_rx.recv()).await {
+                forwarded.push(es.payload[4]);
+            }
+            assert_eq!(
+                forwarded,
+                (0..20u8).collect::<Vec<_>>(),
+                "{path_differential_ms:?}: the primary alone"
+            );
+            let warned: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                .filter(|e| {
+                    e.details.as_ref().and_then(|d| d["error_code"].as_str())
+                        == Some("hitless_seq_aware_leg_unsequenced")
+                })
+                .collect();
+            assert_eq!(warned.len(), 1, "{path_differential_ms:?}: one Warning for the leg");
             cancel.cancel();
         }
     }
@@ -960,7 +1118,7 @@ mod tests {
             crate::redundancy::merger::REORDER_WINDOW,
             path_differential_ms,
             ForwardingPrimary::default(),
-            cancel.clone(),
+            cancel.clone(), None
         );
         let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
         let mut demux_a = TsEsDemuxer::new("in-a", bus.clone());
@@ -1057,7 +1215,7 @@ mod tests {
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
                 ForwardingPrimary::default(),
-                cancel.clone(),
+                cancel.clone(), None
             );
             let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
             let pri = bus.sender_for("in-a", 0x100, 0x1B);
@@ -1112,7 +1270,7 @@ mod tests {
             4096,
             /* path_differential_ms */ None,
             ForwardingPrimary::default(),
-            cancel.clone(),
+            cancel.clone(), None
         );
         let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
         let mut demux_a = TsEsDemuxer::new("in-a", bus.clone());

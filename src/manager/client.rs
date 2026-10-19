@@ -2377,6 +2377,12 @@ async fn execute_command(
                 if cfg.flows.iter().any(|f| f.id == flow.id) {
                     return Err(CommandError::new(format!("Duplicate flow ID '{}'", flow.id)));
                 }
+                crate::config::validation::validate_flow_hitless_legs(&flow, &cfg).map_err(|e| {
+                    CommandError::with_code(
+                        format!("Invalid flow config: {e}"),
+                        "hitless_seq_aware_leg_unsequenced",
+                    )
+                })?;
             }
             tracing::info!("Manager command: create flow '{}'", flow.id);
             let resolved = {
@@ -2431,6 +2437,13 @@ async fn execute_command(
                 new_flow.recording = Some(prev);
             }
             validate_flow(&new_flow).map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
+            crate::config::validation::validate_flow_hitless_legs(&new_flow, &*app_config.read().await)
+                .map_err(|e| {
+                    CommandError::with_code(
+                        format!("Invalid flow config: {e}"),
+                        "hitless_seq_aware_leg_unsequenced",
+                    )
+                })?;
             tracing::info!("Manager command: update flow '{flow_id}' (diff-based)");
 
             // Get old flow config for comparison
@@ -2730,6 +2743,20 @@ async fn execute_command(
                 &format!("Flow '{flow_id}'"),
             )
             .map_err(|e| CommandError::from_validation("Invalid assembly", e))?;
+            // A seq-aware Hitless leg must carry an upstream sequence number,
+            // which depends on the leg inputs' own config: checked against
+            // the node's.
+            crate::config::validation::validate_hitless_seq_aware_legs(
+                &new_assembly,
+                flow_id,
+                &*app_config.read().await,
+            )
+            .map_err(|e| {
+                CommandError::with_code(
+                    format!("Invalid assembly: {e}"),
+                    "hitless_seq_aware_leg_unsequenced",
+                )
+            })?;
             tracing::info!(
                 "Manager command: update_flow_assembly '{flow_id}' (kind={:?}, programs={})",
                 new_assembly.kind,
@@ -3171,6 +3198,9 @@ async fn execute_command(
                 .ok_or_else(|| format!("Input '{input_id}' not found"))?;
             validate_port_conflicts_with_input(&cfg, &input)
                 .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
+            crate::config::validation::validate_input_hitless_legs(&input, &cfg).map_err(|e| {
+                CommandError::with_code(format!("Invalid input: {e}"), "hitless_seq_aware_leg_unsequenced")
+            })?;
             let old = cfg.inputs[idx].clone();
             // Activation is owned by the `activate_input` command. Edits to
             // an input's config must never change its active state.

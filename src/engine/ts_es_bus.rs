@@ -159,10 +159,10 @@ pub struct EsPacket {
     pub recv_time_us: u64,
     /// Where this packet sat on the wire, when its input knows: the
     /// sequence number of the datagram that carried it and its place among
-    /// that datagram's packets of its PID. `input_rtp` and `input_rist`
-    /// stamp the sequence number on the `RtpPacket` and [`TsEsDemuxer`]
-    /// counts the place; `None` from every other input — SRT, UDP, ST 2110
-    /// among them.
+    /// that datagram's packets of its PID. The sequence number is the
+    /// `RtpPacket`'s `upstream_seq` — only `input_rtp` (a FEC-decoded one too) and `input_rist` stamp it, and a packet through an ingress transcode or post-process stage (`audio_encode` / `video_encode`, `program_number`, `pid_overrides`, `pid_map`, or the muxer-mode clock regenerator that runs on an input of a flow with no `assembly` unless `passthrough_clock: true`) leaves without it — and
+    /// [`TsEsDemuxer`] counts the place; `None` otherwise — from SRT, UDP
+    /// and ST 2110 among others.
     ///
     /// The pre-bus seq-aware Hitless merger merges on it. Both legs of a
     /// 2022-7 pair carry identical datagrams, so the pair names the same TS

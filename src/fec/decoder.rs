@@ -167,7 +167,9 @@ impl FecDecoder {
             rtp_timestamp: ts,
             recv_time_us: now_us(),
             is_raw_ts: false,
-            upstream_seq: None,
+            // The wire seq: a FEC-decoded input stamps it like any RTP
+            // input, so a seq-aware Hitless slot can merge it.
+            upstream_seq: Some(seq),
             upstream_leg_id: None,
             sender_timestamp_us: None,
         });
@@ -395,7 +397,8 @@ impl FecDecoder {
             rtp_timestamp: self.last_rtp_timestamp,
             recv_time_us: now_us(),
             is_raw_ts: false,
-            upstream_seq: None,
+            // The recovered packet's wire seq, as for a received one.
+            upstream_seq: Some(seq),
             upstream_leg_id: None,
             sender_timestamp_us: None,
         }

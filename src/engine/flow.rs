@@ -5106,7 +5106,7 @@ async fn finalize_spts_assembler(
             build.pending_hitless.first().map(|h| h.stall_ms).unwrap_or(0),
         );
     }
-    let mut hitless_mergers = crate::engine::ts_es_hitless::HitlessMergers::default();
+    let mut hitless_mergers = crate::engine::ts_es_hitless::HitlessMergers::new(event_sender.clone(), flow_id);
     hitless_mergers
         .apply(&build.pending_hitless, &mut build.plan, bus, cancel_token)
         .await;

@@ -123,6 +123,8 @@ pub async fn update_input(
     // 404 rather than a port conflict against a phantom entity.
     validate_port_conflicts_with_input(&config, &input)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    crate::config::validation::validate_input_hitless_legs(&input, &config)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let old = config.inputs[idx].clone();
     // Activation is owned by POST /api/v1/flows/{id}/activate-input (and the

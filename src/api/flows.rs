@@ -138,6 +138,8 @@ pub async fn create_flow(
     validate_flow(&flow).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let mut config = state.config.write().await;
+    crate::config::validation::validate_flow_hitless_legs(&flow, &config)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     if config.flows.iter().any(|f| f.id == flow.id) {
         return Err(ApiError::Conflict(format!(
@@ -194,6 +196,8 @@ pub async fn update_flow(
     validate_flow(&flow).map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let mut config = state.config.write().await;
+    crate::config::validation::validate_flow_hitless_legs(&flow, &config)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let idx = config
         .flows
@@ -390,6 +394,14 @@ pub async fn update_flow_assembly(
     crate::config::validation::validate_assembly_for_hotswap(
         &new_assembly,
         &format!("Flow '{flow_id}'"),
+    )
+    .map_err(|e| ApiError::BadRequest(format!("Invalid assembly: {e}")))?;
+    // A seq-aware Hitless leg must carry an upstream sequence number, which
+    // depends on the leg inputs' own config: checked against the node's.
+    crate::config::validation::validate_hitless_seq_aware_legs(
+        &new_assembly,
+        &flow_id,
+        &*state.config.read().await,
     )
     .map_err(|e| ApiError::BadRequest(format!("Invalid assembly: {e}")))?;
 

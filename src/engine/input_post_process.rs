@@ -154,6 +154,28 @@ impl InputPostProcess {
         })
     }
 
+    /// Whether [`Self::from_config`] builds a stage for an input with these
+    /// settings, on a flow whose A/V sync pacer an assembler has claimed
+    /// (`pacer_claimed`, set for a flow with an `assembly` block) or not:
+    /// a program filter, active PID overrides or remap, or the muxer-mode
+    /// PTS rewriter, which runs unless `passthrough_clock` is set or the
+    /// pacer is claimed. Every packet through a stage leaves without its
+    /// `upstream_seq` ([`super::input_transcode::process_input_packet_with_post`]),
+    /// which is what config validation asks this for, without a pacer to
+    /// hand: a seq-aware Hitless leg must keep it.
+    pub fn would_run(
+        program_number: Option<u16>,
+        pid_overrides: Option<&TsPidOverridesMap>,
+        pid_map: Option<&BTreeMap<u16, u16>>,
+        passthrough_clock: bool,
+        pacer_claimed: bool,
+    ) -> bool {
+        program_number.is_some()
+            || pid_overrides.is_some_and(|m| TsPidOverridesRewriter::new(m).is_active())
+            || pid_map.is_some_and(|m| TsPidRemapper::new(m).is_active())
+            || (!passthrough_clock && !pacer_claimed)
+    }
+
     /// Wire the manager event sender into the muxer-mode clock rewriter
     /// (when present) so it can report falling back to the source clock
     /// because no PMT could be learned (`clock_rewrite_pmt_not_learned`,
@@ -234,6 +256,65 @@ impl InputPostProcess {
 mod tests {
     use super::*;
     use crate::config::models::TsPidOverridesEntry;
+
+    /// [`InputPostProcess::would_run`] answers what [`InputPostProcess::from_config`]
+    /// does, for every combination a flow input can have: validation refuses
+    /// a seq-aware Hitless leg on that answer, and the runtime drops the
+    /// leg's sequence number on the other.
+    #[test]
+    fn would_run_answers_as_from_config_builds() {
+        let mut overrides = TsPidOverridesMap::new();
+        overrides.insert(
+            1,
+            TsPidOverridesEntry {
+                pmt_pid: None,
+                video_pid: Some(0x200),
+                audio_pid: None,
+                audio_pids: None,
+                pcr_pid: None,
+            },
+        );
+        let empty_overrides = TsPidOverridesMap::new();
+        let remap: BTreeMap<u16, u16> = [(0x100, 0x200)].into();
+        let identity: BTreeMap<u16, u16> = BTreeMap::new();
+        for program_number in [None, Some(1)] {
+            for pid_overrides in [None, Some(&empty_overrides), Some(&overrides)] {
+                for pid_map in [None, Some(&identity), Some(&remap)] {
+                    for passthrough_clock in [false, true] {
+                        for claimed in [false, true] {
+                            let pacer = Arc::new(AvSyncPacer::new(
+                                crate::engine::master_clock::MasterClockHandle::wallclock(),
+                            ));
+                            if claimed {
+                                pacer.mark_assembler_owned();
+                            }
+                            let built = InputPostProcess::from_config(&InputPostProcessConfig {
+                                program_number,
+                                pid_overrides,
+                                pid_map,
+                                passthrough_clock,
+                                av_sync_pacer: Some(&pacer),
+                                av_skew: None,
+                            })
+                            .is_some();
+                            assert_eq!(
+                                InputPostProcess::would_run(
+                                    program_number,
+                                    pid_overrides,
+                                    pid_map,
+                                    passthrough_clock,
+                                    claimed,
+                                ),
+                                built,
+                                "{program_number:?} {pid_overrides:?} {pid_map:?} \
+                                 passthrough {passthrough_clock} claimed {claimed}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
     use crate::engine::ts_parse::{mpeg2_crc32, ts_pid, TS_PACKET_SIZE, TS_SYNC_BYTE};
 
     /// Build a single-section PAT TS packet listing the given

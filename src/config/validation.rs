@@ -453,6 +453,14 @@ pub fn validate_config(config: &AppConfig) -> Result<()> {
         validate_flow_epoch_lock(flow, &ins, &outs)?;
     }
 
+    // A seq-aware Hitless slot merges on each leg's upstream sequence
+    // number; a leg that reaches the bus without one cannot be merged.
+    for flow in &config.flows {
+        if let Some(assembly) = &flow.assembly {
+            validate_hitless_seq_aware_legs(assembly, &flow.id, config)?;
+        }
+    }
+
     // Validate ST 2110 flow groups (essence bundles).
     // Each group must have a unique ID and only reference defined flows; each
     // member flow's `flow_group_id` (if set) must point at this group.
@@ -4346,6 +4354,253 @@ pub(crate) fn validate_encoder_codec_name(codec: &str, context: &str) -> anyhow:
              h264_vaapi, hevc_vaapi, h264_rkmpp, hevc_rkmpp, h264_auto, hevc_auto"
         ),
     }
+}
+
+/// Why an input's packets reach the PID bus without the upstream sequence
+/// number a seq-aware Hitless merge runs on, or `None` when they carry it.
+/// `owner_assembled` says whether the flow that owns the input has an
+/// `assembly` block: its assembler then claims the A/V sync pacer and the
+/// input runs no muxer-mode clock rewriter of its own.
+///
+/// The runtime's own rule, not the input type alone: only `input_rtp` and
+/// `input_rist` stamp the sequence number (a FEC-decoded RTP input too), and
+/// every packet that goes through an ingress transcoder or post-process
+/// stage leaves without it (`process_input_packet_with_post`), so this asks
+/// the stages' own `would_run`.
+pub(crate) fn upstream_seq_missing(
+    input: &crate::config::models::InputConfig,
+    owner_assembled: bool,
+) -> Option<String> {
+    use crate::config::models::InputConfig;
+    use crate::engine::input_post_process::InputPostProcess;
+    use crate::engine::input_transcode::InputTranscoder;
+    let (audio_encode, video_encode, program_number, pid_overrides, pid_map, passthrough_clock) =
+        match input {
+            InputConfig::Rtp(c) => (
+                c.audio_encode.as_ref(),
+                c.video_encode.as_ref(),
+                c.program_number,
+                c.pid_overrides.as_ref(),
+                c.pid_map.as_ref(),
+                c.passthrough_clock.unwrap_or(false),
+            ),
+            InputConfig::Rist(c) => (
+                c.audio_encode.as_ref(),
+                c.video_encode.as_ref(),
+                c.program_number,
+                c.pid_overrides.as_ref(),
+                c.pid_map.as_ref(),
+                c.passthrough_clock.unwrap_or(false),
+            ),
+            other => {
+                return Some(format!(
+                    "a {} input carries no sequence number; only RTP and RIST inputs do",
+                    other.type_name()
+                ));
+            }
+        };
+    if InputTranscoder::would_run(audio_encode, video_encode) {
+        return Some("its ingress transcode (`audio_encode` / `video_encode`) re-muxes it".into());
+    }
+    if !InputPostProcess::would_run(program_number, pid_overrides, pid_map, passthrough_clock, owner_assembled) {
+        return None;
+    }
+    // Which stage: the same terms `would_run` reads.
+    Some(if program_number.is_some() {
+        "its `program_number` filter rewrites it".into()
+    } else if InputPostProcess::would_run(None, pid_overrides, None, true, true) {
+        "its `pid_overrides` rewrite it".into()
+    } else if InputPostProcess::would_run(None, None, pid_map, true, true) {
+        "its `pid_map` remaps it".into()
+    } else {
+        "its flow regenerates its PCR and PTS (muxer mode); set `passthrough_clock: true` on it".into()
+    })
+}
+
+/// The seq-aware Hitless slots of `assembly` and, of each, every leg whose
+/// input reaches the bus without an upstream sequence number: `(stream
+/// index, which leg, input id, why)`.
+/// `config`'s flows read with `flow` in place of the one of its id, or
+/// beside them when it is new, and its inputs with `input` in place of the
+/// one of its id.
+fn unsequenced_seq_aware_legs(
+    assembly: &crate::config::models::FlowAssembly,
+    config: &crate::config::models::AppConfig,
+    flow: Option<&FlowConfig>,
+    input: Option<&InputDefinition>,
+) -> Vec<(u16, u16, &'static str, String, String)> {
+    use crate::config::models::{HitlessMode, SlotSource};
+    let leg_input = |src: &SlotSource| match src {
+        SlotSource::Pid { input_id, .. } | SlotSource::Essence { input_id, .. } => {
+            Some(input_id.clone())
+        }
+        _ => None,
+    };
+    let mut found = Vec::new();
+    for program in &assembly.programs {
+        for stream in &program.streams {
+            let SlotSource::Hitless { primary, backup, mode: HitlessMode::SeqAware, .. } =
+                &stream.source
+            else {
+                continue;
+            };
+            for (leg, src) in [("primary", primary), ("backup", backup)] {
+                let Some(input_id) = leg_input(src) else { continue };
+                // A missing input is refused elsewhere.
+                let Some(leg_input) = input
+                    .filter(|i| i.id == input_id)
+                    .or_else(|| config.inputs.iter().find(|i| i.id == input_id))
+                else {
+                    continue;
+                };
+                // An input on no flow does not run, and sends nothing to merge.
+                let owner_assembled = config
+                    .flows
+                    .iter()
+                    .filter(|f| flow.is_none_or(|new| new.id != f.id))
+                    .chain(flow)
+                    .find(|f| f.input_ids.contains(&input_id))
+                    .is_none_or(|f| f.assembly.is_some());
+                if let Some(why) = upstream_seq_missing(&leg_input.config, owner_assembled) {
+                    found.push((program.program_number, stream.out_pid, leg, input_id, why));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Refuse a seq-aware Hitless slot of `assembly` (flow `flow_id`, in
+/// `config`) one of whose legs reaches the PID bus without the upstream
+/// sequence number the merge runs on. With such a primary the merger
+/// forwarded the primary on its bypass and merged the stamped backup, so
+/// both legs reached the output, every ES packet twice; with such a backup
+/// it never failed over. Called by [`validate_config`] and, for the plan a
+/// hot swap brings, by both of its handlers.
+pub(crate) fn validate_hitless_seq_aware_legs(
+    assembly: &crate::config::models::FlowAssembly,
+    flow_id: &str,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
+    refuse_unsequenced_legs(unsequenced_seq_aware_legs(assembly, config, None, None), flow_id)
+}
+
+/// [`validate_hitless_seq_aware_legs`] for every flow, with `input` in
+/// `config` in place of the input of its id: an input edit — a program
+/// filter, a transcode — must not take the sequence number from a leg a
+/// seq-aware slot merges on. An input edit validates the input alone
+/// otherwise.
+pub(crate) fn validate_input_hitless_legs(
+    input: &InputDefinition,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
+    for flow in &config.flows {
+        if let Some(assembly) = &flow.assembly {
+            refuse_unsequenced_legs(
+                unsequenced_seq_aware_legs(assembly, config, None, Some(input)),
+                &flow.id,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// [`validate_hitless_seq_aware_legs`] for a flow being created or
+/// replaced: its legs' owners read with `flow` in `config` in place of the
+/// flow of its id. A create or update validates the flow alone otherwise.
+pub(crate) fn validate_flow_hitless_legs(
+    flow: &FlowConfig,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
+    match &flow.assembly {
+        Some(assembly) => refuse_unsequenced_legs(
+            unsequenced_seq_aware_legs(assembly, config, Some(flow), None),
+            &flow.id,
+        ),
+        None => Ok(()),
+    }
+}
+
+fn refuse_unsequenced_legs(
+    found: Vec<(u16, u16, &'static str, String, String)>,
+    flow_id: &str,
+) -> Result<()> {
+    if let Some((program, out_pid, leg, input_id, why)) = found.into_iter().next() {
+        bail!(
+            "Flow '{flow_id}': program {program} stream 0x{out_pid:04X}: the {leg} leg of a \
+             seq_aware Hitless slot, input '{input_id}', reaches the PID bus without the upstream \
+             sequence number the merge runs on — {why}. Use mode \"primary_preference\", or a leg \
+             that carries one: an RTP or RIST input with no ingress transcode, program filter, PID \
+             rewrite or clock regeneration (hitless_seq_aware_leg_unsequenced)"
+        );
+    }
+    Ok(())
+}
+
+/// A seq-aware Hitless slot the load path switched to primary preference,
+/// one of its legs carrying no upstream sequence number: see
+/// [`repair_hitless_seq_aware_legs`].
+pub struct RepairedSeqAwareSlot {
+    pub flow_id: String,
+    pub program_number: u16,
+    pub out_pid: u16,
+    pub leg: &'static str,
+    pub input_id: String,
+    pub why: String,
+}
+
+/// Switch every seq-aware Hitless slot with a leg that reaches the bus
+/// without an upstream sequence number to primary preference, dropping its
+/// seq-aware-only `reorder_window` and `path_differential_ms`, and say which.
+///
+/// [`validate_hitless_seq_aware_legs`] refuses such a slot, but releases
+/// before that refusal accepted it, and the load path turns a validation
+/// error into an exit — a node that will not start has no manager WebSocket
+/// to be repaired over. The slot never merged anyway: its merger forwarded
+/// an unsequenced primary and the backup both, or never failed over to an
+/// unsequenced backup. Primary preference forwards the primary and fails
+/// over on a stall, which is what such a pair can do.
+pub fn repair_hitless_seq_aware_legs(
+    config: &mut crate::config::models::AppConfig,
+) -> Vec<RepairedSeqAwareSlot> {
+    use crate::config::models::{HitlessMode, SlotSource};
+    let mut repaired = Vec::new();
+    for f in 0..config.flows.len() {
+        let Some(assembly) = config.flows[f].assembly.as_ref() else {
+            continue;
+        };
+        let found = unsequenced_seq_aware_legs(assembly, config, None, None);
+        if found.is_empty() {
+            continue;
+        }
+        let flow_id = config.flows[f].id.clone();
+        let assembly = config.flows[f].assembly.as_mut().expect("checked above");
+        for (program_number, out_pid, leg, input_id, why) in found {
+            let slot = assembly
+                .programs
+                .iter_mut()
+                .filter(|p| p.program_number == program_number)
+                .flat_map(|p| p.streams.iter_mut())
+                .find(|s| s.out_pid == out_pid);
+            if let Some(stream) = slot
+                && let SlotSource::Hitless { mode, reorder_window, path_differential_ms, .. } =
+                    &mut stream.source
+            {
+                *mode = HitlessMode::PrimaryPreference;
+                *reorder_window = None;
+                *path_differential_ms = None;
+            }
+            repaired.push(RepairedSeqAwareSlot {
+                flow_id: flow_id.clone(),
+                program_number,
+                out_pid,
+                leg,
+                input_id,
+                why,
+            });
+        }
+    }
+    repaired
 }
 
 /// Drop a persisted `reorder_window` from every Hitless slot that is not
@@ -10289,6 +10544,190 @@ mod tests {
         assert_eq!(window(&config.flows[0]), None);
         assert_eq!(window(&config.flows[1]), Some(512));
         assert!(repair_hitless_reorder_windows(&mut config).is_empty(), "nothing left to repair");
+    }
+
+    /// A seq-aware Hitless slot over legs `a` and `b` on assembled flow
+    /// "f", whose inputs are `own`, beside `others` flows; every input in
+    /// `inputs`.
+    fn seq_aware_config(
+        own: &[&str],
+        inputs: Vec<serde_json::Value>,
+        others: Vec<serde_json::Value>,
+    ) -> AppConfig {
+        let mut flow: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f", "name": "f", "input_ids": own, "output_ids": []
+        }))
+        .expect("flow fixture");
+        flow.assembly = Some(hitless_assembly(HitlessMode::SeqAware, Some(512)));
+        let mut flows = vec![flow];
+        for other in others {
+            flows.push(serde_json::from_value(other).expect("flow fixture"));
+        }
+        AppConfig {
+            inputs: inputs
+                .into_iter()
+                .map(|i| serde_json::from_value(i).expect("input fixture"))
+                .collect(),
+            flows,
+            ..Default::default()
+        }
+    }
+
+    fn rtp_leg(id: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut leg = serde_json::json!({
+            "id": id, "name": id, "type": "rtp", "bind_addr": "127.0.0.1:5000"
+        });
+        leg.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        leg
+    }
+
+    /// A seq-aware Hitless slot merges on each leg's upstream sequence
+    /// number, so each leg must reach the bus with one: an RTP or RIST
+    /// input (a FEC-decoded one included) that no ingress transcode or
+    /// post-process stage rewrites — the runtime's own rule, its stages'
+    /// `would_run`, not the input type. Validation accepted any leg: with an
+    /// unsequenced primary both legs reached the output, every packet
+    /// twice; with an unsequenced backup the slot never failed over.
+    #[test]
+    fn a_seq_aware_hitless_leg_must_carry_a_sequence_number() {
+        use serde_json::json;
+        let both = ["in-a", "in-b"];
+        let ok = |inputs: Vec<serde_json::Value>, own: &[&str], others: Vec<serde_json::Value>| {
+            let config = seq_aware_config(own, inputs, others);
+            validate_hitless_seq_aware_legs(config.flows[0].assembly.as_ref().unwrap(), "f", &config)
+        };
+        let refused = |inputs, own: &[&str], others, needle: &str| {
+            let err = ok(inputs, own, others).expect_err(needle);
+            let text = err.to_string();
+            assert!(text.contains(needle), "{needle}: {text}");
+            assert!(text.contains("hitless_seq_aware_leg_unsequenced"), "{text}");
+        };
+        let plain = || vec![rtp_leg("in-a", json!({})), rtp_leg("in-b", json!({}))];
+        ok(plain(), &both, vec![]).expect("two plain RTP legs");
+        ok(
+            vec![
+                rtp_leg("in-a", json!({ "fec_decode": { "columns": 5, "rows": 5 } })),
+                json!({ "id": "in-b", "name": "in-b", "type": "rist", "bind_addr": "127.0.0.1:6000" }),
+            ],
+            &both,
+            vec![],
+        )
+        .expect("FEC-decoded RTP, and RIST");
+        refused(
+            vec![
+                rtp_leg("in-a", json!({})),
+                json!({ "id": "in-b", "name": "in-b", "type": "srt", "mode": "listener",
+                        "local_addr": "127.0.0.1:9000" }),
+            ],
+            &both,
+            vec![],
+            "backup leg",
+        );
+        refused(
+            vec![rtp_leg("in-a", json!({ "program_number": 1 })), rtp_leg("in-b", json!({}))],
+            &both,
+            vec![],
+            "`program_number`",
+        );
+        refused(
+            vec![rtp_leg("in-a", json!({ "audio_encode": { "codec": "aac_lc" } })), rtp_leg("in-b", json!({}))],
+            &both,
+            vec![],
+            "ingress transcode",
+        );
+        refused(
+            vec![rtp_leg("in-a", json!({ "pid_map": { "256": 512 } })), rtp_leg("in-b", json!({}))],
+            &both,
+            vec![],
+            "`pid_map`",
+        );
+        // A leg owned by a passthrough host flow has its clock regenerated
+        // there, unless it passes its clock through.
+        let host = || json!({ "id": "host", "name": "host", "input_ids": ["in-a"], "output_ids": [] });
+        refused(plain(), &["in-b"], vec![host()], "`passthrough_clock: true`");
+        ok(
+            vec![rtp_leg("in-a", json!({ "passthrough_clock": true })), rtp_leg("in-b", json!({}))],
+            &["in-b"],
+            vec![host()],
+        )
+        .expect("a host-flow leg that passes its clock through");
+        // A primary-preference slot merges on nothing.
+        let mut config = seq_aware_config(&both, plain(), vec![]);
+        config.inputs[1] = serde_json::from_value(json!({
+            "id": "in-b", "name": "in-b", "type": "srt", "mode": "listener", "local_addr": "127.0.0.1:9000"
+        }))
+        .unwrap();
+        config.flows[0].assembly = Some(hitless_assembly(HitlessMode::PrimaryPreference, None));
+        validate_hitless_seq_aware_legs(config.flows[0].assembly.as_ref().unwrap(), "f", &config)
+            .expect("primary preference");
+    }
+
+    /// The routes that validate a flow or an input alone — create / update
+    /// flow, update input — refuse one that would leave a seq-aware leg
+    /// with no sequence number.
+    #[test]
+    fn a_flow_or_input_edit_cannot_unsequence_a_seq_aware_leg() {
+        use serde_json::json;
+        let config = seq_aware_config(
+            &["in-a", "in-b"],
+            vec![rtp_leg("in-a", json!({})), rtp_leg("in-b", json!({}))],
+            vec![],
+        );
+        let edited: InputDefinition =
+            serde_json::from_value(rtp_leg("in-a", json!({ "program_number": 3 }))).unwrap();
+        let err = validate_input_hitless_legs(&edited, &config).unwrap_err();
+        assert!(err.to_string().contains("`program_number`"), "{err}");
+        let untouched: InputDefinition = serde_json::from_value(rtp_leg("in-a", json!({}))).unwrap();
+        validate_input_hitless_legs(&untouched, &config).expect("an edit that keeps the seq");
+        // The flow's legs moved onto a passthrough host flow's input, its
+        // own assembly dropped: its clock is regenerated.
+        let mut host: FlowConfig = serde_json::from_value(json!({
+            "id": "host", "name": "host", "input_ids": ["in-a", "in-b"], "output_ids": []
+        }))
+        .unwrap();
+        validate_flow_hitless_legs(&host, &config).expect("no assembly, nothing to merge");
+        host.assembly = None;
+        let mut f = config.flows[0].clone();
+        f.input_ids.clear();
+        let mut both = config.clone();
+        both.flows.push(host);
+        let err = validate_flow_hitless_legs(&f, &both).unwrap_err();
+        assert!(err.to_string().contains("`passthrough_clock: true`"), "{err}");
+    }
+
+    /// Such a slot persisted by a release that accepted it is switched to
+    /// primary preference at load — its seq-aware-only fields dropped —
+    /// rather than failing the boot.
+    #[test]
+    fn a_persisted_unsequenced_seq_aware_slot_is_repaired_at_load() {
+        use serde_json::json;
+        let mut config = seq_aware_config(
+            &["in-a", "in-b"],
+            vec![
+                rtp_leg("in-a", json!({})),
+                json!({ "id": "in-b", "name": "in-b", "type": "srt", "mode": "listener",
+                        "local_addr": "127.0.0.1:9000" }),
+            ],
+            vec![],
+        );
+        if let Some(SlotSource::Hitless { path_differential_ms, .. }) =
+            config.flows[0].assembly.as_mut().map(|a| &mut a.programs[0].streams[0].source)
+        {
+            *path_differential_ms = Some(50);
+        }
+        let repaired = repair_hitless_seq_aware_legs(&mut config);
+        assert_eq!(repaired.len(), 1);
+        assert_eq!((repaired[0].flow_id.as_str(), repaired[0].leg, repaired[0].input_id.as_str()), ("f", "backup", "in-b"));
+        match &config.flows[0].assembly.as_ref().unwrap().programs[0].streams[0].source {
+            SlotSource::Hitless { mode, reorder_window, path_differential_ms, .. } => {
+                assert_eq!(*mode, HitlessMode::PrimaryPreference);
+                assert_eq!((*reorder_window, *path_differential_ms), (None, None));
+            }
+            other => panic!("{other:?}"),
+        }
+        validate_hitless_seq_aware_legs(config.flows[0].assembly.as_ref().unwrap(), "f", &config)
+            .expect("nothing left to refuse");
+        assert!(repair_hitless_seq_aware_legs(&mut config).is_empty(), "nothing left to repair");
     }
 
     #[test]

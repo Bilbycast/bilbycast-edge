@@ -50,13 +50,14 @@ pub struct RtpPacket {
     /// True when the data is raw TS (no RTP header). Outputs that strip RTP
     /// headers should skip stripping when this is set.
     pub is_raw_ts: bool,
-    /// Upstream wire sequence number when known. Stamped by `input_rtp`
-    /// and `input_rist` so the pre-bus seq-aware hitless merger
-    /// (`engine::ts_es_hitless`) can dedup + gap-fill against the
-    /// authoritative wire-level seq instead of relying on a 200 ms stall
+    /// Upstream wire sequence number when known, so the pre-bus seq-aware
+    /// hitless merger (`engine::ts_es_hitless`) can dedup + gap-fill against
+    /// the authoritative wire-level seq instead of relying on a 200 ms stall
     /// timer; the PID bus carries it onto each TS packet of the datagram
-    /// with that packet's place in it. `None` for SRT, raw TS over UDP
-    /// and any other input that does not carry a wire seq.
+    /// with that packet's place in it. Whether a packet has it is the
+    /// runtime's rule, not its input type: only `input_rtp` (a FEC-decoded one too) and `input_rist` stamp it, and a packet through an ingress transcode or post-process stage (`audio_encode` / `video_encode`, `program_number`, `pid_overrides`, `pid_map`, or the muxer-mode clock regenerator that runs on an input of a flow with no `assembly` unless `passthrough_clock: true`) leaves without it (`process_input_packet_with_post`) — what
+    /// `config::validation::upstream_seq_missing` asks of a seq-aware
+    /// Hitless leg. `None` from SRT, UDP and every other input.
     pub upstream_seq: Option<u16>,
     /// 2022-7 leg identity (0 = primary, 1 = backup). `None` for
     /// single-leg inputs. Used by the seq-aware merger to attribute

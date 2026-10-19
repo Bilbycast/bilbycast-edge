@@ -100,6 +100,18 @@ pub struct InputTranscoder {
 }
 
 impl InputTranscoder {
+    /// Whether [`Self::new`] builds a transcoder for these blocks: an
+    /// `audio_encode` or a `video_encode` (a `transcode` block feeds only
+    /// `audio_encode`). Every packet through one leaves without its
+    /// `upstream_seq` ([`process_input_packet_with_post`]), which is what
+    /// config validation asks this for: a seq-aware Hitless leg must keep it.
+    pub fn would_run(
+        audio_encode: Option<&AudioEncodeConfig>,
+        video_encode: Option<&VideoEncodeConfig>,
+    ) -> bool {
+        audio_encode.is_some() || video_encode.is_some()
+    }
+
     /// Build a transcoder from optional `audio_encode`, `transcode`, and
     /// `video_encode` blocks.
     ///
@@ -116,7 +128,10 @@ impl InputTranscoder {
         video_encode: Option<&VideoEncodeConfig>,
         force_idr: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Option<Self>, InputTranscoderError> {
-        if audio_encode.is_none() && transcode.is_none() && video_encode.is_none() {
+        // A `transcode` block without `audio_encode` has no encoder to feed
+        // and is ignored, matching the output side (transcode is a sub-block
+        // of audio_encode in practice).
+        if !Self::would_run(audio_encode, video_encode) {
             return Ok(None);
         }
 
@@ -128,14 +143,6 @@ impl InputTranscoder {
             Some(ve) => Some(TsVideoReplacer::new(ve, force_idr)?),
             None => None,
         };
-
-        // If `transcode` is set but `audio_encode` is not, the transcode block
-        // has no encoder to feed — ignore silently to match the output-side
-        // contract (transcode is a sub-block of audio_encode in practice).
-        // We still return `Some` if video_encode is set.
-        if audio.is_none() && video.is_none() {
-            return Ok(None);
-        }
 
         // A/V emission realigner — DISABLED pending a redesign.
         //
