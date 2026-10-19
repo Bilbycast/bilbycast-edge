@@ -504,6 +504,8 @@ async fn run_seq_aware(
     use crate::redundancy::merger::{ActiveLeg, HitlessRunMerger};
     let mut merger = HitlessRunMerger::with_window(reorder_window);
     let mut leg_log = LegLog::default();
+    let mut primary_clock = DatagramClock::default();
+    let mut backup_clock = DatagramClock::default();
 
     loop {
         tokio::select! {
@@ -517,7 +519,8 @@ async fn run_seq_aware(
                         let _ = out_tx.send(es);
                         continue;
                     };
-                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg1, es.recv_time_us) {
+                    let now_us = primary_clock.now_us(seq);
+                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg1, now_us) {
                         let _ = leg_log.forwarded(&uid, chosen);
                         let _ = out_tx.send(es);
                     }
@@ -536,7 +539,8 @@ async fn run_seq_aware(
                         unsequenced.backup();
                         continue;
                     };
-                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg2, es.recv_time_us) {
+                    let now_us = backup_clock.now_us(seq);
+                    if let Some(chosen) = merger.try_merge(seq, index, ActiveLeg::Leg2, now_us) {
                         let _ = leg_log.forwarded(&uid, chosen);
                         let _ = out_tx.send(es);
                     }
@@ -544,6 +548,30 @@ async fn run_seq_aware(
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return,
             },
+        }
+    }
+}
+
+/// When a leg's packets reach a seq-aware merger, on the merger's own clock:
+/// read at the first packet of each datagram and kept for the rest of its
+/// run of the PID, which follows it on the bus. Not `recv_time_us`, which
+/// is a different instant on each kind of leg — a RIST input's arrival
+/// before its hold, a de-jittered RTP input's release, a plain RTP input's
+/// socket read — so a mixed pair's stamps sit up to a hold apart, and the
+/// merger would read a silence where the other leg had just been accepted.
+#[derive(Default)]
+struct DatagramClock(Option<(u16, u64)>);
+
+impl DatagramClock {
+    /// The time a packet of datagram `seq` reached the merger.
+    fn now_us(&mut self, seq: u16) -> u64 {
+        match self.0 {
+            Some((datagram, us)) if datagram == seq => us,
+            _ => {
+                let us = crate::util::time::now_us();
+                self.0 = Some((seq, us));
+                us
+            }
         }
     }
 }
@@ -885,27 +913,24 @@ mod tests {
 
     /// SCTE-35 on a PID-bus Hitless slot: one TS packet a cue, a few seconds
     /// apart, so consecutive cues' datagram seqs can be half the sequence
-    /// space or more apart, which reads as "too far behind". Nothing was
-    /// accepted between them, so each cue re-anchors the window and is
-    /// forwarded once, bare or buffered; cues closer together than the stale
-    /// time are re-anchored by the backup's copy agreeing with the
-    /// primary's. (A buffered merger reads its own clock rather than the
-    /// packets' arrival stamps, so here, its packets sent milliseconds apart,
-    /// the backup's copy re-anchors it; its stale time is covered in
-    /// `redundancy::merger`.) Half the cues used to be dropped: lost ad cues.
+    /// space or more apart, which reads as "too far behind". Such a cue steps
+    /// back as far from its own leg's previous cue, so when the backup's copy
+    /// follows the primary's, both legs' sequences broken at one seq, it
+    /// re-anchors the window and the cue is forwarded once, bare or buffered.
+    /// (Both mergers read their own clock, and the cues here are sent
+    /// milliseconds apart, so their stale time never runs out; it is covered
+    /// in `redundancy::merger`.) Half the cues used to be dropped: lost ad
+    /// cues.
     #[tokio::test]
     async fn seq_aware_forwards_every_cue_of_a_sparse_pid() {
-        let cue = |pid: u16, seq: u16, at_us: u64| EsPacket {
+        let cue = |pid: u16, seq: u16| EsPacket {
             upstream_seq: Some(UpstreamSeq { seq, index: 0 }),
-            recv_time_us: at_us,
             ..es(pid, 0)
         };
         // Seq steps between cues: four in the too-far-behind band, one a
         // forward jump of a window or more, one an ordinary step.
         let steps: [u16; 7] = [40_000, 35_000, 20_000, 50_000, 33_000, 900, 61_000];
-        for (gap_us, path_differential_ms) in
-            [(3_000_000u64, None), (3_000_000, Some(50)), (500_000, None), (500_000, Some(50))]
-        {
+        for path_differential_ms in [None, Some(50)] {
             let bus = Arc::new(NodeEsBus::new());
             let cancel = CancellationToken::new();
             let _handle = spawn_hitless_es_merger_full(
@@ -926,30 +951,79 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
 
             let mut seq: u16 = 100;
-            let mut at_us = 1_000_000u64;
             let mut cues = vec![seq];
             for step in steps {
                 seq = seq.wrapping_add(step);
                 cues.push(seq);
             }
             for &seq in &cues {
-                pri.send(cue(0x1F0, seq, at_us)).unwrap();
-                bak.send(cue(0x1F0, seq, at_us + 30_000)).unwrap();
+                pri.send(cue(0x1F0, seq)).unwrap();
+                bak.send(cue(0x1F0, seq)).unwrap();
                 // In order through the merger task, primary before backup.
                 tokio::time::sleep(Duration::from_millis(2)).await;
-                at_us += gap_us;
             }
             let quiet = Duration::from_millis(if path_differential_ms.is_some() { 300 } else { 100 });
             let mut forwarded = Vec::new();
             while let Ok(Ok(es)) = tokio::time::timeout(quiet, out_rx.recv()).await {
                 forwarded.push(es.upstream_seq.map(|u| u.seq).unwrap());
             }
-            assert_eq!(
-                forwarded, cues,
-                "cues {gap_us} us apart, path differential {path_differential_ms:?}"
-            );
+            assert_eq!(forwarded, cues, "path differential {path_differential_ms:?}");
             cancel.cancel();
         }
+    }
+
+    /// A bare seq-aware merger over a RIST primary, whose packets are stamped
+    /// at their arrival ahead of a 1.5 s hold, and an RTP backup with ingress
+    /// de-jitter, stamped at its release and 2 000 datagrams behind. The
+    /// backup's first packet is too far behind the window and, a first
+    /// packet, taken for a break: it may re-anchor the window only if the
+    /// merger has been quiet for the stale time, which on its own clock it
+    /// has not — the primary was accepted a moment ago. Read off the stamps,
+    /// 1.5 s apart, it had been, and the merger forwarded a datagram the
+    /// primary had delivered 2 000 earlier, then jumped forward again.
+    #[tokio::test]
+    async fn seq_aware_reads_its_own_clock_not_its_legs_stamps() {
+        crate::util::time::init_epoch();
+        let bus = Arc::new(NodeEsBus::new());
+        let cancel = CancellationToken::new();
+        let _handle = spawn_hitless_es_merger_full(
+            hitless_bus_key("f1", "slot_0_0"),
+            ("in-a".to_string(), 0x100),
+            ("in-b".to_string(), 0x100),
+            bus.clone(),
+            Duration::from_millis(50),
+            /* seq_aware */ true,
+            crate::redundancy::merger::REORDER_WINDOW,
+            /* path_differential_ms */ None,
+            ForwardingPrimary::default(),
+            cancel.clone(),
+            None,
+        );
+        let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+        let pri = bus.sender_for("in-a", 0x100, 0x1B);
+        let bak = bus.sender_for("in-b", 0x100, 0x1B);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let packet = |seq: u16, recv_time_us: u64| EsPacket {
+            upstream_seq: Some(UpstreamSeq { seq, index: 0 }),
+            recv_time_us,
+            ..es(0x100, 0)
+        };
+        let released_us = 10_000_000u64;
+        for seq in 3_000..3_100u16 {
+            pri.send(packet(seq, released_us - 1_500_000)).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        bak.send(packet(1_099, released_us)).unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        pri.send(packet(3_100, released_us - 1_500_000)).unwrap();
+
+        let mut forwarded = Vec::new();
+        while let Ok(Ok(es)) = tokio::time::timeout(Duration::from_millis(100), out_rx.recv()).await {
+            forwarded.push(es.upstream_seq.map(|u| u.seq).unwrap());
+        }
+        assert_eq!(forwarded, (3_000..=3_100).collect::<Vec<u16>>());
+        cancel.cancel();
     }
 
     /// SRT legs carry no `upstream_seq`, so a seq-aware merger forwards the
