@@ -1888,6 +1888,93 @@ mod tests {
         }
     }
 
+    /// A plan swap is saved only onto the run it swapped. A swap racing an
+    /// `update_flow` / `update_config` that restarted the flow onto another
+    /// plan, or a stop, swapped a run that is gone: saved after the
+    /// restart's own, its plan sat in `config.json` and `GetConfig` while
+    /// the other ran, and took over at the next start. It is refused,
+    /// `pid_bus_assembly_swap_superseded`, with the config untouched.
+    #[tokio::test]
+    async fn a_plan_swap_is_saved_only_onto_the_run_it_swapped() {
+        let fm = make_fm();
+        let assembly = |marker: bool| -> crate::config::models::FlowAssembly {
+            let mut streams = vec![serde_json::json!({
+                "source": { "type": "pid", "input_id": "in-c", "source_pid": 256 },
+                "out_pid": 256, "stream_type": 27
+            })];
+            if marker {
+                streams.push(serde_json::json!({
+                    "source": { "type": "pid", "input_id": "in-c", "source_pid": 258 },
+                    "out_pid": 258, "stream_type": 15
+                }));
+            }
+            serde_json::from_value(serde_json::json!({
+                "kind": "spts",
+                "pcr_source": { "input_id": "in-c", "pid": 256 },
+                "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": streams }]
+            }))
+            .expect("assembly fixture")
+        };
+        let flow = serde_json::json!({
+            "id": "f1", "name": "f1", "input_ids": ["in-c"], "output_ids": [],
+            "assembly": assembly(false)
+        });
+        let cfg = crate::config::models::AppConfig {
+            inputs: vec![input(serde_json::json!({
+                "id": "in-c", "name": "in-c", "type": "udp", "bind_addr": "127.0.0.1:41937"
+            }))],
+            flows: vec![serde_json::from_value(flow).expect("flow fixture")],
+            ..Default::default()
+        };
+        let code = |e: &anyhow::Error| {
+            e.downcast_ref::<crate::engine::flow::AssemblySwapError>().map(|e| e.code)
+        };
+        let saved = |config: &crate::config::models::AppConfig| config.flows[0].assembly.clone();
+
+        // A swap on the run that runs is saved.
+        let first = fm
+            .create_flow(cfg.resolve_flow(&cfg.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+        // A failed assertion must not leave the flow running: its input
+        // thread would hold the test runtime's shutdown forever.
+        let checks = tokio::spawn({
+            let fm = fm.clone();
+            async move {
+                let mut swap = first.begin_assembly_swap().await;
+                swap.replace(assembly(true), None).await.expect("swap");
+                let mut config = cfg.clone();
+                swap.record(&mut config, assembly(true)).expect("the run swapped runs");
+                assert_eq!(saved(&config), Some(assembly(true)));
+
+                // The flow restarts onto its configured plan while the swap
+                // is held: the swap no longer saves.
+                fm.destroy_flow("f1").await.expect("stop");
+                let second = fm
+                    .create_flow(cfg.resolve_flow(&cfg.flows[0]).expect("resolve"))
+                    .await
+                    .expect("restart");
+                let mut config = cfg.clone();
+                let err = swap.record(&mut config, assembly(true)).expect_err("a restarted flow");
+                assert_eq!(code(&err), Some("pid_bus_assembly_swap_superseded"));
+                assert_eq!(saved(&config), Some(assembly(false)), "the config keeps the plan that runs");
+                drop(swap);
+
+                // Nor onto a run that stopped.
+                let swap = second.begin_assembly_swap().await;
+                second.stop().await;
+                let err = swap.record(&mut config, assembly(true)).expect_err("a stopped flow");
+                assert_eq!(code(&err), Some("pid_bus_assembly_swap_superseded"));
+                assert_eq!(saved(&config), Some(assembly(false)));
+            }
+        });
+        let outcome = checks.await;
+        let _ = fm.destroy_flow("f1").await;
+        if let Err(failed) = outcome {
+            std::panic::resume_unwind(failed.into_panic());
+        }
+    }
+
     /// The ES bus is node-wide, so a Hitless slot's bus key names its flow:
     /// two assembled flows with a Hitless slot at the same position (program
     /// 0, slot 0) each play only their own merger's packets. Keyed on the

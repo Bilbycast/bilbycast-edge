@@ -3361,7 +3361,7 @@ The assembly plan is **hot-swappable**. A manager `UpdateFlowAssembly` WS comman
 - Per-program `PMT.version_number` bumps for any program whose composition or PCR source changed.
 - `PAT.version_number` bumps only when the set of programs changed (added / removed / renumbered).
 - PSI is re-emitted immediately on swap so receivers see the new PMT before any packet lands on a new `out_pid` — prevents ffprobe from briefly seeing TS bytes on an unknown PID.
-- Persists to `config.json` only after the swap succeeds. A no-op swap (new assembly deserialises byte-equal to current) is a silent short-circuit.
+- Persists to `config.json` only after the swap succeeds, and only while the flow still runs on the runtime the swap swapped: a swap overtaken by an `UpdateFlow` / `UpdateConfig` that restarted the flow onto another plan, or by a stop, is refused `pid_bus_assembly_swap_superseded` (HTTP 409) and saves nothing, so `config.json` keeps the plan that runs. A no-op swap (new assembly deserialises byte-equal to current) is a silent short-circuit.
 - Waits at most 3 s on the flow's assembler — for room in its command queue, then for its word that the new plan is on air. Past that the swap fails with a Warning `pid_bus_assembler_unresponsive` and is not saved; a stalled assembler that already took the plan runs it when it resumes.
 - Transitions across the passthrough boundary (passthrough ↔ spts/mpts) are **not hot-swappable** — those require a full `UpdateFlow` round-trip because the plumbing on the flow changes (bus + assembler spawn vs. direct broadcast).
 

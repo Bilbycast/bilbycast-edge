@@ -7478,7 +7478,8 @@ impl AssemblySwap<'_> {
     ///    to the running assembler.
     ///
     /// On success the runtime's `current_assembly` is updated; the caller
-    /// persists the plan before it drops the swap.
+    /// records the plan ([`Self::record`]) and persists it before it drops
+    /// the swap.
     pub async fn replace(
         &mut self,
         new_assembly: crate::config::models::FlowAssembly,
@@ -7487,6 +7488,45 @@ impl AssemblySwap<'_> {
         self.runtime
             .replace_assembly_locked(&mut self.mergers, new_assembly, splice_mode_override)
             .await
+    }
+
+    /// Write `assembly`, the plan this swap put on air, into the flow's
+    /// entry in `config` — the node config, its write lock held by the
+    /// caller, who persists it — if the flow still runs on the runtime this
+    /// swap swapped.
+    ///
+    /// A swap racing an `update_flow` / `update_config` that restarted the
+    /// flow onto another plan, or a stop, swapped a runtime that is gone:
+    /// written after the restart's own, its plan sat in `config.json` and
+    /// `GetConfig` while the other ran, and took over at the next start.
+    /// Such a swap is refused — an [`AssemblySwapError`]
+    /// `pid_bus_assembly_swap_superseded`, `config` untouched. The check
+    /// holds until the caller persists, because every route that replaces
+    /// a runtime does so before it takes the config write lock to persist,
+    /// or under it.
+    pub fn record(&self, config: &mut AppConfig, assembly: FlowAssembly) -> Result<()> {
+        let runtime = self.runtime;
+        let flow_id = &runtime.config.config.id;
+        let current = runtime
+            .flow_manager_weak
+            .upgrade()
+            .and_then(|flow_manager| flow_manager.get_runtime(flow_id));
+        let still_runs = current.is_some_and(|current| std::ptr::eq(Arc::as_ptr(&current), runtime));
+        if !still_runs || runtime.cancel_token.is_cancelled() {
+            return Err(AssemblySwapError {
+                code: "pid_bus_assembly_swap_superseded",
+                message: format!(
+                    "flow '{flow_id}': assembly swap superseded — the flow was restarted or \
+                     stopped while the swap ran, so it does not run the swapped plan; nothing \
+                     was saved"
+                ),
+            }
+            .into());
+        }
+        if let Some(flow) = config.flows.iter_mut().find(|f| &f.id == flow_id) {
+            flow.assembly = Some(assembly);
+        }
+        Ok(())
     }
 }
 #[cfg(test)]

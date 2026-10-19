@@ -366,7 +366,9 @@ pub async fn stop_flow(
 ///    which validates, resolves any `Essence` slots, spawns Hitless
 ///    mergers, and dispatches `PlanCommand::ReplacePlan` to the
 ///    running assembler. PMT version bumps automatically per program.
-/// 4. Persists the new `assembly` block to `config.json`.
+/// 4. Persists the new `assembly` block to `config.json`, if the flow
+///    still runs on the runtime it swapped
+///    ([`crate::engine::flow::AssemblySwap::record`]).
 ///
 /// Mirrors the WS `update_flow_assembly` command — same helper, same
 /// validation, same error codes. Used by the testbed probe so it can
@@ -381,6 +383,9 @@ pub async fn stop_flow(
 /// - [`ApiError::Internal`] (500) when the flow's assembler does not take
 ///   the plan, or put it on air, within a few seconds
 ///   (`pid_bus_assembler_unresponsive`); the swap is not saved.
+/// - [`ApiError::Conflict`] (409) when the flow was restarted or stopped
+///   while the swap ran (`pid_bus_assembly_swap_superseded`); the swap is
+///   not saved, so `config.json` keeps the plan the flow runs.
 pub async fn update_flow_assembly(
     _admin: RequireAdmin,
     State(state): State<AppState>,
@@ -424,11 +429,11 @@ pub async fn update_flow_assembly(
         }
     })?;
 
+    // Unless the flow was restarted or stopped under the swap.
     let cfg_clone = {
         let mut cfg = state.config.write().await;
-        if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
-            flow.assembly = Some(new_assembly);
-        }
+        swap.record(&mut cfg, new_assembly)
+            .map_err(|e| ApiError::Conflict(e.to_string()))?;
         cfg.clone()
     };
     if let Err(e) = save_config_split_async(

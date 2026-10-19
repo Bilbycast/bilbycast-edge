@@ -2816,11 +2816,15 @@ async fn execute_command(
                 });
             }
 
-            // Persist to config.json so the change survives restart.
+            // Persist to config.json so the change survives restart — unless
+            // the flow was restarted or stopped under the swap.
             let mut cfg = app_config.write().await;
-            if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id) {
-                flow.assembly = Some(new_assembly);
-            }
+            swap.record(&mut cfg, new_assembly).map_err(|e| {
+                match e.downcast_ref::<crate::engine::flow::AssemblySwapError>() {
+                    Some(swap_error) => CommandError::with_code(e.to_string(), swap_error.code),
+                    None => CommandError::new(e.to_string()),
+                }
+            })?;
             persist_config(&cfg, config_path, secrets_path).await?;
             drop(cfg);
             drop(swap);
