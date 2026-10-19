@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::models::{SrtInputConfig, SrtMode};
+use crate::config::models::{SrtInputConfig, SrtMode, SrtRedundancyConfig};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::srt::connection::{
@@ -805,6 +805,23 @@ async fn srt_input_recv_loop(
 // Dual-leg SRT input with SMPTE 2022-7 hitless protection switching
 // ---------------------------------------------------------------------------
 
+/// The stale time of a 2022-7 pair's merger
+/// ([`HitlessMerger::with_stale_after_us`]): a second past the difference
+/// between the receive latencies the legs ask for. TSBPD delivers each
+/// packet its leg's latency after it was sent, so the later leg lags the
+/// other by that difference whatever the networks do — 1.38 s for legs at
+/// 120 ms and 1 500 ms — and a stream that moves is followed cleanly only
+/// while the stale time exceeds it. A sender asking for more latency than
+/// a leg does moves that leg later still.
+fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64 {
+    let latency1 = leg1.recv_latency_ms.unwrap_or(leg1.latency_ms);
+    let latency2 = leg2.recv_latency_ms.unwrap_or(leg2.latency_ms);
+    latency1
+        .abs_diff(latency2)
+        .saturating_mul(1_000)
+        .saturating_add(crate::redundancy::merger::DEFAULT_STALE_AFTER_US)
+}
+
 /// Dual-leg SRT input with SMPTE 2022-7 hitless merge.
 ///
 /// For **RTP/TS** streams: merge uses the RTP sequence number (standard 2022-7).
@@ -959,7 +976,8 @@ async fn srt_input_redundant_loop(
         );
         let leg2_poller = cancel.child_token();
 
-        let mut merger = HitlessMerger::new();
+        let mut merger =
+            HitlessMerger::new().with_stale_after_us(pair_stale_after_us(&config, redundancy));
         // What of the merger's counts the pair's stats have been told.
         let mut merger_handoff = crate::stats::collector::MergerHandoff::default();
         let mut failover = RawTsFailover::new();
@@ -1881,6 +1899,51 @@ mod tests {
         assert_eq!(pair.recv_dropped(), 0, "and SRT dropped none of it");
         let codes: Vec<&str> = snap.health_reasons.iter().map(|r| r.code.as_str()).collect();
         assert!(codes.contains(&"packet_loss") && !codes.contains(&"srt_recv_dropped"), "{codes:?}");
+    }
+
+    /// A pair's merger waits out its legs' latency difference: legs at
+    /// 120 ms and 1 500 ms (a receive override over a 4 s `latency_ms`), and
+    /// a source restarting on a sequence number behind the old while the
+    /// later leg still plays the old stream, 1.38 s behind. Above that lag
+    /// the stale time lets the later leg reach the restart before the
+    /// merger follows it, so nothing of either stream goes out twice. At the
+    /// 1 s default the merger followed the earlier leg's restart first, and
+    /// the later leg's last of the old stream, ahead of it, moved it forward
+    /// again and went out a second time.
+    #[test]
+    fn a_pairs_merger_waits_out_its_latency_difference() {
+        let config: SrtInputConfig = serde_json::from_value(serde_json::json!({
+            "mode": "listener", "local_addr": "127.0.0.1:9000", "latency_ms": 120,
+            "redundancy": {
+                "mode": "listener", "local_addr": "127.0.0.1:9002",
+                "latency_ms": 4_000, "recv_latency_ms": 1_500
+            }
+        }))
+        .expect("SRT config fixture");
+        let stale = pair_stale_after_us(&config, config.redundancy.as_ref().unwrap());
+        assert_eq!(stale, 2_380_000);
+        let mut merger = HitlessMerger::new().with_stale_after_us(stale);
+        // 4 750 packets a second; the restart at packet 20 000, onto seqs
+        // 25 000 behind.
+        let (period, lag) = (210, 6_555u64);
+        let mut arrivals = Vec::new();
+        for k in 0..60_000u64 {
+            arrivals.push((k * period, k, ActiveLeg::Leg1));
+            arrivals.push(((k + lag) * period, k, ActiveLeg::Leg2));
+        }
+        arrivals.sort_by_key(|&(t, k, _)| (t, k));
+        let mut sent = Vec::new();
+        for (t, k, leg) in arrivals {
+            let seq = (if k < 20_000 { 30_000 + k } else { 5_000 + k }) as u16;
+            if merger.try_merge(seq, leg, t).is_some() {
+                sent.push(k);
+            }
+        }
+        assert_eq!(sent.last(), Some(&59_999), "the restarted stream is followed");
+        let mut once = sent.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!(once.len(), sent.len(), "nothing is forwarded twice");
     }
 
     #[test]
