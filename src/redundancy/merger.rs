@@ -50,18 +50,23 @@
 //!   same seq, so a leg that lost that packet leaves it to the stale time.
 //!
 //! A leg's break is kept until one of its own packets is accepted, not
-//! dropped at the other leg's: the leading leg's first packet of a moved
-//! stream breaks its sequence while the lagging leg, still on the old
-//! stream, fills the gaps it left, and once the lagging leg stops, the new
-//! stream, running on from that break, follows the stale time rather than
-//! waiting for its seqs to come back into the window — up to 32 767 packets.
+//! dropped at the other leg's (but for its first packet's, below): the
+//! leading leg's first packet of a moved stream breaks its sequence while
+//! the lagging leg, still on the old stream, fills the gaps it left, and
+//! once the lagging leg stops, the new stream, running on from that break,
+//! follows the stale time rather than waiting for its seqs to come back into
+//! the window — up to 32 767 packets.
 //!
 //! A leg that only lags never moves the window, however long the lag,
 //! wherever its own sequence can be followed: when the other leg fails it
 //! carries the stream on from where it is, with a gap and nothing forwarded
 //! twice. Two of its packets read as breaks all the same: its first, which
-//! has no sequence to judge and is taken as a break for that packet alone,
-//! and its first after an outage of its own of half the sequence space or
+//! has no sequence to judge and is taken as a break for that packet alone —
+//! forgotten at the next packet accepted from either leg, or a leg lagging
+//! past the window, never accepted while the other is healthy, would keep it
+//! for good, and a source restarting on that seq would find it there and
+//! re-anchor at once, under the lagging leg's last packets of the old stream
+//! — and its first after an outage of its own of half the sequence space or
 //! more (3.4 s at 100 Mbps), kept until one of its packets is accepted.
 //! Neither moves anything while the other leg's packets are being accepted.
 //! Only once the other leg has been silent for the stale time is either
@@ -79,9 +84,9 @@
 //! that lag ([`stale_after_lag_us`]): an SRT pair its legs' latency
 //! difference, a PID-bus Hitless slot the difference between its legs'
 //! receive holds ([`crate::engine::ts_es_hitless::leg_receive_hold`]), a
-//! buffered merger its path differential — or the slot's difference, when
-//! that is larger. What the legs' networks add on top is left to the
-//! second.
+//! buffered merger its path differential, which budgets its legs' networks,
+//! plus the slot's difference. What the legs' networks add past that is
+//! left to the second.
 //!
 //! ## Why a gap-fill window
 //!
@@ -193,8 +198,10 @@ pub struct HitlessMerger {
     /// its packets was last accepted.
     moved: u8,
     /// The last packet that broke its leg's sequence, while none of that
-    /// leg's has been accepted since: its seq and its leg.
-    last_break: Option<(u16, ActiveLeg)>,
+    /// leg's has been accepted since: its seq, its leg, and whether it was
+    /// the leg's first packet — a break for that packet alone, so forgotten
+    /// at the next packet accepted from either leg.
+    last_break: Option<(u16, ActiveLeg, bool)>,
     /// Which leg last provided the forwarded packet.
     active_leg: ActiveLeg,
     /// Whether we've forwarded at least one packet.
@@ -422,14 +429,15 @@ impl HitlessMerger {
     }
 
     /// Record that a packet arriving at `now_us` from `leg` is forwarded:
-    /// `leg`'s own sequence break is forgotten, and the other leg's kept (see
-    /// "Re-anchoring" in the module doc).
+    /// `leg`'s own sequence break is forgotten, and the other leg's kept
+    /// unless it was that leg's first packet (see "Re-anchoring" in the
+    /// module doc).
     #[inline]
     fn accept(&mut self, leg: ActiveLeg, now_us: u64) -> Option<ActiveLeg> {
         self.active_leg = leg;
         self.last_accept_us = now_us;
         self.moved &= !leg_bit(leg);
-        if matches!(self.last_break, Some((_, l)) if l == leg) {
+        if matches!(self.last_break, Some((_, l, first)) if first || l == leg) {
             self.last_break = None;
         }
         Some(leg)
@@ -463,9 +471,10 @@ impl HitlessMerger {
             // Its packets run on from its last: a leg that only lags.
             return false;
         }
-        let both_legs = breaks && matches!(self.last_break, Some((s, l)) if s == seq && l != leg);
+        let both_legs =
+            breaks && matches!(self.last_break, Some((s, l, _)) if s == seq && l != leg);
         if breaks {
-            self.last_break = Some((seq, leg));
+            self.last_break = Some((seq, leg, prev.is_none()));
         }
         both_legs || now_us.saturating_sub(self.last_accept_us) >= self.stale_after_us
     }
@@ -1153,6 +1162,62 @@ mod tests {
         assert_eq!(sent, (0..80_000u64).map(|k| k as u16).collect::<Vec<_>>());
     }
 
+    /// A source that restarts on the seq it started on, its legs 2 400
+    /// packets (1 s) apart, past the window, with the stale time a second
+    /// past that. The lagging leg's first packet, seq 0, is too far behind
+    /// the window and taken as a break, and is forgotten at the leading leg's
+    /// next packet. Kept, the leading leg's first packet of the restarted
+    /// stream, seq 0 again, matched it and re-anchored at once, under the
+    /// lagging leg's last second of the old stream, which then moved the
+    /// window forward again and went out a second time. The restart is
+    /// followed when the lagging leg breaks at seq 0 too: the old stream goes
+    /// out once, the new one after it in order, with a gap where the leading
+    /// leg's first second of it was dropped waiting.
+    #[test]
+    fn test_a_restart_on_the_seq_a_lagging_leg_first_brought_waits_for_the_legs() {
+        let mut merger = HitlessMerger::new().with_stale_after_us(2_000_000);
+        let period = 416;
+        let lag = 2_400u64;
+        let restart = 10_000u64;
+        let mut arrivals: Vec<(u64, u64, ActiveLeg)> = Vec::new();
+        for k in 0..20_000u64 {
+            arrivals.push((k * period, k, ActiveLeg::Leg1));
+            arrivals.push(((k + lag) * period, k, ActiveLeg::Leg2));
+        }
+        arrivals.sort_by_key(|&(t, k, _)| (t, k));
+        let mut sent = Vec::new();
+        for (t, k, leg) in arrivals {
+            let seq = (if k < restart { k } else { k - restart }) as u16;
+            if merger.try_merge(seq, leg, t).is_some() {
+                sent.push(k);
+            }
+        }
+        let (old, new): (Vec<u64>, Vec<u64>) = sent.iter().copied().partition(|&k| k < restart);
+        assert_eq!(old, (0..restart).collect::<Vec<_>>(), "the old stream once, in order");
+        assert!(
+            sent[..old.len()].iter().all(|&k| k < restart),
+            "nothing of the old stream after the new"
+        );
+        assert!(new.windows(2).all(|w| w[0] < w[1]), "the new stream once, in order");
+        assert_eq!(new.first(), Some(&restart), "from its first packet");
+        assert_eq!(new.last(), Some(&19_999), "to its last");
+    }
+
+    /// A buffered merger's legs may lag each other by what their
+    /// configuration sets and, on top, by what their networks add, which its
+    /// hold budgets: its dedup waits out both together, a second past them.
+    /// The larger alone left a leg lagging by both a window behind when the
+    /// stale time ran out, and the output stepped back.
+    #[test]
+    fn test_a_buffered_runs_merger_waits_out_its_hold_and_its_legs_lag() {
+        let merger: BufferedHitlessMerger<(), HeldRuns> = BufferedHitlessMerger::with_runs(
+            Duration::from_millis(2_000),
+            REORDER_WINDOW,
+            Duration::from_millis(1_500),
+        );
+        assert_eq!(merger.dedup.0.stale_after_us, 4_500_000);
+    }
+
     /// A sparse PID with one leg up: its cues' datagram seqs 40 000 apart,
     /// too far behind the window, each a break of the leg's sequence. With
     /// no second copy to agree, a cue is forwarded only once nothing has been
@@ -1755,14 +1820,16 @@ impl<T: Clone> BufferedHitlessMerger<T, HeldRuns> {
     /// [`HeldRuns`]), its seqs in a `window`-seq gap-fill window as
     /// [`Self::with_window`]'s are. `leg_lag` is how far one leg's packets
     /// reach it behind the other's by configuration: its dedup's stale time
-    /// is a second past the larger of that and the hold, which a slower leg
-    /// lagging past the hold outruns.
+    /// is a second past that and the hold together — the hold budgets the
+    /// legs' networks, which come on top of the lag their configuration sets,
+    /// so the larger of the two alone left a leg lagging by both a window
+    /// behind when it ran out.
     pub fn with_runs(max_path_diff: Duration, window: u16, leg_lag: Duration) -> Self {
         let max_path_diff = bounded_path_diff(max_path_diff);
         Self::build(
             HeldRuns(
                 HitlessMerger::with_window(window)
-                    .with_stale_after_us(stale_after_lag_us(max_path_diff.max(leg_lag))),
+                    .with_stale_after_us(stale_after_lag_us(max_path_diff.saturating_add(leg_lag))),
             ),
             max_path_diff,
             RUN_MAX_BUFFER_PACKETS,

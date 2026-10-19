@@ -537,8 +537,8 @@ impl HitlessMergers {
 ///
 /// `leg_lag` is how far one leg's packets reach a seq-aware merger behind
 /// the other's by configuration (the difference of their
-/// [`leg_receive_hold`]s): its stale time is a second past it — past the
-/// larger of it and the hold, buffered — rather than the second of
+/// [`leg_receive_hold`]s): its stale time is a second past it — past it and
+/// the hold together, buffered — rather than the second of
 /// [`crate::redundancy::merger::DEFAULT_STALE_AFTER_US`], so a lagging leg
 /// is never taken for a moved stream while it is still a window behind (see
 /// "Re-anchoring" in [`crate::redundancy::merger`]).
