@@ -3773,6 +3773,18 @@ const PAIR_DROP_MIN_POLLS: u32 = 2;
 /// 50 Mbps but ten seconds at 1 Mbps — while libsrt counts its drop at once.
 /// Half a window more absorbs the legs' skew.
 const PAIR_DROP_MIN_DELIVERED: u64 = crate::redundancy::merger::REORDER_WINDOW as u64 * 3 / 2;
+/// … but no more than this many of the leg's polls, whatever it delivered.
+/// A leg connected but delivering nothing kept its drops for good, a leg at
+/// a packet a second for half an hour, and matched them against loss long
+/// after: an upstream gap once it resumed was named SRT's
+/// (`srt_recv_dropped`, whose remedy, more latency, would not help). Below
+/// about 34 packets a second a merger window is longer than 30 s, so a drop
+/// can expire before the merger counts its seq: that loss then counts as an
+/// upstream gap, and a re-anchor's last window of skipped seqs, which leave
+/// the window as late, can go unconfirmed — which takes a shared outage of
+/// over 30 s, longer than the default 30 s peer idle timeout lets either
+/// socket live through.
+const PAIR_DROP_MAX_POLLS: u32 = 30;
 /// How many polls of each connected leg the pair's loss waits for that leg's
 /// drops. libsrt counts a drop when the leg plays the packet after it, so
 /// two legs of different latency count one shared burst up to their latency
@@ -3798,8 +3810,9 @@ const PAIR_LOSS_MAX_WAIT_POLLS: u8 = 10;
 /// - a leg's drops wait in [`LegDrops`] for the pair's loss they explain,
 ///   for a merger window and a half of the leg's packets and two of its
 ///   polls ([`PAIR_DROP_MIN_DELIVERED`], [`PAIR_DROP_MIN_POLLS`]) at least,
-///   then expire — a drop the sibling leg covered is no loss, and must not
-///   stay to name a later gap SRT's;
+///   30 of its polls at most ([`PAIR_DROP_MAX_POLLS`]), then expire — a
+///   drop the sibling leg covered is no loss, and must not stay to name a
+///   later gap SRT's;
 /// - the pair's loss waits for two polls of each connected leg
 ///   ([`PAIR_LOSS_WAIT_POLLS`]), and never more than ten of either leg's
 ///   ([`PAIR_LOSS_MAX_WAIT_POLLS`]), matched at every poll meanwhile. A
@@ -3955,7 +3968,8 @@ impl PairLedger {
 /// One leg's too-late drops not yet matched to the pair's loss, as each of
 /// its polls found them. Each poll's drops expire once they have waited
 /// [`PAIR_DROP_MIN_POLLS`] of the leg's polls and [`PAIR_DROP_MIN_DELIVERED`]
-/// of its packets.
+/// of its packets, or [`PAIR_DROP_MAX_POLLS`] of its polls: so a leg holds
+/// at most that many entries, one per poll.
 #[derive(Default)]
 struct LegDrops {
     /// Drops not yet matched, by the poll that found them; oldest first.
@@ -4016,8 +4030,10 @@ impl LegDrops {
     fn expire(&mut self) {
         let (polls, delivered) = (self.polls, self.delivered);
         self.found.retain(|f| {
-            polls - f.poll < u64::from(PAIR_DROP_MIN_POLLS)
-                || delivered - f.delivered < PAIR_DROP_MIN_DELIVERED
+            let waited = polls - f.poll;
+            waited < u64::from(PAIR_DROP_MAX_POLLS)
+                && (waited < u64::from(PAIR_DROP_MIN_POLLS)
+                    || delivered - f.delivered < PAIR_DROP_MIN_DELIVERED)
         });
     }
 }
@@ -7789,6 +7805,54 @@ mod srt_input_stats_tests {
         assert_eq!(pair.ledger_len().0, 0);
     }
 
+    /// A connected leg that stops delivering keeps its unmatched drops no
+    /// more than 30 of its polls ([`PAIR_DROP_MAX_POLLS`]). Kept until it had
+    /// delivered a window and a half again, they were still pending when it
+    /// resumed, and named a fresh upstream gap SRT's.
+    #[test]
+    fn a_quiet_legs_drops_expire_and_name_no_later_gap_srts() {
+        let mut pair = MergedPair::new();
+        // Leg 1 drops 30 seqs leg 2 delivers: no loss.
+        pair.merge(0..3_000);
+        pair.poll(SrtInputSocket::Leg1, 30, 2_970);
+        pair.poll(SrtInputSocket::Leg2, 0, 3_000);
+        // Then it goes quiet for 40 s, connected; leg 2 carries the stream.
+        let (mut next, mut delivered2) = (3_000u16, 3_000);
+        for _ in 0..40 {
+            pair.merge(next..next + 1_000);
+            (next, delivered2) = (next + 1_000, delivered2 + 1_000);
+            pair.poll(SrtInputSocket::Leg1, 30, 2_970);
+            pair.poll(SrtInputSocket::Leg2, 0, delivered2);
+        }
+        // Leg 2 goes, leg 1 resumes, and the source skips 20 seqs.
+        pair.srt.leg2.send_replace(None);
+        pair.merge((next..next + 3_000).filter(|s| !(next + 1_000..next + 1_020).contains(s)));
+        pair.poll(SrtInputSocket::Leg1, 30, 5_950);
+        for delivered in [6_950, 7_950] {
+            pair.merge(next + 3_000..next + 4_000);
+            next += 1_000;
+            pair.poll(SrtInputSocket::Leg1, 30, delivered);
+        }
+        assert_eq!(pair.lost(), (20, 0));
+    }
+
+    /// At a packet a second a window and a half of a leg's packets is 25
+    /// minutes: a lossy leg's drops the other leg covers piled up an entry a
+    /// poll for that long. They stay at 30.
+    #[test]
+    fn a_legs_drops_stay_bounded_at_a_low_rate() {
+        let mut pair = MergedPair::new();
+        for poll in 1..=100 {
+            // Each second leg 1 drops a packet leg 2 delivers, and plays one.
+            pair.merge([2 * poll as u16, 2 * poll as u16 + 1]);
+            pair.poll(SrtInputSocket::Leg1, poll, 1 + i64::from(poll));
+            pair.poll(SrtInputSocket::Leg2, 0, 1 + 2 * i64::from(poll));
+            let (_, found) = pair.ledger_len();
+            assert!(found[0] <= PAIR_DROP_MAX_POLLS as usize, "{} entries", found[0]);
+        }
+        assert_eq!(pair.lost(), (0, 0));
+    }
+
     /// Loss in flight when the receive loop loses both legs is counted once
     /// across the reconnect — to a new merger and hand-off, new pollers —
     /// as far as the drops that outlived the sockets explain it.
@@ -8094,10 +8158,14 @@ mod srt_input_stats_tests {
                 let now = pair.lost();
                 assert!(now.0 >= last_seen.0 && now.1 >= last_seen.1, "seed {seed}: counters fell");
                 assert!(now.1 <= now.0, "seed {seed}: SRT's part {} over the total {}", now.1, now.0);
-                let (waiting, _) = pair.ledger_len();
+                let (waiting, found) = pair.ledger_len();
                 assert!(
                     waiting <= 2 * usize::from(PAIR_LOSS_MAX_WAIT_POLLS),
                     "seed {seed}: {waiting} waiting"
+                );
+                assert!(
+                    found.iter().all(|&f| f <= PAIR_DROP_MAX_POLLS as usize),
+                    "seed {seed}: {found:?} drop entries"
                 );
                 last_seen = now;
                 while stretch < stretches.len() && at >= stretches[stretch].2 * period_us {
