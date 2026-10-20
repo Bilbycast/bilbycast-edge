@@ -4,6 +4,14 @@ Release of bilbycast-edge version {{VERSION}}.
 
 {{CHANGES}}
 
+## Upgrading from v0.114.1 or earlier
+
+<!-- Static text: remove once no supported upgrade starts at v0.114.1 or earlier. -->
+- **Upgrade the manager to v0.89.0 first** (or together). This edge can answer a flow-assembly swap with `pid_bus_assembly_unconfirmed` (the plan was saved and goes on air once the assembler resumes); the v0.88.1 AI assistant reads that as "nothing changed" and reports the plan rolled back. v0.89.0 reverses and audits it.
+- **Seq-aware Hitless slots are now checked.** A `seq_aware` slot with a leg that carries no sequence number (any leg but RTP or RIST, or an RTP/RIST leg behind an ingress transcode, `program_number`, `pid_overrides` or `pid_map`, or on a flow with no assembly without `passthrough_clock: true`) is switched to `primary_preference` at the first start, `config.json` is rewritten, and a Warning `config` event names it (`hitless_seq_aware_leg_unsequenced`). A whole-config push of the manager's cached copy is repaired the same way; a targeted edit that carries such a slot (a flow or input edit, an assembly swap, `add_input`) is refused with that code, so fix the slot in the manager before editing those flows.
+- **A seq-aware slot's `reorder_window` now takes effect.** The merger used to run 1024 whatever was configured, so a slot set lower now accepts fewer late gap fills. Review it before upgrading.
+- **SRT loss is now counted.** libsrt's too-late drops reach `packets_lost` and a new `srt_recv_dropped` health reason (Warning, Error past 100) while the input is on air, and SMPTE 2022-7 SRT inputs report both legs and the pair's loss for the first time. Flows that were losing packets silently can raise alarms after the upgrade.
+
 ## Upgrading from v0.114.0 or earlier
 
 <!-- Static text: remove once no supported upgrade starts at v0.114.0 or earlier. -->
