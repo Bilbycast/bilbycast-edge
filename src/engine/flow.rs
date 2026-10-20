@@ -593,7 +593,7 @@ pub enum SwapOutcome {
     OnAir,
     /// The assembler did not say so within its bound, and puts the plan on
     /// air when it resumes. Carries the error to report, an
-    /// [`AssemblySwapError`] `pid_bus_assembler_unresponsive`.
+    /// [`AssemblySwapError`] `pid_bus_assembly_unconfirmed`.
     Unconfirmed(anyhow::Error),
 }
 
@@ -5012,7 +5012,11 @@ async fn await_plan_on_air(
 /// the flow's assembler up while `awaiting` room in its queue (`"queue"`:
 /// nothing was changed) or its word that the plan is on air (`"applied"`:
 /// the mergers, the queued plan, the no-op check and — saved by the caller
-/// — `config.json` are the new plan's), and hand back the error to report.
+/// — `config.json` are the new plan's), and hand back the error to report:
+/// `pid_bus_assembler_unresponsive` for the first, and for the second
+/// `pid_bus_assembly_unconfirmed`, since a caller that read one code for both
+/// could not tell a refused swap from one that stands, and would undo or
+/// retry the wrong one.
 fn assembler_unresponsive(
     flow_id: &str,
     awaiting: &'static str,
@@ -5044,7 +5048,12 @@ fn assembler_unresponsive(
             "timeout_ms": ms,
         }),
     );
-    AssemblySwapError { code: "pid_bus_assembler_unresponsive", message }.into()
+    let code = if awaiting == "queue" {
+        "pid_bus_assembler_unresponsive"
+    } else {
+        "pid_bus_assembly_unconfirmed"
+    };
+    AssemblySwapError { code, message }.into()
 }
 
 /// How long `FlowRuntime::start` waits for every pending `Essence`
@@ -8261,9 +8270,11 @@ mod assembly_plan_tests {
 
     /// A plan swap gives its flow's assembler a bounded time — for room in
     /// its queue, then to put the plan on air — and then gives it up with a
-    /// Warning and an error of code `pid_bus_assembler_unresponsive`,
-    /// keeping the Hitless channels it retired for the flow's stop to
-    /// release, since the stalled assembler's fan-ins still read them.
+    /// Warning `pid_bus_assembler_unresponsive` and an error that says which
+    /// (`pid_bus_assembly_unconfirmed` for a plan it took, the Warning's own
+    /// code for one it never took), keeping the Hitless channels it retired
+    /// for the flow's stop to release, since the stalled assembler's fan-ins
+    /// still read them.
     /// Unbounded, a stalled assembler held the swap — the REST call or WS
     /// command — and the flow's merger lock, and every later swap with it.
     #[tokio::test]
@@ -8319,13 +8330,13 @@ mod assembly_plan_tests {
         .expect("the wait for the plan to go on air is bounded") else {
             panic!("a stalled assembler fails the swap");
         };
-        assert_eq!(code(&err), Some("pid_bus_assembler_unresponsive"));
+        assert_eq!(code(&err), Some("pid_bus_assembly_unconfirmed"), "a plan it took stands");
         assert!(bus.keys().contains(&key), "the dropped slot's channel is kept for its fan-in");
         let err = tokio::time::timeout(bounded, reserve_plan_slot(&plan_tx, "f1", &events, wait))
             .await
             .expect("the wait for room in the queue is bounded")
             .expect_err("a full queue refuses the swap");
-        assert_eq!(code(&err), Some("pid_bus_assembler_unresponsive"));
+        assert_eq!(code(&err), Some("pid_bus_assembler_unresponsive"), "a plan it never took is refused");
         let warnings: Vec<_> = std::iter::from_fn(|| raised.try_recv().ok())
             .filter(|e| e.severity == EventSeverity::Warning)
             .filter_map(|e| e.details)

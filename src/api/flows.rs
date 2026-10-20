@@ -381,10 +381,10 @@ pub async fn stop_flow(
 ///   validation, when essence resolution can't find a matching ES, or
 ///   when the input shape forbids the requested switch.
 /// - [`ApiError::Internal`] (500) when the flow's assembler does not take
-///   the plan, or put it on air, within a few seconds
-///   (`pid_bus_assembler_unresponsive`). One it did not take is not saved;
-///   one it took and did not put on air is, since it runs it when it
-///   resumes, so re-sending the previous plan is a swap back.
+///   the plan, or put it on air, within a few seconds. One it did not take
+///   is not saved (`pid_bus_assembler_unresponsive`); one it took and did
+///   not put on air is (`pid_bus_assembly_unconfirmed`), since it runs it
+///   when it resumes, so re-sending the previous plan is a swap back.
 /// - [`ApiError::Conflict`] (409) when the flow was restarted or stopped
 ///   while the swap ran (`pid_bus_assembly_swap_superseded`); the swap is
 ///   not saved, so `config.json` keeps the plan the flow runs.

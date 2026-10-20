@@ -2061,7 +2061,7 @@ mod tests {
                     panic!("a stalled assembler confirms nothing");
                 };
                 let code = err.downcast_ref::<crate::engine::flow::AssemblySwapError>().map(|e| e.code);
-                assert_eq!(code, Some("pid_bus_assembler_unresponsive"));
+                assert_eq!(code, Some("pid_bus_assembly_unconfirmed"));
                 let mut config = cfg.clone();
                 swap.record(&mut config, assembly(true)).expect("the run swapped runs");
                 assert_eq!(config.flows[0].assembly, Some(assembly(true)), "the plan is saved");
