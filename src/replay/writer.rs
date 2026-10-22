@@ -34,9 +34,9 @@ use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::{Mutex, broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RecordingConfig;
@@ -75,7 +75,27 @@ const SYNC_BYTE: u8 = 0x47;
 /// brief disk hiccup doesn't immediately drop, but a sustained stall
 /// still surfaces the `replay_writer_lagged` event before unbounded
 /// memory growth.
-const WRITER_QUEUE_CAP: usize = 1024;
+///
+/// Counted in broadcast packets, which is not a fixed size: an SDI flow
+/// broadcasts one 188-byte TS packet per message, about 6,900 a second at
+/// 10 Mbit/s. At 1024 that was ~150 ms of headroom, and five recorders on one
+/// volume (bilby-voyager, 2026-10-22) dropped ~2.5 % of their packets at every
+/// load, a single session included. 16384 is ~2.4 s of that feed, and at most
+/// ~21 MB per recorder for a feed sending 1316-byte datagrams, only while
+/// stalled.
+const WRITER_QUEUE_CAP: usize = 16384;
+/// Userspace buffer in front of each segment file.
+///
+/// Unbuffered, every broadcast packet was its own `write_all` — for an SDI
+/// flow ~6,900 round trips a second through tokio's blocking pool per
+/// recorder, each awaited before the next packet left the queue. 256 KiB is
+/// ~0.2 s of a 10 Mbit/s feed per write. Nothing reads a segment before it is
+/// closed and renamed, and the close flushes this buffer first.
+const SEGMENT_WRITE_BUF: usize = 256 * 1024;
+/// Segments whose close (flush, fsync, rename) may run behind the writer at
+/// once. The close is off the receive path; this bounds how far behind it may
+/// fall before the writer waits for the oldest rather than queue more files.
+const MAX_PENDING_CLOSES: usize = 4;
 /// Minimum gap between `replay_writer_lagged` events when the writer is
 /// continuously dropping. Avoids flooding the events feed.
 const LAG_EVENT_INTERVAL: Duration = Duration::from_secs(5);
@@ -533,6 +553,7 @@ pub async fn spawn_writer(
         clips,
         index_writer,
         current_segment: None,
+        closing: JoinSet::new(),
         current_segment_started: None,
         disk_pressure_emitted: false,
         accumulated_pts: resumed_pts.unwrap_or(0),
@@ -660,6 +681,9 @@ struct WriterState {
     clips: ClipStore,
     index_writer: IndexWriter,
     current_segment: Option<OpenSegment>,
+    /// Finished segments still being flushed, fsynced and renamed, off the
+    /// receive path — see [`WriterState::finish_segment`].
+    closing: JoinSet<()>,
     current_segment_started: Option<Instant>,
     /// Sticky bit so the 80 % disk-pressure Warning fires once per
     /// pressure episode rather than every segment roll. Cleared via
@@ -694,7 +718,7 @@ struct WriterState {
 
 struct OpenSegment {
     id: u32,
-    file: File,
+    file: BufWriter<File>,
     bytes_written: u64,
     staging_path: PathBuf,
     final_path: PathBuf,
@@ -1071,7 +1095,7 @@ impl WriterState {
     async fn roll_segment(&mut self) -> Result<()> {
         // Close out the current segment first.
         if let Some(seg) = self.current_segment.take() {
-            close_segment(seg).await?;
+            self.finish_segment(seg).await;
             self.stats.segments_written.fetch_add(1, Ordering::Relaxed);
             // Best-effort sync of the index per-segment.
             let _ = self.index_writer.flush_and_sync().await;
@@ -1111,6 +1135,7 @@ impl WriterState {
             .create(true).truncate(true).write(true)
             .open(&staging_path).await
             .with_context(|| format!("open staging {}", staging_path.display()))?;
+        let file = BufWriter::with_capacity(SEGMENT_WRITE_BUF, file);
         self.current_segment = Some(OpenSegment {
             id, file, bytes_written: 0, staging_path, final_path, saw_first_idr: false,
         });
@@ -1261,7 +1286,54 @@ impl WriterState {
             let _ = close_segment(seg).await;
             self.stats.segments_written.fetch_add(1, Ordering::Relaxed);
         }
+        // A stopped recording must leave every segment it wrote finished on
+        // disk, not some of them still being renamed behind it.
+        while self.closing.join_next().await.is_some() {}
         let _ = self.index_writer.flush_and_sync().await;
+    }
+
+    /// Close a finished segment beside the writer rather than in it.
+    ///
+    /// The close is a flush, an fsync and a rename. Awaited here, the writer
+    /// stopped taking packets for as long as the disk took to answer, and on a
+    /// RAID volume shared by five recorders that outlasted the queue: every
+    /// roll dropped a burst. Run as its own task, the queue keeps draining.
+    ///
+    /// Nothing reads a segment until it has its final name, and every reader
+    /// already copes with a segment the index names but whose rename has not
+    /// landed, because that window existed before — only the writer was stuck
+    /// inside it. A close that fails is reported, and the next segment is
+    /// still written: if the disk is truly gone, its own writes fail and the
+    /// writer error path takes over.
+    async fn finish_segment(&mut self, seg: OpenSegment) {
+        while self.closing.try_join_next().is_some() {}
+        // Bounded: a disk that cannot keep up makes the writer wait for the
+        // oldest close rather than leave an unbounded tail of staging files.
+        while self.closing.len() >= MAX_PENDING_CLOSES {
+            if self.closing.join_next().await.is_none() {
+                break;
+            }
+        }
+        let recording_id = self.recording_id.clone();
+        let events = self.events.clone();
+        self.closing.spawn(async move {
+            let id = seg.id;
+            if let Err(e) = close_segment(seg).await {
+                tracing::warn!(target: "replay", recording_id = %recording_id, segment = id, "segment close failed: {e:#}");
+                events.emit_with_details(
+                    EventSeverity::Warning,
+                    category::REPLAY,
+                    format!("Recording '{recording_id}' could not finish segment {id}: {e}"),
+                    None,
+                    serde_json::json!({
+                        "error_code": "replay_segment_close_failed",
+                        "replay_event": "segment_close_failed",
+                        "recording_id": recording_id,
+                        "segment_id": id,
+                    }),
+                );
+            }
+        });
     }
 
     /// Retention window currently in force. In `Armed` mode this is the
@@ -1533,8 +1605,9 @@ fn smpte_tc_packed(snap: Option<&crate::stats::models::TimecodeStats>) -> Option
 }
 
 async fn close_segment(mut seg: OpenSegment) -> Result<()> {
+    // Drains the userspace buffer into the file, then the file to the kernel.
     seg.file.flush().await?;
-    seg.file.sync_all().await?;
+    seg.file.get_mut().sync_all().await?;
     drop(seg.file);
     tokio::fs::rename(&seg.staging_path, &seg.final_path).await
         .with_context(|| format!("rename {} -> {}", seg.staging_path.display(), seg.final_path.display()))?;
