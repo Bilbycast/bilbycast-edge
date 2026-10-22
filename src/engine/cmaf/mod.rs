@@ -3491,6 +3491,24 @@ fn ll_tail_chunk(seg: &CompletedSegment, tail: &[Sample], chunks_emitted: u32) -
     }
 }
 
+/// How many chunks a low-latency segment's PUT may hold queued for the origin:
+/// two segments' worth, and never fewer than eight.
+///
+/// A full queue abandons the segment. Live, chunks are cut one
+/// `chunk_duration_ms` apart and eight was room to spare; but an output
+/// catching up on a backlog in its intake cuts a whole segment's chunks in
+/// milliseconds — four at the default 2 s / 500 ms, a hundred at the 10 s /
+/// 100 ms validation allows — and with room for eight, every caught-up
+/// segment past its eighth chunk was abandoned, turning the backlog the
+/// intake had just saved back into lost video. Two segments' worth, because
+/// a segment runs to the IDR at or past its target, so a source GOP longer
+/// than the target lengthens it. Each segment has a PUT of its own, finished
+/// before the next opens, so this is all a slow origin can hold.
+fn ll_chunk_queue_depth(config: &CmafOutputConfig) -> usize {
+    let per_segment = (config.segment_duration_secs * 1000.0 / config.chunk_duration_ms.max(1) as f64).ceil();
+    (per_segment as usize).saturating_mul(2).max(8)
+}
+
 /// LL-CMAF chunk pump. Called once per video frame push; it opens a
 /// chunked PUT at segment boundaries, flushes accumulated samples as
 /// moof+mdat chunks every `chunk_duration_ms` worth of media, and
@@ -3568,7 +3586,7 @@ async fn handle_ll_cmaf(
                             &format!("{base_url}/{uri}"),
                             "video/mp4",
                             config.auth_token.as_deref(),
-                            8,
+                            ll_chunk_queue_depth(config),
                         );
                         ll.handle.send_chunk(bytes).is_ok()
                     }
@@ -3661,8 +3679,12 @@ async fn handle_ll_cmaf(
             let seq = vs.next_segment_number();
             let uri = default_segment_uri(seq);
             let url = format!("{}/{}", base_url, uri);
-            let handle =
-                chunked_put(&url, "video/mp4", config.auth_token.as_deref(), 8);
+            let handle = chunked_put(
+                &url,
+                "video/mp4",
+                config.auth_token.as_deref(),
+                ll_chunk_queue_depth(config),
+            );
             tracing::debug!(
                 "CMAF output '{}': opened LL chunked PUT for seg={} ({})",
                 config.id, seq, url
@@ -3736,7 +3758,7 @@ async fn handle_ll_cmaf(
                         &format!("{}/{}", base_url, ll.uri),
                         "video/mp4",
                         config.auth_token.as_deref(),
-                        8,
+                        ll_chunk_queue_depth(config),
                     );
                     ll.handle.send_chunk(bytes)
                 }
@@ -5051,6 +5073,28 @@ seg-00042.m4s?token=abc
             assert!(err.abs() <= 5, "segment {n} dated {err} ms off its content");
         }
         assert!(reanchored_by_processing, "the model no longer shows what dating by processing did");
+    }
+
+    /// A low-latency segment's PUT holds a whole segment's chunks, so an
+    /// output catching up on a backlog — which cuts them in milliseconds —
+    /// does not abandon the segment past an eighth.
+    #[test]
+    fn a_caught_up_low_latency_segment_fits_its_chunk_queue() {
+        let config = |segment_duration_secs: f64, chunk_duration_ms: u32| CmafOutputConfig {
+            segment_duration_secs,
+            chunk_duration_ms,
+            low_latency: true,
+            ..serde_json::from_value(serde_json::json!({
+                "id": "o", "name": "o", "ingest_url": "https://origin.example/x",
+            }))
+            .unwrap()
+        };
+        for (seg, chunk) in [(2.0, 500), (10.0, 100), (1.0, 2000), (6.0, 200), (10.0, 2000)] {
+            let per_segment = (seg * 1000.0 / chunk as f64).ceil() as usize;
+            let depth = ll_chunk_queue_depth(&config(seg, chunk));
+            assert!(depth >= 2 * per_segment, "{seg} s / {chunk} ms: room for {depth} of {per_segment} chunks");
+            assert!(depth >= 8);
+        }
     }
 
     /// The low-latency path reads the flow clock; it must never steer it.
