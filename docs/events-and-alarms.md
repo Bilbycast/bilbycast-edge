@@ -883,9 +883,10 @@ edge logs as `Manager connection to {url} failed: {reason}`) and `url` (the
 manager URL that attempt dialled, without any userinfo, query or fragment).
 The manager coalesces events on their message and keeps the first
 occurrence's `details`, which is why the message varies with the kind: each
-kind keeps its own row and count. A clean end — a close frame, the end of the
-stream, or a write that fails under a broken connection — raises nothing;
-the edge logs it and dials again 5 s later. Events raised while the link is
+kind keeps its own row and count. A clean end of an authenticated session — a
+close frame, the end of the stream, or a write that fails under a broken
+connection — raises nothing; the edge logs it and dials again 5 s later. The
+same close before the auth reply is a `manager_connection_error`. Events raised while the link is
 down are queued and reach the manager once the next session authenticates.
 
 | Severity | Message | Trigger | `details.error_code` |
@@ -896,8 +897,8 @@ down are queued and reach the manager once the next session authenticates.
 | warning | Manager connection lost: dial timed out | The dial did not finish within 30 s; `reason` names the stage that was still running — DNS lookup, TCP connect, or TLS/WebSocket upgrade | `manager_dial_timeout` |
 | warning | Manager connection lost: handshake timed out | The auth frame could not be written within 10 s, no auth reply came within 10 s, or the whole handshake did not get an auth reply within 60 s | `manager_handshake_timeout` |
 | warning | Manager connection lost: authentication refused | The manager answered `auth_error` (after the Critical below) | `manager_auth_rejected` |
-| warning | Manager connection lost: unexpected reply | The auth reply was not a text frame, not JSON, or not one of `auth_ok` / `register_ack` / `auth_error` | `manager_protocol_error` |
-| warning | Manager connection lost: connection error | The connection broke: a WebSocket error during auth or the session (a reset, a protocol violation), or a close during auth | `manager_connection_error` |
+| warning | Manager connection lost: unexpected reply | The auth reply was a frame other than text or close (binary, say), not JSON, or not one of `auth_ok` / `register_ack` / `auth_error` | `manager_protocol_error` |
+| warning | Manager connection lost: connection error | The connection broke: a WebSocket error during auth or the session (a reset, a protocol violation), or the connection closed during auth — a close frame or the end of the stream | `manager_connection_error` |
 | warning | Manager connection lost: manager went silent | Nothing heard from the manager for longer than the limit its pings set: `max(90 s, 4 × the median of its last 8 ping intervals)`, each interval counted as at most 300 s. Unarmed until the session's first ping, so a manager that never pings is never dropped for being quiet | `manager_silent` |
 | warning | Manager connection lost: manager stopped reading | One write to the manager (any frame, the first health frame included) did not complete in 300 s — the manager stopped draining the connection. Independent of the pings, so it also covers the window before the first ping and a manager that never pings | `manager_write_stalled` |
 | critical | Manager authentication failed: {reason} | Auth rejected by the manager. After a `rotate_secret` the manager did not store (its acknowledgement written but read too late, or its database write failed), the next reconnect raises this once, with the new secret, before the edge falls back to the previous one | — |

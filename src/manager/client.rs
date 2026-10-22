@@ -519,13 +519,17 @@ where
     // Step 2: Wait for auth response (auth_ok, register_ack, or auth_error)
     let reply = match tokio::time::timeout(AUTH_REPLY_TIMEOUT, ws_read.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => text,
+        // A close frame — a draining manager, a proxy in front of one — ends
+        // the connection as the end of the stream does; it is not a reply.
+        Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+            return Err(LinkError::new(LinkLoss::ConnectionError, "Connection closed during auth"));
+        }
         Ok(Some(Ok(_))) => {
             return Err(LinkError::new(LinkLoss::Protocol, "Unexpected non-text auth response"));
         }
         Ok(Some(Err(e))) => {
             return Err(LinkError::new(LinkLoss::ConnectionError, format!("WebSocket error during auth: {e}")));
         }
-        Ok(None) => return Err(LinkError::new(LinkLoss::ConnectionError, "Connection closed during auth")),
         Err(_) => {
             return Err(LinkError::new(
                 LinkLoss::HandshakeTimeout,
@@ -10433,6 +10437,25 @@ mod manager_link_tests {
             edge.deps.app_config.read().await.manager.as_ref().unwrap().node_secret.as_deref(),
             Some(OLD)
         );
+    }
+
+    /// A manager — or a proxy in front of one — that answers the auth frame
+    /// with a close frame has closed the connection, as the end of the
+    /// stream does. It used to be reported as a reply the edge could not
+    /// read.
+    #[tokio::test]
+    async fn a_close_frame_during_auth_is_a_connection_error() {
+        let mut edge = Edge::new(manager_config(Some(OLD), None));
+        let creds = edge.credentials();
+        let (ended, ()) = edge
+            .session(&creds, |mut ws| async move {
+                recv(&mut ws).await;
+                ws.send(Message::Close(None)).await.unwrap();
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+            .await;
+        let ended = ended.unwrap_err();
+        assert_eq!(ended.loss, LinkLoss::ConnectionError, "{}", ended.reason);
     }
 
     /// Registration handed its credentials back in the session's `Ok` value:
