@@ -5025,6 +5025,13 @@ seg-00042.m4s?token=abc
     /// re-anchor, an `#EXT-X-DISCONTINUITY` and a jump in every rendition's
     /// dates, over nothing but a slow upload. The close is dated by arrival
     /// instead — now, less what the intake says the packet waited.
+    ///
+    /// This pins the pieces — the intake's wait, `arrival_now`, and what each
+    /// dating does to the flow's clock — not the wiring between them. No test
+    /// drives `push_video_sample` or `handle_ll_cmaf`, which need a segmenter
+    /// and an origin, so their two `closed_at = state.arrival_now()` lines are
+    /// held by review alone: either edited back to `Utc::now()` leaves this
+    /// test green.
     #[tokio::test]
     async fn a_backlog_in_the_intake_is_dated_by_arrival() {
         // What the output reads: the intake says how long a packet waited,

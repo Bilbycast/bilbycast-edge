@@ -2662,6 +2662,58 @@ mod tests {
         assert!(waited < Duration::from_millis(1_900), "waited {waited:?} on two tasks given 1 s");
     }
 
+    /// The budget is given back as the writer takes each message off: a
+    /// recorder that keeps up carries more than [`WRITER_QUEUE_BYTES`]
+    /// through its queue without dropping a packet. Without the release,
+    /// every recorder went silent once 32 MiB had passed through it — about
+    /// 17 s of an SDI feed — and stayed silent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_writer_that_keeps_up_carries_more_than_its_budget_without_dropping() {
+        // ~64 KiB a message, at most ~2 MiB in flight at once.
+        const PER_MSG: u64 = 348;
+        const BATCH: u64 = 32;
+        let tmp = tempfile::tempdir().unwrap();
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let (tx, _) = broadcast::channel::<RtpPacket>(1024);
+        let cancel = CancellationToken::new();
+        let handle = spawn_writer_at(
+            "rec".into(), tmp.path().join("rec"), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
+        )
+        .await
+        .unwrap();
+        let msg_bytes = PER_MSG * TS_PACKET as u64;
+        let total = WRITER_QUEUE_BYTES as u64 / msg_bytes + 16;
+        let (mut n, mut sent) = (0u64, 0u64);
+        while n < total {
+            for _ in 0..BATCH.min(total - n) {
+                let mut data = Vec::with_capacity(msg_bytes as usize);
+                for k in 0..PER_MSG {
+                    let pcr = (k == 0).then_some(n * 9_000);
+                    data.extend_from_slice(&ts_packet(n * PER_MSG + k, pcr, k == 0 && n % 8 == 0));
+                }
+                tx.send(raw_ts(data)).unwrap();
+                n += 1;
+                sent += msg_bytes;
+            }
+            // Let the writer catch up before the next batch.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let written = handle.stats.bytes_written.load(Ordering::Relaxed);
+                let dropped = handle.stats.packets_dropped.load(Ordering::Relaxed) * msg_bytes;
+                if written + dropped >= sent {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the writer stalled at {written} of {sent} bytes");
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+        assert!(sent > WRITER_QUEUE_BYTES as u64);
+        assert_eq!(handle.stats.packets_dropped.load(Ordering::Relaxed), 0, "the budget was never given back");
+        assert_eq!(handle.stats.bytes_written.load(Ordering::Relaxed), sent);
+        cancel.cancel();
+        assert!(handle.finished(Duration::from_secs(10)).await);
+    }
+
     /// The recorder against an SDI flow's message rate, measured.
     ///
     /// An SDI flow broadcasts one 188-byte TS packet per message, about 6,900
