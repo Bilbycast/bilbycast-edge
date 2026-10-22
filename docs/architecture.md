@@ -291,9 +291,11 @@ treat TS payloads as opaque bytes or maintain independent state.
 ## Concurrency & Shutdown Model
 
 ```
-  main() shutdown signal (Ctrl+C)
+  main() shutdown signal (SIGTERM / Ctrl+C)
   │
-  ├─▶ FlowManager.stop_all()
+  ├─▶ API server graceful shutdown
+  │
+  ├─▶ FlowManager.stop_all_within(10 s) — every flow at once
   │     │
   │     ├─▶ Flow-1 cancel_token.cancel()
   │     │     ├─▶ input_task (child token) ──▶ exits select! loop
@@ -307,7 +309,7 @@ treat TS payloads as opaque bytes or maintain independent state.
   │
   ├─▶ TunnelManager.stop_all()
   │
-  └─▶ API server graceful shutdown
+  └─▶ BondRouteManager.teardown_all()
 
   Hot-add/remove (runtime, no restart):
   ├─ add_output()    ──▶ new child token + subscribe to broadcast

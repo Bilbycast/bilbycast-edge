@@ -92,9 +92,12 @@ section.)
   clip cut through it would come out that far from the moment marked.
 - **The closer task** finishes each segment the writer closes, one at a
   time, in the order they closed — see [Recording arm → roll →
-  prune](#recording-arm--roll--prune). Every fsync and directory scan the
-  recorder does is there. Up to four finished segments may wait for it;
+  prune](#recording-arm--roll--prune). Every fsync and directory scan on
+  the roll path is there. Up to four finished segments may wait for it;
   past that the writer waits for room, and the queue in front absorbs it.
+  Two fsyncs stay on the writer: a mark-out persists `clips.json` (the file
+  and its directory) before it answers, and the writer's exit fsyncs the
+  index once the closer has finished.
 - Playback is a **new input type** (`type: "replay"`). The replayer
   reads segments back, paces them by PCR from an inline pump in
   `engine::input_replay` (`pump_one_bundle` + `PacingState`), and
@@ -230,8 +233,9 @@ writer accumulates from PCR deltas, so the index stays monotonic across the
 33-bit PCR wrap — and `find_floor` binary-searches it, so monotonic is a
 requirement, not a nicety.
 
-A restart resumes an existing recording: it continues the segment numbering,
-appends to the same `index.bin`, and keeps the anchor. The counter therefore has
+A restart resumes an existing recording: it continues the segment numbering
+(past any ids a crash lost — see [Segment ids](#segment-ids)), appends to the
+same `index.bin`, and keeps the anchor. The counter therefore has
 to be resumed too. It picks up at **the last indexed tick plus the wall-clock
 time the writer was down** — the gap is added, not skipped, because nothing was
 recorded during it but the anchor maps wall clock to ticks linearly, and a
@@ -310,12 +314,20 @@ range has to honour it — see [Clip export](#clip-export) below.
    the order they closed:
    - flushes the userspace buffer and `sync_all`s the segment;
    - renames `.tmp/<n>.ts` → `<n>.ts`. One closer, so renames land in id
-     order: a reader or a clip export can only ever find the newest
-     segments not yet in place, never a missing one in the middle (which
-     `export::read_chunk` would skip without a word);
-   - fsyncs `index.bin` — **after** the rename, so a power cut between the
-     two leaves a segment the index has not caught up with, never an index
-     naming a segment that is not there;
+     order: a reader or a clip export finds only the newest segments not
+     yet in place, never a later one in place ahead of an earlier one still
+     being finished. A segment can still be missing from the middle — a
+     close that failed, or the segments a crash lost — and readers step
+     over it (see [Segment ids](#segment-ids));
+   - fsyncs `index.bin` — **after** the rename, so the fsync issued for a
+     segment never makes its entries durable while the segment is still in
+     `.tmp/`. That is all the ordering buys: the writer is already
+     appending entries for the open segment, and for any queued behind this
+     one, and an fsync covers the whole file (as can the kernel's own
+     writeback), so a power cut can still leave entries naming a segment
+     that never left `.tmp/`. A restart resumes past every id the index
+     names, so such an entry names a missing file, never media recorded
+     after the restart;
    - writes `recording.json` (the next segment id, the clock anchor and
      its rolling sample);
    - runs the retention prune — oldest-first by mtime, capped by both
@@ -335,9 +347,14 @@ range has to honour it — see [Clip export](#clip-export) below.
    fixed it reopened the stopped segment's id, and the next roll renamed
    the new file over the last segment before the Stop, whose index
    entries still pointed into it. A flow that stops or restarts waits up
-   to 10 s for its recorder to do the same (`RecordingHandle::finished`):
-   without that, the restarted writer's `.tmp/` sweep (below) deleted the
-   segments the old one was still finishing. On a fatal write error:
+   to 10 s for its recorder to do the same (`RecordingHandle::finished`,
+   one deadline for the writer and its filmstrip together): without that,
+   the restarted writer's `.tmp/` sweep (below) deleted the segments the
+   old one was still finishing. A node shutting down stops all its flows
+   at once and gives them 10 s in all (`SHUTDOWN_FLOW_STOP_BUDGET`), so a
+   stalled replay volume costs that wait once rather than once per
+   recording flow, and the tunnels and bond routes torn down after the
+   flows still go before systemd's `TimeoutStopSec=20`. On a fatal write error:
    Critical `replay_disk_full` (`replay_event: disk_full`); the partial
    segment goes to the closer, which renames it into place or, when that
    close fails too, unlinks its `.tmp/` staging file (without a second
@@ -348,8 +365,8 @@ range has to honour it — see [Clip export](#clip-export) below.
    disk itself failed (ENOSPC, EDQUOT, EIO, EROFS), the fault the writer's
    own writes report, and `replay_segment_close_failed` for anything else
    (the staging file taken away, a rename refused). The segment is lost;
-   its index entries remain, naming a file that does not exist. Writing
-   carries on with the next segment.
+   its index entries remain, naming a file that does not exist, and
+   playback steps over the gap. Writing carries on with the next segment.
 7. Retention will **never** unlink the segment just finished — losing the
    live edge would tear out clips that touch the most recent few seconds.
    It runs after that segment's rename, so the segment is in the listing
@@ -365,16 +382,18 @@ opening a new segment:
 1. **`.tmp/` orphan cleanup.** Any `<NNNNNN>.ts` left in `.tmp/` is a
    partial segment the writer never atomically renamed onto the
    recording — unlinked unconditionally.
-2. **Resume id derivation.** The next segment id is
-   `max(largest <NNNNNN>.ts on disk, recording.json's current_segment_id) + 1`.
-   With finalized segments on disk the meta file is never trusted
-   alone: if `recording.json` is missing or fails to parse, the id is
-   `largest <NNNNNN>.ts on disk + 1`. Only when no finalized segment
-   exists is the meta's `current_segment_id` resumed as-is (a
-   brand-new recording, with neither, starts at 0). The meta file is
-   best-effort on the roll path (and may be corrupt after a SIGKILL);
-   trusting it alone would cause segment-id reuse and overwrite
-   finalized data.
+2. **Resume id derivation.** The next segment id is the largest of
+   `recording.json`'s `current_segment_id`, the largest `<NNNNNN>.ts` on
+   disk + 1, and the largest `segment_id` in `index.bin` + 1 (a
+   brand-new recording, with none of them, starts at 0). The field is the
+   lowest id not yet finished, so it is taken as it stands, never plus
+   one. Neither of the other two is redundant: the meta is written by
+   the closer after the rename it follows, so it can be missing, corrupt
+   or behind the directory; and it trails the index by every segment the
+   closer had not finished when the edge died, whose entries may already
+   be in `index.bin`. Opening one of those ids again would point its
+   entries at media recorded after the restart. See
+   [Segment ids](#segment-ids).
 3. **`index.bin` alignment.** If the file length isn't a 24-byte
    multiple (a SIGKILL between `append` and `flush_and_sync` can
    leave a partial entry), `IndexWriter::open` aligns down to the
@@ -382,11 +401,42 @@ opening a new segment:
    same rule on the reader side. The trailing partial IDR is
    discarded; the next IDR re-establishes the index head.
 4. **Recovery alert.** If any of the above fired (orphans removed,
-   meta corrupt, or disk-derived id outranked the meta), the writer
+   meta corrupt, or the directory or the index held an id past the one
+   the meta had reached — segments a crash lost while the closer was
+   behind, or a meta write that failed), the writer
    emits the Warning event `replay_recovery_alert` with structured
    `details.tmp_orphans_removed`, `details.meta_corrupt`,
    `details.next_segment_id`. Recovery is non-fatal; the recording
    continues from the next id without operator intervention.
+
+### Segment ids
+
+A segment id is handed out once in a recording's life. A segment's file,
+its `index.bin` entries and the clips cut through them all name it by id,
+so an id that came round again would point every one of them at media
+recorded later. The writer (`replay::writer`, whose module docs state the
+same rules) keeps it so:
+
+- **Every close moves the id on** — a roll, a Stop, a write error, the
+  writer exiting. A Start after a Stop therefore opens a new id, never the
+  stopped one.
+- **A writer resumes past every id anything names**: the largest of the
+  meta's `current_segment_id`, the largest segment on disk + 1 and the
+  largest id in `index.bin` + 1 (see [Crash recovery](#crash-recovery-writer-init-scan)).
+  After a clean stop — a Stop, a flow restart, a node restart — the three
+  agree and the numbering carries straight on. After a crash the index
+  term resumes past the segments the crash lost, so their entries name a
+  file that is missing rather than media recorded after the restart; an
+  id nothing names yet (a segment lost before its first random-access
+  point) is used again.
+- **A gap in the ids is not the end of the recording.** A crash leaves one
+  where the segments it lost were, and so does a close that fails.
+  Playback (`Reader::advance_segment`) steps over it to the next segment
+  on disk, as the exporter always has; it used to stop at the first
+  missing id, ending a replay at the gap. The gap is not closed instead,
+  because that would mean handing the lost ids out again and first
+  cutting their entries out of `index.bin` on the strength of a directory
+  scan — and a failed close leaves a gap whatever the numbering does.
 
 ### Clip create
 
@@ -466,8 +516,8 @@ parsing strings.
 | `replay_invalid_range` | Error | `update_clip` whose prospective `out_pts_90khz <= in_pts_90khz` (empty or inverted); `export_recording` (TS or MP4) with both bounds supplied and `to_pts_90khz <= from_pts_90khz`; `export_clip` (TS or MP4) on a clip whose stored `out_pts_90khz <= in_pts_90khz`. `play_clip` with `to_pts_90khz < from_pts_90khz` (or below the clip's `in_pts` when `from` is omitted) is refused too, but its ack carries `replay_clip_not_found` with `replay_invalid_range` as the message; `scrub_playback` takes a single `pts_90khz` and cannot raise it | Pass a forward range |
 | `replay_invalid_tag` | Error | `update_clip` (or any tag-bearing path) with a tag that fails `[A-Z0-9_-]{1,32}`, more than 16 tags per clip | Use the v1 fixed set (`GOAL`/`FOUL`/`OFFSIDE`/`SAVE`/`YELLOW`/`VAR-CHECK`) or shorten / re-case |
 | `replay_max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without deleting the live edge — operator's cap is smaller than one segment | Raise `max_bytes` to at least `segment_seconds × bitrate × 2` |
-| `replay_metadata_stale` | Warning | `recording.json` write failed on segment roll; recovery scan will derive next segment id from the directory listing on restart | Investigate the disk (typically ENOSPC on the replay volume) |
-| `replay_recovery_alert` | Warning | Edge restarted after a crash; orphan `.tmp/` segments cleaned and / or `recording.json` was corrupt | Informational — verify `details.tmp_orphans_removed` and `details.next_segment_id` match expectations |
+| `replay_metadata_stale` | Warning | `recording.json` write failed after a segment's close; on restart the resume id is bounded by the directory listing and `index.bin` as well, so no id is reused | Investigate the disk (typically ENOSPC on the replay volume) |
+| `replay_recovery_alert` | Warning | Edge restarted after a crash; orphan `.tmp/` segments cleaned, `recording.json` was corrupt, and / or ids were in use past the one `recording.json` had reached | Informational — verify `details.tmp_orphans_removed` and `details.next_segment_id` match expectations |
 | `replay_filmstrip_setup_failed` | Warning | Filmstrip writer could not create `<recording_dir>/thumbs/.tmp/`; the subscriber returns and no filmstrip is written (the recording itself keeps rolling) | Check permissions / free space on the replay root, then re-arm the recording |
 | `replay_filmstrip_decode_failed` | Warning | Filmstrip decode failed on a capture tick; rate-limited to one event per 60 s per recording | Informational unless sustained — check the source has decodable video (`details.detail` carries the decoder error) |
 | `replay_filmstrip_frame_not_found` | Error (`command_ack.error_code` only — no event) | `get_filmstrip_frame` for a `pts_90khz` with no `thumbs/<pts>.jpg` | Re-run `list_filmstrip` — the frame may have been pruned with its recording, or the PTS was not a capture tick |
