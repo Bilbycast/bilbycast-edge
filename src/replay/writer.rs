@@ -10,12 +10,13 @@
 //! Three tasks per recording, in series:
 //!
 //! 1. **Subscriber task** (`subscriber_loop`) — `broadcast::Receiver`,
-//!    drops on `RecvError::Lagged`, never blocks the data path. Try-sends
-//!    into a bounded mpsc; if the mpsc is full, drops the packet, bumps
-//!    a counter, and emits a (rate-limited) Critical event under
-//!    category `replay` with `error_code: replay_writer_lagged`.
+//!    drops on `RecvError::Lagged`, never blocks the data path. Queues
+//!    each message for the writer within a budget counted in bytes
+//!    ([`WRITER_QUEUE_BYTES`]); past it, drops the packet, bumps a
+//!    counter, and emits a (rate-limited) Critical event under category
+//!    `replay` with `error_code: replay_writer_lagged`.
 //!
-//! 2. **Writer task** (`writer_loop`) — drains the mpsc, parses TS
+//! 2. **Writer task** (`writer_loop`) — drains that queue, parses TS
 //!    packets out of each `RtpPacket`, appends them through a userspace
 //!    buffer to the current segment file under `<recording_dir>/.tmp/`,
 //!    tracks PCR for the index, runs SMPTE TC extraction via
@@ -36,7 +37,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -80,19 +81,33 @@ pub fn mode_to_wire_str(mode: u8) -> &'static str {
 }
 /// MPEG-TS sync byte.
 const SYNC_BYTE: u8 = 0x47;
-/// Bounded queue between the subscriber and the writer task. Sized so a
-/// brief disk hiccup doesn't immediately drop, but a sustained stall
-/// still surfaces the `replay_writer_lagged` event before unbounded
-/// memory growth.
+/// What the queue between the subscriber and the writer may hold before the
+/// subscriber drops: 32 MiB per recorder, and only while the writer is behind.
+/// Sized so a disk that pauses for seconds costs latency rather than packets,
+/// while a disk that has stopped still surfaces `replay_writer_lagged` long
+/// before memory is in question.
 ///
-/// Counted in broadcast packets, which is not a fixed size: an SDI flow
+/// Counted in bytes, because a message is not a fixed size. An SDI flow
 /// broadcasts one 188-byte TS packet per message, about 6,900 a second at
-/// 10 Mbit/s. At 1024 that was ~150 ms of headroom, and five recorders on one
-/// volume (bilby-voyager, 2026-10-22) dropped ~2.5 % of their packets at every
-/// load, a single session included. 16384 is ~2.4 s of that feed, and at most
-/// ~21 MB per recorder for a feed sending 1316-byte datagrams, only while
-/// stalled.
-const WRITER_QUEUE_CAP: usize = 16384;
+/// 10 Mbit/s; an RTMP or RTSP flow broadcasts a whole frame per message, tens
+/// of kilobytes. A cap in messages — 1024 until bilby-voyager's five recorders
+/// dropped ~2.5 % of their packets at every load (2026-10-22), then 16,384 —
+/// was ~150 ms and then ~2.4 s of the first, but let the second hold hundreds
+/// of megabytes on a stalled disk. Each message is charged its payload plus
+/// [`MESSAGE_OVERHEAD`], so in time the budget is ~17 s of that SDI feed,
+/// ~25 s of 1316-byte datagrams at 10 Mbit/s and ~27 s of a 10 Mbit/s
+/// frame-per-message feed.
+const WRITER_QUEUE_BYTES: usize = 32 * 1024 * 1024;
+/// What one queued message costs beyond its payload: its slot in the queue,
+/// the shared header the broadcast's clone gave its `Bytes`, and the
+/// allocator's own overhead on the payload. Negligible beside a frame, and
+/// half again a 188-byte SDI packet, so counting the payload alone
+/// understated what an SDI recorder's queue really held by a third.
+const MESSAGE_OVERHEAD: usize = 96;
+/// The queue's capacity in messages — a backstop only. It is what the byte
+/// budget admits at the smallest message that records anything, one TS
+/// packet, so the budget always binds first.
+const WRITER_QUEUE_CAP: usize = WRITER_QUEUE_BYTES / (TS_PACKET + MESSAGE_OVERHEAD);
 /// Userspace buffer in front of each segment file.
 ///
 /// Unbuffered, every broadcast packet was its own `write_all` — for an SDI
@@ -383,19 +398,22 @@ async fn spawn_writer_at(
     let stats = state.stats.clone();
 
     let cancel = parent_cancel.child_token();
-    let (writer_tx, writer_rx) = mpsc::channel::<Bytes>(WRITER_QUEUE_CAP);
+    // Each message with the instant it came off the broadcast — see
+    // `WriterState::arrived`.
+    let (writer_tx, writer_rx) = mpsc::channel::<(Bytes, Instant)>(WRITER_QUEUE_CAP);
     let (cmd_tx, cmd_rx) = mpsc::channel::<RecordingCommand>(32);
 
-    // Subscriber task: forwards Bytes onto the writer mpsc, with
-    // drop-on-full + Critical event semantics.
+    // Subscriber task: forwards Bytes onto the writer queue within its byte
+    // budget, with drop-past-it + Critical event semantics.
     {
         let stats_sub = stats.clone();
         let events_sub = events.clone();
         let cancel_sub = cancel.clone();
         let recording_id_sub = recording_id.clone();
+        let budget_sub = state.budget.clone();
         tokio::spawn(async move {
             subscriber_loop(
-                &mut rx, writer_tx, stats_sub, events_sub, cancel_sub, recording_id_sub,
+                &mut rx, writer_tx, budget_sub, stats_sub, events_sub, cancel_sub, recording_id_sub,
             ).await;
         });
     }
@@ -635,6 +653,8 @@ async fn open_writer(
         current_segment: None,
         closer: closer_tx,
         closer_task: tokio::spawn(run_closer(closer, closer_rx)),
+        budget: Arc::new(QueueBudget::default()),
+        arrived: Instant::now(),
         current_segment_started: None,
         accumulated_pts: resumed_pts.unwrap_or(0),
         last_pcr: None,
@@ -658,9 +678,41 @@ async fn open_writer(
     })
 }
 
+/// The writer queue's budget in bytes — see [`WRITER_QUEUE_BYTES`]. The
+/// subscriber charges each message as it queues it, and the writer releases
+/// it as it takes it off.
+#[derive(Debug, Default)]
+struct QueueBudget {
+    queued: AtomicUsize,
+}
+
+impl QueueBudget {
+    fn cost(payload: usize) -> usize {
+        payload + MESSAGE_OVERHEAD
+    }
+
+    /// Charge a message of `payload` bytes, or refuse it — charging nothing —
+    /// if it would take the queue past the budget. Only the subscriber
+    /// charges, so the check and the charge cannot be raced past the budget:
+    /// the writer only ever brings the count down.
+    fn try_charge(&self, payload: usize) -> bool {
+        let cost = Self::cost(payload);
+        if self.queued.load(Ordering::Relaxed) + cost > WRITER_QUEUE_BYTES {
+            return false;
+        }
+        self.queued.fetch_add(cost, Ordering::Relaxed);
+        true
+    }
+
+    fn release(&self, payload: usize) {
+        self.queued.fetch_sub(Self::cost(payload), Ordering::Relaxed);
+    }
+}
+
 async fn subscriber_loop(
     rx: &mut broadcast::Receiver<RtpPacket>,
-    writer_tx: mpsc::Sender<Bytes>,
+    writer_tx: mpsc::Sender<(Bytes, Instant)>,
+    budget: Arc<QueueBudget>,
     stats: Arc<RecordingStats>,
     events: EventSender,
     cancel: CancellationToken,
@@ -672,7 +724,18 @@ async fn subscriber_loop(
             _ = cancel.cancelled() => break,
             recv = rx.recv() => match recv {
                 Ok(pkt) => {
-                    if writer_tx.try_send(pkt.data).is_err() {
+                    let len = pkt.data.len();
+                    // Charged before it is queued, so the writer can never
+                    // release a message the budget has not counted yet.
+                    let queued = budget.try_charge(len)
+                        && match writer_tx.try_send((pkt.data, Instant::now())) {
+                            Ok(()) => true,
+                            Err(_) => {
+                                budget.release(len);
+                                false
+                            }
+                        };
+                    if !queued {
                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         let now = Instant::now();
                         let should_emit = last_lag_event.map(|t| now.duration_since(t) > LAG_EVENT_INTERVAL).unwrap_or(true);
@@ -752,6 +815,19 @@ struct WriterState {
     /// The closer itself, awaited when the writer exits so that a stopped
     /// writer has finished every segment it closed.
     closer_task: JoinHandle<()>,
+    /// The queue's byte budget, released here as each message is taken off.
+    budget: Arc<QueueBudget>,
+    /// When the message being written came off the broadcast.
+    ///
+    /// The writer can be seconds behind the feed — its queue holds up to
+    /// [`WRITER_QUEUE_BYTES`] — so whatever it dates or times by the clock,
+    /// it dates by this rather than by when it got round to the message: the
+    /// wall-clock anchor and its rolling sample, a gap's length, a segment's
+    /// age. Dated on processing instead, a writer catching up on a stalled
+    /// disk would stamp the anchor's sample seconds late, and every clip cut
+    /// through it would come out that far from the moment marked.
+    arrived: Instant,
+    /// When the open segment's first message arrived — see [`Self::arrived`].
     current_segment_started: Option<Instant>,
     accumulated_pts: u64,
     last_pcr: Option<u64>,
@@ -791,7 +867,7 @@ struct OpenSegment {
 
 async fn writer_loop(
     mut state: WriterState,
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<(Bytes, Instant)>,
     mut cmd_rx: mpsc::Receiver<RecordingCommand>,
     cancel: CancellationToken,
 ) {
@@ -803,8 +879,9 @@ async fn writer_loop(
                 None => break,
             },
             data = rx.recv() => match data {
-                Some(buf) => {
-                    if let Err(e) = state.write_chunk(&buf).await {
+                Some((buf, arrived)) => {
+                    state.budget.release(buf.len());
+                    if let Err(e) = state.write_chunk(&buf, arrived).await {
                         tracing::error!(target: "replay", "writer error: {e:#}");
                         state.events.emit_with_details(
                             EventSeverity::Critical,
@@ -847,13 +924,17 @@ impl WriterState {
     /// RTP-wrapped TS. We assume raw TS in the simple Phase 1 path
     /// (assembled and passthrough flows produce raw TS); the RTP-wrap
     /// case is handled by skipping the 12-byte RTP header.
-    async fn write_chunk(&mut self, buf: &Bytes) -> Result<()> {
+    ///
+    /// `arrived` is when the chunk came off the broadcast — see
+    /// [`Self::arrived`].
+    async fn write_chunk(&mut self, buf: &Bytes, arrived: Instant) -> Result<()> {
         // Idle: operator pressed Stop. Drain the broadcast subscriber
         // (so it doesn't lag) but no bytes hit disk and no segments
         // roll. A later Start flips back to Armed and writes resume.
         if self.mode == WriterMode::Idle {
             return Ok(());
         }
+        self.arrived = arrived;
         let ts = strip_rtp_if_present(buf);
         if ts.is_empty() || !ts.len().is_multiple_of(TS_PACKET) {
             // Mis-sized or non-TS payload — don't poison the segment.
@@ -861,10 +942,14 @@ impl WriterState {
             // for them in Phase 1.
             return Ok(());
         }
-        // Roll segment if wall time exceeded.
+        // Roll segment if wall time exceeded — the feed's, not the writer's,
+        // so a segment holds `segment_seconds` of media even when the writer
+        // is catching up on a backlog.
         let need_roll = match self.current_segment_started {
             None => true,
-            Some(started) => started.elapsed().as_secs() >= self.config.segment_seconds as u64,
+            Some(started) => {
+                arrived.saturating_duration_since(started).as_secs() >= self.config.segment_seconds as u64
+            }
         };
         if need_roll {
             self.roll_segment().await?;
@@ -910,7 +995,7 @@ impl WriterState {
                 // through the published dates and a cut made through this
                 // anchor agree with each other, which is what matters.
                 if self.meta.anchor_wall_us.is_none() {
-                    let us = now_unix_us();
+                    let us = self.arrival_wall_us();
                     self.meta.anchor_wall_us = Some(us);
                     self.meta.anchor_pts_90khz = Some(entry.pts_90khz);
                     tracing::info!(
@@ -938,7 +1023,7 @@ impl WriterState {
                     // with no PCR field), and pairing *now* with a tick from
                     // before the gap would teach the mapping a rate that is
                     // wrong by the whole outage for the next sixty seconds.
-                    let us = now_unix_us();
+                    let us = self.arrival_wall_us();
                     let due = self.pending_resume.is_none()
                         && self
                             .meta
@@ -970,7 +1055,7 @@ impl WriterState {
             self.meta.anchor_wall_us,
             self.meta.anchor_pts_90khz,
             self.meta.recent_wall_us.zip(self.meta.recent_pts_90khz),
-            now_unix_us(),
+            self.arrival_wall_us(),
         );
         tracing::debug!(
             recording_id = %self.recording_id,
@@ -1059,7 +1144,7 @@ impl WriterState {
                         pending.anchor_wall_us,
                         pending.anchor_pts_90khz,
                         pending.recent,
-                        now_unix_us(),
+                        self.arrival_wall_us(),
                     );
                     self.accumulated_pts = resumed.max(self.accumulated_pts);
                     tracing::info!(
@@ -1142,7 +1227,7 @@ impl WriterState {
         self.current_segment = Some(OpenSegment {
             id, file, bytes_written: 0, staging_path, final_path, saw_first_idr: false,
         });
-        self.current_segment_started = Some(Instant::now());
+        self.current_segment_started = Some(self.arrived);
         Ok(())
     }
 
@@ -1206,6 +1291,12 @@ impl WriterState {
     /// next segment closed, whose close writes `recording.json` whole.
     fn persist_meta(&self, anchor: bool) {
         let _ = self.closer.try_send(CloseJob::Meta { meta: self.meta.clone(), anchor });
+    }
+
+    /// The wall clock at [`Self::arrived`]: now, less the time the message
+    /// spent queued.
+    fn arrival_wall_us(&self) -> i64 {
+        now_unix_us().saturating_sub(i64::try_from(self.arrived.elapsed().as_micros()).unwrap_or(i64::MAX))
     }
 
     /// The writer exiting — a cancel, or the flow's broadcast or command
@@ -2051,17 +2142,13 @@ mod tests {
         (state, events_rx)
     }
 
-    /// Feed packets `from..to`, one per message, a segment rolling every 20
-    /// — the open one is aged past `segment_seconds` — with a PCR on each and
-    /// a random-access point on every fifth.
-    async fn feed(state: &mut WriterState, from: u64, to: u64) {
+    /// Feed packets `from..to`, one per message, arriving 100 ms apart from
+    /// `t0` — so a 2 s segment rolls every 20 — with a PCR on each and a
+    /// random-access point on every fifth.
+    async fn feed(state: &mut WriterState, t0: Instant, from: u64, to: u64) {
         for n in from..to {
-            if n % 20 == 0 && state.current_segment.is_some() {
-                let aged = Duration::from_secs(state.config.segment_seconds as u64);
-                state.current_segment_started = Instant::now().checked_sub(aged);
-            }
             let data = Bytes::from(ts_packet(n, Some(n * 9_000), n % 5 == 0).to_vec());
-            state.write_chunk(&data).await.unwrap();
+            state.write_chunk(&data, t0 + Duration::from_millis(n * 100)).await.unwrap();
         }
     }
 
@@ -2109,7 +2196,7 @@ mod tests {
         let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
         let (mut state, _events) = writer_in(tmp.path(), config).await;
         let dir = tmp.path().join("rec");
-        feed(&mut state, 0, 50).await;
+        feed(&mut state, Instant::now(), 0, 50).await;
         command(&mut state, true).await;
 
         assert_eq!(segment_files(&dir), ["000000.ts", "000001.ts", "000002.ts"]);
@@ -2144,13 +2231,14 @@ mod tests {
         let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
         let (mut state, _events) = writer_in(tmp.path(), config).await;
         let dir = tmp.path().join("rec");
-        feed(&mut state, 0, 30).await;
+        let t0 = Instant::now();
+        feed(&mut state, t0, 0, 30).await;
         command(&mut state, true).await;
         let last_before_stop = std::fs::read(dir.join("000001.ts")).unwrap();
         let index_before = InMemoryIndex::load(&dir.join("index.bin")).await.unwrap().entries;
 
         command(&mut state, false).await;
-        feed(&mut state, 100, 130).await;
+        feed(&mut state, t0, 100, 130).await;
         command(&mut state, true).await;
 
         assert_eq!(
@@ -2178,7 +2266,7 @@ mod tests {
         // (EISDIR) after the flush and fsync have succeeded — whoever runs
         // the test, root included.
         std::fs::create_dir(dir.join("000000.ts")).unwrap();
-        feed(&mut state, 0, 30).await;
+        feed(&mut state, Instant::now(), 0, 30).await;
         command(&mut state, true).await;
 
         assert!(!dir.join(".tmp/000000.ts").exists(), "the failed segment's staging file was left behind");
@@ -2221,7 +2309,7 @@ mod tests {
         };
         let (mut state, mut events) = writer_in(tmp.path(), config).await;
         let dir = tmp.path().join("rec");
-        feed(&mut state, 0, 30).await;
+        feed(&mut state, Instant::now(), 0, 30).await;
         command(&mut state, true).await;
 
         let below: usize = drain_events(&mut events)
@@ -2231,6 +2319,51 @@ mod tests {
         // Once for segment 0 at the roll, once for segment 1 at the Stop.
         assert_eq!(below, 2);
         assert_eq!(segment_files(&dir), ["000001.ts"]);
+    }
+
+    /// A writer behind its feed dates the clock anchor by when the frame came
+    /// off the broadcast, not by when it got round to writing it — or every
+    /// clip cut through the anchor is off by the backlog.
+    #[tokio::test]
+    async fn the_anchor_is_dated_by_arrival_not_by_the_writers_backlog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _events) = writer_in(tmp.path(), RecordingConfig::default()).await;
+        let backlog = Duration::from_secs(5);
+        let arrived = Instant::now().checked_sub(backlog).unwrap();
+        let data = Bytes::from(ts_packet(0, Some(0), true).to_vec());
+        state.write_chunk(&data, arrived).await.unwrap();
+        let anchor = state.meta.anchor_wall_us.expect("the first random-access point takes the anchor");
+        let behind_us = now_unix_us() - anchor;
+        assert!(
+            (4_500_000..6_000_000).contains(&behind_us),
+            "anchored {behind_us} us before now; it arrived {backlog:?} ago"
+        );
+    }
+
+    /// The queue is bounded by what it holds, not by how many messages: a
+    /// feed that broadcasts whole frames gets the same 32 MiB as one that
+    /// broadcasts single TS packets — and for the smallest message, the
+    /// message cap never binds before the bytes do.
+    #[test]
+    fn the_writer_queue_is_bounded_in_bytes() {
+        let admitted = |payload: usize| {
+            let budget = QueueBudget::default();
+            let mut n = 0usize;
+            while budget.try_charge(payload) {
+                n += 1;
+            }
+            (n, budget)
+        };
+        // RTMP-sized frames: 16,384 of them used to be ~800 MB.
+        let (frames, budget) = admitted(50_000);
+        assert!(frames * 50_000 <= WRITER_QUEUE_BYTES);
+        assert!((frames + 1) * QueueBudget::cost(50_000) > WRITER_QUEUE_BYTES);
+        budget.release(50_000);
+        assert!(budget.try_charge(50_000), "a released message's room was not given back");
+        // SDI-sized messages, overhead and all.
+        let (packets, _) = admitted(TS_PACKET);
+        assert!(packets <= WRITER_QUEUE_CAP, "the message cap would bind before the budget");
+        assert!(packets * TS_PACKET < WRITER_QUEUE_BYTES, "the per-message overhead went uncounted");
     }
 
     /// A cancelled recorder is not finished until it has closed its open
