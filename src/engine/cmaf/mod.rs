@@ -27,6 +27,7 @@ mod cenc;
 mod cenc_boxes;
 mod clips;
 pub(crate) mod codecs;
+mod intake;
 pub(crate) mod encode;
 #[allow(dead_code)]
 pub(crate) mod fmp4;
@@ -84,7 +85,10 @@ pub fn spawn_cmaf_output(
     flow_id: String,
     flow_stats: Arc<crate::stats::collector::FlowStatsAccumulator>,
 ) -> JoinHandle<()> {
-    let mut rx = broadcast_tx.subscribe();
+    // Not the broadcast receiver itself: the loop awaits the origin while it
+    // closes a segment, and the intake is what keeps reading meanwhile — see
+    // `intake`.
+    let mut rx = intake::Intake::spawn(broadcast_tx.subscribe(), intake::INTAKE_BUDGET_BYTES);
 
     let mut egress_static = EgressMediaSummaryStatic {
         transport_mode: Some("cmaf".to_string()),
@@ -1488,7 +1492,7 @@ impl CmafState {
 
 async fn run(
     config: &CmafOutputConfig,
-    rx: &mut broadcast::Receiver<RtpPacket>,
+    rx: &mut intake::Intake,
     stats: Arc<OutputStatsAccumulator>,
     cancel: CancellationToken,
     event_sender: &EventSender,
