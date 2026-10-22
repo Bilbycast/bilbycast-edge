@@ -131,11 +131,25 @@ impl IndexWriter {
         Ok(())
     }
 
-    /// Flush + fsync. Call on segment roll boundaries.
+    /// Flush + fsync.
     pub async fn flush_and_sync(&mut self) -> Result<()> {
         self.file.flush().await?;
         self.file.sync_all().await?;
         Ok(())
+    }
+
+    /// Hand every entry appended so far to the kernel, without the fsync —
+    /// what a [`Self::sync_handle`] elsewhere then makes durable.
+    pub async fn flush(&mut self) -> Result<()> {
+        self.file.flush().await?;
+        Ok(())
+    }
+
+    /// A second handle on the same file, for fsyncing it from another task:
+    /// the recorder's closer makes the index durable after each segment's
+    /// rename, while the writer goes on appending through this one.
+    pub async fn sync_handle(&self) -> Result<File> {
+        Ok(self.file.try_clone().await?)
     }
 }
 

@@ -7,7 +7,7 @@
 //!
 //! # Architecture
 //!
-//! Two tasks per recording, in series:
+//! Three tasks per recording, in series:
 //!
 //! 1. **Subscriber task** (`subscriber_loop`) — `broadcast::Receiver`,
 //!    drops on `RecvError::Lagged`, never blocks the data path. Try-sends
@@ -16,11 +16,20 @@
 //!    category `replay` with `error_code: replay_writer_lagged`.
 //!
 //! 2. **Writer task** (`writer_loop`) — drains the mpsc, parses TS
-//!    packets out of each `RtpPacket`, appends them to the current
-//!    segment file under `<recording_dir>/.tmp/`, tracks PCR for the
-//!    index, runs SMPTE TC extraction via [`TimecodeTracker`], and rolls
-//!    segments on wall-time. On roll: fsync the segment, atomic-rename
-//!    out of `.tmp/`, fsync the index, run retention prune.
+//!    packets out of each `RtpPacket`, appends them through a userspace
+//!    buffer to the current segment file under `<recording_dir>/.tmp/`,
+//!    tracks PCR for the index, runs SMPTE TC extraction via
+//!    [`TimecodeTracker`], and rolls segments on wall-time. Everything it
+//!    does per packet is bookkeeping in memory and buffered writes; a roll
+//!    hands the finished segment to the closer and opens the next.
+//!
+//! 3. **Closer task** (`run_closer`) — finishes segments one at a time, in
+//!    the order they closed: flush and fsync the segment, rename it out of
+//!    `.tmp/`, fsync the index, write `recording.json`, run the retention
+//!    prune. Every fsync and every directory scan the recorder does is
+//!    here, off the receive path, and a disk that cannot keep up makes the
+//!    writer wait for room ([`MAX_PENDING_CLOSES`]) rather than pile up
+//!    staging files.
 //!
 //! Mirrors the slow-consumer pattern in `engine::output_udp` — slow disk
 //! never propagates back to the broadcast channel.
@@ -35,8 +44,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio::sync::{Mutex, broadcast, mpsc};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::RecordingConfig;
@@ -92,9 +101,10 @@ const WRITER_QUEUE_CAP: usize = 16384;
 /// ~0.2 s of a 10 Mbit/s feed per write. Nothing reads a segment before it is
 /// closed and renamed, and the close flushes this buffer first.
 const SEGMENT_WRITE_BUF: usize = 256 * 1024;
-/// Segments whose close (flush, fsync, rename) may run behind the writer at
-/// once. The close is off the receive path; this bounds how far behind it may
-/// fall before the writer waits for the oldest rather than queue more files.
+/// Finished segments that may wait for the closer — besides the one it is
+/// working on — before a roll makes the writer wait for room. The close is
+/// off the receive path; this bounds how far behind it may fall, in staging
+/// files, while the queue above absorbs the wait.
 const MAX_PENDING_CLOSES: usize = 4;
 /// Minimum gap between `replay_writer_lagged` events when the writer is
 /// continuously dropping. Avoids flooding the events feed.
@@ -309,14 +319,34 @@ pub struct RecordingHandle {
     /// cascades to this child, so explicit cancel is rarely needed.
     #[allow(dead_code)]
     pub cancel: CancellationToken,
-    /// Writer task handle — held for ownership; shutdown is driven by
-    /// [`Self::cancel`] (or its parent), not by aborting the handle.
-    #[allow(dead_code)]
-    pub join: JoinHandle<()>,
-    /// Filmstrip writer task handle, when spawned. Same lifecycle as
-    /// `join` — shutdown via `cancel`, not abort.
-    #[allow(dead_code)]
-    pub filmstrip_join: Option<JoinHandle<()>>,
+    /// The writer task, and the filmstrip writer's when there is one.
+    /// Shutdown is driven by [`Self::cancel`] (or its parent), never by
+    /// aborting these: a writer finishes the segments it has closed before
+    /// it exits, and [`Self::finished`] is how a stopping flow waits for it.
+    tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl RecordingHandle {
+    /// Wait for the recorder's tasks to exit after a cancel, at most `within`
+    /// each. `false` if one did not.
+    ///
+    /// A cancelled writer is not done yet: it hands its open segment to the
+    /// closer and waits for every close still pending — flush, fsync, rename
+    /// — before it returns. A flow that restarted without waiting started a
+    /// new writer on the same directory meanwhile, whose first act is to
+    /// unlink every staging file in `.tmp/` as a crash's leftovers: the old
+    /// writer's last segments, still being finished, went with them. And a
+    /// process that exited without waiting abandoned them.
+    pub async fn finished(&self, within: Duration) -> bool {
+        // Taken out under the lock and awaited outside it: the lock guards a
+        // hand-over, not the wait.
+        let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut all = true;
+        for task in tasks {
+            all &= tokio::time::timeout(within, task).await.is_ok();
+        }
+        all
+    }
 }
 
 /// Spawn the subscriber + writer task pair for a recording. Returns
@@ -346,6 +376,73 @@ async fn spawn_writer_at(
     events: EventSender,
     parent_cancel: CancellationToken,
 ) -> Result<RecordingHandle> {
+    // Subscribed first, so what the flow publishes while the recording is
+    // opened waits in the broadcast ring rather than going unrecorded.
+    let mut rx = broadcast_tx.subscribe();
+    let state = open_writer(recording_id.clone(), dir.clone(), &config, events.clone()).await?;
+    let stats = state.stats.clone();
+
+    let cancel = parent_cancel.child_token();
+    let (writer_tx, writer_rx) = mpsc::channel::<Bytes>(WRITER_QUEUE_CAP);
+    let (cmd_tx, cmd_rx) = mpsc::channel::<RecordingCommand>(32);
+
+    // Subscriber task: forwards Bytes onto the writer mpsc, with
+    // drop-on-full + Critical event semantics.
+    {
+        let stats_sub = stats.clone();
+        let events_sub = events.clone();
+        let cancel_sub = cancel.clone();
+        let recording_id_sub = recording_id.clone();
+        tokio::spawn(async move {
+            subscriber_loop(
+                &mut rx, writer_tx, stats_sub, events_sub, cancel_sub, recording_id_sub,
+            ).await;
+        });
+    }
+
+    // Filmstrip subscriber — opt-in via `recording.filmstrip_seconds`.
+    // Sibling broadcast subscriber, drop-on-Lagged, never blocks the
+    // data path. Stats are surfaced on the FlowStats recording snapshot
+    // so the manager UI can render a "frames written" counter alongside
+    // the segment counters.
+    let (filmstrip_stats, filmstrip_join) = if let Some(secs) = config.filmstrip_seconds {
+        let fstats = Arc::new(FilmstripStats::default());
+        let join = spawn_filmstrip_writer(
+            recording_id.clone(),
+            dir,
+            &broadcast_tx,
+            secs,
+            fstats.clone(),
+            events.clone(),
+            cancel.clone(),
+        );
+        (Some(fstats), Some(join))
+    } else {
+        (None, None)
+    };
+
+    let join = tokio::spawn(async move {
+        writer_loop(state, writer_rx, cmd_rx, cancel.clone()).await;
+    });
+
+    Ok(RecordingHandle {
+        recording_id,
+        stats,
+        filmstrip_stats,
+        command_tx: cmd_tx,
+        cancel: parent_cancel.child_token(),
+        tasks: std::sync::Mutex::new(std::iter::once(join).chain(filmstrip_join).collect()),
+    })
+}
+
+/// Open — or resume — the recording in `dir`, and start its closer: the
+/// writer's state, ready for packets, before any task feeds it.
+async fn open_writer(
+    recording_id: String,
+    dir: PathBuf,
+    config: &RecordingConfig,
+    events: EventSender,
+) -> Result<WriterState> {
     tokio::fs::create_dir_all(&dir).await
         .with_context(|| format!("create recording dir {}", dir.display()))?;
     let staging = dir.join(".tmp");
@@ -465,49 +562,20 @@ async fn spawn_writer_at(
         Ordering::Relaxed,
     );
 
-    let cancel = parent_cancel.child_token();
-    let (writer_tx, writer_rx) = mpsc::channel::<Bytes>(WRITER_QUEUE_CAP);
-    let (cmd_tx, cmd_rx) = mpsc::channel::<RecordingCommand>(32);
-
-    // Subscriber task: forwards Bytes onto the writer mpsc, with
-    // drop-on-full + Critical event semantics.
-    {
-        let stats_sub = stats.clone();
-        let events_sub = events.clone();
-        let cancel_sub = cancel.clone();
-        let recording_id_sub = recording_id.clone();
-        let mut rx = broadcast_tx.subscribe();
-        tokio::spawn(async move {
-            subscriber_loop(
-                &mut rx, writer_tx, stats_sub, events_sub, cancel_sub, recording_id_sub,
-            ).await;
-        });
-    }
-
-    // Filmstrip subscriber — opt-in via `recording.filmstrip_seconds`.
-    // Sibling broadcast subscriber, drop-on-Lagged, never blocks the
-    // data path. Stats are surfaced on the FlowStats recording snapshot
-    // so the manager UI can render a "frames written" counter alongside
-    // the segment counters.
-    let (filmstrip_stats, filmstrip_join) = if let Some(secs) = config.filmstrip_seconds {
-        let fstats = Arc::new(FilmstripStats::default());
-        let join = spawn_filmstrip_writer(
-            recording_id.clone(),
-            dir.clone(),
-            &broadcast_tx,
-            secs,
-            fstats.clone(),
-            events.clone(),
-            cancel.clone(),
-        );
-        (Some(fstats), Some(join))
-    } else {
-        (None, None)
-    };
-
     let clips = ClipStore::open(&recording_id, &dir).await?;
     let index_path = dir.join("index.bin");
     let index_writer = IndexWriter::open(&index_path).await?;
+    let (closer_tx, closer_rx) = mpsc::channel::<CloseJob>(MAX_PENDING_CLOSES);
+    let closer = Closer {
+        recording_id: recording_id.clone(),
+        dir: dir.clone(),
+        meta_path: meta_path.clone(),
+        index: index_writer.sync_handle().await?,
+        config: config.clone(),
+        stats: stats.clone(),
+        events: events.clone(),
+        disk_pressure_emitted: false,
+    };
     // Pre-populate the lookup mirror from the on-disk index so post-crash
     // mark-in / mark-out for a PTS in an existing segment still resolves
     // its SMPTE TC. New IDR appends in `write_chunk` push into this same
@@ -555,20 +623,19 @@ async fn spawn_writer_at(
         );
     }
 
-    let writer_state = WriterState {
-        recording_id: recording_id.clone(),
+    Ok(WriterState {
+        recording_id,
         dir,
-        meta_path,
         meta,
         config: config.clone(),
-        stats: stats.clone(),
-        events: events.clone(),
+        stats,
+        events,
         clips,
         index_writer,
         current_segment: None,
-        closing: JoinSet::new(),
+        closer: closer_tx,
+        closer_task: tokio::spawn(run_closer(closer, closer_rx)),
         current_segment_started: None,
-        disk_pressure_emitted: false,
         accumulated_pts: resumed_pts.unwrap_or(0),
         last_pcr: None,
         pending_resume,
@@ -588,20 +655,6 @@ async fn spawn_writer_at(
         index_mirror,
         pending_mark_in: Arc::new(Mutex::new(None)),
         mode: initial_mode,
-    };
-
-    let join = tokio::spawn(async move {
-        writer_loop(writer_state, writer_rx, cmd_rx, cancel.clone()).await;
-    });
-
-    Ok(RecordingHandle {
-        recording_id,
-        stats,
-        filmstrip_stats,
-        command_tx: cmd_tx,
-        cancel: parent_cancel.child_token(),
-        join,
-        filmstrip_join,
     })
 }
 
@@ -686,7 +739,6 @@ struct PendingMarkIn {
 struct WriterState {
     recording_id: String,
     dir: PathBuf,
-    meta_path: PathBuf,
     meta: RecordingMeta,
     config: RecordingConfig,
     stats: Arc<RecordingStats>,
@@ -694,14 +746,13 @@ struct WriterState {
     clips: ClipStore,
     index_writer: IndexWriter,
     current_segment: Option<OpenSegment>,
-    /// Finished segments still being flushed, fsynced and renamed, off the
-    /// receive path — see [`WriterState::finish_segment`].
-    closing: JoinSet<()>,
+    /// Where finished segments go to be closed, in order — see [`Closer`].
+    /// Bounded at [`MAX_PENDING_CLOSES`]: a roll that finds it full waits.
+    closer: mpsc::Sender<CloseJob>,
+    /// The closer itself, awaited when the writer exits so that a stopped
+    /// writer has finished every segment it closed.
+    closer_task: JoinHandle<()>,
     current_segment_started: Option<Instant>,
-    /// Sticky bit so the 80 % disk-pressure Warning fires once per
-    /// pressure episode rather than every segment roll. Cleared via
-    /// hysteresis at 70 % so a recovered system can re-warn later.
-    disk_pressure_emitted: bool,
     accumulated_pts: u64,
     last_pcr: Option<u64>,
     /// A resume whose wall-clock gap has not been measured yet, or an
@@ -746,20 +797,10 @@ async fn writer_loop(
 ) {
     loop {
         tokio::select! {
-            _ = cancel.cancelled() => {
-                state.flush_and_close().await;
-                state.stats.armed.store(false, Ordering::Relaxed);
-                state.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
-                return;
-            }
+            _ = cancel.cancelled() => break,
             cmd = cmd_rx.recv() => match cmd {
                 Some(c) => state.handle_command(c).await,
-                None => {
-                    state.flush_and_close().await;
-                    state.stats.armed.store(false, Ordering::Relaxed);
-                    state.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
-                    return;
-                }
+                None => break,
             },
             data = rx.recv() => match data {
                 Some(buf) => {
@@ -778,31 +819,25 @@ async fn writer_loop(
                         );
                         // Stop writing on error. The recording stays armed
                         // so subsequent commands surface a meaningful state
-                        // rather than a generic "send to closed channel" — but
-                        // future packets are silently dropped until the
-                        // operator stops/restarts. Best-effort close the
-                        // partial segment so we don't leave a half-finished
-                        // .tmp/<id>.ts on disk; on ENOSPC the close itself
-                        // will likely fail too, so unlink the staging path
-                        // as a fallback. Either way the file handle is
-                        // released here, not when the writer task exits.
-                        if let Some(seg) = state.current_segment.take() {
-                            let staging = seg.staging_path.clone();
-                            if close_segment(seg).await.is_err() {
-                                let _ = tokio::fs::remove_file(&staging).await;
-                            }
-                        }
+                        // rather than a generic "send to closed channel" —
+                        // packets are dropped until the next roll boundary
+                        // opens a fresh segment. The partial segment goes to
+                        // the closer like any other, so it lands in order:
+                        // renamed into place if it can be finished, its
+                        // staging file unlinked if not (on ENOSPC the close
+                        // will likely fail too). Marked as reported, since
+                        // this event already says what happened to it.
+                        state.close_current(true).await;
                     }
                 }
-                None => {
-                    state.flush_and_close().await;
-                    state.stats.armed.store(false, Ordering::Relaxed);
-                    state.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
-                    return;
-                }
+                None => break,
             }
         }
     }
+    let stats = state.stats.clone();
+    state.shut_down().await;
+    stats.armed.store(false, Ordering::Relaxed);
+    stats.mode.store(MODE_IDLE, Ordering::Relaxed);
 }
 
 impl WriterState {
@@ -878,22 +913,15 @@ impl WriterState {
                     let us = now_unix_us();
                     self.meta.anchor_wall_us = Some(us);
                     self.meta.anchor_pts_90khz = Some(entry.pts_90khz);
-                    // Persisted immediately: an anchor only in memory is lost
-                    // to the first restart, and every clip cut afterwards
-                    // would fall back to whole segments.
-                    if let Err(e) = write_meta_atomic(&self.meta_path, &self.meta).await {
-                        tracing::warn!(
-                            recording_id = %self.recording_id, error = %e,
-                            "replay: could not persist the wall-clock anchor; \
-                             clip cuts will fall back to whole segments"
-                        );
-                    } else {
-                        tracing::info!(
-                            recording_id = %self.recording_id,
-                            anchor_pts = entry.pts_90khz, anchor_wall_us = us,
-                            "replay: wall-clock anchor taken on the first indexed frame"
-                        );
-                    }
+                    tracing::info!(
+                        recording_id = %self.recording_id,
+                        anchor_pts = entry.pts_90khz, anchor_wall_us = us,
+                        "replay: wall-clock anchor taken on the first indexed frame"
+                    );
+                    // Persisted at once, by the closer: an anchor only in
+                    // memory is lost to the first restart, and every clip cut
+                    // afterwards would fall back to whole segments.
+                    self.persist_meta(true);
                 } else {
                     // Re-take the *second* point of the mapping on a slow tick.
                     //
@@ -919,12 +947,7 @@ impl WriterState {
                     if due {
                         self.meta.recent_wall_us = Some(us);
                         self.meta.recent_pts_90khz = Some(entry.pts_90khz);
-                        if let Err(e) = write_meta_atomic(&self.meta_path, &self.meta).await {
-                            tracing::debug!(
-                                recording_id = %self.recording_id, error = %e,
-                                "replay: could not persist the rolling clock sample"
-                            );
-                        }
+                        self.persist_meta(false);
                     }
                 }
             }
@@ -1106,40 +1129,7 @@ impl WriterState {
     }
 
     async fn roll_segment(&mut self) -> Result<()> {
-        // Close out the current segment first.
-        if let Some(seg) = self.current_segment.take() {
-            self.finish_segment(seg).await;
-            self.stats.segments_written.fetch_add(1, Ordering::Relaxed);
-            // Best-effort sync of the index per-segment.
-            let _ = self.index_writer.flush_and_sync().await;
-            self.run_retention().await;
-            // Update meta with next segment id.
-            self.meta.current_segment_id = self.meta.current_segment_id.wrapping_add(1);
-            // Surface meta-write failures to the operator. On restart the
-            // recovery scan in `WriterState::new` will derive the next
-            // segment id from the directory listing, so a stale meta
-            // doesn't cause segment-id reuse — but the operator should
-            // still see the warning so they can investigate (typically
-            // ENOSPC on the same volume that holds the segments).
-            if let Err(e) = write_meta_atomic(&self.meta_path, &self.meta).await {
-                tracing::warn!(target: "replay", "meta write failed: {e:#}");
-                self.events.emit_with_details(
-                    EventSeverity::Warning,
-                    category::REPLAY,
-                    format!(
-                        "Recording '{}' metadata write failed: {e} (recovery scan will resume from directory listing)",
-                        self.recording_id
-                    ),
-                    None,
-                    serde_json::json!({
-                        "error_code": "replay_metadata_stale",
-                        "replay_event": "metadata_stale",
-                        "recording_id": self.recording_id,
-                        "current_segment_id": self.meta.current_segment_id,
-                    }),
-                );
-            }
-        }
+        self.close_current(false).await;
         // Open the new segment.
         let id = self.meta.current_segment_id;
         let staging_path = self.dir.join(".tmp").join(format!("{:06}.ts", id));
@@ -1156,197 +1146,81 @@ impl WriterState {
         Ok(())
     }
 
-    async fn run_retention(&mut self) {
-        // Snapshot existing segments — exclude .tmp, recording.json,
-        // index.bin, clips.json. Compute total size; remove oldest until
-        // both retention_seconds and max_bytes are satisfied.
-        let mut entries: Vec<(u32, u64, u64)> = Vec::new(); // (id, mtime_unix, size)
-        let mut dir = match tokio::fs::read_dir(&self.dir).await {
-            Ok(d) => d,
-            Err(_) => return,
+    /// Hand the open segment, if there is one, to the closer, and move the
+    /// segment id on past it.
+    ///
+    /// Every path that ends a segment comes through here — a roll, a Stop, a
+    /// write error, the writer exiting — because each needs the same two
+    /// things. The id moves on whatever closed the segment: only the roll
+    /// used to advance it, so after a Stop the next Start opened the stopped
+    /// segment's id again, and the roll after that renamed the new file over
+    /// the last segment before the Stop, with that segment's index entries
+    /// still pointing into it. A write error did the same. And the segment
+    /// goes to the one closer, so renames land in the order segments closed.
+    ///
+    /// `reported` is for the write-error path, whose event already says what
+    /// became of the segment: a close that then fails too is cleaned up
+    /// without a second one.
+    ///
+    /// Waits only when [`MAX_PENDING_CLOSES`] segments are already waiting —
+    /// a disk that cannot keep up — and the queue in front absorbs that.
+    async fn close_current(&mut self, reported: bool) {
+        let Some(seg) = self.current_segment.take() else {
+            return;
         };
-        while let Ok(Some(e)) = dir.next_entry().await {
-            let name = e.file_name();
-            let name_str = match name.to_str() {
-                Some(s) => s,
-                None => continue,
-            };
-            // Match NNNNNN.ts
-            let stem = match name_str.strip_suffix(".ts") {
-                Some(s) => s,
-                None => continue,
-            };
-            let id: u32 = match stem.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let meta = match e.metadata().await {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let mtime = meta
-                .modified().ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            entries.push((id, mtime, meta.len()));
-        }
-        // Oldest first by mtime then id.
-        entries.sort_by_key(|(id, m, _)| (*m, *id));
-        let now_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let mut total: u64 = entries.iter().map(|(_, _, s)| s).sum();
-        let retention = self.effective_retention_seconds();
-        // The just-finalized segment id (`run_retention` is called after
-        // `current_segment.take()` and *before* the id bump in
-        // `roll_segment`, so `meta.current_segment_id` here is the id of
-        // the segment we just closed). Never prune it — losing the most
-        // recent segment would tear out clips that touch the live edge,
-        // and on a fresh-after-stop_recording call the next start would
-        // reuse the id and overwrite the very segment we just kept on
-        // disk for the retention window.
-        let protected_id = self.meta.current_segment_id;
-        let mut max_bytes_unmet = false;
-        for (id, mtime, size) in entries {
-            let too_old = retention > 0
-                && now_unix.saturating_sub(mtime) > retention;
-            let too_big = self.config.max_bytes > 0 && total > self.config.max_bytes;
-            if !too_old && !too_big {
-                break;
-            }
-            if id == protected_id {
-                // Can't satisfy `max_bytes` without deleting the live edge —
-                // remember it and surface a Warning at the end so the
-                // operator sees their cap is smaller than one segment.
-                if too_big {
-                    max_bytes_unmet = true;
-                }
-                continue;
-            }
-            let path = self.dir.join(format!("{:06}.ts", id));
-            if tokio::fs::remove_file(&path).await.is_ok() {
-                total = total.saturating_sub(size);
-                self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        if max_bytes_unmet {
-            self.events.emit_with_details(
-                EventSeverity::Warning,
-                category::REPLAY,
-                format!(
-                    "Recording '{}' max_bytes ({}) is smaller than one segment — \
-                     retention cannot keep usage under the cap without deleting the live edge",
-                    self.recording_id, self.config.max_bytes
-                ),
-                None,
-                serde_json::json!({
-                    "error_code": "replay_max_bytes_below_segment",
-                    "replay_event": "max_bytes_below_segment",
-                    "recording_id": self.recording_id,
-                    "max_bytes": self.config.max_bytes,
-                    "segment_seconds": self.config.segment_seconds,
-                }),
+        self.meta.current_segment_id = seg.id.wrapping_add(1);
+        // The index entries for this segment's packets go to the kernel
+        // before the segment goes to the closer, so the fsync it gives the
+        // index after the rename covers them. A buffered write, not an fsync.
+        let _ = self.index_writer.flush().await;
+        let job = CloseJob::Segment {
+            seg,
+            meta: self.meta.clone(),
+            retention_seconds: self.effective_retention_seconds(),
+            reported,
+        };
+        if self.closer.send(job).await.is_err() {
+            // The closer exits only once the writer has, so this is a closer
+            // that panicked: nothing will finish this segment, and a restart
+            // will find its staging file as a crash's leftover.
+            tracing::error!(
+                target: "replay", recording_id = %self.recording_id,
+                "segment closer is gone; a finished segment was not closed"
             );
         }
-        // Disk-pressure signal — emit once at 80 % of either the
-        // configured per-recording cap or the filesystem free space.
-        // Sticky until usage drops back below 70 % (hysteresis) so a
-        // continuously-pressured recorder doesn't spam the events feed.
-        let pct = self.compute_pressure_pct(total);
-        match (pct, self.disk_pressure_emitted) {
-            (Some(p), false) if p >= 80 => {
-                self.disk_pressure_emitted = true;
-                self.events.emit_with_details(
-                    EventSeverity::Warning,
-                    category::REPLAY,
-                    format!(
-                        "Recording '{}' disk usage at {p}% — free disk before recorder hits ENOSPC",
-                        self.recording_id
-                    ),
-                    None,
-                    serde_json::json!({
-                        "error_code": "replay_disk_pressure",
-                        "replay_event": "disk_pressure",
-                        "recording_id": self.recording_id,
-                        "pct": p,
-                    }),
-                );
-            }
-            (Some(p), true) if p < 70 => {
-                self.disk_pressure_emitted = false;
-            }
-            _ => {}
+    }
+
+    /// Wait until the closer has finished everything handed to it so far.
+    async fn drain_closer(&self) {
+        let (done, finished) = oneshot::channel();
+        if self.closer.send(CloseJob::Drain(done)).await.is_ok() {
+            let _ = finished.await;
         }
     }
 
-    /// Pick the pressure percentage for the recording. When the
-    /// operator set `max_bytes`, treat the cap as authoritative. When
-    /// it's 0 (unlimited), fall back to the filesystem-level signal.
-    fn compute_pressure_pct(&self, total_bytes_in_dir: u64) -> Option<u8> {
-        if self.config.max_bytes > 0 {
-            let pct = (total_bytes_in_dir.saturating_mul(100) / self.config.max_bytes).min(100);
-            return Some(pct as u8);
-        }
-        let (free, total) = super::replay_disk_usage()?;
-        if total == 0 { return None; }
-        let used = total.saturating_sub(free);
-        let pct = (used.saturating_mul(100) / total).min(100);
-        Some(pct as u8)
-    }
-
-    async fn flush_and_close(&mut self) {
-        if let Some(seg) = self.current_segment.take() {
-            let _ = close_segment(seg).await;
-            self.stats.segments_written.fetch_add(1, Ordering::Relaxed);
-        }
-        // A stopped recording must leave every segment it wrote finished on
-        // disk, not some of them still being renamed behind it.
-        while self.closing.join_next().await.is_some() {}
-        let _ = self.index_writer.flush_and_sync().await;
-    }
-
-    /// Close a finished segment beside the writer rather than in it.
+    /// Have the closer write `recording.json` as it stands — the clock
+    /// anchor (`anchor`) or its rolling second sample.
     ///
-    /// The close is a flush, an fsync and a rename. Awaited here, the writer
-    /// stopped taking packets for as long as the disk took to answer, and on a
-    /// RAID volume shared by five recorders that outlasted the queue: every
-    /// roll dropped a burst. Run as its own task, the queue keeps draining.
-    ///
-    /// Nothing reads a segment until it has its final name, and every reader
-    /// already copes with a segment the index names but whose rename has not
-    /// landed, because that window existed before — only the writer was stuck
-    /// inside it. A close that fails is reported, and the next segment is
-    /// still written: if the disk is truly gone, its own writes fail and the
-    /// writer error path takes over.
-    async fn finish_segment(&mut self, seg: OpenSegment) {
-        while self.closing.try_join_next().is_some() {}
-        // Bounded: a disk that cannot keep up makes the writer wait for the
-        // oldest close rather than leave an unbounded tail of staging files.
-        while self.closing.len() >= MAX_PENDING_CLOSES {
-            if self.closing.join_next().await.is_none() {
-                break;
-            }
-        }
-        let recording_id = self.recording_id.clone();
-        let events = self.events.clone();
-        self.closing.spawn(async move {
-            let id = seg.id;
-            if let Err(e) = close_segment(seg).await {
-                tracing::warn!(target: "replay", recording_id = %recording_id, segment = id, "segment close failed: {e:#}");
-                events.emit_with_details(
-                    EventSeverity::Warning,
-                    category::REPLAY,
-                    format!("Recording '{recording_id}' could not finish segment {id}: {e}"),
-                    None,
-                    serde_json::json!({
-                        "error_code": "replay_segment_close_failed",
-                        "replay_event": "segment_close_failed",
-                        "recording_id": recording_id,
-                        "segment_id": id,
-                    }),
-                );
-            }
-        });
+    /// Never waits: a closer with no room is behind on segments, and rather
+    /// than hold the writer for a metadata write, the update rides with the
+    /// next segment closed, whose close writes `recording.json` whole.
+    fn persist_meta(&self, anchor: bool) {
+        let _ = self.closer.try_send(CloseJob::Meta { meta: self.meta.clone(), anchor });
+    }
+
+    /// The writer exiting — a cancel, or the flow's broadcast or command
+    /// channel closing: close the open segment and wait for the closer to
+    /// finish every segment it holds, so a stopped writer leaves each one
+    /// renamed into place, or gone.
+    async fn shut_down(mut self) {
+        self.close_current(false).await;
+        let WriterState { closer, closer_task, mut index_writer, .. } = self;
+        // Its last sender: the closer runs out of work and returns.
+        drop(closer);
+        let _ = closer_task.await;
+        // Covers index entries appended with no segment open to carry them
+        // to the closer — after a write error, until the next roll.
+        let _ = index_writer.flush_and_sync().await;
     }
 
     /// Retention window currently in force. In `Armed` mode this is the
@@ -1354,8 +1228,8 @@ impl WriterState {
     /// snaps to `recording.pre_buffer_seconds` so the on-disk window
     /// stays bounded to "the last N seconds" while the operator hasn't
     /// pressed Start. In `Idle` mode the value is irrelevant — no new
-    /// data is being written and `run_retention` is only called from the
-    /// segment-roll path, which is itself gated on writes happening.
+    /// data is being written, and the only segment closed in `Idle` is the
+    /// one a Stop closes, whose close takes the full retention.
     /// `0` always means unlimited (subject to `max_bytes` and free disk).
     fn effective_retention_seconds(&self) -> u64 {
         match self.mode {
@@ -1446,7 +1320,12 @@ impl WriterState {
                 self.mode = WriterMode::Idle;
                 self.stats.armed.store(false, Ordering::Relaxed);
                 self.stats.mode.store(MODE_IDLE, Ordering::Relaxed);
-                self.flush_and_close().await;
+                // Acked only once the closer has finished every segment this
+                // recording wrote, the one just closed last: a stopped
+                // recording is complete on disk, every segment renamed into
+                // place, in order.
+                self.close_current(false).await;
+                self.drain_closer().await;
                 self.current_segment_started = None;
                 let _ = reply.send(Ok(()));
             }
@@ -1512,6 +1391,315 @@ impl WriterState {
             }
         }
     }
+}
+
+/// Work for the closer, in the order the writer hands it over.
+enum CloseJob {
+    /// A finished segment.
+    Segment {
+        seg: OpenSegment,
+        /// `recording.json` as of the close, the next segment id included.
+        meta: RecordingMeta,
+        /// The retention in force when it closed — see
+        /// [`WriterState::effective_retention_seconds`].
+        retention_seconds: u64,
+        /// Already reported by the writer, whose own write failed: a close
+        /// that fails too is cleaned up without a second event.
+        reported: bool,
+    },
+    /// `recording.json` alone, between segments: the clock anchor
+    /// (`anchor`), or its rolling second sample.
+    Meta { meta: RecordingMeta, anchor: bool },
+    /// Answered once everything handed over before it is done.
+    Drain(oneshot::Sender<()>),
+}
+
+/// The recorder's third task: finishes each segment the writer closes, one
+/// at a time, in the order they closed.
+///
+/// Before it, the roll did all of this in line — and #192 then moved only
+/// the segment's own flush, fsync and rename into concurrent background
+/// tasks. That left the index fsync, the retention scan and the metadata
+/// fsync on the receive path, let renames land out of order (a slow close of
+/// one segment finishing after its successor's, so a reader or a clip export
+/// met a missing *middle* segment and skipped it silently), made the index
+/// durable before the segment it names, and ran retention while the segment
+/// it protects was still in `.tmp/` — invisible to the guard and to the
+/// `replay_max_bytes_below_segment` warning, which then fired only when the
+/// close happened to win the race. One ordered task fixes all four: per
+/// segment it flushes and fsyncs, renames, then makes the index durable,
+/// writes `recording.json`, and runs retention with that segment in place.
+struct Closer {
+    recording_id: String,
+    dir: PathBuf,
+    meta_path: PathBuf,
+    /// A second handle on `index.bin`, fsynced after each rename.
+    index: File,
+    config: RecordingConfig,
+    stats: Arc<RecordingStats>,
+    events: EventSender,
+    /// Sticky bit so the 80 % disk-pressure Warning fires once per
+    /// pressure episode rather than every segment roll. Cleared via
+    /// hysteresis at 70 % so a recovered system can re-warn later.
+    disk_pressure_emitted: bool,
+}
+
+async fn run_closer(mut closer: Closer, mut jobs: mpsc::Receiver<CloseJob>) {
+    // Ends when the writer, its only sender, has gone.
+    while let Some(job) = jobs.recv().await {
+        match job {
+            CloseJob::Segment { seg, meta, retention_seconds, reported } => {
+                closer.finish(seg, &meta, retention_seconds, reported).await;
+            }
+            CloseJob::Meta { meta, anchor } => {
+                if let Err(e) = write_meta_atomic(&closer.meta_path, &meta).await {
+                    if anchor {
+                        tracing::warn!(
+                            recording_id = %closer.recording_id, error = %e,
+                            "replay: could not persist the wall-clock anchor; it goes \
+                             with the next segment's metadata, and until then clip cuts \
+                             after a restart fall back to whole segments"
+                        );
+                    } else {
+                        tracing::debug!(
+                            recording_id = %closer.recording_id, error = %e,
+                            "replay: could not persist the rolling clock sample"
+                        );
+                    }
+                }
+            }
+            CloseJob::Drain(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+impl Closer {
+    async fn finish(&mut self, seg: OpenSegment, meta: &RecordingMeta, retention: u64, reported: bool) {
+        let id = seg.id;
+        let staging = seg.staging_path.clone();
+        match close_segment(seg).await {
+            Ok(()) => {
+                self.stats.segments_written.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                // Never left in `.tmp/`, outside both retention and the
+                // recordings listing, for the next start to sweep up.
+                let _ = tokio::fs::remove_file(&staging).await;
+                if !reported {
+                    self.report_close_failure(id, &e);
+                }
+            }
+        }
+        // The index after the rename, never before: a power cut between the
+        // two leaves a segment the index has not caught up with, not an
+        // index naming a segment that is not there. Best-effort, as the
+        // index is rebuildable from the segments.
+        let _ = self.index.sync_all().await;
+        // Surface meta-write failures to the operator. On restart the
+        // recovery scan in `open_writer` derives the next segment id from
+        // the directory listing, so a stale meta doesn't cause segment-id
+        // reuse — but the operator should still see the warning so they can
+        // investigate (typically ENOSPC on the same volume that holds the
+        // segments).
+        if let Err(e) = write_meta_atomic(&self.meta_path, meta).await {
+            tracing::warn!(target: "replay", "meta write failed: {e:#}");
+            self.events.emit_with_details(
+                EventSeverity::Warning,
+                category::REPLAY,
+                format!(
+                    "Recording '{}' metadata write failed: {e} (recovery scan will resume from directory listing)",
+                    self.recording_id
+                ),
+                None,
+                serde_json::json!({
+                    "error_code": "replay_metadata_stale",
+                    "replay_event": "metadata_stale",
+                    "recording_id": self.recording_id,
+                    "current_segment_id": meta.current_segment_id,
+                }),
+            );
+        }
+        self.run_retention(id, retention).await;
+    }
+
+    /// A segment that could not be finished is a gap in the recording, so it
+    /// is Critical whatever the cause; the code says which kind of gap. The
+    /// disk itself failing — full, over quota, read-only, I/O errors — is
+    /// `replay_disk_full`, the code the writer's own write failures carry
+    /// and the one the manager and the docs know: a close that fails there
+    /// is the same fault surfacing a little later. Anything else — the
+    /// staging file taken away, a rename refused — is
+    /// `replay_segment_close_failed`.
+    fn report_close_failure(&self, id: u32, e: &anyhow::Error) {
+        tracing::error!(
+            target: "replay", recording_id = %self.recording_id, segment = id,
+            "segment close failed: {e:#}"
+        );
+        let (error_code, replay_event) = if is_disk_failure(e) {
+            ("replay_disk_full", "disk_full")
+        } else {
+            ("replay_segment_close_failed", "segment_close_failed")
+        };
+        self.events.emit_with_details(
+            EventSeverity::Critical,
+            category::REPLAY,
+            format!(
+                "Recording '{}' could not finish segment {id}; it is lost: {e}",
+                self.recording_id
+            ),
+            None,
+            serde_json::json!({
+                "error_code": error_code,
+                "replay_event": replay_event,
+                "recording_id": self.recording_id,
+                "segment_id": id,
+            }),
+        );
+    }
+
+    /// Prune by age and size, oldest first — never `protected_id`, the
+    /// segment just finished.
+    async fn run_retention(&mut self, protected_id: u32, retention: u64) {
+        // Snapshot existing segments — exclude .tmp, recording.json,
+        // index.bin, clips.json. Compute total size; remove oldest until
+        // both retention_seconds and max_bytes are satisfied.
+        let mut entries: Vec<(u32, u64, u64)> = Vec::new(); // (id, mtime_unix, size)
+        let mut dir = match tokio::fs::read_dir(&self.dir).await {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        while let Ok(Some(e)) = dir.next_entry().await {
+            let name = e.file_name();
+            let name_str = match name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            // Match NNNNNN.ts
+            let stem = match name_str.strip_suffix(".ts") {
+                Some(s) => s,
+                None => continue,
+            };
+            let id: u32 = match stem.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let meta = match e.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let mtime = meta
+                .modified().ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            entries.push((id, mtime, meta.len()));
+        }
+        // Oldest first by mtime then id.
+        entries.sort_by_key(|(id, m, _)| (*m, *id));
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut total: u64 = entries.iter().map(|(_, _, s)| s).sum();
+        // The just-finished segment is never pruned — losing the most
+        // recent segment would tear out clips that touch the live edge. It
+        // is renamed into place before this runs, so it is in the listing
+        // and in `total`: the guard and the warning below both see it.
+        let mut max_bytes_unmet = false;
+        for (id, mtime, size) in entries {
+            let too_old = retention > 0
+                && now_unix.saturating_sub(mtime) > retention;
+            let too_big = self.config.max_bytes > 0 && total > self.config.max_bytes;
+            if !too_old && !too_big {
+                break;
+            }
+            if id == protected_id {
+                // Can't satisfy `max_bytes` without deleting the live edge —
+                // remember it and surface a Warning at the end so the
+                // operator sees their cap is smaller than one segment.
+                if too_big {
+                    max_bytes_unmet = true;
+                }
+                continue;
+            }
+            let path = self.dir.join(format!("{:06}.ts", id));
+            if tokio::fs::remove_file(&path).await.is_ok() {
+                total = total.saturating_sub(size);
+                self.stats.segments_pruned.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if max_bytes_unmet {
+            self.events.emit_with_details(
+                EventSeverity::Warning,
+                category::REPLAY,
+                format!(
+                    "Recording '{}' max_bytes ({}) is smaller than one segment — \
+                     retention cannot keep usage under the cap without deleting the live edge",
+                    self.recording_id, self.config.max_bytes
+                ),
+                None,
+                serde_json::json!({
+                    "error_code": "replay_max_bytes_below_segment",
+                    "replay_event": "max_bytes_below_segment",
+                    "recording_id": self.recording_id,
+                    "max_bytes": self.config.max_bytes,
+                    "segment_seconds": self.config.segment_seconds,
+                }),
+            );
+        }
+        // Disk-pressure signal — emit once at 80 % of either the
+        // configured per-recording cap or the filesystem free space.
+        // Sticky until usage drops back below 70 % (hysteresis) so a
+        // continuously-pressured recorder doesn't spam the events feed.
+        let pct = self.compute_pressure_pct(total);
+        match (pct, self.disk_pressure_emitted) {
+            (Some(p), false) if p >= 80 => {
+                self.disk_pressure_emitted = true;
+                self.events.emit_with_details(
+                    EventSeverity::Warning,
+                    category::REPLAY,
+                    format!(
+                        "Recording '{}' disk usage at {p}% — free disk before recorder hits ENOSPC",
+                        self.recording_id
+                    ),
+                    None,
+                    serde_json::json!({
+                        "error_code": "replay_disk_pressure",
+                        "replay_event": "disk_pressure",
+                        "recording_id": self.recording_id,
+                        "pct": p,
+                    }),
+                );
+            }
+            (Some(p), true) if p < 70 => {
+                self.disk_pressure_emitted = false;
+            }
+            _ => {}
+        }
+    }
+
+    /// Pick the pressure percentage for the recording. When the
+    /// operator set `max_bytes`, treat the cap as authoritative. When
+    /// it's 0 (unlimited), fall back to the filesystem-level signal.
+    fn compute_pressure_pct(&self, total_bytes_in_dir: u64) -> Option<u8> {
+        if self.config.max_bytes > 0 {
+            let pct = (total_bytes_in_dir.saturating_mul(100) / self.config.max_bytes).min(100);
+            return Some(pct as u8);
+        }
+        let (free, total) = super::replay_disk_usage()?;
+        if total == 0 { return None; }
+        let used = total.saturating_sub(free);
+        let pct = (used.saturating_mul(100) / total).min(100);
+        Some(pct as u8)
+    }
+}
+
+/// Whether a failure is the disk itself: full, over quota, remounted
+/// read-only, or failing I/O.
+fn is_disk_failure(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| matches!(io.raw_os_error(), Some(libc::ENOSPC | libc::EDQUOT | libc::EIO | libc::EROFS)))
 }
 
 /// Walk `<recording_dir>/.tmp/` and unlink any `<NNNNNN>.ts` files
@@ -1851,6 +2039,229 @@ mod tests {
             upstream_leg_id: None,
             sender_timestamp_us: None,
         }
+    }
+
+    /// A writer recording into `parent/rec`, with the receiver for its events.
+    async fn writer_in(
+        parent: &Path,
+        config: RecordingConfig,
+    ) -> (WriterState, mpsc::Receiver<crate::manager::events::Event>) {
+        let (events, events_rx) = crate::manager::events::event_channel();
+        let state = open_writer("rec".into(), parent.join("rec"), &config, events).await.unwrap();
+        (state, events_rx)
+    }
+
+    /// Feed packets `from..to`, one per message, a segment rolling every 20
+    /// — the open one is aged past `segment_seconds` — with a PCR on each and
+    /// a random-access point on every fifth.
+    async fn feed(state: &mut WriterState, from: u64, to: u64) {
+        for n in from..to {
+            if n % 20 == 0 && state.current_segment.is_some() {
+                let aged = Duration::from_secs(state.config.segment_seconds as u64);
+                state.current_segment_started = Instant::now().checked_sub(aged);
+            }
+            let data = Bytes::from(ts_packet(n, Some(n * 9_000), n % 5 == 0).to_vec());
+            state.write_chunk(&data).await.unwrap();
+        }
+    }
+
+    async fn command(state: &mut WriterState, stop: bool) {
+        if stop {
+            let (reply, ack) = oneshot::channel();
+            state.handle_command(RecordingCommand::Stop { reply }).await;
+            ack.await.unwrap().unwrap();
+        } else {
+            let (reply, ack) = oneshot::channel();
+            state.handle_command(RecordingCommand::Start { reply }).await;
+            ack.await.unwrap().unwrap();
+        }
+    }
+
+    /// The `.ts` files in `dir`, sorted.
+    fn segment_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.ends_with(".ts"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn drain_events(rx: &mut mpsc::Receiver<crate::manager::events::Event>) -> Vec<crate::manager::events::Event> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn error_code(e: &crate::manager::events::Event) -> Option<&str> {
+        e.details.as_ref()?.get("error_code")?.as_str()
+    }
+
+    /// Two rolls, then a Stop: every segment the recording wrote is renamed
+    /// into place by the time the Stop is answered, none is left in `.tmp/`,
+    /// `segments_written` counts exactly the files, and every index entry
+    /// lands on the random-access packet it names.
+    #[tokio::test]
+    async fn a_stopped_recording_is_complete_on_disk_and_its_index_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let (mut state, _events) = writer_in(tmp.path(), config).await;
+        let dir = tmp.path().join("rec");
+        feed(&mut state, 0, 50).await;
+        command(&mut state, true).await;
+
+        assert_eq!(segment_files(&dir), ["000000.ts", "000001.ts", "000002.ts"]);
+        assert!(segment_files(&dir.join(".tmp")).is_empty(), "a staging file outlived the Stop");
+        assert_eq!(state.stats.segments_written.load(Ordering::Relaxed), 3);
+        let on_disk: u64 = segment_files(&dir).iter().map(|f| std::fs::metadata(dir.join(f)).unwrap().len()).sum();
+        assert_eq!(on_disk, 50 * TS_PACKET as u64);
+
+        let index = InMemoryIndex::load(&dir.join("index.bin")).await.unwrap();
+        assert_eq!(index.entries.len(), 10);
+        for e in &index.entries {
+            let seg = std::fs::read(dir.join(format!("{:06}.ts", e.segment_id))).unwrap();
+            let p = &seg[e.byte_offset as usize..e.byte_offset as usize + TS_PACKET];
+            assert_eq!(p[0], SYNC_BYTE);
+            assert!(p[3] & 0x20 != 0 && p[5] & 0x40 != 0, "entry {e:?} is not on a random-access packet");
+        }
+        // The id the next segment takes is past every one on disk.
+        let meta: RecordingMeta =
+            serde_json::from_slice(&std::fs::read(dir.join("recording.json")).unwrap()).unwrap();
+        assert_eq!(meta.current_segment_id, 3);
+    }
+
+    /// Stop then Start must not reuse the stopped segment's id.
+    ///
+    /// Only a roll used to move the id on. A Stop closed the open segment
+    /// and left the id where it was, so the Start opened it again and the
+    /// next roll renamed the new file over the last segment before the
+    /// Stop — whose index entries still named byte offsets in it.
+    #[tokio::test]
+    async fn stop_then_start_never_overwrites_the_last_segment_before_the_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let (mut state, _events) = writer_in(tmp.path(), config).await;
+        let dir = tmp.path().join("rec");
+        feed(&mut state, 0, 30).await;
+        command(&mut state, true).await;
+        let last_before_stop = std::fs::read(dir.join("000001.ts")).unwrap();
+        let index_before = InMemoryIndex::load(&dir.join("index.bin")).await.unwrap().entries;
+
+        command(&mut state, false).await;
+        feed(&mut state, 100, 130).await;
+        command(&mut state, true).await;
+
+        assert_eq!(
+            std::fs::read(dir.join("000001.ts")).unwrap(),
+            last_before_stop,
+            "the segment closed by the Stop was overwritten after the Start"
+        );
+        assert_eq!(segment_files(&dir), ["000000.ts", "000001.ts", "000002.ts", "000003.ts"]);
+        // The entries written before the Stop still land on what they named.
+        for e in index_before.iter().filter(|e| e.segment_id == 1) {
+            let o = e.byte_offset as usize;
+            assert_eq!(&last_before_stop[o..o + TS_PACKET], &std::fs::read(dir.join("000001.ts")).unwrap()[o..o + TS_PACKET]);
+        }
+    }
+
+    /// A close that fails leaves no staging file behind, raises a Critical
+    /// event under a documented code, and is not counted as written.
+    #[tokio::test]
+    async fn a_close_that_fails_is_reported_and_its_staging_file_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let (mut state, mut events) = writer_in(tmp.path(), config).await;
+        let dir = tmp.path().join("rec");
+        // A directory where segment 0 is to land: its rename is refused
+        // (EISDIR) after the flush and fsync have succeeded — whoever runs
+        // the test, root included.
+        std::fs::create_dir(dir.join("000000.ts")).unwrap();
+        feed(&mut state, 0, 30).await;
+        command(&mut state, true).await;
+
+        assert!(!dir.join(".tmp/000000.ts").exists(), "the failed segment's staging file was left behind");
+        assert!(dir.join("000001.ts").is_file());
+        assert_eq!(state.stats.segments_written.load(Ordering::Relaxed), 1, "a failed close was counted");
+        let failed: Vec<_> = drain_events(&mut events)
+            .into_iter()
+            .filter(|e| error_code(e) == Some("replay_segment_close_failed"))
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].severity, EventSeverity::Critical);
+        assert_eq!(failed[0].details.as_ref().unwrap()["segment_id"], 0);
+    }
+
+    /// The disk failing under a close is the fault the writer's own writes
+    /// report, under the code the manager and the docs already know.
+    #[test]
+    fn a_close_failing_on_the_disk_itself_is_replay_disk_full() {
+        let io = |errno| anyhow::Error::from(std::io::Error::from_raw_os_error(errno));
+        for errno in [libc::ENOSPC, libc::EDQUOT, libc::EIO, libc::EROFS] {
+            assert!(is_disk_failure(&io(errno)), "errno {errno}");
+            assert!(is_disk_failure(&io(errno).context("rename a -> b")), "errno {errno} under context");
+        }
+        for errno in [libc::EISDIR, libc::ENOENT, libc::EACCES] {
+            assert!(!is_disk_failure(&io(errno)), "errno {errno}");
+        }
+        assert!(!is_disk_failure(&anyhow!("not an I/O error")));
+    }
+
+    /// Retention runs once the segment it protects is in place, so a cap
+    /// below one segment is reported every time rather than when the close
+    /// happened to win a race — and the protected segment survives it.
+    #[tokio::test]
+    async fn a_cap_below_one_segment_is_reported_and_the_newest_segment_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig {
+            segment_seconds: 2,
+            max_bytes: 5 * TS_PACKET as u64,
+            ..RecordingConfig::default()
+        };
+        let (mut state, mut events) = writer_in(tmp.path(), config).await;
+        let dir = tmp.path().join("rec");
+        feed(&mut state, 0, 30).await;
+        command(&mut state, true).await;
+
+        let below: usize = drain_events(&mut events)
+            .iter()
+            .filter(|e| error_code(e) == Some("replay_max_bytes_below_segment"))
+            .count();
+        // Once for segment 0 at the roll, once for segment 1 at the Stop.
+        assert_eq!(below, 2);
+        assert_eq!(segment_files(&dir), ["000001.ts"]);
+    }
+
+    /// A cancelled recorder is not finished until it has closed its open
+    /// segment and every close behind it — what `FlowRuntime::stop` waits on
+    /// before a restarted recorder may sweep `.tmp/`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_recorder_is_finished_only_once_its_segments_are_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let (tx, _) = broadcast::channel::<RtpPacket>(1024);
+        let cancel = CancellationToken::new();
+        let dir = tmp.path().join("rec");
+        let handle = spawn_writer_at(
+            "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
+        )
+        .await
+        .unwrap();
+        for n in 0..20 {
+            tx.send(raw_ts(ts_packet(n, Some(n * 9_000), n % 5 == 0).to_vec())).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.stats.bytes_written.load(Ordering::Relaxed) < 20 * TS_PACKET as u64 {
+            assert!(Instant::now() < deadline, "the writer never took the packets");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        cancel.cancel();
+        assert!(handle.finished(Duration::from_secs(10)).await);
+        assert_eq!(segment_files(&dir), ["000000.ts"]);
+        assert!(segment_files(&dir.join(".tmp")).is_empty());
+        assert_eq!(std::fs::metadata(dir.join("000000.ts")).unwrap().len(), 20 * TS_PACKET as u64);
+        assert_eq!(handle.stats.segments_written.load(Ordering::Relaxed), 1);
     }
 
     /// The recorder against an SDI flow's message rate, measured.
