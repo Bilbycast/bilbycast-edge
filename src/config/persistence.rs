@@ -162,23 +162,38 @@ pub fn save_config_split(
     secrets_path: &Path,
     config: &AppConfig,
 ) -> Result<()> {
+    // secrets.json FIRST — see the ordering note above.
+    save_split_secrets(secrets_path, config)?;
+    save_split_config(config_path, config)
+}
+
+/// The first half of [`save_config_split`]: write `secrets.json` alone, from
+/// the secrets in `config`. Writes nothing when `config` holds none, as the
+/// split save always has.
+///
+/// This is the file that decides which secrets a restart holds, and it is
+/// one atomic replacement: `Err` leaves it exactly as it was (the rename is
+/// the last step that can fail), `Ok` means it holds `config`'s secrets. A
+/// caller that has to know which secret a restart presents — `rotate_secret`
+/// — decides on this rather than on the two-file save, which can fail at
+/// `config.json` after this has landed.
+pub fn save_split_secrets(secrets_path: &Path, config: &AppConfig) -> Result<()> {
     let secrets = SecretsConfig::extract_from(config);
-
-    // Write encrypted secrets to secrets.json FIRST (only if there are any) —
-    // see the ordering note above.
-    if !secrets.is_empty() {
-        let secrets_dir = secrets_path.parent().unwrap_or(Path::new("."));
-        let machine_seed = crypto::get_machine_seed(secrets_dir)
-            .context("Failed to obtain machine seed for secrets encryption")?;
-        save_secrets(secrets_path, &secrets, &machine_seed)?;
+    if secrets.is_empty() {
+        return Ok(());
     }
+    let secrets_dir = secrets_path.parent().unwrap_or(Path::new("."));
+    let machine_seed = crypto::get_machine_seed(secrets_dir)
+        .context("Failed to obtain machine seed for secrets encryption")?;
+    save_secrets(secrets_path, &secrets, &machine_seed)
+}
 
-    // Then the stripped config to config.json
+/// The second half of [`save_config_split`]: write `config.json` alone, with
+/// `config`'s secrets stripped out.
+pub fn save_split_config(config_path: &Path, config: &AppConfig) -> Result<()> {
     let mut stripped = config.clone();
     stripped.strip_secrets();
-    save_config(config_path, &stripped)?;
-
-    Ok(())
+    save_config(config_path, &stripped)
 }
 
 /// Async wrapper around [`save_config_split`] that offloads the blocking
@@ -196,6 +211,28 @@ pub async fn save_config_split_async(
     })
     .await
     .context("Config save task panicked")?
+}
+
+/// Async wrapper around [`save_split_secrets`], on the blocking pool like
+/// [`save_config_split_async`].
+pub async fn save_split_secrets_async(
+    secrets_path: std::path::PathBuf,
+    config: AppConfig,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || save_split_secrets(&secrets_path, &config))
+        .await
+        .context("Secrets save task panicked")?
+}
+
+/// Async wrapper around [`save_split_config`], on the blocking pool like
+/// [`save_config_split_async`].
+pub async fn save_split_config_async(
+    config_path: std::path::PathBuf,
+    config: AppConfig,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || save_split_config(&config_path, &config))
+        .await
+        .context("Config save task panicked")?
 }
 
 /// Load secrets from a JSON file, decrypting if encrypted.

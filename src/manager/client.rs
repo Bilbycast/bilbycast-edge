@@ -21,7 +21,7 @@ use tokio_tungstenite::tungstenite::Message;
 use super::events::{Event, EventSeverity, build_event_envelope, category};
 
 use crate::config::models::{AppConfig, FlowAssembly, FlowConfig, FlowGroupConfig, InputDefinition, OutputConfig, ResolvedFlow};
-use crate::config::persistence::save_config_split_async;
+use crate::config::persistence::{save_config_split_async, save_split_config_async, save_split_secrets_async};
 use crate::config::secrets::SecretsConfig;
 use crate::config::validation::{
     validate_config, validate_flow, validate_input_definition, validate_output,
@@ -1779,9 +1779,16 @@ async fn persist_credentials(
 /// Save `node_secret` as the secret this node presents, with the node ID it
 /// belongs to, in the running config and in `config.json` / `secrets.json`.
 ///
-/// The files are written from a copy first, and the running config takes the
-/// change only once that write succeeded, so a failed write leaves both on
-/// what they held — never on a secret the edge then refuses to acknowledge.
+/// `Ok` and `Err` say what `secrets.json` holds, because that file alone
+/// decides which secret a restart presents. It is written first and on its
+/// own, from a copy: `Err` means it could not be written and is as it was,
+/// and so is the running config. Once it holds the secret the running config
+/// takes it too, whatever `config.json` then does — a two-file save that
+/// failed at `config.json` used to be reported as nothing saved, with the
+/// new secret already in `secrets.json`, so a rotation was refused and the
+/// next restart presented the secret the manager had been told to discard.
+/// A `config.json` that cannot be rewritten is only logged: it holds the
+/// node ID, which a rotation does not change, and none of the secrets.
 /// The registration token goes: a node presenting a secret has spent it.
 ///
 /// Only ever writes a secret, never clears one: a `PUT /api/v1/config` of the
@@ -1803,10 +1810,17 @@ async fn save_node_secret(
     mgr.node_id = Some(node_id.to_string());
     mgr.node_secret = Some(node_secret.to_string());
     mgr.registration_token = None;
-    save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), next.clone())
+    save_split_secrets_async(secrets_path.to_path_buf(), next.clone())
         .await
         .map_err(|e| e.to_string())?;
     *cfg = next;
+    if let Err(e) = save_split_config_async(config_path.to_path_buf(), cfg.clone()).await {
+        tracing::warn!(
+            "The node secret is saved to {}, but {} could not be rewritten: {e}",
+            secrets_path.display(),
+            config_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -1830,11 +1844,13 @@ fn emit_credentials_not_saved(events: &super::events::EventSender, during: &str,
 /// present it from the next authentication.
 ///
 /// The order is save, answer, adopt — bilbycast-relay's, for the same
-/// reasons. A secret the edge could not save is refused (`success: false`,
-/// `config_persist_failed`): the manager keeps the old one, and the edge goes
-/// on presenting it. Acknowledging it instead would have the manager store a
-/// secret the files do not hold, and the node would be locked out at its
-/// next restart.
+/// reasons. A secret the edge could not write to `secrets.json` is refused
+/// (`success: false`, `config_persist_failed`): the manager keeps the old
+/// one, and the edge goes on presenting it, as `secrets.json` does.
+/// Acknowledging it instead would have the manager store a secret a restart
+/// does not present, and the node would be locked out at its next restart.
+/// One `secrets.json` took is acknowledged even when `config.json` could not
+/// be rewritten — see [`save_node_secret`].
 ///
 /// Which secret goes first afterwards depends on whether the answer left —
 /// see [`LinkCredentials::rotating`]. When it never did, the manager cannot
@@ -10036,6 +10052,21 @@ mod manager_link_tests {
             LinkCredentials::shared(self.manager.clone())
         }
 
+        /// Write the running config to the files, as an edge that has been
+        /// running has them.
+        async fn save(&self) {
+            let config = self.deps.app_config.read().await.clone();
+            crate::config::persistence::save_config_split(&self.deps.config_path, &self.deps.secrets_path, &config)
+                .unwrap();
+        }
+
+        /// Make every later write of the file at `path` fail where it starts
+        /// — its temporary sibling is a directory — and leave the other file
+        /// writable. A full disk fails the bigger file alone the same way.
+        fn block_writes_to(path: &Path) {
+            std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+        }
+
         /// What a restart would read: the secret in the files.
         fn secret_on_disk(&self) -> Option<String> {
             crate::config::persistence::load_config_split(&self.deps.config_path, &self.deps.secrets_path)
@@ -10305,6 +10336,103 @@ mod manager_link_tests {
         let mut held = lock_credentials(&creds);
         assert_eq!(held.config.node_secret.as_deref(), Some(OLD));
         assert!(!held.accepted(), "a refused secret is not a candidate");
+    }
+
+    /// `secrets.json` alone decides what a restart presents, so a secret it
+    /// took is acknowledged though `config.json` could not be rewritten. The
+    /// two-file save used to call that a failure: the rotation was refused,
+    /// the manager kept the old secret, and `secrets.json` held the new one,
+    /// which the next restart presented and the manager refused for good.
+    #[tokio::test]
+    async fn a_secret_saved_beside_an_unwritable_config_json_is_acknowledged() {
+        let mut edge = Edge::new(manager_config(Some(OLD), None));
+        edge.save().await;
+        Edge::block_writes_to(&edge.deps.config_path);
+        let creds = edge.credentials();
+
+        let (_, ack) = edge
+            .session(&creds, |mut ws| async move {
+                authenticate(&mut ws, auth_ok()).await;
+                rotate(&mut ws, NEW).await
+            })
+            .await;
+        assert_eq!(ack["success"], true, "{ack}");
+        assert_eq!(edge.secret_on_disk().as_deref(), Some(NEW));
+        assert_eq!(
+            edge.deps.app_config.read().await.manager.as_ref().unwrap().node_secret.as_deref(),
+            Some(NEW),
+            "the running config must hold what secrets.json holds"
+        );
+        presents(&creds, NEW).await;
+        let mut held = lock_credentials(&creds);
+        held.rejected();
+        assert_eq!(held.config.node_secret.as_deref(), Some(OLD), "the previous secret is the fallback");
+    }
+
+    /// The other way round: `secrets.json` cannot take the secret while
+    /// `config.json` could. Nothing a restart reads has changed, so the
+    /// rotation is refused, and the running config and the credentials stay
+    /// where the file is.
+    #[tokio::test]
+    async fn a_secret_secrets_json_cannot_take_is_refused_though_config_json_is_writable() {
+        let edge = Edge::new(manager_config(Some(OLD), None));
+        edge.save().await;
+        Edge::block_writes_to(&edge.deps.secrets_path);
+        let creds = edge.credentials();
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        rotate_node_secret(
+            "rotate-1",
+            &rotate_command(NEW)["payload"]["action"],
+            &creds,
+            &edge.deps.app_config,
+            &edge.deps.config_path,
+            &edge.deps.secrets_path,
+            edge.deps.tunnel_manager.event_sender(),
+            &out_tx,
+        )
+        .await;
+
+        let ack: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap().json).unwrap();
+        assert_eq!(ack["payload"]["success"], false, "{ack}");
+        assert_eq!(ack["payload"]["error_code"], "config_persist_failed", "{ack}");
+        assert_eq!(edge.secret_on_disk().as_deref(), Some(OLD));
+        let running = edge.deps.app_config.read().await;
+        assert_eq!(running.manager.as_ref().unwrap().node_secret.as_deref(), Some(OLD));
+        let mut held = lock_credentials(&creds);
+        assert_eq!(held.config.node_secret.as_deref(), Some(OLD));
+        assert!(!held.accepted(), "a refused secret is not a candidate");
+    }
+
+    /// An acknowledgement that never left puts the previous secret back in
+    /// `secrets.json` with `config.json` unwritable too, and the running
+    /// config follows the file: a partial write used to leave the running
+    /// config on the new secret and the file on the old, for the next
+    /// unrelated config save to write the new one back.
+    #[tokio::test]
+    async fn a_rollback_beside_an_unwritable_config_json_leaves_the_running_config_on_the_file() {
+        let edge = Edge::new(manager_config(Some(OLD), None));
+        edge.save().await;
+        Edge::block_writes_to(&edge.deps.config_path);
+        let creds = edge.credentials();
+        let (out_tx, out_rx) = mpsc::channel(1);
+        drop(out_rx);
+        rotate_node_secret(
+            "rotate-1",
+            &rotate_command(NEW)["payload"]["action"],
+            &creds,
+            &edge.deps.app_config,
+            &edge.deps.config_path,
+            &edge.deps.secrets_path,
+            edge.deps.tunnel_manager.event_sender(),
+            &out_tx,
+        )
+        .await;
+
+        assert_eq!(edge.secret_on_disk().as_deref(), Some(OLD));
+        assert_eq!(
+            edge.deps.app_config.read().await.manager.as_ref().unwrap().node_secret.as_deref(),
+            Some(OLD)
+        );
     }
 
     /// Registration handed its credentials back in the session's `Ok` value:
