@@ -176,8 +176,9 @@ silently `set_len`s an `index.bin` whose length is not a multiple of 24
 down to the last whole entry and continues to append, and every reader
 (`InMemoryIndex::load`) ignores the trailing partial entry the same way.
 Nothing else is validated (no magic, no CRC), and no event or log line
-is emitted — `replay_recovery_alert` covers `.tmp` orphans and a corrupt
-`recording.json`, not the index.
+is emitted for a corrupt or truncated index — `replay_recovery_alert`
+reads `index.bin` only for the segment ids it names (see Crash recovery
+item 4), never for its integrity.
 
 ### The wall-clock anchor
 
@@ -761,7 +762,8 @@ edges keep accepting the legacy shape.
   same partial tail, and the writer keeps appending. There is no CRC
   or content validation, no `replay_index_corrupt` event, and nothing
   is surfaced to the operator (the start-up `replay_recovery_alert`
-  covers `.tmp` orphans and `recording.json`, not the index). Phase 2
+  reads `index.bin` only for the segment ids it names, not for
+  corruption). Phase 2
   will rebuild from segments at open time.
 - **Clip IDs are edge-side generated.** Cross-edge collision
   handling isn't in scope — clip IDs are scoped to a recording.
