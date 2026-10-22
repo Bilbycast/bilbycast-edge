@@ -886,6 +886,9 @@ struct CmafState {
     /// A decodable non-AAC audio source with no `audio_encode` has been
     /// reported.
     audio_needs_encode_warned: bool,
+    /// How long the packet being processed waited in the intake — how far
+    /// behind its feed this output is. See [`CmafState::arrival_now`].
+    intake_wait: std::time::Duration,
 }
 
 struct CencRuntime {
@@ -920,14 +923,16 @@ async fn restore_published_window(
 ) -> Option<RestoredWindow> {
     // Its own budget, and racing the cancel token.
     //
-    // This is awaited between subscribing the broadcast receiver and entering
-    // the packet loop, so every second it spends is a second the output is not
-    // draining its channel — at the default capacity, about seventeen seconds
-    // of headroom at 10 Mbps before the output opens on a `Lagged` and the
-    // window gains a hole at exactly the join the restore exists to make
-    // seamless. The clip client's 60 s request timeout is sized for pulling
-    // whole segments, not for a startup preflight, and an origin that accepts
-    // the connection and then stalls holds the whole of it.
+    // This is awaited between subscribing and entering the packet loop, so
+    // every second it spends is a second the output falls behind its feed.
+    // The intake keeps the broadcast drained meanwhile, but its budget is
+    // finite — about fifteen seconds of a 10 Mbit/s SDI feed — and past it the
+    // output opens on a `Lagged` and the window gains a hole at exactly the
+    // join the restore exists to make seamless; well before that, a backlog is
+    // latency on every viewer's live edge. The clip client's 60 s request
+    // timeout is sized for pulling whole segments, not for a startup
+    // preflight, and an origin that accepts the connection and then stalls
+    // holds the whole of it.
     //
     // A window is a nicety; the media path is not. Three seconds is ample for
     // a manifest, and a stop arriving during it is honoured rather than waited
@@ -1341,7 +1346,24 @@ impl CmafState {
             timeline_jump_logged: None,
             mpeg2_warned: false,
             audio_needs_encode_warned: false,
+            intake_wait: std::time::Duration::ZERO,
         }
+    }
+
+    /// The wall clock as of when the packet being processed arrived: now,
+    /// less the time it waited in the intake.
+    ///
+    /// What a segment is dated by. The intake lets an output fall seconds
+    /// behind its feed rather than lose packets, and a segment closed from
+    /// that backlog was dated as if its packets had just arrived: the flow's
+    /// epoch absorbed the lag, and past `EPOCH_REANCHOR_SECS` re-anchored —
+    /// an `#EXT-X-DISCONTINUITY` and a jump in the dates on every rendition,
+    /// over a slow upload. Dated by arrival, how far behind the output runs
+    /// does not reach the dates at all. While it keeps up the wait is
+    /// microseconds, and this is the `Utc::now()` it always was.
+    fn arrival_now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+            - chrono::Duration::from_std(self.intake_wait).unwrap_or(chrono::Duration::zero())
     }
 
     /// A source timestamp of `track` on this output's timeline
@@ -1780,6 +1802,7 @@ async fn run(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
+                        state.intake_wait = rx.waited();
                         let payload = if packet.is_raw_ts {
                             &packet.data[..]
                         } else if packet.data.len() > RTP_HEADER_MIN {
@@ -2410,7 +2433,12 @@ async fn push_video_sample(
     // It also takes the origin's latency out of every *ordinary* sample, where
     // the filter had been absorbing it, and stops two renditions publishing to
     // different origins disagreeing by the difference in their response times.
-    let closed_at = chrono::Utc::now();
+    //
+    // And as of the arrival of the packet that closed the segment, not of its
+    // processing: the same latency, come back through the intake's queue — a
+    // wait on the origin now leaves the output behind its feed rather than
+    // short of packets. See `CmafState::arrival_now`.
+    let closed_at = state.arrival_now();
 
     // The init is published — first time, periodic republish, or a new
     // generation — AFTER the segment this push closed has entered the
@@ -3487,9 +3515,10 @@ async fn handle_ll_cmaf(
     // Before anything here can wait on the origin — the init republish just
     // below, and the closing PUT's `finish()` after it. `push()` cut the
     // segment a few microseconds ago in `handle_video`, and this is the instant
-    // the row that closes below is dated from. See the same sample on the plain
-    // path for what sampling after an upload does to the flow's epoch.
-    let closed_at = chrono::Utc::now();
+    // the row that closes below is dated from — as of the closing packet's
+    // arrival. See the same sample on the plain path for what sampling after
+    // an upload, or after a wait in the intake, does to the flow's epoch.
+    let closed_at = state.arrival_now();
 
     // On a new segment boundary, finalise the previous LL PUT and open a new
     // one — before the init publish, whatever state the init is in. A
@@ -4040,7 +4069,10 @@ async fn publish_ll_hls(
         }),
         config.segment_duration_secs,
         flow_id,
-        chrono::Utc::now(),
+        // As of the packet's arrival, like the rows that close: the open row
+        // is dated only while this agrees with the flow's epoch, and an
+        // output working through a backlog would otherwise publish it bare.
+        state.arrival_now(),
     );
     let hints = LowLatencyHints {
         part_target_secs: config.chunk_duration_ms as f64 / 1000.0,
@@ -4960,6 +4992,65 @@ seg-00042.m4s?token=abc
     /// `secs_f` seconds after `base`.
     fn at(base: chrono::DateTime<chrono::Utc>, secs_f: f64) -> chrono::DateTime<chrono::Utc> {
         base + secs(secs_f)
+    }
+
+    /// A backlog in the intake must not reach the flow's epoch.
+    ///
+    /// The intake lets an output fall behind its feed — seconds behind, on a
+    /// slow origin — rather than lose packets. A segment closed from that
+    /// backlog was dated as if its packets had just arrived, so a 15 s wait on
+    /// the origin carried the flow's epoch past `EPOCH_REANCHOR_SECS`: a
+    /// re-anchor, an `#EXT-X-DISCONTINUITY` and a jump in every rendition's
+    /// dates, over nothing but a slow upload. The close is dated by arrival
+    /// instead — now, less what the intake says the packet waited.
+    #[tokio::test]
+    async fn a_backlog_in_the_intake_is_dated_by_arrival() {
+        // What the output reads: the intake says how long a packet waited,
+        // and the close's sample is that much before now.
+        let (tx, src) = broadcast::channel::<RtpPacket>(16);
+        let mut rx = intake::Intake::spawn(src, intake::INTAKE_BUDGET_BYTES);
+        tx.send(RtpPacket {
+            data: bytes::Bytes::from_static(&[0x47; 188]),
+            sequence_number: 0,
+            rtp_timestamp: 0,
+            recv_time_us: 0,
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        rx.recv().await.unwrap();
+        let mut state = CmafState::new();
+        state.intake_wait = rx.waited();
+        let behind = (chrono::Utc::now() - state.arrival_now()).num_milliseconds();
+        assert!((300..2_000).contains(&behind), "the close was dated {behind} ms back");
+
+        // What that does to the flow's clock. 2 s segments; from segment 5 the
+        // output waits 15 s on the origin, then works through the backlog in
+        // a burst, closing segments 5-12 within milliseconds of each other.
+        let seg = 2.0;
+        let origin = ts("2026-10-22T00:00:00.000Z");
+        let mut by_processing = FlowClock::new(0, seg, at(origin, seg));
+        let mut by_arrival = FlowClock::new(0, seg, at(origin, seg));
+        let mut reanchored_by_processing = false;
+        for n in 0..20u64 {
+            let base = n * 180_000;
+            let arrived = (n + 1) as f64 * seg;
+            let processed = if (5..13).contains(&n) { 27.0 + (n - 5) as f64 * 0.01 } else { arrived };
+            let waited = secs(processed - arrived);
+
+            let (_, disc) = by_processing.date_closed_segment(base, seg, at(origin, processed), "flow-backlog-a");
+            reanchored_by_processing |= disc;
+
+            let (pdt, disc) = by_arrival.date_closed_segment(base, seg, at(origin, processed) - waited, "flow-backlog-b");
+            assert!(!disc, "segment {n}: a backlog re-anchored the flow's timeline");
+            let err = (pdt - at(origin, n as f64 * seg)).num_milliseconds();
+            assert!(err.abs() <= 5, "segment {n} dated {err} ms off its content");
+        }
+        assert!(reanchored_by_processing, "the model no longer shows what dating by processing did");
     }
 
     /// The low-latency path reads the flow clock; it must never steer it.
