@@ -378,7 +378,7 @@ pub struct RecordingHandle {
 
 impl RecordingHandle {
     /// Wait for the recorder's tasks to exit after a cancel, at most `within`
-    /// each. `false` if one did not.
+    /// for all of them. `false` if one did not.
     ///
     /// A cancelled writer is not done yet: it hands its open segment to the
     /// closer and waits for every close still pending — flush, fsync, rename
@@ -387,13 +387,19 @@ impl RecordingHandle {
     /// unlink every staging file in `.tmp/` as a crash's leftovers: the old
     /// writer's last segments, still being finished, went with them. And a
     /// process that exited without waiting abandoned them.
+    ///
+    /// One deadline, not one each: the writer and the filmstrip are cancelled
+    /// together and write to the same volume, so on the disk that holds one
+    /// up the other is held up too, and waiting for each in turn doubled the
+    /// wait a stopping flow — or a node, one flow after another — spent there.
     pub async fn finished(&self, within: Duration) -> bool {
         // Taken out under the lock and awaited outside it: the lock guards a
         // hand-over, not the wait.
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()));
+        let deadline = tokio::time::Instant::now() + within;
         let mut all = true;
         for task in tasks {
-            all &= tokio::time::timeout(within, task).await.is_ok();
+            all &= tokio::time::timeout_at(deadline, task).await.is_ok();
         }
         all
     }
@@ -2633,6 +2639,27 @@ mod tests {
         assert!(segment_files(&dir.join(".tmp")).is_empty());
         assert_eq!(std::fs::metadata(dir.join("000000.ts")).unwrap().len(), 20 * TS_PACKET as u64);
         assert_eq!(handle.stats.segments_written.load(Ordering::Relaxed), 1);
+    }
+
+    /// `finished` waits once for all of a recorder's tasks, not once each:
+    /// the writer and the filmstrip stall on the same disk together, and a
+    /// node stopping waits on every recording flow's.
+    #[tokio::test]
+    async fn finished_waits_once_for_all_of_a_recorders_tasks() {
+        let stuck = || tokio::spawn(tokio::time::sleep(Duration::from_secs(60)));
+        let (command_tx, _commands) = mpsc::channel(1);
+        let handle = RecordingHandle {
+            recording_id: "rec".into(),
+            stats: Arc::default(),
+            filmstrip_stats: None,
+            command_tx,
+            cancel: CancellationToken::new(),
+            tasks: std::sync::Mutex::new(vec![stuck(), stuck()]),
+        };
+        let started = Instant::now();
+        assert!(!handle.finished(Duration::from_secs(1)).await);
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_millis(1_900), "waited {waited:?} on two tasks given 1 s");
     }
 
     /// The recorder against an SDI flow's message rate, measured.

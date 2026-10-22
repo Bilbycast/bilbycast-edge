@@ -1348,17 +1348,35 @@ impl FlowManager {
 
     /// Gracefully stop all running flows, typically called during application shutdown.
     ///
-    /// Iterates over every active flow, cancels its token, and removes it from
-    /// the map. Each flow's input and output tasks will observe the cancellation
-    /// and exit. This method does not return until every flow has been signalled.
+    /// Removes every active flow from the map and stops them all at once, as
+    /// [`Self::stop_flow_group`] does a group's members. Each flow's input and
+    /// output tasks will observe the cancellation and exit. This method does
+    /// not return until every flow's [`FlowRuntime::stop`] has.
+    ///
+    /// At once rather than one after another, because a stop can wait: up to
+    /// 10 s for a recorder to finish closing its segments, on the stalled
+    /// volume that is when a recorder needs it. In turn, a node recording a
+    /// handful of flows spent that once per flow — past systemd's stop
+    /// timeout — before any later flow had even been cancelled.
     pub async fn stop_all(&self) {
         let ids: Vec<String> = self.flows.iter().map(|e| e.key().clone()).collect();
-        for id in ids {
-            if let Some((_, runtime)) = self.flows.remove(&id) {
-                runtime.stop().await;
-            }
-        }
+        let runtimes: Vec<Arc<FlowRuntime>> = ids
+            .iter()
+            .filter_map(|id| self.flows.remove(id).map(|(_, runtime)| runtime))
+            .collect();
+        futures_util::future::join_all(runtimes.iter().map(|runtime| runtime.stop())).await;
         tracing::info!("All flows stopped");
+    }
+
+    /// [`Self::stop_all`] for a process that is exiting, within `budget`:
+    /// `false` if the flows had not all stopped by then.
+    ///
+    /// What is left of a stop past the budget is abandoned — acceptable only
+    /// because the process is about to exit, and needed because it is about
+    /// to be killed: what follows the flows on the way out (the tunnels, the
+    /// bond policy routes) has to run inside the service's stop timeout.
+    pub async fn stop_all_within(&self, budget: std::time::Duration) -> bool {
+        tokio::time::timeout(budget, self.stop_all()).await.is_ok()
     }
 
     /// Return a reference to the global [`StatsCollector`].
@@ -2373,5 +2391,63 @@ mod tests {
         assert_eq!(flow.snapshot().input.packets_lost, 40);
         // `cam` never sends a catalogue, so the start gives up.
         assert!(start.await.expect("join").is_err());
+    }
+
+    /// A flow on its own UDP input that takes its full 1 s allowance to stop:
+    /// it holds a task, as a cross-flow demuxer shim does, that does not end
+    /// when the flow is cancelled — standing in for a recorder whose closes
+    /// outlast its allowance on a stalled disk.
+    async fn start_a_flow_slow_to_stop(fm: &Arc<FlowManager>, id: &str, port: u16) {
+        let cfg = crate::config::models::AppConfig {
+            inputs: vec![input(serde_json::json!({
+                "id": format!("{id}-in"), "name": id, "active": true,
+                "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+            }))],
+            flows: vec![serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "input_ids": [format!("{id}-in")], "output_ids": []
+            }))
+            .expect("flow fixture")],
+            ..Default::default()
+        };
+        let runtime = fm
+            .create_flow(cfg.resolve_flow(&cfg.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+        runtime
+            .foreign_demuxer_shims
+            .lock()
+            .await
+            .push(tokio::spawn(tokio::time::sleep(std::time::Duration::from_secs(60))));
+    }
+
+    /// Every flow is stopped at once: a node whose flows each wait on the way
+    /// out waits as long as the slowest, not the sum — which, at 10 s for each
+    /// recorder on a stalled disk, ran past systemd's stop timeout.
+    #[tokio::test]
+    async fn every_flow_stops_at_once() {
+        let fm = make_fm();
+        for (i, port) in [42371u16, 42372, 42373].into_iter().enumerate() {
+            start_a_flow_slow_to_stop(&fm, &format!("slow-{i}"), port).await;
+        }
+        let started = std::time::Instant::now();
+        fm.stop_all().await;
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(2_500),
+            "three flows each 1 s from stopping took {took:?}"
+        );
+        assert!(fm.flows.is_empty());
+    }
+
+    /// A process shutdown gives its flows no longer than its budget, so what
+    /// follows them still runs before the service manager's kill.
+    #[tokio::test]
+    async fn a_shutdown_waits_on_its_flows_no_longer_than_its_budget() {
+        let fm = make_fm();
+        start_a_flow_slow_to_stop(&fm, "slow", 42374).await;
+        let started = std::time::Instant::now();
+        assert!(!fm.stop_all_within(std::time::Duration::from_millis(200)).await);
+        let took = started.elapsed();
+        assert!(took < std::time::Duration::from_millis(900), "the 200 ms budget took {took:?}");
     }
 }
