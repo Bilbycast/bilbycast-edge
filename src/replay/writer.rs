@@ -333,6 +333,19 @@ pub async fn spawn_writer(
 ) -> Result<RecordingHandle> {
     let recording_id = config.storage_id.clone().unwrap_or_else(|| flow_id.clone());
     let dir = super::recording_dir(&recording_id);
+    spawn_writer_at(recording_id, dir, config, broadcast_tx, events, parent_cancel).await
+}
+
+/// [`spawn_writer`] into a named directory rather than the replay root's, so
+/// a test can record into a directory of its own.
+async fn spawn_writer_at(
+    recording_id: String,
+    dir: PathBuf,
+    config: RecordingConfig,
+    broadcast_tx: broadcast::Sender<RtpPacket>,
+    events: EventSender,
+    parent_cancel: CancellationToken,
+) -> Result<RecordingHandle> {
     tokio::fs::create_dir_all(&dir).await
         .with_context(|| format!("create recording dir {}", dir.display()))?;
     let staging = dir.join(".tmp");
@@ -480,7 +493,7 @@ pub async fn spawn_writer(
         let fstats = Arc::new(FilmstripStats::default());
         let join = spawn_filmstrip_writer(
             recording_id.clone(),
-            super::recording_dir(&recording_id),
+            dir.clone(),
             &broadcast_tx,
             secs,
             fstats.clone(),
@@ -1783,5 +1796,189 @@ mod tests {
         let mut idx = InMemoryIndex::default();
         idx.entries.push(entry(100, 0xFFFFFFFF, false));
         assert!(lookup_smpte_in_index(&idx, 150).is_none());
+    }
+
+    /// One 188-byte TS packet on PID 0x100, its payload stamped with `n` so a
+    /// segment overwritten by a later one reads differently. `pcr_90k` puts a
+    /// PCR in an adaptation field, and `rap` sets its random-access flag —
+    /// which is what the writer indexes.
+    fn ts_packet(n: u64, pcr_90k: Option<u64>, rap: bool) -> [u8; TS_PACKET] {
+        let mut p = [0u8; TS_PACKET];
+        p[0] = SYNC_BYTE;
+        p[1] = 0x41;
+        p[2] = 0x00;
+        let cc = (n & 0x0F) as u8;
+        let mut payload_at = 4;
+        if pcr_90k.is_some() || rap {
+            p[3] = 0x30 | cc;
+            let mut flags = 0u8;
+            if rap {
+                flags |= 0x40;
+            }
+            let af_len = if let Some(base) = pcr_90k {
+                flags |= 0x10;
+                let base = base & ((1u64 << 33) - 1);
+                p[6] = (base >> 25) as u8;
+                p[7] = (base >> 17) as u8;
+                p[8] = (base >> 9) as u8;
+                p[9] = (base >> 1) as u8;
+                p[10] = (((base & 1) as u8) << 7) | 0x7E;
+                p[11] = 0;
+                7
+            } else {
+                1
+            };
+            p[4] = af_len as u8;
+            p[5] = flags;
+            payload_at = 5 + af_len;
+        } else {
+            p[3] = 0x10 | cc;
+        }
+        for (i, b) in p[payload_at..].iter_mut().enumerate() {
+            *b = (n >> ((i % 8) * 8)) as u8;
+        }
+        p
+    }
+
+    fn raw_ts(data: Vec<u8>) -> RtpPacket {
+        RtpPacket {
+            data: Bytes::from(data),
+            sequence_number: 0,
+            rtp_timestamp: 0,
+            recv_time_us: 0,
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        }
+    }
+
+    /// The recorder against an SDI flow's message rate, measured.
+    ///
+    /// An SDI flow broadcasts one 188-byte TS packet per message, about 6,900
+    /// a second at 10 Mbit/s — the shape that made every recorder on
+    /// bilby-voyager drop ~2.5 % of its packets (#190), five sessions to one
+    /// volume. This runs five recorders at that rate for 25 s with 2 s
+    /// segments, so each rolls a dozen times, and reports what they dropped
+    /// and how far the worst of them fell behind its feed. A measurement
+    /// rather than a pass/fail test, because the answer depends on the disk:
+    /// run it on the volume a recorder would use, under whatever else that
+    /// volume carries, e.g.
+    ///
+    /// `TMPDIR=/srv/replay cargo test --bin bilbycast-edge bench_sdi_rate -- --ignored --nocapture`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "a 25 s measurement of five recorders against an SDI message rate"]
+    async fn bench_sdi_rate_through_the_recorder() {
+        const RATE: u64 = 6_900;
+        const SECS: u64 = 25;
+        const RECORDERS: usize = 5;
+        let tmp = tempfile::tempdir().unwrap();
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let mut txs = Vec::new();
+        let mut handles = Vec::new();
+        for r in 0..RECORDERS {
+            let (tx, _) = broadcast::channel::<RtpPacket>(16_384);
+            let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+            let id = format!("bench-{r}");
+            let dir = tmp.path().join(&id);
+            handles.push(
+                spawn_writer_at(id, dir, config, tx.clone(), events.clone(), cancel.clone())
+                    .await
+                    .unwrap(),
+            );
+            txs.push(tx);
+        }
+
+        let published = Arc::new(AtomicU64::new(0));
+        let publisher = {
+            let published = published.clone();
+            // Clones: a flow holds its sender for as long as it runs, and a
+            // recorder stops when the last one goes.
+            let txs = txs.clone();
+            std::thread::spawn(move || {
+                // 69 packets every 10 ms, against absolute deadlines so the
+                // rate holds however long a send takes.
+                let start = Instant::now();
+                let per_tick = RATE / 100;
+                for tick in 0..SECS * 100 {
+                    let due = start + Duration::from_millis(tick * 10);
+                    if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                        std::thread::sleep(wait);
+                    }
+                    for k in 0..per_tick {
+                        let n = tick * per_tick + k;
+                        let pcr = n.is_multiple_of(276).then_some(n * 90_000 / RATE);
+                        let rap = n.is_multiple_of(RATE);
+                        let pkt = raw_ts(ts_packet(n, pcr, rap).to_vec());
+                        for tx in &txs {
+                            let _ = tx.send(pkt.clone());
+                        }
+                        published.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                start.elapsed()
+            })
+        };
+
+        // How far each writer is behind its feed, sampled every 10 ms: what
+        // was published and neither written nor dropped is still queued. And
+        // the longest any writer went without writing while the feed ran.
+        let mut lags_ms: Vec<f64> = Vec::new();
+        let mut longest_stall = Duration::ZERO;
+        let mut progress = [(0u64, Instant::now()); RECORDERS];
+        let byte_rate = (RATE * TS_PACKET as u64) as f64;
+        while !publisher.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let sent = published.load(Ordering::Relaxed) * TS_PACKET as u64;
+            for (h, last) in handles.iter().zip(progress.iter_mut()) {
+                let written = h.stats.bytes_written.load(Ordering::Relaxed);
+                let dropped = h.stats.packets_dropped.load(Ordering::Relaxed) * TS_PACKET as u64;
+                lags_ms.push(sent.saturating_sub(written + dropped) as f64 / byte_rate * 1000.0);
+                if written != last.0 {
+                    *last = (written, Instant::now());
+                }
+                longest_stall = longest_stall.max(last.1.elapsed());
+            }
+        }
+        let elapsed = publisher.join().unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for h in &handles {
+            let (reply, ack) = tokio::sync::oneshot::channel();
+            h.command_tx.send(RecordingCommand::Stop { reply }).await.unwrap();
+            ack.await.unwrap().unwrap();
+        }
+
+        lags_ms.sort_by(f64::total_cmp);
+        let pct = |p: f64| lags_ms[((lags_ms.len() - 1) as f64 * p) as usize];
+        let mut on_disk = 0u64;
+        let mut files = 0u64;
+        for r in 0..RECORDERS {
+            let mut rd = tokio::fs::read_dir(tmp.path().join(format!("bench-{r}"))).await.unwrap();
+            while let Some(e) = rd.next_entry().await.unwrap() {
+                if e.file_name().to_string_lossy().ends_with(".ts") {
+                    files += 1;
+                    on_disk += e.metadata().await.unwrap().len();
+                }
+            }
+        }
+        let sent = published.load(Ordering::Relaxed) * RECORDERS as u64;
+        let dropped: u64 = handles.iter().map(|h| h.stats.packets_dropped.load(Ordering::Relaxed)).sum();
+        let segments: u64 = handles.iter().map(|h| h.stats.segments_written.load(Ordering::Relaxed)).sum();
+        eprintln!(
+            "recorder bench: {RECORDERS} recorders, {sent} packets in {:.2} s ({:.0}/s each); \
+             dropped {dropped} ({:.3} %); writer lag p50 {:.1} ms, p99 {:.1} ms, max {:.1} ms; \
+             longest stall {} ms; segments_written {segments}, {files} files, \
+             {on_disk} bytes on disk of {} published",
+            elapsed.as_secs_f64(),
+            sent as f64 / RECORDERS as f64 / elapsed.as_secs_f64(),
+            dropped as f64 * 100.0 / sent as f64,
+            pct(0.50),
+            pct(0.99),
+            pct(1.0),
+            longest_stall.as_millis(),
+            sent * TS_PACKET as u64,
+        );
+        cancel.cancel();
     }
 }
