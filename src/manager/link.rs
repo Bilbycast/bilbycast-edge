@@ -800,10 +800,12 @@ impl LinkCredentials {
     /// start before the handler hears whether it did — with the new secret
     /// already a candidate, that reconnect still reaches it.
     pub(super) fn rotating(&mut self, new_secret: String) {
+        // Room for it comes from the last fallback, the least likely: the
+        // oldest, the manager's only if every rotation since was lost, or a
+        // rotation whose acknowledgement never left. Pushed first and cut
+        // after, it was the new secret that went whenever four were held.
+        self.fallback_secrets.truncate(MAX_FALLBACK_SECRETS - 1);
         self.fallback_secrets.push(new_secret);
-        // Oldest last, and the least likely: it is the manager's only if every
-        // rotation since was lost.
-        self.fallback_secrets.truncate(MAX_FALLBACK_SECRETS);
     }
 
     /// The acknowledgement of the rotation to `new_secret` was written: the
@@ -1423,11 +1425,15 @@ mod tests {
         let candidates = 1 + creds.fallback_secrets.len();
         assert!(candidates <= 5, "{candidates} candidates would run into the lockout");
 
-        // Unacknowledged rotations stay inside it too.
+        // Unacknowledged rotations stay inside it too, and each is still a
+        // candidate when it is made.
         for i in 11..=20 {
-            creds.rotating(format!("s{i}"));
+            let s = format!("s{i}");
+            creds.rotating(s.clone());
+            assert_eq!(creds.fallback_secrets.last(), Some(&s), "{:?}", creds.fallback_secrets);
+            assert!(creds.fallback_secrets.len() <= MAX_FALLBACK_SECRETS);
         }
-        assert!(creds.fallback_secrets.len() <= MAX_FALLBACK_SECRETS);
+        assert_eq!(creds.fallback_secrets, ["s9", "s8", "s7", "s20"]);
     }
 
     /// A registration replaces whatever was there, fallbacks included.
