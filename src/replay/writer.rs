@@ -27,13 +27,46 @@
 //! 3. **Closer task** (`run_closer`) — finishes segments one at a time, in
 //!    the order they closed: flush and fsync the segment, rename it out of
 //!    `.tmp/`, fsync the index, write `recording.json`, run the retention
-//!    prune. Every fsync and every directory scan the recorder does is
-//!    here, off the receive path, and a disk that cannot keep up makes the
-//!    writer wait for room ([`MAX_PENDING_CLOSES`]) rather than pile up
-//!    staging files.
+//!    prune. Every fsync and directory scan on the roll path is here, off
+//!    the receive path, and a disk that cannot keep up makes the writer
+//!    wait for room ([`MAX_PENDING_CLOSES`]) rather than pile up staging
+//!    files. Two fsyncs stay with the writer: a mark-out persists
+//!    `clips.json` (the file and its directory) before it answers, and the
+//!    writer's exit fsyncs the index once the closer has finished.
 //!
 //! Mirrors the slow-consumer pattern in `engine::output_udp` — slow disk
 //! never propagates back to the broadcast channel.
+//!
+//! # Segment ids
+//!
+//! An id is handed out once in a recording's life. A segment's file, its
+//! `index.bin` entries and the clips cut through them all name it by id, so
+//! an id that came round again would point every one of them at media
+//! recorded later. Three rules keep it so:
+//!
+//! - **Every close moves the id on.** `recording.json`'s
+//!   `current_segment_id` is the lowest id not yet finished — the open
+//!   segment's while one is open, the next to open once it has closed — and a
+//!   roll, a Stop, a write error and the writer exiting all move it past the
+//!   segment they close. A Start after a Stop therefore opens a new id, never
+//!   the stopped one.
+//! - **A writer resumes past every id anything names** ([`open_writer`]): the
+//!   largest of that field, one past the largest segment on disk, and one past
+//!   the largest id `index.bin` names. After a clean stop — a Stop, a flow
+//!   restart, a node restart — the three agree, because the writer exits only
+//!   once the closer has written the field past its last segment, so the
+//!   numbering carries straight on. After a crash the field trails by every
+//!   segment the closer had not finished, while the writer may already have
+//!   indexed them; the index term resumes past those, so their entries name a
+//!   file that is missing rather than media recorded after the restart. An id
+//!   nothing names — a segment lost before its first entry — is used again.
+//! - **A gap in the ids is not the end of the recording.** A crash leaves one
+//!   where the segments it lost were, and so does a close that fails. Readers
+//!   step over it to the next segment on disk (`Reader::advance_segment`; the
+//!   exporter has always skipped a missing segment). Closing such a gap
+//!   instead would mean handing the lost ids out again, and so first cutting
+//!   their entries out of `index.bin` on the strength of a directory scan —
+//!   and a failed close leaves a gap whatever the numbering does.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -164,7 +197,9 @@ struct RecordingMeta {
     created_at_unix: u64,
     /// Configured rolling segment duration.
     segment_seconds: u32,
-    /// Current segment ID (next NNNNNN.ts to write).
+    /// The lowest segment id not yet finished: the open segment's while one
+    /// is open, the next NNNNNN.ts to open once it has closed. Resumed as-is
+    /// — see "Segment ids" in the module docs.
     current_segment_id: u32,
     /// Wall clock at `anchor_pts_90khz`, in **microseconds** since the Unix
     /// epoch — the pair that lets a wall-clock instant be turned into a PTS.
@@ -477,12 +512,21 @@ async fn open_writer(
     //     overwrite finalized segments on the next roll.
     //   * An `index.bin` truncated mid-entry — handled inside
     //     `IndexWriter::open` / `InMemoryIndex::load`, not here.
-    // Scan the directory once: unlink `.tmp/*.ts` orphans and derive the
-    // largest finalized segment id so the next roll picks `max + 1`
-    // regardless of what the meta file says. This is also the recovery
-    // path when `recording.json` deserialise fails.
+    // Scan the directory once: unlink `.tmp/*.ts` orphans and find the
+    // largest finalized segment id, one of the three bounds on the resume
+    // id below. This is also the recovery path when `recording.json`
+    // deserialise fails.
     let recovered_orphans = recover_tmp_orphans(&staging).await;
     let max_finalized_id = scan_max_segment_id(&dir).await;
+    // The index, loaded before the resume id is chosen, because it names ids
+    // the directory and the meta can both miss — see below. `load` aligns a
+    // partial trailing entry down by itself, so it reads what
+    // `IndexWriter::open` will keep. It is also the lookup mirror: post-crash
+    // mark-in / mark-out for a PTS in an existing segment still resolves its
+    // SMPTE TC, and new IDR appends in `write_chunk` push into it.
+    let index_path = dir.join("index.bin");
+    let index_mirror = InMemoryIndex::load(&index_path).await.unwrap_or_default();
+    let max_indexed_id = index_mirror.entries.iter().map(|e| e.segment_id).max();
 
     // Write or update recording.json. Existing recording = resume.
     let meta_path = dir.join("recording.json");
@@ -498,20 +542,35 @@ async fn open_writer(
         None
     };
     let meta_corrupt = meta_existed && existing_meta.is_none();
-    // Pick the next segment id by walking the directory: trust whatever
-    // is on disk over what `recording.json` claims, because the meta
-    // write is best-effort on the roll path. `meta.current_segment_id`
-    // is the *just-finalized* id, so the resume id is `max(disk, meta) + 1`
-    // — except on a fresh recording where both are 0 and we start at 0.
+    // The resume id: past every id anything on disk names — see "Segment
+    // ids" in the module docs.
+    //
+    // `current_segment_id` is the lowest id not yet finished, so it is taken
+    // as it stands, never plus one: after a clean stop it is already one past
+    // the last segment, and adding one more left a hole in the ids that a
+    // reader took for the end of the recording. The directory and the index
+    // each bound it from below. The directory, because the meta is written
+    // after the rename it follows, and can be missing or corrupt. The index,
+    // because the closer writes the meta only once it has finished a segment,
+    // while the writer is already indexing the next — and, on a disk the
+    // closer is behind on, the several after that. A crash in that window
+    // leaves entries for ids neither of the others accounts for, and opening
+    // one of those again would point them into media recorded after the
+    // restart. A fresh recording, with none of the three, starts at 0.
     let meta_seg = existing_meta.as_ref().map(|m| m.current_segment_id);
-    let starting_segment = match (max_finalized_id, meta_seg) {
-        (Some(disk), Some(meta)) => disk.max(meta).saturating_add(1),
-        (Some(disk), None) => disk.saturating_add(1),
-        (None, Some(meta)) if existing_meta.is_some() => meta,
-        _ => 0,
-    };
+    // `Option::max`: any id beats none.
+    let max_used_id = max_finalized_id.max(max_indexed_id);
+    let starting_segment = max_used_id.map(|id| id.saturating_add(1)).max(meta_seg).unwrap_or(0);
+    // Something to report: a crash's leftovers swept up, a meta that could not
+    // be read, or ids in use past the one the meta had reached — the segments
+    // a crash lost while the closer was behind, or a meta write that failed.
+    // Not an id equal to it: that is the segment a crash left open, whose
+    // staging file is the orphan already counted, or one renamed into place
+    // just before the meta caught up, which lost nothing. Nor a meta written
+    // by a build from before every close moved the id on, which held the id
+    // of the last segment rather than the next.
     if recovered_orphans > 0 || meta_corrupt
-        || max_finalized_id.zip(meta_seg).map(|(d, m)| d > m).unwrap_or(false)
+        || max_used_id.zip(meta_seg).is_some_and(|(used, meta)| used > meta)
     {
         events.emit_with_details(
             EventSeverity::Warning,
@@ -581,7 +640,6 @@ async fn open_writer(
     );
 
     let clips = ClipStore::open(&recording_id, &dir).await?;
-    let index_path = dir.join("index.bin");
     let index_writer = IndexWriter::open(&index_path).await?;
     let (closer_tx, closer_rx) = mpsc::channel::<CloseJob>(MAX_PENDING_CLOSES);
     let closer = Closer {
@@ -594,11 +652,6 @@ async fn open_writer(
         events: events.clone(),
         disk_pressure_emitted: false,
     };
-    // Pre-populate the lookup mirror from the on-disk index so post-crash
-    // mark-in / mark-out for a PTS in an existing segment still resolves
-    // its SMPTE TC. New IDR appends in `write_chunk` push into this same
-    // mirror.
-    let index_mirror = InMemoryIndex::load(&index_path).await.unwrap_or_default();
 
     // Resume the pseudo-PTS timeline; do not restart it at zero.
     //
@@ -1583,17 +1636,23 @@ impl Closer {
                 }
             }
         }
-        // The index after the rename, never before: a power cut between the
-        // two leaves a segment the index has not caught up with, not an
-        // index naming a segment that is not there. Best-effort, as the
-        // index is rebuildable from the segments.
+        // The index after the rename, never before, so the fsync issued for
+        // a segment never makes its entries durable while it is still in
+        // `.tmp/`. That is all the ordering buys. The writer is already
+        // appending entries for the open segment, and for any queued behind
+        // this one, and an fsync covers the whole file — as can the kernel's
+        // own writeback — so a power cut can still leave entries naming a
+        // segment that never left `.tmp/`. A restart resumes past every id
+        // the index names, so such an entry names a missing file, never one
+        // written later. Best-effort, as the index is rebuildable from the
+        // segments.
         let _ = self.index.sync_all().await;
-        // Surface meta-write failures to the operator. On restart the
-        // recovery scan in `open_writer` derives the next segment id from
-        // the directory listing, so a stale meta doesn't cause segment-id
-        // reuse — but the operator should still see the warning so they can
-        // investigate (typically ENOSPC on the same volume that holds the
-        // segments).
+        // Surface meta-write failures to the operator. On restart
+        // `open_writer` resumes past the directory listing and the ids in
+        // `index.bin` as well as the meta, so a stale meta doesn't cause
+        // segment-id reuse — but the operator should still see the warning
+        // so they can investigate (typically ENOSPC on the same volume that
+        // holds the segments).
         if let Err(e) = write_meta_atomic(&self.meta_path, meta).await {
             tracing::warn!(target: "replay", "meta write failed: {e:#}");
             self.events.emit_with_details(
@@ -1818,9 +1877,9 @@ async fn recover_tmp_orphans(staging: &Path) -> u64 {
 }
 
 /// Largest `<NNNNNN>.ts` segment id present in the main recording
-/// directory, or `None` on a fresh recording. Used as the source of
-/// truth for resume-after-crash because `recording.json` is best-effort
-/// on the roll path.
+/// directory, or `None` on a fresh recording. One of the three bounds on
+/// the resume id — see [`open_writer`] — because `recording.json` is
+/// written after the rename it follows, and can be missing or corrupt.
 async fn scan_max_segment_id(dir: &Path) -> Option<u32> {
     let mut max_id: Option<u32> = None;
     let mut entries = match tokio::fs::read_dir(dir).await {
@@ -2252,6 +2311,185 @@ mod tests {
             let o = e.byte_offset as usize;
             assert_eq!(&last_before_stop[o..o + TS_PACKET], &std::fs::read(dir.join("000001.ts")).unwrap()[o..o + TS_PACKET]);
         }
+    }
+
+    /// Every byte a replay of the whole recording in `dir` plays.
+    async fn play_whole(dir: &Path) -> Vec<u8> {
+        let mut reader = crate::replay::reader::Reader::open_recording_at("rec", dir.to_path_buf())
+            .await
+            .unwrap();
+        let mut played = Vec::new();
+        while let Some(bundle) = reader.read_bundle(7).await.unwrap() {
+            played.extend_from_slice(&bundle);
+        }
+        played
+    }
+
+    /// Every segment in `dir`, in id order, end to end.
+    fn recorded(dir: &Path) -> Vec<u8> {
+        segment_files(dir).iter().flat_map(|f| std::fs::read(dir.join(f)).unwrap()).collect()
+    }
+
+    /// What a crash leaves behind: whatever the kernel had been handed — the
+    /// segments renamed into place, the index entries appended, the staging
+    /// files — and nothing the process still held: the open segment's
+    /// buffer, the closes it had not done. The closer is let finish what it
+    /// was already given, so drain it first, or stall it, to say where in
+    /// its work the crash fell.
+    async fn crash(mut state: WriterState) {
+        state.index_writer.flush().await.unwrap();
+        let WriterState { closer, closer_task, .. } = state;
+        drop(closer);
+        closer_task.await.unwrap();
+    }
+
+    fn recovery_alert(rx: &mut mpsc::Receiver<crate::manager::events::Event>) -> Option<serde_json::Value> {
+        drain_events(rx)
+            .into_iter()
+            .find(|e| error_code(e) == Some("replay_recovery_alert"))
+            .and_then(|e| e.details)
+    }
+
+    /// A clean stop and restart — a flow restart, a node restart, a DVR
+    /// session re-arming the recorder — carries the numbering straight on,
+    /// with or without a Stop first, and playback runs across the join.
+    ///
+    /// The meta's id is the next to open once a segment has closed. Resumed
+    /// plus one, as when it held the last segment's, it left a hole one id
+    /// wide at every restart, and a replay ended there.
+    #[tokio::test]
+    async fn a_restarted_recording_carries_its_numbering_on_with_no_gap() {
+        for stop_first in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+            let dir = tmp.path().join("rec");
+            let (mut state, _events) = writer_in(tmp.path(), config.clone()).await;
+            feed(&mut state, Instant::now(), 0, 50).await;
+            if stop_first {
+                command(&mut state, true).await;
+            }
+            state.shut_down().await;
+
+            let (mut state, mut events) = writer_in(tmp.path(), config).await;
+            assert_eq!(state.meta.current_segment_id, 3, "stop first: {stop_first}");
+            assert_eq!(recovery_alert(&mut events), None, "a clean restart was reported as a recovery");
+            feed(&mut state, Instant::now(), 0, 25).await;
+            state.shut_down().await;
+
+            assert_eq!(
+                segment_files(&dir),
+                ["000000.ts", "000001.ts", "000002.ts", "000003.ts", "000004.ts"],
+                "stop first: {stop_first}"
+            );
+            assert_eq!(play_whole(&dir).await, recorded(&dir), "stop first: {stop_first}");
+        }
+    }
+
+    /// A recording last closed by a build whose meta held the last segment's
+    /// id rather than the next resumes one past it, and is not reported as a
+    /// recovery: nothing was lost.
+    #[tokio::test]
+    async fn a_meta_naming_the_last_segment_resumes_past_it_unreported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let dir = tmp.path().join("rec");
+        let (mut state, _events) = writer_in(tmp.path(), config.clone()).await;
+        feed(&mut state, Instant::now(), 0, 50).await;
+        state.shut_down().await;
+        let meta_path = dir.join("recording.json");
+        let mut meta: RecordingMeta = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        meta.current_segment_id = 2;
+        write_meta_atomic(&meta_path, &meta).await.unwrap();
+
+        let (state, mut events) = writer_in(tmp.path(), config).await;
+        assert_eq!(state.meta.current_segment_id, 3);
+        assert_eq!(recovery_alert(&mut events), None);
+    }
+
+    /// A crash with a segment open that the index already names: the restart
+    /// resumes past it, so the entries the crash left for it name a missing
+    /// file rather than media recorded after the restart — and a replay
+    /// steps over the gap.
+    #[tokio::test]
+    async fn a_crash_never_hands_out_again_an_id_the_index_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let dir = tmp.path().join("rec");
+        let (mut state, _events) = writer_in(tmp.path(), config.clone()).await;
+        // Segments 0 and 1, then 2 open with two random-access points in it.
+        feed(&mut state, Instant::now(), 0, 50).await;
+        state.drain_closer().await;
+        crash(state).await;
+        let left = InMemoryIndex::load(&dir.join("index.bin")).await.unwrap().entries;
+        assert!(left.iter().any(|e| e.segment_id == 2));
+
+        let (mut state, mut events) = writer_in(tmp.path(), config).await;
+        assert_eq!(state.meta.current_segment_id, 3, "an id the index names was handed out again");
+        let alert = recovery_alert(&mut events).expect("the crash's leftovers are reported");
+        assert_eq!(alert["tmp_orphans_removed"], 1);
+        assert_eq!(alert["next_segment_id"], 3);
+        feed(&mut state, Instant::now(), 0, 45).await;
+        state.shut_down().await;
+
+        assert_eq!(segment_files(&dir), ["000000.ts", "000001.ts", "000003.ts", "000004.ts", "000005.ts"]);
+        assert_eq!(play_whole(&dir).await, recorded(&dir), "a replay stopped at the gap");
+    }
+
+    /// An id nothing names yet is used again: a crash before the open
+    /// segment's first random-access point leaves no entry naming it, so the
+    /// restart carries on with no gap.
+    #[tokio::test]
+    async fn a_crash_before_the_open_segment_is_indexed_leaves_no_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let dir = tmp.path().join("rec");
+        let (mut state, _events) = writer_in(tmp.path(), config.clone()).await;
+        let t0 = Instant::now();
+        feed(&mut state, t0, 0, 40).await;
+        // Rolls to segment 2 on a packet that is not a random-access point.
+        let data = Bytes::from(ts_packet(41, Some(41 * 9_000), false).to_vec());
+        state.write_chunk(&data, t0 + Duration::from_millis(4_100)).await.unwrap();
+        state.drain_closer().await;
+        crash(state).await;
+
+        let (mut state, _events) = writer_in(tmp.path(), config).await;
+        assert_eq!(state.meta.current_segment_id, 2);
+        feed(&mut state, Instant::now(), 0, 25).await;
+        state.shut_down().await;
+        assert_eq!(segment_files(&dir), ["000000.ts", "000001.ts", "000002.ts", "000003.ts"]);
+    }
+
+    /// A crash while the closer is behind — a disk stalling on fsyncs —
+    /// loses every segment it had not finished, and the meta it last wrote
+    /// trails all of them. The restart resumes past every one the index
+    /// names.
+    #[tokio::test]
+    async fn a_crash_with_the_closer_behind_resumes_past_every_segment_it_lost() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let dir = tmp.path().join("rec");
+        let (mut state, _events) = writer_in(tmp.path(), config.clone()).await;
+        let t0 = Instant::now();
+        feed(&mut state, t0, 0, 50).await;
+        state.drain_closer().await;
+        // From here nothing is taken off the closer's queue, as when it is
+        // stuck on a disk that has stopped answering.
+        let (stalled, queued) = mpsc::channel::<CloseJob>(16);
+        drop(std::mem::replace(&mut state.closer, stalled));
+        // Closes 2, 3 and 4, and opens 5.
+        feed(&mut state, t0, 50, 110).await;
+        crash(state).await;
+        drop(queued);
+        assert_eq!(segment_files(&dir), ["000000.ts", "000001.ts"]);
+        let meta: RecordingMeta =
+            serde_json::from_slice(&std::fs::read(dir.join("recording.json")).unwrap()).unwrap();
+        assert_eq!(meta.current_segment_id, 2);
+
+        let (state, mut events) = writer_in(tmp.path(), config).await;
+        assert_eq!(state.meta.current_segment_id, 6, "an id the index names was handed out again");
+        let alert = recovery_alert(&mut events).expect("the lost segments are reported");
+        assert_eq!(alert["tmp_orphans_removed"], 4);
+        assert_eq!(alert["next_segment_id"], 6);
     }
 
     /// A close that fails leaves no staging file behind, raises a Critical
