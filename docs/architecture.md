@@ -421,6 +421,10 @@ this diagram omitted:
 
 - `manager` — WebSocket client to bilbycast-manager: registration, health /
   stats push, and command dispatch (`manager/client.rs::execute_command`).
+  What keeps the link from stranding a node — the staged dial, the handshake
+  backstop, the ping-learned silence watchdog, the write bound and the
+  credentials carried across reconnects — is `manager/link.rs`; see
+  [configuration-guide.md](configuration-guide.md#connection-resilience).
   Event catalogue: [events-and-alarms.md](events-and-alarms.md).
 - `display` — local HDMI / DisplayPort + ALSA playout. Behind the `display`
   feature, Linux only.

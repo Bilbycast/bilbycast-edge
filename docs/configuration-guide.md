@@ -432,7 +432,7 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 {
   "manager": {
     "enabled": true,
-    "url": "wss://manager-host:8443/ws/node",
+    "urls": ["wss://manager-host:8443/ws/node"],
     "accept_self_signed_cert": false,
     "cert_fingerprint": "ab:cd:ef:01:23:45:67:89:..."
   }
@@ -442,7 +442,7 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `enabled` | boolean | No | `false` | Enable the manager connection. |
-| `url` | string | Yes (if enabled) | - | Manager WebSocket URL. Must use `wss://` (TLS required). Example: `"wss://manager-host:8443/ws/node"`. Max 2048 characters. |
+| `urls` | array of string | Yes (if enabled) | - | 1–16 manager WebSocket URLs, each `wss://` (TLS required), at most 2048 characters, no duplicates. A single-manager deployment uses a one-element array; there is no scalar `url`. The edge dials `urls[0]` first and moves to the next entry after every close or failure. |
 | `accept_self_signed_cert` | boolean | No | `false` | Accept self-signed TLS certificates from the manager. **Dev/testing only** — disables all TLS validation. Requires `BILBYCAST_ALLOW_INSECURE=1` environment variable as a safety guard. |
 | `cert_fingerprint` | string | No | `null` | SHA-256 fingerprint of the manager's TLS certificate for certificate pinning. Format: hex with colons, e.g. `"ab:cd:ef:01:23:..."`. When set, connections to servers presenting a different certificate are rejected, even if the certificate is CA-signed. Protects against compromised CAs. The server's fingerprint is logged on first connection. |
 | `registration_token` | string | No | `null` | One-time registration token from the manager. Used on first connection only. After successful registration, the token is cleared and replaced by `node_id` + `node_secret`. **Stored in `secrets.json`.** |
@@ -455,15 +455,24 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 2. Provide the token via the setup wizard (`http://<edge-ip>:8080/setup`) or in `secrets.json`.
 3. Start the edge. It connects to the manager, sends the token, and receives `node_id` + `node_secret`.
 4. Credentials are saved automatically: `node_id` to `config.json`, `node_secret` to `secrets.json`.
-5. The registration token is cleared. Future connections use `node_id` + `node_secret`.
-6. If the connection drops, the edge auto-reconnects with exponential backoff (1s to 60s).
+5. The registration token is cleared. Future connections use `node_id` + `node_secret` — from the very next reconnect, however the registering session ended.
+6. If the connection drops, the edge dials again after a flat 5 s, moving to the next entry in `urls`. The delay never grows.
+
+### Connection resilience
+
+The link is built so that no stall on the manager's side, and no credential change, can leave a node offline until it is restarted (bilbycast-edge#180). Every end of a connection is logged with its cause, and every failure raises a cause-specific "Manager connection lost: …" event (a clean close raises none) — see [events-and-alarms.md](events-and-alarms.md#manager-connection-manager).
+
+- **Dial: 30 s, in stages.** DNS lookup, TCP connect and TLS + WebSocket upgrade share one 30 s deadline, and a timeout names the stage that was still running. When the manager's name resolves to several addresses they are raced Happy-Eyeballs style (families interleaved, the next attempt started 250 ms after the previous one or as soon as it fails), so an address that silently drops SYNs — a broken IPv6 path to a dual-stack manager, a dead A record — cannot hold the dial; the journal names the addresses that did not connect first. A dial that succeeds but takes over 5 s is logged as a warning.
+- **Handshake: 10 s + 10 s, 60 s overall.** Writing the auth frame and waiting for the reply each have 10 s, and the whole attempt — dial included — must have an auth reply within 60 s. That backstop is disarmed the moment the reply is in hand, so it can never cancel the saving of credentials the manager has just issued.
+- **Silence: learned from the manager's pings.** The manager pings every node on its `ws_keepalive_interval_secs` (1–300 s). The edge drops a session that has heard nothing at all for `max(90 s, 4 × the median of the last 8 ping intervals)`, each interval counted as at most 300 s — so 90 s at the default 15 s keepalive, 20 minutes at 300 s. The check is unarmed until the session's first ping, so a manager that predates the keepalive is never dropped for being quiet. Frames are read beside the session's own writes, so an edge busy pushing thumbnails over a slow uplink still hears every ping.
+- **Writes: 300 s each.** A single write to the manager that has not completed in five minutes means the manager has stopped reading, and ends the session. This needs no pings, so it also covers the start of every session and a manager that never pings.
+- **Credentials carry across reconnects.** A registration, a `rotate_secret`, and which secret the manager accepted after a rotation all take effect from the next attempt, however the session that learned them ended. The edge saves a rotated secret **before** acknowledging it (a secret it cannot save is refused), and because it cannot know whether the manager stored it, it keeps the secrets issued since the last one the manager accepted — at most four besides the one it presents, inside the manager's five-refusals lockout — falling back to the next on each refusal and saving whichever the manager accepts.
 
 ### Validation Rules
 
-- `url` must start with `wss://` (plaintext `ws://` is rejected).
-- `url` max 2048 characters.
+- `urls` must hold 1–16 entries, each starting with `wss://` (plaintext `ws://` is rejected), at most 2048 characters, with no duplicates.
 - `registration_token` max 4096 characters.
-- `accept_self_signed_cert: true` is rejected unless `BILBYCAST_ALLOW_INSECURE=1` is set.
+- `accept_self_signed_cert: true` loads, but every connection attempt is refused unless `BILBYCAST_ALLOW_INSECURE=1` is set.
 
 ---
 

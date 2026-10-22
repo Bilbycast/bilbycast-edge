@@ -875,13 +875,36 @@ three published release artefacts carry it. Full reference:
 
 ### Manager Connection (`manager`)
 
-| Severity | Message | Trigger |
-|----------|---------|---------|
-| info | Connected to manager | WebSocket auth succeeded |
-| warning | Manager connection lost, reconnecting | WebSocket closed or errored |
-| critical | Manager authentication failed: {reason} | Auth rejected by manager |
+A connection attempt or a live session that ends in an error raises one
+**"Manager connection lost: …"** Warning, with a constant message per kind of
+loss and the specifics in `details`: `error_code` (below), `reason` (the
+edge's own description, naming the stage that failed — the same text the
+edge logs as `Manager connection to {url} failed: {reason}`) and `url` (the
+manager URL that attempt dialled, without any userinfo, query or fragment).
+The manager coalesces events on their message and keeps the first
+occurrence's `details`, which is why the message varies with the kind: each
+kind keeps its own row and count. A clean end — a close frame, the end of the
+stream, or a write that fails under a broken connection — raises nothing;
+the edge logs it and dials again 5 s later. Events raised while the link is
+down are queued and reach the manager once the next session authenticates.
 
-**Source**: `src/manager/client.rs`
+| Severity | Message | Trigger | `details.error_code` |
+|----------|---------|---------|----------------------|
+| info | Connected to manager | The manager answered the auth frame with `auth_ok` or `register_ack` | — |
+| warning | Manager connection lost: connection settings refused | The settings cannot be used as they stand: a URL that is not `wss://` or cannot be parsed, `accept_self_signed_cert` without `BILBYCAST_ALLOW_INSECURE=1`, or a `cert_fingerprint` verifier that could not be built | `manager_link_settings` |
+| warning | Manager connection lost: could not reach the manager | The dial failed outright: the DNS lookup failed or returned nothing, every resolved address refused the TCP connect, or TLS or the HTTP upgrade failed (certificate rejected, fingerprint mismatch, an answer other than `101`) | `manager_dial_failed` |
+| warning | Manager connection lost: dial timed out | The dial did not finish within 30 s; `reason` names the stage that was still running — DNS lookup, TCP connect, or TLS/WebSocket upgrade | `manager_dial_timeout` |
+| warning | Manager connection lost: handshake timed out | The auth frame could not be written within 10 s, no auth reply came within 10 s, or the whole handshake did not get an auth reply within 60 s | `manager_handshake_timeout` |
+| warning | Manager connection lost: authentication refused | The manager answered `auth_error` (after the Critical below) | `manager_auth_rejected` |
+| warning | Manager connection lost: unexpected reply | The auth reply was not a text frame, not JSON, or not one of `auth_ok` / `register_ack` / `auth_error` | `manager_protocol_error` |
+| warning | Manager connection lost: connection error | The connection broke: a WebSocket error during auth or the session (a reset, a protocol violation), or a close during auth | `manager_connection_error` |
+| warning | Manager connection lost: manager went silent | Nothing heard from the manager for longer than the limit its pings set: `max(90 s, 4 × the median of its last 8 ping intervals)`, each interval counted as at most 300 s. Unarmed until the session's first ping, so a manager that never pings is never dropped for being quiet | `manager_silent` |
+| warning | Manager connection lost: manager stopped reading | One write to the manager (any frame, the first health frame included) did not complete in 300 s — the manager stopped draining the connection. Independent of the pings, so it also covers the window before the first ping and a manager that never pings | `manager_write_stalled` |
+| critical | Manager authentication failed: {reason} | Auth rejected by the manager. After a `rotate_secret` the manager did not store (its acknowledgement written but read too late, or its database write failed), the next reconnect raises this once, with the new secret, before the edge falls back to the previous one | — |
+| info | Node authentication secret rotated and persisted | `rotate_secret` saved the new secret to `secrets.json` and its acknowledgement was written to the connection. The next authentication presents the new secret | — |
+| warning | Node credentials could not be saved | `details.during` says what: `rotate_secret` — the new secret could not be written, so the rotation was **refused** (`success: false`, `config_persist_failed`) and the manager and the edge both keep the old one; `rotation_rollback` — a rotation's acknowledgement never left, and the previous secret could not be put back on disk, so a restart before the next authentication would present the new one, which the manager never stored; `fallback_accepted` — the manager accepted a fallback secret after a rotation, and it could not be written, so the edge is connected but a restart would present the secret the manager refused. `details.reason` carries the write error | `manager_credentials_not_saved` |
+
+**Source**: `src/manager/client.rs`, `src/manager/link.rs`
 
 ---
 
