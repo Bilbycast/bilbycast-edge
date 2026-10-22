@@ -35,170 +35,11 @@ use crate::tunnel::manager::TunnelManager;
 
 use super::ManagerConfig;
 
-/// Hard deadline on the WebSocket dial (TCP + TLS + HTTP upgrade).
-///
-/// `tokio_tungstenite::connect_async*` has no deadline of its own. A peer that
-/// completes TCP and TLS and then never returns the 101 parks the future for
-/// ever, and because the reconnect loop is a single task that one `.await`
-/// ends all future reconnection: the node goes offline until the process is
-/// restarted, with no error logged. Two production edges did exactly that,
-/// 20 hours apart, and stayed dark for 36 and 29 hours while their media kept
-/// flowing — see bilbycast-edge#180.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Deadline on writing the auth frame. A stalled peer stops draining long
-/// before it closes, so this write can block just as the dial can.
-const AUTH_SEND_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Deadline on the whole pre-session handshake: dial, TLS, upgrade, auth
-/// write and auth reply.
-///
-/// The per-step timeouts above cover the stalls we have actually observed.
-/// This one covers the ones we have not: it is armed before the attempt and
-/// disarmed the moment the session authenticates, so any pre-auth step that
-/// blocks for a reason nobody anticipated still ends in a retry rather than
-/// in a node that never comes back. Generous on purpose — it is a backstop,
-/// not the primary control.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// A dial slower than this is logged even when it eventually succeeds, so the
-/// condition is visible before it becomes an outage.
-const SLOW_DIAL_WARN: Duration = Duration::from_secs(5);
-
-/// Inbound silence never tolerated for less than this, however fast the
-/// manager pings. It is only a floor: the real limit scales with the cadence
-/// the manager is actually using (see [`InboundCadence::silence_limit`]).
-const SILENCE_FLOOR: Duration = Duration::from_secs(90);
-
-/// How many ping intervals of silence end a session. Four, so one lost ping
-/// or one slow burst of our own writes cannot do it on its own.
-const SILENCE_PINGS: u32 = 4;
-
-/// How often the watchdog looks. Coarse on purpose: the limit is measured in
-/// minutes, and a check is a clock read.
-const SILENCE_CHECK: Duration = Duration::from_secs(5);
-
-/// What the live session has heard from the manager, and how often it pings.
-///
-/// The dial deadline (bilbycast-edge#180) covers a session that never starts.
-/// This covers one that dies after it started: nothing in the session loop
-/// noticed a manager that had gone quiet, and every write in it awaits with no
-/// deadline, so a peer that stops draining parks the loop on a full socket
-/// buffer exactly as the dial parked on a missing 101 — the node offline in
-/// the manager, nothing logged, media still flowing.
-///
-/// The manager pings every node on its `ws_keepalive_interval_secs` setting,
-/// which an operator can set anywhere from 1 to 300 s. So the edge learns the
-/// cadence from the pings themselves rather than assuming 15 s, and the
-/// watchdog stays **unarmed until it has seen two pings**: a manager that
-/// predates the keepalive never pings, and treating its quiet as death would
-/// drop a healthy session every few minutes.
-#[derive(Debug, Clone)]
-struct InboundCadence {
-    last_frame: tokio::time::Instant,
-    last_ping: Option<tokio::time::Instant>,
-    widest_ping_gap: Option<Duration>,
-}
-
-impl InboundCadence {
-    fn new(now: tokio::time::Instant) -> Self {
-        Self { last_frame: now, last_ping: None, widest_ping_gap: None }
-    }
-
-    /// Any frame at all from the manager proves the session is alive.
-    fn on_frame(&mut self, now: tokio::time::Instant) {
-        self.last_frame = now;
-    }
-
-    /// A ping also teaches the cadence. The widest gap seen, not the latest,
-    /// so a manager whose keepalive was raised mid-session is never judged by
-    /// its old, shorter interval.
-    fn on_ping(&mut self, now: tokio::time::Instant) {
-        self.on_frame(now);
-        if let Some(prev) = self.last_ping {
-            let gap = now.saturating_duration_since(prev);
-            self.widest_ping_gap = Some(self.widest_ping_gap.map_or(gap, |w| w.max(gap)));
-        }
-        self.last_ping = Some(now);
-    }
-
-    /// The silence that ends the session, or `None` while the cadence is
-    /// unknown — the watchdog is unarmed until then.
-    fn silence_limit(&self) -> Option<Duration> {
-        self.widest_ping_gap
-            .map(|gap| SILENCE_FLOOR.max(gap.saturating_mul(SILENCE_PINGS)))
-    }
-
-    /// How long the manager has been silent, if that is past the limit.
-    fn dead_for(&self, now: tokio::time::Instant) -> Option<(Duration, Duration)> {
-        let limit = self.silence_limit()?;
-        let silent = now.saturating_duration_since(self.last_frame);
-        (silent > limit).then_some((silent, limit))
-    }
-}
-
-/// Resolves once the manager has been silent past its limit.
-///
-/// Raced against the session loop rather than run as one of its `select!`
-/// branches, which is the point: a write that never completes holds the loop
-/// inside one branch, where no other branch can run. Out here the timer still
-/// fires, and winning the race drops the session future — and the stuck write
-/// with it.
-async fn manager_silence_watchdog(
-    cadence: &std::sync::Mutex<InboundCadence>,
-) -> (Duration, Duration) {
-    let mut check = tokio::time::interval(SILENCE_CHECK);
-    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        check.tick().await;
-        let dead = cadence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .dead_for(tokio::time::Instant::now());
-        if let Some(dead) = dead {
-            return dead;
-        }
-    }
-}
-
-/// The stream type every dial path produces.
-type ManagerWsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
-
-/// Dial the manager, giving up after `deadline`.
-///
-/// One call site for every TLS variant: passing `None` as the connector is
-/// what `connect_async` does internally, so the default-TLS path is unchanged
-/// while gaining the deadline the others needed too.
-async fn dial_manager(
-    url: &str,
-    connector: Option<tokio_tungstenite::Connector>,
-    deadline: Duration,
-) -> Result<ManagerWsStream, String> {
-    let started = Instant::now();
-    let dial = tokio_tungstenite::connect_async_tls_with_config(url, None, false, connector);
-
-    let (stream, _response) = match tokio::time::timeout(deadline, dial).await {
-        Ok(Ok(ok)) => ok,
-        Ok(Err(e)) => return Err(format!("WebSocket connect failed: {e}")),
-        Err(_) => {
-            return Err(format!(
-                "WebSocket connect timed out after {}s (no response to the upgrade)",
-                deadline.as_secs()
-            ))
-        }
-    };
-
-    let took = started.elapsed();
-    if took >= SLOW_DIAL_WARN {
-        tracing::warn!(
-            "Manager dial took {:.1}s — slow handshake, watch for a stall",
-            took.as_secs_f64()
-        );
-    }
-    Ok(stream)
-}
+use super::link::{
+    self, AUTH_REPLY_TIMEOUT, AUTH_SEND_TIMEOUT, DIAL_TIMEOUT, HANDSHAKE_TIMEOUT, INBOUND_QUEUE, Inbound,
+    InboundCadence, LinkCredentials, LinkError, LinkLoss, ManagerWsStream, SessionEnd, SharedCredentials,
+    lock_credentials, send_bounded,
+};
 
 #[cfg(feature = "webrtc")]
 use crate::engine::flow::FlowRuntime;
@@ -360,12 +201,11 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-/// Start the manager client background task.
 /// Everything the manager client needs from the rest of the process, bundled
 /// because it is one thing — "the node this client speaks for" — and because
-/// all three of `start_manager_client`, `manager_client_loop` and
-/// `try_connect` need the identical set. Passing it as 17 positional
-/// parameters through three call layers was how they drifted apart.
+/// the reconnect loop and every session it runs need the identical set.
+/// Passing it as 17 positional parameters through three call layers was how
+/// they drifted apart.
 pub struct ManagerClientDeps {
     pub flow_manager: Arc<FlowManager>,
     pub tunnel_manager: Arc<TunnelManager>,
@@ -386,60 +226,41 @@ pub struct ManagerClientDeps {
     pub manager_link: Arc<crate::manager::link_state::ManagerLinkState>,
 }
 
+/// Start the manager client background task.
 pub fn start_manager_client(
     config: ManagerConfig,
     deps: ManagerClientDeps,
     event_rx: mpsc::Receiver<Event>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        manager_client_loop(config, deps, event_rx).await;
+        manager_client_loop(config, deps, event_rx, connect_to_manager).await;
     })
 }
 
-/// Resolves when an attempt has failed to authenticate in time.
-///
-/// If `authenticated` fires first the attempt got through, so this future
-/// pends for ever and the `select!` it sits in can only be resolved by the
-/// session itself ending. A dropped sender (the attempt returned early with
-/// an error) also counts as "no longer waiting": the attempt's own error is
-/// the better message, so this still pends and lets that one surface.
-async fn handshake_backstop(authenticated: oneshot::Receiver<()>, deadline: Duration) {
-    if tokio::time::timeout(deadline, authenticated).await.is_ok() {
-        std::future::pending::<()>().await;
-    }
-}
-
-async fn manager_client_loop(
-    mut config: ManagerConfig,
+/// The reconnect loop. `connect` opens the WebSocket for one attempt —
+/// [`connect_to_manager`] in the edge, an in-memory stream in the tests — and
+/// [`run_session`] runs it.
+async fn manager_client_loop<C, F, S>(
+    config: ManagerConfig,
     deps: ManagerClientDeps,
     mut event_rx: mpsc::Receiver<Event>,
-) {
-    // Destructured back into the original bindings so the body below is
-    // untouched by this refactor.
-    let ManagerClientDeps {
-        flow_manager,
-        tunnel_manager,
-        ws_stats_tx,
-        app_config,
-        config_path,
-        secrets_path,
-        api_addr,
-        monitor_addr,
-        webrtc_sessions,
-        resource_state,
-        static_caps,
-        live_gpu,
-        standby_listeners,
-        cellular_cache,
-        starlink_cache,
-        start_time,
-        manager_link,
-    } = deps;
+    mut connect: C,
+) where
+    C: FnMut(String, ManagerConfig) -> F,
+    F: std::future::Future<Output = Result<tokio_tungstenite::WebSocketStream<S>, LinkError>>,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // If we already have a node_id from config, set it on the tunnel manager
     // so relay tunnels can identify this edge before the first manager connection.
     if let Some(ref node_id) = config.node_id {
-        tunnel_manager.set_manager_node_id(node_id.clone());
+        deps.tunnel_manager.set_manager_node_id(node_id.clone());
     }
+    // Made once, before the loop, and shared with every session and every
+    // command handler: they record here what they learn about the
+    // credentials — a registration, a rotated secret, which candidate secret
+    // the manager accepted — and the next attempt authenticates with that,
+    // not with the config the edge started with. See `LinkCredentials`.
+    let creds = LinkCredentials::shared(config);
 
     // Multi-URL failover (scale-out): 1..16 URLs in config.urls. We
     // rotate on every close/failure with a fixed 5 s backoff that
@@ -449,102 +270,74 @@ async fn manager_client_loop(
     let mut cursor: usize = 0;
 
     loop {
-        if config.urls.is_empty() {
+        let settings = lock_credentials(&creds).config.clone();
+        if settings.urls.is_empty() {
             tracing::error!("Manager client started with no URLs — config.urls is empty");
             tokio::time::sleep(fixed_backoff).await;
             continue;
         }
-        let current_url = config.urls[cursor % config.urls.len()].clone();
+        let current_url = settings.urls[cursor % settings.urls.len()].clone();
         tracing::info!(
             "Connecting to manager at {current_url} (url {} of {})",
-            (cursor % config.urls.len()) + 1,
-            config.urls.len(),
+            (cursor % settings.urls.len()) + 1,
+            settings.urls.len(),
         );
 
-        // Re-bundled per attempt; every field is an Arc/clone-cheap handle.
-        let attempt_deps = ManagerClientDeps {
-            flow_manager: flow_manager.clone(),
-            tunnel_manager: tunnel_manager.clone(),
-            ws_stats_tx: ws_stats_tx.clone(),
-            app_config: app_config.clone(),
-            config_path: config_path.clone(),
-            secrets_path: secrets_path.clone(),
-            api_addr: api_addr.clone(),
-            monitor_addr: monitor_addr.clone(),
-            webrtc_sessions: webrtc_sessions.clone(),
-            resource_state: resource_state.clone(),
-            static_caps: static_caps.clone(),
-            live_gpu: live_gpu.clone(),
-            standby_listeners: standby_listeners.clone(),
-            cellular_cache: cellular_cache.clone(),
-            starlink_cache: starlink_cache.clone(),
-            start_time,
-            manager_link: manager_link.clone(),
-        };
         // Arm the whole-handshake backstop. `handshake_backstop` resolves
-        // only if the attempt fails to authenticate within HANDSHAKE_TIMEOUT;
-        // once `try_connect` signals success it pends for ever, leaving the
-        // live session to run as long as it likes. Winning the select drops
-        // the connect future, which cancels it and closes its socket.
-        //
-        // The attempt is scoped so that the pinned future — and with it the
-        // borrows of `config` and `event_rx` — is released before the match
-        // below, which needs `config` mutably on the registration path.
+        // only if the attempt fails to get an auth reply within
+        // HANDSHAKE_TIMEOUT; once the session has one it pends for ever,
+        // leaving the live session to run as long as it likes. Winning the
+        // select drops the attempt, which cancels it and closes its socket.
         let outcome = {
             let (auth_tx, auth_rx) = oneshot::channel();
-            let attempt = try_connect(
-                &current_url,
-                &config,
-                &attempt_deps,
-                &mut event_rx,
-                Some(auth_tx),
-            );
+            let attempt = async {
+                let ws_stream = connect(current_url.clone(), settings).await?;
+                run_session(ws_stream, &creds, &deps, &mut event_rx, Some(auth_tx)).await
+            };
             tokio::pin!(attempt);
 
             tokio::select! {
                 result = &mut attempt => result,
-                () = handshake_backstop(auth_rx, HANDSHAKE_TIMEOUT) => {
-                    Err(format!(
-                        "Handshake did not complete within {}s — abandoning the attempt",
-                        HANDSHAKE_TIMEOUT.as_secs()
+                () = link::handshake_backstop(auth_rx, HANDSHAKE_TIMEOUT) => {
+                    Err(LinkError::new(
+                        LinkLoss::HandshakeTimeout,
+                        format!(
+                            "Handshake did not complete within {}s — abandoning the attempt",
+                            HANDSHAKE_TIMEOUT.as_secs()
+                        ),
                     ))
                 }
             }
         };
 
         match outcome {
-            Ok(ConnectResult::Closed) => {
+            Ok(()) => {
                 tracing::info!("Manager connection to {current_url} closed normally");
-            }
-            Ok(ConnectResult::Registered {
-                node_id,
-                node_secret,
-            }) => {
-                tracing::info!(
-                    "Registered with manager as node_id={node_id}, persisting credentials"
-                );
-                config.registration_token = None;
-                config.node_id = Some(node_id.clone());
-                config.node_secret = Some(node_secret.clone());
-                tunnel_manager.set_manager_node_id(node_id.clone());
-
-                // Persist to config + secrets files
-                persist_credentials(&app_config, &config_path, &secrets_path, &node_id, &node_secret).await;
             }
             Err(e) => {
                 tracing::warn!("Manager connection to {current_url} failed: {e}");
-                tunnel_manager.event_sender().emit(
+                // One message per kind of loss, the specifics in `details`:
+                // the manager coalesces events on their message, keeping the
+                // first one's details, so a single message would show the
+                // first cause against every later one.
+                deps.tunnel_manager.event_sender().emit_with_details(
                     EventSeverity::Warning,
                     category::MANAGER,
-                    "Manager connection lost, rotating to next URL",
+                    e.loss.event_message(),
+                    None,
+                    serde_json::json!({
+                        "error_code": e.loss.error_code(),
+                        "reason": e.reason,
+                        "url": link::shown_url(&current_url),
+                    }),
                 );
             }
         }
 
-        // The session ended (closed, registered-then-closed, or failed to
-        // connect). Reflect the lost link on the device's local surfaces
-        // before we back off and retry. Idempotent if already disconnected.
-        manager_link.set_disconnected();
+        // The session ended (closed, or failed to connect or run). Reflect
+        // the lost link on the device's local surfaces before we back off
+        // and retry. Idempotent if already disconnected.
+        deps.manager_link.set_disconnected();
 
         cursor = cursor.wrapping_add(1);
         tracing::info!(
@@ -555,34 +348,127 @@ async fn manager_client_loop(
     }
 }
 
-enum ConnectResult {
-    Closed,
-    Registered {
-        node_id: String,
-        node_secret: String,
-    },
+/// Open the WebSocket to the manager at `url`, over TLS as `config` asks.
+/// It takes its arguments by value so the reconnect loop can take it as a
+/// plain function; the loop hands it a copy of the credentials it holds.
+async fn connect_to_manager(url: String, config: ManagerConfig) -> Result<ManagerWsStream, LinkError> {
+    // Enforce TLS — only wss:// connections are allowed
+    if !url.starts_with("wss://") {
+        return Err(LinkError::new(
+            LinkLoss::Settings,
+            "Manager URL must use wss:// (TLS). Plaintext ws:// connections are not allowed.",
+        ));
+    }
+
+    let connector = if config.accept_self_signed_cert {
+        // SECURITY: Require explicit env var to allow insecure connections.
+        // This prevents accidental use in production when left in config files.
+        if std::env::var("BILBYCAST_ALLOW_INSECURE").as_deref() != Ok("1") {
+            return Err(LinkError::new(
+                LinkLoss::Settings,
+                "accept_self_signed_cert is enabled but BILBYCAST_ALLOW_INSECURE=1 is not set. \
+                 This is a security safeguard — self-signed cert mode disables ALL certificate \
+                 validation, making the connection vulnerable to MITM attacks. Set \
+                 BILBYCAST_ALLOW_INSECURE=1 to confirm this is intentional (dev/testing only).",
+            ));
+        }
+        tracing::warn!(
+            "SECURITY WARNING: accept_self_signed_cert is enabled — ALL TLS certificate \
+             validation is disabled. This makes the connection vulnerable to man-in-the-middle \
+             attacks. Do NOT use this in production."
+        );
+        // Build a rustls ClientConfig that accepts any certificate
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(InsecureCertVerifier))
+            .with_no_client_auth();
+        Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config)))
+    } else if let Some(ref fingerprint) = config.cert_fingerprint {
+        // Certificate pinning: validate CA chain AND check fingerprint
+        tracing::info!("Certificate pinning enabled (fingerprint: {}...)", &fingerprint[..fingerprint.len().min(11)]);
+        let root_store = rustls::RootCertStore::from_iter(
+            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+        );
+        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| {
+                LinkError::new(LinkLoss::Settings, format!("Failed to build certificate verifier: {e}"))
+            })?;
+        let verifier = PinnedCertVerifier {
+            expected_fingerprint: fingerprint.clone(),
+            inner,
+        };
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(tls_config)))
+    } else {
+        None
+    };
+    let ws_stream = link::dial_manager(&url, connector, DIAL_TIMEOUT).await?;
+
+    tracing::info!("WebSocket connected, sending auth...");
+
+    // TOFU hint: if no cert pinning is configured, suggest it
+    if config.cert_fingerprint.is_none() && !config.accept_self_signed_cert {
+        tracing::info!(
+            "Tip: Set \"cert_fingerprint\" in the manager config to enable certificate \
+             pinning (protects against compromised CAs). Use the manager's TLS certificate \
+             SHA-256 fingerprint (colon-separated hex)."
+        );
+    }
+    Ok(ws_stream)
 }
 
-/// Establish one manager session: connect, authenticate, then pump until the
-/// session ends.
+/// A frame a command handler hands the session loop to write. The loop is
+/// the only writer to the socket, so the handlers, which run on their own
+/// tasks, queue their replies here.
+struct Outbound {
+    json: String,
+    /// Told once the frame has been written; dropped unsent when the session
+    /// ends first. Only `rotate_secret` asks, because which secret the edge
+    /// presents next depends on whether its answer left.
+    written: Option<oneshot::Sender<()>>,
+}
+
+impl From<String> for Outbound {
+    fn from(json: String) -> Self {
+        Self { json, written: None }
+    }
+}
+
+/// One manager session over an open WebSocket: authenticate, then pump
+/// stats, health, thumbnails, events and commands until the connection ends.
+///
+/// Separate from [`connect_to_manager`] so the tests can drive it over an
+/// in-memory stream against a fake manager.
+///
+/// Whatever it learns about the credentials goes into `creds` at once, before
+/// any local `.await`, so it survives however the session ends — a close, a
+/// reset, the silence watchdog or the write bound. Nothing is handed back in
+/// the result.
 ///
 /// **Link-state invariant:** on a successful `auth_ok` / `register_ack` this
 /// calls `manager_link.set_connected()` mid-function (it does NOT mark the link
 /// disconnected on any of its return paths). The caller (`manager_client_loop`)
 /// is responsible for calling `manager_link.set_disconnected()` after every
-/// `try_connect` return — both `Ok` and `Err`. If a future early-return is
-/// added AFTER the `set_connected()` calls below, it must preserve this
-/// contract: leave the disconnect to the caller's unconditional
-/// `set_disconnected()`, or the local `/health` + monitor surfaces will
-/// latch a stale "Connected" state after the session has actually ended.
-async fn try_connect(
-    current_url: &str,
-    config: &ManagerConfig,
+/// return — both `Ok` and `Err`. If a future early-return is added AFTER the
+/// `set_connected()` calls below, it must preserve this contract: leave the
+/// disconnect to the caller's unconditional `set_disconnected()`, or the local
+/// `/health` + monitor surfaces will latch a stale "Connected" state after the
+/// session has actually ended.
+async fn run_session<T>(
+    ws_stream: tokio_tungstenite::WebSocketStream<T>,
+    creds: &SharedCredentials,
     deps: &ManagerClientDeps,
     event_rx: &mut mpsc::Receiver<Event>,
-    auth_done: Option<oneshot::Sender<()>>,
-) -> Result<ConnectResult, String> {
-    // Same destructure-back trick: the body keeps its original bindings.
+    mut auth_done: Option<oneshot::Sender<()>>,
+) -> Result<(), LinkError>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    // Destructured so the body keeps the bindings it always had.
     let ManagerClientDeps {
         flow_manager,
         tunnel_manager,
@@ -605,76 +491,12 @@ async fn try_connect(
     let api_addr = api_addr.as_str();
     let monitor_addr = monitor_addr.as_deref();
     let start_time = *start_time;
-    // Enforce TLS — only wss:// connections are allowed
-    if !current_url.starts_with("wss://") {
-        return Err(
-            "Manager URL must use wss:// (TLS). Plaintext ws:// connections are not allowed."
-                .into(),
-        );
-    }
-
-    let ws_stream = if config.accept_self_signed_cert {
-        // SECURITY: Require explicit env var to allow insecure connections.
-        // This prevents accidental use in production when left in config files.
-        if std::env::var("BILBYCAST_ALLOW_INSECURE").as_deref() != Ok("1") {
-            return Err(
-                "accept_self_signed_cert is enabled but BILBYCAST_ALLOW_INSECURE=1 is not set. \
-                 This is a security safeguard — self-signed cert mode disables ALL certificate \
-                 validation, making the connection vulnerable to MITM attacks. Set \
-                 BILBYCAST_ALLOW_INSECURE=1 to confirm this is intentional (dev/testing only)."
-                    .into(),
-            );
-        }
-        tracing::warn!(
-            "SECURITY WARNING: accept_self_signed_cert is enabled — ALL TLS certificate \
-             validation is disabled. This makes the connection vulnerable to man-in-the-middle \
-             attacks. Do NOT use this in production."
-        );
-        // Build a rustls ClientConfig that accepts any certificate
-        let tls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(InsecureCertVerifier))
-            .with_no_client_auth();
-        let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(tls_config));
-        dial_manager(current_url, Some(connector), DIAL_TIMEOUT).await?
-    } else if let Some(ref fingerprint) = config.cert_fingerprint {
-        // Certificate pinning: validate CA chain AND check fingerprint
-        tracing::info!("Certificate pinning enabled (fingerprint: {}...)", &fingerprint[..fingerprint.len().min(11)]);
-        let root_store = rustls::RootCertStore::from_iter(
-            webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-        );
-        let inner = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-            .build()
-            .map_err(|e| format!("Failed to build certificate verifier: {e}"))?;
-        let verifier = PinnedCertVerifier {
-            expected_fingerprint: fingerprint.clone(),
-            inner,
-        };
-        let tls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
-        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
-        dial_manager(current_url, Some(connector), DIAL_TIMEOUT).await?
-    } else {
-        dial_manager(current_url, None, DIAL_TIMEOUT).await?
-    };
-
-    tracing::info!("WebSocket connected, sending auth...");
-
-    // TOFU hint: if no cert pinning is configured, suggest it
-    if config.cert_fingerprint.is_none() && !config.accept_self_signed_cert {
-        tracing::info!(
-            "Tip: Set \"cert_fingerprint\" in the manager config to enable certificate \
-             pinning (protects against compromised CAs). Use the manager's TLS certificate \
-             SHA-256 fingerprint (colon-separated hex)."
-        );
-    }
 
     let (mut ws_write, mut ws_read) = ws_stream.split();
 
-    // Step 1: Send auth message as first frame
-    let auth_msg = build_auth_message(config);
+    // Step 1: Send auth message as first frame, with the credentials as they
+    // stand at this attempt.
+    let auth_msg = build_auth_message(&lock_credentials(creds).config);
     if let Ok(json) = serde_json::to_string(&auth_msg) {
         // A stalled peer stops draining long before it closes, so this write
         // blocks as readily as the dial does.
@@ -682,99 +504,135 @@ async fn try_connect(
             .await
         {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(format!("Failed to send auth: {e}")),
+            Ok(Err(e)) => {
+                return Err(LinkError::new(LinkLoss::ConnectionError, format!("Failed to send auth: {e}")));
+            }
             Err(_) => {
-                return Err(format!(
-                    "Auth send timed out after {}s",
-                    AUTH_SEND_TIMEOUT.as_secs()
-                ))
+                return Err(LinkError::new(
+                    LinkLoss::HandshakeTimeout,
+                    format!("Auth send timed out after {}s", AUTH_SEND_TIMEOUT.as_secs()),
+                ));
             }
         }
     }
 
     // Step 2: Wait for auth response (auth_ok, register_ack, or auth_error)
-    let auth_timeout =
-        tokio::time::timeout(Duration::from_secs(10), ws_read.next()).await;
-
-    let mut registered_creds: Option<(String, String)> = None;
-
-    match auth_timeout {
-        Ok(Some(Ok(Message::Text(text)))) => {
-            let response: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|e| format!("Invalid auth response: {e}"))?;
-
-            match response["type"].as_str().unwrap_or("") {
-                "auth_ok" => {
-                    tracing::info!("Authenticated with manager");
-                    // Device-local link indicator: an authenticated session is
-                    // now live. Surfaced on the edge's own /health + monitor UI.
-                    manager_link.set_connected();
-                    tunnel_manager.event_sender().emit(
-                        EventSeverity::Info,
-                        category::MANAGER,
-                        "Connected to manager",
-                    );
-                    // First successful auth on the new binary post-upgrade —
-                    // tells the boot watchdog that the new version reached
-                    // the network, so it can promote `pending_health → stable`
-                    // once the configured boot_health_window elapses.
-                    if let Some(ref up_cfg) = app_config.read().await.upgrades {
-                        crate::upgrade::watchdog::record_healthy_beat(&up_cfg.install_root);
-                    }
-                }
-                "register_ack" => {
-                    let payload = &response["payload"];
-                    let node_id = payload["node_id"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let node_secret = payload["node_secret"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    tracing::info!("Registered with manager: node_id={node_id}");
-                    // Device-local link indicator: registration counts as an
-                    // authenticated session for the operator-facing surfaces.
-                    manager_link.set_connected();
-                    tunnel_manager.event_sender().emit(
-                        EventSeverity::Info,
-                        category::MANAGER,
-                        "Connected to manager",
-                    );
-
-                    if !node_id.is_empty() && !node_secret.is_empty() {
-                        // Persist immediately
-                        persist_credentials(app_config, config_path, secrets_path, &node_id, &node_secret)
-                            .await;
-                        registered_creds = Some((node_id, node_secret));
-                    }
-                }
-                "auth_error" => {
-                    let msg = response["message"]
-                        .as_str()
-                        .unwrap_or("Unknown auth error");
-                    tunnel_manager.event_sender().emit(
-                        EventSeverity::Critical,
-                        category::MANAGER,
-                        format!("Manager authentication failed: {msg}"),
-                    );
-                    return Err(format!("Auth rejected: {msg}"));
-                }
-                other => {
-                    return Err(format!("Unexpected auth response type: {other}"));
-                }
-            }
+    let reply = match tokio::time::timeout(AUTH_REPLY_TIMEOUT, ws_read.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => text,
+        Ok(Some(Ok(_))) => {
+            return Err(LinkError::new(LinkLoss::Protocol, "Unexpected non-text auth response"));
         }
-        Ok(Some(Ok(_))) => return Err("Unexpected non-text auth response".into()),
-        Ok(Some(Err(e))) => return Err(format!("WebSocket error during auth: {e}")),
-        Ok(None) => return Err("Connection closed during auth".into()),
-        Err(_) => return Err("Auth response timeout (10s)".into()),
+        Ok(Some(Err(e))) => {
+            return Err(LinkError::new(LinkLoss::ConnectionError, format!("WebSocket error during auth: {e}")));
+        }
+        Ok(None) => return Err(LinkError::new(LinkLoss::ConnectionError, "Connection closed during auth")),
+        Err(_) => {
+            return Err(LinkError::new(
+                LinkLoss::HandshakeTimeout,
+                format!("Auth response timeout ({}s)", AUTH_REPLY_TIMEOUT.as_secs()),
+            ));
+        }
+    };
+    let response: serde_json::Value = serde_json::from_str(&reply)
+        .map_err(|e| LinkError::new(LinkLoss::Protocol, format!("Invalid auth response: {e}")))?;
+
+    // The reply is in hand: disarm the handshake backstop before anything
+    // below awaits local state. By now the manager has acted on the auth — on
+    // a registration it has spent the token and stored the secret it issued —
+    // so a backstop firing from here could only cancel the work that keeps
+    // what it issued. A registration cancelled while it waited on the config
+    // lock left the node with a spent token and no secret, locked out even
+    // across a restart. Every step before this one has its own deadline.
+    if let Some(tx) = auth_done.take() {
+        let _ = tx.send(());
     }
 
-    // Authenticated: disarm the handshake backstop. Everything from here is
-    // a live session, which is allowed to last for days.
-    if let Some(tx) = auth_done {
-        let _ = tx.send(());
+    match response["type"].as_str().unwrap_or("") {
+        "auth_ok" => {
+            tracing::info!("Authenticated with manager");
+            // Device-local link indicator: an authenticated session is
+            // now live. Surfaced on the edge's own /health + monitor UI.
+            manager_link.set_connected();
+            tunnel_manager.event_sender().emit(
+                EventSeverity::Info,
+                category::MANAGER,
+                "Connected to manager",
+            );
+            // After a rotation the files hold the secret presented first,
+            // which the manager may never have stored. Save the one it just
+            // accepted, so a restart presents it too.
+            let settled = {
+                let mut held = lock_credentials(creds);
+                held.accepted().then(|| (held.config.node_id.clone(), held.config.node_secret.clone()))
+            };
+            if let Some((Some(node_id), Some(node_secret))) = settled {
+                match save_node_secret(app_config, config_path, secrets_path, &node_id, &node_secret).await {
+                    Ok(()) => tracing::info!(
+                        "Manager accepted a node secret after a rotation; saved it to {}",
+                        secrets_path.display()
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to save the node secret the manager accepted: {e}; after a restart \
+                             the edge may present one the manager does not hold"
+                        );
+                        emit_credentials_not_saved(tunnel_manager.event_sender(), "fallback_accepted", &e);
+                    }
+                }
+            }
+            // First successful auth on the new binary post-upgrade —
+            // tells the boot watchdog that the new version reached
+            // the network, so it can promote `pending_health → stable`
+            // once the configured boot_health_window elapses.
+            if let Some(ref up_cfg) = app_config.read().await.upgrades {
+                crate::upgrade::watchdog::record_healthy_beat(&up_cfg.install_root);
+            }
+        }
+        "register_ack" => {
+            let payload = &response["payload"];
+            let node_id = payload["node_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let node_secret = payload["node_secret"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            tracing::info!("Registered with manager: node_id={node_id}");
+            // Device-local link indicator: registration counts as an
+            // authenticated session for the operator-facing surfaces.
+            manager_link.set_connected();
+            tunnel_manager.event_sender().emit(
+                EventSeverity::Info,
+                category::MANAGER,
+                "Connected to manager",
+            );
+
+            if !node_id.is_empty() && !node_secret.is_empty() {
+                // In memory first, before anything awaits: whatever ends
+                // this session from here on, the next attempt presents what
+                // the manager just issued rather than the token it spent.
+                lock_credentials(creds).registered(node_id.clone(), node_secret.clone());
+                tunnel_manager.set_manager_node_id(node_id.clone());
+                persist_credentials(app_config, config_path, secrets_path, &node_id, &node_secret).await;
+            }
+        }
+        "auth_error" => {
+            let msg = response["message"]
+                .as_str()
+                .unwrap_or("Unknown auth error");
+            tunnel_manager.event_sender().emit(
+                EventSeverity::Critical,
+                category::MANAGER,
+                format!("Manager authentication failed: {msg}"),
+            );
+            // Present the next candidate secret, if a rotation left one.
+            lock_credentials(creds).rejected();
+            return Err(LinkError::new(LinkLoss::AuthRejected, format!("Auth rejected: {msg}")));
+        }
+        other => {
+            return Err(LinkError::new(LinkLoss::Protocol, format!("Unexpected auth response type: {other}")));
+        }
     }
 
     // Now in the authenticated session — run the main loop
@@ -789,22 +647,9 @@ async fn try_connect(
         starlink_cache.clone(),
     );
 
-    // Send initial health
-    let health = build_health_message(
-        flow_manager,
-        api_addr,
-        monitor_addr,
-        resource_state,
-        static_caps,
-        live_gpu,
-        Some(&mut network_sampler),
-        Some(cellular_cache),
-        Some(starlink_cache),
-        start_time,
-    );
-    if let Ok(json) = serde_json::to_string(&health) {
-        let _ = ws_write.send(Message::Text(json.into())).await;
-    }
+    // The session's liveness clock starts here: the manager's first ping
+    // arms the watchdog, its gap measured from now (see `InboundCadence`).
+    let cadence = std::sync::Mutex::new(InboundCadence::new(tokio::time::Instant::now()));
 
     let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
     // Periodic stats timer ensures tunnel-only nodes (no flows) still send
@@ -821,7 +666,7 @@ async fn try_connect(
     // command produces exactly one outbound frame and command_acks are
     // small, but a sustained burst from the manager (cluster reconcile,
     // boot-time fan-out) can pile up briefly.
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
+    let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(256);
 
     // Event-driven thumbnail delivery: the thumbnail generators notify this
     // shared handle on every successful capture (input switch, freeze,
@@ -835,10 +680,34 @@ async fn try_connect(
     // Track last-sent generation per flow to avoid re-sending unchanged thumbnails
     let mut thumbnail_generations: HashMap<String, u64> = HashMap::new();
 
-    // The session loop races a watchdog on the manager's silence: see
-    // `InboundCadence` for why it cannot be one of the loop's own branches.
-    let cadence = std::sync::Mutex::new(InboundCadence::new(tokio::time::Instant::now()));
+    // The manager's frames are read beside the loop, not in one of its
+    // branches: see `link::read_inbound` for why. Text, binary and the end of
+    // the stream reach the loop over this queue; pings stop at the reader.
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Inbound>(INBOUND_QUEUE);
+    let reader = link::read_inbound(ws_read, &cadence, inbound_tx);
+
+    // Every write below goes through `send_bounded`, so none of them can park
+    // the session for good: a write the manager has stopped draining ends it
+    // after WRITE_STALL_LIMIT, a failed one ends it as a close does.
     let session = async {
+        // The first health frame, inside the session so the write bound
+        // covers it like every other write.
+        let health = build_health_message(
+            flow_manager,
+            api_addr,
+            monitor_addr,
+            resource_state,
+            static_caps,
+            live_gpu,
+            Some(&mut network_sampler),
+            Some(cellular_cache),
+            Some(starlink_cache),
+            start_time,
+        );
+        if let Ok(json) = serde_json::to_string(&health) {
+            send_bounded(&mut ws_write, Message::Text(json.into())).await?;
+        }
+
         loop {
             tokio::select! {
                 stats_result = stats_rx.recv() => {
@@ -875,10 +744,9 @@ async fn try_connect(
                                 "timestamp": chrono::Utc::now().to_rfc3339(),
                                 "payload": payload
                             });
-                            if let Ok(json) = serde_json::to_string(&envelope)
-                                && ws_write.send(Message::Text(json.into())).await.is_err() {
-                                    break;
-                                }
+                            if let Ok(json) = serde_json::to_string(&envelope) {
+                                send_bounded(&mut ws_write, Message::Text(json.into())).await?;
+                            }
                             // Reset the periodic timer since we just sent stats
                             stats_interval.reset();
                         }
@@ -918,37 +786,28 @@ async fn try_connect(
                         "timestamp": chrono::Utc::now().to_rfc3339(),
                         "payload": payload
                     });
-                    if let Ok(json) = serde_json::to_string(&envelope)
-                        && ws_write.send(Message::Text(json.into())).await.is_err() {
-                            break;
-                        }
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        send_bounded(&mut ws_write, Message::Text(json.into())).await?;
+                    }
                 }
 
                 // Drain queued outbound frames produced by spawned per-command
                 // handler tasks. Keeping the socket writer single-owner here
                 // avoids interleaving partial Text frames from concurrent
                 // tasks.
-                Some(json) = out_rx.recv() => {
-                    if ws_write.send(Message::Text(json.into())).await.is_err() {
-                        break;
+                Some(frame) = out_rx.recv() => {
+                    send_bounded(&mut ws_write, Message::Text(frame.json.into())).await?;
+                    if let Some(written) = frame.written {
+                        let _ = written.send(());
                     }
                 }
 
-                msg = ws_read.next() => {
-                    if let Some(Ok(ref frame)) = msg {
-                        let now = tokio::time::Instant::now();
-                        let mut heard = cadence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if matches!(frame, Message::Ping(_)) {
-                            heard.on_ping(now);
-                        } else {
-                            heard.on_frame(now);
-                        }
-                    }
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
+                inbound = inbound_rx.recv() => {
+                    match inbound {
+                        Some(Inbound::Text(text)) => {
                             // Spawn per-message so a long-running command
                             // (media upload chunk, update_config, etc.) can
-                            // never park the WS receive loop. Each handler
+                            // never park the session loop. Each handler
                             // emits its reply via `out_tx` which the loop
                             // drains alongside stats / health / thumbnails.
                             let flow_manager = flow_manager.clone();
@@ -957,18 +816,19 @@ async fn try_connect(
                             let config_path = config_path.clone();
                             let secrets_path = secrets_path.clone();
                             let webrtc_sessions = webrtc_sessions.clone();
+                            let creds = creds.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
                                 handle_manager_message(
                                     &text, &flow_manager, &tunnel_manager, &app_config,
-                                    &config_path, &secrets_path, &webrtc_sessions, &out_tx,
+                                    &config_path, &secrets_path, &webrtc_sessions, &creds, &out_tx,
                                 ).await;
                             });
                         }
-                        Some(Ok(Message::Binary(bytes))) => {
+                        Some(Inbound::Binary(bytes)) => {
                             // Binary frames carry media-upload chunks with no
                             // base64 inflation. Spawn per-frame like the Text arm
-                            // so a slow disk write never parks the receive loop;
+                            // so a slow disk write never parks the session loop;
                             // the `command_ack` reply rides `out_tx` (single-owner
                             // writer rule).
                             let tunnel_manager = tunnel_manager.clone();
@@ -977,14 +837,16 @@ async fn try_connect(
                                 handle_manager_binary(&bytes, &tunnel_manager, &out_tx).await;
                             });
                         }
-                        Some(Ok(Message::Ping(data))) => {
-                            let _ = ws_write.send(Message::Pong(data)).await;
+                        Some(Inbound::Closed) | None => {
+                            tracing::info!("The manager closed the connection");
+                            break;
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
-                        Some(Err(e)) => {
-                            return Err(format!("WebSocket error: {e}"));
+                        Some(Inbound::Failed(e)) => {
+                            return Err(SessionEnd::Lost(LinkError::new(
+                                LinkLoss::ConnectionError,
+                                format!("WebSocket error: {e}"),
+                            )));
                         }
-                        _ => {}
                     }
                 }
 
@@ -1005,61 +867,36 @@ async fn try_connect(
                             start_time,
                         )
                     });
-                    if let Ok(json) = serde_json::to_string(&pong)
-                        && ws_write.send(Message::Text(json.into())).await.is_err() {
-                            break;
-                        }
+                    if let Ok(json) = serde_json::to_string(&pong) {
+                        send_bounded(&mut ws_write, Message::Text(json.into())).await?;
+                    }
                 }
 
                 // Thumbnail push — fires when any ThumbnailAccumulator stores a
                 // new JPEG (input switch / freeze detection / steady-state tick).
                 _ = thumbnail_notify.notified() => {
-                    if send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await.is_err() {
-                        break;
-                    }
+                    send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await?;
                 }
 
                 // Safety-net fallback. Covers the cold-start case after reconnect
                 // (the notifier may have no permit waiting) and shields against
                 // any missed notification.
                 _ = thumbnail_fallback.tick() => {
-                    if send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await.is_err() {
-                        break;
-                    }
+                    send_pending_thumbnails(flow_manager, &mut thumbnail_generations, &mut ws_write).await?;
                 }
 
                 // Forward queued events to the manager
                 Some(event) = event_rx.recv() => {
                     let envelope = build_event_envelope(&event);
-                    if let Ok(json) = serde_json::to_string(&envelope)
-                        && ws_write.send(Message::Text(json.into())).await.is_err() {
-                            break;
-                        }
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        send_bounded(&mut ws_write, Message::Text(json.into())).await?;
+                    }
                 }
             }
         }
-        Ok::<(), String>(())
+        Ok::<(), SessionEnd>(())
     };
-    tokio::select! {
-        ended = session => ended?,
-        (silent, limit) = manager_silence_watchdog(&cadence) => {
-            return Err(format!(
-                "Nothing heard from the manager for {}s (limit {}s from its ping cadence) \
-                 — treating the session as dead and reconnecting",
-                silent.as_secs(),
-                limit.as_secs()
-            ));
-        }
-    }
-
-    if let Some((node_id, node_secret)) = registered_creds {
-        return Ok(ConnectResult::Registered {
-            node_id,
-            node_secret,
-        });
-    }
-
-    Ok(ConnectResult::Closed)
+    link::race_session(session, reader, &cadence).await
 }
 
 /// Build the auth message sent as the first WebSocket frame.
@@ -1939,18 +1776,184 @@ async fn persist_credentials(
     }
 }
 
+/// Save `node_secret` as the secret this node presents, with the node ID it
+/// belongs to, in the running config and in `config.json` / `secrets.json`.
+///
+/// The files are written from a copy first, and the running config takes the
+/// change only once that write succeeded, so a failed write leaves both on
+/// what they held — never on a secret the edge then refuses to acknowledge.
+/// The registration token goes: a node presenting a secret has spent it.
+///
+/// Only ever writes a secret, never clears one: a `PUT /api/v1/config` of the
+/// masked `GET` body leaves the running config's `node_secret` empty, and
+/// this puts it back.
+async fn save_node_secret(
+    app_config: &Arc<RwLock<AppConfig>>,
+    config_path: &Path,
+    secrets_path: &Path,
+    node_id: &str,
+    node_secret: &str,
+) -> Result<(), String> {
+    let mut cfg = app_config.write().await;
+    let mut next = cfg.clone();
+    let mgr = next
+        .manager
+        .as_mut()
+        .ok_or_else(|| "the running config has no manager section to save it in".to_string())?;
+    mgr.node_id = Some(node_id.to_string());
+    mgr.node_secret = Some(node_secret.to_string());
+    mgr.registration_token = None;
+    save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), next.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    *cfg = next;
+    Ok(())
+}
+
+/// The node's credentials could not be written to disk. `during` names what
+/// was being saved; the message is constant so the manager coalesces repeats.
+fn emit_credentials_not_saved(events: &super::events::EventSender, during: &str, reason: &str) {
+    events.emit_with_details(
+        EventSeverity::Warning,
+        category::MANAGER,
+        "Node credentials could not be saved",
+        None,
+        serde_json::json!({
+            "error_code": "manager_credentials_not_saved",
+            "during": during,
+            "reason": reason,
+        }),
+    );
+}
+
+/// `rotate_secret`: save the manager's new secret for this node, answer, and
+/// present it from the next authentication.
+///
+/// The order is save, answer, adopt — bilbycast-relay's, for the same
+/// reasons. A secret the edge could not save is refused (`success: false`,
+/// `config_persist_failed`): the manager keeps the old one, and the edge goes
+/// on presenting it. Acknowledging it instead would have the manager store a
+/// secret the files do not hold, and the node would be locked out at its
+/// next restart.
+///
+/// Which secret goes first afterwards depends on whether the answer left —
+/// see [`LinkCredentials::rotating`]. When it never did, the manager cannot
+/// have read it, so the files go straight back to the secret the edge
+/// presents first: the session that failed may stay down a while (a manager
+/// outage, say), and a restart in that time must not present a secret the
+/// manager never stored.
+///
+/// Handled here, beside the credentials, rather than in `execute_command`:
+/// it is the one command whose outcome changes what the reconnect loop
+/// presents.
+async fn rotate_node_secret(
+    command_id: &str,
+    action: &serde_json::Value,
+    creds: &SharedCredentials,
+    app_config: &Arc<RwLock<AppConfig>>,
+    config_path: &Path,
+    secrets_path: &Path,
+    events: &super::events::EventSender,
+    out_tx: &mpsc::Sender<Outbound>,
+) {
+    let saved: Result<String, CommandError> = match action["new_secret"].as_str() {
+        None => Err("Missing new_secret in rotate_secret command".into()),
+        Some("") => Err("Empty new_secret in rotate_secret command".into()),
+        Some(new_secret) => {
+            tracing::info!("Manager command: rotate_secret — updating node authentication secret");
+            let node_id = lock_credentials(creds).config.node_id.clone();
+            match node_id {
+                None => Err("This node has not registered, so it has no secret to rotate".into()),
+                Some(node_id) => {
+                    match save_node_secret(app_config, config_path, secrets_path, &node_id, new_secret).await {
+                        Ok(()) => Ok(new_secret.to_string()),
+                        Err(e) => {
+                            tracing::warn!("Failed to persist rotated secret: {e}");
+                            emit_credentials_not_saved(events, "rotate_secret", &e);
+                            Err(CommandError::with_code(
+                                format!("The edge could not save the new secret, so it keeps its current one: {e}"),
+                                "config_persist_failed",
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    let mut payload = serde_json::json!({
+        "command_id": command_id,
+        "success": saved.is_ok(),
+    });
+    if let Err(e) = &saved {
+        payload["error"] = serde_json::Value::String(e.message.clone());
+        if let Some(code) = &e.code {
+            payload["error_code"] = serde_json::Value::String(code.clone());
+        }
+    }
+    let ack = serde_json::json!({
+        "type": "command_ack",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "payload": payload
+    });
+    let Ok(json) = serde_json::to_string(&ack) else {
+        return;
+    };
+    let Ok(new_secret) = saved else {
+        let _ = out_tx.send(json.into()).await;
+        return;
+    };
+
+    // A candidate before the answer is even queued, so a reconnect that
+    // starts before this handler hears back still reaches it.
+    lock_credentials(creds).rotating(new_secret.clone());
+    let (written_tx, written_rx) = oneshot::channel();
+    let _ = out_tx.send(Outbound { json, written: Some(written_tx) }).await;
+    // An answer the session never wrote — it ended first, or the send to it
+    // failed — drops the sender unused.
+    if written_rx.await.is_ok() {
+        lock_credentials(creds).rotation_acknowledged(&new_secret);
+        tracing::info!("Node secret rotated and persisted; the next authentication presents it");
+        // Surface a manager-visible confirmation so the UI can show the
+        // rotation actually landed on disk.
+        events.emit(
+            EventSeverity::Info,
+            category::MANAGER,
+            "Node authentication secret rotated and persisted",
+        );
+    } else {
+        tracing::warn!(
+            "Node secret rotated and persisted, but the acknowledgement did not reach the manager; \
+             the edge keeps presenting the previous secret first"
+        );
+        let presented = {
+            let held = lock_credentials(creds);
+            (held.config.node_id.clone(), held.config.node_secret.clone())
+        };
+        if let (Some(node_id), Some(node_secret)) = presented
+            && let Err(e) = save_node_secret(app_config, config_path, secrets_path, &node_id, &node_secret).await
+        {
+            tracing::warn!(
+                "Failed to put the previous node secret back on disk: {e}; a restart before the next \
+                 authentication would present one the manager does not hold"
+            );
+            emit_credentials_not_saved(events, "rotation_rollback", &e);
+        }
+    }
+}
+
 /// Scan every flow's thumbnail accumulators (flow-level + per-input) and
 /// push any JPEG whose generation counter has advanced since the last send.
-/// Returns `Err(())` if a WebSocket send fails so the caller can terminate
-/// the session loop — matches the behavior of the stats / health / event
-/// send sites.
+/// Each write goes through `send_bounded`, and its `Err` ends the session —
+/// the same as the stats / health / event send sites.
 async fn send_pending_thumbnails<S>(
     flow_manager: &Arc<FlowManager>,
     thumbnail_generations: &mut HashMap<String, u64>,
     ws_write: &mut futures_util::stream::SplitSink<S, Message>,
-) -> Result<(), ()>
+) -> Result<(), SessionEnd>
 where
     S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
 {
     use base64::Engine;
     let stats = flow_manager.stats();
@@ -1985,10 +1988,9 @@ where
                             "height": 180
                         }
                     });
-                    if let Ok(json) = serde_json::to_string(&envelope)
-                        && ws_write.send(Message::Text(json.into())).await.is_err() {
-                            return Err(());
-                        }
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        send_bounded(ws_write, Message::Text(json.into())).await?;
+                    }
                     thumbnail_generations.insert(gen_key, thumb_gen);
                 }
             }
@@ -2019,10 +2021,9 @@ where
                             "height": 180
                         }
                     });
-                    if let Ok(json) = serde_json::to_string(&envelope)
-                        && ws_write.send(Message::Text(json.into())).await.is_err() {
-                            return Err(());
-                        }
+                    if let Ok(json) = serde_json::to_string(&envelope) {
+                        send_bounded(ws_write, Message::Text(json.into())).await?;
+                    }
                     thumbnail_generations.insert(gen_key, thumb_gen);
                 }
             }
@@ -2057,7 +2058,7 @@ const BINARY_FRAME_KIND_MEDIA_CHUNK: u8 = 0x01;
 async fn handle_manager_binary(
     frame: &[u8],
     tunnel_manager: &Arc<TunnelManager>,
-    out_tx: &mpsc::Sender<String>,
+    out_tx: &mpsc::Sender<Outbound>,
 ) {
     let alarm = |msg: String| {
         tracing::warn!("{msg}");
@@ -2132,7 +2133,7 @@ async fn handle_manager_binary(
         "payload": ack_payload,
     });
     if let Ok(json) = serde_json::to_string(&ack) {
-        let _ = out_tx.send(json).await;
+        let _ = out_tx.send(json.into()).await;
     }
 }
 
@@ -2176,7 +2177,8 @@ async fn handle_manager_message(
     config_path: &Path,
     secrets_path: &Path,
     webrtc_sessions: &WebrtcRegistry,
-    out_tx: &mpsc::Sender<String>,
+    creds: &SharedCredentials,
+    out_tx: &mpsc::Sender<Outbound>,
 ) {
     let envelope: serde_json::Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -2197,7 +2199,7 @@ async fn handle_manager_message(
                 "payload": null
             });
             if let Ok(json) = serde_json::to_string(&pong) {
-                let _ = out_tx.send(json).await;
+                let _ = out_tx.send(json.into()).await;
             }
         }
         "command" => {
@@ -2220,8 +2222,17 @@ async fn handle_manager_message(
                     "payload": config_json
                 });
                 if let Ok(json) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(json).await;
+                    let _ = out_tx.send(json.into()).await;
                 }
+                return;
+            }
+
+            if action_type == "rotate_secret" {
+                rotate_node_secret(
+                    command_id, action, creds, app_config, config_path, secrets_path,
+                    tunnel_manager.event_sender(), out_tx,
+                )
+                .await;
                 return;
             }
 
@@ -2251,7 +2262,7 @@ async fn handle_manager_message(
                 "payload": payload
             });
             if let Ok(json) = serde_json::to_string(&ack) {
-                let _ = out_tx.send(json).await;
+                let _ = out_tx.send(json.into()).await;
             }
         }
         "register_ack" => {
@@ -5193,40 +5204,6 @@ async fn execute_command(
                     format!("Flow '{flow_id}' removed from group '{group_id}'"),
                 );
             }
-            Ok(None)
-        }
-        "rotate_secret" => {
-            let new_secret = action["new_secret"]
-                .as_str()
-                .ok_or("Missing new_secret in rotate_secret command")?;
-            if new_secret.is_empty() {
-                return Err("Empty new_secret in rotate_secret command".into());
-            }
-
-            tracing::info!("Manager command: rotate_secret — updating node authentication secret");
-
-            // Update in-memory config and persist to disk
-            {
-                let mut cfg = app_config.write().await;
-                if let Some(ref mut mgr) = cfg.manager {
-                    mgr.node_secret = Some(new_secret.to_string());
-                } else {
-                    return Err("No manager config present to update secret".into());
-                }
-                persist_config(&cfg, config_path, secrets_path).await?;
-            }
-
-            tracing::info!("Node secret rotated and persisted to secrets.json");
-            // Surface a manager-visible confirmation so the UI can show the
-            // rotation actually landed on disk. Without this, the manager
-            // has only its own DB update to go on; if the edge reboots
-            // before the new secret is persisted the next reconnect auth
-            // fails silently.
-            flow_manager.event_sender().emit(
-                crate::manager::events::EventSeverity::Info,
-                crate::manager::events::category::MANAGER,
-                "Node authentication secret rotated and persisted",
-            );
             Ok(None)
         }
         "test_input" => {
@@ -9950,199 +9927,653 @@ mod multiviewer_capability_gate {
 }
 
 #[cfg(test)]
-mod dial_deadline_tests {
+mod manager_link_tests {
+    //! The manager link end to end: the real session loop, reconnect loop and
+    //! command handler, against a fake manager over an in-memory WebSocket.
+    //! The pieces each test leans on are unit-tested in `manager::link`; these
+    //! pin the wiring between them, which is where the lockouts and the
+    //! flapping actually came from.
+
     use super::*;
-    use tokio::net::TcpListener;
+    use crate::engine::hardware_probe::{AvxClass, CpuInfo, LiveUtilizationState, StaticCapabilities};
+    use crate::stats::collector::StatsCollector;
+    use tokio::io::DuplexStream;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Bytes;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    type Ws = WebSocketStream<DuplexStream>;
+
+    const OLD: &str = "old-secret";
+    const NEW: &str = "new-secret";
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
     }
 
-    /// A manager that has not pinged twice has told us nothing about its
-    /// cadence, and one that predates the keepalive never will. Either way
-    /// the watchdog must not fire, however long the quiet.
-    #[test]
-    fn the_watchdog_is_unarmed_until_the_cadence_is_known() {
-        let t0 = tokio::time::Instant::now();
-        let mut c = InboundCadence::new(t0);
-        assert_eq!(c.dead_for(t0 + secs(3600)), None, "no pings at all");
-        c.on_ping(t0 + secs(15));
-        assert_eq!(c.dead_for(t0 + secs(3600)), None, "one ping is not a cadence");
+    fn manager_config(secret: Option<&str>, token: Option<&str>) -> ManagerConfig {
+        ManagerConfig {
+            enabled: true,
+            urls: vec!["wss://manager.test/ws/node".into()],
+            accept_self_signed_cert: false,
+            cert_fingerprint: None,
+            registration_token: token.map(str::to_string),
+            node_id: secret.map(|_| "node-1".to_string()),
+            node_secret: secret.map(str::to_string),
+        }
     }
 
-    /// The default 15 s keepalive: four intervals is 60 s, under the floor,
-    /// so the floor rules.
-    #[test]
-    fn a_fast_cadence_is_held_to_the_floor() {
-        let t0 = tokio::time::Instant::now();
-        let mut c = InboundCadence::new(t0);
-        c.on_ping(t0);
-        c.on_ping(t0 + secs(15));
-        assert_eq!(c.silence_limit(), Some(SILENCE_FLOOR));
-        assert_eq!(c.dead_for(t0 + secs(15) + secs(89)), None);
-        assert!(c.dead_for(t0 + secs(15) + secs(91)).is_some());
+    fn static_caps() -> StaticCapabilities {
+        StaticCapabilities {
+            hw_encoders: Default::default(),
+            hw_decoders: Default::default(),
+            hw_encoder_session_limits: Default::default(),
+            hw_decoder_session_limits: Default::default(),
+            hw_encoder_chroma: Default::default(),
+            vaapi: Default::default(),
+            hw_encoder_diagnostics: None,
+            cpu: CpuInfo { brand: "Test CPU".into(), physical_cores: 1, logical_cores: 1, avx_class: AvxClass::None },
+            sw_capacity: Default::default(),
+            wire_pacing_txtime: false,
+        }
     }
 
-    /// The keepalive is configurable to 300 s. A fixed limit would drop
-    /// every healthy session on such a manager; a learned one does not.
-    #[test]
-    fn a_slow_cadence_scales_the_limit() {
-        let t0 = tokio::time::Instant::now();
-        let mut c = InboundCadence::new(t0);
-        c.on_ping(t0);
-        c.on_ping(t0 + secs(300));
-        assert_eq!(c.silence_limit(), Some(secs(1200)));
-        assert_eq!(c.dead_for(t0 + secs(300) + secs(1199)), None);
+    /// An edge with no flows, its config files in a temporary directory.
+    struct Edge {
+        dir: tempfile::TempDir,
+        deps: ManagerClientDeps,
+        event_rx: mpsc::Receiver<Event>,
+        manager: ManagerConfig,
     }
 
-    /// Any frame keeps the session alive, not only pings — a manager busy
-    /// sending commands is plainly there.
-    #[test]
-    fn any_frame_resets_the_silence() {
-        let t0 = tokio::time::Instant::now();
-        let mut c = InboundCadence::new(t0);
-        c.on_ping(t0);
-        c.on_ping(t0 + secs(15));
-        c.on_frame(t0 + secs(80));
-        assert_eq!(c.dead_for(t0 + secs(160)), None);
-        assert!(c.dead_for(t0 + secs(171)).is_some());
+    impl Edge {
+        fn new(manager: ManagerConfig) -> Self {
+            Self::in_dir(tempfile::tempdir().unwrap(), "", manager)
+        }
+
+        /// An edge whose config files live at `subdir` under `dir`; a subdir
+        /// that does not exist makes every save fail.
+        fn in_dir(dir: tempfile::TempDir, subdir: &str, manager: ManagerConfig) -> Self {
+            let (event_sender, event_rx) = crate::manager::events::event_channel();
+            let resource_state = Arc::new(SystemResourceState::new());
+            let flow_manager = Arc::new(FlowManager::new(
+                Arc::new(StatsCollector::new()),
+                false,
+                event_sender.clone(),
+                resource_state.clone(),
+                None,
+                None,
+                #[cfg(all(feature = "display", target_os = "linux"))]
+                crate::display::claim_registry::DisplayClaimRegistry::new(),
+                #[cfg(feature = "webrtc")]
+                None,
+            ));
+            let app_config = AppConfig { manager: Some(manager.clone()), ..Default::default() };
+            let base = dir.path().join(subdir);
+            let deps = ManagerClientDeps {
+                flow_manager,
+                tunnel_manager: Arc::new(TunnelManager::new(event_sender)),
+                ws_stats_tx: broadcast::channel(16).0,
+                app_config: Arc::new(RwLock::new(app_config)),
+                config_path: base.join("config.json"),
+                secrets_path: base.join("secrets.json"),
+                api_addr: "127.0.0.1:8080".into(),
+                monitor_addr: None,
+                webrtc_sessions: WebrtcRegistry::default(),
+                resource_state,
+                static_caps: Arc::new(static_caps()),
+                live_gpu: Arc::new(LiveUtilizationState::new()),
+                standby_listeners: None,
+                cellular_cache: Arc::new(crate::util::cellular::CellularCache::new()),
+                starlink_cache: Arc::new(crate::util::starlink::StarlinkCache::new()),
+                start_time: Instant::now(),
+                manager_link: crate::manager::link_state::ManagerLinkState::new(true),
+            };
+            Self { dir, deps, event_rx, manager }
+        }
+
+        fn credentials(&self) -> SharedCredentials {
+            LinkCredentials::shared(self.manager.clone())
+        }
+
+        /// What a restart would read: the secret in the files.
+        fn secret_on_disk(&self) -> Option<String> {
+            crate::config::persistence::load_config_split(&self.deps.config_path, &self.deps.secrets_path)
+                .ok()?
+                .manager?
+                .node_secret
+        }
+
+        /// One session with `manager` playing the other end. Returns how the
+        /// session ended and what `manager` returned.
+        async fn session<F, Fut, R>(&mut self, creds: &SharedCredentials, manager: F) -> (Result<(), LinkError>, R)
+        where
+            F: FnOnce(Ws) -> Fut,
+            Fut: std::future::Future<Output = R>,
+        {
+            let (edge_io, manager_io) = tokio::io::duplex(1 << 20);
+            let edge_ws = WebSocketStream::from_raw_socket(edge_io, Role::Client, None).await;
+            let manager_ws = answer(manager_io).await;
+            let session = run_session(edge_ws, creds, &self.deps, &mut self.event_rx, None);
+            tokio::time::timeout(secs(30), async { tokio::join!(session, manager(manager_ws)) })
+                .await
+                .expect("the session did not end")
+        }
+
+        /// Run the real reconnect loop. Each attempt gets a fresh in-memory
+        /// connection, whose manager end comes out of the returned channel.
+        /// The config directory is handed back so it outlives the loop.
+        fn reconnect_loop(
+            self,
+        ) -> (impl std::future::Future<Output = ()>, mpsc::UnboundedReceiver<DuplexStream>, tempfile::TempDir) {
+            let (manager_end, accepted) = mpsc::unbounded_channel();
+            let connect = move |_url: String, _config: ManagerConfig| {
+                let (edge_io, manager_io) = tokio::io::duplex(1 << 20);
+                let _ = manager_end.send(manager_io);
+                async move { Ok(WebSocketStream::from_raw_socket(edge_io, Role::Client, None).await) }
+            };
+            let Edge { dir, deps, event_rx, manager } = self;
+            (manager_client_loop(manager, deps, event_rx, connect), accepted, dir)
+        }
     }
 
-    /// The widest gap is kept, so a keepalive raised mid-session is not
-    /// judged by the old, shorter interval.
-    #[test]
-    fn the_widest_ping_gap_governs() {
-        let t0 = tokio::time::Instant::now();
-        let mut c = InboundCadence::new(t0);
-        c.on_ping(t0);
-        c.on_ping(t0 + secs(60));
-        c.on_ping(t0 + secs(75));
-        assert_eq!(c.silence_limit(), Some(secs(240)));
+    /// The manager's end of a connection the edge opened.
+    async fn answer(io: DuplexStream) -> Ws {
+        WebSocketStream::from_raw_socket(io, Role::Server, None).await
     }
 
-    /// The watchdog future itself must resolve on a manager already silent
-    /// past its limit. The pings are backdated rather than waited for, so the
-    /// test takes no wall-clock minutes (tokio's paused clock needs the
-    /// `test-util` feature, which this crate does not enable).
-    #[tokio::test]
-    async fn the_watchdog_fires_on_a_silent_manager() {
-        let t0 = tokio::time::Instant::now()
-            .checked_sub(secs(300))
-            .expect("the monotonic clock is past 300 s");
-        let mut c = InboundCadence::new(t0);
-        c.on_ping(t0);
-        c.on_ping(t0 + secs(15));
-        let cadence = std::sync::Mutex::new(c);
-        let (silent, limit) = tokio::time::timeout(secs(10), manager_silence_watchdog(&cadence))
-            .await
-            .expect("a silent manager must end the session");
-        assert_eq!(limit, SILENCE_FLOOR);
-        assert!(silent > limit);
+    /// The next text frame from the edge, skipping anything else.
+    async fn recv(ws: &mut Ws) -> serde_json::Value {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).unwrap(),
+                Some(Ok(_)) => continue,
+                other => panic!("the edge's connection ended: {other:?}"),
+            }
+        }
     }
 
-    /// And it must not fire on a manager that is still talking: a session
-    /// can last for days.
-    #[tokio::test]
-    async fn the_watchdog_stays_quiet_while_the_manager_talks() {
-        let t0 = tokio::time::Instant::now();
-        let mut c = InboundCadence::new(t0);
-        c.on_ping(t0);
-        c.on_ping(t0);
-        let cadence = std::sync::Mutex::new(c);
-        let fired =
-            tokio::time::timeout(Duration::from_millis(200), manager_silence_watchdog(&cadence))
-                .await;
-        assert!(fired.is_err(), "the watchdog fired on a live session");
+    async fn send(ws: &mut Ws, value: serde_json::Value) {
+        ws.send(Message::Text(value.to_string().into())).await.unwrap();
     }
 
-    /// The exact shape of the stall behind bilbycast-edge#180: the peer
-    /// accepts the connection and then says nothing. Before the deadline this
-    /// parked the reconnect loop for ever and the node never came back.
-    #[tokio::test]
-    async fn a_dial_to_a_peer_that_never_answers_gives_up() {
-        // `main` installs the process-wide rustls provider; a test process has
-        // none, and the `wss://` dial below needs one to build its config.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            // Hold the accepted socket open and never write a byte.
-            let _held = listener.accept().await;
-            std::future::pending::<()>().await
-        });
+    fn auth_ok() -> serde_json::Value {
+        serde_json::json!({ "type": "auth_ok" })
+    }
 
-        let started = Instant::now();
-        let err = dial_manager(
-            &format!("wss://{addr}/ws/node"),
-            None,
-            Duration::from_secs(1),
-        )
+    /// What the manager answers a secret it does not hold.
+    fn auth_error() -> serde_json::Value {
+        serde_json::json!({ "type": "auth_error", "message": "Invalid node secret" })
+    }
+
+    fn register_ack() -> serde_json::Value {
+        serde_json::json!({
+            "type": "register_ack",
+            "payload": { "node_id": "node-9", "node_secret": "issued-secret" }
+        })
+    }
+
+    /// The manager's half of an authentication: answer `reply`, and return
+    /// what the edge presented.
+    async fn authenticate(ws: &mut Ws, reply: serde_json::Value) -> serde_json::Value {
+        let auth = recv(ws).await;
+        assert_eq!(auth["type"], "auth", "{auth}");
+        send(ws, reply).await;
+        auth["payload"].clone()
+    }
+
+    fn rotate_command(new_secret: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "command",
+            "payload": {
+                "command_id": "rotate-1",
+                "action": { "type": "rotate_secret", "new_secret": new_secret }
+            }
+        })
+    }
+
+    /// Send `rotate_secret`, as `POST /api/v1/nodes/{id}/rotate-secret` does,
+    /// and return the edge's acknowledgement.
+    async fn rotate(ws: &mut Ws, new_secret: &str) -> serde_json::Value {
+        send(ws, rotate_command(new_secret)).await;
+        loop {
+            let msg = recv(ws).await;
+            if msg["type"] == "command_ack" && msg["payload"]["command_id"] == "rotate-1" {
+                return msg["payload"].clone();
+            }
+        }
+    }
+
+    /// End the connection the way a reset does: the edge's read fails, so
+    /// the session returns `Err`, not `Ok`. Then wait for the edge to hang up.
+    async fn break_connection(mut ws: Ws) {
+        use tokio::io::AsyncWriteExt;
+        // A frame with every reserved bit set, which no peer may send.
+        ws.get_mut().write_all(&[0xF1, 0x00]).await.unwrap();
+        while let Some(Ok(_)) = ws.next().await {}
+    }
+
+    /// Wait until the edge would present `secret` at its next attempt. The
+    /// rotation handler adopts a new secret once its acknowledgement has been
+    /// written, which is a moment after the manager reads it.
+    async fn presents(creds: &SharedCredentials, secret: &str) {
+        tokio::time::timeout(secs(5), async {
+            while lock_credentials(creds).config.node_secret.as_deref() != Some(secret) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
         .await
-        .expect_err("a peer that never answers must not hang for ever");
-
-        assert!(
-            err.contains("timed out"),
-            "expected a timeout error, got: {err}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "dial took {:?} — the deadline did not apply",
-            started.elapsed()
-        );
+        .unwrap_or_else(|_| panic!("the edge never came to present {secret}"));
     }
 
-    /// A refused connection must still come back as an ordinary error, not as
-    /// a timeout: the retry path depends on telling the two apart.
+    // ── Credentials across reconnects ──────────────────────────────
+
+    /// The edge used to save the rotated secret and acknowledge it — so the
+    /// manager stored it — and go on presenting the old one, refused at every
+    /// reconnect until a restart read the file. The connection is broken
+    /// rather than closed, because a session that ends in `Err` is the path
+    /// on which credentials handed back in the result were lost.
     #[tokio::test]
-    async fn a_refused_dial_reports_the_connection_error() {
-        // Bind and drop, so the port is almost certainly closed.
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+    async fn a_rotated_secret_is_presented_at_the_next_reconnect() {
+        let mut edge = Edge::new(manager_config(Some(OLD), None));
+        let creds = edge.credentials();
 
-        let err = dial_manager(
-            &format!("wss://{addr}/ws/node"),
-            None,
-            Duration::from_secs(10),
-        )
-        .await
-        .expect_err("a closed port cannot connect");
+        let (ended, ack) = edge
+            .session(&creds, |mut ws| async move {
+                let shown = authenticate(&mut ws, auth_ok()).await;
+                assert_eq!(shown["node_secret"], OLD);
+                let ack = rotate(&mut ws, NEW).await;
+                break_connection(ws).await;
+                ack
+            })
+            .await;
+        assert_eq!(ack["success"], true, "{ack}");
+        assert_eq!(ended.unwrap_err().loss, LinkLoss::ConnectionError);
+        assert_eq!(edge.secret_on_disk().as_deref(), Some(NEW));
+        presents(&creds, NEW).await;
 
-        assert!(
-            err.contains("connect failed"),
-            "expected a connect error, got: {err}"
-        );
+        let (_, shown) = edge
+            .session(&creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_id"], "node-1");
+        assert_eq!(shown["node_secret"], NEW, "the reconnect presented the secret the manager replaced");
+        assert_eq!(edge.secret_on_disk().as_deref(), Some(NEW));
     }
 
-    /// Once a session authenticates it may run for days, so the backstop must
-    /// never fire behind it.
+    /// An acknowledgement the manager wrote off — read after its 10 s wait,
+    /// or followed by a failed database write — leaves the manager on the old
+    /// secret. The edge is refused once with the new one, falls back to the
+    /// old one, and saves it, so a restart presents it too.
     #[tokio::test]
-    async fn the_backstop_stays_quiet_once_authenticated() {
-        let (tx, rx) = oneshot::channel();
-        tx.send(()).unwrap();
+    async fn a_rotation_the_manager_did_not_store_falls_back_to_the_previous_secret() {
+        let mut edge = Edge::new(manager_config(Some(OLD), None));
+        let creds = edge.credentials();
 
-        let fired = tokio::time::timeout(
-            Duration::from_millis(250),
-            handshake_backstop(rx, Duration::from_millis(50)),
+        let (_, ack) = edge
+            .session(&creds, |mut ws| async move {
+                authenticate(&mut ws, auth_ok()).await;
+                rotate(&mut ws, NEW).await
+            })
+            .await;
+        assert_eq!(ack["success"], true, "{ack}");
+        presents(&creds, NEW).await;
+
+        let (ended, shown) = edge
+            .session(&creds, |mut ws| async move { authenticate(&mut ws, auth_error()).await })
+            .await;
+        assert_eq!(shown["node_secret"], NEW, "the likelier secret goes first");
+        assert_eq!(ended.unwrap_err().loss, LinkLoss::AuthRejected);
+
+        let (_, shown) = edge
+            .session(&creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_secret"], OLD, "the refused secret was presented again");
+        assert_eq!(
+            edge.secret_on_disk().as_deref(),
+            Some(OLD),
+            "a restart would present the secret the manager refused"
+        );
+        assert_eq!(
+            edge.deps.app_config.read().await.manager.as_ref().unwrap().node_secret.as_deref(),
+            Some(OLD)
+        );
+
+        // Settled: the next connection presents the accepted secret at once.
+        let (_, shown) = edge
+            .session(&creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_secret"], OLD);
+    }
+
+    /// When the acknowledgement could not even be written, the manager cannot
+    /// have read it: the old secret stays first, the new one a fallback, and
+    /// the files go straight back to the old one. The connection that failed
+    /// may stay down — a manager outage, say — and a restart in that time
+    /// must not present the new one.
+    #[tokio::test]
+    async fn an_acknowledgement_that_never_left_puts_the_previous_secret_back() {
+        let edge = Edge::new(manager_config(Some(OLD), None));
+        let creds = edge.credentials();
+        // A session that has already ended: nothing will write the answer.
+        let (out_tx, out_rx) = mpsc::channel(1);
+        drop(out_rx);
+        rotate_node_secret(
+            "rotate-1",
+            &rotate_command(NEW)["payload"]["action"],
+            &creds,
+            &edge.deps.app_config,
+            &edge.deps.config_path,
+            &edge.deps.secrets_path,
+            edge.deps.tunnel_manager.event_sender(),
+            &out_tx,
         )
         .await;
 
-        assert!(
-            fired.is_err(),
-            "the backstop fired on an authenticated session"
-        );
+        assert_eq!(edge.secret_on_disk().as_deref(), Some(OLD), "a restart would present a secret the manager never read");
+        let mut held = lock_credentials(&creds);
+        assert_eq!(held.config.node_secret.as_deref(), Some(OLD));
+        held.rejected();
+        assert_eq!(held.config.node_secret.as_deref(), Some(NEW), "the new secret is still a candidate");
     }
 
-    /// And it must fire when authentication never arrives.
+    /// A secret the edge cannot save is refused, and nothing changes:
+    /// acknowledging it would have the manager store a secret the files do
+    /// not hold, and the node would be locked out at its next restart.
     #[tokio::test]
-    async fn the_backstop_fires_when_auth_never_arrives() {
-        let (_tx, rx) = oneshot::channel::<()>();
-
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            handshake_backstop(rx, Duration::from_millis(50)),
+    async fn a_secret_that_cannot_be_saved_is_refused_and_the_old_one_kept() {
+        let edge = Edge::in_dir(tempfile::tempdir().unwrap(), "missing", manager_config(Some(OLD), None));
+        let creds = edge.credentials();
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        rotate_node_secret(
+            "rotate-1",
+            &rotate_command(NEW)["payload"]["action"],
+            &creds,
+            &edge.deps.app_config,
+            &edge.deps.config_path,
+            &edge.deps.secrets_path,
+            edge.deps.tunnel_manager.event_sender(),
+            &out_tx,
         )
+        .await;
+
+        let ack: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap().json).unwrap();
+        assert_eq!(ack["payload"]["success"], false, "{ack}");
+        assert_eq!(ack["payload"]["error_code"], "config_persist_failed", "{ack}");
+        // Saved before committed: the running config never took the secret.
+        let running = edge.deps.app_config.read().await;
+        assert_eq!(running.manager.as_ref().unwrap().node_secret.as_deref(), Some(OLD));
+        let mut held = lock_credentials(&creds);
+        assert_eq!(held.config.node_secret.as_deref(), Some(OLD));
+        assert!(!held.accepted(), "a refused secret is not a candidate");
+    }
+
+    /// Registration handed its credentials back in the session's `Ok` value:
+    /// a reset after `register_ack` dropped them, and the edge presented its
+    /// spent registration token until a restart.
+    #[tokio::test]
+    async fn a_registration_survives_an_errored_session() {
+        let mut edge = Edge::new(manager_config(None, Some("one-time-token")));
+        let creds = edge.credentials();
+
+        let (ended, shown) = edge
+            .session(&creds, |mut ws| async move {
+                let shown = authenticate(&mut ws, register_ack()).await;
+                break_connection(ws).await;
+                shown
+            })
+            .await;
+        assert_eq!(shown["registration_token"], "one-time-token");
+        assert_eq!(ended.unwrap_err().loss, LinkLoss::ConnectionError);
+
+        let (_, shown) = edge
+            .session(&creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_id"], "node-9");
+        assert_eq!(shown["node_secret"], "issued-secret");
+        assert!(shown.get("registration_token").is_none(), "{shown}");
+        assert_eq!(edge.secret_on_disk().as_deref(), Some("issued-secret"));
+    }
+
+    /// A `PUT /api/v1/config` of the masked `GET` body leaves the running
+    /// config without a secret. What the edge presents does not come from
+    /// there, so the next reconnect is unaffected — read back from the
+    /// running config, it would have presented no secret at all.
+    #[tokio::test]
+    async fn a_masked_config_does_not_change_what_the_edge_presents() {
+        let mut edge = Edge::new(manager_config(Some(OLD), None));
+        let creds = edge.credentials();
+        edge.deps.app_config.write().await.mask_secrets();
+
+        let (_, shown) = edge
+            .session(&creds, |mut ws| async move { authenticate(&mut ws, auth_ok()).await })
+            .await;
+        assert_eq!(shown["node_secret"], OLD);
+    }
+
+    /// The reconnect loop itself, not only one session, carries what a
+    /// session learned: the credentials outlive each attempt.
+    #[tokio::test(start_paused = true)]
+    async fn the_reconnect_loop_presents_a_rotated_secret_at_its_next_attempt() {
+        let (client, mut accepted, _dir) = Edge::new(manager_config(Some(OLD), None)).reconnect_loop();
+        let fake_manager = async {
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            let shown = authenticate(&mut ws, auth_ok()).await;
+            assert_eq!(shown["node_secret"], OLD);
+            let ack = rotate(&mut ws, NEW).await;
+            assert_eq!(ack["success"], true, "{ack}");
+            break_connection(ws).await;
+
+            // The loop waits out its backoff (on the paused clock) and dials again.
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            authenticate(&mut ws, auth_ok()).await
+        };
+        let shown = tokio::time::timeout(secs(120), async {
+            tokio::select! {
+                () = client => panic!("the reconnect loop never returns"),
+                shown = fake_manager => shown,
+            }
+        })
         .await
-        .expect("the backstop should have fired when auth never completed");
+        .expect("the edge never dialled again");
+        assert_eq!(shown["node_secret"], NEW, "the reconnect presented the secret the manager replaced");
+    }
+
+    // ── Liveness ───────────────────────────────────────────────────
+
+    /// A manager that pings and then goes quiet — its task wedged, the
+    /// connection still up — is dropped once the silence passes the limit
+    /// its pings set, and the loop dials again. The silence ends a session
+    /// that registered, so this also pins that the watchdog keeps what the
+    /// session obtained: the redial presents the issued credentials.
+    #[tokio::test(start_paused = true)]
+    async fn a_manager_that_pings_then_goes_silent_is_dropped_and_redialled() {
+        let (client, mut accepted, _dir) = Edge::new(manager_config(None, Some("one-time-token"))).reconnect_loop();
+        let fake_manager = async {
+            let ws = answer(accepted.recv().await.unwrap()).await;
+            let (mut tx, mut rx) = ws.split();
+            let auth = loop {
+                if let Some(Ok(Message::Text(text))) = rx.next().await {
+                    break serde_json::from_str::<serde_json::Value>(&text).unwrap();
+                }
+            };
+            assert_eq!(auth["payload"]["registration_token"], "one-time-token");
+            tx.send(Message::Text(register_ack().to_string().into())).await.unwrap();
+
+            // Read everything the edge sends, so its writes never stall:
+            // only the silence can end this session.
+            let drain = async { while let Some(Ok(_)) = rx.next().await {} };
+            // Two pings 15 s apart, then nothing: the manager goes quiet 30 s
+            // from now, holding the connection open.
+            let went_quiet = tokio::time::Instant::now() + secs(30);
+            let pinging = async {
+                for _ in 0..2 {
+                    tokio::time::sleep(secs(15)).await;
+                    tx.send(Message::Ping(Bytes::new())).await.unwrap();
+                }
+                std::future::pending::<()>().await
+            };
+            tokio::select! {
+                () = drain => {}
+                () = pinging => unreachable!(),
+            }
+            let hung_up_after = tokio::time::Instant::now() - went_quiet;
+            assert!(
+                hung_up_after > secs(90) && hung_up_after <= secs(90) + secs(5) + secs(1),
+                "the edge hung up {hung_up_after:?} after the manager went quiet"
+            );
+
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            let shown = authenticate(&mut ws, auth_ok()).await;
+            // The loss reaches the manager on the next session, named.
+            let lost = loop {
+                let msg = recv(&mut ws).await;
+                if msg["type"] == "event" && msg["payload"]["details"]["error_code"] == "manager_silent" {
+                    break msg["payload"].clone();
+                }
+            };
+            (shown, lost)
+        };
+        let (shown, lost) = tokio::time::timeout(secs(600), async {
+            tokio::select! {
+                () = client => panic!("the reconnect loop never returns"),
+                got = fake_manager => got,
+            }
+        })
+        .await
+        .expect("the edge never dropped the silent session");
+        assert_eq!(shown["node_id"], "node-9");
+        assert_eq!(shown["node_secret"], "issued-secret");
+        assert_eq!(lost["message"], "Manager connection lost: manager went silent", "{lost}");
+        assert_eq!(lost["details"]["url"], "wss://manager.test/ws/node", "{lost}");
+        assert!(lost["details"]["reason"].as_str().unwrap().contains("Nothing heard"), "{lost}");
+    }
+
+    /// A manager that keeps pinging while the edge's own writes crawl — a
+    /// starved uplink, the manager draining only now and then — is alive,
+    /// and the session must stay up. With the reads in one of the session
+    /// loop's branches, a loop parked in a slow write left the pings unread
+    /// and the watchdog took the manager for dead: the session flapped.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_whose_writes_are_slow_stays_up_while_the_manager_pings() {
+        let mut edge = Edge::new(manager_config(Some(OLD), None));
+        let creds = edge.credentials();
+        // Small enough that the first health frame alone fills it.
+        let (edge_io, manager_io) = tokio::io::duplex(1024);
+        let edge_ws = WebSocketStream::from_raw_socket(edge_io, Role::Client, None).await;
+        let mut ws = answer(manager_io).await;
+        let session = run_session(edge_ws, &creds, &edge.deps, &mut edge.event_rx, None);
+
+        let fake_manager = async {
+            authenticate(&mut ws, auth_ok()).await;
+            let mut drained = 0usize;
+            // Eleven minutes: pings every 15 s throughout, the edge's frames
+            // read for five seconds every 200 s and not at all in between —
+            // each write waits up to 200 s, under the 300 s write bound.
+            for minute_mark in 1..=44u32 {
+                tokio::time::sleep(secs(15)).await;
+                ws.send(Message::Ping(Bytes::new())).await.unwrap();
+                if minute_mark % 13 == 0 {
+                    let window = tokio::time::sleep(secs(5));
+                    tokio::pin!(window);
+                    loop {
+                        tokio::select! {
+                            () = &mut window => break,
+                            frame = ws.next() => match frame {
+                                Some(Ok(_)) => drained += 1,
+                                other => panic!("the edge's connection ended: {other:?}"),
+                            },
+                        }
+                    }
+                }
+            }
+            drained
+        };
+        let drained = tokio::select! {
+            ended = session => panic!("the session ended on a live manager: {ended:?}"),
+            drained = fake_manager => drained,
+        };
+        assert!(drained > 0, "the edge never got a frame out");
+    }
+
+    /// A manager that never reads and never pings — its task wedged before
+    /// its keepalive started, or one that predates the keepalive — leaves the
+    /// silence watchdog unarmed for good. The write bound ends the session
+    /// anyway; before it, the first write the socket could not take parked
+    /// the session for ever.
+    #[tokio::test(start_paused = true)]
+    async fn a_manager_that_stops_reading_is_dropped_after_the_write_bound() {
+        let mut edge = Edge::new(manager_config(Some(OLD), None));
+        let creds = edge.credentials();
+        let (edge_io, manager_io) = tokio::io::duplex(1024);
+        let edge_ws = WebSocketStream::from_raw_socket(edge_io, Role::Client, None).await;
+        let mut ws = answer(manager_io).await;
+        let session = run_session(edge_ws, &creds, &edge.deps, &mut edge.event_rx, None);
+
+        let fake_manager = async {
+            authenticate(&mut ws, auth_ok()).await;
+            // Hold the connection and read nothing more.
+            std::future::pending::<()>().await
+        };
+        let started = tokio::time::Instant::now();
+        let ended = tokio::time::timeout(secs(400), async {
+            tokio::select! {
+                ended = session => ended,
+                () = fake_manager => unreachable!(),
+            }
+        })
+        .await
+        .expect("a manager that stopped reading parked the session");
+        assert_eq!(ended.unwrap_err().loss, LinkLoss::WriteStalled);
+        assert!(started.elapsed() >= link::WRITE_STALL_LIMIT);
+    }
+
+    /// The handshake backstop must never cancel the work that keeps what the
+    /// manager issued. By the time a `register_ack` arrives the manager has
+    /// spent the token; a registration cancelled while it waited on the
+    /// config lock left the node with neither its token nor a secret —
+    /// locked out even across a restart.
+    #[tokio::test(start_paused = true)]
+    async fn the_backstop_does_not_cancel_a_registration_waiting_on_the_config() {
+        let edge = Edge::new(manager_config(None, Some("one-time-token")));
+        let app_config = edge.deps.app_config.clone();
+        let (config_path, secrets_path) = (edge.deps.config_path.clone(), edge.deps.secrets_path.clone());
+        let (client, mut accepted, _dir) = edge.reconnect_loop();
+
+        let fake_manager = async {
+            let mut ws = answer(accepted.recv().await.unwrap()).await;
+            let auth = recv(&mut ws).await;
+            assert_eq!(auth["payload"]["registration_token"], "one-time-token");
+            // Something else holds the config — a slow save on an SD card,
+            // say — past the backstop's deadline.
+            let held = app_config.write().await;
+            send(&mut ws, register_ack()).await;
+            tokio::time::sleep(link::HANDSHAKE_TIMEOUT * 2).await;
+            assert!(accepted.try_recv().is_err(), "the backstop dropped the session and the edge redialled");
+            drop(held);
+
+            tokio::time::timeout(secs(10), async {
+                while app_config.read().await.manager.as_ref().unwrap().node_secret.is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the issued credentials never reached the running config");
+            ws
+        };
+        let _ws = tokio::time::timeout(secs(600), async {
+            tokio::select! {
+                () = client => panic!("the reconnect loop never returns"),
+                ws = fake_manager => ws,
+            }
+        })
+        .await
+        .expect("the registration never completed");
+        let on_disk = crate::config::persistence::load_config_split(&config_path, &secrets_path)
+            .unwrap()
+            .manager
+            .unwrap();
+        assert_eq!(on_disk.node_id.as_deref(), Some("node-9"));
+        assert_eq!(on_disk.node_secret.as_deref(), Some("issued-secret"));
+        assert!(on_disk.registration_token.is_none());
     }
 }

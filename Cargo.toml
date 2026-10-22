@@ -851,6 +851,10 @@ version = "0.21.5"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `test-util` for tokio's paused clock, so the manager-link tests can run a
+# session through minutes of keepalive, silence and write stalls in
+# milliseconds. Tests only, and it adds no crate.
+tokio = { version = "1.52", features = ["test-util"] }
 
 # NVIDIA NVML — live NVENC / NVDEC utilization for the resource-budget
 # block on the manager UI. Optional; gated on the `hardware-monitor-nvml`
