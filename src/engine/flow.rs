@@ -3570,6 +3570,24 @@ impl FlowRuntime {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), ih).await;
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), fh).await;
         }
+        // And the recorder, which is still finishing after the cancel: it
+        // closes its open segment and waits out every close pending behind
+        // it. A restart that did not wait started the next writer on the
+        // same directory meanwhile, and that writer's first act — sweeping
+        // `.tmp/` of a crash's leftovers — deleted the segments the old one
+        // was still finishing; a process exit abandoned them. Longer than an
+        // output's allowance, since this is up to five segments' fsyncs on
+        // whatever disk made the closer fall behind.
+        #[cfg(feature = "replay")]
+        if let Some(rec) = &self.recording_handle
+            && !rec.finished(std::time::Duration::from_secs(10)).await
+        {
+            tracing::warn!(
+                "Flow '{}': recording '{}' had not finished closing its segments after 10 s; \
+                 a restarted recorder may sweep up the last of them",
+                self.config.config.id, rec.recording_id,
+            );
+        }
         // PES Switch Phase 2.1c Stage 3: drain any cross-flow demuxer
         // shim tasks. Each holds a `DemuxerHandle` whose `Drop` impl
         // decrements the FlowManager's refcounted demuxer slot; the

@@ -259,6 +259,18 @@ fn exit_without_static_teardown(code: i32) -> ! {
 /// it stays within a few hundred megabytes of the floor.
 const DEFAULT_HEAP_TRIM_SECS: u64 = 60;
 
+/// How long a process shutdown gives its flows to stop, all at once.
+///
+/// `packaging/bilbycast-edge.service` allows the whole stop `TimeoutStopSec=20`
+/// before it sends SIGKILL. The API server's graceful close comes first —
+/// bounded at 5 s on the TLS listener — and the tunnels and the bond policy
+/// routes torn down after the flows need what is left. A flow's own stop waits
+/// up to 10 s for its recorder to finish closing segments, and on a stalled
+/// replay volume it waits all of it; flows stop concurrently, so this is that
+/// wait once, not once per recording flow, and the bound keeps a disk that
+/// outlasts even that from carrying the route teardown past the kill.
+const SHUTDOWN_FLOW_STOP_BUDGET: Duration = Duration::from_secs(10);
+
 #[cfg(target_env = "gnu")]
 fn spawn_heap_trimmer(every_secs: u64, cancel: tokio_util::sync::CancellationToken) {
     // The interval sets how much slack the process carries, because it is the
@@ -1367,8 +1379,14 @@ async fn real_main() -> anyhow::Result<()> {
         run_multi_listener_plain(bind_addrs.as_slice(), router, shutdown_token).await?;
     }
 
-    // Graceful shutdown: stop all flows and tunnels
-    flow_manager.stop_all().await;
+    // Graceful shutdown: stop all flows and tunnels — the flows within a
+    // bound, so what follows them still runs before systemd's SIGKILL.
+    if !flow_manager.stop_all_within(SHUTDOWN_FLOW_STOP_BUDGET).await {
+        tracing::warn!(
+            "flows had not all stopped after {} s; carrying on with the shutdown",
+            SHUTDOWN_FLOW_STOP_BUDGET.as_secs()
+        );
+    }
     tunnel_manager.stop_all().await;
 
     // Remove any gateway-mode bond policy routes this process installed.

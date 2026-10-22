@@ -886,6 +886,9 @@ struct CmafState {
     /// A decodable non-AAC audio source with no `audio_encode` has been
     /// reported.
     audio_needs_encode_warned: bool,
+    /// How long the packet being processed waited in the intake — how far
+    /// behind its feed this output is. See [`CmafState::arrival_now`].
+    intake_wait: std::time::Duration,
 }
 
 struct CencRuntime {
@@ -920,14 +923,16 @@ async fn restore_published_window(
 ) -> Option<RestoredWindow> {
     // Its own budget, and racing the cancel token.
     //
-    // This is awaited between subscribing the broadcast receiver and entering
-    // the packet loop, so every second it spends is a second the output is not
-    // draining its channel — at the default capacity, about seventeen seconds
-    // of headroom at 10 Mbps before the output opens on a `Lagged` and the
-    // window gains a hole at exactly the join the restore exists to make
-    // seamless. The clip client's 60 s request timeout is sized for pulling
-    // whole segments, not for a startup preflight, and an origin that accepts
-    // the connection and then stalls holds the whole of it.
+    // This is awaited between subscribing and entering the packet loop, so
+    // every second it spends is a second the output falls behind its feed.
+    // The intake keeps the broadcast drained meanwhile, but its budget is
+    // finite — about fifteen seconds of a 10 Mbit/s SDI feed — and past it the
+    // output opens on a `Lagged` and the window gains a hole at exactly the
+    // join the restore exists to make seamless; well before that, a backlog is
+    // latency on every viewer's live edge. The clip client's 60 s request
+    // timeout is sized for pulling whole segments, not for a startup
+    // preflight, and an origin that accepts the connection and then stalls
+    // holds the whole of it.
     //
     // A window is a nicety; the media path is not. Three seconds is ample for
     // a manifest, and a stop arriving during it is honoured rather than waited
@@ -1341,7 +1346,24 @@ impl CmafState {
             timeline_jump_logged: None,
             mpeg2_warned: false,
             audio_needs_encode_warned: false,
+            intake_wait: std::time::Duration::ZERO,
         }
+    }
+
+    /// The wall clock as of when the packet being processed arrived: now,
+    /// less the time it waited in the intake.
+    ///
+    /// What a segment is dated by. The intake lets an output fall seconds
+    /// behind its feed rather than lose packets, and a segment closed from
+    /// that backlog was dated as if its packets had just arrived: the flow's
+    /// epoch absorbed the lag, and past `EPOCH_REANCHOR_SECS` re-anchored —
+    /// an `#EXT-X-DISCONTINUITY` and a jump in the dates on every rendition,
+    /// over a slow upload. Dated by arrival, how far behind the output runs
+    /// does not reach the dates at all. While it keeps up the wait is
+    /// microseconds, and this is the `Utc::now()` it always was.
+    fn arrival_now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+            - chrono::Duration::from_std(self.intake_wait).unwrap_or(chrono::Duration::zero())
     }
 
     /// A source timestamp of `track` on this output's timeline
@@ -1780,6 +1802,7 @@ async fn run(
             result = rx.recv() => {
                 match result {
                     Ok(packet) => {
+                        state.intake_wait = rx.waited();
                         let payload = if packet.is_raw_ts {
                             &packet.data[..]
                         } else if packet.data.len() > RTP_HEADER_MIN {
@@ -2410,7 +2433,12 @@ async fn push_video_sample(
     // It also takes the origin's latency out of every *ordinary* sample, where
     // the filter had been absorbing it, and stops two renditions publishing to
     // different origins disagreeing by the difference in their response times.
-    let closed_at = chrono::Utc::now();
+    //
+    // And as of the arrival of the packet that closed the segment, not of its
+    // processing: the same latency, come back through the intake's queue — a
+    // wait on the origin now leaves the output behind its feed rather than
+    // short of packets. See `CmafState::arrival_now`.
+    let closed_at = state.arrival_now();
 
     // The init is published — first time, periodic republish, or a new
     // generation — AFTER the segment this push closed has entered the
@@ -3463,6 +3491,24 @@ fn ll_tail_chunk(seg: &CompletedSegment, tail: &[Sample], chunks_emitted: u32) -
     }
 }
 
+/// How many chunks a low-latency segment's PUT may hold queued for the origin:
+/// two segments' worth, and never fewer than eight.
+///
+/// A full queue abandons the segment. Live, chunks are cut one
+/// `chunk_duration_ms` apart and eight was room to spare; but an output
+/// catching up on a backlog in its intake cuts a whole segment's chunks in
+/// milliseconds — four at the default 2 s / 500 ms, a hundred at the 10 s /
+/// 100 ms validation allows — and with room for eight, every caught-up
+/// segment past its eighth chunk was abandoned, turning the backlog the
+/// intake had just saved back into lost video. Two segments' worth, because
+/// a segment runs to the IDR at or past its target, so a source GOP longer
+/// than the target lengthens it. Each segment has a PUT of its own, finished
+/// before the next opens, so this is all a slow origin can hold.
+fn ll_chunk_queue_depth(config: &CmafOutputConfig) -> usize {
+    let per_segment = (config.segment_duration_secs * 1000.0 / config.chunk_duration_ms.max(1) as f64).ceil();
+    (per_segment as usize).saturating_mul(2).max(8)
+}
+
 /// LL-CMAF chunk pump. Called once per video frame push; it opens a
 /// chunked PUT at segment boundaries, flushes accumulated samples as
 /// moof+mdat chunks every `chunk_duration_ms` worth of media, and
@@ -3487,9 +3533,10 @@ async fn handle_ll_cmaf(
     // Before anything here can wait on the origin — the init republish just
     // below, and the closing PUT's `finish()` after it. `push()` cut the
     // segment a few microseconds ago in `handle_video`, and this is the instant
-    // the row that closes below is dated from. See the same sample on the plain
-    // path for what sampling after an upload does to the flow's epoch.
-    let closed_at = chrono::Utc::now();
+    // the row that closes below is dated from — as of the closing packet's
+    // arrival. See the same sample on the plain path for what sampling after
+    // an upload, or after a wait in the intake, does to the flow's epoch.
+    let closed_at = state.arrival_now();
 
     // On a new segment boundary, finalise the previous LL PUT and open a new
     // one — before the init publish, whatever state the init is in. A
@@ -3539,7 +3586,7 @@ async fn handle_ll_cmaf(
                             &format!("{base_url}/{uri}"),
                             "video/mp4",
                             config.auth_token.as_deref(),
-                            8,
+                            ll_chunk_queue_depth(config),
                         );
                         ll.handle.send_chunk(bytes).is_ok()
                     }
@@ -3632,8 +3679,12 @@ async fn handle_ll_cmaf(
             let seq = vs.next_segment_number();
             let uri = default_segment_uri(seq);
             let url = format!("{}/{}", base_url, uri);
-            let handle =
-                chunked_put(&url, "video/mp4", config.auth_token.as_deref(), 8);
+            let handle = chunked_put(
+                &url,
+                "video/mp4",
+                config.auth_token.as_deref(),
+                ll_chunk_queue_depth(config),
+            );
             tracing::debug!(
                 "CMAF output '{}': opened LL chunked PUT for seg={} ({})",
                 config.id, seq, url
@@ -3707,7 +3758,7 @@ async fn handle_ll_cmaf(
                         &format!("{}/{}", base_url, ll.uri),
                         "video/mp4",
                         config.auth_token.as_deref(),
-                        8,
+                        ll_chunk_queue_depth(config),
                     );
                     ll.handle.send_chunk(bytes)
                 }
@@ -4040,7 +4091,10 @@ async fn publish_ll_hls(
         }),
         config.segment_duration_secs,
         flow_id,
-        chrono::Utc::now(),
+        // As of the packet's arrival, like the rows that close: the open row
+        // is dated only while this agrees with the flow's epoch, and an
+        // output working through a backlog would otherwise publish it bare.
+        state.arrival_now(),
     );
     let hints = LowLatencyHints {
         part_target_secs: config.chunk_duration_ms as f64 / 1000.0,
@@ -4960,6 +5014,94 @@ seg-00042.m4s?token=abc
     /// `secs_f` seconds after `base`.
     fn at(base: chrono::DateTime<chrono::Utc>, secs_f: f64) -> chrono::DateTime<chrono::Utc> {
         base + secs(secs_f)
+    }
+
+    /// A backlog in the intake must not reach the flow's epoch.
+    ///
+    /// The intake lets an output fall behind its feed — seconds behind, on a
+    /// slow origin — rather than lose packets. A segment closed from that
+    /// backlog was dated as if its packets had just arrived, so a 15 s wait on
+    /// the origin carried the flow's epoch past `EPOCH_REANCHOR_SECS`: a
+    /// re-anchor, an `#EXT-X-DISCONTINUITY` and a jump in every rendition's
+    /// dates, over nothing but a slow upload. The close is dated by arrival
+    /// instead — now, less what the intake says the packet waited.
+    ///
+    /// This pins the pieces — the intake's wait, `arrival_now`, and what each
+    /// dating does to the flow's clock — not the wiring between them. No test
+    /// drives `push_video_sample` or `handle_ll_cmaf`, which need a segmenter
+    /// and an origin, so their two `closed_at = state.arrival_now()` lines are
+    /// held by review alone: either edited back to `Utc::now()` leaves this
+    /// test green.
+    #[tokio::test]
+    async fn a_backlog_in_the_intake_is_dated_by_arrival() {
+        // What the output reads: the intake says how long a packet waited,
+        // and the close's sample is that much before now.
+        let (tx, src) = broadcast::channel::<RtpPacket>(16);
+        let mut rx = intake::Intake::spawn(src, intake::INTAKE_BUDGET_BYTES);
+        tx.send(RtpPacket {
+            data: bytes::Bytes::from_static(&[0x47; 188]),
+            sequence_number: 0,
+            rtp_timestamp: 0,
+            recv_time_us: 0,
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        })
+        .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        rx.recv().await.unwrap();
+        let mut state = CmafState::new();
+        state.intake_wait = rx.waited();
+        let behind = (chrono::Utc::now() - state.arrival_now()).num_milliseconds();
+        assert!((300..2_000).contains(&behind), "the close was dated {behind} ms back");
+
+        // What that does to the flow's clock. 2 s segments; from segment 5 the
+        // output waits 15 s on the origin, then works through the backlog in
+        // a burst, closing segments 5-12 within milliseconds of each other.
+        let seg = 2.0;
+        let origin = ts("2026-10-22T00:00:00.000Z");
+        let mut by_processing = FlowClock::new(0, seg, at(origin, seg));
+        let mut by_arrival = FlowClock::new(0, seg, at(origin, seg));
+        let mut reanchored_by_processing = false;
+        for n in 0..20u64 {
+            let base = n * 180_000;
+            let arrived = (n + 1) as f64 * seg;
+            let processed = if (5..13).contains(&n) { 27.0 + (n - 5) as f64 * 0.01 } else { arrived };
+            let waited = secs(processed - arrived);
+
+            let (_, disc) = by_processing.date_closed_segment(base, seg, at(origin, processed), "flow-backlog-a");
+            reanchored_by_processing |= disc;
+
+            let (pdt, disc) = by_arrival.date_closed_segment(base, seg, at(origin, processed) - waited, "flow-backlog-b");
+            assert!(!disc, "segment {n}: a backlog re-anchored the flow's timeline");
+            let err = (pdt - at(origin, n as f64 * seg)).num_milliseconds();
+            assert!(err.abs() <= 5, "segment {n} dated {err} ms off its content");
+        }
+        assert!(reanchored_by_processing, "the model no longer shows what dating by processing did");
+    }
+
+    /// A low-latency segment's PUT holds a whole segment's chunks, so an
+    /// output catching up on a backlog — which cuts them in milliseconds —
+    /// does not abandon the segment past an eighth.
+    #[test]
+    fn a_caught_up_low_latency_segment_fits_its_chunk_queue() {
+        let config = |segment_duration_secs: f64, chunk_duration_ms: u32| CmafOutputConfig {
+            segment_duration_secs,
+            chunk_duration_ms,
+            low_latency: true,
+            ..serde_json::from_value(serde_json::json!({
+                "id": "o", "name": "o", "ingest_url": "https://origin.example/x",
+            }))
+            .unwrap()
+        };
+        for (seg, chunk) in [(2.0, 500), (10.0, 100), (1.0, 2000), (6.0, 200), (10.0, 2000)] {
+            let per_segment = (seg * 1000.0 / chunk as f64).ceil() as usize;
+            let depth = ll_chunk_queue_depth(&config(seg, chunk));
+            assert!(depth >= 2 * per_segment, "{seg} s / {chunk} ms: room for {depth} of {per_segment} chunks");
+            assert!(depth >= 8);
+        }
     }
 
     /// The low-latency path reads the flow clock; it must never steer it.

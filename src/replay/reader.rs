@@ -52,7 +52,12 @@ pub struct Reader {
 impl Reader {
     /// Open the entire recording (no clip range).
     pub async fn open_recording(recording_id: &str) -> Result<Self> {
-        let dir = super::recording_dir(recording_id);
+        Self::open_recording_at(recording_id, super::recording_dir(recording_id)).await
+    }
+
+    /// [`Self::open_recording`] in a named directory rather than the replay
+    /// root's, so a test can read a recording of its own.
+    pub(crate) async fn open_recording_at(recording_id: &str, dir: PathBuf) -> Result<Self> {
         if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
             return Err(anyhow!("replay_clip_not_found"));
         }
@@ -145,12 +150,26 @@ impl Reader {
         Ok(Some(buf))
     }
 
+    /// Move on to the segment after the current one: the next id or, past a
+    /// gap in the ids, the next segment on disk. `false` at the end of the
+    /// recording.
+    ///
+    /// A gap is not the end. A crash leaves one where the segments it lost
+    /// were, and so does a close that failed (see "Segment ids" in
+    /// `replay::writer`); stopping at the first missing id ended the playback
+    /// of everything recorded after it. Only a miss lists the directory, so
+    /// the common case is still one probe.
     async fn advance_segment(&mut self) -> Result<bool> {
-        let next_id = self.current_segment.unwrap_or(0).wrapping_add(1);
-        // Probe whether next_id exists.
-        let path = self.recording_dir.join(format!("{:06}.ts", next_id));
+        let current = self.current_segment.unwrap_or(0);
+        let mut next_id = current.wrapping_add(1);
+        let mut path = self.recording_dir.join(format!("{:06}.ts", next_id));
         if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return Ok(false);
+            let after = self.list_segments().await.unwrap_or_default().into_iter().find(|&id| id > current);
+            let Some(id) = after else {
+                return Ok(false);
+            };
+            next_id = id;
+            path = self.recording_dir.join(format!("{:06}.ts", next_id));
         }
         let file = File::open(&path).await?;
         self.current_segment = Some(next_id);
@@ -160,7 +179,6 @@ impl Reader {
 
     /// List segment files actually present on disk for this recording,
     /// sorted by segment id.
-    #[allow(dead_code)]
     pub async fn list_segments(&self) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
         let mut dir = read_dir(&self.recording_dir).await?;
@@ -177,5 +195,42 @@ impl Reader {
         }
         ids.sort_unstable();
         Ok(ids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replay::index::{IndexWriter, flag};
+
+    /// A gap in the segment ids is stepped over, not taken for the end: what
+    /// was recorded after a crash, or after a segment whose close failed, is
+    /// still played.
+    #[tokio::test]
+    async fn playback_steps_over_a_gap_in_the_segment_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("rec");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        // Segments 0, 1, 4 and 5: 2 and 3 were lost.
+        let mut expected = Vec::new();
+        for id in [0u32, 1, 4, 5] {
+            let seg: Vec<u8> = (0..2 * TS_PACKET).map(|i| (id as usize * 31 + i) as u8).collect();
+            tokio::fs::write(dir.join(format!("{id:06}.ts")), &seg).await.unwrap();
+            expected.extend_from_slice(&seg);
+        }
+        let mut index = IndexWriter::open(&dir.join("index.bin")).await.unwrap();
+        index
+            .append(IndexEntry { pts_90khz: 0, smpte_tc: 0, segment_id: 0, byte_offset: 0, flags: flag::IS_IDR })
+            .await
+            .unwrap();
+        index.flush_and_sync().await.unwrap();
+
+        let mut reader = Reader::open_recording_at("rec", dir).await.unwrap();
+        let mut played = Vec::new();
+        while let Some(bundle) = reader.read_bundle(1).await.unwrap() {
+            played.extend_from_slice(&bundle);
+        }
+        assert_eq!(played.len(), expected.len(), "playback stopped at the gap");
+        assert_eq!(played, expected);
     }
 }

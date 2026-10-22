@@ -20,21 +20,49 @@
 //! It cannot help if the whole runtime stalls: the intake is a task like any
 //! other and would stall with it. It turns a slow peer into latency instead of
 //! loss, which is the case the output itself can do something about.
+//!
+//! Latency that the output must not mistake for the time. A segment is dated
+//! by the instant it closed, and the flow's wall-clock epoch is steered by that
+//! date — re-anchored outright past `EPOCH_REANCHOR_SECS` (10 s) — so an
+//! output catching up on a backlog would date each segment it closes as if its
+//! packets had just arrived: past ten seconds behind, a re-anchor and an
+//! `#EXT-X-DISCONTINUITY` on every rendition of the flow, and a rendition that
+//! stayed that far behind its sibling would re-anchor the two against each
+//! other on every segment. The broadcast ring never allowed that — it was 2.4 s
+//! of an SDI feed — and this queue does. So the intake records when it took
+//! each packet off the broadcast, and [`Intake::waited`] says how long the one
+//! just returned sat queued, for the output to date by arrival.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::engine::packet::RtpPacket;
 
-/// Bytes an output may hold unread before the intake drops. ~24 s of a
-/// 10 Mbit/s feed, held only while the output is behind.
+/// Memory an output may hold unread before the intake drops, held only while
+/// the output is behind: each packet is charged its payload plus
+/// [`ITEM_OVERHEAD_BYTES`]. In time that is ~15 s of a 10 Mbit/s SDI feed
+/// (one 188-byte TS packet per message), ~24 s of 1316-byte datagrams at
+/// 10 Mbit/s, and more on a frame-per-message feed (RTMP, RTSP). Per output:
+/// the renditions of a flow share one origin connection, so a stall that
+/// fills one tends to fill them all, and the worst case is this times the
+/// flow's CMAF outputs.
 pub(super) const INTAKE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
+/// What a queued packet costs beyond its payload: the queue's own slot for it
+/// (the packet header and its arrival instant), the shared header the
+/// broadcast's clone gave its `Bytes`, and the allocator's overhead on the
+/// payload. A 188-byte SDI packet is no bigger than all of that put
+/// together, so counting the payload alone let an SDI feed's queue reach
+/// well over one and a half times the budget it was said to be held to.
+const ITEM_OVERHEAD_BYTES: usize = std::mem::size_of::<Item>() + 64;
+
 enum Item {
-    Packet(RtpPacket),
+    /// A packet, and when the intake took it off the broadcast.
+    Packet(RtpPacket, Instant),
     /// Packets lost ahead of the next one: overrun on the broadcast, or past
     /// the intake's own budget.
     Lost(u64),
@@ -45,6 +73,8 @@ pub(super) struct Intake {
     rx: mpsc::UnboundedReceiver<Item>,
     queued: Arc<AtomicUsize>,
     task: JoinHandle<()>,
+    /// How long the packet [`Self::recv`] last returned had been queued.
+    waited: Duration,
 }
 
 impl Intake {
@@ -53,21 +83,33 @@ impl Intake {
         let (tx, rx) = mpsc::unbounded_channel();
         let queued = Arc::new(AtomicUsize::new(0));
         let task = tokio::spawn(forward(src, tx, queued.clone(), budget));
-        Self { rx, queued, task }
+        Self { rx, queued, task, waited: Duration::ZERO }
     }
 
     /// The next packet, or what the broadcast receiver would have said: a
     /// `Lagged(n)` for packets lost ahead of it, `Closed` when the flow ends.
     pub(super) async fn recv(&mut self) -> Result<RtpPacket, broadcast::error::RecvError> {
         match self.rx.recv().await {
-            Some(Item::Packet(p)) => {
-                self.queued.fetch_sub(p.data.len(), Ordering::Relaxed);
+            Some(Item::Packet(p, queued_at)) => {
+                self.queued.fetch_sub(cost(&p), Ordering::Relaxed);
+                self.waited = queued_at.elapsed();
                 Ok(p)
             }
             Some(Item::Lost(n)) => Err(broadcast::error::RecvError::Lagged(n)),
             None => Err(broadcast::error::RecvError::Closed),
         }
     }
+
+    /// How long the packet [`Self::recv`] last returned sat in the queue: how
+    /// far behind the feed this output is. Near zero while it keeps up.
+    pub(super) fn waited(&self) -> Duration {
+        self.waited
+    }
+}
+
+/// What a packet is charged against the budget.
+fn cost(p: &RtpPacket) -> usize {
+    p.data.len() + ITEM_OVERHEAD_BYTES
 }
 
 impl Drop for Intake {
@@ -88,7 +130,7 @@ async fn forward(
     loop {
         match src.recv().await {
             Ok(p) => {
-                let len = p.data.len();
+                let len = cost(&p);
                 if queued.load(Ordering::Relaxed) + len > budget {
                     lost += 1;
                     continue;
@@ -99,7 +141,7 @@ async fn forward(
                     return;
                 }
                 queued.fetch_add(len, Ordering::Relaxed);
-                if tx.send(Item::Packet(p)).is_err() {
+                if tx.send(Item::Packet(p, Instant::now())).is_err() {
                     return;
                 }
             }
@@ -157,7 +199,7 @@ mod tests {
     #[tokio::test]
     async fn past_its_budget_it_drops_and_reports_the_loss_in_order() {
         let (tx, rx) = broadcast::channel::<RtpPacket>(1024);
-        let mut intake = Intake::spawn(rx, 188 * 10);
+        let mut intake = Intake::spawn(rx, cost(&pkt(0, 188)) * 10);
         for i in 0..15u16 {
             tx.send(pkt(i, 188)).unwrap();
         }
@@ -173,6 +215,42 @@ mod tests {
             other => panic!("expected Lagged(5), got {:?}", other.map(|p| p.sequence_number)),
         }
         assert_eq!(intake.recv().await.unwrap().sequence_number, 15);
+    }
+
+    /// The budget counts what a packet really holds, not just its payload: a
+    /// budget of ten payloads takes fewer than ten small packets.
+    #[tokio::test]
+    async fn the_budget_charges_each_packet_its_overhead_too() {
+        let (tx, rx) = broadcast::channel::<RtpPacket>(1024);
+        let mut intake = Intake::spawn(rx, 188 * 10);
+        for i in 0..10u16 {
+            tx.send(pkt(i, 188)).unwrap();
+        }
+        tokio::task::yield_now().await;
+        let fit = (188 * 10) / cost(&pkt(0, 188));
+        assert!(fit < 10);
+        for i in 0..fit as u16 {
+            assert_eq!(intake.recv().await.unwrap().sequence_number, i);
+        }
+        tx.send(pkt(10, 188)).unwrap();
+        assert!(matches!(intake.recv().await, Err(broadcast::error::RecvError::Lagged(n)) if n == 10 - fit as u64));
+    }
+
+    /// The output is told how far behind the feed it is: a packet read after
+    /// the reader slept has waited that long, and one read as it arrives has
+    /// not — what lets a segment closed from a backlog be dated by arrival.
+    #[tokio::test]
+    async fn it_says_how_long_each_packet_waited() {
+        let (tx, rx) = broadcast::channel::<RtpPacket>(16);
+        let mut intake = Intake::spawn(rx, 1 << 20);
+        tx.send(pkt(0, 188)).unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        intake.recv().await.unwrap();
+        assert!(intake.waited() >= Duration::from_millis(300), "waited {:?}", intake.waited());
+        tx.send(pkt(1, 188)).unwrap();
+        intake.recv().await.unwrap();
+        assert!(intake.waited() < Duration::from_millis(300), "waited {:?}", intake.waited());
     }
 
     #[tokio::test]

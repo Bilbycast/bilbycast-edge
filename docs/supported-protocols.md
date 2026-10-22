@@ -239,7 +239,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   - **CENC encryption** (ISO/IEC 23001-7): `cenc` (AES-128 CTR) or `cbcs` (AES-128 CBC pattern 1:9 — FairPlay) with subsample encryption for H.264 / HEVC video, whole-sample encryption for AAC. ClearKey `pssh` emitted automatically; operators may add Widevine / PlayReady / FairPlay PSSH boxes via `pssh_boxes` (verbatim wrap into `moov`)
   - **MPTS passthrough** or optional MPTS→SPTS program filter via `program_number`
   - Optional Bearer token authentication via `auth_token`
-  - Codec work runs in `tokio::task::block_in_place`; LL chunked PUT uses `mpsc(8)` with `try_send` + drop-on-full so the broadcast subscriber is never blocked
+  - Codec work runs in `tokio::task::block_in_place`; each output reads the broadcast through an intake that queues up to 32 MiB while the output waits on the origin, so a slow upload costs latency rather than video; LL chunked PUT uses a per-segment `mpsc` of two segments' chunks with `try_send` + drop-on-full, so the output never waits on it
 - **Limitations:**
   - Output only. Standard mode adds 1-4 s latency; LL targets <3 s
   - Source must emit IDR at least every `segment_duration_secs` unless `video_encode` is set
