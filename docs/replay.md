@@ -50,22 +50,51 @@ section.)
                                        │     (Phase-1 recorder)
                                        │
                                        ▼
-                  drop-on-Lagged ──► bounded mpsc ──► writer task
-                                                       │
-                                                       ▼
+                  drop-on-Lagged ──► 32 MiB queue ──► writer task
+                                                         │ finished segments,
+                                                         ▼ in order (≤ 4 waiting)
+                                                     closer task
+                                                         │
+                                                         ▼
                                               segment N.ts on disk
                                               index.bin (timecode → offset)
+                                              recording.json, retention
                                               clips.json (named ranges)
 ```
 
 - The recorder is **another broadcast subscriber**, exactly like the
   TR-101290 / content-analysis tiers. `RecvError::Lagged(n)` adds `n` to
   `packets_dropped` silently; the Critical `replay_writer_lagged` event
-  fires when the writer mpsc is full and a packet is dropped there
-  (rate-limited to one event per 5 s); the input task is never blocked.
-- Disk I/O lives behind a bounded `tokio::sync::mpsc` (default capacity
-  1024 packets) feeding a dedicated writer task. The subscriber drops
-  rather than awaiting `write_all`.
+  fires when the writer's queue is past its budget and a packet is dropped
+  there (rate-limited to one event per 5 s); the input task is never
+  blocked.
+- **The queue to the writer is bounded in bytes: 32 MiB per recorder**,
+  held only while the writer is behind, each message charged its payload
+  plus a fixed 96 bytes for its queue slot, its shared `Bytes` header and
+  the allocator. Bytes rather than messages because a message is not a
+  fixed size: an SDI flow broadcasts one 188-byte TS packet per message,
+  about 6,900 a second at 10 Mbit/s, while an RTMP or RTSP flow broadcasts
+  a whole frame per message. A cap of 1,024 messages was ~150 ms of the SDI
+  feed — five recorders on bilby-voyager dropped ~2.5 % of their packets at
+  every load (#190) — and the 16,384 that replaced it was 2.4 s of that feed
+  but hundreds of megabytes of frames on a stalled disk. 32 MiB is about
+  17 s of a 10 Mbit/s SDI feed, 25 s of 1316-byte datagrams and 27 s of a
+  frame-per-message feed at the same rate.
+- **The writer task** does in-memory bookkeeping and buffered writes only:
+  it parses the TS, tracks PCR and SMPTE timecode, appends index entries,
+  and writes each segment through a 256 KiB userspace buffer (unbuffered, an
+  SDI flow was ~6,900 blocking-pool round trips a second). It can be
+  seconds behind its feed, so it dates nothing by when it got round to a
+  message: each message carries the instant it came off the broadcast, and
+  the wall-clock anchor, its rolling sample, a gap's length and a segment's
+  age are all taken from that. A writer catching up on a stalled disk
+  would otherwise stamp the anchor's sample late by the backlog, and every
+  clip cut through it would come out that far from the moment marked.
+- **The closer task** finishes each segment the writer closes, one at a
+  time, in the order they closed — see [Recording arm → roll →
+  prune](#recording-arm--roll--prune). Every fsync and directory scan the
+  recorder does is there. Up to four finished segments may wait for it;
+  past that the writer waits for room, and the queue in front absorbs it.
 - Playback is a **new input type** (`type: "replay"`). The replayer
   reads segments back, paces them by PCR from an inline pump in
   `engine::input_replay` (`pump_one_bundle` + `PacingState`), and
@@ -76,7 +105,7 @@ section.)
 | Path | Role |
 |---|---|
 | `src/replay/mod.rs` | Public types (`RecordingCommand`, `ReplayCommand`, `ClipInfo`), storage-root resolution + `statvfs` disk usage |
-| `src/replay/writer.rs` | Subscriber + writer task; segment roll, retention prune, fsync, stats |
+| `src/replay/writer.rs` | Subscriber, writer and closer tasks; the byte-bounded queue, segment roll, the ordered close (fsync, rename, index fsync, `recording.json`), retention prune, stats |
 | `src/replay/reader.rs` | Segment-by-segment streaming reads with seek across segment boundaries |
 | `src/replay/index.rs` | 24 B append-only `index.bin` entries (timecode → segment + offset), in-memory load + binary search |
 | `src/replay/clips.rs` | `clips.json` persistence (atomic `tmp` + rename + fsync) |
@@ -102,7 +131,7 @@ section.)
     recording.json       ← schema_version, recording_id, created_at_unix, segment_seconds, current_segment_id, anchor_wall_us, anchor_pts_90khz
     index.bin            ← 24 B / IDR; binary search resolves PTS → (segment_id, byte_offset)
     clips.json           ← Vec<ClipInfo>; atomic write-to-tmp + rename + fsync
-    .tmp/                ← in-flight writes; atomic rename onto the final path on segment roll
+    .tmp/                ← in-flight writes; renamed onto the final path, in id order, once the closer has fsynced the segment
     thumbs/              ← filmstrip JPEGs, one per capture, named <pts_90khz>.jpg (only when filmstrip_seconds is set)
       .tmp/              ← in-flight filmstrip encodes; fsync + rename onto thumbs/; orphans unlinked on writer init
 ```
@@ -158,7 +187,9 @@ wall = anchor_wall_us   + (pts - anchor_pts_90khz)   * 1_000_000 / 90_000
 ```
 
 It is taken once, on the first index entry appended, and preserved across
-restarts. Both fields are absent on recordings made before it existed; the clip
+restarts. It is dated by when that frame came off the flow's broadcast, not by
+when the writer got round to it — the writer's queue can hold seconds of the
+feed, and the rolling sample below is dated the same way. Both fields are absent on recordings made before it existed; the clip
 exporter refuses the exact cut on those and falls back to whole segments, which
 is the honest answer — there is no mapping to cut through.
 
@@ -250,7 +281,7 @@ range has to honour it — see [Clip export](#clip-export) below.
 
 ### Recording arm → roll → prune
 
-1. The subscriber + writer tasks are spawned once, at flow start, by
+1. The subscriber, writer and closer tasks are spawned once, at flow start, by
    `FlowRuntime::start` → `replay::writer::spawn_writer` when
    `RecordingConfig.enabled = true`. With no `pre_buffer_seconds` the
    writer starts already `Armed`; with one it starts in `PreBuffer`.
@@ -270,32 +301,60 @@ range has to honour it — see [Clip export](#clip-export) below.
 3. The writer appends 188 B-aligned packets to a staging file under
    `.tmp/`. PCR is tracked from the data; SMPTE timecode is extracted
    via `engine::content_analysis::timecode::TimecodeTracker`.
-4. Every `segment_seconds` (default 10 s, validated `[2, 60]`):
-   - `seg.file.sync_all()` on the current segment.
-   - Atomic rename `.tmp/<n>.ts` → `<n>.ts`.
-   - `index_writer.flush_and_sync()` — the IDR entries themselves were
-     already appended one by one in `write_chunk` as each random-access
-     point was observed; the roll only flushes + fsyncs them.
-   - Run retention prune — oldest-first by mtime, capped by both
-     `retention_seconds` and `max_bytes`. Either being `0` disables
-     that axis (still bounded by free disk on the size axis).
+4. Every `segment_seconds` (default 10 s, validated `[2, 60]`) of the
+   feed's arrival time, the writer opens the next segment and hands the
+   finished one to the **closer**, moving the segment id on past it. The
+   IDR entries were already appended one by one in `write_chunk` as each
+   random-access point was observed; the writer hands them to the kernel
+   (no fsync) before the hand-over. The closer then, for each segment in
+   the order they closed:
+   - flushes the userspace buffer and `sync_all`s the segment;
+   - renames `.tmp/<n>.ts` → `<n>.ts`. One closer, so renames land in id
+     order: a reader or a clip export can only ever find the newest
+     segments not yet in place, never a missing one in the middle (which
+     `export::read_chunk` would skip without a word);
+   - fsyncs `index.bin` — **after** the rename, so a power cut between the
+     two leaves a segment the index has not caught up with, never an index
+     naming a segment that is not there;
+   - writes `recording.json` (the next segment id, the clock anchor and
+     its rolling sample);
+   - runs the retention prune — oldest-first by mtime, capped by both
+     `retention_seconds` and `max_bytes`. Either being `0` disables that
+     axis (still bounded by free disk on the size axis).
+   `segments_written` counts a segment once its close has succeeded.
 5. On stop (`stop_recording`): the writer goes Idle
-   (`RecordingCommand::Stop`), the current segment closes + fsyncs and
-   is renamed into place, the index is flushed, `RecordingStats.armed
-   = false`. The writer task and its broadcast subscriber stay alive —
-   `write_chunk` returns early while Idle, so the channel keeps
-   draining but nothing reaches disk — and no event is emitted (there
-   is no `recording_stopped` event). On a fatal write error: Critical
-   `replay_disk_full` (`replay_event: disk_full`); the partial segment
-   is closed and renamed into place, or its `.tmp/` staging file
-   unlinked when that close itself fails; the writer stays armed
-   (`armed` is not cleared) and the next roll boundary opens a fresh
-   segment.
-6. Retention will **never** unlink the just-finalized segment id
-   (`meta.current_segment_id`) — losing the live edge would tear out
-   clips that touch the most recent few seconds. A `max_bytes` cap
-   smaller than one segment fires the Warning
-   `replay_max_bytes_below_segment` instead.
+   (`RecordingCommand::Stop`) and hands the open segment to the closer,
+   and the command is acknowledged only once the closer has finished
+   every segment handed to it — a stopped recording is complete on disk,
+   every segment renamed into place, in order. `RecordingStats.armed =
+   false`. The writer task and its broadcast subscriber stay alive —
+   `write_chunk` returns early while Idle, so the queue keeps draining
+   but nothing reaches disk — and no event is emitted (there is no
+   `recording_stopped` event). The segment id has moved on past the
+   stopped segment, so a later Start opens a new one; until this was
+   fixed it reopened the stopped segment's id, and the next roll renamed
+   the new file over the last segment before the Stop, whose index
+   entries still pointed into it. A flow that stops or restarts waits up
+   to 10 s for its recorder to do the same (`RecordingHandle::finished`):
+   without that, the restarted writer's `.tmp/` sweep (below) deleted the
+   segments the old one was still finishing. On a fatal write error:
+   Critical `replay_disk_full` (`replay_event: disk_full`); the partial
+   segment goes to the closer, which renames it into place or, when that
+   close fails too, unlinks its `.tmp/` staging file (without a second
+   event); the writer stays armed (`armed` is not cleared) and the next
+   roll boundary opens a fresh segment.
+6. A close that fails — flush, fsync or rename — unlinks the segment's
+   staging file and raises a Critical event: `replay_disk_full` when the
+   disk itself failed (ENOSPC, EDQUOT, EIO, EROFS), the fault the writer's
+   own writes report, and `replay_segment_close_failed` for anything else
+   (the staging file taken away, a rename refused). The segment is lost;
+   its index entries remain, naming a file that does not exist. Writing
+   carries on with the next segment.
+7. Retention will **never** unlink the segment just finished — losing the
+   live edge would tear out clips that touch the most recent few seconds.
+   It runs after that segment's rename, so the segment is in the listing
+   and in the total. A `max_bytes` cap smaller than one segment fires the
+   Warning `replay_max_bytes_below_segment` at every close instead.
 
 ### Crash recovery (writer init scan)
 
@@ -397,9 +456,10 @@ parsing strings.
 | `replay_recording_not_active` | Error | `start_recording` / `stop_recording` / `mark_in` / `mark_out` on a flow whose `recording` block is absent or has `enabled: false` (no writer is spawned at flow start — `engine/flow.rs` filters on `enabled`); `start_recording` on an unknown `flow_id` (the other three return a bare error with no code for that); `mark_in` without an explicit `pts_90khz` on a fresh recording before the writer has seen its first PCR (the counter is still 0), or `mark_out` with no pending `mark_in` (or with `pts_90khz` at or before the pending in-point — the arm lifts every writer-side error under this code) | Add a `RecordingConfig` with `enabled: true` via `configure_recording` (the edge reports `restart_required`; the recorder binds at the next flow start) or `update_flow` (`recording` is a restart-triggering field). For the mark cases, wait for the source to deliver, or send `mark_in` first |
 | `replay_no_playback_input` | Error | `play_clip`/`scrub_playback` on a flow with no `replay` input | Add a `replay` input to the flow |
 | `replay_clip_not_found` | Error | `play_clip`/`delete_clip` with an unknown `clip_id` | Refresh the clip list (it may have been pruned by retention) |
-| `replay_writer_lagged` | Critical | Writer mpsc full; recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
+| `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
 | `replay_disk_pressure` | Warning | Recording usage ≥ 80 % of `max_bytes` (or of replay-root filesystem when `max_bytes = 0`); sticky until back below 70 % | Free disk before ENOSPC; raise `max_bytes` if appropriate; reduce retention |
-| `replay_disk_full` | Critical | Segment write hit ENOSPC | Free disk, then `stop_recording` + `start_recording` to re-arm |
+| `replay_disk_full` | Critical | A segment write hit a disk error (typically ENOSPC), or a finished segment's close (flush, fsync, rename) failed on the disk itself — ENOSPC, EDQUOT, EIO or EROFS; the latter carries `details.segment_id`, and that segment is lost | Free disk, then `stop_recording` + `start_recording` to re-arm |
+| `replay_segment_close_failed` | Critical | A finished segment's close failed for a reason other than the disk — its staging file removed from under the writer, a rename refused (permissions, something else at the final path). The staging file is unlinked and the segment lost; `details.segment_id`. Recording carries on with the next segment | Check the recording directory's ownership and permissions, and that nothing else writes into it |
 | `validation_error` | Error (`command_ack.error_code` only — no event) | `configure_recording`, `create_flow`, `update_flow` or `update_config` carrying a `recording` block whose `segment_seconds` is outside `[2, 60]`, `pre_buffer_seconds` outside `[1, 300]` or above a non-zero `retention_seconds`, `filmstrip_seconds` outside `[1, 30]`, `storage_id` not 1–64 ASCII alphanumerics + `_-`, or no `storage_id` on a flow whose id is not a single path component (`.`, `..`, or containing `/` `\`). The same check refuses `config.json` at node start, where there is no ack at all | Use a value in range, or set a valid `storage_id` |
 | `replay_storage_id_invalid` | Error (`command_ack.error_code` only — no event) | `delete_recording` whose `recording_id` is empty, > 64 chars, or contains a character outside ASCII alphanumerics + `_-`, or whose directory could not be removed (`remove_dir_all` failed; a directory that does not exist is acked with `bytes_freed: 0`, not refused). A bad `RecordingConfig.storage_id` is never reported under this code — it is refused as `validation_error` (row above), and `.` is not permitted in the charset | Use a valid id / check the replay volume |
 | `replay_invalid_field` | Error | `mark_out` / `rename_clip` / `update_clip` `name` > 256 chars or contains control chars; `description` > 4096 chars | Trim to limits |
@@ -425,7 +485,7 @@ clips. When both fields are present, `recording_id` wins and `flow_id`
 is not consulted.
 
 Disk-pressure monitoring runs alongside the reactive ENOSPC handling.
-On every segment roll the writer computes a usage percentage —
+After every segment close the closer computes a usage percentage —
 `(on-disk segment bytes after prune) / max_bytes` when the operator
 set a per-recording cap, or filesystem `(total - free) / total` when
 `max_bytes = 0`.
@@ -446,10 +506,10 @@ render a coloured disk meter as soon as the recorder is armed.
 |---|---|
 | `armed` | `true` while a recording session is active. Pre-buffer mode keeps `armed = false` so the manager UI can distinguish pre-roll from a recording session and the stall detector doesn't fire on pre-buffered flows. |
 | `mode` | Phase 2 / 1.5 — wire-string mirror of [`WriterMode`]: `"armed"` when a session is live, `"pre_buffer"` when the writer is rolling pre-roll TS but the operator hasn't pressed Start, `"idle"` when the writer is stopped — after any Stop (pre-buffer configured or not; a Stop never returns to `pre_buffer`), or after cancel. Drives the `/replay` page's tri-state `Recording / Pre-roll / Idle` badge and the flow-card `● PRE-ROLL` chip. Older edges omit the field; the manager falls back to `armed`-derived state. |
-| `segments_written` | Completed, rolled, fsynced segments |
+| `segments_written` | Segments closed successfully — fsynced and renamed into place. A segment whose close failed is not counted (see `replay_disk_full` / `replay_segment_close_failed`), and one still waiting for the closer is not counted yet |
 | `bytes_written` | Total bytes appended (across all segments, including pruned) |
 | `segments_pruned` | Segments evicted by retention (mtime / size) |
-| `packets_dropped` | Packets dropped at the broadcast subscriber (writer mpsc full) |
+| `packets_dropped` | Packets dropped at the broadcast subscriber — the broadcast lagged it, or the writer's queue was past its 32 MiB budget |
 | `index_entries` | Entries in `index.bin` (one per IDR) |
 | `current_pts_90khz` | Most recent PCR-derived PTS; `0` until the first PCR is seen |
 

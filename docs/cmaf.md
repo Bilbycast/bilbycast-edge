@@ -56,9 +56,37 @@ HLS emits MPEG-TS `.ts` segments and CMAF emits `.mp4` / `.m4s`.
 CMAF is designed to never block the broadcast subscriber, matching the
 project-wide "never block the data path" invariant.
 
-- The subscriber loop receives `RtpPacket`s from the broadcast channel,
-  demuxes MPEG-TS, accumulates samples per track, and cuts segments on
-  IDR. All of this is synchronous and in-memory.
+- **The intake** (`intake.rs`) is a task of its own per output that does
+  nothing but move packets from the flow's broadcast into a queue for the
+  output's loop. The loop awaits the origin in places — the low-latency
+  segment close (`finish()`), the init and playlist PUTs — and while it
+  waits nothing else reads the broadcast, whose ring is sized in packets:
+  16,384 on a standard flow, about 2.4 s of an SDI feed that broadcasts one
+  188-byte TS packet per message. A longer wait used to come back as
+  `Lagged`, a hole in every rendition (bilby-voyager, 2026-10-22: every
+  output of five sessions lagged in the same millisecond, 3–4 s at a time).
+  With the intake, a waiting output falls behind and catches up instead.
+  - **Its budget is memory, 32 MiB per output** (`INTAKE_BUDGET_BYTES`),
+    held only while the output is behind. Each packet is charged its payload
+    plus its overhead — the queue slot holding the packet and its arrival
+    time, the shared header of its `Bytes`, the allocator's own — because a
+    188-byte packet is no bigger than those together. In time that is about
+    15 s of a 10 Mbit/s SDI feed and 24 s of 1316-byte datagrams at the same
+    rate. It is per output, and the renditions of a flow share one origin
+    connection, so a stall that fills one fills them all: the worst case is
+    32 MiB times the flow's CMAF outputs, freed as they catch up.
+  - **Past the budget it drops**, and reports the loss in order as the
+    broadcast would (`Lagged(n)`), so the `packets_dropped` stat and the
+    `broadcast lag` warning cover both.
+  - **A backlog never reaches the published dates.** The intake records when
+    it took each packet off the broadcast, and a segment is dated as of the
+    arrival of the packet that closed it — see [The close-time sample is
+    taken before the upload](#the-close-time-sample-is-taken-before-the-upload).
+  - It cannot help if the whole runtime stalls; it is a task like any other.
+    It turns a slow origin into latency instead of loss.
+- The output's loop receives `RtpPacket`s from the intake, demuxes
+  MPEG-TS, accumulates samples per track, and cuts segments on IDR. All of
+  this is synchronous and in-memory.
 - Video / audio re-encoding (Phase 3) runs inside
   `tokio::task::block_in_place` wrapped around `VideoDecoder` /
   `VideoEncoder` (`bilbycast-ffmpeg-video-rs`) and `AacDecoder` /
@@ -67,13 +95,18 @@ project-wide "never block the data path" invariant.
   tasks onto free workers.
 - HTTP uploads use `reqwest` with a process-wide shared `Client` behind
   a `OnceLock` so TLS handshakes are amortised across segments.
-- LL-CMAF uses `reqwest::Body::wrap_stream` over a
-  `tokio::sync::mpsc::channel(8)`. Chunks are pushed with `try_send`;
-  if the channel is full (ingest is too slow) the PUT is aborted, a
-  Warning event is emitted (once per aborted segment — it is the
-  origin-closed case, not this one, that is held to one Warning per
-  failure episode), and the current segment is discarded — the
-  broadcast subscriber is **never blocked**.
+- LL-CMAF uses `reqwest::Body::wrap_stream` over a bounded
+  `tokio::sync::mpsc` channel per segment, sized at two segments' worth of
+  chunks and never fewer than eight (`ll_chunk_queue_depth`). Chunks are
+  pushed with `try_send`; if the channel is full (ingest is too slow) the
+  PUT is aborted, a Warning event is emitted (once per aborted segment — it
+  is the origin-closed case, not this one, that is held to one Warning per
+  failure episode), and the current segment is discarded — the output's loop
+  is **never blocked** on it. It was a fixed eight, which live was room to
+  spare, but an output catching up on a backlog cuts a whole segment's
+  chunks in milliseconds — a hundred at 10 s segments of 100 ms chunks — so
+  every caught-up segment past its eighth chunk was abandoned. Two segments'
+  worth, because a segment runs to the IDR at or past its target.
 
 Under 60 s of 15 Mbps 1080p30 H.264+AAC passthrough, peak edge CPU
 measured 3 % with zero broadcast lag events
@@ -447,11 +480,13 @@ reached is not a reason to refuse to start. The cost of failing here is no
 output at all; the cost of the restore not happening is a shorter window.
 
 **It has a three-second budget and is raced against the cancel token.** The
-read-back sits between subscribing the broadcast receiver and entering the
-packet loop, so every second it spends is a second the output is not draining
-its channel — about seventeen at the default capacity and 10 Mbps before the
-output opens on a `Lagged` and the window gains a hole at exactly the join the
-restore exists to make seamless. A connect that never completes was already
+read-back sits between subscribing and entering the packet loop, so every
+second it spends is a second the output falls behind its feed. The intake keeps
+the broadcast drained meanwhile, but its budget is finite — about fifteen
+seconds of a 10 Mbit/s SDI feed — and past it the output opens on a `Lagged`
+and the window gains a hole at exactly the join the restore exists to make
+seamless; well before that, the backlog is latency on every viewer's live
+edge. A connect that never completes was already
 bounded at five seconds, but an origin that accepts the connection and then
 stalls held the clip client's whole 60 s request timeout, which is sized for
 pulling segments rather than for a startup preflight.
@@ -996,6 +1031,21 @@ been absorbing it, stops two renditions publishing to different origins
 disagreeing by the difference in their response times, and shrinks the skew that
 the bound above depends on to encode and scheduling jitter — tens of
 milliseconds, measured.
+
+**And the sample is as of the closing packet's arrival, not its processing.**
+The [intake](#threading-and-performance) brought the origin's latency back by
+another route: a wait on the origin now leaves the output behind its feed rather
+than short of packets, and a segment closed from that backlog was dated as if
+its packets had just arrived — the stall above, through a queue instead of an
+upload. Its reach was the intake's: up to about fifteen seconds of a 10 Mbit/s
+SDI feed, where the broadcast ring had capped it at 2.4 s, so a wait on the
+origin past ten seconds re-anchored the flow, and a rendition that stayed that
+far behind its sibling would have re-anchored the two against each other on
+every segment. So the intake records when it took each packet off the
+broadcast, and both close sites, and the low-latency open row, date by
+`CmafState::arrival_now`: now, less the time the packet that closed the segment
+waited in the intake. While an output keeps up that is microseconds, and the
+sample is what it always was. Pinned by `a_backlog_in_the_intake_is_dated_by_arrival`.
 
 ### A re-anchor reaches HLS only, not DASH
 

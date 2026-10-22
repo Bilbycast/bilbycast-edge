@@ -4759,8 +4759,10 @@ clips.json       ← named (in_pts, out_pts) ranges
 The writer is a sibling subscriber on the flow's broadcast channel —
 drop-on-lag with a Critical `replay_writer_lagged` event mirrors the
 slow-consumer pattern in `engine::output_udp`. Disk I/O lives behind
-a bounded mpsc to a dedicated writer task; the broadcast subscriber
-never blocks on `write_all`.
+a queue bounded at 32 MiB to a dedicated writer task, which hands each
+finished segment to a closer task that fsyncs and renames them in order;
+the broadcast subscriber never blocks on `write_all`. See
+[`replay.md`](replay.md#architecture).
 
 ### Replay (input type)
 
