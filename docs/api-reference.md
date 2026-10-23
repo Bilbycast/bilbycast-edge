@@ -1235,10 +1235,12 @@ A secret the body **names** is set, validated like any field — `server.auth` a
 | The node's registration, to register again at the next restart | `"manager": { …, "node_id": null, "registration_token": "<new token>" }` — a `null` `node_id` removes the node secret with it, since a secret is only good with its own ID. `"node_secret": null` removes the secret alone. |
 | A spare registration token | `"manager": { …, "registration_token": null }` |
 | The NMOS registry bearer token | `"nmos_registration": { …, "bearer_token": null }` |
-| A tunnel key | `null` on `tunnel_encryption_key`, `tunnel_bind_secret`, `tunnel_psk`, `tls_cert_pem` or `tls_key_pem` in that tunnel |
+| A tunnel key | `null` on `tunnel_bind_secret`, `tls_cert_pem` or `tls_key_pem` in that tunnel, or on `tunnel_encryption_key` in a direct tunnel. A relay tunnel's `tunnel_encryption_key` (its end-to-end encryption) and a direct tunnel's `tunnel_psk` cannot be removed while the tunnel stays: a body that does so is refused with 400. Remove the tunnel, or change its mode, instead. |
 | A cellular router's password | `"password": null` in that uplink |
 
 `server.auth` and `server.tls` take effect at the next restart, since the router reads them once. A body that names `setup_token` — a value or `null` — is refused: the node mints that token itself (set `setup_enabled: true` to re-open the setup wizard).
+
+A tunnel the body adds or changes is validated as [`POST /api/v1/tunnels`](#post-apiv1tunnels) validates it, and a direct tunnel must hold its `tunnel_psk` (that route refuses one without it when it starts the tunnel; a `PUT` starts none). A tunnel the body leaves as it runs is not checked again.
 
 **Response (200):**
 
@@ -1250,7 +1252,7 @@ A Hitless slot that validation refuses but an earlier release accepted is repair
 
 | Status | Condition |
 |--------|-----------|
-| 400 | The body is not a config, config validation failure (duplicate flow IDs, invalid addresses, etc.), or the body names `setup_token` |
+| 400 | The body is not a config, config validation failure (duplicate flow IDs, invalid addresses, etc.), a tunnel it adds or changes is invalid (a relay tunnel without its `tunnel_encryption_key`, a direct tunnel without its `tunnel_psk`), or the body names `setup_token` |
 | 500 | Failed to persist config or individual flows failed to start |
 
 **curl example:**

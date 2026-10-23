@@ -758,7 +758,10 @@ pub async fn get_config(
 /// off: it has only two paths, neither of which may be empty. A `null`
 /// `manager.node_id` removes the node secret with it, so a body naming a new
 /// `registration_token` registers again at the next restart rather than
-/// presenting the old pair.
+/// presenting the old pair. A tunnel the body adds or changes, a `null` key
+/// included, is validated as `POST /api/v1/tunnels` validates it
+/// (`validate_changed_tunnels`), so a relay tunnel's encryption key and a
+/// direct tunnel's PSK cannot be removed while the tunnel stays.
 ///
 /// A secret the body names is set, subject to validation like any field. This
 /// is where a local admin parts from the manager, whose `update_config` may
@@ -775,8 +778,9 @@ pub async fn get_config(
 /// # Errors
 ///
 /// - [`ApiError::BadRequest`] (400) if the body is not a config, the new config
-///   fails validation (e.g., duplicate flow IDs, invalid addresses), or the
-///   body names `setup_token`.
+///   fails validation (e.g., duplicate flow IDs, invalid addresses), a tunnel
+///   it adds or changes fails the tunnel route's validation, or the body names
+///   `setup_token`.
 /// - [`ApiError::Internal`] (500) if persisting the config to disk fails, or if
 ///   individual flows fail to start (logged as errors but does not fail the request).
 pub async fn replace_config(
@@ -805,6 +809,7 @@ pub async fn replace_config(
     kept.forget_nulled(&body);
     kept.merge_into(&mut new_config);
     validate_config(&new_config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    validate_changed_tunnels(&config.tunnels, &new_config.tunnels)?;
     repairs.report(state.flow_manager.event_sender());
 
     // Stop all running flows
@@ -838,6 +843,34 @@ pub async fn replace_config(
     let mut safe_config = new_config;
     safe_config.mask_secrets();
     Ok(Json(ApiResponse::ok(safe_config)))
+}
+
+/// Hold every tunnel a whole config adds or changes to what
+/// `POST /api/v1/tunnels` holds it to, so a `PUT` cannot leave one that will
+/// not start or that crosses a relay unencrypted: a `null` on a relay
+/// tunnel's `tunnel_encryption_key` (`forget_nulled`) used to be saved, and
+/// the next start forwarded its media in the clear.
+///
+/// The route refuses a direct tunnel without its `tunnel_psk` when it starts
+/// it, not in `validate_tunnel`; a `PUT` starts no tunnel, so that is checked
+/// here as well. A tunnel the body leaves as it runs is not checked:
+/// `validate_config` does not run these rules either, since it is also the
+/// boot gate, so a node may hold a tunnel they refuse, and refusing it here
+/// would refuse every edit put back around it.
+fn validate_changed_tunnels(
+    running: &[crate::tunnel::TunnelConfig],
+    new: &[crate::tunnel::TunnelConfig],
+) -> Result<(), ApiError> {
+    for tunnel in new.iter().filter(|t| !running.contains(t)) {
+        crate::config::validation::validate_tunnel(tunnel).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if tunnel.mode == crate::tunnel::config::TunnelMode::Direct && tunnel.tunnel_psk.is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "Tunnel '{}': tunnel_psk is required for direct mode",
+                tunnel.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `POST /api/v1/config/reload` -- Reload configuration from disk.
@@ -1191,8 +1224,21 @@ mod whole_config_tests {
             "peer_addr": "127.0.0.1:29911",
             "tunnel_encryption_key": "a".repeat(64),
             "tunnel_bind_secret": "b".repeat(64),
+            "tunnel_psk": "direct-tunnel-psk",
         }))
         .expect("tunnel fixture")
+    }
+
+    /// A relay tunnel, which carries its media end-to-end encrypted with
+    /// the key it holds.
+    fn relay_tunnel(id: &str, local_port: u16) -> crate::tunnel::TunnelConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "protocol": "udp", "mode": "relay", "direction": "egress",
+            "local_addr": format!("127.0.0.1:{local_port}"),
+            "relay_addrs": ["127.0.0.1:4433"],
+            "tunnel_encryption_key": "a".repeat(64),
+        }))
+        .expect("relay tunnel fixture")
     }
 
     /// Run `node` in `state`, as a load leaves it, with its files written.
@@ -1431,5 +1477,66 @@ mod whole_config_tests {
                 }
             }
         }
+    }
+
+    /// A tunnel the `PUT` adds or changes is validated as on
+    /// `POST /api/v1/tunnels`. A relay tunnel's key named `null` was saved,
+    /// and the next start forwarded its media across the relay unencrypted;
+    /// a direct tunnel's PSK named `null` left a tunnel that does not start.
+    #[tokio::test]
+    async fn a_put_cannot_leave_a_tunnel_that_will_not_start_or_is_unencrypted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let relay = "11111111-2222-3333-4444-555555555555";
+        let direct = "66666666-7777-8888-9999-000000000000";
+        provision(&state, relay_tunnel(relay, 29906)).await;
+        let mut node = state.config.read().await.clone();
+        node.tunnels.push(tunnel(direct, 29907));
+        install(&state, node).await;
+
+        let body = masked_get_body(&state).await;
+        let mut nulled_key = body.clone();
+        nulled_key["tunnels"][0]["tunnel_encryption_key"] = serde_json::Value::Null;
+        let mut nulled_psk = body.clone();
+        nulled_psk["tunnels"][1]["tunnel_psk"] = serde_json::Value::Null;
+        // Added under a new id, with no key: no null involved.
+        let mut added_keyless = body;
+        let mut keyless_relay = relay_tunnel("12121212-3434-5656-7878-909090909090", 29908);
+        keyless_relay.tunnel_encryption_key = None;
+        added_keyless["tunnels"].as_array_mut().unwrap().push(serde_json::to_value(keyless_relay).expect("serialise"));
+
+        for (names, body) in [
+            ("tunnel_encryption_key", nulled_key),
+            ("tunnel_psk", nulled_psk),
+            ("tunnel_encryption_key", added_keyless),
+        ] {
+            let refused = refusal(replace_config(RequireAdmin, State(state.clone()), Json(body)).await);
+            assert!(refused.contains(names), "a PUT leaving a tunnel without its {names} must be refused: {refused:?}");
+
+            for (what, config) in running_and_restarted(&state).await {
+                assert_eq!(config.tunnels.len(), 2, "{what}");
+                let held = |id: &str| config.tunnels.iter().find(|t| t.id == id).expect("the tunnel").clone();
+                assert_eq!(held(relay).tunnel_encryption_key, Some("a".repeat(64)), "{what}");
+                assert_eq!(held(direct).tunnel_psk.as_deref(), Some("direct-tunnel-psk"), "{what}");
+            }
+        }
+    }
+
+    /// A tunnel the body leaves as it runs is not validated again: a node may
+    /// hold one the tunnel route would refuse (the boot gate does not run
+    /// that validation), and every edit put back around it would be refused.
+    #[tokio::test]
+    async fn a_put_leaves_a_tunnel_it_does_not_change_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let mut keyless_relay = relay_tunnel("11111111-2222-3333-4444-555555555555", 29909);
+        keyless_relay.tunnel_encryption_key = None;
+        install(&state, AppConfig { tunnels: vec![keyless_relay], ..Default::default() }).await;
+
+        let mut body = masked_get_body(&state).await;
+        body["device_name"] = "renamed".into();
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+        assert!(replaced.is_ok(), "an unchanged tunnel must not refuse the edit: {}", refusal(replaced));
+        assert_eq!(state.config.read().await.device_name.as_deref(), Some("renamed"));
     }
 }
