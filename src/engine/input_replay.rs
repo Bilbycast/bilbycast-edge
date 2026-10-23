@@ -167,13 +167,9 @@ async fn run(
                     Ok(true) => {} // bundle published, continue
                     Ok(false) => {
                         // EOF or out-of-range
-                        if config.loop_playback {
-                            let _ = reader.scrub_to(reader.range.from_pts_90khz).await;
-                            pacing.reset();
-                        } else {
-                            playing = false;
-                            emit_eof(&events, &flow_id, &input_id);
-                        }
+                        playing = at_end_of_range(
+                            &mut reader, config.loop_playback, &mut pacing, &events, &flow_id, &input_id,
+                        ).await;
                     }
                     Err(e) => {
                         tracing::warn!(target: "replay", "playback read error: {e:#}");
@@ -181,6 +177,40 @@ async fn run(
                     }
                 }
             }
+        }
+    }
+}
+
+/// Playback has reached the end of its range: go back to its start when it
+/// loops, and say whether it is still playing.
+///
+/// A loop whose start can no longer be played — retention has removed it,
+/// the recording was deleted under the replay, or a crash lost it — stops,
+/// with a Warning naming why. The refusal used to be ignored: the reader
+/// stayed at the end with playback on, and every turn of the input's loop
+/// went straight back here, a busy spin of directory listings with nothing
+/// to say so, that played whatever the recorder closed next and spun again.
+async fn at_end_of_range(
+    reader: &mut Reader,
+    loop_playback: bool,
+    pacing: &mut PacingState,
+    events: &EventSender,
+    flow_id: &str,
+    input_id: &str,
+) -> bool {
+    if !loop_playback {
+        emit_eof(events, flow_id, input_id);
+        return false;
+    }
+    match reader.scrub_to(reader.range.from_pts_90khz).await {
+        Ok(_) => {
+            pacing.reset();
+            true
+        }
+        Err(e) => {
+            tracing::warn!(target: "replay", "replay input '{input_id}' cannot loop: {e:#}");
+            emit_loop_failed(events, flow_id, input_id, &e);
+            false
         }
     }
 }
@@ -854,6 +884,25 @@ fn emit_eof(events: &EventSender, flow_id: &str, input_id: &str) {
     );
 }
 
+fn emit_loop_failed(events: &EventSender, flow_id: &str, input_id: &str, error: &anyhow::Error) {
+    let error = error.to_string();
+    // The refusal's own code, when it names one — `replay_segment_missing`,
+    // `replay_segment_not_ready`.
+    let code = error.split(':').next().filter(|code| code.starts_with("replay_"));
+    events.emit_with_details(
+        EventSeverity::Warning,
+        category::REPLAY,
+        format!("Replay input '{input_id}' stopped: it cannot loop back to the start of its range"),
+        Some(flow_id),
+        serde_json::json!({
+            "replay_event": "playback_loop_failed",
+            "error_code": code,
+            "input_id": input_id,
+            "error": error,
+        }),
+    );
+}
+
 fn now_micros() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -911,6 +960,27 @@ mod tests {
         let (mut playing, mut pacing) = (false, PacingState::new());
         handle_command(cmd, reader, &replay_config(), &mut playing, &mut pacing, events, "f", "i").await;
         ack.await.unwrap()
+    }
+
+    /// A loop whose start is no longer on disk stops, and says why. It ignored
+    /// the refusal and left playback on at the end of the range, where every
+    /// turn of the input's loop came straight back to it: a busy spin.
+    #[tokio::test]
+    async fn a_loop_back_to_media_no_longer_on_disk_stops_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = recording(tmp.path(), 3, &[]).await;
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let mut reader = Reader::open_recording_at("rec", dir.clone()).await.unwrap();
+        let mut pacing = PacingState::new();
+        assert!(at_end_of_range(&mut reader, true, &mut pacing, &events, "f", "i").await, "a loop over media on disk stopped");
+        // The recording deleted under the replay.
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+        assert!(!at_end_of_range(&mut reader, true, &mut pacing, &events, "f", "i").await, "playback stayed on");
+        let event = events_rx.try_recv().expect("no event said why");
+        let details = event.details.unwrap();
+        assert_eq!(details["replay_event"], "playback_loop_failed");
+        assert_eq!(details["error_code"], "replay_segment_missing");
+        assert_eq!(event.flow_id.as_deref(), Some("f"));
     }
 
     /// A Play into a lost window lands by the range it asks for. It was

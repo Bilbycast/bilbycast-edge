@@ -589,7 +589,13 @@ pointed at a known clip).
    `<NNNNNN>.ts` segment) with `loop_playback = false` the replayer
    fires `playback_eof` and idles with NULL-PID padding; with
    `loop_playback = true` it wraps to the range's `from_pts_90khz` at
-   that same point. The clip's `out_pts_90khz` (and a `play_clip`
+   that same point — and when that start can no longer be played
+   (retention removed it, a crash lost it, the recording was deleted under
+   the replay) it stops instead, with a Warning `playback_loop_failed`
+   naming the refusal (`details.error_code`: `replay_segment_missing`, or
+   `replay_segment_not_ready`). It used to ignore the refusal and spin at
+   the end of the range with playback on, listing the recording directory
+   on every turn of the input's loop. The clip's `out_pts_90khz` (and a `play_clip`
    `to_pts_90khz`) is recorded on the reader's range and reported in
    the `playback_started` event, but is not enforced by the inline
    pump today — a cued clip plays through to the end of the
