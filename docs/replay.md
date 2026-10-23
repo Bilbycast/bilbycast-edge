@@ -418,25 +418,37 @@ there:
    the old closer fsyncs on a slow disk — opens in its own task once the
    previous one lets go, so the flow's start never waits on it: what the
    flow publishes meanwhile queues for the writer within its 32 MiB budget
-   (past it, `replay_writer_lagged`, as behind any slow disk), a flow
-   stopped meanwhile ends the wait, and an open that then fails raises the
-   same Critical `recording_start_failed` event a failure at flow start
-   does, against the flow. Only a writer of the same flow waits: one of
-   another flow — two flows naming one recording through `storage_id` — is
-   refused at flow start with `replay_recording_in_use`, since that flow
-   holds the directory for as long as it runs, and a writer kept waiting
-   for it recorded nothing while its queue filled and raised
-   `replay_writer_lagged` against the disk. The flow has already reported that recording
-   started by then and keeps its handle, so the recorder goes on answering
-   its commands until the flow stops — `start_recording`, `mark_in` and
-   `mark_out` with `replay_recording_not_active`, as for a flow with no
-   recorder (`stop_recording`'s handler codes nothing, so it carries that
-   code at the head of its message) — where a writer task that simply ended
-   left them failing with the uncoded "recording writer task is gone". `FlowRuntime::stop`'s 10 s wait used to be all that kept the two
-   apart, and a disk slower than that let the new writer's sweep below
-   unlink the segments the old closer had yet to rename — and a segment
-   the old writer had open with no index entry yet, an id nothing names,
-   share its id with the new writer's first.
+   (past it, `replay_writer_lagged`, as behind any slow disk), and a flow
+   stopped meanwhile ends the wait. `FlowRuntime::stop`'s 10 s wait used to
+   be all that kept the two apart, and a disk slower than that let the new
+   writer's sweep below unlink the segments the old closer had yet to
+   rename — and a segment the old writer had open with no index entry yet,
+   an id nothing names, share its id with the new writer's first.
+
+   An open that waited and then fails raises the same Critical
+   `recording_start_failed` event a failure at flow start does, against the
+   flow. The flow has already reported that recording started by then and
+   keeps its handle, so the recorder goes on answering its commands until
+   the flow stops — `start_recording`, `mark_in` and `mark_out` with
+   `replay_recording_not_active`, as for a flow with no recorder
+   (`stop_recording`'s handler codes nothing, so it carries that code at
+   the head of its message) — where a writer task that simply ended left
+   them failing with the uncoded "recording writer task is gone".
+
+   A writer of another flow — two flows naming one recording through
+   `storage_id` — waits the same way while that flow is stopping. One
+   config push that moves a `storage_id` from one flow to another restarts
+   the two in no set order, so the flow taking it can start before the one
+   giving it up has begun to stop, and a deleted flow's closer can still be
+   finishing when another flow takes its recording. Another flow still
+   running is given 30 s (`HANDOVER_GRACE`) to begin stopping — long enough
+   for the push to reach it — and if it has not, the waiting writer is
+   refused with `replay_recording_in_use`, naming that flow, through the
+   same `recording_start_failed` event and with the same answers to its
+   commands. Refused at once, a handover was refused for good whenever the
+   push restarted the taking flow first; waited for as long as the other
+   flow runs, the writer would record nothing while its queue filled and
+   raised `replay_writer_lagged` against the disk.
 1. **`.tmp/` orphan cleanup.** Any `<NNNNNN>.ts` left in `.tmp/` is a
    partial segment the writer never atomically renamed onto the
    recording — unlinked unconditionally.
@@ -636,7 +648,7 @@ parsing strings.
 | `replay_clip_not_found` | Error | `play_clip`/`delete_clip` with an unknown `clip_id` | Refresh the clip list (it may have been pruned by retention) |
 | `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget, or past its own first 4 MiB with the node's recorders past the 256 MiB they share — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
 | `replay_disk_pressure` | Warning | Recording usage ≥ 80 % of `max_bytes` (or of replay-root filesystem when `max_bytes = 0`); sticky until back below 70 % | Free disk before ENOSPC; raise `max_bytes` if appropriate; reduce retention |
-| `replay_recording_in_use` | Critical (`recording_start_failed`) | The flow's recorder was not started: another flow's writer is working in the same recording directory — both flows' recordings resolve to one `storage_id`, or one flow's `storage_id` names another flow's id. Nothing in validation refuses the pair, and the two writers used to corrupt the directory between them | Give one of the flows its own `recording.storage_id`, then restart it |
+| `replay_recording_in_use` | Critical (`recording_start_failed`) | The flow's recorder was not started: another flow's writer was still working in the same recording directory 30 s after it was asked to start, and that flow was not stopping — both flows' recordings resolve to one `storage_id`, or one flow's `storage_id` names another flow's id. Nothing in validation refuses the pair, and the two writers used to corrupt the directory between them. A recording moved from one flow to another is handed over instead, whatever order the push restarts the two in | Give one of the flows its own `recording.storage_id`, then restart it |
 | `replay_disk_full` | Critical | A segment write hit a disk error (typically ENOSPC), or a finished segment's close (flush, fsync, rename) failed on the disk itself — ENOSPC, EDQUOT, EIO or EROFS; the latter carries `details.segment_id`, and that segment is lost | Free disk, then `stop_recording` + `start_recording` to re-arm |
 | `replay_segment_close_failed` | Critical | A finished segment's close failed for a reason other than the disk — its staging file removed from under the writer, a rename refused (permissions, something else at the final path). The staging file is unlinked and the segment lost; `details.segment_id`. Recording carries on with the next segment | Check the recording directory's ownership and permissions, and that nothing else writes into it |
 | `validation_error` | Error (`command_ack.error_code` only — no event) | `configure_recording`, `create_flow`, `update_flow` or `update_config` carrying a `recording` block whose `segment_seconds` is outside `[2, 60]`, `pre_buffer_seconds` outside `[1, 300]` or above a non-zero `retention_seconds`, `filmstrip_seconds` outside `[1, 30]`, `storage_id` not 1–64 ASCII alphanumerics + `_-`, or no `storage_id` on a flow whose id is not a single path component (`.`, `..`, or containing `/` `\`). The same check refuses `config.json` at node start, where there is no ack at all | Use a value in range, or set a valid `storage_id` |

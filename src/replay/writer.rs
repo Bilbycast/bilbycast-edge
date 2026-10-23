@@ -79,9 +79,11 @@
 //!   fsyncing on a slow disk — waits for it before it sweeps `.tmp/` or picks
 //!   a resume id. Without that, the sweep unlinked the segments the old closer
 //!   was still finishing, and a segment it had open with no index entry yet
-//!   shared its id with the new writer's first. A writer of another flow —
-//!   two flows naming one recording — is refused, `replay_recording_in_use`,
-//!   rather than kept waiting for as long as that flow runs.
+//!   shared its id with the new writer's first. A writer of another flow
+//!   waits too while that flow is stopping — one config push handing the
+//!   recording from it to this one — and is refused,
+//!   `replay_recording_in_use`, if that flow is still running once
+//!   [`HANDOVER_GRACE`] has passed: two flows naming one recording.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -450,10 +452,12 @@ impl RecordingHandle {
 /// the handle the FlowRuntime stores. Errors from setup (directory
 /// creation, index open, recording.json write) are surfaced
 /// synchronously — the caller is expected to lift them onto a
-/// `command_ack.error_code` if it's a manager-driven create — except while a
-/// previous writer of the same recording is still finishing: the open then
-/// waits for it in the writer task, and an error from it is raised there as
-/// the same `recording_start_failed` event (see [`RecordingLease`]).
+/// `command_ack.error_code` if it's a manager-driven create — except while
+/// another writer holds the recording: the open then waits for it in the
+/// writer task, and an error from it, or a refusal of a recording another
+/// running flow holds, is raised there as the same `recording_start_failed`
+/// event (see [`RecordingLease`]). `parent_cancel` is the flow's own token,
+/// cancelled as it stops.
 pub async fn spawn_writer(
     flow_id: String,
     config: RecordingConfig,
@@ -463,11 +467,12 @@ pub async fn spawn_writer(
 ) -> Result<RecordingHandle> {
     let recording_id = config.storage_id.clone().unwrap_or_else(|| flow_id.clone());
     let dir = super::recording_dir(&recording_id);
-    spawn_writer_at(flow_id, recording_id, dir, config, broadcast_tx, events, parent_cancel).await
+    spawn_writer_at(flow_id, recording_id, dir, config, broadcast_tx, events, parent_cancel, HANDOVER_GRACE).await
 }
 
-/// [`spawn_writer`] into a named directory rather than the replay root's, so
-/// a test can record into a directory of its own.
+/// [`spawn_writer`] into a named directory rather than the replay root's, and
+/// with a handover grace of its own, so a test can record into a directory of
+/// its own and see a refusal without waiting [`HANDOVER_GRACE`] for it.
 async fn spawn_writer_at(
     flow_id: String,
     recording_id: String,
@@ -476,6 +481,7 @@ async fn spawn_writer_at(
     broadcast_tx: broadcast::Sender<RtpPacket>,
     events: EventSender,
     parent_cancel: CancellationToken,
+    handover_grace: Duration,
 ) -> Result<RecordingHandle> {
     // Subscribed first, so what the flow publishes while the recording is
     // opened waits in the broadcast ring rather than going unrecorded.
@@ -486,26 +492,22 @@ async fn spawn_writer_at(
         dir: dir.clone(),
         config: config.clone(),
         events: events.clone(),
+        stopping: parent_cancel.clone(),
         stats: Arc::default(),
         budget: Arc::default(),
     };
     let stats = setup.stats.clone();
     let budget = setup.budget.clone();
     // Opened here when nothing else holds the recording, so a failure is the
-    // caller's to report. When a previous writer of it is still finishing —
-    // a restart on a disk its closer is behind on — the open waits for that
-    // writer in the writer task instead: the flow's start does not wait on
-    // somebody else's fsyncs, and what the flow publishes meanwhile queues
-    // for the writer within its budget, as it would behind a slow disk.
-    let opening = match RecordingLease::try_take(&dir, &setup.flow_id) {
+    // caller's to report. When another writer holds it — a restart on a disk
+    // the previous closer is behind on, or another flow's, handing it over —
+    // the open waits for that writer in the writer task instead: the flow's
+    // start does not wait on somebody else's fsyncs, and what the flow
+    // publishes meanwhile queues for the writer within its budget, as it
+    // would behind a slow disk.
+    let opening = match RecordingLease::try_take(&dir, &setup.flow_id, &setup.stopping) {
         Ok(lease) => Opening::Ready(Box::new(open_writer(setup, lease).await?)),
-        Err(Held::ByPrevious(held)) => Opening::AfterPrevious(held, setup),
-        // Refused, not waited for: that flow holds it for as long as it runs.
-        Err(Held::ByFlow(other)) => bail!(
-            "replay_recording_in_use: recording '{recording_id}' is being written by flow \
-             '{other}' — two flows cannot record into one directory; give one of them its \
-             own recording.storage_id"
-        ),
+        Err(held) => Opening::AfterPrevious(held, setup),
     };
 
     let cancel = parent_cancel.child_token();
@@ -553,7 +555,7 @@ async fn spawn_writer_at(
         let state = match opening {
             Opening::Ready(state) => *state,
             Opening::AfterPrevious(held, setup) => {
-                match open_after_previous(held, setup, &cancel).await {
+                match open_after_previous(held, setup, &cancel, handover_grace).await {
                     Ok(Some(state)) => state,
                     Ok(None) => return,
                     Err(failed) => {
@@ -587,51 +589,89 @@ struct WriterSetup {
     dir: PathBuf,
     config: RecordingConfig,
     events: EventSender,
+    /// The flow's cancel token: what the next writer to want the recording
+    /// reads to see whether this flow is stopping (see [`RecordingLease`]).
+    stopping: CancellationToken,
     /// Made before the open, because the flow publishes them, and the
     /// subscriber charges the queue, from the moment the recorder is spawned.
     stats: Arc<RecordingStats>,
     budget: Arc<QueueBudget>,
 }
 
-/// A recorder's open: done, or waiting on the writer before it.
+/// A recorder's open: done, or waiting on the writer that holds its
+/// recording.
 enum Opening {
     Ready(Box<WriterState>),
-    AfterPrevious(Arc<Mutex<()>>, WriterSetup),
+    AfterPrevious(Held, WriterSetup),
 }
 
-/// Open the recording once the writer before this one has let it go — see
+/// How long a writer gives another flow's running writer to begin letting
+/// its recording go before it is refused — see [`RecordingLease`].
+///
+/// One config push that moves a `storage_id` from one flow to another
+/// restarts the flows it changes one after another, in no set order, each
+/// stop waiting up to 10 s for its recorder, so the flow taking the recording
+/// can start before the one giving it up has been stopped at all. Long enough
+/// for a push of a few flows to reach the one giving it up; short enough
+/// that two flows really naming one recording are told so within a minute,
+/// the second's queue held within its budget until then.
+const HANDOVER_GRACE: Duration = Duration::from_secs(30);
+
+/// How often a writer waiting for a recording looks again at what holds it:
+/// a flow that begins stopping is waited for, and a third flow's writer that
+/// takes the recording first is held to the same grace as the one before it.
+const LEASE_RECHECK: Duration = Duration::from_secs(1);
+
+/// Open the recording once the writer that holds it has let it go — see
 /// [`RecordingLease`]. `None` if the flow stops first. A failed open is
 /// reported as a failure at flow start is — the same Critical
 /// `recording_start_failed` against the flow — and returned, for the writer
-/// to answer the flow's recording commands with.
+/// to answer the flow's recording commands with; so is a refusal, a running
+/// flow's writer still holding it once `grace` has passed.
 async fn open_after_previous(
-    held: Arc<Mutex<()>>,
+    held: Held,
     setup: WriterSetup,
     cancel: &CancellationToken,
+    grace: Duration,
 ) -> Result<Option<WriterState>> {
     let flow_id = setup.flow_id.clone();
     let recording_id = setup.recording_id.clone();
     let events = setup.events.clone();
-    tracing::info!(
-        recording_id = %recording_id,
-        "replay: the recording's previous writer is still finishing its segments; \
-         opening it once that writer is done"
-    );
+    match &held {
+        Held::ByPrevious(_) => tracing::info!(
+            recording_id = %recording_id,
+            "replay: the recording's previous writer is still finishing its segments; \
+             opening it once that writer is done"
+        ),
+        Held::ByFlow(other, _) => tracing::info!(
+            recording_id = %recording_id, holder = %other,
+            "replay: another flow's writer holds the recording; opening it once that flow \
+             lets it go, or refusing it if that flow is still running in {} s",
+            grace.as_secs(),
+        ),
+    }
     let waiting = Instant::now();
-    let guard = tokio::select! {
-        _ = cancel.cancelled() => return Ok(None),
-        guard = held.lock_owned() => guard,
+    let opened = match take_after(held, &setup, cancel, tokio::time::Instant::now() + grace).await {
+        Ok(None) => return Ok(None),
+        Ok(Some(lease)) => open_writer(setup, lease).await,
+        Err(refused) => Err(refused),
     };
-    let lease = RecordingLease::held(setup.dir.clone(), guard);
-    match open_writer(setup, lease).await {
+    match opened {
         Ok(state) => {
             tracing::info!(
                 recording_id = %recording_id, waited_ms = waiting.elapsed().as_millis() as u64,
-                "replay: opened the recording after its previous writer finished"
+                "replay: opened the recording after the writer holding it let it go"
             );
             Ok(Some(state))
         }
         Err(e) => {
+            // Another flow writing the same recording is the configuration's
+            // fault, not the disk's.
+            let error_code = if e.to_string().starts_with("replay_recording_in_use") {
+                "replay_recording_in_use"
+            } else {
+                "replay_disk_full"
+            };
             events.emit_with_details(
                 EventSeverity::Critical,
                 category::REPLAY,
@@ -639,13 +679,56 @@ async fn open_after_previous(
                 Some(&flow_id),
                 serde_json::json!({
                     "replay_event": "recording_start_failed",
-                    "error_code": "replay_disk_full",
+                    "error_code": error_code,
                     "recording_id": recording_id,
                     "error": e.to_string(),
                 }),
             );
             Err(e)
         }
+    }
+}
+
+/// Take the recording for `setup`'s flow once what holds it — `held`, as
+/// [`RecordingLease::try_take`] found it — lets it go. A writer that is only
+/// finishing, its own flow's or a stopping flow's, is waited for; a running
+/// flow's is given until `deadline` to begin stopping, and refused,
+/// `replay_recording_in_use`, if it has not. `None` if this flow stops first.
+async fn take_after(
+    mut held: Held,
+    setup: &WriterSetup,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Result<Option<RecordingLease>> {
+    loop {
+        match held {
+            Held::ByPrevious(lock) => tokio::select! {
+                _ = cancel.cancelled() => return Ok(None),
+                guard = lock.lock_owned() => {
+                    return Ok(Some(RecordingLease::adopted(setup.dir.clone(), guard, &setup.flow_id, &setup.stopping)));
+                }
+                _ = tokio::time::sleep(LEASE_RECHECK) => {}
+            },
+            Held::ByFlow(other, stopping) => {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!(
+                        "replay_recording_in_use: recording '{}' is being written by flow \
+                         '{other}' — two flows cannot record into one directory; give one of \
+                         them its own recording.storage_id",
+                        setup.recording_id,
+                    );
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return Ok(None),
+                    _ = stopping.cancelled() => {}
+                    _ = tokio::time::sleep(LEASE_RECHECK) => {}
+                }
+            }
+        }
+        held = match RecordingLease::try_take(&setup.dir, &setup.flow_id, &setup.stopping) {
+            Ok(lease) => return Ok(Some(lease)),
+            Err(held) => held,
+        };
     }
 }
 
@@ -686,21 +769,26 @@ fn recordings_in_use() -> &'static DashMap<PathBuf, InUse> {
 }
 
 /// A recording directory a writer is working in: the lock its writer holds,
-/// and the flow that writer records.
+/// the flow that writer records, and that flow's cancel token.
 #[derive(Debug, Default)]
 struct InUse {
     lock: Arc<Mutex<()>>,
     flow_id: String,
+    /// Cancelled once the holding flow is stopping: from then on its writer
+    /// and closer are only finishing, and the directory is about to be free.
+    stopping: CancellationToken,
 }
 
 /// Why [`RecordingLease::try_take`] could not take a directory.
 #[derive(Debug)]
 enum Held {
-    /// An earlier writer of the same flow is still finishing in it: the lock
-    /// to wait on.
+    /// A writer that is only finishing is still in it — an earlier one of
+    /// the same flow, or one whose flow is stopping: the lock to wait on,
+    /// which its closer's bounded backlog lets go of.
     ByPrevious(Arc<Mutex<()>>),
-    /// Another flow's writer is working in it.
-    ByFlow(String),
+    /// A running flow's writer is working in it: that flow, and its cancel
+    /// token.
+    ByFlow(String, CancellationToken),
 }
 
 /// Whether a writer is working in the recording in `dir` now: holding it, or
@@ -718,7 +806,7 @@ pub(crate) fn is_being_written(dir: &Path) -> bool {
 /// what a live writer changes for its readers.
 #[cfg(test)]
 pub(crate) fn hold_as_writer(dir: &Path) -> impl Drop + use<> {
-    RecordingLease::try_take(dir, "flow").expect("another writer holds the recording")
+    RecordingLease::try_take(dir, "flow", &CancellationToken::new()).expect("another writer holds the recording")
 }
 
 /// One writer's hold on its recording directory, from before its
@@ -740,34 +828,52 @@ pub(crate) fn hold_as_writer(dir: &Path) -> impl Drop + use<> {
 /// ([`MAX_PENDING_CLOSES`] segments behind at most), and giving up on it
 /// would bring back exactly the race.
 ///
-/// Only a writer of the same flow waits. Two flows can name one recording —
-/// `storage_id: "cam1"` on one, and a flow `cam1` recording under its own id —
-/// and nothing in the configuration refuses that. Their writers used to
-/// corrupt the directory between them; with the lease the second waited for
-/// as long as the first flow ran, recording nothing, its queue full, raising a
-/// Critical `replay_writer_lagged` every five seconds that blamed the disk. A
-/// writer of another flow is refused instead, at once, by name.
+/// A writer of another flow waits only while that flow lets the recording go.
+/// Two flows can name one recording — `storage_id: "cam1"` on one, and a flow
+/// `cam1` recording under its own id — and nothing in the configuration
+/// refuses that. Their writers used to corrupt the directory between them;
+/// with the lease the second waited for as long as the first flow ran,
+/// recording nothing, its queue full, raising a Critical
+/// `replay_writer_lagged` every five seconds that blamed the disk. Refused at
+/// once instead, a recording moved from one flow to another by a single
+/// config push was refused for good whenever the push restarted the flow
+/// taking it before the one giving it up — the order is a `HashMap`'s — and
+/// so was one taken over from a deleted flow whose closer was still
+/// finishing. So a writer whose flow is stopping is waited for as a flow's
+/// own previous writer is, and a running flow's is given [`HANDOVER_GRACE`]
+/// to begin stopping, then refused by name.
 struct RecordingLease {
     dir: PathBuf,
     guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl RecordingLease {
-    /// Take `dir` for a writer of `flow_id` if no writer holds it; otherwise
-    /// what holds it.
-    fn try_take(dir: &Path, flow_id: &str) -> std::result::Result<Self, Held> {
+    /// Take `dir` for a writer of `flow_id`, whose flow's cancel token is
+    /// `stopping`, if no writer holds it; otherwise what holds it.
+    fn try_take(dir: &Path, flow_id: &str, stopping: &CancellationToken) -> std::result::Result<Self, Held> {
         let mut in_use = recordings_in_use().entry(dir.to_path_buf()).or_default();
         match in_use.lock.clone().try_lock_owned() {
             Ok(guard) => {
                 in_use.flow_id = flow_id.to_owned();
-                Ok(Self::held(dir.to_path_buf(), guard))
+                in_use.stopping = stopping.clone();
+                Ok(Self { dir: dir.to_path_buf(), guard: Some(guard) })
             }
-            Err(_) if in_use.flow_id == flow_id => Err(Held::ByPrevious(in_use.lock.clone())),
-            Err(_) => Err(Held::ByFlow(in_use.flow_id.clone())),
+            Err(_) if in_use.flow_id == flow_id || in_use.stopping.is_cancelled() => {
+                Err(Held::ByPrevious(in_use.lock.clone()))
+            }
+            Err(_) => Err(Held::ByFlow(in_use.flow_id.clone(), in_use.stopping.clone())),
         }
     }
 
-    fn held(dir: PathBuf, guard: OwnedMutexGuard<()>) -> Self {
+    /// A hold on `dir` taken by waiting on its lock, recorded as `flow_id`'s
+    /// so the next writer to want it sees who holds it now and whether that
+    /// flow is stopping — not the writer that let it go, whose flow is.
+    fn adopted(dir: PathBuf, guard: OwnedMutexGuard<()>, flow_id: &str, stopping: &CancellationToken) -> Self {
+        // In the registry still: the guard's share of the lock keeps it there.
+        if let Some(mut in_use) = recordings_in_use().get_mut(&dir) {
+            in_use.flow_id = flow_id.to_owned();
+            in_use.stopping = stopping.clone();
+        }
         Self { dir, guard: Some(guard) }
     }
 }
@@ -787,7 +893,7 @@ impl Drop for RecordingLease {
 /// Open — or resume — the recording in `dir`, and start its closer: the
 /// writer's state, ready for packets, before any task feeds it.
 async fn open_writer(setup: WriterSetup, lease: RecordingLease) -> Result<WriterState> {
-    let WriterSetup { flow_id: _, recording_id, dir, config, events, stats, budget } = setup;
+    let WriterSetup { flow_id: _, recording_id, dir, config, events, stopping: _, stats, budget } = setup;
     let lease = Arc::new(lease);
     tokio::fs::create_dir_all(&dir).await
         .with_context(|| format!("create recording dir {}", dir.display()))?;
@@ -2524,13 +2630,15 @@ mod tests {
     ) -> (WriterState, mpsc::Receiver<crate::manager::events::Event>) {
         let (events, events_rx) = crate::manager::events::event_channel();
         let dir = parent.join("rec");
-        let lease = RecordingLease::try_take(&dir, "flow").expect("another writer holds the recording");
+        let stopping = CancellationToken::new();
+        let lease = RecordingLease::try_take(&dir, "flow", &stopping).expect("another writer holds the recording");
         let setup = WriterSetup {
             flow_id: "flow".into(),
             recording_id: "rec".into(),
             dir,
             config,
             events,
+            stopping,
             stats: Arc::default(),
             budget: Arc::default(),
         };
@@ -3013,7 +3121,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let dir = tmp.path().join("rec");
         let handle = spawn_writer_at(
-            "flow".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
+            "flow".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, cancel.clone(), HANDOVER_GRACE,
         )
         .await
         .unwrap();
@@ -3062,14 +3170,14 @@ mod tests {
         // The previous writer, still finishing segment 2: it holds the
         // recording, and the segment waits in `.tmp/` for its rename, with
         // no index entry naming it.
-        let previous = RecordingLease::try_take(&dir, "flow").unwrap();
+        let previous = RecordingLease::try_take(&dir, "flow", &CancellationToken::new()).unwrap();
         let in_flight: Vec<u8> = (0..20u64).flat_map(|n| ts_packet(500 + n, None, false)).collect();
         std::fs::write(dir.join(".tmp/000002.ts"), &in_flight).unwrap();
 
         let (events, mut events_rx) = crate::manager::events::event_channel();
         let (tx, _) = broadcast::channel::<RtpPacket>(1024);
         let cancel = CancellationToken::new();
-        let handle = spawn_writer_at("flow".into(), "rec".into(), dir.clone(), config, tx.clone(), events, cancel.clone())
+        let handle = spawn_writer_at("flow".into(), "rec".into(), dir.clone(), config, tx.clone(), events, cancel.clone(), HANDOVER_GRACE)
             .await
             .unwrap();
         publish(&tx, 0, 30);
@@ -3102,27 +3210,158 @@ mod tests {
         assert_eq!(recovery_alert(&mut events_rx), None, "a clean restart was swept as a crash's leftovers");
     }
 
-    /// Another flow's writer working in the recording — two flows naming one
-    /// recording — refuses the second at once, by name. It waited for as long
-    /// as the first flow ran, recording nothing, its queue full, raising lag
-    /// events that blamed the disk.
-    #[tokio::test]
-    async fn a_writer_of_another_flow_is_refused_rather_than_kept_waiting() {
+    /// The first `recording_start_failed` the writer raises within 10 s.
+    async fn start_failure(events_rx: &mut mpsc::Receiver<crate::manager::events::Event>) -> crate::manager::events::Event {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events_rx.recv().await.expect("the events channel closed");
+                if event.details.as_ref().and_then(|d| d["replay_event"].as_str()) == Some("recording_start_failed") {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the writer never gave up")
+    }
+
+    /// Another running flow's writer working in the recording — two flows
+    /// naming one recording — has the second refused by name once the
+    /// handover grace has passed, and the second's recorder goes on answering
+    /// its commands as one that failed to start. Waiting for as long as the
+    /// first flow ran, it recorded nothing, its queue full, raising lag events
+    /// that blamed the disk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_writer_of_another_running_flow_is_refused_once_its_grace_has_passed() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("rec");
-        let _other = RecordingLease::try_take(&dir, "cam1").unwrap();
-        let (events, _events_rx) = crate::manager::events::event_channel();
-        let (tx, _) = broadcast::channel::<RtpPacket>(16);
-        let refused = spawn_writer_at(
-            "cam2".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, CancellationToken::new(),
+        let _other = RecordingLease::try_take(&dir, "cam1", &CancellationToken::new()).unwrap();
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let (tx, _) = broadcast::channel::<RtpPacket>(1024);
+        let cancel = CancellationToken::new();
+        let handle = spawn_writer_at(
+            "cam2".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
+            Duration::from_millis(200),
         )
         .await
-        .err()
-        .expect("a second flow's writer was let into the recording");
-        assert!(refused.to_string().starts_with("replay_recording_in_use"), "{refused}");
-        assert!(refused.to_string().contains("'cam1'"), "{refused}");
-        assert_eq!(tx.receiver_count(), 0, "the refused recorder kept a subscriber");
+        .unwrap();
+        let failed = start_failure(&mut events_rx).await;
+        let details = failed.details.as_ref().unwrap();
+        assert_eq!(details["error_code"], "replay_recording_in_use", "{details}");
+        assert!(details["error"].as_str().unwrap().contains("'cam1'"), "{details}");
+        assert_eq!(failed.flow_id.as_deref(), Some("cam2"), "the refusal was not reported against the flow");
         assert!(!dir.exists(), "the recording was opened");
+
+        publish(&tx, 0, 20);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(tx.receiver_count(), 0, "the refused recorder kept a subscriber");
+        let (reply, ack) = oneshot::channel();
+        handle.command_tx.send(RecordingCommand::Start { reply }).await.expect("the recorder no longer answers");
+        let err = ack.await.unwrap().expect_err("a refused recording started");
+        assert!(err.to_string().starts_with("replay_recording_not_active"), "{err}");
+        cancel.cancel();
+        assert!(handle.finished(Duration::from_secs(5)).await);
+    }
+
+    /// One config push that moves a recording from one flow to another
+    /// restarts the two in no set order — a `HashMap`'s — and either way the
+    /// flow taking it records, nothing refused. Taken at once or refused, the
+    /// taking flow's writer was refused for good whenever it started before
+    /// the giving flow had begun to stop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recording_handed_from_one_flow_to_another_opens_in_either_order() {
+        for giver_stops_first in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path().join("rec");
+            let giver = CancellationToken::new();
+            let lease = RecordingLease::try_take(&dir, "cam1", &giver).unwrap();
+            if giver_stops_first {
+                giver.cancel();
+            }
+            let (events, mut events_rx) = crate::manager::events::event_channel();
+            let (tx, _) = broadcast::channel::<RtpPacket>(1024);
+            let cancel = CancellationToken::new();
+            let handle = spawn_writer_at(
+                "cam2".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
+                HANDOVER_GRACE,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("giver stops first: {giver_stops_first}: {e}"));
+            publish(&tx, 0, 20);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(handle.stats.bytes_written.load(Ordering::Relaxed), 0, "opened under the giving flow's writer");
+
+            // The push reaches the giving flow: it stops, and its closer lets
+            // the recording go.
+            giver.cancel();
+            drop(lease);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while handle.stats.bytes_written.load(Ordering::Relaxed) < 20 * TS_PACKET as u64 {
+                assert!(Instant::now() < deadline, "giver stops first: {giver_stops_first}: never opened");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                !drain_events(&mut events_rx)
+                    .iter()
+                    .any(|e| e.details.as_ref().and_then(|d| d["replay_event"].as_str()) == Some("recording_start_failed")),
+                "giver stops first: {giver_stops_first}: a handover was reported as a failed start"
+            );
+            cancel.cancel();
+            assert!(handle.finished(Duration::from_secs(10)).await);
+        }
+    }
+
+    /// A flow that is stopping is waited for however long its closer takes —
+    /// a deleted flow whose closer was still finishing refused the flow that
+    /// took its recording next, naming a flow that no longer existed — and
+    /// the recording is then held as the new flow's: a third flow is held to
+    /// the grace against the new holder, not left waiting on the stopped one
+    /// for as long as the new one runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopping_flows_writer_is_waited_for_and_the_recording_then_held_by_the_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("rec");
+        let deleted = CancellationToken::new();
+        let closer = RecordingLease::try_take(&dir, "gone", &deleted).unwrap();
+        deleted.cancel();
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let (tx, _) = broadcast::channel::<RtpPacket>(1024);
+        let cancel = CancellationToken::new();
+        let grace = Duration::from_millis(200);
+        let handle = spawn_writer_at(
+            "cam2".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events.clone(), cancel.clone(), grace,
+        )
+        .await
+        .unwrap();
+        publish(&tx, 0, 20);
+        // Well past the grace, and past a look again at what holds it.
+        tokio::time::sleep(LEASE_RECHECK + Duration::from_millis(500)).await;
+        drop(closer);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle.stats.bytes_written.load(Ordering::Relaxed) < 20 * TS_PACKET as u64 {
+            assert!(Instant::now() < deadline, "the writer never opened the recording");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !drain_events(&mut events_rx)
+                .iter()
+                .any(|e| e.details.as_ref().and_then(|d| d["replay_event"].as_str()) == Some("recording_start_failed")),
+            "a stopping flow's writer was refused rather than waited for"
+        );
+
+        let (tx3, _) = broadcast::channel::<RtpPacket>(16);
+        let cancel3 = CancellationToken::new();
+        let third = spawn_writer_at(
+            "cam3".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx3, events, cancel3.clone(), grace,
+        )
+        .await
+        .unwrap();
+        let failed = start_failure(&mut events_rx).await;
+        assert_eq!(failed.flow_id.as_deref(), Some("cam3"));
+        assert!(failed.details.as_ref().unwrap()["error"].as_str().unwrap().contains("'cam2'"), "{failed:?}");
+        cancel3.cancel();
+        cancel.cancel();
+        assert!(third.finished(Duration::from_secs(5)).await);
+        assert!(handle.finished(Duration::from_secs(10)).await);
     }
 
     /// A flow stopped while its writer waits for the previous one ends the
@@ -3131,11 +3370,13 @@ mod tests {
     async fn a_writer_waiting_on_the_previous_one_stops_with_its_flow() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("rec");
-        let _previous = RecordingLease::try_take(&dir, "flow").unwrap();
+        let _previous = RecordingLease::try_take(&dir, "flow", &CancellationToken::new()).unwrap();
         let (events, _events_rx) = crate::manager::events::event_channel();
         let (tx, _) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
-        let handle = spawn_writer_at("flow".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx, events, cancel.clone())
+        let handle = spawn_writer_at(
+            "flow".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx, events, cancel.clone(), HANDOVER_GRACE,
+        )
             .await
             .unwrap();
         cancel.cancel();
@@ -3154,11 +3395,13 @@ mod tests {
         // A file where the recording's directory should be.
         let dir = tmp.path().join("rec");
         std::fs::write(&dir, b"not a directory").unwrap();
-        let previous = RecordingLease::try_take(&dir, "flow").unwrap();
+        let previous = RecordingLease::try_take(&dir, "flow", &CancellationToken::new()).unwrap();
         let (events, mut events_rx) = crate::manager::events::event_channel();
         let (tx, _) = broadcast::channel::<RtpPacket>(1024);
         let cancel = CancellationToken::new();
-        let handle = spawn_writer_at("flow".into(), "rec".into(), dir, RecordingConfig::default(), tx.clone(), events, cancel.clone())
+        let handle = spawn_writer_at(
+            "flow".into(), "rec".into(), dir, RecordingConfig::default(), tx.clone(), events, cancel.clone(), HANDOVER_GRACE,
+        )
             .await
             .unwrap();
         drop(previous);
@@ -3230,7 +3473,7 @@ mod tests {
         let (tx, _) = broadcast::channel::<RtpPacket>(1024);
         let cancel = CancellationToken::new();
         let handle = spawn_writer_at(
-            "flow".into(), "rec".into(), tmp.path().join("rec"), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
+            "flow".into(), "rec".into(), tmp.path().join("rec"), RecordingConfig::default(), tx.clone(), events, cancel.clone(), HANDOVER_GRACE,
         )
         .await
         .unwrap();
@@ -3297,7 +3540,7 @@ mod tests {
             let id = format!("bench-{r}");
             let dir = tmp.path().join(&id);
             handles.push(
-                spawn_writer_at(id.clone(), id, dir, config, tx.clone(), events.clone(), cancel.clone())
+                spawn_writer_at(id.clone(), id, dir, config, tx.clone(), events.clone(), cancel.clone(), HANDOVER_GRACE)
                     .await
                     .unwrap(),
             );
