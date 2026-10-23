@@ -531,12 +531,19 @@ same rules) keeps it so:
     played range, with nothing left before its end is refused with
     `replay_segment_missing`, and so is a lost tail with nothing after it.
     A `play_clip` with a `from_pts_90khz` lands within the range it asks
-    for — bounded by its own `to_pts_90khz`, or by the range already in
-    play when it names none — and is refused before the reader moves: it
-    was bounded by the range played before it, so a Play past an earlier
-    range's end was refused though its own range had media after the hole,
-    and one landing past its own end came back `replay_invalid_range` with
-    the reader already moved;
+    for — bounded by its own `to_pts_90khz`, else by the clip it names,
+    else by the range already in play — where it was bounded by the range
+    played before it, so a Play past an earlier range's end was refused
+    though its own range had media after the hole. A Play refused for any
+    reason — its range, its clip, its landing, its `speed`, its
+    `start_at_unix_ms` — leaves playback as it was: the reader, its range
+    and the pacer, its speed included. Every check runs before anything
+    moves, and the clip a Play names is opened beside the reader in play
+    and takes its place only once the Play has landed on it. The clip used
+    to take its place first, so a refused Play of a clip put that clip on
+    air from its in-point while the operator was told it had failed, and a
+    refused speed or start time came after the reader had moved and the
+    pacer had been reset;
   - an export (TS or MP4, clip or range, and the DVR clip cutter's exact
     cut) that needs a segment `index.bin` names but the disk lacks is
     refused with `replay_segment_missing`. It skipped the segment and

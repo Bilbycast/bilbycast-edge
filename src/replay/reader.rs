@@ -82,7 +82,13 @@ impl Reader {
 
     /// Open a recording scoped to a specific clip's range.
     pub async fn open_clip(recording_id: &str, clip_id: &str) -> Result<Self> {
-        let mut r = Self::open_recording(recording_id).await?;
+        Self::open_clip_at(recording_id, super::recording_dir(recording_id), clip_id).await
+    }
+
+    /// [`Self::open_clip`] in a named directory rather than the replay root's,
+    /// so a test can play a clip of its own.
+    pub(crate) async fn open_clip_at(recording_id: &str, dir: PathBuf, clip_id: &str) -> Result<Self> {
+        let mut r = Self::open_recording_at(recording_id, dir).await?;
         let clip = r.clips.get(clip_id).await
             .ok_or_else(|| anyhow!("replay_clip_not_found"))?;
         r.scope_to_clip(&clip).await?;
