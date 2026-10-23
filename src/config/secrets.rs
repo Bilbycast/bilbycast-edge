@@ -214,8 +214,11 @@ impl SecretsConfig {
         if let Some(ref mgr) = config.manager {
             secrets.manager_node_secret = mgr.node_secret.clone();
             secrets.manager_registration_token = mgr.registration_token.clone();
-            // Only beside its secret. On its own it would have a running
-            // config that had lost its secret rewrite this file without one.
+            // Only beside its secret: on its own it authenticates nothing, and
+            // `merge_into` brings it back only with one. This does not keep a
+            // secret in the file — a running config that has lost its secret
+            // now empties `secrets.json` (see `save_split_secrets`), so what
+            // keeps it is the callers never dropping it by accident.
             secrets.manager_node_id = mgr.node_secret.as_ref().and(mgr.node_id.clone());
         }
 
@@ -1347,8 +1350,8 @@ mod manager_secret_tests {
 
     #[test]
     fn a_node_id_is_never_saved_without_its_secret() {
-        // A running config that has lost its secret holds nothing to save:
-        // a node ID alone would rewrite `secrets.json` without the secret.
+        // A node ID with no secret beside it is not saved: on its own it
+        // authenticates nothing, and `merge_into` ignores it.
         assert!(SecretsConfig::extract_from(&with_manager(Some("node-9"), None)).is_empty());
     }
 }
