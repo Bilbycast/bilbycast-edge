@@ -356,7 +356,7 @@ Configuration is persisted across two files:
 At runtime, both files merge into a single `AppConfig` in memory — all existing code works unchanged. The split is purely a persistence and serialization boundary.
 
 **Secrets inventory** (fields stored in `secrets.json`):
-- Node-level: `manager.node_secret`, `manager.registration_token`, `server.tls`, `server.auth` (jwt_secret, client credentials), `setup_token` (one-shot `/setup` bearer, cleared on the first successful manager registration — see `docs/configuration-guide.md`), `nmos_registration.bearer_token` (see `docs/nmos.md`)
+- Node-level: `manager.node_secret` (with a copy of the `manager.node_id` it was issued for, `SecretsConfig::manager_node_id`, so a restart authenticates from this file alone — the registration save writes it first and on its own), `manager.registration_token`, `server.tls`, `server.auth` (jwt_secret, client credentials), `setup_token` (one-shot `/setup` bearer, cleared on the first successful manager registration — see `docs/configuration-guide.md`), `nmos_registration.bearer_token` (see `docs/nmos.md`)
 - Per-tunnel (keyed by ID): `tunnel_encryption_key`, `tunnel_bind_secret`, `tunnel_psk`, `tls_cert_pem`, `tls_key_pem`
 - Per-cellular-uplink (keyed by interface name): `password` (read-only RutOS credential)
 

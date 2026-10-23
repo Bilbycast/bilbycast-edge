@@ -446,7 +446,7 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 | `accept_self_signed_cert` | boolean | No | `false` | Accept self-signed TLS certificates from the manager. **Dev/testing only** — disables all TLS validation. Requires `BILBYCAST_ALLOW_INSECURE=1` environment variable as a safety guard. |
 | `cert_fingerprint` | string | No | `null` | SHA-256 fingerprint of the manager's TLS certificate for certificate pinning. Format: hex with colons, e.g. `"ab:cd:ef:01:23:..."`. When set, connections to servers presenting a different certificate are rejected, even if the certificate is CA-signed. Protects against compromised CAs. The server's fingerprint is logged on first connection. |
 | `registration_token` | string | No | `null` | One-time registration token from the manager. Used on first connection only. After successful registration, the token is cleared and replaced by `node_id` + `node_secret`. **Stored in `secrets.json`.** |
-| `node_id` | string | No | `null` | Persistent node ID assigned by the manager during registration. Saved automatically. |
+| `node_id` | string | No | `null` | Persistent node ID assigned by the manager during registration. Saved automatically, to `config.json` and beside `node_secret` in `secrets.json`. |
 | `node_secret` | string | No | `null` | Persistent node secret assigned by the manager during registration. **Stored in `secrets.json`** (encrypted at rest). |
 
 ### Registration Flow
@@ -454,7 +454,7 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 1. Create a node in the manager UI — you receive a one-time registration token.
 2. Provide the token via the setup wizard (`http://<edge-ip>:8080/setup`) or in `secrets.json`.
 3. Start the edge. It connects to the manager, sends the token, and receives `node_id` + `node_secret`.
-4. Credentials are saved automatically: `node_id` to `config.json`, `node_secret` to `secrets.json`.
+4. Credentials are saved automatically: `secrets.json` first and on its own, holding `node_secret` and the `node_id` it was issued for, then `config.json`, holding `node_id`. A restart reads the pair from `secrets.json`, so a `config.json` that could not be rewritten (a full disk fails the bigger file alone) does not lock the node out. A `secrets.json` that cannot be written raises a Warning `manager_credentials_not_saved` (`during: registration`): the node stays connected on the issued credentials and the next config save that succeeds writes them, but a restart before then presents the spent token.
 5. The registration token is cleared. Future connections use `node_id` + `node_secret` — from the very next reconnect, however the registering session ended.
 6. If the connection drops, the edge dials again after a flat 5 s, moving to the next entry in `urls`. The delay never grows.
 

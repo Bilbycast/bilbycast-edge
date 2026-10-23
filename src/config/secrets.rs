@@ -38,6 +38,13 @@ pub struct SecretsConfig {
     /// Manager authentication secret (assigned after registration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager_node_secret: Option<String>,
+    /// The node ID `manager_node_secret` was issued for. Not a secret, and
+    /// `config.json` carries it too, but a secret is only good with its own
+    /// node ID, and this file is written first and in one rename: with the
+    /// ID here, a registration whose `config.json` could not be written still
+    /// authenticates after a restart. Only ever written beside the secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_node_id: Option<String>,
     /// One-time registration token for initial manager registration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager_registration_token: Option<String>,
@@ -181,6 +188,7 @@ impl SecretsConfig {
     /// Returns true if there are any secrets stored.
     pub fn is_empty(&self) -> bool {
         self.manager_node_secret.is_none()
+            && self.manager_node_id.is_none()
             && self.manager_registration_token.is_none()
             && self.server_tls.is_none()
             && self.server_auth.is_none()
@@ -206,6 +214,9 @@ impl SecretsConfig {
         if let Some(ref mgr) = config.manager {
             secrets.manager_node_secret = mgr.node_secret.clone();
             secrets.manager_registration_token = mgr.registration_token.clone();
+            // Only beside its secret. On its own it would have a running
+            // config that had lost its secret rewrite this file without one.
+            secrets.manager_node_id = mgr.node_secret.as_ref().and(mgr.node_id.clone());
         }
 
         // Server TLS
@@ -264,6 +275,13 @@ impl SecretsConfig {
         if let Some(ref mut mgr) = config.manager {
             if self.manager_node_secret.is_some() && mgr.node_secret.is_none() {
                 mgr.node_secret = self.manager_node_secret.clone();
+                // The secret brings the node ID it was issued for. The two
+                // were written together; `config.json` is written after and
+                // can hold an older ID, or none — a registration whose
+                // `config.json` write failed left it without one.
+                if self.manager_node_id.is_some() {
+                    mgr.node_id = self.manager_node_id.clone();
+                }
             }
             if self.manager_registration_token.is_some() && mgr.registration_token.is_none() {
                 mgr.registration_token = self.manager_registration_token.clone();
@@ -1178,5 +1196,53 @@ mod node_local_secret_tests {
         assert_eq!(stripped.server.auth.is_none(), cleared.server.auth.is_none());
         assert_eq!(stripped.server.tls.is_none(), cleared.server.tls.is_none());
         assert_eq!(stripped.setup_token.is_none(), cleared.setup_token.is_none());
+    }
+}
+
+#[cfg(test)]
+mod manager_secret_tests {
+    use super::*;
+
+    fn with_manager(node_id: Option<&str>, node_secret: Option<&str>) -> AppConfig {
+        AppConfig {
+            manager: Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true,
+                    "urls": ["wss://manager.example/ws/node"],
+                    "node_id": node_id,
+                    "node_secret": node_secret,
+                }))
+                .expect("manager fixture"),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_node_secret_brings_the_node_id_it_was_issued_for() {
+        let secrets = SecretsConfig::extract_from(&with_manager(Some("node-9"), Some("issued-secret")));
+
+        // `config.json` is written after `secrets.json`, so beside it a
+        // restart can find no node ID (a registration whose `config.json`
+        // write failed) or an older one (the same, re-registering).
+        for in_config_json in [None, Some("node-1")] {
+            let mut loaded = with_manager(in_config_json, None);
+            secrets.merge_into(&mut loaded);
+            let mgr = loaded.manager.unwrap();
+            assert_eq!(mgr.node_id.as_deref(), Some("node-9"), "beside {in_config_json:?}");
+            assert_eq!(mgr.node_secret.as_deref(), Some("issued-secret"));
+        }
+
+        // A config that names its own secret merges none, and keeps its ID.
+        let mut explicit = with_manager(Some("node-3"), Some("its-own-secret"));
+        secrets.merge_into(&mut explicit);
+        assert_eq!(explicit.manager.unwrap().node_id.as_deref(), Some("node-3"));
+    }
+
+    #[test]
+    fn a_node_id_is_never_saved_without_its_secret() {
+        // A running config that has lost its secret holds nothing to save:
+        // a node ID alone would rewrite `secrets.json` without the secret.
+        assert!(SecretsConfig::extract_from(&with_manager(Some("node-9"), None)).is_empty());
     }
 }

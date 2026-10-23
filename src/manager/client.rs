@@ -618,7 +618,15 @@ where
                 // the manager just issued rather than the token it spent.
                 lock_credentials(creds).registered(node_id.clone(), node_secret.clone());
                 tunnel_manager.set_manager_node_id(node_id.clone());
-                persist_credentials(app_config, config_path, secrets_path, &node_id, &node_secret).await;
+                persist_credentials(
+                    app_config,
+                    config_path,
+                    secrets_path,
+                    &node_id,
+                    &node_secret,
+                    tunnel_manager.event_sender(),
+                )
+                .await;
             }
         }
         "auth_error" => {
@@ -1747,13 +1755,31 @@ pub fn edge_capabilities() -> Vec<&'static str> {
     caps
 }
 
-/// Persist manager credentials to config + secrets files.
+/// Save the credentials the manager issued at registration, in the running
+/// config and in `secrets.json` / `config.json`, and close the setup wizard.
+///
+/// `secrets.json` decides, as it does for [`save_node_secret`]: it is written
+/// first and on its own, and it carries the node ID with the secret
+/// (`SecretsConfig::manager_node_id`), so once it lands a restart
+/// authenticates whatever `config.json` then does. The node ID used to live in
+/// `config.json` alone, written by the same two-file save: a `config.json`
+/// that could not be written — a full disk fails the bigger file alone — left
+/// a restart with the issued secret, no node ID to present it with, and a
+/// spent registration token.
+///
+/// Unlike a rotation there is nothing to refuse: the manager spent the token
+/// and stored the secret before it answered. So the running config takes the
+/// credentials whatever the files do, and the next save that succeeds writes
+/// them. A `secrets.json` that cannot take them is reported, since until then
+/// a restart presents the spent token; a `config.json` that cannot be
+/// rewritten is only logged.
 async fn persist_credentials(
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &Path,
     secrets_path: &Path,
     node_id: &str,
     node_secret: &str,
+    events: &super::events::EventSender,
 ) {
     let mut cfg = app_config.write().await;
     if let Some(ref mut mgr) = cfg.manager {
@@ -1773,10 +1799,22 @@ async fn persist_credentials(
             "Setup wizard disabled and one-shot token cleared after successful manager registration"
         );
     }
-    if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
-        tracing::warn!("Failed to persist manager credentials: {e}");
-    } else {
-        tracing::info!("Manager credentials saved (node_secret → {})", secrets_path.display());
+    if let Err(e) = save_split_secrets_async(secrets_path.to_path_buf(), cfg.clone()).await {
+        tracing::warn!(
+            "Failed to save the credentials the manager issued to {}: {e}; until a later save \
+             succeeds, a restart presents the spent registration token",
+            secrets_path.display()
+        );
+        emit_credentials_not_saved(events, "registration", &e.to_string());
+        return;
+    }
+    tracing::info!("Manager credentials saved (node_secret → {})", secrets_path.display());
+    if let Err(e) = save_split_config_async(config_path.to_path_buf(), cfg.clone()).await {
+        tracing::warn!(
+            "The credentials the manager issued are saved to {}, but {} could not be rewritten: {e}",
+            secrets_path.display(),
+            config_path.display()
+        );
     }
 }
 
@@ -10494,6 +10532,67 @@ mod manager_link_tests {
         assert_eq!(shown["node_id"], "node-9");
         assert_eq!(shown["node_secret"], "issued-secret");
         assert!(shown.get("registration_token").is_none(), "{shown}");
+        assert_eq!(edge.secret_on_disk().as_deref(), Some("issued-secret"));
+    }
+
+    /// `secrets.json` alone decides what a restart presents after a
+    /// registration too. The node ID lived only in `config.json`, so one that
+    /// could not be written left a restart with the issued secret and no node
+    /// ID to present it with — and the registration token was spent.
+    #[tokio::test]
+    async fn a_registration_beside_an_unwritable_config_json_authenticates_after_a_restart() {
+        let mut edge = Edge::new(manager_config(None, Some("one-time-token")));
+        edge.save().await;
+        Edge::block_writes_to(&edge.deps.config_path);
+        let creds = edge.credentials();
+
+        let (_, shown) = edge
+            .session(&creds, |mut ws| async move { authenticate(&mut ws, register_ack()).await })
+            .await;
+        assert_eq!(shown["registration_token"], "one-time-token");
+
+        let restarted = crate::config::persistence::load_config_split(&edge.deps.config_path, &edge.deps.secrets_path)
+            .unwrap()
+            .manager
+            .unwrap();
+        let shown = build_auth_message(&restarted)["payload"].clone();
+        assert_eq!(shown["node_id"], "node-9", "{shown}");
+        assert_eq!(shown["node_secret"], "issued-secret", "{shown}");
+    }
+
+    /// A `secrets.json` that cannot take the issued credentials is reported,
+    /// and the running config keeps them, so the next save that succeeds
+    /// writes them. There is no refusing them, as a rotation is refused: the
+    /// manager has already spent the token.
+    #[tokio::test]
+    async fn a_registration_secrets_json_cannot_take_is_reported_and_kept_running() {
+        let mut edge = Edge::new(manager_config(None, Some("one-time-token")));
+        edge.save().await;
+        Edge::block_writes_to(&edge.deps.secrets_path);
+
+        persist_credentials(
+            &edge.deps.app_config,
+            &edge.deps.config_path,
+            &edge.deps.secrets_path,
+            "node-9",
+            "issued-secret",
+            edge.deps.tunnel_manager.event_sender(),
+        )
+        .await;
+
+        let reported = std::iter::from_fn(|| edge.event_rx.try_recv().ok()).any(|e| {
+            e.details.as_ref().is_some_and(|d| {
+                d["error_code"] == "manager_credentials_not_saved" && d["during"] == "registration"
+            })
+        });
+        assert!(reported, "a registration secrets.json could not take must be reported");
+        let running = edge.deps.app_config.read().await.manager.clone().unwrap();
+        assert_eq!(running.node_id.as_deref(), Some("node-9"));
+        assert_eq!(running.node_secret.as_deref(), Some("issued-secret"));
+        assert!(running.registration_token.is_none());
+
+        std::fs::remove_dir(edge.deps.secrets_path.with_extension("json.tmp")).unwrap();
+        edge.save().await;
         assert_eq!(edge.secret_on_disk().as_deref(), Some("issued-secret"));
     }
 
