@@ -421,7 +421,13 @@ there:
    (past it, `replay_writer_lagged`, as behind any slow disk), a flow
    stopped meanwhile ends the wait, and an open that then fails raises the
    same Critical `recording_start_failed` event a failure at flow start
-   does. `FlowRuntime::stop`'s 10 s wait used to be all that kept the two
+   does, against the flow. The flow has already reported that recording
+   started by then and keeps its handle, so the recorder goes on answering
+   its commands until the flow stops — `start_recording`, `mark_in` and
+   `mark_out` with `replay_recording_not_active`, as for a flow with no
+   recorder (`stop_recording`'s handler codes nothing, so it carries that
+   code at the head of its message) — where a writer task that simply ended
+   left them failing with the uncoded "recording writer task is gone". `FlowRuntime::stop`'s 10 s wait used to be all that kept the two
    apart, and a disk slower than that let the new writer's sweep below
    unlink the segments the old closer had yet to rename — and a segment
    the old writer had open with no index entry yet, an id nothing names,
@@ -619,7 +625,7 @@ parsing strings.
 
 | `error_code` | Severity | Trigger | Operator action |
 |---|---|---|---|
-| `replay_recording_not_active` | Error | `start_recording` / `stop_recording` / `mark_in` / `mark_out` on a flow whose `recording` block is absent or has `enabled: false` (no writer is spawned at flow start — `engine/flow.rs` filters on `enabled`); `start_recording` on an unknown `flow_id` (the other three return a bare error with no code for that); `mark_in` without an explicit `pts_90khz` on a fresh recording before the writer has seen its first PCR (the counter is still 0), or `mark_out` with no pending `mark_in` (or with `pts_90khz` at or before the pending in-point — the arm lifts every writer-side error under this code) | Add a `RecordingConfig` with `enabled: true` via `configure_recording` (the edge reports `restart_required`; the recorder binds at the next flow start) or `update_flow` (`recording` is a restart-triggering field). For the mark cases, wait for the source to deliver, or send `mark_in` first |
+| `replay_recording_not_active` | Error | `start_recording` / `stop_recording` / `mark_in` / `mark_out` on a flow whose `recording` block is absent or has `enabled: false` (no writer is spawned at flow start — `engine/flow.rs` filters on `enabled`); `start_recording` on an unknown `flow_id` (the other three return a bare error with no code for that); `mark_in` without an explicit `pts_90khz` on a fresh recording before the writer has seen its first PCR (the counter is still 0), or `mark_out` with no pending `mark_in` (or with `pts_90khz` at or before the pending in-point — the arm lifts every writer-side error under this code); any of them on a flow whose recorder failed to open after waiting for its previous writer (see `recording_start_failed`) | Add a `RecordingConfig` with `enabled: true` via `configure_recording` (the edge reports `restart_required`; the recorder binds at the next flow start) or `update_flow` (`recording` is a restart-triggering field). For the mark cases, wait for the source to deliver, or send `mark_in` first |
 | `replay_no_playback_input` | Error | `play_clip`/`scrub_playback` on a flow with no `replay` input | Add a `replay` input to the flow |
 | `replay_clip_not_found` | Error | `play_clip`/`delete_clip` with an unknown `clip_id` | Refresh the clip list (it may have been pruned by retention) |
 | `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget, or past its own first 4 MiB with the node's recorders past the 256 MiB they share — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |

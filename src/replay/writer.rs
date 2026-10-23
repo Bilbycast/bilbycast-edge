@@ -461,12 +461,13 @@ pub async fn spawn_writer(
 ) -> Result<RecordingHandle> {
     let recording_id = config.storage_id.clone().unwrap_or_else(|| flow_id.clone());
     let dir = super::recording_dir(&recording_id);
-    spawn_writer_at(recording_id, dir, config, broadcast_tx, events, parent_cancel).await
+    spawn_writer_at(flow_id, recording_id, dir, config, broadcast_tx, events, parent_cancel).await
 }
 
 /// [`spawn_writer`] into a named directory rather than the replay root's, so
 /// a test can record into a directory of its own.
 async fn spawn_writer_at(
+    flow_id: String,
     recording_id: String,
     dir: PathBuf,
     config: RecordingConfig,
@@ -478,6 +479,7 @@ async fn spawn_writer_at(
     // opened waits in the broadcast ring rather than going unrecorded.
     let mut rx = broadcast_tx.subscribe();
     let setup = WriterSetup {
+        flow_id,
         recording_id: recording_id.clone(),
         dir: dir.clone(),
         config: config.clone(),
@@ -544,8 +546,15 @@ async fn spawn_writer_at(
             Opening::Ready(state) => *state,
             Opening::AfterPrevious(held, setup) => {
                 match open_after_previous(held, setup, &cancel).await {
-                    Some(state) => state,
-                    None => return,
+                    Ok(Some(state)) => state,
+                    Ok(None) => return,
+                    Err(failed) => {
+                        // Nothing will write what the subscriber queues: it
+                        // stops when it finds the queue closed.
+                        drop(writer_rx);
+                        refuse_commands(cmd_rx, &cancel, &failed).await;
+                        return;
+                    }
                 }
             }
         };
@@ -564,6 +573,8 @@ async fn spawn_writer_at(
 /// What opening a recording needs, besides the [`RecordingLease`] on its
 /// directory.
 struct WriterSetup {
+    /// The flow it records — what a failure to open it is reported against.
+    flow_id: String,
     recording_id: String,
     dir: PathBuf,
     config: RecordingConfig,
@@ -581,13 +592,16 @@ enum Opening {
 }
 
 /// Open the recording once the writer before this one has let it go — see
-/// [`RecordingLease`]. `None` if the flow stops first, or the open fails,
-/// which is reported as [`spawn_writer`]'s caller reports a synchronous one.
+/// [`RecordingLease`]. `None` if the flow stops first. A failed open is
+/// reported as a failure at flow start is — the same Critical
+/// `recording_start_failed` against the flow — and returned, for the writer
+/// to answer the flow's recording commands with.
 async fn open_after_previous(
     held: Arc<Mutex<()>>,
     setup: WriterSetup,
     cancel: &CancellationToken,
-) -> Option<WriterState> {
+) -> Result<Option<WriterState>> {
+    let flow_id = setup.flow_id.clone();
     let recording_id = setup.recording_id.clone();
     let events = setup.events.clone();
     tracing::info!(
@@ -597,7 +611,7 @@ async fn open_after_previous(
     );
     let waiting = Instant::now();
     let guard = tokio::select! {
-        _ = cancel.cancelled() => return None,
+        _ = cancel.cancelled() => return Ok(None),
         guard = held.lock_owned() => guard,
     };
     let lease = RecordingLease::held(setup.dir.clone(), guard);
@@ -607,14 +621,14 @@ async fn open_after_previous(
                 recording_id = %recording_id, waited_ms = waiting.elapsed().as_millis() as u64,
                 "replay: opened the recording after its previous writer finished"
             );
-            Some(state)
+            Ok(Some(state))
         }
         Err(e) => {
             events.emit_with_details(
                 EventSeverity::Critical,
                 category::REPLAY,
-                format!("Recording '{recording_id}' failed to start: {e}"),
-                None,
+                format!("Recording failed to start for flow '{flow_id}': {e}"),
+                Some(&flow_id),
                 serde_json::json!({
                     "replay_event": "recording_start_failed",
                     "error_code": "replay_disk_full",
@@ -622,7 +636,37 @@ async fn open_after_previous(
                     "error": e.to_string(),
                 }),
             );
-            None
+            Err(e)
+        }
+    }
+}
+
+/// Answer the flow's recording commands, until it stops, for a recorder whose
+/// open failed after the flow had started: as a flow with no recorder is
+/// answered, `replay_recording_not_active`.
+///
+/// The flow has already published this recorder and reported it started — the
+/// open waited in the writer task — and keeps its handle. A writer task that
+/// simply ended left that handle's commands failing with "recording writer
+/// task is gone", which carries no code at all.
+async fn refuse_commands(
+    mut cmd_rx: mpsc::Receiver<RecordingCommand>,
+    cancel: &CancellationToken,
+    failed: &anyhow::Error,
+) {
+    let refusal = || anyhow!("replay_recording_not_active: the recording failed to start: {failed}");
+    loop {
+        let cmd = tokio::select! {
+            _ = cancel.cancelled() => return,
+            cmd = cmd_rx.recv() => cmd,
+        };
+        // A reply nobody waits for any more is nothing to report.
+        match cmd {
+            None => return,
+            Some(RecordingCommand::Start { reply }) => drop(reply.send(Err(refusal()))),
+            Some(RecordingCommand::Stop { reply }) => drop(reply.send(Err(refusal()))),
+            Some(RecordingCommand::MarkIn { reply, .. }) => drop(reply.send(Err(refusal()))),
+            Some(RecordingCommand::MarkOut { reply, .. }) => drop(reply.send(Err(refusal()))),
         }
     }
 }
@@ -705,7 +749,7 @@ impl Drop for RecordingLease {
 /// Open — or resume — the recording in `dir`, and start its closer: the
 /// writer's state, ready for packets, before any task feeds it.
 async fn open_writer(setup: WriterSetup, lease: RecordingLease) -> Result<WriterState> {
-    let WriterSetup { recording_id, dir, config, events, stats, budget } = setup;
+    let WriterSetup { flow_id: _, recording_id, dir, config, events, stats, budget } = setup;
     let lease = Arc::new(lease);
     tokio::fs::create_dir_all(&dir).await
         .with_context(|| format!("create recording dir {}", dir.display()))?;
@@ -2444,6 +2488,7 @@ mod tests {
         let dir = parent.join("rec");
         let lease = RecordingLease::try_take(&dir).expect("another writer holds the recording");
         let setup = WriterSetup {
+            flow_id: "flow".into(),
             recording_id: "rec".into(),
             dir,
             config,
@@ -2930,7 +2975,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let dir = tmp.path().join("rec");
         let handle = spawn_writer_at(
-            "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
+            "flow".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
         )
         .await
         .unwrap();
@@ -2986,7 +3031,7 @@ mod tests {
         let (events, mut events_rx) = crate::manager::events::event_channel();
         let (tx, _) = broadcast::channel::<RtpPacket>(1024);
         let cancel = CancellationToken::new();
-        let handle = spawn_writer_at("rec".into(), dir.clone(), config, tx.clone(), events, cancel.clone())
+        let handle = spawn_writer_at("flow".into(), "rec".into(), dir.clone(), config, tx.clone(), events, cancel.clone())
             .await
             .unwrap();
         publish(&tx, 0, 30);
@@ -3029,7 +3074,7 @@ mod tests {
         let (events, _events_rx) = crate::manager::events::event_channel();
         let (tx, _) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
-        let handle = spawn_writer_at("rec".into(), dir.clone(), RecordingConfig::default(), tx, events, cancel.clone())
+        let handle = spawn_writer_at("flow".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx, events, cancel.clone())
             .await
             .unwrap();
         cancel.cancel();
@@ -3038,8 +3083,10 @@ mod tests {
     }
 
     /// An open that waited and then failed is reported once, as a failed
-    /// start, and the subscriber stops with the writer instead of calling
-    /// every packet after it a lag.
+    /// start of the flow's recording, and the subscriber stops with the
+    /// writer instead of calling every packet after it a lag. The flow keeps
+    /// its handle, and the recorder answers its commands as a flow with no
+    /// recorder is answered, not with "recording writer task is gone".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_waited_open_that_fails_is_reported_as_a_failed_start() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3050,29 +3097,41 @@ mod tests {
         let (events, mut events_rx) = crate::manager::events::event_channel();
         let (tx, _) = broadcast::channel::<RtpPacket>(1024);
         let cancel = CancellationToken::new();
-        let handle = spawn_writer_at("rec".into(), dir, RecordingConfig::default(), tx.clone(), events, cancel.clone())
+        let handle = spawn_writer_at("flow".into(), "rec".into(), dir, RecordingConfig::default(), tx.clone(), events, cancel.clone())
             .await
             .unwrap();
         drop(previous);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.tasks.lock().unwrap().iter().all(JoinHandle::is_finished) {
-            assert!(Instant::now() < deadline, "the writer never gave up");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events_rx.recv().await.expect("the events channel closed");
+                if event.details.as_ref().and_then(|d| d["replay_event"].as_str()) == Some("recording_start_failed") {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the writer never gave up");
+        assert_eq!(failed.flow_id.as_deref(), Some("flow"), "the failure was not reported against the flow");
+        assert_eq!(failed.details.as_ref().unwrap()["recording_id"], "rec");
+
         publish(&tx, 0, 20);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(tx.receiver_count(), 0, "the subscriber outlived the writer");
+        let (reply, ack) = oneshot::channel();
+        handle.command_tx.send(RecordingCommand::Start { reply }).await.expect("the recorder no longer answers");
+        let err = ack.await.unwrap().expect_err("a recording that failed to start started");
+        assert!(err.to_string().starts_with("replay_recording_not_active"), "{err}");
         let events = drain_events(&mut events_rx);
-        let failed = events
-            .iter()
-            .filter(|e| e.details.as_ref().and_then(|d| d["replay_event"].as_str()) == Some("recording_start_failed"))
-            .count();
-        assert_eq!(failed, 1);
+        assert!(
+            !events.iter().any(|e| e.details.as_ref().and_then(|d| d["replay_event"].as_str()) == Some("recording_start_failed")),
+            "the failure was reported twice"
+        );
         assert!(
             !events.iter().any(|e| error_code(e) == Some("replay_writer_lagged")),
             "packets nothing would take were reported as a lag"
         );
         cancel.cancel();
+        assert!(handle.finished(Duration::from_secs(5)).await);
     }
 
     /// `finished` waits once for all of a recorder's tasks, not once each:
@@ -3110,7 +3169,7 @@ mod tests {
         let (tx, _) = broadcast::channel::<RtpPacket>(1024);
         let cancel = CancellationToken::new();
         let handle = spawn_writer_at(
-            "rec".into(), tmp.path().join("rec"), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
+            "flow".into(), "rec".into(), tmp.path().join("rec"), RecordingConfig::default(), tx.clone(), events, cancel.clone(),
         )
         .await
         .unwrap();
@@ -3177,7 +3236,7 @@ mod tests {
             let id = format!("bench-{r}");
             let dir = tmp.path().join(&id);
             handles.push(
-                spawn_writer_at(id, dir, config, tx.clone(), events.clone(), cancel.clone())
+                spawn_writer_at(id.clone(), id, dir, config, tx.clone(), events.clone(), cancel.clone())
                     .await
                     .unwrap(),
             );
