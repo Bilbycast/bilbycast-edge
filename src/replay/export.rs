@@ -578,9 +578,15 @@ mod tests {
             let err = pull_all(dir, from, to).await.expect_err("refused");
             assert!(err.to_string().starts_with("replay_segment_missing"), "{from:?}..{to:?}: {err}");
         }
-        // The range's last segment gone: refused, rather than counted in the
-        // total and then not read.
-        let err = pull_all(dir, Some(0), Some(180_000)).await.expect_err("refused");
+        // The range ending part-way into a segment that has gone: refused,
+        // rather than that segment's bytes up to the end point counted in the
+        // total and then not read. Segment 2 gets a second random-access point
+        // a packet in, for the range to end on.
+        let mut entries: Vec<IndexEntry> = (0..5u32).map(|id| idx(id as u64 * 90_000, id, 0)).collect();
+        entries.insert(3, idx(225_000, 2, 188));
+        fs::remove_file(dir.join("index.bin")).await.unwrap();
+        make_index(dir, &entries).await;
+        let err = pull_all(dir, Some(0), Some(225_000)).await.expect_err("refused");
         assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
         // A range clear of the hole exports as before.
         let (data, total) = pull_all(dir, Some(270_000), None).await.unwrap();

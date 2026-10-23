@@ -1081,8 +1081,10 @@ low-latency — against a local HTTP origin that holds one segment's PUT for
 12 s, longer than a 64-message broadcast ring holds the feed many times over,
 and checks that no packet is lost, every segment is published, no playlist
 declares a discontinuity, the flow's epoch never re-anchors, every row after
-the first carries a date, and every date sits within a frame or so of when
-that segment's first frame was published. Each of the three `arrival_now()`
+the first carries a date, and every date sits within −500 to +750 ms of when
+that segment's first frame was published — a bound loose enough for a loaded
+test run that still catches the backlog's eleven seconds, not a measure of how
+accurate the dates are. Each of the three `arrival_now()`
 call sites edited back to `Utc::now()` fails it, and so does an intake too
 small to ride the stall. What it does not cover: the feed is synthetic H.264
 (real parameter sets, filler slices — a default build has no H.264 encoder, and

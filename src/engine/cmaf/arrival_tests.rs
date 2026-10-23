@@ -283,10 +283,11 @@ fn assert_rode_out_the_stall(run: &Run) {
         dated.range(STALLED_SEGMENT + 1..).count() >= 10,
         "too few segments after the stall were dated to check: {dated:?}"
     );
-    // Within a frame or so of when each segment's first frame was published —
-    // the closing frame's 40 ms in the demuxer, and whatever a loaded test
-    // run adds — where dating by processing put the backlog's eleven seconds
-    // out.
+    // Within half a second or so of when each segment's first frame was
+    // published, -500 to +750 ms — the closing frame's 40 ms in the demuxer,
+    // and whatever a loaded test run adds — where dating by processing put the
+    // backlog's eleven seconds out. A bound on the stall's effect, not a
+    // measure of how accurate the dates are.
     for (seq, pdt) in dates {
         let off = (pdt - run.gop_sent[seq as usize]).num_milliseconds();
         assert!(
