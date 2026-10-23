@@ -101,6 +101,68 @@ pub(crate) async fn segments_on_disk(dir: &Path) -> std::io::Result<Vec<u32>> {
     Ok(ids)
 }
 
+/// Where a segment `index.bin` names stands: finished, still on its way, or
+/// gone for good.
+///
+/// The index names the segment the writer has open as soon as it sees a
+/// random-access point in it, and the segments queued for the closer until
+/// each is renamed into place, so a range at the live edge reaches segments
+/// that are not on disk yet and will be within a segment's length. Those are
+/// not the segments a crash or a failed close lost, or retention removed, and
+/// a reader that called them lost told the operator their media was gone when
+/// it was not finished yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SegmentState {
+    /// Finished and in place, this many bytes long.
+    Finished(u64),
+    /// Still being written: open in the recording's writer, or waiting on its
+    /// closer. In place once it closes.
+    Pending,
+    /// Not on disk and not on its way: lost to a crash or a failed close, or
+    /// removed by retention.
+    Lost,
+}
+
+/// Where segment `id` of the recording in `dir` stands — see [`SegmentState`].
+///
+/// A staging file in `.tmp/` is on its way only while a writer is working in
+/// the recording ([`writer::is_being_written`]): the leftovers of a crash stay
+/// there until the next writer sweeps them, so with nobody writing, a staging
+/// file is what a crash lost. And the finished path is looked at again after
+/// the staging one, because the closer may rename the segment between the
+/// two looks — a rename is atomic, so it is then in one place or the other.
+pub(crate) async fn segment_state(dir: &Path, id: u32) -> std::io::Result<SegmentState> {
+    let finished = segment_path(dir, id);
+    match tokio::fs::metadata(&finished).await {
+        Ok(m) => return Ok(SegmentState::Finished(m.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    if writer::is_being_written(dir)
+        && tokio::fs::try_exists(segment_path(&dir.join(".tmp"), id)).await.unwrap_or(false)
+    {
+        return Ok(SegmentState::Pending);
+    }
+    match tokio::fs::metadata(&finished).await {
+        Ok(m) => Ok(SegmentState::Finished(m.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SegmentState::Lost),
+        Err(e) => Err(e),
+    }
+}
+
+/// The ids of the segments the recording's writer has yet to put in place —
+/// open, or waiting on its closer — in ascending order; none while no writer
+/// is working in it (see [`segment_state`]).
+///
+/// Listed before [`segments_on_disk`] by a caller that wants both, so that a
+/// segment the closer renames between the two listings is in at least one.
+pub(crate) async fn segments_pending(dir: &Path) -> Vec<u32> {
+    if !writer::is_being_written(dir) {
+        return Vec::new();
+    }
+    segments_on_disk(&dir.join(".tmp")).await.unwrap_or_default()
+}
+
 /// Filesystem free / total bytes for the replay root, via `statvfs(3)`.
 /// Cross-platform across Linux + macOS (the only edge targets).
 /// Returns `None` if the root doesn't exist yet or `statvfs` fails — the

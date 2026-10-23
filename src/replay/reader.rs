@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
 use super::ClipInfo;
 use super::clips::ClipStore;
 use super::index::{InMemoryIndex, IndexEntry};
-use super::{segment_path, segments_on_disk};
+use super::{segment_path, segments_on_disk, segments_pending};
 
 /// 188-byte MPEG-TS packet size.
 const TS_PACKET: usize = 188;
@@ -131,22 +131,41 @@ impl Reader {
     /// sees how far it moved. Not on the last random-access point before the
     /// hole, which may be minutes of media the operator did not ask for. Past
     /// the end of the range there is nothing of it left to play, and that is
-    /// refused with `replay_segment_missing`.
+    /// refused with `replay_segment_missing` — or, when what comes next in
+    /// range is a segment the live writer has yet to put in place (see
+    /// [`super::SegmentState`]), with `replay_segment_not_ready`, since the
+    /// same request plays once it has closed. A recording directory that has
+    /// gone altogether has no media left in it either.
     async fn playable_from(&self, target: u64, before: u64) -> Result<IndexEntry> {
         let floor = self.index.find_floor(target)
             .ok_or_else(|| anyhow!("replay_no_index"))?;
         if tokio::fs::try_exists(segment_path(&self.recording_dir, floor.segment_id)).await.unwrap_or(false) {
             return Ok(floor);
         }
-        let on_disk = segments_on_disk(&self.recording_dir).await?;
-        match self.index.next_present(floor.pts_90khz, |id| on_disk.binary_search(&id).is_ok()) {
-            Some(next) if next.pts_90khz < before => Ok(next),
-            _ => Err(anyhow!(
-                "replay_segment_missing: segment {:06}.ts, which index.bin names at PTS {}, \
-                 is not on disk, and no recorded media follows it in range",
-                floor.segment_id, floor.pts_90khz,
-            )),
+        // Pending first: a segment the closer renames between the two listings
+        // is then in one or the other.
+        let pending = segments_pending(&self.recording_dir).await;
+        let on_disk = finished_segments(&self.recording_dir).await?;
+        let in_range = |list: &[u32]| {
+            self.index
+                .next_present(floor.pts_90khz, |id| list.binary_search(&id).is_ok())
+                .filter(|next| next.pts_90khz < before)
+        };
+        if let Some(next) = in_range(&on_disk) {
+            return Ok(next);
         }
+        if in_range(&pending).is_some() {
+            return Err(anyhow!(
+                "replay_segment_not_ready: segment {:06}.ts, which index.bin names at PTS {}, \
+                 is still being recorded — it can be played once it has closed",
+                floor.segment_id, floor.pts_90khz,
+            ));
+        }
+        Err(anyhow!(
+            "replay_segment_missing: segment {:06}.ts, which index.bin names at PTS {}, \
+             is not on disk, and no recorded media follows it in range",
+            floor.segment_id, floor.pts_90khz,
+        ))
     }
 
     /// Read the next bundle of `chunks * 188` bytes from the current
@@ -220,14 +239,33 @@ impl Reader {
 /// The first entry outright named a file retention had removed, on every
 /// recording old enough to have been pruned, and a whole-recording replay then
 /// failed at its first read.
+///
+/// A recording whose first segment is still open has nothing to start on yet,
+/// and says so (`replay_segment_not_ready`) rather than that it was lost.
 pub(crate) async fn recording_start(index: &InMemoryIndex, dir: &Path) -> Result<IndexEntry> {
     if index.entries.is_empty() {
         return Err(anyhow!("replay_no_index"));
     }
+    let pending = segments_pending(dir).await;
     let on_disk = segments_on_disk(dir).await?;
-    index
-        .first_present(|id| on_disk.binary_search(&id).is_ok())
-        .ok_or_else(|| anyhow!("replay_segment_missing: no segment index.bin names is on disk"))
+    if let Some(start) = index.first_present(|id| on_disk.binary_search(&id).is_ok()) {
+        return Ok(start);
+    }
+    if index.first_present(|id| pending.binary_search(&id).is_ok()).is_some() {
+        return Err(anyhow!(
+            "replay_segment_not_ready: the recording's first segment is still being recorded"
+        ));
+    }
+    Err(anyhow!("replay_segment_missing: no segment index.bin names is on disk"))
+}
+
+/// The finished segments in a recording directory, none when the directory
+/// itself has gone — a recording deleted under a replay of it.
+async fn finished_segments(dir: &Path) -> Result<Vec<u32>> {
+    match segments_on_disk(dir).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        listed => listed.with_context(|| format!("list segments in {}", dir.display())),
+    }
 }
 
 #[cfg(test)]
@@ -363,6 +401,34 @@ mod tests {
         reader.scope_to_clip(&clip(190_000, 400_000)).await.unwrap();
         assert_eq!(reader.range.start_entry.segment_id, 4);
         assert_eq!(reader.range.from_pts_90khz, 360_000);
+    }
+
+    /// A scrub onto a segment the live writer has yet to put in place is
+    /// refused as not ready, not as lost — and so is a replay of a recording
+    /// whose first segment is still open. With no writer at work, the same
+    /// staging file is a crash's leftover.
+    #[tokio::test]
+    async fn a_scrub_onto_a_segment_still_being_recorded_is_not_ready() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (dir, _) = recording(tmp.path(), 4, &[]).await;
+        tokio::fs::create_dir(dir.join(".tmp")).await.unwrap();
+        for id in [2, 3] {
+            tokio::fs::rename(segment_path(&dir, id), segment_path(&dir.join(".tmp"), id)).await.unwrap();
+        }
+        let mut reader = Reader::open_recording_at("rec", dir.clone()).await.unwrap();
+        let writer = crate::replay::writer::hold_as_writer(&dir);
+        let err = reader.scrub_to(280_000).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_not_ready"), "{err}");
+        drop(writer);
+        let err = reader.scrub_to(280_000).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+
+        let (dir, _) = recording(&tmp.path().join("fresh"), 1, &[]).await;
+        tokio::fs::create_dir(dir.join(".tmp")).await.unwrap();
+        tokio::fs::rename(segment_path(&dir, 0), segment_path(&dir.join(".tmp"), 0)).await.unwrap();
+        let _writer = crate::replay::writer::hold_as_writer(&dir);
+        let err = Reader::open_recording_at("rec", dir).await.err().expect("refused");
+        assert!(err.to_string().starts_with("replay_segment_not_ready"), "{err}");
     }
 
     /// A crash that lost the tail leaves nothing after the hole to land on.

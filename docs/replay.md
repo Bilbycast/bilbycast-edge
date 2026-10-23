@@ -517,7 +517,23 @@ same rules) keeps it so:
     nothing — is stepped over, as playback steps over it. An export's
     `total_bytes` is the sum of exactly the segment windows it reads; it
     was worked out separately, and a missing last segment was counted
-    there and not read.
+    there and not read. The start's own segment is checked whatever the
+    end: an export from a lost tail with no `to_pts_90khz` is refused,
+    where it came back as an empty file and a success;
+  - an entry can also name a segment that is **not on disk yet**: the
+    writer indexes the open segment's random-access points as it sees them,
+    and the segments waiting on the closer until each is renamed into
+    place. A cue, scrub, play or export that reaches one — a mark-out at
+    "now" exported at once, a range ending in the newest few seconds — is
+    refused with `replay_segment_not_ready`, which is transient: the same
+    request succeeds once the segment has closed, within `segment_seconds`
+    plus the closer's lag. What tells the two apart is the live writer's
+    hold on the directory (`RecordingLease`, `writer::is_being_written`):
+    while a writer holds it, every staging file in `.tmp/` is one of its
+    segments still to come; with nobody writing, a staging file is a
+    crash's leftover and the segment it names is lost. The finished path is
+    looked at again after the staging one, since the closer may rename
+    between the two (`replay::segment_state`).
 
 ### Clip create
 
@@ -556,8 +572,9 @@ pointed at a known clip).
    ≤ target), seeks to the IDR's byte offset, and yields paced bundles
    to the broadcast channel. When that segment is no longer on disk it
    starts at the first IDR after it that is, and refuses a clip with
-   nothing left before its out-point (`replay_segment_missing`; see
-   [Segment ids](#segment-ids)).
+   nothing left before its out-point (`replay_segment_missing`, or
+   `replay_segment_not_ready` while what comes next is still being
+   recorded; see [Segment ids](#segment-ids)).
 4. **K** key or `stop_playback` halts playback (`playback_stopped`
    Info). On reaching the end of the recording on disk (no next
    `<NNNNNN>.ts` segment) with `loop_playback = false` the replayer
@@ -599,7 +616,8 @@ parsing strings.
 | `replay_invalid_field` | Error | `mark_out` / `rename_clip` / `update_clip` `name` > 256 chars or contains control chars; `description` > 4096 chars | Trim to limits |
 | `replay_invalid_range` | Error | `update_clip` whose prospective `out_pts_90khz <= in_pts_90khz` (empty or inverted); `export_recording` (TS or MP4) with both bounds supplied and `to_pts_90khz <= from_pts_90khz`; `export_clip` (TS or MP4) on a clip whose stored `out_pts_90khz <= in_pts_90khz`. `play_clip` with `to_pts_90khz < from_pts_90khz` (or below the clip's `in_pts` when `from` is omitted) is refused too, but its ack carries `replay_clip_not_found` with `replay_invalid_range` as the message; `scrub_playback` takes a single `pts_90khz` and cannot raise it | Pass a forward range |
 | `replay_invalid_tag` | Error | `update_clip` (or any tag-bearing path) with a tag that fails `[A-Z0-9_-]{1,32}`, more than 16 tags per clip | Use the v1 fixed set (`GOAL`/`FOUL`/`OFFSIDE`/`SAVE`/`YELLOW`/`VAR-CHECK`) or shorten / re-case |
-| `replay_segment_missing` | Error (in the error text) | An export (`export_clip` / `export_recording`, TS or MP4) needs a segment `index.bin` names that is not on disk — lost to a crash or a failed close, or pruned by retention; or a `cue_clip` / `play_clip` / `scrub_playback` lands in a lost window with no recorded media after it before the end of the range; or a whole-recording replay or export finds none of the index's segments on disk. Settled, not transient. `dispatch_replay_input_command` re-codes cue / play / scrub errors onto `replay_clip_not_found`, and the export verbs' `error_code` mapping in `src/manager/client.rs` does not name it yet, so an export ack carries `replay_export_failed` with this code at the head of the message | Export each side of the gap separately, or move the clip clear of it; a moment the recorder lost may still be on the relay's origin (the DVR cutter falls back to it by itself) |
+| `replay_segment_missing` | Error (in the error text) | An export (`export_clip` / `export_recording`, TS or MP4) needs a segment `index.bin` names that is not on disk — lost to a crash or a failed close, or pruned by retention; or a `cue_clip` / `play_clip` / `scrub_playback` lands in a lost window with no recorded media after it before the end of the range; or a whole-recording replay or export finds none of the index's segments on disk. Settled, not transient — told from a segment still being recorded, which is `replay_segment_not_ready`. `dispatch_replay_input_command` re-codes cue / play / scrub errors onto `replay_clip_not_found`, and the export verbs' `error_code` mapping in `src/manager/client.rs` does not name it yet, so an export ack carries `replay_export_failed` with this code at the head of the message | Export each side of the gap separately, or move the clip clear of it; a moment the recorder lost may still be on the relay's origin (the DVR cutter falls back to it by itself) |
+| `replay_segment_not_ready` | Error (in the error text) | A cue, play, scrub or export (TS or MP4) reaches a segment `index.bin` already names that the live writer has yet to put in place — the open segment, or one waiting on its closer: a mark-out at "now" exported at once, a range ending in the newest few seconds; or a whole-recording replay or export of a recording whose first segment is still open. Transient. Carried in the error text the same way as `replay_segment_missing` (cue / play / scrub re-coded onto `replay_clip_not_found`, an export ack carrying `replay_export_failed`) | Retry once the segment has closed — within `segment_seconds` plus the closer's lag |
 | `replay_max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without deleting the live edge — operator's cap is smaller than one segment | Raise `max_bytes` to at least `segment_seconds × bitrate × 2` |
 | `replay_metadata_stale` | Warning | `recording.json` write failed after a segment's close; on restart the resume id is bounded by the directory listing and `index.bin` as well, so no id is reused | Investigate the disk (typically ENOSPC on the replay volume) |
 | `replay_recovery_alert` | Warning | Edge restarted after a crash; orphan `.tmp/` segments cleaned, `recording.json` was corrupt, and / or ids were in use past the one `recording.json` had reached | Informational — verify `details.tmp_orphans_removed` and `details.next_segment_id` match expectations |
@@ -1154,7 +1172,9 @@ Any failure from the exact path therefore hands the clip to the segment
 fallback rather than failing the export — the common one being
 `replay_segment_missing`, the exporter's refusal of a range that needs a
 segment no longer on disk (retention pruned it, or a crash or a failed close
-lost it) rather than a clip that plays straight across the hole. The clip then lands on segment boundaries
+lost it) rather than a clip that plays straight across the hole. A window that
+reaches the segment still being recorded is refused `replay_segment_not_ready`
+and falls back too: the cutter does not wait for that segment to close. The clip then lands on segment boundaries
 instead of the frame, which is the documented trade, and the reason is logged.
 It used to be a permanent failure after three attempts, with media sitting on
 the relay that would have served it.

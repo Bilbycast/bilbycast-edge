@@ -634,6 +634,24 @@ fn recordings_in_use() -> &'static DashMap<PathBuf, Arc<Mutex<()>>> {
     IN_USE.get_or_init(DashMap::new)
 }
 
+/// Whether a writer is working in the recording in `dir` now: holding it, or
+/// waiting on the writer before it that is.
+///
+/// What tells a staging file on its way from a crash's leftover — see
+/// [`super::segment_state`]. A writer holds the directory from before its
+/// sweep of `.tmp/` until its closer has renamed its last segment, so while it
+/// does, every staging file there is one of its segments still to come.
+pub(crate) fn is_being_written(dir: &Path) -> bool {
+    recordings_in_use().contains_key(dir)
+}
+
+/// A hold on the recording in `dir` as its writer takes one, for the tests of
+/// what a live writer changes for its readers.
+#[cfg(test)]
+pub(crate) fn hold_as_writer(dir: &Path) -> impl Drop + use<> {
+    RecordingLease::try_take(dir).expect("another writer holds the recording")
+}
+
 /// One writer's hold on its recording directory, from before its
 /// crash-recovery sweep until its closer has finished every segment and the
 /// index is synced: the writer state and the closer each keep a share, so

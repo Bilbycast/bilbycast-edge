@@ -20,7 +20,8 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 use super::clips::ClipStore;
 use super::index::InMemoryIndex;
-use super::{segment_path, segments_on_disk};
+use super::index::IndexEntry;
+use super::{SegmentState, segment_path, segment_state, segments_on_disk};
 
 /// 188 byte MPEG-TS packet — exports stay packet-aligned so any
 /// downstream demuxer can ingest the file without resyncing on the
@@ -196,14 +197,24 @@ fn clamp_chunk(requested: u64) -> u64 {
 /// what the operator scrubbed).
 ///
 /// **A segment `index.bin` names inside the range must be on disk**, or the
-/// export is refused with `replay_segment_missing`. One that is not was lost —
-/// to a crash, or to a close that failed — or retention has removed it, and
-/// the media it held is not in the export whatever happens next. Skipping it,
-/// as this did, produced a file short of what was asked for by however much of
-/// the range that segment covered, with nothing to say so: a clip spanning the
-/// hole played straight across it. The DVR clip cutter, which reads through
-/// here, takes the refusal like any other exact-cut failure and falls back to
-/// whole segments from the origin.
+/// export is refused. One that is not was lost — to a crash, or to a close
+/// that failed — or retention has removed it, and the media it held is not
+/// in the export whatever happens next: `replay_segment_missing`. Skipping
+/// it, as this did, produced a file short of what was asked for by however
+/// much of the range that segment covered, with nothing to say so: a clip
+/// spanning the hole played straight across it. The DVR clip cutter, which
+/// reads through here, takes the refusal like any other exact-cut failure and
+/// falls back to whole segments from the origin.
+///
+/// One the live writer has yet to put in place — open, or waiting on its
+/// closer — is refused too, but as `replay_segment_not_ready`: the same
+/// request succeeds once it closes. A range at the live edge reaches it as a
+/// matter of course, a mark-out at "now" first of all.
+///
+/// The start's own segment is looked at first, whatever the end: from the
+/// open segment or a lost tail, with no `to`, the end is the last segment on
+/// disk, before the start, and the plan came out empty — an export of no
+/// bytes at all, answered as a success.
 ///
 /// A gap no entry names is stepped over, as playback steps over it: a segment
 /// with no random-access point in it whose close failed, or the hole an older
@@ -216,6 +227,10 @@ async fn plan_pts_range(
 ) -> Result<BytePlan> {
     let start = index.find_floor(from_pts_90khz)
         .ok_or_else(|| anyhow!("replay_no_index"))?;
+    let start_len = match stat_segment(dir, start.segment_id).await? {
+        SegmentState::Finished(len) => len,
+        state => return Err(not_exportable(state, start.segment_id, Some(&start))),
+    };
     let (end_segment, end_offset) = match to_pts_90khz {
         Some(to) => {
             let end = index.find_floor(to)
@@ -236,22 +251,14 @@ async fn plan_pts_range(
     let mut total_bytes = 0u64;
     if start.segment_id <= end_segment {
         for id in start.segment_id..=end_segment {
-            let path = segment_path(dir, id);
-            let len = match fs::metadata(&path).await {
-                Ok(m) => m.len(),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    if let Some(named) = index.entries.iter().find(|e| e.segment_id == id) {
-                        bail!(
-                            "replay_segment_missing: segment {id:06}.ts, which index.bin names at \
-                             PTS {}, is not on disk — lost to a crash or a failed close, or removed \
-                             by retention — so the range cannot be exported whole",
-                            named.pts_90khz,
-                        );
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("stat segment {}", path.display()));
+            let len = if id == start.segment_id {
+                start_len
+            } else {
+                let named = index.entries.iter().find(|e| e.segment_id == id);
+                match stat_segment(dir, id).await? {
+                    SegmentState::Finished(len) => len,
+                    SegmentState::Lost if named.is_none() => continue,
+                    state => return Err(not_exportable(state, id, named)),
                 }
             };
             let lo = if id == start.segment_id { (start.byte_offset as u64).min(len) } else { 0 };
@@ -263,6 +270,27 @@ async fn plan_pts_range(
         }
     }
     Ok(BytePlan { spans, total_bytes })
+}
+
+async fn stat_segment(dir: &Path, id: u32) -> Result<SegmentState> {
+    segment_state(dir, id).await
+        .with_context(|| format!("stat segment {}", segment_path(dir, id).display()))
+}
+
+/// The refusal of a range that needs segment `id`, which is not in place —
+/// see [`plan_pts_range`]. `named` is the entry `index.bin` names it by.
+fn not_exportable(state: SegmentState, id: u32, named: Option<&IndexEntry>) -> anyhow::Error {
+    let at = named.map(|e| format!(", which index.bin names at PTS {},", e.pts_90khz)).unwrap_or_default();
+    match state {
+        SegmentState::Pending => anyhow!(
+            "replay_segment_not_ready: segment {id:06}.ts{at} is still being recorded — \
+             the range can be exported once it has closed"
+        ),
+        _ => anyhow!(
+            "replay_segment_missing: segment {id:06}.ts{at} is not on disk — lost to a crash \
+             or a failed close, or removed by retention — so the range cannot be exported whole"
+        ),
+    }
 }
 
 async fn read_chunk(
@@ -458,6 +486,46 @@ mod tests {
         let (data, total) = pull_all(dir, Some(270_000), None).await.unwrap();
         assert_eq!(data.len() as u64, total);
         assert_eq!(total, 4 * 188);
+    }
+
+    /// A segment the live writer has yet to put in place — the open one, or
+    /// one waiting on its closer — is not lost: the export is refused as not
+    /// ready, and goes through once it has closed. With no writer at work the
+    /// same staging file is a crash's leftover, and the segment is lost.
+    #[tokio::test]
+    async fn a_segment_still_being_recorded_is_not_ready_rather_than_missing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let segments = five_segments(dir).await;
+        fs::create_dir(dir.join(".tmp")).await.unwrap();
+        fs::rename(dir.join("000004.ts"), dir.join(".tmp/000004.ts")).await.unwrap();
+        let writer = crate::replay::writer::hold_as_writer(dir);
+        for (from, to) in [(Some(0), Some(360_000)), (Some(360_000), None)] {
+            let err = pull_all(dir, from, to).await.expect_err("refused");
+            assert!(err.to_string().starts_with("replay_segment_not_ready"), "{from:?}..{to:?}: {err}");
+        }
+        // Closed: the same range exports.
+        fs::rename(dir.join(".tmp/000004.ts"), dir.join("000004.ts")).await.unwrap();
+        let (data, _) = pull_all(dir, Some(0), Some(360_000)).await.unwrap();
+        assert_eq!(data, segments[..4].concat());
+        // Nobody writing: a staging file is what a crash left.
+        fs::rename(dir.join("000004.ts"), dir.join(".tmp/000004.ts")).await.unwrap();
+        drop(writer);
+        let err = pull_all(dir, Some(0), Some(360_000)).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+    }
+
+    /// An export from a lost tail, with no end given, is refused: the end is
+    /// the last segment on disk, before the start, and the plan came out empty
+    /// — no bytes, answered as a success.
+    #[tokio::test]
+    async fn an_export_from_a_lost_tail_is_refused_rather_than_empty() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        five_segments(dir).await;
+        fs::remove_file(dir.join("000004.ts")).await.unwrap();
+        let err = pull_all(dir, Some(360_000), None).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
     }
 
     /// A gap no entry names is stepped over, and the total is what the
