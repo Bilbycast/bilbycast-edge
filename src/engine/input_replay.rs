@@ -241,11 +241,21 @@ async fn handle_command(
                     }
                 }
             }
+            // Landing before the end of the range being asked for, not the
+            // end of the one played before it: the scrub runs before that end
+            // is applied, and bounded by the old one, a Play past an earlier
+            // range's end into a lost window was refused though its own range
+            // had media, and one landing past its own end was refused as
+            // `replay_invalid_range` below after the scrub had already moved
+            // the reader.
             if let Some(from) = from_pts_90khz
-                && let Err(e) = reader.scrub_to(from).await {
-                    let _ = reply.send(Err(e));
-                    return;
-                }
+                && let Err(e) = reader
+                    .scrub_within(from, to_pts_90khz.unwrap_or(reader.range.to_pts_90khz))
+                    .await
+            {
+                let _ = reply.send(Err(e));
+                return;
+            }
             if let Some(to) = to_pts_90khz {
                 if to < reader.range.from_pts_90khz {
                     let _ = reply.send(Err(anyhow!("replay_invalid_range")));
@@ -854,6 +864,79 @@ fn now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::index::{IndexEntry, IndexWriter, flag};
+
+    /// A recording in `parent/rec` of one-packet segments `0..count`, each a
+    /// second long and indexed at its start, with the segments `gone`
+    /// removed — what retention or a crash leaves.
+    async fn recording(parent: &std::path::Path, count: u32, gone: &[u32]) -> std::path::PathBuf {
+        let dir = parent.join("rec");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut index = IndexWriter::open(&dir.join("index.bin")).await.unwrap();
+        for id in 0..count {
+            tokio::fs::write(dir.join(format!("{id:06}.ts")), [0x47u8; TS_PACKET]).await.unwrap();
+            index
+                .append(IndexEntry {
+                    pts_90khz: id as u64 * 90_000,
+                    smpte_tc: 0,
+                    segment_id: id,
+                    byte_offset: 0,
+                    flags: flag::IS_IDR,
+                })
+                .await
+                .unwrap();
+        }
+        index.flush_and_sync().await.unwrap();
+        for id in gone {
+            tokio::fs::remove_file(dir.join(format!("{id:06}.ts"))).await.unwrap();
+        }
+        dir
+    }
+
+    fn replay_config() -> ReplayInputConfig {
+        serde_json::from_value(serde_json::json!({ "recording_id": "rec" })).unwrap()
+    }
+
+    /// Send a Play of `from..to` through the input's command handling.
+    async fn play(reader: &mut Reader, events: &EventSender, from: u64, to: u64) -> Result<()> {
+        let (reply, ack) = tokio::sync::oneshot::channel();
+        let cmd = ReplayCommand::Play {
+            clip_id: None,
+            from_pts_90khz: Some(from),
+            to_pts_90khz: Some(to),
+            speed: None,
+            start_at_unix_ms: None,
+            reply,
+        };
+        let (mut playing, mut pacing) = (false, PacingState::new());
+        handle_command(cmd, reader, &replay_config(), &mut playing, &mut pacing, events, "f", "i").await;
+        ack.await.unwrap()
+    }
+
+    /// A Play into a lost window lands by the range it asks for. It was
+    /// bounded by the range played before it: a Play past an earlier range's
+    /// end was refused though its own range had media after the hole, and
+    /// one whose landing fell past its own end was refused as an inverted
+    /// range, after the scrub had moved the reader.
+    #[tokio::test]
+    async fn a_play_into_a_lost_window_lands_by_the_range_it_asks_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Segment 9 lost: media resumes at 10 s.
+        let dir = recording(tmp.path(), 13, &[9]).await;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let mut reader = Reader::open_recording_at("rec", dir.clone()).await.unwrap();
+        play(&mut reader, &events, 90_000, 180_000).await.unwrap();
+        play(&mut reader, &events, 828_000, 1_080_000).await.expect("its range has media after the hole");
+        assert_eq!(reader.range.from_pts_90khz, 900_000);
+        assert_eq!(reader.range.to_pts_90khz, 1_080_000);
+
+        // A fresh reader plays to the end; a Play whose landing falls at or
+        // past its own end has nothing of its range left.
+        let mut reader = Reader::open_recording_at("rec", dir).await.unwrap();
+        let err = play(&mut reader, &events, 828_000, 864_000).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+        assert_eq!(reader.range.from_pts_90khz, 0, "a refused Play moved the reader");
+    }
 
     /// VH1.ts: the PMT sits behind a 0xC0 section; replay pacing used to
     /// find no video PID on such a recording.

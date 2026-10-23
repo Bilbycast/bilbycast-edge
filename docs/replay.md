@@ -505,7 +505,14 @@ same rules) keeps it so:
     before the hole arrives anyway, by stepping over it; the last point
     before the hole could be minutes of media nobody asked for. A clip, or a
     played range, with nothing left before its end is refused with
-    `replay_segment_missing`, and so is a lost tail with nothing after it;
+    `replay_segment_missing`, and so is a lost tail with nothing after it.
+    A `play_clip` with a `from_pts_90khz` lands within the range it asks
+    for — bounded by its own `to_pts_90khz`, or by the range already in
+    play when it names none — and is refused before the reader moves: it
+    was bounded by the range played before it, so a Play past an earlier
+    range's end was refused though its own range had media after the hole,
+    and one landing past its own end came back `replay_invalid_range` with
+    the reader already moved;
   - an export (TS or MP4, clip or range, and the DVR clip cutter's exact
     cut) that needs a segment `index.bin` names but the disk lacks is
     refused with `replay_segment_missing`. It skipped the segment and

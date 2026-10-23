@@ -106,7 +106,13 @@ impl Reader {
     /// [`Self::playable_from`]). Closes the current segment file (if open) —
     /// the next `read_bundle` call will reopen at the computed offset.
     pub async fn scrub_to(&mut self, target_pts: u64) -> Result<IndexEntry> {
-        let entry = self.playable_from(target_pts, self.range.to_pts_90khz).await?;
+        self.scrub_within(target_pts, self.range.to_pts_90khz).await
+    }
+
+    /// [`Self::scrub_to`], landing before `before` rather than the end of the
+    /// range being played — for a Play that brings a range of its own.
+    pub async fn scrub_within(&mut self, target_pts: u64, before: u64) -> Result<IndexEntry> {
+        let entry = self.playable_from(target_pts, before).await?;
         self.range.start_entry = entry;
         self.range.from_pts_90khz = entry.pts_90khz;
         self.current_segment = None;
