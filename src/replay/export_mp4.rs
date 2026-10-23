@@ -275,7 +275,7 @@ fn slice_export_chunk(bytes: &[u8], byte_offset: u64, max_bytes: u64) -> ExportC
             total_bytes: total,
             byte_offset,
             eof: true,
-            plan_start: None,
+            resume: None,
         };
     }
     let want = if max_bytes == 0 {
@@ -291,7 +291,7 @@ fn slice_export_chunk(bytes: &[u8], byte_offset: u64, max_bytes: u64) -> ExportC
         total_bytes: total,
         byte_offset,
         eof: byte_offset + take as u64 >= total,
-        plan_start: None,
+        resume: None,
     }
 }
 

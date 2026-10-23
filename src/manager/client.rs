@@ -5951,10 +5951,6 @@ async fn execute_command(
             let byte_offset = action["byte_offset"].as_u64().unwrap_or(0);
             let max_bytes = action["chunk_bytes"].as_u64()
                 .unwrap_or(crate::replay::export::DEFAULT_CHUNK_BYTES);
-            // The segment the download's first chunk was planned from, sent
-            // back on every later chunk by a manager that pins it — see
-            // `replay::export`.
-            let expect_plan_start = action["expect_plan_start_segment_id"].as_u64();
             // Locate the recording that owns the clip — same walk as
             // the get_clip / rename_clip / delete_clip arms.
             let root = crate::replay::replay_root();
@@ -5987,12 +5983,18 @@ async fn execute_command(
                     &recording_id, &clip_id, byte_offset, max_bytes,
                 ).await
             } else {
-                crate::replay::export::export_clip_chunk(
-                    &recording_id, &clip_id, byte_offset, max_bytes, expect_plan_start,
-                ).await
+                // Where the previous chunk said this one starts, for a
+                // manager that follows it — see `replay::export`.
+                async {
+                    let cursor = crate::replay::export::ChunkCursor::from_request(&action)?;
+                    crate::replay::export::export_clip_chunk(
+                        &recording_id, &clip_id, byte_offset, max_bytes, cursor,
+                    ).await
+                }.await
             }.map_err(|e| {
                 let code = match e.to_string().as_str() {
                     s if s.contains("replay_invalid_range") => "replay_invalid_range",
+                    s if s.contains("replay_invalid_field") => "replay_invalid_field",
                     s if s.contains("replay_clip_not_found") => "replay_clip_not_found",
                     s if s.contains("replay_no_index") => "replay_no_index",
                     s if s.contains("replay_export_format_unsupported") => "replay_export_format_unsupported",
@@ -6018,7 +6020,7 @@ async fn execute_command(
                 "data": b64,
                 "eof": chunk.eof,
             });
-            chunk.ack_plan_start(&mut ack);
+            chunk.ack_resume(&mut ack);
             Ok(Some(ack))
         }
         #[cfg(feature = "replay")]
@@ -6043,18 +6045,21 @@ async fn execute_command(
             let byte_offset = action["byte_offset"].as_u64().unwrap_or(0);
             let max_bytes = action["chunk_bytes"].as_u64()
                 .unwrap_or(crate::replay::export::DEFAULT_CHUNK_BYTES);
-            let expect_plan_start = action["expect_plan_start_segment_id"].as_u64();
             let chunk = if format == "mp4" {
                 crate::replay::export_mp4::export_recording_mp4_chunk(
                     &recording_id, from_pts, to_pts, byte_offset, max_bytes,
                 ).await
             } else {
-                crate::replay::export::export_recording_chunk(
-                    &recording_id, from_pts, to_pts, byte_offset, max_bytes, expect_plan_start,
-                ).await
+                async {
+                    let cursor = crate::replay::export::ChunkCursor::from_request(&action)?;
+                    crate::replay::export::export_recording_chunk(
+                        &recording_id, from_pts, to_pts, byte_offset, max_bytes, cursor,
+                    ).await
+                }.await
             }.map_err(|e| {
                 let code = match e.to_string().as_str() {
                     s if s.contains("replay_invalid_range") => "replay_invalid_range",
+                    s if s.contains("replay_invalid_field") => "replay_invalid_field",
                     s if s.contains("replay_clip_not_found") => "replay_clip_not_found",
                     s if s.contains("replay_no_index") => "replay_no_index",
                     s if s.contains("replay_no_segments") => "replay_no_segments",
@@ -6082,7 +6087,7 @@ async fn execute_command(
                 "from_pts_90khz": from_pts,
                 "to_pts_90khz": to_pts,
             });
-            chunk.ack_plan_start(&mut ack);
+            chunk.ack_resume(&mut ack);
             Ok(Some(ack))
         }
         #[cfg(feature = "replay")]
