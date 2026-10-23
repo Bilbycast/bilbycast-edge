@@ -3762,7 +3762,7 @@ bilbycast-edge automatically persists configuration changes to disk when inputs,
 
 ### Atomic writes
 
-All config saves use an atomic write strategy: both `config.json` and `secrets.json` are written to temporary files (`.json.tmp`), then atomically renamed to the target paths. This prevents corruption if the process is interrupted during a write. `secrets.json` is written with `0600` permissions (owner-only) on Unix.
+All config saves use an atomic write strategy: both `config.json` and `secrets.json` are written to temporary files (`.json.tmp`), then atomically renamed to the target paths. This prevents corruption if the process is interrupted during a write. A save that fails — a full disk part way through the write, or a rename that is refused — removes its temporary file rather than leaving it beside the file it never replaced. `secrets.json` is written with `0600` permissions (owner-only) on Unix.
 
 ### Default config
 

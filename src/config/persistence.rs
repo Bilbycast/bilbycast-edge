@@ -42,16 +42,36 @@ pub fn save_config(path: &Path, config: &AppConfig) -> Result<()> {
     let contents = serde_json::to_string_pretty(config)
         .context("Failed to serialize config")?;
 
-    // Write to a temp file first, then rename for atomicity
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &contents)
-        .with_context(|| format!("Failed to write temp config file: {}", tmp_path.display()))?;
-
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("Failed to rename temp config to: {}", path.display()))?;
+    replace_file(path, contents.as_bytes(), "config")?;
 
     tracing::debug!("Config saved to {}", path.display());
     Ok(())
+}
+
+/// Replace the file at `path` with `contents`: written to its `.json.tmp`
+/// sibling first, then renamed into place, so a reader only ever sees the
+/// whole old file or the whole new one. `what` names the file in errors.
+///
+/// A save that fails removes its temporary file. A write that fails part way
+/// — a full disk is the usual cause — used to leave it half written, and a
+/// failed rename left it whole, beside the file it never replaced. Nothing
+/// reads either, and for `secrets.json` it is a copy of the node's credentials
+/// outside the file the save restricts to its owner.
+fn replace_file(path: &Path, contents: &[u8], what: &str) -> Result<()> {
+    let tmp_path = path.with_extension("json.tmp");
+    let replaced = std::fs::write(&tmp_path, contents)
+        .with_context(|| format!("Failed to write temp {what} file: {}", tmp_path.display()))
+        .and_then(|()| {
+            std::fs::rename(&tmp_path, path)
+                .with_context(|| format!("Failed to rename temp {what} to: {}", path.display()))
+        });
+    if replaced.is_err() {
+        // Best effort: a write refused before it created the file (no such
+        // directory, or something else already at that path) leaves nothing
+        // of ours to remove.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    replaced
 }
 
 /// Load configuration from split files (`config.json` + `secrets.json`).
@@ -285,12 +305,7 @@ pub fn save_secrets(path: &Path, secrets: &SecretsConfig, machine_seed: &str) ->
     let encrypted =
         crypto::encrypt_secrets(&json, machine_seed).context("Failed to encrypt secrets")?;
 
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, &encrypted)
-        .with_context(|| format!("Failed to write temp secrets file: {}", tmp_path.display()))?;
-
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("Failed to rename temp secrets to: {}", path.display()))?;
+    replace_file(path, encrypted.as_bytes(), "secrets")?;
 
     // Set restrictive file permissions on Unix (owner read/write only)
     #[cfg(unix)]
@@ -397,6 +412,46 @@ mod tests {
             Some("rotated-secret"),
             "the rotated node_secret must be the one that survived the cut"
         );
+    }
+
+    /// A save that fails takes its temporary file with it, from both files'
+    /// saves and from either step. Each temporary path is a link to
+    /// `/dev/full`, which takes the open and refuses the bytes with ENOSPC, as
+    /// a full disk does part way through a write; the link left behind is what
+    /// a half-written file used to be. A directory where the file goes fails
+    /// the rename after a whole write instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_save_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let secrets_path = dir.path().join("secrets.json");
+        let secrets = SecretsConfig {
+            manager_node_secret: Some("node-secret".into()),
+            ..Default::default()
+        };
+        let leftover = |path: &Path| std::fs::symlink_metadata(path.with_extension("json.tmp")).is_ok();
+
+        for path in [&config_path, &secrets_path] {
+            std::os::unix::fs::symlink("/dev/full", path.with_extension("json.tmp")).unwrap();
+        }
+        let err = save_config(&config_path, &AppConfig::default()).expect_err("a full disk fails the save");
+        assert!(format!("{err:#}").contains("Failed to write temp config"), "{err:#}");
+        let err = save_secrets(&secrets_path, &secrets, "test-seed").expect_err("a full disk fails the save");
+        assert!(format!("{err:#}").contains("Failed to write temp secrets"), "{err:#}");
+        assert!(!leftover(&config_path), "a failed config.json write left its temporary file");
+        assert!(!leftover(&secrets_path), "a failed secrets.json write left its temporary file");
+
+        for path in [&config_path, &secrets_path] {
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("occupied"), b"").unwrap();
+        }
+        let err = save_config(&config_path, &AppConfig::default()).expect_err("the rename must fail");
+        assert!(format!("{err:#}").contains("Failed to rename temp config"), "{err:#}");
+        let err = save_secrets(&secrets_path, &secrets, "test-seed").expect_err("the rename must fail");
+        assert!(format!("{err:#}").contains("Failed to rename temp secrets"), "{err:#}");
+        assert!(!leftover(&config_path), "a failed config.json rename left its temporary file");
+        assert!(!leftover(&secrets_path), "a failed secrets.json rename left its temporary file");
     }
 
     #[test]

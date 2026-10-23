@@ -30,7 +30,7 @@ Both `config.json` and `secrets.json` are written to disk immediately after any 
 
 ### Atomic writes
 
-Config saves use an atomic two-phase write: the JSON is first written to a temporary file (`.json.tmp`), then renamed to the actual config path. This prevents partial or corrupted config files if the node crashes or loses power mid-write. Both `config.json` and `secrets.json` use this approach.
+Config saves use an atomic two-phase write: the JSON is first written to a temporary file (`.json.tmp`), then renamed to the actual config path. This prevents partial or corrupted config files if the node crashes or loses power mid-write. Both `config.json` and `secrets.json` use this approach. A save that fails — a full disk part way through the write, or a rename that is refused — removes its temporary file rather than leaving it beside the file it never replaced.
 
 ### Manager config update behavior
 
