@@ -1833,9 +1833,9 @@ async fn persist_credentials(
 /// node ID, which a rotation does not change, and none of the secrets.
 /// The registration token goes: a node presenting a secret has spent it.
 ///
-/// Only ever writes a secret, never clears one: a `PUT /api/v1/config` of the
-/// masked `GET` body leaves the running config's `node_secret` empty, and
-/// this puts it back.
+/// Only ever writes a secret, never clears one, so it also puts back a
+/// `node_secret` the running config has lost — as a `PUT /api/v1/config` of
+/// the masked `GET` body used to lose it.
 async fn save_node_secret(
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &Path,
@@ -10596,10 +10596,11 @@ mod manager_link_tests {
         assert_eq!(edge.secret_on_disk().as_deref(), Some("issued-secret"));
     }
 
-    /// A `PUT /api/v1/config` of the masked `GET` body leaves the running
-    /// config without a secret. What the edge presents does not come from
-    /// there, so the next reconnect is unaffected — read back from the
-    /// running config, it would have presented no secret at all.
+    /// A running config without a secret — what a `PUT /api/v1/config` of
+    /// the masked `GET` body used to leave — does not change what the edge
+    /// presents, which does not come from there: the next reconnect is
+    /// unaffected. Read back from the running config, it would have presented
+    /// no secret at all.
     #[tokio::test]
     async fn a_masked_config_does_not_change_what_the_edge_presents() {
         let mut edge = Edge::new(manager_config(Some(OLD), None));

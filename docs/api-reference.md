@@ -1222,6 +1222,8 @@ Replace the entire application configuration atomically. Stops all running flows
 
 A complete `AppConfig` JSON object (see [Configuration Guide](configuration-guide.md)). Flow parameters (SRT passphrases, RTSP credentials, RTMP keys, etc.) are stored in `config.json`. Infrastructure secrets (auth config, TLS) are stored in `secrets.json`.
 
+**Infrastructure secrets the body leaves out are kept.** An absent or `null` `manager.node_secret` / `registration_token`, `server.tls`, `server.auth`, `nmos_registration.bearer_token`, tunnel key or cellular-uplink password keeps the node's current value — which is what makes the body `GET /api/v1/config` returns, with every one of them left out, safe to edit and put back. (It used to replace them with nothing: the node kept running, but the next save with any secret in it wrote `secrets.json` without the node secret, and after a restart the node could not authenticate to its manager.) A secret the body names is set, validated like any field — `server.auth` and `server.tls` included, which a manager `update_config` push can never set; they take effect at the next restart. To switch API auth off, name it: `"auth": {"enabled": false, "jwt_secret": "", "clients": []}`. A body that names `setup_token` is refused: the node mints that token itself (set `setup_enabled: true` to re-open the setup wizard).
+
 **Response (200):**
 
 Returns the new configuration with infrastructure secrets stripped (flow parameters preserved).
@@ -1232,7 +1234,7 @@ A Hitless slot that validation refuses but an earlier release accepted is repair
 
 | Status | Condition |
 |--------|-----------|
-| 400 | Config validation failure (duplicate flow IDs, invalid addresses, etc.) |
+| 400 | Config validation failure (duplicate flow IDs, invalid addresses, etc.), or the body names `setup_token` |
 | 500 | Failed to persist config or individual flows failed to start |
 
 **curl example:**
