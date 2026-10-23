@@ -91,9 +91,14 @@ section.)
   the CMAF intakes' node budget (`docs/cmaf.md`): a disk and an origin fail
   independently, and one stall filling a shared budget would make the other
   consumers drop on a stall they would have ridden out. What a stopped
-  recorder still had queued goes back to the node as it goes. Beyond each
-  flow's broadcast ring, the node's queues together hold at most 512 MiB —
-  see the worst case in `docs/cmaf.md`.
+  recorder still had queued goes back to the node as it goes. The first
+  4 MiB of each recorder's queue (`WRITER_QUEUE_FLOOR_BYTES`, an eighth of
+  it) are its own and charge the node nothing, so a recorder that keeps up
+  never drops for what the others hold: on the one disk they usually share
+  that costs nothing, but a recording directory can sit on a volume of its
+  own, and a writer can fall behind for reasons of its own. Beyond each
+  flow's broadcast ring, the node's queues together hold at most 512 MiB
+  plus those floors — see the worst case in `docs/cmaf.md`.
 - **The writer task** does in-memory bookkeeping and buffered writes only:
   it parses the TS, tracks PCR and SMPTE timecode, appends index entries,
   and writes each segment through a 256 KiB userspace buffer (unbuffered, an
@@ -585,7 +590,7 @@ parsing strings.
 | `replay_recording_not_active` | Error | `start_recording` / `stop_recording` / `mark_in` / `mark_out` on a flow whose `recording` block is absent or has `enabled: false` (no writer is spawned at flow start — `engine/flow.rs` filters on `enabled`); `start_recording` on an unknown `flow_id` (the other three return a bare error with no code for that); `mark_in` without an explicit `pts_90khz` on a fresh recording before the writer has seen its first PCR (the counter is still 0), or `mark_out` with no pending `mark_in` (or with `pts_90khz` at or before the pending in-point — the arm lifts every writer-side error under this code) | Add a `RecordingConfig` with `enabled: true` via `configure_recording` (the edge reports `restart_required`; the recorder binds at the next flow start) or `update_flow` (`recording` is a restart-triggering field). For the mark cases, wait for the source to deliver, or send `mark_in` first |
 | `replay_no_playback_input` | Error | `play_clip`/`scrub_playback` on a flow with no `replay` input | Add a `replay` input to the flow |
 | `replay_clip_not_found` | Error | `play_clip`/`delete_clip` with an unknown `clip_id` | Refresh the clip list (it may have been pruned by retention) |
-| `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget, or the node's recorders are past the 256 MiB they share — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
+| `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget, or past its own first 4 MiB with the node's recorders past the 256 MiB they share — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
 | `replay_disk_pressure` | Warning | Recording usage ≥ 80 % of `max_bytes` (or of replay-root filesystem when `max_bytes = 0`); sticky until back below 70 % | Free disk before ENOSPC; raise `max_bytes` if appropriate; reduce retention |
 | `replay_disk_full` | Critical | A segment write hit a disk error (typically ENOSPC), or a finished segment's close (flush, fsync, rename) failed on the disk itself — ENOSPC, EDQUOT, EIO or EROFS; the latter carries `details.segment_id`, and that segment is lost | Free disk, then `stop_recording` + `start_recording` to re-arm |
 | `replay_segment_close_failed` | Critical | A finished segment's close failed for a reason other than the disk — its staging file removed from under the writer, a rename refused (permissions, something else at the final path). The staging file is unlinked and the segment lost; `details.segment_id`. Recording carries on with the next segment | Check the recording directory's ownership and permissions, and that nothing else writes into it |
@@ -639,7 +644,7 @@ render a coloured disk meter as soon as the recorder is armed.
 | `segments_written` | Segments closed successfully — fsynced and renamed into place. A segment whose close failed is not counted (see `replay_disk_full` / `replay_segment_close_failed`), and one still waiting for the closer is not counted yet |
 | `bytes_written` | Total bytes appended (across all segments, including pruned) |
 | `segments_pruned` | Segments evicted by retention (mtime / size) |
-| `packets_dropped` | Packets dropped at the broadcast subscriber — the broadcast lagged it, or the writer's queue was past its 32 MiB budget (or the node's recorders past their shared 256 MiB) |
+| `packets_dropped` | Packets dropped at the broadcast subscriber — the broadcast lagged it, or the writer's queue was past its 32 MiB budget (or past its own first 4 MiB with the node's recorders past their shared 256 MiB) |
 | `index_entries` | Entries in `index.bin` (one per IDR) |
 | `current_pts_90khz` | Most recent PCR-derived PTS; `0` until the first PCR is seen |
 

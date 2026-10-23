@@ -85,17 +85,28 @@ project-wide "never block the data path" invariant.
     charge is a bound, not what is resident: a flow's renditions queue clones
     of one payload, which is held once. Not shared with the recorders' node
     budget (see `docs/replay.md`): a disk and an origin fail independently.
+  - **Except each intake's first 4 MiB, which are its own**
+    (`INTAKE_FLOOR_BYTES`, an eighth of its budget — a second or two of a
+    10 Mbit/s feed) and charge the node nothing. The outputs on one node can
+    push to different origins, and while every byte went through the node's
+    budget, eight outputs stalled on one origin held all of it and a ninth,
+    pushing to a healthy origin, dropped every packet it was handed until
+    they recovered. An output that keeps up holds less than its floor, so it
+    never asks the node for anything; only what an intake holds past its
+    floor competes for the 256 MiB. Each packet carries the node share it
+    was charged and gives back exactly that as it leaves.
   - **Past either budget it drops**, and reports the loss in order as the
     broadcast would (`Lagged(n)`), so the `packets_dropped` stat and the
     `broadcast lag` warning cover all three. An output stopped with a
     backlog gives its charge back to the node as it goes.
   - **The real worst case**, for the queues that let a consumer fall behind:
-    `min(32 MiB × CMAF outputs, 256 MiB)` in intakes plus
-    `min(32 MiB × recording flows, 256 MiB)` in recorder queues — 512 MiB at
-    most beyond each flow's own broadcast ring, reached only when an origin
-    stall and a disk stall each fill eight queues' worth at once, and freed
-    as the consumers catch up. A queued message still in its flow's ring is
-    not held twice.
+    `min(32 MiB × CMAF outputs, 256 MiB + 4 MiB × CMAF outputs)` in intakes
+    plus `min(32 MiB × recording flows, 256 MiB + 4 MiB × recording flows)`
+    in recorder queues — 512 MiB plus 4 MiB per CMAF output and per
+    recording flow, beyond each flow's own broadcast ring, reached only when
+    an origin stall and a disk stall each fill eight queues' worth at once,
+    and freed as the consumers catch up. A queued message still in its
+    flow's ring is not held twice.
   - **A backlog never reaches the published dates.** The intake records when
     it took each packet off the broadcast, and a segment is dated as of the
     arrival of the packet that closed it — see [The close-time sample is

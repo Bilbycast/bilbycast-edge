@@ -21,6 +21,16 @@
 //! one would make every CMAF output drop on an origin hiccup it would
 //! otherwise have ridden out.
 //!
+//! The first bytes of every queue are its own, though — its floor, charged to
+//! it and not to the node. Stalls are correlated, not universal: the outputs
+//! on one node can push to different origins, and a node budget that every
+//! byte had to pass through let eight outputs stalled on one origin starve a
+//! ninth pushing to a healthy one, which then dropped every packet it was
+//! handed for as long as the others stayed stuck. A queue that keeps up holds
+//! less than its floor, so it never asks the node for anything, and only what
+//! a queue holds past its floor competes for the node's budget. The node's
+//! queues can therefore hold the node budget plus one floor each.
+//!
 //! What is charged is a bound, not what is resident: two outputs of one flow
 //! queue clones of the same payload, which is held once.
 
@@ -67,8 +77,8 @@ impl NodeBudget {
     }
 }
 
-/// One queue's account: its own limit, and its share of its kind's
-/// [`NodeBudget`].
+/// One queue's account: its own limit, the floor of it that is its alone,
+/// and its share of its kind's [`NodeBudget`] past that.
 ///
 /// The queue's producer charges each item as it queues it, and its consumer
 /// releases it as it takes it off. Whatever is still charged when the last of
@@ -78,42 +88,63 @@ impl NodeBudget {
 #[derive(Debug)]
 pub struct QueueBudget {
     queued: AtomicUsize,
+    /// The part of `queued` charged to the node as well.
+    on_node: AtomicUsize,
     limit: usize,
+    floor: usize,
     node: &'static NodeBudget,
 }
 
+/// What one item was charged, handed back to [`QueueBudget::release`] as it
+/// leaves the queue.
+///
+/// It carries its node share with it rather than having the release work the
+/// share out again, because the producer and the consumer move the queue's
+/// count at once, and a share each worked out from its own view of it would
+/// drift: the node budget leaks, or is given back twice.
+#[derive(Debug, Clone, Copy)]
+pub struct Charge {
+    cost: usize,
+    on_node: usize,
+}
+
 impl QueueBudget {
-    pub fn new(limit: usize, node: &'static NodeBudget) -> Self {
-        Self { queued: AtomicUsize::new(0), limit, node }
+    pub fn new(limit: usize, floor: usize, node: &'static NodeBudget) -> Self {
+        Self { queued: AtomicUsize::new(0), on_node: AtomicUsize::new(0), limit, floor, node }
     }
 
-    /// Charge an item of `cost` bytes against this queue's limit and the
-    /// node's, or refuse it, charging neither.
+    /// Charge an item of `cost` bytes against this queue's limit and — for
+    /// what of it lands past the queue's floor — the node's, or refuse it,
+    /// charging neither.
     ///
     /// The queue's own limit needs no compare-and-swap: only its producer
     /// charges it, so the check and the charge cannot be raced past it — the
-    /// consumer only ever brings the count down.
-    pub fn try_charge(&self, cost: usize) -> bool {
-        if self.queued.load(Ordering::Relaxed) + cost > self.limit {
-            return false;
-        }
-        if !self.node.try_charge(cost) {
-            return false;
+    /// consumer only ever brings the count down. A count the consumer brings
+    /// down meanwhile makes this charge the node for more than it had to,
+    /// never less.
+    pub fn try_charge(&self, cost: usize) -> Option<Charge> {
+        let queued = self.queued.load(Ordering::Relaxed);
+        let total = queued.checked_add(cost).filter(|&total| total <= self.limit)?;
+        let on_node = total.saturating_sub(self.floor).min(cost);
+        if on_node > 0 && !self.node.try_charge(on_node) {
+            return None;
         }
         self.queued.fetch_add(cost, Ordering::Relaxed);
-        true
+        self.on_node.fetch_add(on_node, Ordering::Relaxed);
+        Some(Charge { cost, on_node })
     }
 
-    /// Give back an item of `cost` bytes as it leaves the queue.
-    pub fn release(&self, cost: usize) {
-        self.queued.fetch_sub(cost, Ordering::Relaxed);
-        self.node.release(cost);
+    /// Give back an item as it leaves the queue.
+    pub fn release(&self, charge: Charge) {
+        self.queued.fetch_sub(charge.cost, Ordering::Relaxed);
+        self.on_node.fetch_sub(charge.on_node, Ordering::Relaxed);
+        self.node.release(charge.on_node);
     }
 }
 
 impl Drop for QueueBudget {
     fn drop(&mut self) {
-        self.node.release(*self.queued.get_mut());
+        self.node.release(*self.on_node.get_mut());
     }
 }
 
@@ -122,31 +153,77 @@ mod tests {
     use super::*;
 
     /// Queues of one kind cannot hold more between them than the node's
-    /// budget, whatever each may hold on its own, and the room one gives back
-    /// is the others' to take.
+    /// budget past their floors, whatever each may hold on its own, and the
+    /// room one gives back is the others' to take.
     #[test]
     fn queues_share_the_node_budget() {
         static NODE: NodeBudget = NodeBudget::new(150);
-        let a = QueueBudget::new(100, &NODE);
-        let b = QueueBudget::new(100, &NODE);
-        assert!((0..10).all(|_| a.try_charge(10)));
-        assert!(!a.try_charge(10), "past its own limit");
-        assert!((0..5).all(|_| b.try_charge(10)));
-        assert!(!b.try_charge(10), "past the node's, inside its own");
-        a.release(10);
-        assert!(b.try_charge(10), "the room a gave back was not b's to take");
+        let a = QueueBudget::new(100, 0, &NODE);
+        let b = QueueBudget::new(100, 0, &NODE);
+        let taken: Vec<_> = (0..10).map_while(|_| a.try_charge(10)).collect();
+        assert_eq!(taken.len(), 10);
+        assert!(a.try_charge(10).is_none(), "past its own limit");
+        assert!((0..5).all(|_| b.try_charge(10).is_some()));
+        assert!(b.try_charge(10).is_none(), "past the node's, inside its own");
+        a.release(taken[0]);
+        assert!(b.try_charge(10).is_some(), "the room a gave back was not b's to take");
         assert_eq!(NODE.queued(), 150);
     }
 
+    /// A queue that keeps up never needs the node: with every byte of the
+    /// node's budget held by queues that have stalled, one holding less than
+    /// its floor still takes everything it is handed. Past its floor it
+    /// competes for the node like any other. Without the floor, eight CMAF
+    /// outputs stalled on one origin made a ninth, pushing to a healthy one,
+    /// drop every packet.
+    #[test]
+    fn a_queue_within_its_floor_needs_nothing_from_the_node() {
+        static NODE: NodeBudget = NodeBudget::new(100);
+        let stalled = QueueBudget::new(1_000, 0, &NODE);
+        while stalled.try_charge(10).is_some() {}
+        assert_eq!(NODE.queued(), 100);
+
+        let healthy = QueueBudget::new(1_000, 50, &NODE);
+        for _ in 0..1_000 {
+            let charge = healthy.try_charge(10).expect("a queue that keeps up dropped");
+            healthy.release(charge);
+        }
+        let held: Vec<_> = (0..5).map_while(|_| healthy.try_charge(10)).collect();
+        assert_eq!(held.len(), 5, "the floor was not the queue's own");
+        assert!(healthy.try_charge(10).is_none(), "past its floor it took what the node did not have");
+        assert_eq!(NODE.queued(), 100, "a charge inside the floor reached the node");
+    }
+
+    /// An item charged partly past the floor gives back exactly the node
+    /// share it took, whatever the queue holds when it leaves — so a queue
+    /// that drains in order, its early items inside the floor and its later
+    /// ones past it, leaves the node as it found it.
+    #[test]
+    fn each_item_gives_back_the_node_share_it_took() {
+        static NODE: NodeBudget = NodeBudget::new(1_000);
+        let q = QueueBudget::new(1_000, 25, &NODE);
+        let first = q.try_charge(20).unwrap();
+        let second = q.try_charge(20).unwrap();
+        assert_eq!(NODE.queued(), 15, "only what lands past the floor is the node's");
+        q.release(first);
+        // Back inside the floor, with the second still charged to the node.
+        let third = q.try_charge(5).unwrap();
+        assert_eq!(NODE.queued(), 15);
+        q.release(second);
+        q.release(third);
+        assert_eq!(NODE.queued(), 0);
+    }
+
     /// A queue dropped with items still charged — a consumer that stopped
-    /// with a backlog — gives them back to the node.
+    /// with a backlog — gives its node share back to the node.
     #[test]
     fn a_dropped_queue_gives_its_charge_back_to_the_node() {
         static NODE: NodeBudget = NodeBudget::new(1_000);
-        let a = QueueBudget::new(1_000, &NODE);
-        assert!(a.try_charge(300) && a.try_charge(200));
-        a.release(200);
-        assert_eq!(NODE.queued(), 300);
+        let a = QueueBudget::new(1_000, 100, &NODE);
+        let _ = a.try_charge(300).unwrap();
+        let second = a.try_charge(200).unwrap();
+        a.release(second);
+        assert_eq!(NODE.queued(), 200);
         drop(a);
         assert_eq!(NODE.queued(), 0, "a stopped queue kept its share of the node budget");
     }
@@ -159,8 +236,8 @@ mod tests {
         let threads: Vec<_> = (0..8)
             .map(|_| {
                 std::thread::spawn(|| {
-                    let q = QueueBudget::new(usize::MAX, &NODE);
-                    let taken = (0..10_000).filter(|_| q.try_charge(7)).count();
+                    let q = QueueBudget::new(usize::MAX, 0, &NODE);
+                    let taken = (0..10_000).filter(|_| q.try_charge(7).is_some()).count();
                     // Held until every thread has charged, so none of the
                     // room comes back early.
                     (q, taken)
@@ -173,5 +250,30 @@ mod tests {
         assert!(NODE.queued() <= 10_000);
         drop(held);
         assert_eq!(NODE.queued(), 0);
+    }
+
+    /// A producer and a consumer moving one queue's count at once, across
+    /// its floor and back, leave nothing charged to the node once the queue
+    /// is empty — the share each item took is the share it gives back.
+    #[test]
+    fn a_racing_producer_and_consumer_leave_the_node_as_they_found_it() {
+        static NODE: NodeBudget = NodeBudget::new(usize::MAX);
+        let q = std::sync::Arc::new(QueueBudget::new(usize::MAX, 1_000, &NODE));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Charge>(256);
+        let consumer = {
+            let q = q.clone();
+            std::thread::spawn(move || rx.into_iter().for_each(|charge| q.release(charge)))
+        };
+        let producer = {
+            let q = q.clone();
+            std::thread::spawn(move || {
+                for n in 0..200_000usize {
+                    tx.send(q.try_charge(1 + n % 97).unwrap()).unwrap();
+                }
+            })
+        };
+        producer.join().unwrap();
+        consumer.join().unwrap();
+        assert_eq!(NODE.queued(), 0, "the node kept bytes no item holds");
     }
 }

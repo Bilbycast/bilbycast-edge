@@ -12,8 +12,9 @@
 //! 1. **Subscriber task** (`subscriber_loop`) — `broadcast::Receiver`,
 //!    drops on `RecvError::Lagged`, never blocks the data path. Queues
 //!    each message for the writer within a budget counted in bytes
-//!    ([`WRITER_QUEUE_BYTES`], and [`NODE_RECORDER_QUEUE_BYTES`] shared by
-//!    every recorder on the node); past it, drops the packet, bumps a
+//!    ([`WRITER_QUEUE_BYTES`], and past its first [`WRITER_QUEUE_FLOOR_BYTES`]
+//!    within [`NODE_RECORDER_QUEUE_BYTES`] shared by every recorder on the
+//!    node); past it, drops the packet, bumps a
 //!    counter, and emits a (rate-limited) Critical event under category
 //!    `replay` with `error_code: replay_writer_lagged`.
 //!
@@ -100,7 +101,7 @@ use crate::config::models::RecordingConfig;
 use crate::engine::content_analysis::timecode::TimecodeTracker;
 use crate::engine::packet::RtpPacket;
 use crate::manager::events::{EventSender, EventSeverity, category};
-use crate::util::byte_budget::{self, NodeBudget};
+use crate::util::byte_budget::{self, Charge, NodeBudget};
 
 use super::clips::ClipStore;
 use super::filmstrip::{FilmstripStats, spawn_filmstrip_writer};
@@ -160,6 +161,18 @@ const WRITER_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 const NODE_RECORDER_QUEUE_BYTES: usize = 256 * 1024 * 1024;
 /// The budget every recorder's queue on the node shares.
 static NODE_RECORDER_QUEUES: NodeBudget = NodeBudget::new(NODE_RECORDER_QUEUE_BYTES);
+/// What of each recorder's queue is its own, charged to it and not to
+/// [`NODE_RECORDER_QUEUES`]: an eighth, a second or two of a 10 Mbit/s feed.
+///
+/// A recorder that keeps up never holds this much, so it never asks the node
+/// for anything and never drops for what other recorders hold. On the one
+/// disk they usually share that costs nothing — a disk that stalls stalls them
+/// all — but a recording's directory can be on a volume of its own, and a
+/// writer can fall behind for reasons of its own; a node budget every byte had
+/// to pass through made those recorders drop with the stalled ones. The node's
+/// recorders can therefore hold [`NODE_RECORDER_QUEUE_BYTES`] plus this much
+/// each.
+const WRITER_QUEUE_FLOOR_BYTES: usize = WRITER_QUEUE_BYTES / 8;
 /// What one queued message costs beyond its payload: its slot in the queue,
 /// the shared header the broadcast's clone gave its `Bytes`, and the
 /// allocator's own overhead on the payload. Negligible beside a frame, and
@@ -488,7 +501,7 @@ async fn spawn_writer_at(
     let cancel = parent_cancel.child_token();
     // Each message with the instant it came off the broadcast — see
     // `WriterState::arrived`.
-    let (writer_tx, writer_rx) = mpsc::channel::<(Bytes, Instant)>(WRITER_QUEUE_CAP);
+    let (writer_tx, writer_rx) = mpsc::channel::<(Bytes, Instant, Charge)>(WRITER_QUEUE_CAP);
     let (cmd_tx, cmd_rx) = mpsc::channel::<RecordingCommand>(32);
 
     // Subscriber task: forwards Bytes onto the writer queue within its byte
@@ -913,10 +926,11 @@ async fn open_writer(setup: WriterSetup, lease: RecordingLease) -> Result<Writer
 }
 
 /// The writer queue's budget in bytes — [`WRITER_QUEUE_BYTES`] of its own,
-/// within [`NODE_RECORDER_QUEUE_BYTES`] shared by every recorder on the node.
-/// The subscriber charges each message as it queues it, and the writer
-/// releases it as it takes it off; what is still queued when both have gone
-/// goes back to the node then.
+/// past its first [`WRITER_QUEUE_FLOOR_BYTES`] within
+/// [`NODE_RECORDER_QUEUE_BYTES`] shared by every recorder on the node. The
+/// subscriber charges each message as it queues it, and the writer releases
+/// it as it takes it off; what is still queued when both have gone goes back
+/// to the node then.
 #[derive(Debug)]
 struct QueueBudget(byte_budget::QueueBudget);
 
@@ -928,7 +942,7 @@ impl Default for QueueBudget {
 
 impl QueueBudget {
     fn within(node: &'static NodeBudget) -> Self {
-        Self(byte_budget::QueueBudget::new(WRITER_QUEUE_BYTES, node))
+        Self(byte_budget::QueueBudget::new(WRITER_QUEUE_BYTES, WRITER_QUEUE_FLOOR_BYTES, node))
     }
 
     fn cost(payload: usize) -> usize {
@@ -938,18 +952,18 @@ impl QueueBudget {
     /// Charge a message of `payload` bytes, or refuse it — charging nothing —
     /// if it would take the queue, or the node's recorders between them, past
     /// the budget.
-    fn try_charge(&self, payload: usize) -> bool {
+    fn try_charge(&self, payload: usize) -> Option<Charge> {
         self.0.try_charge(Self::cost(payload))
     }
 
-    fn release(&self, payload: usize) {
-        self.0.release(Self::cost(payload));
+    fn release(&self, charge: Charge) {
+        self.0.release(charge);
     }
 }
 
 async fn subscriber_loop(
     rx: &mut broadcast::Receiver<RtpPacket>,
-    writer_tx: mpsc::Sender<(Bytes, Instant)>,
+    writer_tx: mpsc::Sender<(Bytes, Instant, Charge)>,
     budget: Arc<QueueBudget>,
     stats: Arc<RecordingStats>,
     events: EventSender,
@@ -962,14 +976,14 @@ async fn subscriber_loop(
             _ = cancel.cancelled() => break,
             recv = rx.recv() => match recv {
                 Ok(pkt) => {
-                    let len = pkt.data.len();
                     // Charged before it is queued, so the writer can never
                     // release a message the budget has not counted yet.
-                    let queued = budget.try_charge(len)
-                        && match writer_tx.try_send((pkt.data, Instant::now())) {
+                    let queued = match budget.try_charge(pkt.data.len()) {
+                        None => false,
+                        Some(charge) => match writer_tx.try_send((pkt.data, Instant::now(), charge)) {
                             Ok(()) => true,
                             Err(TrySendError::Full(_)) => {
-                                budget.release(len);
+                                budget.release(charge);
                                 false
                             }
                             // The writer has gone — it could not open the
@@ -978,10 +992,11 @@ async fn subscriber_loop(
                             // a lag raised a Critical `replay_writer_lagged`
                             // every five seconds for the rest of the flow.
                             Err(TrySendError::Closed(_)) => {
-                                budget.release(len);
+                                budget.release(charge);
                                 break;
                             }
-                        };
+                        },
+                    };
                     if !queued {
                         stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                         let now = Instant::now();
@@ -1117,7 +1132,7 @@ struct OpenSegment {
 
 async fn writer_loop(
     mut state: WriterState,
-    mut rx: mpsc::Receiver<(Bytes, Instant)>,
+    mut rx: mpsc::Receiver<(Bytes, Instant, Charge)>,
     mut cmd_rx: mpsc::Receiver<RecordingCommand>,
     cancel: CancellationToken,
 ) {
@@ -1129,8 +1144,8 @@ async fn writer_loop(
                 None => break,
             },
             data = rx.recv() => match data {
-                Some((buf, arrived)) => {
-                    state.budget.release(buf.len());
+                Some((buf, arrived, charge)) => {
+                    state.budget.release(charge);
                     if let Err(e) = state.write_chunk(&buf, arrived).await {
                         tracing::error!(target: "replay", "writer error: {e:#}");
                         state.events.emit_with_details(
@@ -2843,41 +2858,47 @@ mod tests {
         static NODE: NodeBudget = NodeBudget::new(usize::MAX);
         let admitted = |payload: usize| {
             let budget = QueueBudget::within(&NODE);
-            let mut n = 0usize;
-            while budget.try_charge(payload) {
-                n += 1;
-            }
-            (n, budget)
+            let charges: Vec<Charge> = std::iter::from_fn(|| budget.try_charge(payload)).collect();
+            (charges, budget)
         };
         // RTMP-sized frames: 16,384 of them used to be ~800 MB.
         let (frames, budget) = admitted(50_000);
-        assert!(frames * 50_000 <= WRITER_QUEUE_BYTES);
-        assert!((frames + 1) * QueueBudget::cost(50_000) > WRITER_QUEUE_BYTES);
-        budget.release(50_000);
-        assert!(budget.try_charge(50_000), "a released message's room was not given back");
+        assert!(frames.len() * 50_000 <= WRITER_QUEUE_BYTES);
+        assert!((frames.len() + 1) * QueueBudget::cost(50_000) > WRITER_QUEUE_BYTES);
+        budget.release(frames[0]);
+        assert!(budget.try_charge(50_000).is_some(), "a released message's room was not given back");
         // SDI-sized messages, overhead and all.
         let (packets, _) = admitted(TS_PACKET);
-        assert!(packets <= WRITER_QUEUE_CAP, "the message cap would bind before the budget");
-        assert!(packets * TS_PACKET < WRITER_QUEUE_BYTES, "the per-message overhead went uncounted");
+        assert!(packets.len() <= WRITER_QUEUE_CAP, "the message cap would bind before the budget");
+        assert!(packets.len() * TS_PACKET < WRITER_QUEUE_BYTES, "the per-message overhead went uncounted");
     }
 
     /// The node's recorders cannot queue more between them than the node's
-    /// budget, whatever each may on its own — a disk that stalls under the
-    /// one replay root stalls them all at once.
+    /// budget past their floors, whatever each may on its own — a disk that
+    /// stalls under the one replay root stalls them all at once — and a
+    /// recorder with nothing of the node's left still has its floor.
     #[test]
     fn recorders_share_the_nodes_queue_budget() {
         const NODE_LIMIT: usize = WRITER_QUEUE_BYTES + WRITER_QUEUE_BYTES / 2;
+        const FLOOR: usize = WRITER_QUEUE_FLOOR_BYTES;
         static NODE: NodeBudget = NodeBudget::new(NODE_LIMIT);
         let cost = QueueBudget::cost(50_000);
-        let fill = |budget: &QueueBudget| std::iter::from_fn(|| budget.try_charge(50_000).then_some(())).count();
+        let fill = |budget: &QueueBudget| std::iter::from_fn(|| budget.try_charge(50_000)).count();
         let first = QueueBudget::within(&NODE);
         let second = QueueBudget::within(&NODE);
         let (a, b) = (fill(&first), fill(&second));
         assert_eq!(a, WRITER_QUEUE_BYTES / cost, "the first did not get its own whole budget");
-        assert_eq!(a + b, NODE_LIMIT / cost, "the two between them were not held to the node's budget");
+        assert_eq!(
+            b,
+            (NODE_LIMIT - (a * cost - FLOOR) + FLOOR) / cost,
+            "the second was not held to its floor and what the node had left"
+        );
+        let third = QueueBudget::within(&NODE);
+        assert!(fill(&third) >= FLOOR / cost, "a recorder that keeps up dropped for what the others hold");
+        drop(third);
         // A recorder stopped with a backlog gives it back.
         drop(first);
-        assert_eq!(NODE.queued(), b * cost);
+        assert_eq!(NODE.queued(), b * cost - FLOOR);
     }
 
     /// A cancelled recorder is not finished until it has closed its open
