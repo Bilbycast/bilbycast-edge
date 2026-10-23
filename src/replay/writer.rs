@@ -1246,22 +1246,30 @@ impl WriterState {
             self.timecode.observe_ts(pusi, &ts[payload_start..]);
         }
 
-        // Index every random-access point we have a PCR for.
-        if random_access && self.current_segment.as_ref().map(|s| !s.saw_first_idr).unwrap_or(false) {
+        // Index every random-access point that lands in a segment.
+        //
+        // Not one that lands in none. After a write error the writer closes
+        // the segment and drops what arrives until the next roll opens one,
+        // and an entry made meanwhile named segment 0 — `unwrap_or(0)` — at an
+        // offset into the packets being dropped: a scrub or an export resolving
+        // it read whatever segment 0 holds, the start of the recording or a
+        // file retention removed long ago. The PCR above is still followed, so
+        // the counter keeps time across the gap.
+        let seg = self.current_segment.as_mut()?;
+        if random_access && !seg.saw_first_idr {
             // First random-access of segment — promote to the canonical
             // index entry for this segment.
-            if let Some(seg) = self.current_segment.as_mut() {
-                seg.saw_first_idr = true;
-            }
+            seg.saw_first_idr = true;
         }
         if random_access {
+            let segment_id = seg.id;
             let snap = self.timecode.snapshot();
             let tc_packed = smpte_tc_packed(snap.as_ref());
             let pcr_disc = std::mem::replace(&mut self.pending_pcr_discontinuity, false);
             let entry = IndexEntry {
                 pts_90khz: self.accumulated_pts,
                 smpte_tc: tc_packed.unwrap_or(0xFFFFFFFF),
-                segment_id: self.current_segment.as_ref().map(|s| s.id).unwrap_or(0),
+                segment_id,
                 byte_offset: byte_offset_in_seg,
                 flags: flag::IS_IDR
                     | if tc_packed.is_some() { flag::SMPTE_TC_VALID } else { 0 }
@@ -1368,8 +1376,10 @@ impl WriterState {
         // Its last sender: the closer runs out of work and returns.
         drop(closer);
         let _ = closer_task.await;
-        // Covers index entries appended with no segment open to carry them
-        // to the closer — after a write error, until the next roll.
+        // An entry is appended only while a segment is open, and handed to the
+        // kernel when that segment closes, so the closer's fsync after the
+        // segment's rename covers it. This covers a closer that did not get
+        // that far — one that panicked.
         let _ = index_writer.flush_and_sync().await;
     }
 
@@ -2282,6 +2292,41 @@ mod tests {
         let meta: RecordingMeta =
             serde_json::from_slice(&std::fs::read(dir.join("recording.json")).unwrap()).unwrap();
         assert_eq!(meta.current_segment_id, 3);
+    }
+
+    /// The `n` a [`ts_packet`] was stamped with.
+    fn stamp(p: &[u8]) -> u64 {
+        let at = if p[3] & 0x20 != 0 { 5 + p[4] as usize } else { 4 };
+        u64::from_le_bytes(p[at..at + 8].try_into().unwrap())
+    }
+
+    /// Between a write error and the next roll no segment is open, and the
+    /// packets that arrive are dropped. A random-access point among them is
+    /// not indexed: an entry made then named segment 0, at an offset into
+    /// packets nobody wrote, so a scrub or an export resolving it read the
+    /// start of the recording instead.
+    #[tokio::test]
+    async fn no_entry_is_indexed_while_no_segment_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let (mut state, _events) = writer_in(tmp.path(), config).await;
+        let dir = tmp.path().join("rec");
+        let t0 = Instant::now();
+        feed(&mut state, t0, 0, 10).await;
+        // What the writer does on a write error: close the segment and drop
+        // what arrives until the roll, two seconds after it opened.
+        state.close_current(true).await;
+        feed(&mut state, t0, 10, 30).await;
+        command(&mut state, true).await;
+
+        let index = InMemoryIndex::load(&dir.join("index.bin")).await.unwrap();
+        let indexed: Vec<u64> = index.entries.iter().map(|e| e.pts_90khz / 9_000).collect();
+        assert_eq!(indexed, [0, 5, 20, 25], "a random-access point no segment holds was indexed");
+        for e in &index.entries {
+            let seg = std::fs::read(dir.join(format!("{:06}.ts", e.segment_id))).unwrap();
+            let p = &seg[e.byte_offset as usize..e.byte_offset as usize + TS_PACKET];
+            assert_eq!(stamp(p), e.pts_90khz / 9_000, "entry {e:?} names another packet");
+        }
     }
 
     /// Stop then Start must not reuse the stopped segment's id.

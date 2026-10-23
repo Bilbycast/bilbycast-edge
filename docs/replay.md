@@ -360,7 +360,11 @@ range has to honour it — see [Clip export](#clip-export) below.
    segment goes to the closer, which renames it into place or, when that
    close fails too, unlinks its `.tmp/` staging file (without a second
    event); the writer stays armed (`armed` is not cleared) and the next
-   roll boundary opens a fresh segment.
+   roll boundary opens a fresh segment. What arrives meanwhile is dropped:
+   its PCR is still followed, so the timeline keeps time across the gap,
+   but no random-access point in it is indexed — an entry made then used
+   to name segment 0, at an offset into packets nobody wrote, so a scrub
+   or an export resolving it read the start of the recording instead.
 6. A close that fails — flush, fsync or rename — unlinks the segment's
    staging file and raises a Critical event: `replay_disk_full` when the
    disk itself failed (ENOSPC, EDQUOT, EIO, EROFS), the fault the writer's
