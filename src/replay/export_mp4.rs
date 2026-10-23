@@ -275,6 +275,7 @@ fn slice_export_chunk(bytes: &[u8], byte_offset: u64, max_bytes: u64) -> ExportC
             total_bytes: total,
             byte_offset,
             eof: true,
+            resume: None,
         };
     }
     let want = if max_bytes == 0 {
@@ -290,6 +291,7 @@ fn slice_export_chunk(bytes: &[u8], byte_offset: u64, max_bytes: u64) -> ExportC
         total_bytes: total,
         byte_offset,
         eof: byte_offset + take as u64 >= total,
+        resume: None,
     }
 }
 
@@ -315,9 +317,11 @@ async fn build_recording_mp4(
     let index = InMemoryIndex::load(&dir.join("index.bin"))
         .await
         .context("load index for mp4 export")?;
-    let from_pts = from_pts_90khz
-        .or_else(|| index.entries.first().map(|e| e.pts_90khz))
-        .ok_or_else(|| anyhow!("replay_no_index"))?;
+    let from_pts = match from_pts_90khz {
+        Some(from) => from,
+        // From the first media retention kept — see `reader::recording_start`.
+        None => super::reader::recording_start(&index, &dir).await?.pts_90khz,
+    };
 
     // A range that crosses a recorder restart cannot be exported at all.
     //
@@ -334,7 +338,10 @@ async fn build_recording_mp4(
 
     // Pull the whole TS byte range into memory first. Refused up front past the
     // cap so a huge read never happens; the built file is checked again below,
-    // because the re-encode makes output size independent of input size.
+    // because the re-encode makes output size independent of input size. And
+    // refused with `replay_segment_missing` when a segment the range needs is
+    // no longer on disk (`export::plan_pts_range`), rather than muxed into a
+    // clip that plays straight across the hole.
     let plan = super::export::plan_for_pts_range_pub(&index, &dir, from_pts, to_pts_90khz).await?;
     if plan.total_bytes() > MP4_EXPORT_MAX_BYTES as u64 {
         bail!("replay_export_too_large");

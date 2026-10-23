@@ -6036,12 +6036,18 @@ async fn execute_command(
                     &recording_id, &clip_id, byte_offset, max_bytes,
                 ).await
             } else {
-                crate::replay::export::export_clip_chunk(
-                    &recording_id, &clip_id, byte_offset, max_bytes,
-                ).await
+                // Where the previous chunk said this one starts, for a
+                // manager that follows it — see `replay::export`.
+                async {
+                    let cursor = crate::replay::export::ChunkCursor::from_request(action)?;
+                    crate::replay::export::export_clip_chunk(
+                        &recording_id, &clip_id, byte_offset, max_bytes, cursor,
+                    ).await
+                }.await
             }.map_err(|e| {
                 let code = match e.to_string().as_str() {
                     s if s.contains("replay_invalid_range") => "replay_invalid_range",
+                    s if s.contains("replay_invalid_field") => "replay_invalid_field",
                     s if s.contains("replay_clip_not_found") => "replay_clip_not_found",
                     s if s.contains("replay_no_index") => "replay_no_index",
                     s if s.contains("replay_export_format_unsupported") => "replay_export_format_unsupported",
@@ -6057,7 +6063,7 @@ async fn execute_command(
             })?;
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk.data);
-            Ok(Some(serde_json::json!({
+            let mut ack = serde_json::json!({
                 "clip_id": clip_id,
                 "recording_id": recording_id,
                 "format": format,
@@ -6066,7 +6072,9 @@ async fn execute_command(
                 "chunk_bytes": chunk.data.len(),
                 "data": b64,
                 "eof": chunk.eof,
-            })))
+            });
+            chunk.ack_resume(&mut ack);
+            Ok(Some(ack))
         }
         #[cfg(feature = "replay")]
         "export_recording" => {
@@ -6095,12 +6103,16 @@ async fn execute_command(
                     &recording_id, from_pts, to_pts, byte_offset, max_bytes,
                 ).await
             } else {
-                crate::replay::export::export_recording_chunk(
-                    &recording_id, from_pts, to_pts, byte_offset, max_bytes,
-                ).await
+                async {
+                    let cursor = crate::replay::export::ChunkCursor::from_request(action)?;
+                    crate::replay::export::export_recording_chunk(
+                        &recording_id, from_pts, to_pts, byte_offset, max_bytes, cursor,
+                    ).await
+                }.await
             }.map_err(|e| {
                 let code = match e.to_string().as_str() {
                     s if s.contains("replay_invalid_range") => "replay_invalid_range",
+                    s if s.contains("replay_invalid_field") => "replay_invalid_field",
                     s if s.contains("replay_clip_not_found") => "replay_clip_not_found",
                     s if s.contains("replay_no_index") => "replay_no_index",
                     s if s.contains("replay_no_segments") => "replay_no_segments",
@@ -6117,7 +6129,7 @@ async fn execute_command(
             })?;
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk.data);
-            Ok(Some(serde_json::json!({
+            let mut ack = serde_json::json!({
                 "recording_id": recording_id,
                 "format": format,
                 "byte_offset": chunk.byte_offset,
@@ -6127,7 +6139,9 @@ async fn execute_command(
                 "eof": chunk.eof,
                 "from_pts_90khz": from_pts,
                 "to_pts_90khz": to_pts,
-            })))
+            });
+            chunk.ack_resume(&mut ack);
+            Ok(Some(ack))
         }
         #[cfg(feature = "replay")]
         "delete_clip" => {

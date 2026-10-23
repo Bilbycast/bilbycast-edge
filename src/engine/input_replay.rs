@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -167,13 +167,9 @@ async fn run(
                     Ok(true) => {} // bundle published, continue
                     Ok(false) => {
                         // EOF or out-of-range
-                        if config.loop_playback {
-                            let _ = reader.scrub_to(reader.range.from_pts_90khz).await;
-                            pacing.reset();
-                        } else {
-                            playing = false;
-                            emit_eof(&events, &flow_id, &input_id);
-                        }
+                        playing = at_end_of_range(
+                            &mut reader, config.loop_playback, &mut pacing, &events, &flow_id, &input_id,
+                        ).await;
                     }
                     Err(e) => {
                         tracing::warn!(target: "replay", "playback read error: {e:#}");
@@ -183,6 +179,74 @@ async fn run(
             }
         }
     }
+}
+
+/// Playback has reached the end of its range: go back to its start when it
+/// loops, and say whether it is still playing.
+///
+/// A loop whose start can no longer be played — retention has removed it,
+/// the recording was deleted under the replay, or a crash lost it — stops,
+/// with a Warning naming why. The refusal used to be ignored: the reader
+/// stayed at the end with playback on, and every turn of the input's loop
+/// went straight back here, a busy spin of directory listings with nothing
+/// to say so, that played whatever the recorder closed next and spun again.
+async fn at_end_of_range(
+    reader: &mut Reader,
+    loop_playback: bool,
+    pacing: &mut PacingState,
+    events: &EventSender,
+    flow_id: &str,
+    input_id: &str,
+) -> bool {
+    if !loop_playback {
+        emit_eof(events, flow_id, input_id);
+        return false;
+    }
+    match reader.scrub_to(reader.range.from_pts_90khz).await {
+        Ok(_) => {
+            pacing.reset();
+            true
+        }
+        Err(e) => {
+            tracing::warn!(target: "replay", "replay input '{input_id}' cannot loop: {e:#}");
+            emit_loop_failed(events, flow_id, input_id, &e);
+            false
+        }
+    }
+}
+
+/// Land a Play on `clip` when it names one, else on the reader in play —
+/// scrubbed to `from` within the range it asks for, its end moved to `to` —
+/// and put the clip in play only once both have succeeded, so a refused Play
+/// leaves the reader as it was. The clip used to replace the reader before it
+/// was scrubbed: a Play of a clip into a lost window was refused with a new
+/// clip on air, from its in-point, on the previous one's pacing anchors.
+async fn land_play(reader: &mut Reader, mut clip: Option<Reader>, from: Option<u64>, to: Option<u64>) -> Result<()> {
+    let target = clip.as_mut().unwrap_or(&mut *reader);
+    // Landing before the end of the range being asked for, not the end of
+    // the one played before it: the scrub runs before that end is applied,
+    // and bounded by the old one, a Play past an earlier range's end into a
+    // lost window was refused though its own range had media, and one landing
+    // past its own end was refused as `replay_invalid_range` below after the
+    // scrub had already moved the reader. A landing is at or before `from`, or
+    // before `to`, so with a `from` the check below cannot fail.
+    if let Some(from) = from {
+        target.scrub_within(from, to.unwrap_or(target.range.to_pts_90khz)).await?;
+    }
+    if let Some(to) = to {
+        if to < target.range.from_pts_90khz {
+            bail!("replay_invalid_range");
+        }
+        target.range.to_pts_90khz = to;
+    }
+    if let Some(clip) = clip {
+        *reader = clip;
+    }
+    Ok(())
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 async fn open_reader(config: &ReplayInputConfig) -> Result<Reader> {
@@ -231,52 +295,49 @@ async fn handle_command(
                     let _ = reply.send(Err(anyhow!("replay_invalid_range")));
                     return;
                 }
-            // Re-scope if the operator overrode the range.
-            if let Some(cid) = clip_id {
-                match Reader::open_clip(&config.recording_id, &cid).await {
-                    Ok(new_reader) => *reader = new_reader,
-                    Err(e) => {
-                        let _ = reply.send(Err(anyhow!("replay_clip_not_found: {e}")));
-                        return;
-                    }
-                }
-            }
-            if let Some(from) = from_pts_90khz
-                && let Err(e) = reader.scrub_to(from).await {
-                    let _ = reply.send(Err(e));
-                    return;
-                }
-            if let Some(to) = to_pts_90khz {
-                if to < reader.range.from_pts_90khz {
-                    let _ = reply.send(Err(anyhow!("replay_invalid_range")));
-                    return;
-                }
-                reader.range.to_pts_90khz = to;
-            }
-            // Phase 2.4 — clamp speed; reset pacer so anchors snap to
-            // the next observed PCR.
+            // Every check that needs no reader before anything moves, so a
+            // refused Play leaves what is playing as it was: they ran after
+            // the reader had been moved and the pacer reset, and a refused
+            // start time left the refused speed set.
             let s = speed.unwrap_or(1.0);
             if !(s > 0.0 && s <= 1.0) {
                 let _ = reply.send(Err(anyhow!("replay_invalid_speed")));
                 return;
             }
-            pacing.reset();
-            pacing.speed = s;
             // Phase 2.5 — future wall-clock anchor. Bound the wait to
             // 5 s so a misconfigured sync group can't park the input
             // task forever.
+            if let Some(target_ms) = start_at_unix_ms
+                && target_ms > unix_now_ms() + 5_000
+            {
+                let _ = reply.send(Err(anyhow!("replay_invalid_start_at")));
+                return;
+            }
+            // Re-scope if the operator overrode the range — beside the
+            // reader in play, which the clip replaces only once the Play
+            // has landed on it.
+            let clip = match clip_id {
+                Some(cid) => match Reader::open_clip(&config.recording_id, &cid).await {
+                    Ok(clip) => Some(clip),
+                    Err(e) => {
+                        let _ = reply.send(Err(anyhow!("replay_clip_not_found: {e}")));
+                        return;
+                    }
+                },
+                None => None,
+            };
+            if let Err(e) = land_play(reader, clip, from_pts_90khz, to_pts_90khz).await {
+                let _ = reply.send(Err(e));
+                return;
+            }
+            // Phase 2.4 — reset pacer so anchors snap to the next observed
+            // PCR.
+            pacing.reset();
+            pacing.speed = s;
             if let Some(target_ms) = start_at_unix_ms {
-                let now_ms = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                if target_ms > now_ms + 5_000 {
-                    let _ = reply.send(Err(anyhow!("replay_invalid_start_at")));
-                    return;
-                }
+                let now_ms = unix_now_ms();
                 if target_ms > now_ms {
-                    let wait = Duration::from_millis(target_ms - now_ms);
-                    tokio::time::sleep(wait).await;
+                    tokio::time::sleep(Duration::from_millis(target_ms - now_ms)).await;
                 }
             }
             *playing = true;
@@ -844,6 +905,25 @@ fn emit_eof(events: &EventSender, flow_id: &str, input_id: &str) {
     );
 }
 
+fn emit_loop_failed(events: &EventSender, flow_id: &str, input_id: &str, error: &anyhow::Error) {
+    let error = error.to_string();
+    // The refusal's own code, when it names one — `replay_segment_missing`,
+    // `replay_segment_not_ready`.
+    let code = error.split(':').next().filter(|code| code.starts_with("replay_"));
+    events.emit_with_details(
+        EventSeverity::Warning,
+        category::REPLAY,
+        format!("Replay input '{input_id}' stopped: it cannot loop back to the start of its range"),
+        Some(flow_id),
+        serde_json::json!({
+            "replay_event": "playback_loop_failed",
+            "error_code": code,
+            "input_id": input_id,
+            "error": error,
+        }),
+    );
+}
+
 fn now_micros() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -854,6 +934,150 @@ fn now_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replay::index::{IndexEntry, IndexWriter, flag};
+
+    /// A recording in `parent/rec` of one-packet segments `0..count`, each a
+    /// second long and indexed at its start, with the segments `gone`
+    /// removed — what retention or a crash leaves.
+    async fn recording(parent: &std::path::Path, count: u32, gone: &[u32]) -> std::path::PathBuf {
+        let dir = parent.join("rec");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut index = IndexWriter::open(&dir.join("index.bin")).await.unwrap();
+        for id in 0..count {
+            tokio::fs::write(dir.join(format!("{id:06}.ts")), [0x47u8; TS_PACKET]).await.unwrap();
+            index
+                .append(IndexEntry {
+                    pts_90khz: id as u64 * 90_000,
+                    smpte_tc: 0,
+                    segment_id: id,
+                    byte_offset: 0,
+                    flags: flag::IS_IDR,
+                })
+                .await
+                .unwrap();
+        }
+        index.flush_and_sync().await.unwrap();
+        for id in gone {
+            tokio::fs::remove_file(dir.join(format!("{id:06}.ts"))).await.unwrap();
+        }
+        dir
+    }
+
+    fn replay_config() -> ReplayInputConfig {
+        serde_json::from_value(serde_json::json!({ "recording_id": "rec" })).unwrap()
+    }
+
+    /// Send a Play of `from..to` through the input's command handling.
+    async fn play(reader: &mut Reader, events: &EventSender, from: u64, to: u64) -> Result<()> {
+        let (reply, ack) = tokio::sync::oneshot::channel();
+        let cmd = ReplayCommand::Play {
+            clip_id: None,
+            from_pts_90khz: Some(from),
+            to_pts_90khz: Some(to),
+            speed: None,
+            start_at_unix_ms: None,
+            reply,
+        };
+        let (mut playing, mut pacing) = (false, PacingState::new());
+        handle_command(cmd, reader, &replay_config(), &mut playing, &mut pacing, events, "f", "i").await;
+        ack.await.unwrap()
+    }
+
+    /// A loop whose start is no longer on disk stops, and says why. It ignored
+    /// the refusal and left playback on at the end of the range, where every
+    /// turn of the input's loop came straight back to it: a busy spin.
+    #[tokio::test]
+    async fn a_loop_back_to_media_no_longer_on_disk_stops_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = recording(tmp.path(), 3, &[]).await;
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let mut reader = Reader::open_recording_at("rec", dir.clone()).await.unwrap();
+        let mut pacing = PacingState::new();
+        assert!(at_end_of_range(&mut reader, true, &mut pacing, &events, "f", "i").await, "a loop over media on disk stopped");
+        // The recording deleted under the replay.
+        tokio::fs::remove_dir_all(&dir).await.unwrap();
+        assert!(!at_end_of_range(&mut reader, true, &mut pacing, &events, "f", "i").await, "playback stayed on");
+        let event = events_rx.try_recv().expect("no event said why");
+        let details = event.details.unwrap();
+        assert_eq!(details["replay_event"], "playback_loop_failed");
+        assert_eq!(details["error_code"], "replay_segment_missing");
+        assert_eq!(event.flow_id.as_deref(), Some("f"));
+    }
+
+    /// A Play into a lost window lands by the range it asks for. It was
+    /// bounded by the range played before it: a Play past an earlier range's
+    /// end was refused though its own range had media after the hole, and
+    /// one whose landing fell past its own end was refused as an inverted
+    /// range, after the scrub had moved the reader.
+    #[tokio::test]
+    async fn a_play_into_a_lost_window_lands_by_the_range_it_asks_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Segment 9 lost: media resumes at 10 s.
+        let dir = recording(tmp.path(), 13, &[9]).await;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let mut reader = Reader::open_recording_at("rec", dir.clone()).await.unwrap();
+        play(&mut reader, &events, 90_000, 180_000).await.unwrap();
+        play(&mut reader, &events, 828_000, 1_080_000).await.expect("its range has media after the hole");
+        assert_eq!(reader.range.from_pts_90khz, 900_000);
+        assert_eq!(reader.range.to_pts_90khz, 1_080_000);
+
+        // A fresh reader plays to the end; a Play whose landing falls at or
+        // past its own end has nothing of its range left.
+        let mut reader = Reader::open_recording_at("rec", dir).await.unwrap();
+        let err = play(&mut reader, &events, 828_000, 864_000).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+        assert_eq!(reader.range.from_pts_90khz, 0, "a refused Play moved the reader");
+    }
+
+    /// A refused Play changes nothing — the reader, the pacing, whether
+    /// anything plays — whatever refuses it. A clip it named was put in play
+    /// before the scrub refused it, so a rolling playback jumped to that clip
+    /// while the operator was told the Play had failed; and a refused speed
+    /// or start time came after the reader had moved and the pacer reset.
+    #[tokio::test]
+    async fn a_refused_play_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Segment 9 lost: media resumes at 10 s.
+        let dir = recording(tmp.path(), 13, &[9]).await;
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let mut reader = Reader::open_recording_at("rec", dir.clone()).await.unwrap();
+        play(&mut reader, &events, 0, 90_000).await.unwrap();
+        let playing_range = |r: &Reader| (r.range.from_pts_90khz, r.range.to_pts_90khz);
+        let before = playing_range(&reader);
+
+        // A clip of 5 to 12 s, played from inside the lost second up to a
+        // point before the media resumes: nothing of it left to land on.
+        let clip = crate::replay::clips::ClipStore::open("rec", &dir)
+            .await
+            .unwrap()
+            .create("rec", 450_000, 1_080_000, None, None, None, None, None, Vec::new())
+            .await
+            .unwrap();
+        let candidate = Reader::open_clip_at("rec", dir.clone(), &clip.id).await.unwrap();
+        let err = land_play(&mut reader, Some(candidate), Some(828_000), Some(864_000)).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+        assert_eq!(playing_range(&reader), before, "a refused Play put its clip in play");
+
+        // Refused for its speed, or its start time, with a range that lands.
+        for (speed, start_at_unix_ms) in [(Some(2.0), None), (None, Some(unix_now_ms() + 60_000))] {
+            let (reply, ack) = tokio::sync::oneshot::channel();
+            let cmd = ReplayCommand::Play {
+                clip_id: None,
+                from_pts_90khz: Some(450_000),
+                to_pts_90khz: Some(540_000),
+                speed,
+                start_at_unix_ms,
+                reply,
+            };
+            let (mut playing, mut pacing) = (false, PacingState::new());
+            pacing.speed = 0.5;
+            handle_command(cmd, &mut reader, &replay_config(), &mut playing, &mut pacing, &events, "f", "i").await;
+            ack.await.unwrap().expect_err("refused");
+            assert_eq!(playing_range(&reader), before, "{speed:?} {start_at_unix_ms:?}: a refused Play moved the reader");
+            assert_eq!(pacing.speed, 0.5, "{speed:?} {start_at_unix_ms:?}: a refused Play set its speed");
+            assert!(!playing);
+        }
+    }
 
     /// VH1.ts: the PMT sits behind a 0xC0 section; replay pacing used to
     /// find no video PID on such a recording.

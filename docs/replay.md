@@ -51,6 +51,7 @@ section.)
                                        │
                                        ▼
                   drop-on-Lagged ──► 32 MiB queue ──► writer task
+                                     (256 MiB node-wide)
                                                          │ finished segments,
                                                          ▼ in order (≤ 4 waiting)
                                                      closer task
@@ -80,6 +81,24 @@ section.)
   but hundreds of megabytes of frames on a stalled disk. 32 MiB is about
   17 s of a 10 Mbit/s SDI feed, 25 s of 1316-byte datagrams and 27 s of a
   frame-per-message feed at the same rate.
+- **And every recorder's queue on the node shares 256 MiB**
+  (`NODE_RECORDER_QUEUE_BYTES`), because every recorder writes under the one
+  replay root: a disk that stalls stalls them all, and the per-recorder
+  budget alone let a node hold 32 MiB times its recording flows at exactly
+  that moment. Eight recorders' full budgets — bilby-voyager's five keep
+  theirs whole (160 MiB) — so a node recording more flows than eight shares
+  it and drops sooner, with the same `replay_writer_lagged`. Separate from
+  the CMAF intakes' node budget (`docs/cmaf.md`): a disk and an origin fail
+  independently, and one stall filling a shared budget would make the other
+  consumers drop on a stall they would have ridden out. What a stopped
+  recorder still had queued goes back to the node as it goes. The first
+  4 MiB of each recorder's queue (`WRITER_QUEUE_FLOOR_BYTES`, an eighth of
+  it) are its own and charge the node nothing, so a recorder that keeps up
+  never drops for what the others hold: on the one disk they usually share
+  that costs nothing, but a recording directory can sit on a volume of its
+  own, and a writer can fall behind for reasons of its own. Beyond each
+  flow's broadcast ring, the node's queues together hold at most 512 MiB
+  plus those floors — see the worst case in `docs/cmaf.md`.
 - **The writer task** does in-memory bookkeeping and buffered writes only:
   it parses the TS, tracks PCR and SMPTE timecode, appends index entries,
   and writes each segment through a 256 KiB userspace buffer (unbuffered, an
@@ -318,8 +337,9 @@ range has to honour it — see [Clip export](#clip-export) below.
      order: a reader or a clip export finds only the newest segments not
      yet in place, never a later one in place ahead of an earlier one still
      being finished. A segment can still be missing from the middle — a
-     close that failed, or the segments a crash lost — and readers step
-     over it (see [Segment ids](#segment-ids));
+     close that failed, or the segments a crash lost — and playback steps
+     over it while an export across it is refused (see
+     [Segment ids](#segment-ids));
    - fsyncs `index.bin` — **after** the rename, so the fsync issued for a
      segment never makes its entries durable while the segment is still in
      `.tmp/`. That is all the ordering buys: the writer is already
@@ -349,9 +369,12 @@ range has to honour it — see [Clip export](#clip-export) below.
    the new file over the last segment before the Stop, whose index
    entries still pointed into it. A flow that stops or restarts waits up
    to 10 s for its recorder to do the same (`RecordingHandle::finished`,
-   one deadline for the writer and its filmstrip together): without that,
-   the restarted writer's `.tmp/` sweep (below) deleted the segments the
-   old one was still finishing. A node shutting down stops all its flows
+   one deadline for the writer and its filmstrip together), so a process
+   that exits leaves every segment in place. A restarted writer does not
+   rely on that wait: it opens the recording only once the previous writer
+   and its closer have let it go (see [Crash recovery](#crash-recovery-writer-init-scan)),
+   because a disk slow enough outran the 10 s and the new writer's `.tmp/`
+   sweep deleted the segments the old one was still finishing. A node shutting down stops all its flows
    at once and gives them 10 s in all (`SHUTDOWN_FLOW_STOP_BUDGET`), so a
    stalled replay volume costs that wait once rather than once per
    recording flow, and the tunnels and bond routes torn down after the
@@ -360,14 +383,19 @@ range has to honour it — see [Clip export](#clip-export) below.
    segment goes to the closer, which renames it into place or, when that
    close fails too, unlinks its `.tmp/` staging file (without a second
    event); the writer stays armed (`armed` is not cleared) and the next
-   roll boundary opens a fresh segment.
+   roll boundary opens a fresh segment. What arrives meanwhile is dropped:
+   its PCR is still followed, so the timeline keeps time across the gap,
+   but no random-access point in it is indexed — an entry made then used
+   to name segment 0, at an offset into packets nobody wrote, so a scrub
+   or an export resolving it read the start of the recording instead.
 6. A close that fails — flush, fsync or rename — unlinks the segment's
    staging file and raises a Critical event: `replay_disk_full` when the
    disk itself failed (ENOSPC, EDQUOT, EIO, EROFS), the fault the writer's
    own writes report, and `replay_segment_close_failed` for anything else
    (the staging file taken away, a rename refused). The segment is lost;
-   its index entries remain, naming a file that does not exist, and
-   playback steps over the gap. Writing carries on with the next segment.
+   its index entries remain, naming a file that does not exist; playback
+   steps over the gap and an export across it is refused with
+   `replay_segment_missing`. Writing carries on with the next segment.
 7. Retention will **never** unlink the segment just finished — losing the
    live edge would tear out clips that touch the most recent few seconds.
    It runs after that segment's rename, so the segment is in the listing
@@ -378,8 +406,49 @@ range has to honour it — see [Clip export](#clip-export) below.
 
 Whenever `spawn_writer` runs (cold start, edge restart after SIGKILL,
 operator-driven re-arm), it scans the recording directory before
-opening a new segment:
+opening a new segment — and first makes sure it is the only writer
+there:
 
+0. **One writer at a time.** A writer holds its recording's directory
+   (`RecordingLease`, a per-directory lock in a node-wide registry) from
+   before this scan until its closer has finished every segment and the
+   index is synced; the writer state and the closer each keep a share, so
+   the hold outlives whichever ends last, a panic included. A writer
+   started while the previous one still holds it — a flow restarted while
+   the old closer fsyncs on a slow disk — opens in its own task once the
+   previous one lets go, so the flow's start never waits on it: what the
+   flow publishes meanwhile queues for the writer within its 32 MiB budget
+   (past it, `replay_writer_lagged`, as behind any slow disk), and a flow
+   stopped meanwhile ends the wait. `FlowRuntime::stop`'s 10 s wait used to
+   be all that kept the two apart, and a disk slower than that let the new
+   writer's sweep below unlink the segments the old closer had yet to
+   rename — and a segment the old writer had open with no index entry yet,
+   an id nothing names, share its id with the new writer's first.
+
+   An open that waited and then fails raises the same Critical
+   `recording_start_failed` event a failure at flow start does, against the
+   flow. The flow has already reported that recording started by then and
+   keeps its handle, so the recorder goes on answering its commands until
+   the flow stops — `start_recording`, `mark_in` and `mark_out` with
+   `replay_recording_not_active`, as for a flow with no recorder
+   (`stop_recording`'s handler codes nothing, so it carries that code at
+   the head of its message) — where a writer task that simply ended left
+   them failing with the uncoded "recording writer task is gone".
+
+   A writer of another flow — two flows naming one recording through
+   `storage_id` — waits the same way while that flow is stopping. One
+   config push that moves a `storage_id` from one flow to another restarts
+   the two in no set order, so the flow taking it can start before the one
+   giving it up has begun to stop, and a deleted flow's closer can still be
+   finishing when another flow takes its recording. Another flow still
+   running is given 30 s (`HANDOVER_GRACE`) to begin stopping — long enough
+   for the push to reach it — and if it has not, the waiting writer is
+   refused with `replay_recording_in_use`, naming that flow, through the
+   same `recording_start_failed` event and with the same answers to its
+   commands. Refused at once, a handover was refused for good whenever the
+   push restarted the taking flow first; waited for as long as the other
+   flow runs, the writer would record nothing while its queue filled and
+   raised `replay_writer_lagged` against the disk.
 1. **`.tmp/` orphan cleanup.** Any `<NNNNNN>.ts` left in `.tmp/` is a
    partial segment the writer never atomically renamed onto the
    recording — unlinked unconditionally.
@@ -430,14 +499,81 @@ same rules) keeps it so:
   file that is missing rather than media recorded after the restart; an
   id nothing names yet (a segment lost before its first random-access
   point) is used again.
+- **One writer per recording at a time.** A writer resumes past what the
+  directory, the meta and the index say only if no other writer is still
+  adding to them; a restarted writer waits for the previous one (step 0 of
+  [Crash recovery](#crash-recovery-writer-init-scan)).
 - **A gap in the ids is not the end of the recording.** A crash leaves one
   where the segments it lost were, and so does a close that fails.
   Playback (`Reader::advance_segment`) steps over it to the next segment
-  on disk, as the exporter always has; it used to stop at the first
-  missing id, ending a replay at the gap. The gap is not closed instead,
-  because that would mean handing the lost ids out again and first
-  cutting their entries out of `index.bin` on the strength of a directory
-  scan — and a failed close leaves a gap whatever the numbering does.
+  on disk; it used to stop at the first missing id, ending a replay at the
+  gap. The gap is not closed instead, because that would mean handing the
+  lost ids out again and first cutting their entries out of `index.bin` on
+  the strength of a directory scan — and a failed close leaves a gap
+  whatever the numbering does.
+- **An entry can name a segment the disk does not hold**, and everything
+  that turns an entry into a read checks first. Retention prunes segment
+  files and never index entries, and a crash or a failed close leaves
+  entries naming a file that was never finished. So:
+  - a replay of the whole recording, and the first chunk of an export with
+    no `from_pts_90khz` for a manager that follows the export cursor, start
+    at the first entry whose segment is still on disk
+    (`reader::recording_start`) — the first entry outright named a pruned
+    file on any recording old enough, and the replay failed at its first
+    read. The rest of that export's chunks are read from the cursor each
+    chunk hands out (see [`export_clip` /
+    `export_recording`](#export_clip--export_recording));
+  - a cue, scrub or play into a lost window lands on the first random-access
+    point after it still on disk (`Reader::playable_from`), and the
+    `scrub_playback` ack names where it landed. That is where playback from
+    before the hole arrives anyway, by stepping over it; the last point
+    before the hole could be minutes of media nobody asked for. A clip, or a
+    played range, with nothing left before its end is refused with
+    `replay_segment_missing`, and so is a lost tail with nothing after it.
+    A `play_clip` with a `from_pts_90khz` lands within the range it asks
+    for — bounded by its own `to_pts_90khz`, else by the clip it names,
+    else by the range already in play — where it was bounded by the range
+    played before it, so a Play past an earlier range's end was refused
+    though its own range had media after the hole. A Play refused for any
+    reason — its range, its clip, its landing, its `speed`, its
+    `start_at_unix_ms` — leaves playback as it was: the reader, its range
+    and the pacer, its speed included. Every check runs before anything
+    moves, and the clip a Play names is opened beside the reader in play
+    and takes its place only once the Play has landed on it. The clip used
+    to take its place first, so a refused Play of a clip put that clip on
+    air from its in-point while the operator was told it had failed, and a
+    refused speed or start time came after the reader had moved and the
+    pacer had been reset;
+  - an export (TS or MP4, clip or range, and the DVR clip cutter's exact
+    cut) that needs a segment `index.bin` names but the disk lacks is
+    refused with `replay_segment_missing`. It skipped the segment and
+    returned a file short of the range with nothing to say so — a clip
+    spanning the hole played straight across it. The DVR cutter takes the
+    refusal like any other exact-cut failure and cuts from whole segments
+    on the origin instead (see [When the recording cannot serve the
+    moment](#when-the-recording-cannot-serve-the-moment)). A gap no entry
+    names — a segment with no random-access point whose close failed, or
+    the hole an older build left in the ids at every restart, which lost
+    nothing — is stepped over, as playback steps over it. An export's
+    `total_bytes` is the sum of exactly the segment windows it reads; it
+    was worked out separately, and a missing last segment was counted
+    there and not read. The start's own segment is checked whatever the
+    end: an export from a lost tail with no `to_pts_90khz` is refused,
+    where it came back as an empty file and a success;
+  - an entry can also name a segment that is **not on disk yet**: the
+    writer indexes the open segment's random-access points as it sees them,
+    and the segments waiting on the closer until each is renamed into
+    place. A cue, scrub, play or export that reaches one — a mark-out at
+    "now" exported at once, a range ending in the newest few seconds — is
+    refused with `replay_segment_not_ready`, which is transient: the same
+    request succeeds once the segment has closed, within `segment_seconds`
+    plus the closer's lag. What tells the two apart is the live writer's
+    hold on the directory (`RecordingLease`, `writer::is_being_written`):
+    while a writer holds it, every staging file in `.tmp/` is one of its
+    segments still to come; with nobody writing, a staging file is a
+    crash's leftover and the segment it names is lost. The finished path is
+    looked at again after the staging one, since the closer may rename
+    between the two (`replay::segment_state`).
 
 ### Clip create
 
@@ -474,13 +610,23 @@ pointed at a known clip).
 3. The replayer reads the segment containing
    `clip.in_pts_90khz` (binary-search on the in-memory index → IDR
    ≤ target), seeks to the IDR's byte offset, and yields paced bundles
-   to the broadcast channel.
+   to the broadcast channel. When that segment is no longer on disk it
+   starts at the first IDR after it that is, and refuses a clip with
+   nothing left before its out-point (`replay_segment_missing`, or
+   `replay_segment_not_ready` while what comes next is still being
+   recorded; see [Segment ids](#segment-ids)).
 4. **K** key or `stop_playback` halts playback (`playback_stopped`
    Info). On reaching the end of the recording on disk (no next
    `<NNNNNN>.ts` segment) with `loop_playback = false` the replayer
    fires `playback_eof` and idles with NULL-PID padding; with
    `loop_playback = true` it wraps to the range's `from_pts_90khz` at
-   that same point. The clip's `out_pts_90khz` (and a `play_clip`
+   that same point — and when that start can no longer be played
+   (retention removed it, a crash lost it, the recording was deleted under
+   the replay) it stops instead, with a Warning `playback_loop_failed`
+   naming the refusal (`details.error_code`: `replay_segment_missing`, or
+   `replay_segment_not_ready`). It used to ignore the refusal and spin at
+   the end of the range with playback on, listing the recording directory
+   on every turn of the input's loop. The clip's `out_pts_90khz` (and a `play_clip`
    `to_pts_90khz`) is recorded on the reader's range and reported in
    the `playback_started` event, but is not enforced by the inline
    pump today — a cued clip plays through to the end of the
@@ -504,18 +650,21 @@ parsing strings.
 
 | `error_code` | Severity | Trigger | Operator action |
 |---|---|---|---|
-| `replay_recording_not_active` | Error | `start_recording` / `stop_recording` / `mark_in` / `mark_out` on a flow whose `recording` block is absent or has `enabled: false` (no writer is spawned at flow start — `engine/flow.rs` filters on `enabled`); `start_recording` on an unknown `flow_id` (the other three return a bare error with no code for that); `mark_in` without an explicit `pts_90khz` on a fresh recording before the writer has seen its first PCR (the counter is still 0), or `mark_out` with no pending `mark_in` (or with `pts_90khz` at or before the pending in-point — the arm lifts every writer-side error under this code) | Add a `RecordingConfig` with `enabled: true` via `configure_recording` (the edge reports `restart_required`; the recorder binds at the next flow start) or `update_flow` (`recording` is a restart-triggering field). For the mark cases, wait for the source to deliver, or send `mark_in` first |
+| `replay_recording_not_active` | Error | `start_recording` / `stop_recording` / `mark_in` / `mark_out` on a flow whose `recording` block is absent or has `enabled: false` (no writer is spawned at flow start — `engine/flow.rs` filters on `enabled`); `start_recording` on an unknown `flow_id` (the other three return a bare error with no code for that); `mark_in` without an explicit `pts_90khz` on a fresh recording before the writer has seen its first PCR (the counter is still 0), or `mark_out` with no pending `mark_in` (or with `pts_90khz` at or before the pending in-point — the arm lifts every writer-side error under this code); any of them on a flow whose recorder failed to open after waiting for its previous writer (see `recording_start_failed`) | Add a `RecordingConfig` with `enabled: true` via `configure_recording` (the edge reports `restart_required`; the recorder binds at the next flow start) or `update_flow` (`recording` is a restart-triggering field). For the mark cases, wait for the source to deliver, or send `mark_in` first |
 | `replay_no_playback_input` | Error | `play_clip`/`scrub_playback` on a flow with no `replay` input | Add a `replay` input to the flow |
 | `replay_clip_not_found` | Error | `play_clip`/`delete_clip` with an unknown `clip_id` | Refresh the clip list (it may have been pruned by retention) |
-| `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
+| `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget, or past its own first 4 MiB with the node's recorders past the 256 MiB they share — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
 | `replay_disk_pressure` | Warning | Recording usage ≥ 80 % of `max_bytes` (or of replay-root filesystem when `max_bytes = 0`); sticky until back below 70 % | Free disk before ENOSPC; raise `max_bytes` if appropriate; reduce retention |
+| `replay_recording_in_use` | Critical (`recording_start_failed`) | The flow's recorder was not started: another flow's writer was still working in the same recording directory 30 s after it was asked to start, and that flow was not stopping — both flows' recordings resolve to one `storage_id`, or one flow's `storage_id` names another flow's id. Nothing in validation refuses the pair, and the two writers used to corrupt the directory between them. A recording moved from one flow to another is handed over instead, whatever order the push restarts the two in | Give one of the flows its own `recording.storage_id`, then restart it |
 | `replay_disk_full` | Critical | A segment write hit a disk error (typically ENOSPC), or a finished segment's close (flush, fsync, rename) failed on the disk itself — ENOSPC, EDQUOT, EIO or EROFS; the latter carries `details.segment_id`, and that segment is lost | Free disk, then `stop_recording` + `start_recording` to re-arm |
 | `replay_segment_close_failed` | Critical | A finished segment's close failed for a reason other than the disk — its staging file removed from under the writer, a rename refused (permissions, something else at the final path). The staging file is unlinked and the segment lost; `details.segment_id`. Recording carries on with the next segment | Check the recording directory's ownership and permissions, and that nothing else writes into it |
 | `validation_error` | Error (`command_ack.error_code` only — no event) | `configure_recording`, `create_flow`, `update_flow` or `update_config` carrying a `recording` block whose `segment_seconds` is outside `[2, 60]`, `pre_buffer_seconds` outside `[1, 300]` or above a non-zero `retention_seconds`, `filmstrip_seconds` outside `[1, 30]`, `storage_id` not 1–64 ASCII alphanumerics + `_-`, or no `storage_id` on a flow whose id is not a single path component (`.`, `..`, or containing `/` `\`). The same check refuses `config.json` at node start, where there is no ack at all | Use a value in range, or set a valid `storage_id` |
 | `replay_storage_id_invalid` | Error (`command_ack.error_code` only — no event) | `delete_recording` whose `recording_id` is empty, > 64 chars, or contains a character outside ASCII alphanumerics + `_-`, or whose directory could not be removed (`remove_dir_all` failed; a directory that does not exist is acked with `bytes_freed: 0`, not refused). A bad `RecordingConfig.storage_id` is never reported under this code — it is refused as `validation_error` (row above), and `.` is not permitted in the charset | Use a valid id / check the replay volume |
-| `replay_invalid_field` | Error | `mark_out` / `rename_clip` / `update_clip` `name` > 256 chars or contains control chars; `description` > 4096 chars | Trim to limits |
+| `replay_invalid_field` | Error | `mark_out` / `rename_clip` / `update_clip` `name` > 256 chars or contains control chars; `description` > 4096 chars; an export chunk's `resume` this edge would not have handed out | Trim to limits; export again from the start |
 | `replay_invalid_range` | Error | `update_clip` whose prospective `out_pts_90khz <= in_pts_90khz` (empty or inverted); `export_recording` (TS or MP4) with both bounds supplied and `to_pts_90khz <= from_pts_90khz`; `export_clip` (TS or MP4) on a clip whose stored `out_pts_90khz <= in_pts_90khz`. `play_clip` with `to_pts_90khz < from_pts_90khz` (or below the clip's `in_pts` when `from` is omitted) is refused too, but its ack carries `replay_clip_not_found` with `replay_invalid_range` as the message; `scrub_playback` takes a single `pts_90khz` and cannot raise it | Pass a forward range |
 | `replay_invalid_tag` | Error | `update_clip` (or any tag-bearing path) with a tag that fails `[A-Z0-9_-]{1,32}`, more than 16 tags per clip | Use the v1 fixed set (`GOAL`/`FOUL`/`OFFSIDE`/`SAVE`/`YELLOW`/`VAR-CHECK`) or shorten / re-case |
+| `replay_segment_missing` | Error (in the error text) | An export (`export_clip` / `export_recording`, TS or MP4) needs a segment `index.bin` names that is not on disk — lost to a crash or a failed close, or pruned by retention; or a `cue_clip` / `play_clip` / `scrub_playback` lands in a lost window with no recorded media after it before the end of the range; or a whole-recording replay or export finds none of the index's segments on disk; or a later chunk of a TS export still owes bytes from a segment that has gone since the download began; or a manager that follows no export cursor asks for a recording whose first indexed segment is gone. Settled, not transient — told from a segment still being recorded, which is `replay_segment_not_ready`. `dispatch_replay_input_command` re-codes cue / play / scrub errors onto `replay_clip_not_found`, and the export verbs' `error_code` mapping in `src/manager/client.rs` does not name it yet, so an export ack carries `replay_export_failed` with this code at the head of the message | Export each side of the gap separately, or move the clip clear of it; a moment the recorder lost may still be on the relay's origin (the DVR cutter falls back to it by itself) |
+| `replay_segment_not_ready` | Error (in the error text) | A cue, play, scrub or export (TS or MP4) reaches a segment `index.bin` already names that the live writer has yet to put in place — the open segment, or one waiting on its closer: a mark-out at "now" exported at once, a range ending in the newest few seconds; or a whole-recording replay or export of a recording whose first segment is still open. Transient. Carried in the error text the same way as `replay_segment_missing` (cue / play / scrub re-coded onto `replay_clip_not_found`, an export ack carrying `replay_export_failed`) | Retry once the segment has closed — within `segment_seconds` plus the closer's lag |
 | `replay_max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without deleting the live edge — operator's cap is smaller than one segment | Raise `max_bytes` to at least `segment_seconds × bitrate × 2` |
 | `replay_metadata_stale` | Warning | `recording.json` write failed after a segment's close; on restart the resume id is bounded by the directory listing and `index.bin` as well, so no id is reused | Investigate the disk (typically ENOSPC on the replay volume) |
 | `replay_recovery_alert` | Warning | Edge restarted after a crash; orphan `.tmp/` segments cleaned, `recording.json` was corrupt, and / or ids were in use past the one `recording.json` had reached | Informational — verify `details.tmp_orphans_removed` and `details.next_segment_id` match expectations |
@@ -560,7 +709,7 @@ render a coloured disk meter as soon as the recorder is armed.
 | `segments_written` | Segments closed successfully — fsynced and renamed into place. A segment whose close failed is not counted (see `replay_disk_full` / `replay_segment_close_failed`), and one still waiting for the closer is not counted yet |
 | `bytes_written` | Total bytes appended (across all segments, including pruned) |
 | `segments_pruned` | Segments evicted by retention (mtime / size) |
-| `packets_dropped` | Packets dropped at the broadcast subscriber — the broadcast lagged it, or the writer's queue was past its 32 MiB budget |
+| `packets_dropped` | Packets dropped at the broadcast subscriber — the broadcast lagged it, or the writer's queue was past its 32 MiB budget (or past its own first 4 MiB with the node's recorders past their shared 256 MiB) |
 | `index_entries` | Entries in `index.bin` (one per IDR) |
 | `current_pts_90khz` | Most recent PCR-derived PTS; `0` until the first PCR is seen |
 
@@ -847,7 +996,8 @@ Pull-based chunked TS export. The manager makes repeat calls with
 increasing `byte_offset` until the response carries `eof: true`. The
 edge re-opens the on-disk reader stateless-ly on each call —
 `InMemoryIndex::load` is cheap and the segment files are byte
-aligned, so no per-session bookkeeping is needed.
+aligned, so no per-session bookkeeping is needed: where a download
+stands travels with it, in `resume`.
 
 ```jsonc
 // Request
@@ -856,7 +1006,9 @@ aligned, so no per-session bookkeeping is needed.
   "clip_id": "clp_…",
   "format": "ts",            // optional; "ts" (default) or "mp4"
   "byte_offset": 0,          // optional; default 0
-  "chunk_bytes": 1048576     // optional; default 1 MiB, hard cap 3 MiB
+  "chunk_bytes": 1048576,    // optional; default 1 MiB, hard cap 3 MiB
+  "pin_plan_start": true,    // optional; this manager follows `resume` — see below
+  "resume": { … }            // optional; the previous chunk's `resume`, verbatim
 }
 
 // Response
@@ -868,15 +1020,81 @@ aligned, so no per-session bookkeeping is needed.
   "total_bytes": 12_345_678,
   "chunk_bytes": 1048576,
   "data": "<base64>",
-  "eof": false
+  "eof": false,
+  "resume": {                // TS, every chunk but the last; see below
+    "segment": 360, "offset": 1048576,
+    "end_segment": 372, "end_offset": 1203840,
+    "remaining": 11297102
+  }
 }
 ```
+
+**Every chunk of one download is read from one plan.** Being stateless,
+each call used to plan the export afresh and read its `byte_offset` against
+that plan, and a start the edge resolves for itself moves: an
+`export_recording` with no `from_pts_90khz` starts at the first segment
+retention has kept, and a recording at its retention limit loses that
+segment every time one closes — so a download spanning a prune had every
+later chunk read a segment further on, a file of the right length with that
+much cut out of the middle and nothing to say so. An `export_clip` had the
+same fault through `update_clip`, whose trim moved the in-point under the
+download.
+
+So every TS chunk but the last answers with `resume`: the segment and the
+byte in it where the next chunk starts, the segment and byte the plan ends
+at, and how many bytes lie between. It is this edge's to define; the
+manager does not read it, and sends it back unchanged with the next request,
+beside the `byte_offset` it goes on counting. A chunk that carries it is
+read from that position to that end, with no start resolved again:
+
+- segments behind the cursor are never looked at. They are delivered, and
+  they are what retention removes first, so a long download of a recording
+  at its retention limit outlives every prune behind it — planned from its
+  first chunk's start on every chunk instead, it failed at the first prune
+  with every byte it still owed on disk;
+- a segment still owed that has gone is refused, `replay_segment_missing` —
+  by name, or, for a segment no entry names (one with no random-access
+  point in it, which a plan steps over when it is missing), by the bytes
+  left no longer adding up. The manager ends the download short of its
+  `Content-Length` and logs the edge's text. One still owed that is open or
+  closing is `replay_segment_not_ready`;
+- an export with no `to_pts_90khz` stops at the end its first chunk
+  announced, however far the recording has grown since;
+- a `resume` this edge would not have handed out — an unknown field, a
+  value out of range, a position at or past the end it names or past what
+  the segments hold, more or fewer bytes than lie between — is refused
+  `replay_invalid_field`.
+
+A manager that follows `resume` says so with `pin_plan_start: true` on every
+request, the first included. Its first chunk of a whole-recording export (no
+`from_pts_90khz`) starts at the first entry whose segment is still on disk,
+so a recording retention has pruned downloads whole. MP4 chunks carry no
+`resume`: the file is built whole and cached.
+
+**A manager from before the cursor** (v0.89.0 and older) sends neither
+field, and the first chunk's request again with only the offset moved. Every
+chunk it asks for with no `from_pts_90khz`, the first included, is planned
+from the first entry `index.bin` names, which never moves. On a recording
+retention has pruned, the first chunk is refused `replay_segment_missing`,
+with a message saying why and asking for a clip, a from/to range or a
+manager upgrade — before that manager has committed to a response, so the
+Replay page shows the error at once rather than a download that stops after
+its first megabyte. A prune during the download fails the next chunk rather
+than splicing the file. A request carrying `pin_plan_start` but no `resume`
+past the first chunk is read the same way. A clip, or a range with
+`from_pts_90khz`, is planned from its own start on every chunk as before —
+so with such a manager a trim during a clip's download still shifts the
+rest of it. An edge from before the cursor ignores both fields and acks no
+`resume`, and a manager that follows the cursor then sends the request it
+always sent. There is no protocol version bump on either side.
 
 `export_recording` takes the same shape with `recording_id` instead
 of `clip_id`, plus optional `from_pts_90khz` / `to_pts_90khz` to
 bound the export to a PTS sub-range. Whole-recording exports are
 capped at 4 GiB total — over-cap requests fail with
 `replay_export_too_large` and the operator should mark a clip first.
+A clip export has no such cap, and its `resume` carries whatever it has
+left, however far past 4 GiB.
 
 The exported bytes are **packet-aligned MPEG-TS** — the manager can
 concatenate chunks in order and serve the result as
@@ -1068,7 +1286,11 @@ pruned the file.
 
 Any failure from the exact path therefore hands the clip to the segment
 fallback rather than failing the export — the common one being
-`stat segment …: No such file`. The clip then lands on segment boundaries
+`replay_segment_missing`, the exporter's refusal of a range that needs a
+segment no longer on disk (retention pruned it, or a crash or a failed close
+lost it) rather than a clip that plays straight across the hole. A window that
+reaches the segment still being recorded is refused `replay_segment_not_ready`
+and falls back too: the cutter does not wait for that segment to close. The clip then lands on segment boundaries
 instead of the frame, which is the documented trade, and the reason is logged.
 It used to be a permanent failure after three attempts, with media sitting on
 the relay that would have served it.

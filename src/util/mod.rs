@@ -10,7 +10,10 @@
 //!   multicast group join and send interface binding.
 //! - [`time`] -- Monotonic microsecond clock initialized once at startup via
 //!   `init_epoch()`. Provides `now_us()` for low-overhead timestamping.
+//! - [`byte_budget`] -- Byte budgets for the queues a stalled consumer falls
+//!   behind into: each queue's own, and the node-wide one its kind shares.
 
+pub mod byte_budget;
 pub mod cellular;
 pub mod clock_sync;
 pub mod network_interfaces;

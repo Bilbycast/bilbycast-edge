@@ -489,12 +489,14 @@ async fn cut_exact(
         // what the segment fallback is for, so hand it over rather than
         // failing the export.
         //
-        // The common cause is retention: the index still names a segment
-        // that has since been pruned, and the exporter answers "stat
-        // segment …: No such file". The relay's origin window is
-        // configured independently and often still holds the media, so a
-        // clip that the recorder has aged out of is frequently still
-        // cuttable — just on segment boundaries instead of the frame.
+        // The common cause is a segment the range needs that is not on disk:
+        // retention has pruned it while the index still names it, or a crash
+        // or a failed close lost it. The exporter refuses that range by name
+        // (`replay_segment_missing`) rather than cutting a clip that plays
+        // straight across the hole. The relay's origin window is configured
+        // independently and often still holds the media, so a clip the
+        // recorder cannot serve is frequently still cuttable — just on
+        // segment boundaries instead of the frame.
         //
         // Any other failure lands here too, and deliberately: a coarser
         // clip beats no clip, and the reason is logged either way.

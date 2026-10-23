@@ -717,7 +717,7 @@ attribute.
 | `segments_written` | Number of segments closed successfully — fsynced and atomically renamed into place by the recorder's closer. A segment whose close failed is not counted, and one still waiting for the closer is not counted yet |
 | `bytes_written` | Total bytes appended to segment files since flow start |
 | `segments_pruned` | Segments removed by retention (oldest-first by mtime) |
-| `packets_dropped` | Packets dropped by the broadcast subscriber — the broadcast lagged it, or the writer's queue was past its 32 MiB budget (the latter paired with `replay_writer_lagged` Critical events) |
+| `packets_dropped` | Packets dropped by the broadcast subscriber — the broadcast lagged it, or the writer's queue was past its 32 MiB budget or, past its own first 4 MiB, the node's recorders past their shared 256 MiB (the latter two paired with `replay_writer_lagged` Critical events) |
 | `index_entries` | Number of entries appended to `index.bin` (one per IDR) |
 | `current_pts_90khz` | Most recent PCR-derived PTS observed by the writer; `0` when no PCR seen yet |
 | `armed` (bool) | `true` while the writer is actively recording. `false` after `stop_recording`, on a fatal error, **and** while in `PreBuffer` mode (writer is rolling segments to disk but the operator hasn't pressed Start yet) — the manager UI uses this distinction to render "Pre-roll" vs "Recording" labels, and the stall detector gates on `armed = true` |
