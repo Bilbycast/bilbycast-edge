@@ -124,11 +124,15 @@ pub struct Resume {
 
 impl Resume {
     /// Refuse one this edge would never have handed out: a cursor at or past
-    /// the end it names, or more left than an export may hold.
+    /// the end it names, or nothing left. `remaining` is not capped here: a
+    /// clip export has no size limit (only `export_recording` refuses past
+    /// [`MAX_EXPORT_TOTAL_BYTES`]), so a clip over 4 GiB is handed a cursor
+    /// past it — and [`plan_from_resume`] holds the count to exactly the
+    /// bytes on disk between the cursor and its end, so a forged one reads
+    /// nothing a real plan would not.
     fn checked(self) -> Result<Self> {
         if (self.segment, self.offset) >= (self.end_segment, self.end_offset)
             || self.remaining == 0
-            || self.remaining > MAX_EXPORT_TOTAL_BYTES
         {
             bail!("replay_invalid_field: export resume {self:?} names no place in an export");
         }
@@ -1057,7 +1061,6 @@ mod tests {
             with("segment", serde_json::json!("1")),
             with("segment", serde_json::json!(5)),
             with("remaining", serde_json::json!(0)),
-            with("remaining", serde_json::json!(MAX_EXPORT_TOTAL_BYTES + 1)),
         ] {
             let err = ChunkCursor::from_request(&request).expect_err("refused");
             assert!(err.to_string().starts_with("replay_invalid_field"), "{request}: {err}");
@@ -1066,6 +1069,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path();
         five_segments(dir).await;
+
+        // A clip export has no size cap, so a clip over 4 GiB is handed a
+        // cursor with more than that left, and it comes back through the
+        // parse: the count is held to the bytes on disk instead, so this one
+        // — far more than the five segments hold — is refused there.
+        let large = serde_json::json!({ "segment": 1, "offset": 0, "end_segment": 4, "end_offset": 376, "remaining": MAX_EXPORT_TOTAL_BYTES + 1 });
+        let cursor = ChunkCursor::from_request(&serde_json::json!({ "pin_plan_start": true, "resume": large })).unwrap();
+        assert!(cursor.resume.is_some(), "a clip's cursor past 4 GiB is one this edge hands out");
+        let err = pull_chunk(dir, None, None, 188, cursor).await.expect_err("refused against the disk");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+
         for resume in [
             // An end this recording never closed: no walk to segment 4 billion.
             serde_json::json!({ "segment": 0, "offset": 0, "end_segment": u32::MAX, "end_offset": 1, "remaining": 1 }),

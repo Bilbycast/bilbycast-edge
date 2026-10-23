@@ -1093,6 +1093,8 @@ of `clip_id`, plus optional `from_pts_90khz` / `to_pts_90khz` to
 bound the export to a PTS sub-range. Whole-recording exports are
 capped at 4 GiB total — over-cap requests fail with
 `replay_export_too_large` and the operator should mark a clip first.
+A clip export has no such cap, and its `resume` carries whatever it has
+left, however far past 4 GiB.
 
 The exported bytes are **packet-aligned MPEG-TS** — the manager can
 concatenate chunks in order and serve the result as
