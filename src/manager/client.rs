@@ -5986,7 +5986,7 @@ async fn execute_command(
                 // Where the previous chunk said this one starts, for a
                 // manager that follows it — see `replay::export`.
                 async {
-                    let cursor = crate::replay::export::ChunkCursor::from_request(&action)?;
+                    let cursor = crate::replay::export::ChunkCursor::from_request(action)?;
                     crate::replay::export::export_clip_chunk(
                         &recording_id, &clip_id, byte_offset, max_bytes, cursor,
                     ).await
@@ -6051,7 +6051,7 @@ async fn execute_command(
                 ).await
             } else {
                 async {
-                    let cursor = crate::replay::export::ChunkCursor::from_request(&action)?;
+                    let cursor = crate::replay::export::ChunkCursor::from_request(action)?;
                     crate::replay::export::export_recording_chunk(
                         &recording_id, from_pts, to_pts, byte_offset, max_bytes, cursor,
                     ).await
