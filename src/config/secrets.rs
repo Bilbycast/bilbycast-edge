@@ -398,6 +398,81 @@ impl SecretsConfig {
             && mgr.node_id != self.manager_node_id
     }
 
+    /// Forget every secret that `body`, a whole config as JSON, sets to an
+    /// explicit `null`. [`merge_into`](Self::merge_into) then leaves it
+    /// cleared rather than putting this file's value back.
+    ///
+    /// serde reads an explicit `null` and an absent key alike, as `None`, and
+    /// `merge_into` fills every `None`. Only the JSON tells them apart.
+    /// Absent is a caller that does not model the secret: `GET
+    /// /api/v1/config` leaves every one of them out, so the body a client
+    /// reads, edits and puts back carries none. An explicit `null` is a caller
+    /// that names the secret and means to remove it. Without this a `PUT`
+    /// could remove none: `server.tls` (two paths, no off switch) above all.
+    ///
+    /// A node secret is only good with its own node ID, so a `null`
+    /// `manager.node_id` forgets the secret too. Otherwise the kept secret
+    /// would bring the ID back (see `merge_into`), and the node would go on
+    /// presenting the pair rather than the registration token the body names.
+    ///
+    /// A secret is matched where `merge_into` puts it back: a tunnel by its
+    /// `id`, a cellular uplink by its `interface`.
+    pub fn forget_nulled(&mut self, body: &serde_json::Value) {
+        fn nulled(block: &serde_json::Value, key: &str) -> bool {
+            block.get(key).is_some_and(serde_json::Value::is_null)
+        }
+
+        if let Some(mgr) = body.get("manager") {
+            if nulled(mgr, "node_secret") || nulled(mgr, "node_id") {
+                self.manager_node_secret = None;
+                self.manager_node_id = None;
+            }
+            if nulled(mgr, "registration_token") {
+                self.manager_registration_token = None;
+            }
+        }
+        if let Some(server) = body.get("server") {
+            if nulled(server, "tls") {
+                self.server_tls = None;
+            }
+            if nulled(server, "auth") {
+                self.server_auth = None;
+            }
+        }
+        if let Some(nr) = body.get("nmos_registration")
+            && nulled(nr, "bearer_token")
+        {
+            self.nmos_registration_bearer_token = None;
+        }
+        for tunnel in body.get("tunnels").and_then(|t| t.as_array()).into_iter().flatten() {
+            let Some(ts) = tunnel.get("id").and_then(|id| id.as_str()).and_then(|id| self.tunnels.get_mut(id))
+            else {
+                continue;
+            };
+            for (key, secret) in [
+                ("tunnel_encryption_key", &mut ts.tunnel_encryption_key),
+                ("tunnel_bind_secret", &mut ts.tunnel_bind_secret),
+                ("tunnel_psk", &mut ts.tunnel_psk),
+                ("tls_cert_pem", &mut ts.tls_cert_pem),
+                ("tls_key_pem", &mut ts.tls_key_pem),
+            ] {
+                if nulled(tunnel, key) {
+                    *secret = None;
+                }
+            }
+        }
+        for uplink in body.get("cellular_uplinks").and_then(|u| u.as_array()).into_iter().flatten() {
+            if nulled(uplink, "password")
+                && let Some(cs) = uplink
+                    .get("interface")
+                    .and_then(|i| i.as_str())
+                    .and_then(|i| self.cellular_uplinks.get_mut(i))
+            {
+                cs.password = None;
+            }
+        }
+    }
+
     fn merge_input_secrets(is: &InputSecrets, input: &mut InputConfig) {
         match input {
             InputConfig::Srt(srt) => {
@@ -1275,5 +1350,92 @@ mod manager_secret_tests {
         // A running config that has lost its secret holds nothing to save:
         // a node ID alone would rewrite `secrets.json` without the secret.
         assert!(SecretsConfig::extract_from(&with_manager(Some("node-9"), None)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod nulled_secret_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// A node holding every infrastructure secret there is.
+    fn node() -> AppConfig {
+        let mut config = serde_json::to_value(AppConfig::default()).expect("serialise");
+        let fields = json!({
+            "setup_token": "node-minted-token",
+            "manager": {
+                "enabled": true, "urls": ["wss://manager.example/ws/node"],
+                "node_id": "node-1", "node_secret": "node-secret", "registration_token": "spare-token",
+            },
+            "nmos_registration": { "registry_url": "http://registry.example", "bearer_token": "nmos-token" },
+            "tunnels": [{
+                "id": "11111111-2222-3333-4444-555555555555", "name": "t", "protocol": "udp",
+                "mode": "direct", "direction": "egress", "local_addr": "127.0.0.1:29901",
+                "peer_addr": "127.0.0.1:29911",
+                "tunnel_encryption_key": "a".repeat(64), "tunnel_bind_secret": "b".repeat(64),
+                "tunnel_psk": "tunnel-psk", "tls_cert_pem": "cert-pem", "tls_key_pem": "key-pem",
+            }],
+            "cellular_uplinks": [{ "interface": "wwan0", "address": "192.168.1.1", "password": "router-password" }],
+        });
+        config.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        config["server"]["tls"] = json!({ "cert_path": "/etc/edge/cert.pem", "key_path": "/etc/edge/key.pem" });
+        config["server"]["auth"] = json!({ "enabled": true, "jwt_secret": "j".repeat(32), "clients": [] });
+        serde_json::from_value(config).expect("node fixture")
+    }
+
+    /// The secrets the node holds after a `PUT` of `body`, merged as
+    /// `replace_config` merges it.
+    fn after_put(body: &Value) -> Value {
+        let mut kept = SecretsConfig::extract_from(&node());
+        kept.forget_nulled(body);
+        let mut put: AppConfig = serde_json::from_value(body.clone()).expect("body");
+        kept.merge_into(&mut put);
+        serde_json::to_value(SecretsConfig::extract_from(&put)).expect("serialise")
+    }
+
+    fn secrets_of(config: &AppConfig) -> Value {
+        serde_json::to_value(SecretsConfig::extract_from(config)).expect("serialise")
+    }
+
+    /// What `GET /api/v1/config` returns: every secret left out.
+    fn masked() -> Value {
+        let mut config = node();
+        config.mask_secrets();
+        serde_json::to_value(config).expect("serialise")
+    }
+
+    #[test]
+    fn a_secret_left_out_is_kept_and_one_named_null_removed() {
+        assert_eq!(after_put(&masked()), secrets_of(&node()), "the masked GET body keeps every secret");
+
+        let cases: [(&str, fn(&mut AppConfig)); 13] = [
+            ("/manager/node_secret", |c| c.manager.as_mut().unwrap().node_secret = None),
+            // A secret is only good with its node ID, so it goes too.
+            ("/manager/node_id", |c| {
+                let mgr = c.manager.as_mut().unwrap();
+                mgr.node_id = None;
+                mgr.node_secret = None;
+            }),
+            ("/manager/registration_token", |c| c.manager.as_mut().unwrap().registration_token = None),
+            ("/server/tls", |c| c.server.tls = None),
+            ("/server/auth", |c| c.server.auth = None),
+            ("/nmos_registration/bearer_token", |c| c.nmos_registration.as_mut().unwrap().bearer_token = None),
+            ("/tunnels/0/tunnel_encryption_key", |c| c.tunnels[0].tunnel_encryption_key = None),
+            ("/tunnels/0/tunnel_bind_secret", |c| c.tunnels[0].tunnel_bind_secret = None),
+            ("/tunnels/0/tunnel_psk", |c| c.tunnels[0].tunnel_psk = None),
+            ("/tunnels/0/tls_cert_pem", |c| c.tunnels[0].tls_cert_pem = None),
+            ("/tunnels/0/tls_key_pem", |c| c.tunnels[0].tls_key_pem = None),
+            ("/cellular_uplinks/0/password", |c| c.cellular_uplinks[0].password = None),
+            // A null the body puts somewhere no secret lives removes nothing.
+            ("/device_name", |_| {}),
+        ];
+        for (pointer, remove) in cases {
+            let mut body = masked();
+            let (block, key) = pointer.rsplit_once('/').unwrap();
+            body.pointer_mut(block).unwrap().as_object_mut().unwrap().insert(key.into(), Value::Null);
+            let mut expected = node();
+            remove(&mut expected);
+            assert_eq!(after_put(&body), secrets_of(&expected), "{pointer}: null");
+        }
     }
 }

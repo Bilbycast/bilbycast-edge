@@ -3757,7 +3757,7 @@ bilbycast-edge automatically persists configuration changes to disk when inputs,
 - **Delete flow** (`DELETE /api/v1/flows/{id}`) -- Removes the flow and saves.
 - **Add output** (`POST /api/v1/flows/{id}/outputs`) -- Assigns an existing output to the flow by ID and saves.
 - **Remove output** (`DELETE /api/v1/flows/{id}/outputs/{oid}`) -- Unassigns the output from the flow and saves.
-- **Replace config** (`PUT /api/v1/config`) -- Replaces the entire config and saves. An infrastructure secret the body leaves out — as `GET /api/v1/config` returns it — keeps the node's own value; see [api-reference.md](api-reference.md#put-apiv1config).
+- **Replace config** (`PUT /api/v1/config`) -- Replaces the entire config and saves. An infrastructure secret the body leaves out — as `GET /api/v1/config` returns it — keeps the node's own value, within a block the body keeps (leaving out the `manager` block, a tunnel or an uplink removes its secrets with it); one the body names `null` is removed. See [api-reference.md](api-reference.md#put-apiv1config).
 - **Get config** (`GET /api/v1/config`) -- Returns the config with infrastructure secrets stripped. User parameters (passphrases, credentials, keys) are included in the response.
 
 ### Atomic writes
