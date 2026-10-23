@@ -496,7 +496,9 @@ same rules) keeps it so:
     start at the first entry whose segment is still on disk
     (`reader::recording_start`) — the first entry outright named a pruned
     file on any recording old enough, and the replay failed at its first
-    read;
+    read. The rest of that export's chunks keep the start its first chunk
+    was planned from (see [`export_clip` /
+    `export_recording`](#export_clip--export_recording));
   - a cue, scrub or play into a lost window lands on the first random-access
     point after it still on disk (`Reader::playable_from`), and the
     `scrub_playback` ack names where it landed. That is where playback from
@@ -616,7 +618,7 @@ parsing strings.
 | `replay_invalid_field` | Error | `mark_out` / `rename_clip` / `update_clip` `name` > 256 chars or contains control chars; `description` > 4096 chars | Trim to limits |
 | `replay_invalid_range` | Error | `update_clip` whose prospective `out_pts_90khz <= in_pts_90khz` (empty or inverted); `export_recording` (TS or MP4) with both bounds supplied and `to_pts_90khz <= from_pts_90khz`; `export_clip` (TS or MP4) on a clip whose stored `out_pts_90khz <= in_pts_90khz`. `play_clip` with `to_pts_90khz < from_pts_90khz` (or below the clip's `in_pts` when `from` is omitted) is refused too, but its ack carries `replay_clip_not_found` with `replay_invalid_range` as the message; `scrub_playback` takes a single `pts_90khz` and cannot raise it | Pass a forward range |
 | `replay_invalid_tag` | Error | `update_clip` (or any tag-bearing path) with a tag that fails `[A-Z0-9_-]{1,32}`, more than 16 tags per clip | Use the v1 fixed set (`GOAL`/`FOUL`/`OFFSIDE`/`SAVE`/`YELLOW`/`VAR-CHECK`) or shorten / re-case |
-| `replay_segment_missing` | Error (in the error text) | An export (`export_clip` / `export_recording`, TS or MP4) needs a segment `index.bin` names that is not on disk — lost to a crash or a failed close, or pruned by retention; or a `cue_clip` / `play_clip` / `scrub_playback` lands in a lost window with no recorded media after it before the end of the range; or a whole-recording replay or export finds none of the index's segments on disk. Settled, not transient — told from a segment still being recorded, which is `replay_segment_not_ready`. `dispatch_replay_input_command` re-codes cue / play / scrub errors onto `replay_clip_not_found`, and the export verbs' `error_code` mapping in `src/manager/client.rs` does not name it yet, so an export ack carries `replay_export_failed` with this code at the head of the message | Export each side of the gap separately, or move the clip clear of it; a moment the recorder lost may still be on the relay's origin (the DVR cutter falls back to it by itself) |
+| `replay_segment_missing` | Error (in the error text) | An export (`export_clip` / `export_recording`, TS or MP4) needs a segment `index.bin` names that is not on disk — lost to a crash or a failed close, or pruned by retention; or a `cue_clip` / `play_clip` / `scrub_playback` lands in a lost window with no recorded media after it before the end of the range; or a whole-recording replay or export finds none of the index's segments on disk; or a later chunk of a TS export whose start retention removed while it was being downloaded. Settled, not transient — told from a segment still being recorded, which is `replay_segment_not_ready`. `dispatch_replay_input_command` re-codes cue / play / scrub errors onto `replay_clip_not_found`, and the export verbs' `error_code` mapping in `src/manager/client.rs` does not name it yet, so an export ack carries `replay_export_failed` with this code at the head of the message | Export each side of the gap separately, or move the clip clear of it; a moment the recorder lost may still be on the relay's origin (the DVR cutter falls back to it by itself) |
 | `replay_segment_not_ready` | Error (in the error text) | A cue, play, scrub or export (TS or MP4) reaches a segment `index.bin` already names that the live writer has yet to put in place — the open segment, or one waiting on its closer: a mark-out at "now" exported at once, a range ending in the newest few seconds; or a whole-recording replay or export of a recording whose first segment is still open. Transient. Carried in the error text the same way as `replay_segment_missing` (cue / play / scrub re-coded onto `replay_clip_not_found`, an export ack carrying `replay_export_failed`) | Retry once the segment has closed — within `segment_seconds` plus the closer's lag |
 | `replay_max_bytes_below_segment` | Warning | Retention can't satisfy `max_bytes` without deleting the live edge — operator's cap is smaller than one segment | Raise `max_bytes` to at least `segment_seconds × bitrate × 2` |
 | `replay_metadata_stale` | Warning | `recording.json` write failed after a segment's close; on restart the resume id is bounded by the directory listing and `index.bin` as well, so no id is reused | Investigate the disk (typically ENOSPC on the replay volume) |
@@ -958,7 +960,8 @@ aligned, so no per-session bookkeeping is needed.
   "clip_id": "clp_…",
   "format": "ts",            // optional; "ts" (default) or "mp4"
   "byte_offset": 0,          // optional; default 0
-  "chunk_bytes": 1048576     // optional; default 1 MiB, hard cap 3 MiB
+  "chunk_bytes": 1048576,    // optional; default 1 MiB, hard cap 3 MiB
+  "expect_plan_start_segment_id": 360  // optional; see below
 }
 
 // Response
@@ -970,9 +973,40 @@ aligned, so no per-session bookkeeping is needed.
   "total_bytes": 12_345_678,
   "chunk_bytes": 1048576,
   "data": "<base64>",
-  "eof": false
+  "eof": false,
+  "plan_start_segment_id": 360,      // TS only; see below
+  "plan_start_pts_90khz": 324000000
 }
 ```
+
+**Every chunk of one download must be planned from the same start.** Being
+stateless, each call plans the export afresh and reads its `byte_offset`
+against that plan. A start the edge resolves for itself moves: an
+`export_recording` with no `from_pts_90khz` starts at the first segment
+retention has kept, and on a recording that is pruning, retention removes that
+segment every segment or so — so a download spanning a prune had every later
+chunk read a segment further on, a file of the right length with that much cut
+out of the middle and nothing to say so. So every TS chunk acks where its plan
+starts: `plan_start_segment_id`, the segment the plan's first span is in, and
+`plan_start_pts_90khz`, the PTS it was resolved from. A manager that pins them
+sends, on every later chunk of the download, `expect_plan_start_segment_id`
+with the first ack's segment and — when its request had no `from_pts_90khz` —
+`from_pts_90khz` set to the first ack's PTS. A chunk whose plan starts
+anywhere else is refused with `replay_segment_missing` ("the export's start …
+was removed while it was being downloaded") rather than served, and so is one
+whose pinned start retention has since removed; the manager then ends the
+download short of its `Content-Length`. MP4 chunks carry neither field: the
+file is built whole and cached.
+
+A manager from before these fields ignores them and sends the first chunk's
+request again with only the offset moved. For it, a later chunk of an
+`export_recording` with no `from_pts_90khz` (and no
+`expect_plan_start_segment_id`) is planned from the first entry `index.bin`
+names, which never moves, rather than from what is on disk now — so a prune
+during the download fails the chunk by name instead of splicing the file. The
+first chunk still starts at the first segment retention kept, so on a
+recording retention has already pruned such a manager gets its first chunk
+and then a refusal; a whole-recording download needs a manager that pins.
 
 `export_recording` takes the same shape with `recording_id` instead
 of `clip_id`, plus optional `from_pts_90khz` / `to_pts_90khz` to

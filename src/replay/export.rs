@@ -11,6 +11,19 @@
 //! the on-disk reader stateless-ly — `InMemoryIndex::load` is cheap
 //! (~24 B/IDR) and the segment files are already byte-aligned, so a
 //! pull-based design avoids per-session bookkeeping on the edge.
+//!
+//! Stateless, every chunk plans the export afresh and reads its offset
+//! against that plan, so every chunk must plan from the same start. A start
+//! the edge resolves for itself — a whole-recording export starts at the
+//! first segment retention has kept — moves when retention prunes that
+//! segment mid-download, and a chunk planned from the new start served its
+//! offset from media one segment further on: a file of the right length with
+//! a segment's worth cut out of the middle and nothing to say so. So each
+//! chunk names the plan it was cut from ([`PlanStart`], acked as
+//! `plan_start_segment_id` / `plan_start_pts_90khz`), the manager sends the
+//! start back on every later chunk (`from_pts_90khz` when it had none, and
+//! `expect_plan_start_segment_id`), and a chunk whose plan starts anywhere
+//! else is refused rather than served.
 
 use std::path::Path;
 
@@ -55,6 +68,34 @@ pub struct ExportChunk {
     /// `true` on the last chunk — the next byte_offset would be
     /// `>= total_bytes`. Caller stops calling.
     pub eof: bool,
+    /// Where the plan this chunk was cut from starts, for the caller to pin
+    /// the rest of the export to — see the module docs. `None` for an export
+    /// built whole and cached (MP4), which has no plan per chunk.
+    pub plan_start: Option<PlanStart>,
+}
+
+impl ExportChunk {
+    /// Add where this chunk's plan starts to its export ack, as
+    /// `plan_start_segment_id` / `plan_start_pts_90khz` — nothing for an export
+    /// with no plan per chunk. A manager that pins them sends the PTS back as
+    /// `from_pts_90khz` when its request had none, and the segment as
+    /// `expect_plan_start_segment_id`, on every later chunk; one that does not
+    /// ignores them.
+    pub fn ack_plan_start(&self, ack: &mut serde_json::Value) {
+        if let Some(start) = self.plan_start {
+            ack["plan_start_segment_id"] = serde_json::json!(start.segment_id);
+            ack["plan_start_pts_90khz"] = serde_json::json!(start.pts_90khz);
+        }
+    }
+}
+
+/// Where an export's plan starts: the segment its first span is in, and the
+/// PTS it was resolved from. A request naming the same PTS plans from the
+/// same random-access point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanStart {
+    pub segment_id: u32,
+    pub pts_90khz: u64,
 }
 
 /// Resolved byte plan for an export: every segment it reads, in order, with
@@ -67,6 +108,7 @@ pub struct ExportChunk {
 /// was counted and not read, so an export declared bytes it never delivered.
 #[derive(Debug, Clone)]
 pub struct BytePlan {
+    start: PlanStart,
     spans: Vec<SegmentSpan>,
     total_bytes: u64,
 }
@@ -106,12 +148,15 @@ pub async fn read_full_range(dir: &std::path::Path, plan: BytePlan) -> Result<Ve
 
 /// Read up to `max_bytes` of the export starting at `byte_offset` from
 /// the export's logical zero. Re-opens the index + segment file on
-/// every call — stateless against the writer.
+/// every call — stateless against the writer. `expect_plan_start` is the
+/// segment the export's first chunk was planned from, on a later chunk of a
+/// download that pins it — see [`check_plan_start`].
 pub async fn export_clip_chunk(
     recording_id: &str,
     clip_id: &str,
     byte_offset: u64,
     max_bytes: u64,
+    expect_plan_start: Option<u64>,
 ) -> Result<ExportChunk> {
     let dir = super::recording_dir(recording_id);
     if !fs::try_exists(&dir).await.unwrap_or(false) {
@@ -126,19 +171,21 @@ pub async fn export_clip_chunk(
     let index = InMemoryIndex::load(&dir.join("index.bin")).await
         .context("load index for export")?;
     let plan = plan_pts_range(&index, &dir, clip.in_pts_90khz, Some(clip.out_pts_90khz)).await?;
+    check_plan_start(&plan, expect_plan_start)?;
     read_chunk(&dir, &plan, byte_offset, clamp_chunk(max_bytes)).await
 }
 
 /// Read up to `max_bytes` of a recording-level export, optionally
 /// bounded by `from_pts` / `to_pts`. Total bytes is capped at
 /// [`MAX_EXPORT_TOTAL_BYTES`] — over-cap exports must be carved into
-/// clips first.
+/// clips first. `expect_plan_start` as for [`export_clip_chunk`].
 pub async fn export_recording_chunk(
     recording_id: &str,
     from_pts_90khz: Option<u64>,
     to_pts_90khz: Option<u64>,
     byte_offset: u64,
     max_bytes: u64,
+    expect_plan_start: Option<u64>,
 ) -> Result<ExportChunk> {
     if let (Some(from), Some(to)) = (from_pts_90khz, to_pts_90khz)
         && to <= from {
@@ -150,6 +197,7 @@ pub async fn export_recording_chunk(
         to_pts_90khz,
         byte_offset,
         max_bytes,
+        expect_plan_start,
     )
     .await
 }
@@ -162,6 +210,7 @@ async fn export_recording_chunk_at(
     to_pts_90khz: Option<u64>,
     byte_offset: u64,
     max_bytes: u64,
+    expect_plan_start: Option<u64>,
 ) -> Result<ExportChunk> {
     if !fs::try_exists(dir).await.unwrap_or(false) {
         return Err(anyhow!("replay_clip_not_found"));
@@ -171,14 +220,41 @@ async fn export_recording_chunk_at(
     let from = match from_pts_90khz {
         Some(from) => from,
         // From the first media retention kept, not the first entry, which
-        // names a file it has removed on any recording old enough.
-        None => super::reader::recording_start(&index, dir).await?.pts_90khz,
+        // names a file it has removed on any recording old enough — for the
+        // first chunk, and for a later one whose request names the plan the
+        // first was cut from, which is refused below if that start has moved.
+        None if byte_offset == 0 || expect_plan_start.is_some() => {
+            super::reader::recording_start(&index, dir).await?.pts_90khz
+        }
+        // A later chunk from a manager that pins nothing: it sends the first
+        // chunk's request again with only the offset moved. The first media
+        // retention kept is not a start it can keep — a prune between two
+        // chunks moves it, and this chunk would be read against a plan a
+        // segment further on. The first entry never moves, as index entries
+        // are never removed; planned from it, a prune fails the chunk by name
+        // rather than splicing the file.
+        None => index.entries.first().ok_or_else(|| anyhow!("replay_no_index"))?.pts_90khz,
     };
     let plan = plan_pts_range(&index, dir, from, to_pts_90khz).await?;
+    check_plan_start(&plan, expect_plan_start)?;
     if plan.total_bytes > MAX_EXPORT_TOTAL_BYTES {
         bail!("replay_export_too_large");
     }
     read_chunk(dir, &plan, byte_offset, clamp_chunk(max_bytes)).await
+}
+
+/// Refuse a chunk whose plan does not start in the segment the export's first
+/// chunk was planned from: its offset would be read against other media.
+fn check_plan_start(plan: &BytePlan, expected: Option<u64>) -> Result<()> {
+    match expected {
+        Some(id) if id != u64::from(plan.start.segment_id) => bail!(
+            "replay_segment_missing: the export's start, segment {id:06}.ts, was removed while \
+             it was being downloaded — the rest of it would come from segment {:06}.ts on; \
+             export it again",
+            plan.start.segment_id,
+        ),
+        _ => Ok(()),
+    }
 }
 
 fn clamp_chunk(requested: u64) -> u64 {
@@ -269,7 +345,11 @@ async fn plan_pts_range(
             }
         }
     }
-    Ok(BytePlan { spans, total_bytes })
+    Ok(BytePlan {
+        start: PlanStart { segment_id: start.segment_id, pts_90khz: from_pts_90khz },
+        spans,
+        total_bytes,
+    })
 }
 
 async fn stat_segment(dir: &Path, id: u32) -> Result<SegmentState> {
@@ -305,6 +385,7 @@ async fn read_chunk(
             total_bytes: plan.total_bytes,
             byte_offset,
             eof: true,
+            plan_start: Some(plan.start),
         });
     }
     let want = max_bytes.min(plan.total_bytes - byte_offset);
@@ -334,7 +415,9 @@ async fn read_chunk(
         // Not skipped when it has gone: the plan counted it, and a read that
         // left it out would hand back fewer bytes than the total promised.
         // Gone between the plan and the read means retention has just removed
-        // it; the next request plans afresh and refuses the range by name.
+        // it; the next request plans afresh from the same start — the one the
+        // download pinned, or the first entry for a caller that pins nothing
+        // (see the module docs) — and refuses the range by name.
         let path = segment_path(dir, span.id);
         let mut f = fs::File::open(&path).await
             .with_context(|| format!("open segment {}", path.display()))?;
@@ -356,6 +439,7 @@ async fn read_chunk(
         total_bytes: plan.total_bytes,
         byte_offset,
         eof,
+        plan_start: Some(plan.start),
     })
 }
 
@@ -435,17 +519,33 @@ mod tests {
         assert!(past_eof.eof);
     }
 
-    /// Every chunk of an export, end to end, as the manager pulls it.
+    /// Every chunk of an export, end to end, as the manager pulls it: the
+    /// plan's start pinned from the first chunk's ack on.
     async fn pull_all(dir: &std::path::Path, from: Option<u64>, to: Option<u64>) -> Result<(Vec<u8>, u64)> {
         let mut data = Vec::new();
+        let mut pin: Option<PlanStart> = None;
         loop {
-            let c = export_recording_chunk_at(dir, from, to, data.len() as u64, 188).await?;
+            let c = pull_chunk(dir, from, to, data.len() as u64, pin).await?;
+            pin = pin.or(c.plan_start);
             data.extend_from_slice(&c.data);
             if c.eof {
                 return Ok((data, c.total_bytes));
             }
             assert!(!c.data.is_empty(), "a chunk short of the end came back empty: the total promised bytes the read never delivered");
         }
+    }
+
+    /// One 188-byte chunk at `offset`, as a manager pinning `pin` asks for it
+    /// — or, with no pin, as one that sends the same request every time.
+    async fn pull_chunk(
+        dir: &std::path::Path,
+        from: Option<u64>,
+        to: Option<u64>,
+        offset: u64,
+        pin: Option<PlanStart>,
+    ) -> Result<ExportChunk> {
+        let from = from.or(pin.map(|p| p.pts_90khz));
+        export_recording_chunk_at(dir, from, to, offset, 188, pin.map(|p| p.segment_id.into())).await
     }
 
     /// Five two-packet segments, each indexed at its start, every byte
@@ -561,11 +661,77 @@ mod tests {
         assert_eq!(data, segments[2..].concat());
     }
 
+    /// Retention pruning a whole-recording export's first segment mid-download
+    /// fails the download by name; it does not splice it. Planned afresh from
+    /// the first segment still on disk, every later chunk read its offset a
+    /// segment further on: a file of the right length with a segment cut out
+    /// of the middle. A chunk pinned to the first chunk's start plans from
+    /// there; one naming only the start's segment is refused for planning
+    /// from another.
+    #[tokio::test]
+    async fn retention_mid_download_fails_the_download_rather_than_splicing_it() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        five_segments(dir).await;
+        let first = pull_chunk(dir, None, None, 0, None).await.unwrap();
+        let pin = first.plan_start.expect("a TS export names its plan's start");
+        assert_eq!(pin, PlanStart { segment_id: 0, pts_90khz: 0 });
+        // Retention prunes segment 0.
+        fs::remove_file(dir.join("000000.ts")).await.unwrap();
+        let err = pull_chunk(dir, None, None, 188, Some(pin)).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+        let err = export_recording_chunk_at(dir, None, None, 188, 188, Some(0)).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+        assert!(err.to_string().contains("removed while it was being downloaded"), "{err}");
+    }
+
+    /// A manager that pins nothing sends the first chunk's request again with
+    /// only the offset moved. The later chunks plan from the first entry
+    /// `index.bin` names, which never moves, so a prune mid-download fails
+    /// the chunk by name — and a download nothing prunes is whole.
+    #[tokio::test]
+    async fn a_download_that_pins_nothing_fails_on_a_prune_rather_than_splicing() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let segments = five_segments(dir).await;
+        let mut data = Vec::new();
+        loop {
+            let c = pull_chunk(dir, None, None, data.len() as u64, None).await.unwrap();
+            data.extend_from_slice(&c.data);
+            if c.eof {
+                break;
+            }
+        }
+        assert_eq!(data, segments.concat());
+
+        pull_chunk(dir, None, None, 0, None).await.unwrap();
+        fs::remove_file(dir.join("000000.ts")).await.unwrap();
+        let err = pull_chunk(dir, None, None, 188, None).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+    }
+
+    /// The ack carries the plan's start under the names the manager pins,
+    /// and an export with no plan per chunk adds nothing, so a manager sees
+    /// today's payload from it.
+    #[tokio::test]
+    async fn the_ack_names_the_plans_start() {
+        let tmp = TempDir::new().unwrap();
+        five_segments(tmp.path()).await;
+        let chunk = pull_chunk(tmp.path(), Some(100_000), None, 0, None).await.unwrap();
+        let mut ack = serde_json::json!({ "eof": chunk.eof });
+        chunk.ack_plan_start(&mut ack);
+        assert_eq!(ack["plan_start_segment_id"], 1);
+        assert_eq!(ack["plan_start_pts_90khz"], 100_000);
+        let mut ack = serde_json::json!({});
+        ExportChunk { plan_start: None, ..chunk }.ack_plan_start(&mut ack);
+        assert_eq!(ack, serde_json::json!({}));
+    }
+
     #[tokio::test]
     async fn export_recording_chunk_rejects_inverted_range() {
         // Inverted range short-circuits before any filesystem touch,
         // so the test doesn't need a populated replay root.
-        let err = export_recording_chunk("nonexistent", Some(500), Some(100), 0, 188)
+        let err = export_recording_chunk("nonexistent", Some(500), Some(100), 0, 188, None)
             .await.unwrap_err();
         assert_eq!(err.to_string(), "replay_invalid_range");
     }
