@@ -1772,7 +1772,10 @@ pub fn edge_capabilities() -> Vec<&'static str> {
 /// credentials whatever the files do, and the next save that succeeds writes
 /// them. A `secrets.json` that cannot take them is reported, since until then
 /// a restart presents the spent token; a `config.json` that cannot be
-/// rewritten is only logged.
+/// rewritten is only logged. It still has the setup wizard open, but a
+/// restart reads the closure from `secrets.json` too: that `config.json` does
+/// not hold the node ID the secret was issued for
+/// (`SecretsConfig::registered_since`).
 async fn persist_credentials(
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &Path,
@@ -10536,12 +10539,29 @@ mod manager_link_tests {
     }
 
     /// `secrets.json` alone decides what a restart presents after a
-    /// registration too. The node ID lived only in `config.json`, so one that
-    /// could not be written left a restart with the issued secret and no node
-    /// ID to present it with — and the registration token was spent.
+    /// registration, and that the registration closed the setup wizard. The
+    /// node ID lived only in `config.json`, so one that could not be written
+    /// left a restart with the issued secret and no node ID to present it with
+    /// — and the registration token was spent. With the ID in `secrets.json`
+    /// the node authenticated, but `config.json` still had the wizard open:
+    /// the start minted a fresh token and, on the full disk that failed the
+    /// registration's write, exited when it could not save it; with the disk
+    /// freed, it served `/setup` on a registered node for good.
     #[tokio::test]
     async fn a_registration_beside_an_unwritable_config_json_authenticates_after_a_restart() {
+        /// What `main` does at start before the manager link: load the
+        /// files, then mint a setup token if the wizard is open without one.
+        fn start(edge: &Edge) -> (AppConfig, Option<String>) {
+            let mut config =
+                crate::config::persistence::load_config_split(&edge.deps.config_path, &edge.deps.secrets_path)
+                    .expect("the start reads its files");
+            let minted = crate::setup::mint_setup_token(&edge.deps.config_path, &edge.deps.secrets_path, &mut config);
+            (config, minted)
+        }
+
         let mut edge = Edge::new(manager_config(None, Some("one-time-token")));
+        // A fresh install: the wizard open, its first-boot token minted.
+        edge.deps.app_config.write().await.setup_token = Some("first-boot-token".into());
         edge.save().await;
         Edge::block_writes_to(&edge.deps.config_path);
         let creds = edge.credentials();
@@ -10551,13 +10571,30 @@ mod manager_link_tests {
             .await;
         assert_eq!(shown["registration_token"], "one-time-token");
 
-        let restarted = crate::config::persistence::load_config_split(&edge.deps.config_path, &edge.deps.secrets_path)
-            .unwrap()
-            .manager
-            .unwrap();
-        let shown = build_auth_message(&restarted)["payload"].clone();
-        assert_eq!(shown["node_id"], "node-9", "{shown}");
-        assert_eq!(shown["node_secret"], "issued-secret", "{shown}");
+        for disk in ["still full", "freed"] {
+            if disk == "freed" {
+                std::fs::remove_dir(edge.deps.config_path.with_extension("json.tmp")).unwrap();
+            }
+            let (restarted, minted) = start(&edge);
+            assert_eq!(minted, None, "{disk}: the start minted a setup token");
+            assert!(!restarted.setup_enabled, "{disk}: the wizard the registration closed is open");
+            assert!(restarted.setup_token.is_none(), "{disk}");
+            let shown = build_auth_message(restarted.manager.as_ref().unwrap())["payload"].clone();
+            assert_eq!(shown["node_id"], "node-9", "{disk}: {shown}");
+            assert_eq!(shown["node_secret"], "issued-secret", "{disk}: {shown}");
+        }
+
+        // Once `config.json` has been written since the registration, it
+        // decides again: an operator re-opens the wizard by editing it.
+        edge.save().await;
+        let mut on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&edge.deps.config_path).unwrap()).unwrap();
+        assert_eq!(on_disk["setup_enabled"], false);
+        on_disk["setup_enabled"] = true.into();
+        std::fs::write(&edge.deps.config_path, on_disk.to_string()).unwrap();
+        let (reopened, minted) = start(&edge);
+        assert!(reopened.setup_enabled, "the wizard an operator re-opened is closed");
+        assert!(minted.is_some());
     }
 
     /// A `secrets.json` that cannot take the issued credentials is reported,

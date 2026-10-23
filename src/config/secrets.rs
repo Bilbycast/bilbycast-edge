@@ -367,6 +367,37 @@ impl SecretsConfig {
         }
     }
 
+    /// Whether `config`, `config.json` as a load reads it, predates the
+    /// registration that issued this file's node secret: it does not hold the
+    /// node ID the secret was issued for.
+    ///
+    /// A registration writes `secrets.json` first and on its own, then
+    /// `config.json`, so a `config.json` that could not be written (a full
+    /// disk fails the bigger file alone) is left exactly like this. What the
+    /// registration recorded in `config.json` alone is then missing. One is the
+    /// node ID, which [`merge_into`](Self::merge_into) brings with the secret.
+    /// The other is the setup wizard's closure, which
+    /// [`load_config_split`](crate::config::persistence::load_config_split)
+    /// restores on this answer.
+    ///
+    /// Only a registration gives the secret a new ID in practice: the setup
+    /// wizard keeps both, a manager push may not touch the `manager` block,
+    /// and a `PUT /api/v1/config` that leaves the secret out keeps its ID with
+    /// it. A `PUT` naming a new pair is read the same way, which errs towards
+    /// a closed wizard. A registration the manager answers with the ID
+    /// `config.json` already holds (a token regenerated for the same node)
+    /// cannot be told apart this way.
+    pub fn registered_since(&self, config: &AppConfig) -> bool {
+        let Some(ref mgr) = config.manager else {
+            return false;
+        };
+        // As in `merge_into`: only a secret the file supplies brings its ID.
+        self.manager_node_secret.is_some()
+            && mgr.node_secret.is_none()
+            && self.manager_node_id.is_some()
+            && mgr.node_id != self.manager_node_id
+    }
+
     fn merge_input_secrets(is: &InputSecrets, input: &mut InputConfig) {
         match input {
             InputConfig::Srt(srt) => {

@@ -99,8 +99,29 @@ pub fn load_config_split(config_path: &Path, secrets_path: &Path) -> Result<AppC
 
         // Check if secrets.json has legacy flow secrets that need migration
         let has_legacy_flows = !secrets.flows.is_empty();
+        // Asked before the merge, which brings the secret's node ID over the
+        // one config.json holds.
+        let registered_since = secrets.registered_since(&config);
 
         secrets.merge_into(&mut config);
+
+        // A registration closes the setup wizard. Its config.json could not be
+        // written, so that file still has the wizard open, and the next start
+        // would mint a fresh token and serve /setup on a registered node. That
+        // stays so for good, since every later save writes back what was
+        // loaded. The node ID is what tells this apart from an operator who
+        // re-opened the wizard by editing config.json: that file, written
+        // after the registration, holds the registration's node ID.
+        if registered_since && config.setup_enabled {
+            tracing::info!(
+                "{} predates the manager registration recorded in {}; the setup wizard that \
+                 registration closed stays closed",
+                config_path.display(),
+                secrets_path.display()
+            );
+            config.setup_enabled = false;
+            config.setup_token = None;
+        }
 
         if has_legacy_flows {
             // Re-save both files: flow params now go into config.json,
