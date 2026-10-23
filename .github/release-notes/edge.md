@@ -4,6 +4,21 @@ Release of bilbycast-edge version {{VERSION}}.
 
 {{CHANGES}}
 
+## Upgrading from v0.115.0 or earlier
+
+<!-- Static text: remove once no supported upgrade starts at v0.115.0 or earlier. -->
+- **`PUT /api/v1/config` keeps the secrets its body leaves out.** `GET /api/v1/config` leaves out every infrastructure secret. Putting that body back used to empty the node secret, `server.auth`, `server.tls` and the tunnel keys, and the next save stranded the node at its restart. Now:
+  - a secret the body leaves out is kept, and one it names `null` is removed;
+  - a body that names `setup_token` is refused with 400;
+  - a tunnel the body adds or changes is refused with 400 without the key its mode needs (relay: `tunnel_encryption_key`, direct: `tunnel_psk`);
+  - a body that does not parse is 400, where it was 422.
+
+  A script that removed a secret by leaving it out must now send `null`. See [api-reference.md](https://github.com/Bilbycast/bilbycast-edge/blob/main/docs/api-reference.md#put-apiv1config).
+- **A registration survives a restart.** The node keeps the node ID it registered under in `secrets.json` beside its secret, so a registration whose `config.json` write failed still authenticates after a restart, and the setup wizard stays closed. A credential save that fails raises the new Warning event `manager_credentials_not_saved`.
+- **Pair with bilbycast-manager v0.90.0 for whole downloads at the retention limit.** With that manager, a Replay recording at its retention limit downloads whole: each chunk is read from where the last one ended, so retention removing segments already delivered no longer fails the download. With an older manager, a recording retention has already pruned is refused at the first chunk, as before. Every pairing works.
+- **Recorder and CMAF intake queues are bounded in bytes, per queue and node-wide.** Each recorder and each CMAF output queues at most 32 MiB, within 256 MiB for all recorders and 256 MiB for all CMAF outputs on the node. A node whose replay disk or origin cannot keep up drops past those limits and counts the drops in `packets_dropped`.
+- **A recording one config push moves between flows is handed over.** When two flows name one `storage_id`, the flow taking the recording waits for the other to let it go. If the other flow is still running 30 s later, it is refused with `replay_recording_in_use`.
+
 ## Upgrading from v0.114.1 or earlier
 
 <!-- Static text: remove once no supported upgrade starts at v0.114.1 or earlier. -->
