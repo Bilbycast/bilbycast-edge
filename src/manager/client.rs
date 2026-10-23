@@ -1966,6 +1966,13 @@ async fn rotate_node_secret(
 /// push any JPEG whose generation counter has advanced since the last send.
 /// Each write goes through `send_bounded`, and its `Err` ends the session —
 /// the same as the stats / health / event send sites.
+///
+/// The flows and their per-input accumulators are copied out of the stats
+/// maps before anything is written. Iterating a `DashMap` holds a read guard
+/// on each shard it visits, and a write can wait up to `WRITE_STALL_LIMIT`
+/// for a manager that has stopped reading: held across that wait, the guard
+/// blocks every writer to the shard — a flow starting or stopping registers
+/// and unregisters there — and blocks its thread, not just its task.
 async fn send_pending_thumbnails<S>(
     flow_manager: &Arc<FlowManager>,
     thumbnail_generations: &mut HashMap<String, u64>,
@@ -1976,11 +1983,13 @@ where
     S::Error: std::fmt::Display,
 {
     use base64::Engine;
-    let stats = flow_manager.stats();
-    for entry in stats.flow_stats.iter() {
-        let flow_id = entry.key().clone();
-        let acc = entry.value();
-
+    let flows: Vec<_> = flow_manager
+        .stats()
+        .flow_stats
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
+    for (flow_id, acc) in flows {
         // Flow-level thumbnail (what outputs are sending).
         if let Some(thumb_acc) = acc.thumbnail.get() {
             let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
@@ -2017,9 +2026,12 @@ where
         }
 
         // Per-input thumbnails (what each source is receiving).
-        for per_input in acc.per_input_thumbnails.iter() {
-            let input_id = per_input.key().clone();
-            let thumb_acc = per_input.value();
+        let inputs: Vec<_> = acc
+            .per_input_thumbnails
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        for (input_id, thumb_acc) in inputs {
             let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
             let gen_key = format!("input:{flow_id}:{input_id}");
             let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
@@ -10726,5 +10738,45 @@ mod manager_link_tests {
         assert_eq!(on_disk.node_id.as_deref(), Some("node-9"));
         assert_eq!(on_disk.node_secret.as_deref(), Some("issued-secret"));
         assert!(on_disk.registration_token.is_none());
+    }
+
+    // ── Thumbnails ─────────────────────────────────────────────────
+
+    /// A thumbnail write the manager is not reading holds no lock on the
+    /// stats maps. The scan used to iterate them across its writes, so a
+    /// write waiting on the manager — up to `WRITE_STALL_LIMIT` — held a read
+    /// guard on its flow's shard of both maps, and a flow starting or
+    /// stopping on that shard blocked its thread until the write gave up.
+    #[tokio::test]
+    async fn a_stalled_thumbnail_write_holds_no_lock_on_the_stats() {
+        use dashmap::try_result::TryResult;
+
+        let edge = Edge::new(manager_config(Some(OLD), None));
+        let stats = edge.deps.flow_manager.stats();
+        let flow = stats.register_flow("flow-1".into(), "flow-1".into(), "rtp".into());
+        let thumbnail = Arc::new(crate::stats::collector::ThumbnailAccumulator::new());
+        thumbnail.store(bytes::Bytes::from(vec![0u8; 8192]));
+        flow.per_input_thumbnails.insert("input-1".into(), thumbnail);
+
+        // The manager's end is held open and never read, so the first frame,
+        // far bigger than the pipe, cannot finish.
+        let (edge_io, _manager_io) = tokio::io::duplex(1024);
+        let (mut sink, _stream) = WebSocketStream::from_raw_socket(edge_io, Role::Client, None).await.split();
+        let mut sent = HashMap::new();
+        let send = send_pending_thumbnails(&edge.deps.flow_manager, &mut sent, &mut sink);
+        tokio::pin!(send);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err(),
+            "the thumbnail write must be waiting on the manager"
+        );
+
+        assert!(
+            matches!(stats.flow_stats.try_get_mut("flow-1"), TryResult::Present(_)),
+            "the write holds the flows' map locked"
+        );
+        assert!(
+            matches!(flow.per_input_thumbnails.try_get_mut("input-1"), TryResult::Present(_)),
+            "the write holds the flow's per-input thumbnails locked"
+        );
     }
 }
