@@ -733,7 +733,7 @@ pub async fn get_config(
 /// and puts back carries none, and replacing the config wholesale used to
 /// empty them all: the node secret, `server.auth`, `server.tls`, the tunnel
 /// keys, the cellular routers' passwords. Only in memory at first —
-/// `secrets.json` is not written while it would hold nothing — but the next
+/// `secrets.json` was not written while it would hold nothing — but the next
 /// save with any secret in it rewrote the file without the node secret, and
 /// the node could not authenticate to its manager after a restart.
 /// They are kept by [`crate::config::secrets::SecretsConfig::merge_into`], as
@@ -1195,6 +1195,13 @@ mod whole_config_tests {
         .expect("tunnel fixture")
     }
 
+    /// Run `node` in `state`, as a load leaves it, with its files written.
+    async fn install(state: &AppState, node: AppConfig) {
+        crate::config::persistence::save_config_split(&state.config_path, &state.secrets_path, &node)
+            .expect("write the node's files");
+        *state.config.write().await = node;
+    }
+
     /// Put the node in `state` as it runs after a load — registered with its
     /// manager, its API behind auth and TLS, holding a tunnel's keys and its
     /// setup token — with its files written.
@@ -1218,9 +1225,7 @@ mod whole_config_tests {
             cert_path: "/etc/bilbycast/edge-cert.pem".into(),
             key_path: "/etc/bilbycast/edge-key.pem".into(),
         });
-        crate::config::persistence::save_config_split(&state.config_path, &state.secrets_path, &node)
-            .expect("write the node's files");
-        *state.config.write().await = node;
+        install(state, node).await;
     }
 
     fn auth(jwt_secret: &str) -> crate::api::auth::AuthConfig {
@@ -1370,6 +1375,61 @@ mod whole_config_tests {
             assert_eq!(manager.node_id, None, "{what}");
             assert_eq!(manager.node_secret, None, "{what}: the secret outlived its node ID");
             assert_eq!(manager.registration_token.as_deref(), Some("new-registration-token"), "{what}");
+        }
+    }
+
+    /// A `null` on the node's last infrastructure secret removes it at the
+    /// restart too. `secrets.json` was not written while it would hold
+    /// nothing, so the restart loaded the secret back from it.
+    #[tokio::test]
+    async fn a_put_removes_the_last_secret_it_names_null() {
+        let tls = || crate::config::models::TlsConfig {
+            cert_path: "/etc/bilbycast/edge-cert.pem".into(),
+            key_path: "/etc/bilbycast/edge-key.pem".into(),
+        };
+        let registered = AppConfig {
+            setup_enabled: false,
+            manager: Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true,
+                    "urls": ["wss://manager.example/ws/node"],
+                    "node_id": "node-1",
+                    "node_secret": "node-secret",
+                }))
+                .expect("manager fixture"),
+            ),
+            ..Default::default()
+        };
+        let mut standalone = AppConfig { setup_enabled: false, ..Default::default() };
+        standalone.server.tls = Some(tls());
+        let mut standalone_with_auth = standalone.clone();
+        standalone_with_auth.server.auth = Some(auth(JWT_SECRET));
+
+        for (node, nulled) in [
+            (&registered, &["manager", "node_secret"][..]),
+            (&registered, &["manager", "node_id"][..]),
+            (&standalone, &["server", "tls"][..]),
+            (&standalone_with_auth, &["server", "tls", "auth"][..]),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (state, _events) = state(dir.path());
+            install(&state, node.clone()).await;
+
+            let mut body = masked_get_body(&state).await;
+            for key in &nulled[1..] {
+                body[nulled[0]][*key] = serde_json::Value::Null;
+            }
+            let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+            assert!(replaced.is_ok(), "{nulled:?}: {}", refusal(replaced));
+
+            for (what, config) in running_and_restarted(&state).await {
+                let what = format!("{what}, {nulled:?} named null");
+                assert!(SecretsConfig::extract_from(&config).is_empty(), "{what}: a secret is still held");
+                assert!(config.server.tls.is_none() && config.server.auth.is_none(), "{what}");
+                if let Some(manager) = config.manager {
+                    assert_eq!(manager.node_secret, None, "{what}");
+                }
+            }
         }
     }
 }

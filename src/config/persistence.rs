@@ -209,8 +209,8 @@ pub fn save_config_split(
 }
 
 /// The first half of [`save_config_split`]: write `secrets.json` alone, from
-/// the secrets in `config`. Writes nothing when `config` holds none, as the
-/// split save always has.
+/// the secrets in `config`. Writes nothing only when `config` holds none and
+/// there is no file to replace, so a node that never held a secret has none.
 ///
 /// This is the file that decides which secrets a restart holds, and it is
 /// one atomic replacement: `Err` leaves it exactly as it was (the rename is
@@ -220,7 +220,12 @@ pub fn save_config_split(
 /// `config.json` after this has landed.
 pub fn save_split_secrets(secrets_path: &Path, config: &AppConfig) -> Result<()> {
     let secrets = SecretsConfig::extract_from(config);
-    if secrets.is_empty() {
+    // A file that exists is replaced even when there is nothing left to hold.
+    // Skipped, it kept the node's last secret after the running config had
+    // dropped it (a `PUT /api/v1/config` naming it `null`), and the next
+    // start loaded it back. Replaced rather than removed, so a failed save
+    // still leaves the old file whole.
+    if secrets.is_empty() && !secrets_path.exists() {
         return Ok(());
     }
     let secrets_dir = secrets_path.parent().unwrap_or(Path::new("."));
@@ -433,6 +438,33 @@ mod tests {
             Some("rotated-secret"),
             "the rotated node_secret must be the one that survived the cut"
         );
+    }
+
+    /// A save whose config holds no secret replaces the `secrets.json` that
+    /// held its last one, so a restart does not load it back; with no file
+    /// to replace it writes none.
+    #[test]
+    fn a_save_with_no_secret_left_empties_secrets_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let secrets_path = dir.path().join("secrets.json");
+        let standalone = AppConfig { setup_enabled: false, ..Default::default() };
+
+        save_config_split(&config_path, &secrets_path, &standalone).unwrap();
+        assert!(!secrets_path.exists(), "a node with no secret has no secrets.json");
+
+        let mut with_tls = standalone.clone();
+        with_tls.server.tls = Some(TlsConfig {
+            cert_path: "/etc/bilbycast/edge-cert.pem".into(),
+            key_path: "/etc/bilbycast/edge-key.pem".into(),
+        });
+        save_config_split(&config_path, &secrets_path, &with_tls).unwrap();
+        assert!(load_config_split(&config_path, &secrets_path).unwrap().server.tls.is_some());
+
+        save_config_split(&config_path, &secrets_path, &standalone).unwrap();
+        let restarted = load_config_split(&config_path, &secrets_path).unwrap();
+        assert!(restarted.server.tls.is_none(), "the dropped TLS came back from secrets.json");
+        assert!(SecretsConfig::extract_from(&restarted).is_empty());
     }
 
     /// A save that fails takes its temporary file with it, from both files'
