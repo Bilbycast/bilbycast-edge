@@ -88,7 +88,11 @@ pub fn spawn_cmaf_output(
     // Not the broadcast receiver itself: the loop awaits the origin while it
     // closes a segment, and the intake is what keeps reading meanwhile — see
     // `intake`.
-    let mut rx = intake::Intake::spawn(broadcast_tx.subscribe(), intake::INTAKE_BUDGET_BYTES);
+    let mut rx = intake::Intake::spawn(
+        broadcast_tx.subscribe(),
+        intake::INTAKE_BUDGET_BYTES,
+        &intake::NODE_INTAKES,
+    );
 
     let mut egress_static = EgressMediaSummaryStatic {
         transport_mode: Some("cmaf".to_string()),
@@ -5037,7 +5041,7 @@ seg-00042.m4s?token=abc
         // What the output reads: the intake says how long a packet waited,
         // and the close's sample is that much before now.
         let (tx, src) = broadcast::channel::<RtpPacket>(16);
-        let mut rx = intake::Intake::spawn(src, intake::INTAKE_BUDGET_BYTES);
+        let mut rx = intake::Intake::spawn(src, intake::INTAKE_BUDGET_BYTES, &intake::NODE_INTAKES);
         tx.send(RtpPacket {
             data: bytes::Bytes::from_static(&[0x47; 188]),
             sequence_number: 0,

@@ -72,12 +72,30 @@ project-wide "never block the data path" invariant.
     time, the shared header of its `Bytes`, the allocator's own — because a
     188-byte packet is no bigger than those together. In time that is about
     15 s of a 10 Mbit/s SDI feed and 24 s of 1316-byte datagrams at the same
-    rate. It is per output, and the renditions of a flow share one origin
-    connection, so a stall that fills one fills them all: the worst case is
-    32 MiB times the flow's CMAF outputs, freed as they catch up.
-  - **Past the budget it drops**, and reports the loss in order as the
+    rate.
+  - **And 256 MiB between every intake on the node** (`NODE_INTAKES`,
+    `NODE_INTAKE_BUDGET_BYTES`), because the per-output budget alone bounds
+    nothing node-wide: the renditions of a flow share one origin
+    connection, so a stall that fills one fills them all, and a node carries
+    as many outputs as are configured. Five DVR sessions of two renditions
+    each could hold 320 MiB at once without it; through such a stall those
+    ten now get 25.6 MiB each, about 11 s of a 10 Mbit/s SDI feed, against
+    the 3–4 s stalls voyager lost packets to. Eight outputs' full budgets;
+    a node with more outputs stalled, or a longer stall, drops sooner. The
+    charge is a bound, not what is resident: a flow's renditions queue clones
+    of one payload, which is held once. Not shared with the recorders' node
+    budget (see `docs/replay.md`): a disk and an origin fail independently.
+  - **Past either budget it drops**, and reports the loss in order as the
     broadcast would (`Lagged(n)`), so the `packets_dropped` stat and the
-    `broadcast lag` warning cover both.
+    `broadcast lag` warning cover all three. An output stopped with a
+    backlog gives its charge back to the node as it goes.
+  - **The real worst case**, for the queues that let a consumer fall behind:
+    `min(32 MiB × CMAF outputs, 256 MiB)` in intakes plus
+    `min(32 MiB × recording flows, 256 MiB)` in recorder queues — 512 MiB at
+    most beyond each flow's own broadcast ring, reached only when an origin
+    stall and a disk stall each fill eight queues' worth at once, and freed
+    as the consumers catch up. A queued message still in its flow's ring is
+    not held twice.
   - **A backlog never reaches the published dates.** The intake records when
     it took each packet off the broadcast, and a segment is dated as of the
     arrival of the packet that closed it — see [The close-time sample is
