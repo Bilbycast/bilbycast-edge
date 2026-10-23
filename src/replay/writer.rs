@@ -61,12 +61,15 @@
 //!   file that is missing rather than media recorded after the restart. An id
 //!   nothing names — a segment lost before its first entry — is used again.
 //! - **A gap in the ids is not the end of the recording.** A crash leaves one
-//!   where the segments it lost were, and so does a close that fails. Readers
-//!   step over it to the next segment on disk (`Reader::advance_segment`; the
-//!   exporter has always skipped a missing segment). Closing such a gap
-//!   instead would mean handing the lost ids out again, and so first cutting
-//!   their entries out of `index.bin` on the strength of a directory scan —
-//!   and a failed close leaves a gap whatever the numbering does.
+//!   where the segments it lost were, and so does a close that fails.
+//!   Playback steps over it to the next segment on disk
+//!   (`Reader::advance_segment`), and lands after it when cued or scrubbed
+//!   into it; an export that needs a segment `index.bin` names there is
+//!   refused with `replay_segment_missing` rather than cut short
+//!   (`export::plan_pts_range`). Closing such a gap instead would mean
+//!   handing the lost ids out again, and so first cutting their entries out
+//!   of `index.bin` on the strength of a directory scan — and a failed close
+//!   leaves a gap whatever the numbering does.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

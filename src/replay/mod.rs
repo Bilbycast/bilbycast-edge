@@ -35,7 +35,7 @@
 //! - SMPTE timecode extraction reuses
 //!   [`crate::engine::content_analysis::timecode::TimecodeTracker`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,35 @@ pub fn replay_root() -> PathBuf {
 /// Per-recording directory under the replay root.
 pub fn recording_dir(recording_id: &str) -> PathBuf {
     replay_root().join(recording_id)
+}
+
+/// A finished segment's path in a recording directory: `NNNNNN.ts`.
+pub(crate) fn segment_path(dir: &Path, id: u32) -> PathBuf {
+    dir.join(format!("{id:06}.ts"))
+}
+
+/// The ids of the finished segments in a recording directory — every
+/// `NNNNNN.ts` — in ascending order.
+///
+/// What is on disk, which is not what `index.bin` names: retention removes the
+/// oldest files and leaves their entries, and a crash or a failed close leaves
+/// entries naming a file that was never finished (see "Segment ids" in
+/// [`writer`]). Anything that turns an entry into a read asks this first.
+pub(crate) async fn segments_on_disk(dir: &Path) -> std::io::Result<Vec<u32>> {
+    let mut ids = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(e) = entries.next_entry().await? {
+        let name = e.file_name();
+        if let Some(id) = name
+            .to_str()
+            .and_then(|s| s.strip_suffix(".ts"))
+            .and_then(|stem| stem.parse::<u32>().ok())
+        {
+            ids.push(id);
+        }
+    }
+    ids.sort_unstable();
+    Ok(ids)
 }
 
 /// Filesystem free / total bytes for the replay root, via `statvfs(3)`.

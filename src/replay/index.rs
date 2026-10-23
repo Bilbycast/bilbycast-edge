@@ -285,6 +285,26 @@ impl InMemoryIndex {
             .map(|e| e.pts_90khz)
     }
 
+    /// The first entry, in the order they were written, whose segment
+    /// `present` admits — where a replay of the whole recording starts.
+    ///
+    /// Not simply the first entry: retention prunes segment files and never
+    /// index entries, so once it has run the first entry names a file that is
+    /// gone. Positional rather than by PTS for the reason [`Self::span`] is.
+    pub fn first_present(&self, present: impl Fn(u32) -> bool) -> Option<IndexEntry> {
+        self.entries.iter().find(|e| present(e.segment_id)).copied()
+    }
+
+    /// The earliest entry at or after `pts` whose segment `present` admits —
+    /// where playback lands when the media at `pts` is no longer on disk.
+    pub fn next_present(&self, pts: u64, present: impl Fn(u32) -> bool) -> Option<IndexEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.pts_90khz >= pts && present(e.segment_id))
+            .min_by_key(|e| e.pts_90khz)
+            .copied()
+    }
+
     /// First and last PTS in the index, if any.
     ///
     /// Positional rather than min/max, and deliberately: on every index a

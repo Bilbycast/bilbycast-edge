@@ -12,12 +12,15 @@
 //! (~24 B/IDR) and the segment files are already byte-aligned, so a
 //! pull-based design avoids per-session bookkeeping on the edge.
 
+use std::path::Path;
+
 use anyhow::{Context, Result, anyhow, bail};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 use super::clips::ClipStore;
 use super::index::InMemoryIndex;
+use super::{segment_path, segments_on_disk};
 
 /// 188 byte MPEG-TS packet — exports stay packet-aligned so any
 /// downstream demuxer can ingest the file without resyncing on the
@@ -53,16 +56,26 @@ pub struct ExportChunk {
     pub eof: bool,
 }
 
-/// Resolved byte plan for an export — first/last segment id and the
-/// byte offset to start / stop at within those segments.
-#[derive(Debug, Clone, Copy)]
+/// Resolved byte plan for an export: every segment it reads, in order, with
+/// the window of each that falls in range.
+///
+/// The segments are the ones on disk when the plan was made, and the total is
+/// their windows added up, so the total is exactly what a read of the plan
+/// returns. It was worked out separately, and the two disagreed: a missing
+/// middle segment was left out of both, silently, and a missing last segment
+/// was counted and not read, so an export declared bytes it never delivered.
+#[derive(Debug, Clone)]
 pub struct BytePlan {
-    start_segment: u32,
-    start_offset_in_segment: u64,
-    end_segment: u32,
-    /// Exclusive end offset within the last segment.
-    end_offset_in_segment: u64,
+    spans: Vec<SegmentSpan>,
     total_bytes: u64,
+}
+
+/// One segment's part in an export: bytes `lo..hi` of segment `id`.
+#[derive(Debug, Clone, Copy)]
+struct SegmentSpan {
+    id: u32,
+    lo: u64,
+    hi: u64,
 }
 
 impl BytePlan {
@@ -87,7 +100,7 @@ pub async fn plan_for_pts_range_pub(
 /// go. Used by the MP4 remuxer where streaming-build isn't currently
 /// implemented.
 pub async fn read_full_range(dir: &std::path::Path, plan: BytePlan) -> Result<Vec<u8>> {
-    read_chunk(dir, plan, 0, plan.total_bytes).await.map(|c| c.data)
+    read_chunk(dir, &plan, 0, plan.total_bytes).await.map(|c| c.data)
 }
 
 /// Read up to `max_bytes` of the export starting at `byte_offset` from
@@ -112,7 +125,7 @@ pub async fn export_clip_chunk(
     let index = InMemoryIndex::load(&dir.join("index.bin")).await
         .context("load index for export")?;
     let plan = plan_pts_range(&index, &dir, clip.in_pts_90khz, Some(clip.out_pts_90khz)).await?;
-    read_chunk(&dir, plan, byte_offset, clamp_chunk(max_bytes)).await
+    read_chunk(&dir, &plan, byte_offset, clamp_chunk(max_bytes)).await
 }
 
 /// Read up to `max_bytes` of a recording-level export, optionally
@@ -130,20 +143,41 @@ pub async fn export_recording_chunk(
         && to <= from {
             bail!("replay_invalid_range");
         }
-    let dir = super::recording_dir(recording_id);
-    if !fs::try_exists(&dir).await.unwrap_or(false) {
+    export_recording_chunk_at(
+        &super::recording_dir(recording_id),
+        from_pts_90khz,
+        to_pts_90khz,
+        byte_offset,
+        max_bytes,
+    )
+    .await
+}
+
+/// [`export_recording_chunk`] from a named directory rather than the replay
+/// root's, so a test can export a recording of its own.
+async fn export_recording_chunk_at(
+    dir: &Path,
+    from_pts_90khz: Option<u64>,
+    to_pts_90khz: Option<u64>,
+    byte_offset: u64,
+    max_bytes: u64,
+) -> Result<ExportChunk> {
+    if !fs::try_exists(dir).await.unwrap_or(false) {
         return Err(anyhow!("replay_clip_not_found"));
     }
     let index = InMemoryIndex::load(&dir.join("index.bin")).await
         .context("load index for export")?;
-    let from = from_pts_90khz
-        .or_else(|| index.entries.first().map(|e| e.pts_90khz))
-        .ok_or_else(|| anyhow!("replay_no_index"))?;
-    let plan = plan_pts_range(&index, &dir, from, to_pts_90khz).await?;
+    let from = match from_pts_90khz {
+        Some(from) => from,
+        // From the first media retention kept, not the first entry, which
+        // names a file it has removed on any recording old enough.
+        None => super::reader::recording_start(&index, dir).await?.pts_90khz,
+    };
+    let plan = plan_pts_range(&index, dir, from, to_pts_90khz).await?;
     if plan.total_bytes > MAX_EXPORT_TOTAL_BYTES {
         bail!("replay_export_too_large");
     }
-    read_chunk(&dir, plan, byte_offset, clamp_chunk(max_bytes)).await
+    read_chunk(dir, &plan, byte_offset, clamp_chunk(max_bytes)).await
 }
 
 fn clamp_chunk(requested: u64) -> u64 {
@@ -160,95 +194,80 @@ fn clamp_chunk(requested: u64) -> u64 {
 /// to_pts (slightly under-includes — matches the behaviour the JKL
 /// player applies on playback so the file plays back identically to
 /// what the operator scrubbed).
+///
+/// **A segment `index.bin` names inside the range must be on disk**, or the
+/// export is refused with `replay_segment_missing`. One that is not was lost —
+/// to a crash, or to a close that failed — or retention has removed it, and
+/// the media it held is not in the export whatever happens next. Skipping it,
+/// as this did, produced a file short of what was asked for by however much of
+/// the range that segment covered, with nothing to say so: a clip spanning the
+/// hole played straight across it. The DVR clip cutter, which reads through
+/// here, takes the refusal like any other exact-cut failure and falls back to
+/// whole segments from the origin.
+///
+/// A gap no entry names is stepped over, as playback steps over it: a segment
+/// with no random-access point in it whose close failed, or the hole an older
+/// build left in the ids at every restart, which lost nothing.
 async fn plan_pts_range(
     index: &InMemoryIndex,
-    dir: &std::path::Path,
+    dir: &Path,
     from_pts_90khz: u64,
     to_pts_90khz: Option<u64>,
 ) -> Result<BytePlan> {
-    let start_entry = index.find_floor(from_pts_90khz)
+    let start = index.find_floor(from_pts_90khz)
         .ok_or_else(|| anyhow!("replay_no_index"))?;
-    let end_segment;
-    let end_offset_in_segment;
-    if let Some(to) = to_pts_90khz {
-        let end_entry = index.find_floor(to)
-            .ok_or_else(|| anyhow!("replay_no_index"))?;
-        end_segment = end_entry.segment_id;
-        end_offset_in_segment = end_entry.byte_offset as u64;
-    } else {
-        let last_seg = scan_last_segment_id(dir).await
-            .ok_or_else(|| anyhow!("replay_no_segments"))?;
-        let last_path = dir.join(format!("{:06}.ts", last_seg));
-        let last_size = fs::metadata(&last_path).await
-            .with_context(|| format!("stat segment {}", last_path.display()))?
-            .len();
-        end_segment = last_seg;
-        end_offset_in_segment = last_size;
-    }
-    let total = total_bytes_in_range(
-        dir,
-        start_entry.segment_id,
-        start_entry.byte_offset as u64,
-        end_segment,
-        end_offset_in_segment,
-    ).await?;
-    Ok(BytePlan {
-        start_segment: start_entry.segment_id,
-        start_offset_in_segment: start_entry.byte_offset as u64,
-        end_segment,
-        end_offset_in_segment,
-        total_bytes: total,
-    })
-}
-
-async fn scan_last_segment_id(dir: &std::path::Path) -> Option<u32> {
-    let mut max_id: Option<u32> = None;
-    let mut entries = fs::read_dir(dir).await.ok()?;
-    while let Ok(Some(e)) = entries.next_entry().await {
-        let name = e.file_name();
-        let Some(s) = name.to_str() else { continue };
-        let Some(stem) = s.strip_suffix(".ts") else { continue };
-        if let Ok(id) = stem.parse::<u32>() {
-            max_id = Some(max_id.map_or(id, |cur| cur.max(id)));
+    let (end_segment, end_offset) = match to_pts_90khz {
+        Some(to) => {
+            let end = index.find_floor(to)
+                .ok_or_else(|| anyhow!("replay_no_index"))?;
+            (end.segment_id, end.byte_offset as u64)
+        }
+        // To the end of the last segment on disk.
+        None => {
+            let last = segments_on_disk(dir).await
+                .with_context(|| format!("list segments in {}", dir.display()))?
+                .last()
+                .copied()
+                .ok_or_else(|| anyhow!("replay_no_segments"))?;
+            (last, u64::MAX)
+        }
+    };
+    let mut spans = Vec::new();
+    let mut total_bytes = 0u64;
+    if start.segment_id <= end_segment {
+        for id in start.segment_id..=end_segment {
+            let path = segment_path(dir, id);
+            let len = match fs::metadata(&path).await {
+                Ok(m) => m.len(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(named) = index.entries.iter().find(|e| e.segment_id == id) {
+                        bail!(
+                            "replay_segment_missing: segment {id:06}.ts, which index.bin names at \
+                             PTS {}, is not on disk — lost to a crash or a failed close, or removed \
+                             by retention — so the range cannot be exported whole",
+                            named.pts_90khz,
+                        );
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("stat segment {}", path.display()));
+                }
+            };
+            let lo = if id == start.segment_id { (start.byte_offset as u64).min(len) } else { 0 };
+            let hi = if id == end_segment { end_offset.min(len) } else { len };
+            if hi > lo {
+                spans.push(SegmentSpan { id, lo, hi });
+                total_bytes += hi - lo;
+            }
         }
     }
-    max_id
-}
-
-async fn total_bytes_in_range(
-    dir: &std::path::Path,
-    start_seg: u32,
-    start_off: u64,
-    end_seg: u32,
-    end_off: u64,
-) -> Result<u64> {
-    if start_seg > end_seg || (start_seg == end_seg && start_off >= end_off) {
-        return Ok(0);
-    }
-    if start_seg == end_seg {
-        return Ok(end_off - start_off);
-    }
-    // First segment: from start_off to its file size.
-    let first_path = dir.join(format!("{:06}.ts", start_seg));
-    let first_size = fs::metadata(&first_path).await
-        .with_context(|| format!("stat segment {}", first_path.display()))?
-        .len();
-    let mut acc = first_size.saturating_sub(start_off);
-    // Middle segments: full size each.
-    for id in (start_seg + 1)..end_seg {
-        let p = dir.join(format!("{:06}.ts", id));
-        if let Ok(meta) = fs::metadata(&p).await {
-            acc = acc.saturating_add(meta.len());
-        }
-    }
-    // Last segment: 0..end_off.
-    acc = acc.saturating_add(end_off);
-    Ok(acc)
+    Ok(BytePlan { spans, total_bytes })
 }
 
 async fn read_chunk(
-    dir: &std::path::Path,
-    plan: BytePlan,
+    dir: &Path,
+    plan: &BytePlan,
     byte_offset: u64,
     max_bytes: u64,
 ) -> Result<ExportChunk> {
@@ -267,51 +286,36 @@ async fn read_chunk(
     let want = want_aligned.min(plan.total_bytes - byte_offset);
 
     let mut buf = Vec::with_capacity(want as usize);
-    let mut absolute_export_offset: u64 = 0;
+    let mut span_start_in_export: u64 = 0;
     let mut cursor = byte_offset;
 
-    for seg_id in plan.start_segment..=plan.end_segment {
-        let seg_path = dir.join(format!("{:06}.ts", seg_id));
-        let meta = match fs::metadata(&seg_path).await {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let seg_len = meta.len();
-        let (seg_lo, seg_hi) = seg_window(&plan, seg_id, seg_len);
-        let seg_bytes = seg_hi - seg_lo;
-        let seg_start_in_export = absolute_export_offset;
-        let seg_end_in_export = absolute_export_offset + seg_bytes;
-        absolute_export_offset = seg_end_in_export;
+    for span in &plan.spans {
+        let span_end_in_export = span_start_in_export + (span.hi - span.lo);
+        let span_start = std::mem::replace(&mut span_start_in_export, span_end_in_export);
 
         // Skip whole segments that are below the cursor.
-        if cursor >= seg_end_in_export {
+        if cursor >= span_end_in_export {
             continue;
         }
-        // Stop once we've filled the chunk.
-        if buf.len() as u64 >= want {
-            break;
-        }
-
-        let local_start = if cursor > seg_start_in_export {
-            seg_lo + (cursor - seg_start_in_export)
-        } else {
-            seg_lo
-        };
-        let remaining = want.saturating_sub(buf.len() as u64);
-        let available = seg_hi - local_start;
-        let take = remaining.min(available);
+        let local_start = span.lo + cursor.saturating_sub(span_start);
+        let take = want.saturating_sub(buf.len() as u64).min(span.hi - local_start);
         if take == 0 {
             continue;
         }
 
-        let mut f = fs::File::open(&seg_path).await
-            .with_context(|| format!("open segment {}", seg_path.display()))?;
+        // Not skipped when it has gone: the plan counted it, and a read that
+        // left it out would hand back fewer bytes than the total promised.
+        // Gone between the plan and the read means retention has just removed
+        // it; the next request plans afresh and refuses the range by name.
+        let path = segment_path(dir, span.id);
+        let mut f = fs::File::open(&path).await
+            .with_context(|| format!("open segment {}", path.display()))?;
         f.seek(SeekFrom::Start(local_start)).await?;
         let prev_len = buf.len();
         buf.resize(prev_len + take as usize, 0);
         f.read_exact(&mut buf[prev_len..]).await?;
 
-        cursor = seg_start_in_export + (local_start - seg_lo) + take;
+        cursor = span_start + (local_start - span.lo) + take;
         if buf.len() as u64 >= want {
             break;
         }
@@ -325,20 +329,6 @@ async fn read_chunk(
         byte_offset,
         eof,
     })
-}
-
-fn seg_window(plan: &BytePlan, seg_id: u32, seg_len: u64) -> (u64, u64) {
-    let lo = if seg_id == plan.start_segment {
-        plan.start_offset_in_segment.min(seg_len)
-    } else {
-        0
-    };
-    let hi = if seg_id == plan.end_segment {
-        plan.end_offset_in_segment.min(seg_len)
-    } else {
-        seg_len
-    };
-    (lo, hi.max(lo))
 }
 
 #[cfg(test)]
@@ -382,8 +372,7 @@ mod tests {
         let index = InMemoryIndex::load(&dir.join("index.bin")).await.unwrap();
         // Whole-recording plan (to_pts = None) should cover all three segments.
         let plan = plan_pts_range(&index, dir, 0, None).await.unwrap();
-        assert_eq!(plan.start_segment, 0);
-        assert_eq!(plan.end_segment, 2);
+        assert_eq!(plan.spans.iter().map(|s| s.id).collect::<Vec<_>>(), [0, 1, 2]);
         assert_eq!(plan.total_bytes, 3 * 188);
     }
 
@@ -400,22 +389,108 @@ mod tests {
         let plan = plan_pts_range(&index, dir, 0, None).await.unwrap();
 
         // Pull one TS packet at a time.
-        let c0 = read_chunk(dir, plan, 0, 188).await.unwrap();
+        let c0 = read_chunk(dir, &plan, 0, 188).await.unwrap();
         assert_eq!(c0.data.len(), 188);
         assert_eq!(c0.byte_offset, 0);
         assert!(!c0.eof);
 
-        let c1 = read_chunk(dir, plan, 188, 188).await.unwrap();
+        let c1 = read_chunk(dir, &plan, 188, 188).await.unwrap();
         assert_eq!(c1.data.len(), 188);
         assert_eq!(c1.data, payload[188..376]);
 
-        let c2 = read_chunk(dir, plan, 376, 188).await.unwrap();
+        let c2 = read_chunk(dir, &plan, 376, 188).await.unwrap();
         assert_eq!(c2.data, payload[376..564]);
         assert!(c2.eof);
 
-        let past_eof = read_chunk(dir, plan, 564, 188).await.unwrap();
+        let past_eof = read_chunk(dir, &plan, 564, 188).await.unwrap();
         assert!(past_eof.data.is_empty());
         assert!(past_eof.eof);
+    }
+
+    /// Every chunk of an export, end to end, as the manager pulls it.
+    async fn pull_all(dir: &std::path::Path, from: Option<u64>, to: Option<u64>) -> Result<(Vec<u8>, u64)> {
+        let mut data = Vec::new();
+        loop {
+            let c = export_recording_chunk_at(dir, from, to, data.len() as u64, 188).await?;
+            data.extend_from_slice(&c.data);
+            if c.eof {
+                return Ok((data, c.total_bytes));
+            }
+            assert!(!c.data.is_empty(), "a chunk short of the end came back empty: the total promised bytes the read never delivered");
+        }
+    }
+
+    /// Five two-packet segments, each indexed at its start, every byte
+    /// distinct; returns them by id.
+    async fn five_segments(dir: &std::path::Path) -> Vec<Vec<u8>> {
+        let mut segments = Vec::new();
+        let mut entries = Vec::new();
+        for id in 0..5u32 {
+            let seg: Vec<u8> = (0..2 * 188).map(|i| (id as usize * 37 + i) as u8).collect();
+            write_segment(dir, id, &seg).await;
+            segments.push(seg);
+            entries.push(idx(id as u64 * 90_000, id, 0));
+        }
+        make_index(dir, &entries).await;
+        segments
+    }
+
+    /// An export that meets a segment `index.bin` names but the disk lacks —
+    /// lost to a crash or a failed close — is refused by name. It skipped the
+    /// segment and handed back a file short of the range with nothing to say
+    /// so, and the DVR clip cutter, which reads through here, cut a clip that
+    /// played straight across the hole.
+    #[tokio::test]
+    async fn an_export_refuses_a_segment_the_index_names_but_the_disk_lacks() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        five_segments(dir).await;
+        fs::remove_file(dir.join("000002.ts")).await.unwrap();
+        for (from, to) in [(None, None), (Some(0), Some(400_000)), (Some(100_000), Some(200_000))] {
+            let err = pull_all(dir, from, to).await.expect_err("refused");
+            assert!(err.to_string().starts_with("replay_segment_missing"), "{from:?}..{to:?}: {err}");
+        }
+        // The range's last segment gone: refused, rather than counted in the
+        // total and then not read.
+        let err = pull_all(dir, Some(0), Some(180_000)).await.expect_err("refused");
+        assert!(err.to_string().starts_with("replay_segment_missing"), "{err}");
+        // A range clear of the hole exports as before.
+        let (data, total) = pull_all(dir, Some(270_000), None).await.unwrap();
+        assert_eq!(data.len() as u64, total);
+        assert_eq!(total, 4 * 188);
+    }
+
+    /// A gap no entry names is stepped over, and the total is what the
+    /// export then reads — down to the last byte, with the end reported.
+    #[tokio::test]
+    async fn the_total_is_exactly_what_an_export_reads() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let segments = five_segments(dir).await;
+        // Segment 2, with no entry naming it: what an older build's restart
+        // left in the ids, or a segment with no random-access point whose
+        // close failed.
+        let entries: Vec<IndexEntry> = [0u32, 1, 3, 4].iter().map(|&id| idx(id as u64 * 90_000, id, 0)).collect();
+        fs::remove_file(dir.join("index.bin")).await.unwrap();
+        make_index(dir, &entries).await;
+        fs::remove_file(dir.join("000002.ts")).await.unwrap();
+        let (data, total) = pull_all(dir, None, None).await.unwrap();
+        assert_eq!(data.len() as u64, total);
+        assert_eq!(data, [&segments[0][..], &segments[1], &segments[3], &segments[4]].concat());
+    }
+
+    /// A whole-recording export starts at the first segment retention kept.
+    /// From the first entry, which names a file retention has removed, it
+    /// failed on every recording old enough to have been pruned.
+    #[tokio::test]
+    async fn a_whole_recording_export_starts_where_retention_left_it() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let segments = five_segments(dir).await;
+        fs::remove_file(dir.join("000000.ts")).await.unwrap();
+        fs::remove_file(dir.join("000001.ts")).await.unwrap();
+        let (data, _) = pull_all(dir, None, None).await.unwrap();
+        assert_eq!(data, segments[2..].concat());
     }
 
     #[tokio::test]
