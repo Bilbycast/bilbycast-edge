@@ -21,9 +21,11 @@
 //! node shares ([`NODE_INTAKES`]), because an origin stall reaches every
 //! rendition of a flow at once and the outputs on a node are as many as are
 //! configured. Past either, the same drop and the same report. The first
-//! [`INTAKE_FLOOR_BYTES`] of each intake are its own and charge the node
-//! nothing, so an output that keeps up never drops for what the others hold:
-//! the outputs on one node can push to different origins.
+//! bytes of each intake — its floor, a segment and a second of its own
+//! measured feed ([`Floor`]) — are its own and charge the node nothing, so an
+//! output that keeps up through its own waits on its origin drops nothing for
+//! what the others hold: the outputs on one node can push to different
+//! origins.
 //!
 //! It cannot help if the whole runtime stalls: the intake is a task like any
 //! other and would stall with it. It turns a slow peer into latency instead of
@@ -76,18 +78,68 @@ pub(super) const NODE_INTAKE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// The budget every CMAF intake on the node shares.
 pub(super) static NODE_INTAKES: NodeBudget = NodeBudget::new(NODE_INTAKE_BUDGET_BYTES);
 
-/// What of each intake's budget is its own, charged to it and not to
-/// [`NODE_INTAKES`]: an eighth of it, a second or two of a 10 Mbit/s feed.
+/// The least of each intake's budget that is its own, charged to it and not
+/// to [`NODE_INTAKES`]: an eighth of it, a second or two of a 10 Mbit/s feed.
 ///
-/// An output that keeps up holds a few packets, or the moments it waits on a
-/// healthy origin, and all of that fits under here — so it never asks the
-/// node for anything, and outputs stalled on one origin cannot make it drop.
-/// They could: every byte went through the node's budget, so eight outputs
-/// stalled on one origin held all of it and a ninth, pushing to a healthy
-/// origin, dropped every packet it was handed until they recovered. Only what
-/// an intake holds past this competes for the node, which can therefore hold
-/// [`NODE_INTAKE_BUDGET_BYTES`] plus this much per output.
-pub(super) const INTAKE_FLOOR_BYTES: usize = INTAKE_BUDGET_BYTES / 8;
+/// An output that keeps up still waits on its origin at every segment close —
+/// the segment's PUT, then the playlists' — and its intake holds the feed's
+/// rate times that wait. While that fits the intake's floor it never asks the
+/// node for anything, and outputs stalled on another origin cannot make it
+/// drop. They could: every byte went through the node's budget, so eight
+/// outputs stalled on one origin held all of it and a ninth, pushing to a
+/// healthy origin, dropped every packet it was handed until they recovered.
+/// This much alone holds about 30 Mbit of 1316-byte datagrams, or 17 Mbit of
+/// an SDI feed's one TS packet per message, which a 40 Mbit/s output outgrew
+/// at every close of a segment its uplink took 0.9 s to PUT — so the floor
+/// follows the feed ([`Floor::for_segments`]), and this is where it starts
+/// and the least it comes down to.
+pub(super) const INTAKE_FLOOR_MIN_BYTES: usize = INTAKE_BUDGET_BYTES / 8;
+
+/// The most of each intake's budget that is its own: half of it, about 1.8 s
+/// of a 60 Mbit/s feed. An output that waits longer than that on an origin it
+/// keeps up with competes for the node's budget like any other. The node's
+/// intakes hold at most [`NODE_INTAKE_BUDGET_BYTES`] plus each one's floor, so
+/// this is also how much more than the node budget each output can cost.
+pub(super) const INTAKE_FLOOR_MAX_BYTES: usize = INTAKE_BUDGET_BYTES / 2;
+
+/// How long the intake counts what it is offered before it works out its
+/// feed's rate again.
+const RATE_WINDOW: Duration = Duration::from_secs(1);
+
+/// How an intake sizes its floor: `hold` of its feed at the rate it measures,
+/// kept within `min..=max`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Floor {
+    pub(super) min: usize,
+    pub(super) max: usize,
+    pub(super) hold: Duration,
+}
+
+impl Floor {
+    /// A CMAF output's: a segment and a second of its feed, between
+    /// [`INTAKE_FLOOR_MIN_BYTES`] and [`INTAKE_FLOOR_MAX_BYTES`].
+    ///
+    /// A segment because an output whose segment-close wait is longer than a
+    /// segment falls further behind at every close and does not keep up
+    /// anyway; a second for the playlist and init PUTs that follow the
+    /// segment's. The feed is what the intake is charged for — the flow's
+    /// whole broadcast, ahead of any program filter or transcode — so it is
+    /// measured there, on every packet offered, kept or dropped, and an output
+    /// whose origin has stalled sizes its floor the same way.
+    pub(super) fn for_segments(segment_secs: f64) -> Self {
+        Self {
+            min: INTAKE_FLOOR_MIN_BYTES,
+            max: INTAKE_FLOOR_MAX_BYTES,
+            hold: Duration::from_secs_f64(segment_secs.max(0.0)) + Duration::from_secs(1),
+        }
+    }
+
+    /// A floor that stays where it is, for the tests of the rest.
+    #[cfg(test)]
+    const fn fixed(bytes: usize) -> Self {
+        Self { min: bytes, max: bytes, hold: Duration::ZERO }
+    }
+}
 
 /// What a queued packet costs beyond its payload: the queue's own slot for it
 /// (the packet header and its arrival instant), the shared header the
@@ -117,16 +169,17 @@ pub(super) struct Intake {
 
 impl Intake {
     /// Start draining `src` into a queue of at most `budget` bytes, the first
-    /// `floor` of them its own and the rest within what `node` has left.
+    /// of them — its `floor` — its own and the rest within what `node` has
+    /// left.
     pub(super) fn spawn(
         src: broadcast::Receiver<RtpPacket>,
         budget: usize,
-        floor: usize,
+        floor: Floor,
         node: &'static NodeBudget,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let budget = Arc::new(QueueBudget::new(budget, floor, node));
-        let task = tokio::spawn(forward(src, tx, budget.clone()));
+        let budget = Arc::new(QueueBudget::new(budget, floor.min, node));
+        let task = tokio::spawn(forward(src, tx, budget.clone(), FeedRate::new(floor)));
         Self { rx, budget, task, waited: Duration::ZERO }
     }
 
@@ -165,15 +218,51 @@ impl Drop for Intake {
     }
 }
 
+/// The intake's feed, as it measures it, and the floor that follows it.
+struct FeedRate {
+    floor: Floor,
+    since: tokio::time::Instant,
+    bytes: usize,
+    /// Bytes a second. Up to a faster window at once, so the floor is there
+    /// for the close that follows a busy second; down a quarter of the way to
+    /// a slower one each window, so a quiet second just before a close does
+    /// not take it away.
+    rate: f64,
+}
+
+impl FeedRate {
+    fn new(floor: Floor) -> Self {
+        Self { floor, since: tokio::time::Instant::now(), bytes: 0, rate: 0.0 }
+    }
+
+    /// Count `cost` bytes offered, and once a window move the floor of
+    /// `budget` to what the feed now needs.
+    fn offered(&mut self, cost: usize, budget: &QueueBudget) {
+        self.bytes += cost;
+        let elapsed = self.since.elapsed();
+        if elapsed < RATE_WINDOW {
+            return;
+        }
+        let window = self.bytes as f64 / elapsed.as_secs_f64();
+        self.rate = if window > self.rate { window } else { self.rate + (window - self.rate) / 4.0 };
+        self.since += elapsed;
+        self.bytes = 0;
+        let floor = (self.rate * self.floor.hold.as_secs_f64()) as usize;
+        budget.set_floor(floor.clamp(self.floor.min, self.floor.max));
+    }
+}
+
 async fn forward(
     mut src: broadcast::Receiver<RtpPacket>,
     tx: mpsc::UnboundedSender<Item>,
     budget: Arc<QueueBudget>,
+    mut feed: FeedRate,
 ) {
     let mut lost: u64 = 0;
     loop {
         match src.recv().await {
             Ok(p) => {
+                feed.offered(cost(&p), &budget);
                 let Some(charge) = budget.try_charge(cost(&p)) else {
                     lost += 1;
                     continue;
@@ -224,7 +313,7 @@ mod tests {
     #[tokio::test]
     async fn a_reader_that_stalls_past_the_broadcast_capacity_loses_nothing() {
         let (tx, rx) = broadcast::channel::<RtpPacket>(16);
-        let mut intake = Intake::spawn(rx, 1 << 20, 0, &UNBOUNDED);
+        let mut intake = Intake::spawn(rx, 1 << 20, Floor::fixed(0), &UNBOUNDED);
         for i in 0..1000u16 {
             tx.send(pkt(i, 188)).unwrap();
             // Let the forwarder keep pace with the publisher, as it would on a
@@ -244,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn past_its_budget_it_drops_and_reports_the_loss_in_order() {
         let (tx, rx) = broadcast::channel::<RtpPacket>(1024);
-        let mut intake = Intake::spawn(rx, cost(&pkt(0, 188)) * 10, 0, &UNBOUNDED);
+        let mut intake = Intake::spawn(rx, cost(&pkt(0, 188)) * 10, Floor::fixed(0), &UNBOUNDED);
         for i in 0..15u16 {
             tx.send(pkt(i, 188)).unwrap();
         }
@@ -267,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn the_budget_charges_each_packet_its_overhead_too() {
         let (tx, rx) = broadcast::channel::<RtpPacket>(1024);
-        let mut intake = Intake::spawn(rx, 188 * 10, 0, &UNBOUNDED);
+        let mut intake = Intake::spawn(rx, 188 * 10, Floor::fixed(0), &UNBOUNDED);
         for i in 0..10u16 {
             tx.send(pkt(i, 188)).unwrap();
         }
@@ -287,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn it_says_how_long_each_packet_waited() {
         let (tx, rx) = broadcast::channel::<RtpPacket>(16);
-        let mut intake = Intake::spawn(rx, 1 << 20, 0, &UNBOUNDED);
+        let mut intake = Intake::spawn(rx, 1 << 20, Floor::fixed(0), &UNBOUNDED);
         tx.send(pkt(0, 188)).unwrap();
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -307,8 +396,8 @@ mod tests {
         static NODE: NodeBudget = NodeBudget::new(15 * (188 + ITEM_OVERHEAD_BYTES));
         let (tx_a, rx_a) = broadcast::channel::<RtpPacket>(1024);
         let (tx_b, rx_b) = broadcast::channel::<RtpPacket>(1024);
-        let mut a = Intake::spawn(rx_a, per * 10, 0, &NODE);
-        let mut b = Intake::spawn(rx_b, per * 10, 0, &NODE);
+        let mut a = Intake::spawn(rx_a, per * 10, Floor::fixed(0), &NODE);
+        let mut b = Intake::spawn(rx_b, per * 10, Floor::fixed(0), &NODE);
         for i in 0..10u16 {
             tx_a.send(pkt(i, 188)).unwrap();
         }
@@ -357,7 +446,7 @@ mod tests {
         let per = cost(&pkt(0, 188));
         static NODE: NodeBudget = NodeBudget::new(10 * (188 + ITEM_OVERHEAD_BYTES));
         let (tx_stalled, rx_stalled) = broadcast::channel::<RtpPacket>(1024);
-        let _stalled = Intake::spawn(rx_stalled, per * 100, 0, &NODE);
+        let _stalled = Intake::spawn(rx_stalled, per * 100, Floor::fixed(0), &NODE);
         for i in 0..20u16 {
             tx_stalled.send(pkt(i, 188)).unwrap();
         }
@@ -365,7 +454,7 @@ mod tests {
         assert_eq!(NODE.queued(), 10 * per, "the stalled intake did not take the node's budget");
 
         let (tx, rx) = broadcast::channel::<RtpPacket>(1024);
-        let mut healthy = Intake::spawn(rx, per * 100, per * 4, &NODE);
+        let mut healthy = Intake::spawn(rx, per * 100, Floor::fixed(per * 4), &NODE);
         for i in 0..1_000u16 {
             tx.send(pkt(i, 188)).unwrap();
             // A dropped packet is reported only ahead of the next one to get
@@ -387,10 +476,80 @@ mod tests {
         assert!(matches!(healthy.recv().await, Err(broadcast::error::RecvError::Lagged(1))));
     }
 
+    /// The node budget [`lost_through_waits`] runs against: a hundred
+    /// packets.
+    const WAITS_NODE_BYTES: usize = 100 * (188 + ITEM_OVERHEAD_BYTES);
+
+    /// What a healthy intake fed ten packets every 10 ms loses, with the
+    /// node's budget held full by an intake stalled on another origin, when
+    /// its reader keeps up but stops for `wait` every 2 s — the PUTs of a
+    /// segment close. Its floor holds 1.5 s of its feed, and starts at two of
+    /// the feed's bursts until the feed has been measured.
+    async fn lost_through_waits(node: &'static NodeBudget, wait: Duration) -> u64 {
+        let per = cost(&pkt(0, 188));
+        let (tx_stalled, rx_stalled) = broadcast::channel::<RtpPacket>(1024);
+        let _stalled = Intake::spawn(rx_stalled, usize::MAX, Floor::fixed(0), node);
+        for _ in 0..200 {
+            tx_stalled.send(pkt(0, 188)).unwrap();
+        }
+        for _ in 0..1_000 {
+            if node.queued() == WAITS_NODE_BYTES {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(node.queued(), WAITS_NODE_BYTES, "the stalled intake did not take the node's budget");
+
+        let floor = Floor { min: per * 20, max: per * 100_000, hold: Duration::from_millis(1_500) };
+        let (tx, rx) = broadcast::channel::<RtpPacket>(4096);
+        let mut healthy = Intake::spawn(rx, usize::MAX, floor, node);
+        tokio::spawn(async move {
+            // Twelve seconds of a thousand packets a second.
+            for _ in 0..1_200 {
+                for _ in 0..10 {
+                    tx.send(pkt(0, 188)).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+        // The first close after two seconds, by when the rate has settled.
+        let mut next_close = tokio::time::Instant::now() + Duration::from_secs(2);
+        let mut lost = 0;
+        loop {
+            if tokio::time::Instant::now() >= next_close {
+                tokio::time::sleep(wait).await;
+                next_close = tokio::time::Instant::now() + Duration::from_secs(2);
+            }
+            match healthy.recv().await {
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(n)) => lost += n,
+                Err(broadcast::error::RecvError::Closed) => return lost,
+            }
+        }
+    }
+
+    /// A healthy output of a high-rate feed keeps up through its own waits on
+    /// its origin while outputs stalled on another hold the node's whole
+    /// budget: its floor follows its feed, so the backlog a segment close
+    /// leaves fits it. A fixed floor of a second or two of a 10 Mbit/s feed
+    /// let a faster feed's close spill onto the node, and drop there, at every
+    /// segment for as long as the others stayed stalled. Past its floor — a
+    /// wait longer than the floor's hold — it competes for the node like any
+    /// other, and drops.
+    #[tokio::test(start_paused = true)]
+    async fn a_healthy_high_rate_output_rides_its_waits_with_the_node_full() {
+        // A 1.2 s wait leaves 1,200 packets queued: inside the 1,500 the floor
+        // follows the feed to, and far past the twenty of its least floor.
+        static NODE: NodeBudget = NodeBudget::new(WAITS_NODE_BYTES);
+        assert_eq!(lost_through_waits(&NODE, Duration::from_millis(1_200)).await, 0);
+        static OVER: NodeBudget = NodeBudget::new(WAITS_NODE_BYTES);
+        assert!(lost_through_waits(&OVER, Duration::from_millis(2_000)).await > 0);
+    }
+
     #[tokio::test]
     async fn the_flow_ending_reads_as_closed() {
         let (tx, rx) = broadcast::channel::<RtpPacket>(16);
-        let mut intake = Intake::spawn(rx, 1 << 20, 0, &UNBOUNDED);
+        let mut intake = Intake::spawn(rx, 1 << 20, Floor::fixed(0), &UNBOUNDED);
         tx.send(pkt(1, 188)).unwrap();
         drop(tx);
         assert_eq!(intake.recv().await.unwrap().sequence_number, 1);

@@ -85,28 +85,43 @@ project-wide "never block the data path" invariant.
     charge is a bound, not what is resident: a flow's renditions queue clones
     of one payload, which is held once. Not shared with the recorders' node
     budget (see `docs/replay.md`): a disk and an origin fail independently.
-  - **Except each intake's first 4 MiB, which are its own**
-    (`INTAKE_FLOOR_BYTES`, an eighth of its budget — a second or two of a
-    10 Mbit/s feed) and charge the node nothing. The outputs on one node can
-    push to different origins, and while every byte went through the node's
-    budget, eight outputs stalled on one origin held all of it and a ninth,
-    pushing to a healthy origin, dropped every packet it was handed until
-    they recovered. An output that keeps up holds less than its floor, so it
-    never asks the node for anything; only what an intake holds past its
-    floor competes for the 256 MiB. Each packet carries the node share it
-    was charged and gives back exactly that as it leaves.
+  - **Except each intake's floor, which is its own** and charges the node
+    nothing. The outputs on one node can push to different origins, and
+    while every byte went through the node's budget, eight outputs stalled
+    on one origin held all of it and a ninth, pushing to a healthy origin,
+    dropped every packet it was handed until they recovered. Only what an
+    intake holds past its floor competes for the 256 MiB. An output that
+    keeps up still waits on its origin at every segment close — the
+    segment's PUT, then the playlists' — and holds its feed's rate times
+    that wait, so the floor is sized from the rate the intake measures: a
+    segment and a second of it (`intake::Floor::for_segments`), between
+    4 MiB (`INTAKE_FLOOR_MIN_BYTES`, an eighth of the budget, where it
+    starts) and 16 MiB (`INTAKE_FLOOR_MAX_BYTES`, about 1.8 s of a
+    60 Mbit/s feed). The rate is the whole flow's broadcast — the intake
+    carries it ahead of any program filter or transcode — measured over every
+    packet offered, kept or dropped; it rises to a faster second at once and
+    falls a quarter of the way to a slower one each second. A fixed 4 MiB held
+    about 30 Mbit of 1316-byte datagrams (17 Mbit of an SDI feed's one TS
+    packet per message), which a 40 Mbit/s output outgrew at every close of a
+    segment its uplink took 0.9 s to PUT. So the isolation holds while an
+    output's segment-close wait times its flow's rate fits that floor; an
+    output that waits longer than a segment and a second, or holds more than
+    16 MiB through its wait, competes for the node budget like any other.
+    Each packet carries the node share it was charged and gives back exactly
+    that as it leaves, however the floor has moved meanwhile.
   - **Past either budget it drops**, and reports the loss in order as the
     broadcast would (`Lagged(n)`), so the `packets_dropped` stat and the
     `broadcast lag` warning cover all three. An output stopped with a
     backlog gives its charge back to the node as it goes.
   - **The real worst case**, for the queues that let a consumer fall behind:
-    `min(32 MiB × CMAF outputs, 256 MiB + 4 MiB × CMAF outputs)` in intakes
+    `min(32 MiB × CMAF outputs, 256 MiB + each intake's floor)` in intakes
     plus `min(32 MiB × recording flows, 256 MiB + 4 MiB × recording flows)`
-    in recorder queues — 512 MiB plus 4 MiB per CMAF output and per
-    recording flow, beyond each flow's own broadcast ring, reached only when
-    an origin stall and a disk stall each fill eight queues' worth at once,
-    and freed as the consumers catch up. A queued message still in its
-    flow's ring is not held twice.
+    in recorder queues — at most 512 MiB plus 16 MiB per CMAF output and
+    4 MiB per recording flow, beyond each flow's own broadcast ring, reached
+    only when an origin stall and a disk stall each hold 256 MiB past their
+    floors at once (about ten queues each at the 4 MiB floor, since each
+    then holds 28 MiB on the node), and freed as the consumers catch up. A
+    queued message still in its flow's ring is not held twice.
   - **A backlog never reaches the published dates.** The intake records when
     it took each packet off the broadcast, and a segment is dated as of the
     arrival of the packet that closed it — see [The close-time sample is

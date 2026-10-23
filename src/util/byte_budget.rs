@@ -26,10 +26,18 @@
 //! on one node can push to different origins, and a node budget that every
 //! byte had to pass through let eight outputs stalled on one origin starve a
 //! ninth pushing to a healthy one, which then dropped every packet it was
-//! handed for as long as the others stayed stuck. A queue that keeps up holds
-//! less than its floor, so it never asks the node for anything, and only what
-//! a queue holds past its floor competes for the node's budget. The node's
-//! queues can therefore hold the node budget plus one floor each.
+//! handed for as long as the others stayed stuck. A queue that holds no more
+//! than its floor never asks the node for anything, and only what a queue
+//! holds past its floor competes for the node's budget. The node's queues can
+//! therefore hold the node budget plus one floor each.
+//!
+//! That isolates a queue that keeps up only while what it holds as it keeps
+//! up fits its floor, and that is a matter of its feed's rate: a CMAF output
+//! that keeps up still waits on its origin at every segment close, holding
+//! the feed's rate times the wait. So a floor can move
+//! ([`QueueBudget::set_floor`]) — the CMAF intake sizes its own from the rate
+//! it measures — and the charge each item carries keeps its release exact
+//! however the floor has moved since.
 //!
 //! What is charged is a bound, not what is resident: two outputs of one flow
 //! queue clones of the same payload, which is held once.
@@ -91,7 +99,8 @@ pub struct QueueBudget {
     /// The part of `queued` charged to the node as well.
     on_node: AtomicUsize,
     limit: usize,
-    floor: usize,
+    /// Read on every charge and moved by [`Self::set_floor`].
+    floor: AtomicUsize,
     node: &'static NodeBudget,
 }
 
@@ -110,7 +119,21 @@ pub struct Charge {
 
 impl QueueBudget {
     pub fn new(limit: usize, floor: usize, node: &'static NodeBudget) -> Self {
-        Self { queued: AtomicUsize::new(0), on_node: AtomicUsize::new(0), limit, floor, node }
+        Self {
+            queued: AtomicUsize::new(0),
+            on_node: AtomicUsize::new(0),
+            limit,
+            floor: AtomicUsize::new(floor),
+            node,
+        }
+    }
+
+    /// Move the floor. Only what is charged from now on reads the new one:
+    /// each item queued already carries the node share it took, and gives back
+    /// exactly that, so a floor moved under a queue that holds items leaves the
+    /// node's count as exact as one that stayed put.
+    pub fn set_floor(&self, floor: usize) {
+        self.floor.store(floor, Ordering::Relaxed);
     }
 
     /// Charge an item of `cost` bytes against this queue's limit and — for
@@ -125,7 +148,7 @@ impl QueueBudget {
     pub fn try_charge(&self, cost: usize) -> Option<Charge> {
         let queued = self.queued.load(Ordering::Relaxed);
         let total = queued.checked_add(cost).filter(|&total| total <= self.limit)?;
-        let on_node = total.saturating_sub(self.floor).min(cost);
+        let on_node = total.saturating_sub(self.floor.load(Ordering::Relaxed)).min(cost);
         if on_node > 0 && !self.node.try_charge(on_node) {
             return None;
         }
@@ -212,6 +235,29 @@ mod tests {
         q.release(second);
         q.release(third);
         assert_eq!(NODE.queued(), 0);
+    }
+
+    /// A floor moved under a queue that holds items — raised past what it
+    /// holds, lowered under it, and again — leaves the node holding exactly
+    /// what the items still queued took from it, and nothing once they have
+    /// all left.
+    #[test]
+    fn a_floor_moved_under_a_full_queue_leaves_the_node_exact() {
+        static NODE: NodeBudget = NodeBudget::new(1_000);
+        let q = QueueBudget::new(1_000, 20, &NODE);
+        let first = q.try_charge(30).unwrap();
+        assert_eq!(NODE.queued(), 10);
+        q.set_floor(100);
+        let second = q.try_charge(30).unwrap();
+        assert_eq!(NODE.queued(), 10, "a charge under the raised floor reached the node");
+        q.set_floor(0);
+        let third = q.try_charge(30).unwrap();
+        assert_eq!(NODE.queued(), 40, "a charge over the lowered floor missed the node");
+        q.release(first);
+        q.set_floor(50);
+        q.release(third);
+        q.release(second);
+        assert_eq!(NODE.queued(), 0, "the node kept bytes no item holds");
     }
 
     /// A queue dropped with items still charged — a consumer that stopped

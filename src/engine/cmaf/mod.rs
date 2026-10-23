@@ -93,7 +93,7 @@ pub fn spawn_cmaf_output(
     let mut rx = intake::Intake::spawn(
         broadcast_tx.subscribe(),
         intake::INTAKE_BUDGET_BYTES,
-        intake::INTAKE_FLOOR_BYTES,
+        intake::Floor::for_segments(config.segment_duration_secs),
         &intake::NODE_INTAKES,
     );
 
@@ -5044,7 +5044,7 @@ seg-00042.m4s?token=abc
         // and the close's sample is that much before now.
         let (tx, src) = broadcast::channel::<RtpPacket>(16);
         let mut rx = intake::Intake::spawn(
-            src, intake::INTAKE_BUDGET_BYTES, intake::INTAKE_FLOOR_BYTES, &intake::NODE_INTAKES,
+            src, intake::INTAKE_BUDGET_BYTES, intake::Floor::for_segments(2.0), &intake::NODE_INTAKES,
         );
         tx.send(RtpPacket {
             data: bytes::Bytes::from_static(&[0x47; 188]),
