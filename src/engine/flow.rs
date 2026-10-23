@@ -1561,6 +1561,13 @@ impl FlowRuntime {
                         Some(Arc::new(h))
                     }
                     Err(e) => {
+                        // Another flow writing the same recording is the
+                        // configuration's fault, not the disk's.
+                        let error_code = if e.to_string().starts_with("replay_recording_in_use") {
+                            "replay_recording_in_use"
+                        } else {
+                            "replay_disk_full"
+                        };
                         event_sender.emit_with_details(
                             crate::manager::events::EventSeverity::Critical,
                             crate::manager::events::category::REPLAY,
@@ -1568,7 +1575,7 @@ impl FlowRuntime {
                             Some(&config.config.id),
                             serde_json::json!({
                                 "replay_event": "recording_start_failed",
-                                "error_code": "replay_disk_full",
+                                "error_code": error_code,
                                 "error": e.to_string(),
                             }),
                         );

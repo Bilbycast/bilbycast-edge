@@ -79,14 +79,16 @@
 //!   fsyncing on a slow disk — waits for it before it sweeps `.tmp/` or picks
 //!   a resume id. Without that, the sweep unlinked the segments the old closer
 //!   was still finishing, and a segment it had open with no index entry yet
-//!   shared its id with the new writer's first.
+//!   shared its id with the new writer's first. A writer of another flow —
+//!   two flows naming one recording — is refused, `replay_recording_in_use`,
+//!   rather than kept waiting for as long as that flow runs.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use bytes::Bytes;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -495,9 +497,15 @@ async fn spawn_writer_at(
     // writer in the writer task instead: the flow's start does not wait on
     // somebody else's fsyncs, and what the flow publishes meanwhile queues
     // for the writer within its budget, as it would behind a slow disk.
-    let opening = match RecordingLease::try_take(&dir) {
+    let opening = match RecordingLease::try_take(&dir, &setup.flow_id) {
         Ok(lease) => Opening::Ready(Box::new(open_writer(setup, lease).await?)),
-        Err(held) => Opening::AfterPrevious(held, setup),
+        Err(Held::ByPrevious(held)) => Opening::AfterPrevious(held, setup),
+        // Refused, not waited for: that flow holds it for as long as it runs.
+        Err(Held::ByFlow(other)) => bail!(
+            "replay_recording_in_use: recording '{recording_id}' is being written by flow \
+             '{other}' — two flows cannot record into one directory; give one of them its \
+             own recording.storage_id"
+        ),
     };
 
     let cancel = parent_cancel.child_token();
@@ -671,11 +679,28 @@ async fn refuse_commands(
     }
 }
 
-/// The recording directories a writer is working in, each with the lock its
-/// writer holds — see [`RecordingLease`].
-fn recordings_in_use() -> &'static DashMap<PathBuf, Arc<Mutex<()>>> {
-    static IN_USE: OnceLock<DashMap<PathBuf, Arc<Mutex<()>>>> = OnceLock::new();
+/// The recording directories a writer is working in — see [`RecordingLease`].
+fn recordings_in_use() -> &'static DashMap<PathBuf, InUse> {
+    static IN_USE: OnceLock<DashMap<PathBuf, InUse>> = OnceLock::new();
     IN_USE.get_or_init(DashMap::new)
+}
+
+/// A recording directory a writer is working in: the lock its writer holds,
+/// and the flow that writer records.
+#[derive(Debug, Default)]
+struct InUse {
+    lock: Arc<Mutex<()>>,
+    flow_id: String,
+}
+
+/// Why [`RecordingLease::try_take`] could not take a directory.
+#[derive(Debug)]
+enum Held {
+    /// An earlier writer of the same flow is still finishing in it: the lock
+    /// to wait on.
+    ByPrevious(Arc<Mutex<()>>),
+    /// Another flow's writer is working in it.
+    ByFlow(String),
 }
 
 /// Whether a writer is working in the recording in `dir` now: holding it, or
@@ -693,7 +718,7 @@ pub(crate) fn is_being_written(dir: &Path) -> bool {
 /// what a live writer changes for its readers.
 #[cfg(test)]
 pub(crate) fn hold_as_writer(dir: &Path) -> impl Drop + use<> {
-    RecordingLease::try_take(dir).expect("another writer holds the recording")
+    RecordingLease::try_take(dir, "flow").expect("another writer holds the recording")
 }
 
 /// One writer's hold on its recording directory, from before its
@@ -714,18 +739,31 @@ pub(crate) fn hold_as_writer(dir: &Path) -> impl Drop + use<> {
 /// A lock, not a wait with a deadline: the old closer is bounded
 /// ([`MAX_PENDING_CLOSES`] segments behind at most), and giving up on it
 /// would bring back exactly the race.
+///
+/// Only a writer of the same flow waits. Two flows can name one recording —
+/// `storage_id: "cam1"` on one, and a flow `cam1` recording under its own id —
+/// and nothing in the configuration refuses that. Their writers used to
+/// corrupt the directory between them; with the lease the second waited for
+/// as long as the first flow ran, recording nothing, its queue full, raising a
+/// Critical `replay_writer_lagged` every five seconds that blamed the disk. A
+/// writer of another flow is refused instead, at once, by name.
 struct RecordingLease {
     dir: PathBuf,
     guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl RecordingLease {
-    /// Take `dir` if no writer holds it; otherwise the lock to wait on.
-    fn try_take(dir: &Path) -> std::result::Result<Self, Arc<Mutex<()>>> {
-        let lock = recordings_in_use().entry(dir.to_path_buf()).or_default().clone();
-        match lock.clone().try_lock_owned() {
-            Ok(guard) => Ok(Self::held(dir.to_path_buf(), guard)),
-            Err(_) => Err(lock),
+    /// Take `dir` for a writer of `flow_id` if no writer holds it; otherwise
+    /// what holds it.
+    fn try_take(dir: &Path, flow_id: &str) -> std::result::Result<Self, Held> {
+        let mut in_use = recordings_in_use().entry(dir.to_path_buf()).or_default();
+        match in_use.lock.clone().try_lock_owned() {
+            Ok(guard) => {
+                in_use.flow_id = flow_id.to_owned();
+                Ok(Self::held(dir.to_path_buf(), guard))
+            }
+            Err(_) if in_use.flow_id == flow_id => Err(Held::ByPrevious(in_use.lock.clone())),
+            Err(_) => Err(Held::ByFlow(in_use.flow_id.clone())),
         }
     }
 
@@ -742,7 +780,7 @@ impl Drop for RecordingLease {
         // ever opened. Anything holding or waiting on the lock holds its
         // `Arc`, and the check runs under the map's shard lock, which a
         // writer taking the entry needs too.
-        recordings_in_use().remove_if(&self.dir, |_, lock| Arc::strong_count(lock) == 1);
+        recordings_in_use().remove_if(&self.dir, |_, in_use| Arc::strong_count(&in_use.lock) == 1);
     }
 }
 
@@ -2486,7 +2524,7 @@ mod tests {
     ) -> (WriterState, mpsc::Receiver<crate::manager::events::Event>) {
         let (events, events_rx) = crate::manager::events::event_channel();
         let dir = parent.join("rec");
-        let lease = RecordingLease::try_take(&dir).expect("another writer holds the recording");
+        let lease = RecordingLease::try_take(&dir, "flow").expect("another writer holds the recording");
         let setup = WriterSetup {
             flow_id: "flow".into(),
             recording_id: "rec".into(),
@@ -3024,7 +3062,7 @@ mod tests {
         // The previous writer, still finishing segment 2: it holds the
         // recording, and the segment waits in `.tmp/` for its rename, with
         // no index entry naming it.
-        let previous = RecordingLease::try_take(&dir).unwrap();
+        let previous = RecordingLease::try_take(&dir, "flow").unwrap();
         let in_flight: Vec<u8> = (0..20u64).flat_map(|n| ts_packet(500 + n, None, false)).collect();
         std::fs::write(dir.join(".tmp/000002.ts"), &in_flight).unwrap();
 
@@ -3064,13 +3102,36 @@ mod tests {
         assert_eq!(recovery_alert(&mut events_rx), None, "a clean restart was swept as a crash's leftovers");
     }
 
+    /// Another flow's writer working in the recording — two flows naming one
+    /// recording — refuses the second at once, by name. It waited for as long
+    /// as the first flow ran, recording nothing, its queue full, raising lag
+    /// events that blamed the disk.
+    #[tokio::test]
+    async fn a_writer_of_another_flow_is_refused_rather_than_kept_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("rec");
+        let _other = RecordingLease::try_take(&dir, "cam1").unwrap();
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let (tx, _) = broadcast::channel::<RtpPacket>(16);
+        let refused = spawn_writer_at(
+            "cam2".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, CancellationToken::new(),
+        )
+        .await
+        .err()
+        .expect("a second flow's writer was let into the recording");
+        assert!(refused.to_string().starts_with("replay_recording_in_use"), "{refused}");
+        assert!(refused.to_string().contains("'cam1'"), "{refused}");
+        assert_eq!(tx.receiver_count(), 0, "the refused recorder kept a subscriber");
+        assert!(!dir.exists(), "the recording was opened");
+    }
+
     /// A flow stopped while its writer waits for the previous one ends the
     /// wait: nothing opened, nothing left running.
     #[tokio::test]
     async fn a_writer_waiting_on_the_previous_one_stops_with_its_flow() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("rec");
-        let _previous = RecordingLease::try_take(&dir).unwrap();
+        let _previous = RecordingLease::try_take(&dir, "flow").unwrap();
         let (events, _events_rx) = crate::manager::events::event_channel();
         let (tx, _) = broadcast::channel::<RtpPacket>(16);
         let cancel = CancellationToken::new();
@@ -3093,7 +3154,7 @@ mod tests {
         // A file where the recording's directory should be.
         let dir = tmp.path().join("rec");
         std::fs::write(&dir, b"not a directory").unwrap();
-        let previous = RecordingLease::try_take(&dir).unwrap();
+        let previous = RecordingLease::try_take(&dir, "flow").unwrap();
         let (events, mut events_rx) = crate::manager::events::event_channel();
         let (tx, _) = broadcast::channel::<RtpPacket>(1024);
         let cancel = CancellationToken::new();

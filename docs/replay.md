@@ -421,7 +421,12 @@ there:
    (past it, `replay_writer_lagged`, as behind any slow disk), a flow
    stopped meanwhile ends the wait, and an open that then fails raises the
    same Critical `recording_start_failed` event a failure at flow start
-   does, against the flow. The flow has already reported that recording
+   does, against the flow. Only a writer of the same flow waits: one of
+   another flow — two flows naming one recording through `storage_id` — is
+   refused at flow start with `replay_recording_in_use`, since that flow
+   holds the directory for as long as it runs, and a writer kept waiting
+   for it recorded nothing while its queue filled and raised
+   `replay_writer_lagged` against the disk. The flow has already reported that recording
    started by then and keeps its handle, so the recorder goes on answering
    its commands until the flow stops — `start_recording`, `mark_in` and
    `mark_out` with `replay_recording_not_active`, as for a flow with no
@@ -630,6 +635,7 @@ parsing strings.
 | `replay_clip_not_found` | Error | `play_clip`/`delete_clip` with an unknown `clip_id` | Refresh the clip list (it may have been pruned by retention) |
 | `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget, or past its own first 4 MiB with the node's recorders past the 256 MiB they share — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
 | `replay_disk_pressure` | Warning | Recording usage ≥ 80 % of `max_bytes` (or of replay-root filesystem when `max_bytes = 0`); sticky until back below 70 % | Free disk before ENOSPC; raise `max_bytes` if appropriate; reduce retention |
+| `replay_recording_in_use` | Critical (`recording_start_failed`) | The flow's recorder was not started: another flow's writer is working in the same recording directory — both flows' recordings resolve to one `storage_id`, or one flow's `storage_id` names another flow's id. Nothing in validation refuses the pair, and the two writers used to corrupt the directory between them | Give one of the flows its own `recording.storage_id`, then restart it |
 | `replay_disk_full` | Critical | A segment write hit a disk error (typically ENOSPC), or a finished segment's close (flush, fsync, rename) failed on the disk itself — ENOSPC, EDQUOT, EIO or EROFS; the latter carries `details.segment_id`, and that segment is lost | Free disk, then `stop_recording` + `start_recording` to re-arm |
 | `replay_segment_close_failed` | Critical | A finished segment's close failed for a reason other than the disk — its staging file removed from under the writer, a rename refused (permissions, something else at the final path). The staging file is unlinked and the segment lost; `details.segment_id`. Recording carries on with the next segment | Check the recording directory's ownership and permissions, and that nothing else writes into it |
 | `validation_error` | Error (`command_ack.error_code` only — no event) | `configure_recording`, `create_flow`, `update_flow` or `update_config` carrying a `recording` block whose `segment_seconds` is outside `[2, 60]`, `pre_buffer_seconds` outside `[1, 300]` or above a non-zero `retention_seconds`, `filmstrip_seconds` outside `[1, 30]`, `storage_id` not 1–64 ASCII alphanumerics + `_-`, or no `storage_id` on a flow whose id is not a single path component (`.`, `..`, or containing `/` `\`). The same check refuses `config.json` at node start, where there is no ack at all | Use a value in range, or set a valid `storage_id` |
