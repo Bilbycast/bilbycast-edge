@@ -1279,7 +1279,7 @@ also set `details.error_code` for `command_ack` correlation.
 |---|---|---|---|
 | `recording_started` | Info | A flow with `recording.enabled = true` brought up its writer | — |
 | `recording_stopped` | — | **Never implemented.** The `stop_recording` handler in `src/manager/client.rs` returns an empty ack and emits nothing, and there is no writer-side emitter either. A stop is visible only as the absence of further recording activity — no `replay_event` string of this name exists anywhere under `src/`. | — |
-| `recording_start_failed` | Critical | The writer task failed to start (storage unavailable, permission denied) | `replay_disk_full` |
+| `recording_start_failed` | Critical | The writer task failed to start (storage unavailable, permission denied) — at flow start, or, when the recording's previous writer was still finishing its segments, once that writer had let the recording go (the open then waits in the writer task, and this event carries `details.recording_id` and `details.error`) | `replay_disk_full` |
 | `clip_created` | Info | A `mark_out` materialised a new clip into `clips.json` (with fsync). `details.clip` carries the full `ClipInfo`. | — |
 | `clip_deleted` | Info | A `delete_clip` succeeded | — |
 | `recording_deleted` | Info | A `delete_recording` succeeded — the recording's directory under `<replay_root>/<recording_id>/` was unlinked. `details.bytes_freed` carries the byte total reclaimed. | — |

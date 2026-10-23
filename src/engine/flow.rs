@@ -3572,19 +3572,19 @@ impl FlowRuntime {
         }
         // And the recorder, which is still finishing after the cancel: it
         // closes its open segment and waits out every close pending behind
-        // it. A restart that did not wait started the next writer on the
-        // same directory meanwhile, and that writer's first act — sweeping
-        // `.tmp/` of a crash's leftovers — deleted the segments the old one
-        // was still finishing; a process exit abandoned them. Longer than an
-        // output's allowance, since this is up to five segments' fsyncs on
-        // whatever disk made the closer fall behind.
+        // it. A process that exited without waiting abandoned them. A
+        // restarted writer no longer depends on this wait — it holds off
+        // opening the recording until this one has let it go
+        // (`replay::writer::RecordingLease`) — but a node shutting down
+        // does. Longer than an output's allowance, since this is up to five
+        // segments' fsyncs on whatever disk made the closer fall behind.
         #[cfg(feature = "replay")]
         if let Some(rec) = &self.recording_handle
             && !rec.finished(std::time::Duration::from_secs(10)).await
         {
             tracing::warn!(
                 "Flow '{}': recording '{}' had not finished closing its segments after 10 s; \
-                 a restarted recorder may sweep up the last of them",
+                 a restarted recorder waits for them before it opens the recording",
                 self.config.config.id, rec.recording_id,
             );
         }

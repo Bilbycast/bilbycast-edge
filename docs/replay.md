@@ -350,9 +350,12 @@ range has to honour it — see [Clip export](#clip-export) below.
    the new file over the last segment before the Stop, whose index
    entries still pointed into it. A flow that stops or restarts waits up
    to 10 s for its recorder to do the same (`RecordingHandle::finished`,
-   one deadline for the writer and its filmstrip together): without that,
-   the restarted writer's `.tmp/` sweep (below) deleted the segments the
-   old one was still finishing. A node shutting down stops all its flows
+   one deadline for the writer and its filmstrip together), so a process
+   that exits leaves every segment in place. A restarted writer does not
+   rely on that wait: it opens the recording only once the previous writer
+   and its closer have let it go (see [Crash recovery](#crash-recovery-writer-init-scan)),
+   because a disk slow enough outran the 10 s and the new writer's `.tmp/`
+   sweep deleted the segments the old one was still finishing. A node shutting down stops all its flows
    at once and gives them 10 s in all (`SHUTDOWN_FLOW_STOP_BUDGET`), so a
    stalled replay volume costs that wait once rather than once per
    recording flow, and the tunnels and bond routes torn down after the
@@ -384,8 +387,26 @@ range has to honour it — see [Clip export](#clip-export) below.
 
 Whenever `spawn_writer` runs (cold start, edge restart after SIGKILL,
 operator-driven re-arm), it scans the recording directory before
-opening a new segment:
+opening a new segment — and first makes sure it is the only writer
+there:
 
+0. **One writer at a time.** A writer holds its recording's directory
+   (`RecordingLease`, a per-directory lock in a node-wide registry) from
+   before this scan until its closer has finished every segment and the
+   index is synced; the writer state and the closer each keep a share, so
+   the hold outlives whichever ends last, a panic included. A writer
+   started while the previous one still holds it — a flow restarted while
+   the old closer fsyncs on a slow disk — opens in its own task once the
+   previous one lets go, so the flow's start never waits on it: what the
+   flow publishes meanwhile queues for the writer within its 32 MiB budget
+   (past it, `replay_writer_lagged`, as behind any slow disk), a flow
+   stopped meanwhile ends the wait, and an open that then fails raises the
+   same Critical `recording_start_failed` event a failure at flow start
+   does. `FlowRuntime::stop`'s 10 s wait used to be all that kept the two
+   apart, and a disk slower than that let the new writer's sweep below
+   unlink the segments the old closer had yet to rename — and a segment
+   the old writer had open with no index entry yet, an id nothing names,
+   share its id with the new writer's first.
 1. **`.tmp/` orphan cleanup.** Any `<NNNNNN>.ts` left in `.tmp/` is a
    partial segment the writer never atomically renamed onto the
    recording — unlinked unconditionally.
@@ -436,6 +457,10 @@ same rules) keeps it so:
   file that is missing rather than media recorded after the restart; an
   id nothing names yet (a segment lost before its first random-access
   point) is used again.
+- **One writer per recording at a time.** A writer resumes past what the
+  directory, the meta and the index say only if no other writer is still
+  adding to them; a restarted writer waits for the previous one (step 0 of
+  [Crash recovery](#crash-recovery-writer-init-scan)).
 - **A gap in the ids is not the end of the recording.** A crash leaves one
   where the segments it lost were, and so does a close that fails.
   Playback (`Reader::advance_segment`) steps over it to the next segment
