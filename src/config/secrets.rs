@@ -217,8 +217,8 @@ impl SecretsConfig {
             // Only beside its secret: on its own it authenticates nothing, and
             // `merge_into` brings it back only with one. This does not keep a
             // secret in the file — a running config that has lost its secret
-            // now empties `secrets.json` (see `save_split_secrets`), so what
-            // keeps it is the callers never dropping it by accident.
+            // now rewrites `secrets.json` without it (see `save_split_secrets`),
+            // so what keeps it is the callers never dropping it by accident.
             secrets.manager_node_id = mgr.node_secret.as_ref().and(mgr.node_id.clone());
         }
 

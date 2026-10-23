@@ -1062,8 +1062,10 @@ read from that position to that end, with no start resolved again:
   announced, however far the recording has grown since;
 - a `resume` this edge would not have handed out — an unknown field, a
   value out of range, a position at or past the end it names or past what
-  the segments hold, more or fewer bytes than lie between — is refused
-  `replay_invalid_field`.
+  the segments hold, fewer bytes than lie between — is refused
+  `replay_invalid_field`. One claiming more bytes than lie between cannot be
+  told from a segment no entry names that has gone, and is refused
+  `replay_segment_missing`.
 
 A manager that follows `resume` says so with `pin_plan_start: true` on every
 request, the first included. Its first chunk of a whole-recording export (no
@@ -1093,8 +1095,8 @@ of `clip_id`, plus optional `from_pts_90khz` / `to_pts_90khz` to
 bound the export to a PTS sub-range. Whole-recording exports are
 capped at 4 GiB total — over-cap requests fail with
 `replay_export_too_large` and the operator should mark a clip first.
-A clip export has no such cap, and its `resume` carries whatever it has
-left, however far past 4 GiB.
+A TS clip export has no such cap, and its `resume` carries whatever it
+has left, however far past 4 GiB.
 
 The exported bytes are **packet-aligned MPEG-TS** — the manager can
 concatenate chunks in order and serve the result as

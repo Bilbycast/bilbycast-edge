@@ -129,7 +129,8 @@ impl Resume {
     /// [`MAX_EXPORT_TOTAL_BYTES`]), so a clip over 4 GiB is handed a cursor
     /// past it — and [`plan_from_resume`] holds the count to exactly the
     /// bytes on disk between the cursor and its end, so a forged one reads
-    /// nothing a real plan would not.
+    /// only this recording's on-disk bytes, a chunk at a time: bytes a clip
+    /// or a from/to range reaches anyway.
     fn checked(self) -> Result<Self> {
         if (self.segment, self.offset) >= (self.end_segment, self.end_offset)
             || self.remaining == 0
