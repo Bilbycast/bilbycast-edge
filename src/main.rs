@@ -630,17 +630,10 @@ async fn real_main() -> anyhow::Result<()> {
     // generated yet. The token is persisted (encrypted) to secrets.json
     // and printed to stdout exactly once. Required by /setup for any
     // non-loopback caller; cleared by the manager-client on first
-    // successful registration. Runs after CLI overrides so the banner
-    // reflects the actual listen port.
-    if app_config.setup_enabled && app_config.setup_token.is_none() {
-        use rand::RngExt;
-        let mut bytes = [0u8; 32];
-        rand::rng().fill(&mut bytes);
-        let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        app_config.setup_token = Some(token.clone());
-        save_config_split(&cli.config, &secrets_path, &app_config).map_err(|e| {
-            anyhow::anyhow!("Failed to persist auto-generated setup token: {e}")
-        })?;
+    // successful registration. A save that fails is logged and the start
+    // goes on (see `mint_setup_token`). Runs after CLI overrides so the
+    // banner reflects the actual listen port.
+    if let Some(token) = setup::mint_setup_token(&cli.config, &secrets_path, &mut app_config) {
         println!(
             "\n=== bilbycast-edge first-boot setup token ===\n\
              {0}\n\

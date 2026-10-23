@@ -618,7 +618,15 @@ where
                 // the manager just issued rather than the token it spent.
                 lock_credentials(creds).registered(node_id.clone(), node_secret.clone());
                 tunnel_manager.set_manager_node_id(node_id.clone());
-                persist_credentials(app_config, config_path, secrets_path, &node_id, &node_secret).await;
+                persist_credentials(
+                    app_config,
+                    config_path,
+                    secrets_path,
+                    &node_id,
+                    &node_secret,
+                    tunnel_manager.event_sender(),
+                )
+                .await;
             }
         }
         "auth_error" => {
@@ -1747,13 +1755,34 @@ pub fn edge_capabilities() -> Vec<&'static str> {
     caps
 }
 
-/// Persist manager credentials to config + secrets files.
+/// Save the credentials the manager issued at registration, in the running
+/// config and in `secrets.json` / `config.json`, and close the setup wizard.
+///
+/// `secrets.json` decides, as it does for [`save_node_secret`]: it is written
+/// first and on its own, and it carries the node ID with the secret
+/// (`SecretsConfig::manager_node_id`), so once it lands a restart
+/// authenticates whatever `config.json` then does. The node ID used to live in
+/// `config.json` alone, written by the same two-file save: a `config.json`
+/// that could not be written — a full disk fails the bigger file alone — left
+/// a restart with the issued secret, no node ID to present it with, and a
+/// spent registration token.
+///
+/// Unlike a rotation there is nothing to refuse: the manager spent the token
+/// and stored the secret before it answered. So the running config takes the
+/// credentials whatever the files do, and the next save that succeeds writes
+/// them. A `secrets.json` that cannot take them is reported, since until then
+/// a restart presents the spent token; a `config.json` that cannot be
+/// rewritten is only logged. It still has the setup wizard open, but a
+/// restart reads the closure from `secrets.json` too: that `config.json` does
+/// not hold the node ID the secret was issued for
+/// (`SecretsConfig::registered_since`).
 async fn persist_credentials(
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &Path,
     secrets_path: &Path,
     node_id: &str,
     node_secret: &str,
+    events: &super::events::EventSender,
 ) {
     let mut cfg = app_config.write().await;
     if let Some(ref mut mgr) = cfg.manager {
@@ -1773,10 +1802,22 @@ async fn persist_credentials(
             "Setup wizard disabled and one-shot token cleared after successful manager registration"
         );
     }
-    if let Err(e) = save_config_split_async(config_path.to_path_buf(), secrets_path.to_path_buf(), cfg.clone()).await {
-        tracing::warn!("Failed to persist manager credentials: {e}");
-    } else {
-        tracing::info!("Manager credentials saved (node_secret → {})", secrets_path.display());
+    if let Err(e) = save_split_secrets_async(secrets_path.to_path_buf(), cfg.clone()).await {
+        tracing::warn!(
+            "Failed to save the credentials the manager issued to {}: {e}; until a later save \
+             succeeds, a restart presents the spent registration token",
+            secrets_path.display()
+        );
+        emit_credentials_not_saved(events, "registration", &e.to_string());
+        return;
+    }
+    tracing::info!("Manager credentials saved (node_secret → {})", secrets_path.display());
+    if let Err(e) = save_split_config_async(config_path.to_path_buf(), cfg.clone()).await {
+        tracing::warn!(
+            "The credentials the manager issued are saved to {}, but {} could not be rewritten: {e}",
+            secrets_path.display(),
+            config_path.display()
+        );
     }
 }
 
@@ -1795,9 +1836,9 @@ async fn persist_credentials(
 /// node ID, which a rotation does not change, and none of the secrets.
 /// The registration token goes: a node presenting a secret has spent it.
 ///
-/// Only ever writes a secret, never clears one: a `PUT /api/v1/config` of the
-/// masked `GET` body leaves the running config's `node_secret` empty, and
-/// this puts it back.
+/// Only ever writes a secret, never clears one, so it also puts back a
+/// `node_secret` the running config has lost — as a `PUT /api/v1/config` of
+/// the masked `GET` body used to lose it.
 async fn save_node_secret(
     app_config: &Arc<RwLock<AppConfig>>,
     config_path: &Path,
@@ -1966,6 +2007,13 @@ async fn rotate_node_secret(
 /// push any JPEG whose generation counter has advanced since the last send.
 /// Each write goes through `send_bounded`, and its `Err` ends the session —
 /// the same as the stats / health / event send sites.
+///
+/// The flows and their per-input accumulators are copied out of the stats
+/// maps before anything is written. Iterating a `DashMap` holds a read guard
+/// on each shard it visits, and a write can wait up to `WRITE_STALL_LIMIT`
+/// for a manager that has stopped reading: held across that wait, the guard
+/// blocks every writer to the shard — a flow starting or stopping registers
+/// and unregisters there — and blocks its thread, not just its task.
 async fn send_pending_thumbnails<S>(
     flow_manager: &Arc<FlowManager>,
     thumbnail_generations: &mut HashMap<String, u64>,
@@ -1976,11 +2024,13 @@ where
     S::Error: std::fmt::Display,
 {
     use base64::Engine;
-    let stats = flow_manager.stats();
-    for entry in stats.flow_stats.iter() {
-        let flow_id = entry.key().clone();
-        let acc = entry.value();
-
+    let flows: Vec<_> = flow_manager
+        .stats()
+        .flow_stats
+        .iter()
+        .map(|entry| (entry.key().clone(), entry.value().clone()))
+        .collect();
+    for (flow_id, acc) in flows {
         // Flow-level thumbnail (what outputs are sending).
         if let Some(thumb_acc) = acc.thumbnail.get() {
             let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
@@ -2017,9 +2067,12 @@ where
         }
 
         // Per-input thumbnails (what each source is receiving).
-        for per_input in acc.per_input_thumbnails.iter() {
-            let input_id = per_input.key().clone();
-            let thumb_acc = per_input.value();
+        let inputs: Vec<_> = acc
+            .per_input_thumbnails
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        for (input_id, thumb_acc) in inputs {
             let thumb_gen = thumb_acc.generation.load(std::sync::atomic::Ordering::Relaxed);
             let gen_key = format!("input:{flow_id}:{input_id}");
             let prev = thumbnail_generations.get(&gen_key).copied().unwrap_or(0);
@@ -10485,10 +10538,106 @@ mod manager_link_tests {
         assert_eq!(edge.secret_on_disk().as_deref(), Some("issued-secret"));
     }
 
-    /// A `PUT /api/v1/config` of the masked `GET` body leaves the running
-    /// config without a secret. What the edge presents does not come from
-    /// there, so the next reconnect is unaffected — read back from the
-    /// running config, it would have presented no secret at all.
+    /// `secrets.json` alone decides what a restart presents after a
+    /// registration, and that the registration closed the setup wizard. The
+    /// node ID lived only in `config.json`, so one that could not be written
+    /// left a restart with the issued secret and no node ID to present it with
+    /// — and the registration token was spent. With the ID in `secrets.json`
+    /// the node authenticated, but `config.json` still had the wizard open:
+    /// the start minted a fresh token and, on the full disk that failed the
+    /// registration's write, exited when it could not save it; with the disk
+    /// freed, it served `/setup` on a registered node for good.
+    #[tokio::test]
+    async fn a_registration_beside_an_unwritable_config_json_authenticates_after_a_restart() {
+        /// What `main` does at start before the manager link: load the
+        /// files, then mint a setup token if the wizard is open without one.
+        fn start(edge: &Edge) -> (AppConfig, Option<String>) {
+            let mut config =
+                crate::config::persistence::load_config_split(&edge.deps.config_path, &edge.deps.secrets_path)
+                    .expect("the start reads its files");
+            let minted = crate::setup::mint_setup_token(&edge.deps.config_path, &edge.deps.secrets_path, &mut config);
+            (config, minted)
+        }
+
+        let mut edge = Edge::new(manager_config(None, Some("one-time-token")));
+        // A fresh install: the wizard open, its first-boot token minted.
+        edge.deps.app_config.write().await.setup_token = Some("first-boot-token".into());
+        edge.save().await;
+        Edge::block_writes_to(&edge.deps.config_path);
+        let creds = edge.credentials();
+
+        let (_, shown) = edge
+            .session(&creds, |mut ws| async move { authenticate(&mut ws, register_ack()).await })
+            .await;
+        assert_eq!(shown["registration_token"], "one-time-token");
+
+        for disk in ["still full", "freed"] {
+            if disk == "freed" {
+                std::fs::remove_dir(edge.deps.config_path.with_extension("json.tmp")).unwrap();
+            }
+            let (restarted, minted) = start(&edge);
+            assert_eq!(minted, None, "{disk}: the start minted a setup token");
+            assert!(!restarted.setup_enabled, "{disk}: the wizard the registration closed is open");
+            assert!(restarted.setup_token.is_none(), "{disk}");
+            let shown = build_auth_message(restarted.manager.as_ref().unwrap())["payload"].clone();
+            assert_eq!(shown["node_id"], "node-9", "{disk}: {shown}");
+            assert_eq!(shown["node_secret"], "issued-secret", "{disk}: {shown}");
+        }
+
+        // Once `config.json` has been written since the registration, it
+        // decides again: an operator re-opens the wizard by editing it.
+        edge.save().await;
+        let mut on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&edge.deps.config_path).unwrap()).unwrap();
+        assert_eq!(on_disk["setup_enabled"], false);
+        on_disk["setup_enabled"] = true.into();
+        std::fs::write(&edge.deps.config_path, on_disk.to_string()).unwrap();
+        let (reopened, minted) = start(&edge);
+        assert!(reopened.setup_enabled, "the wizard an operator re-opened is closed");
+        assert!(minted.is_some());
+    }
+
+    /// A `secrets.json` that cannot take the issued credentials is reported,
+    /// and the running config keeps them, so the next save that succeeds
+    /// writes them. There is no refusing them, as a rotation is refused: the
+    /// manager has already spent the token.
+    #[tokio::test]
+    async fn a_registration_secrets_json_cannot_take_is_reported_and_kept_running() {
+        let mut edge = Edge::new(manager_config(None, Some("one-time-token")));
+        edge.save().await;
+        Edge::block_writes_to(&edge.deps.secrets_path);
+
+        persist_credentials(
+            &edge.deps.app_config,
+            &edge.deps.config_path,
+            &edge.deps.secrets_path,
+            "node-9",
+            "issued-secret",
+            edge.deps.tunnel_manager.event_sender(),
+        )
+        .await;
+
+        let reported = std::iter::from_fn(|| edge.event_rx.try_recv().ok()).any(|e| {
+            e.details.as_ref().is_some_and(|d| {
+                d["error_code"] == "manager_credentials_not_saved" && d["during"] == "registration"
+            })
+        });
+        assert!(reported, "a registration secrets.json could not take must be reported");
+        let running = edge.deps.app_config.read().await.manager.clone().unwrap();
+        assert_eq!(running.node_id.as_deref(), Some("node-9"));
+        assert_eq!(running.node_secret.as_deref(), Some("issued-secret"));
+        assert!(running.registration_token.is_none());
+
+        std::fs::remove_dir(edge.deps.secrets_path.with_extension("json.tmp")).unwrap();
+        edge.save().await;
+        assert_eq!(edge.secret_on_disk().as_deref(), Some("issued-secret"));
+    }
+
+    /// A running config without a secret — what a `PUT /api/v1/config` of
+    /// the masked `GET` body used to leave — does not change what the edge
+    /// presents, which does not come from there: the next reconnect is
+    /// unaffected. Read back from the running config, it would have presented
+    /// no secret at all.
     #[tokio::test]
     async fn a_masked_config_does_not_change_what_the_edge_presents() {
         let mut edge = Edge::new(manager_config(Some(OLD), None));
@@ -10726,5 +10875,45 @@ mod manager_link_tests {
         assert_eq!(on_disk.node_id.as_deref(), Some("node-9"));
         assert_eq!(on_disk.node_secret.as_deref(), Some("issued-secret"));
         assert!(on_disk.registration_token.is_none());
+    }
+
+    // ── Thumbnails ─────────────────────────────────────────────────
+
+    /// A thumbnail write the manager is not reading holds no lock on the
+    /// stats maps. The scan used to iterate them across its writes, so a
+    /// write waiting on the manager — up to `WRITE_STALL_LIMIT` — held a read
+    /// guard on its flow's shard of both maps, and a flow starting or
+    /// stopping on that shard blocked its thread until the write gave up.
+    #[tokio::test]
+    async fn a_stalled_thumbnail_write_holds_no_lock_on_the_stats() {
+        use dashmap::try_result::TryResult;
+
+        let edge = Edge::new(manager_config(Some(OLD), None));
+        let stats = edge.deps.flow_manager.stats();
+        let flow = stats.register_flow("flow-1".into(), "flow-1".into(), "rtp".into());
+        let thumbnail = Arc::new(crate::stats::collector::ThumbnailAccumulator::new());
+        thumbnail.store(bytes::Bytes::from(vec![0u8; 8192]));
+        flow.per_input_thumbnails.insert("input-1".into(), thumbnail);
+
+        // The manager's end is held open and never read, so the first frame,
+        // far bigger than the pipe, cannot finish.
+        let (edge_io, _manager_io) = tokio::io::duplex(1024);
+        let (mut sink, _stream) = WebSocketStream::from_raw_socket(edge_io, Role::Client, None).await.split();
+        let mut sent = HashMap::new();
+        let send = send_pending_thumbnails(&edge.deps.flow_manager, &mut sent, &mut sink);
+        tokio::pin!(send);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut send).await.is_err(),
+            "the thumbnail write must be waiting on the manager"
+        );
+
+        assert!(
+            matches!(stats.flow_stats.try_get_mut("flow-1"), TryResult::Present(_)),
+            "the write holds the flows' map locked"
+        );
+        assert!(
+            matches!(flow.per_input_thumbnails.try_get_mut("input-1"), TryResult::Present(_)),
+            "the write holds the flow's per-input thumbnails locked"
+        );
     }
 }

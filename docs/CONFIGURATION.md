@@ -30,7 +30,7 @@ Both `config.json` and `secrets.json` are written to disk immediately after any 
 
 ### Atomic writes
 
-Config saves use an atomic two-phase write: the JSON is first written to a temporary file (`.json.tmp`), then renamed to the actual config path. This prevents partial or corrupted config files if the node crashes or loses power mid-write. Both `config.json` and `secrets.json` use this approach.
+Config saves use an atomic two-phase write: the JSON is first written to a temporary file (`.json.tmp`), then renamed to the actual config path. This prevents partial or corrupted config files if the node crashes or loses power mid-write. Both `config.json` and `secrets.json` use this approach. A save that fails — a full disk part way through the write, or a rename that is refused — removes its temporary file rather than leaving it beside the file it never replaced.
 
 ### Manager config update behavior
 
@@ -213,7 +213,7 @@ Optional connection to a bilbycast-manager instance for centralized monitoring a
 | `node_id`            | `string?` | `null`  | Assigned node ID (set automatically after registration) |
 | `node_secret`        | `string?` | `null`  | Assigned node secret (set automatically after registration). **Stored in `secrets.json`.** |
 
-On first connection, provide `registration_token`. After successful registration, the manager returns `node_id` and `node_secret`. The `node_id` is saved to `config.json`, while `node_secret` is saved to `secrets.json`. The `registration_token` is cleared from both files. Subsequent connections use `node_id` and `node_secret`.
+On first connection, provide `registration_token`. After successful registration, the manager returns `node_id` and `node_secret`. The `node_id` is saved to `config.json`, while `node_secret` is saved to `secrets.json` — together with a copy of the `node_id` it was issued for (`manager_node_id`). `secrets.json` is written first, on its own, so once it holds them a restart authenticates even if `config.json` could not then be rewritten (a full disk fails the bigger file alone); on load, the secret brings that node ID with it. The `registration_token` is cleared from both files. Subsequent connections use `node_id` and `node_secret`.
 
 **config.json** (before registration):
 ```json
@@ -250,7 +250,8 @@ After registration, the files are updated to:
 ```json
 {
   "version": 1,
-  "manager_node_secret": "assigned-secret"
+  "manager_node_secret": "assigned-secret",
+  "manager_node_id": "assigned-uuid"
 }
 ```
 

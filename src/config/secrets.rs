@@ -38,6 +38,13 @@ pub struct SecretsConfig {
     /// Manager authentication secret (assigned after registration).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager_node_secret: Option<String>,
+    /// The node ID `manager_node_secret` was issued for. Not a secret, and
+    /// `config.json` carries it too, but a secret is only good with its own
+    /// node ID, and this file is written first and in one rename: with the
+    /// ID here, a registration whose `config.json` could not be written still
+    /// authenticates after a restart. Only ever written beside the secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_node_id: Option<String>,
     /// One-time registration token for initial manager registration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manager_registration_token: Option<String>,
@@ -181,6 +188,7 @@ impl SecretsConfig {
     /// Returns true if there are any secrets stored.
     pub fn is_empty(&self) -> bool {
         self.manager_node_secret.is_none()
+            && self.manager_node_id.is_none()
             && self.manager_registration_token.is_none()
             && self.server_tls.is_none()
             && self.server_auth.is_none()
@@ -206,6 +214,12 @@ impl SecretsConfig {
         if let Some(ref mgr) = config.manager {
             secrets.manager_node_secret = mgr.node_secret.clone();
             secrets.manager_registration_token = mgr.registration_token.clone();
+            // Only beside its secret: on its own it authenticates nothing, and
+            // `merge_into` brings it back only with one. This does not keep a
+            // secret in the file — a running config that has lost its secret
+            // now empties `secrets.json` (see `save_split_secrets`), so what
+            // keeps it is the callers never dropping it by accident.
+            secrets.manager_node_id = mgr.node_secret.as_ref().and(mgr.node_id.clone());
         }
 
         // Server TLS
@@ -264,6 +278,13 @@ impl SecretsConfig {
         if let Some(ref mut mgr) = config.manager {
             if self.manager_node_secret.is_some() && mgr.node_secret.is_none() {
                 mgr.node_secret = self.manager_node_secret.clone();
+                // The secret brings the node ID it was issued for. The two
+                // were written together; `config.json` is written after and
+                // can hold an older ID, or none — a registration whose
+                // `config.json` write failed left it without one.
+                if self.manager_node_id.is_some() {
+                    mgr.node_id = self.manager_node_id.clone();
+                }
             }
             if self.manager_registration_token.is_some() && mgr.registration_token.is_none() {
                 mgr.registration_token = self.manager_registration_token.clone();
@@ -345,6 +366,112 @@ impl SecretsConfig {
                         Self::merge_output_secrets(os, output);
                     }
                 }
+            }
+        }
+    }
+
+    /// Whether `config`, `config.json` as a load reads it, predates the
+    /// registration that issued this file's node secret: it does not hold the
+    /// node ID the secret was issued for.
+    ///
+    /// A registration writes `secrets.json` first and on its own, then
+    /// `config.json`, so a `config.json` that could not be written (a full
+    /// disk fails the bigger file alone) is left exactly like this. What the
+    /// registration recorded in `config.json` alone is then missing. One is the
+    /// node ID, which [`merge_into`](Self::merge_into) brings with the secret.
+    /// The other is the setup wizard's closure, which
+    /// [`load_config_split`](crate::config::persistence::load_config_split)
+    /// restores on this answer.
+    ///
+    /// Only a registration gives the secret a new ID in practice: the setup
+    /// wizard keeps both, a manager push may not touch the `manager` block,
+    /// and a `PUT /api/v1/config` that leaves the secret out keeps its ID with
+    /// it. A `PUT` naming a new pair is read the same way, which errs towards
+    /// a closed wizard. A registration the manager answers with the ID
+    /// `config.json` already holds (a token regenerated for the same node)
+    /// cannot be told apart this way.
+    pub fn registered_since(&self, config: &AppConfig) -> bool {
+        let Some(ref mgr) = config.manager else {
+            return false;
+        };
+        // As in `merge_into`: only a secret the file supplies brings its ID.
+        self.manager_node_secret.is_some()
+            && mgr.node_secret.is_none()
+            && self.manager_node_id.is_some()
+            && mgr.node_id != self.manager_node_id
+    }
+
+    /// Forget every secret that `body`, a whole config as JSON, sets to an
+    /// explicit `null`. [`merge_into`](Self::merge_into) then leaves it
+    /// cleared rather than putting this file's value back.
+    ///
+    /// serde reads an explicit `null` and an absent key alike, as `None`, and
+    /// `merge_into` fills every `None`. Only the JSON tells them apart.
+    /// Absent is a caller that does not model the secret: `GET
+    /// /api/v1/config` leaves every one of them out, so the body a client
+    /// reads, edits and puts back carries none. An explicit `null` is a caller
+    /// that names the secret and means to remove it. Without this a `PUT`
+    /// could remove none: `server.tls` (two paths, no off switch) above all.
+    ///
+    /// A node secret is only good with its own node ID, so a `null`
+    /// `manager.node_id` forgets the secret too. Otherwise the kept secret
+    /// would bring the ID back (see `merge_into`), and the node would go on
+    /// presenting the pair rather than the registration token the body names.
+    ///
+    /// A secret is matched where `merge_into` puts it back: a tunnel by its
+    /// `id`, a cellular uplink by its `interface`.
+    pub fn forget_nulled(&mut self, body: &serde_json::Value) {
+        fn nulled(block: &serde_json::Value, key: &str) -> bool {
+            block.get(key).is_some_and(serde_json::Value::is_null)
+        }
+
+        if let Some(mgr) = body.get("manager") {
+            if nulled(mgr, "node_secret") || nulled(mgr, "node_id") {
+                self.manager_node_secret = None;
+                self.manager_node_id = None;
+            }
+            if nulled(mgr, "registration_token") {
+                self.manager_registration_token = None;
+            }
+        }
+        if let Some(server) = body.get("server") {
+            if nulled(server, "tls") {
+                self.server_tls = None;
+            }
+            if nulled(server, "auth") {
+                self.server_auth = None;
+            }
+        }
+        if let Some(nr) = body.get("nmos_registration")
+            && nulled(nr, "bearer_token")
+        {
+            self.nmos_registration_bearer_token = None;
+        }
+        for tunnel in body.get("tunnels").and_then(|t| t.as_array()).into_iter().flatten() {
+            let Some(ts) = tunnel.get("id").and_then(|id| id.as_str()).and_then(|id| self.tunnels.get_mut(id))
+            else {
+                continue;
+            };
+            for (key, secret) in [
+                ("tunnel_encryption_key", &mut ts.tunnel_encryption_key),
+                ("tunnel_bind_secret", &mut ts.tunnel_bind_secret),
+                ("tunnel_psk", &mut ts.tunnel_psk),
+                ("tls_cert_pem", &mut ts.tls_cert_pem),
+                ("tls_key_pem", &mut ts.tls_key_pem),
+            ] {
+                if nulled(tunnel, key) {
+                    *secret = None;
+                }
+            }
+        }
+        for uplink in body.get("cellular_uplinks").and_then(|u| u.as_array()).into_iter().flatten() {
+            if nulled(uplink, "password")
+                && let Some(cs) = uplink
+                    .get("interface")
+                    .and_then(|i| i.as_str())
+                    .and_then(|i| self.cellular_uplinks.get_mut(i))
+            {
+                cs.password = None;
             }
         }
     }
@@ -1178,5 +1305,140 @@ mod node_local_secret_tests {
         assert_eq!(stripped.server.auth.is_none(), cleared.server.auth.is_none());
         assert_eq!(stripped.server.tls.is_none(), cleared.server.tls.is_none());
         assert_eq!(stripped.setup_token.is_none(), cleared.setup_token.is_none());
+    }
+}
+
+#[cfg(test)]
+mod manager_secret_tests {
+    use super::*;
+
+    fn with_manager(node_id: Option<&str>, node_secret: Option<&str>) -> AppConfig {
+        AppConfig {
+            manager: Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true,
+                    "urls": ["wss://manager.example/ws/node"],
+                    "node_id": node_id,
+                    "node_secret": node_secret,
+                }))
+                .expect("manager fixture"),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_node_secret_brings_the_node_id_it_was_issued_for() {
+        let secrets = SecretsConfig::extract_from(&with_manager(Some("node-9"), Some("issued-secret")));
+
+        // `config.json` is written after `secrets.json`, so beside it a
+        // restart can find no node ID (a registration whose `config.json`
+        // write failed) or an older one (the same, re-registering).
+        for in_config_json in [None, Some("node-1")] {
+            let mut loaded = with_manager(in_config_json, None);
+            secrets.merge_into(&mut loaded);
+            let mgr = loaded.manager.unwrap();
+            assert_eq!(mgr.node_id.as_deref(), Some("node-9"), "beside {in_config_json:?}");
+            assert_eq!(mgr.node_secret.as_deref(), Some("issued-secret"));
+        }
+
+        // A config that names its own secret merges none, and keeps its ID.
+        let mut explicit = with_manager(Some("node-3"), Some("its-own-secret"));
+        secrets.merge_into(&mut explicit);
+        assert_eq!(explicit.manager.unwrap().node_id.as_deref(), Some("node-3"));
+    }
+
+    #[test]
+    fn a_node_id_is_never_saved_without_its_secret() {
+        // A node ID with no secret beside it is not saved: on its own it
+        // authenticates nothing, and `merge_into` ignores it.
+        assert!(SecretsConfig::extract_from(&with_manager(Some("node-9"), None)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod nulled_secret_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// A node holding every infrastructure secret there is.
+    fn node() -> AppConfig {
+        let mut config = serde_json::to_value(AppConfig::default()).expect("serialise");
+        let fields = json!({
+            "setup_token": "node-minted-token",
+            "manager": {
+                "enabled": true, "urls": ["wss://manager.example/ws/node"],
+                "node_id": "node-1", "node_secret": "node-secret", "registration_token": "spare-token",
+            },
+            "nmos_registration": { "registry_url": "http://registry.example", "bearer_token": "nmos-token" },
+            "tunnels": [{
+                "id": "11111111-2222-3333-4444-555555555555", "name": "t", "protocol": "udp",
+                "mode": "direct", "direction": "egress", "local_addr": "127.0.0.1:29901",
+                "peer_addr": "127.0.0.1:29911",
+                "tunnel_encryption_key": "a".repeat(64), "tunnel_bind_secret": "b".repeat(64),
+                "tunnel_psk": "tunnel-psk", "tls_cert_pem": "cert-pem", "tls_key_pem": "key-pem",
+            }],
+            "cellular_uplinks": [{ "interface": "wwan0", "address": "192.168.1.1", "password": "router-password" }],
+        });
+        config.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+        config["server"]["tls"] = json!({ "cert_path": "/etc/edge/cert.pem", "key_path": "/etc/edge/key.pem" });
+        config["server"]["auth"] = json!({ "enabled": true, "jwt_secret": "j".repeat(32), "clients": [] });
+        serde_json::from_value(config).expect("node fixture")
+    }
+
+    /// The secrets the node holds after a `PUT` of `body`, merged as
+    /// `replace_config` merges it.
+    fn after_put(body: &Value) -> Value {
+        let mut kept = SecretsConfig::extract_from(&node());
+        kept.forget_nulled(body);
+        let mut put: AppConfig = serde_json::from_value(body.clone()).expect("body");
+        kept.merge_into(&mut put);
+        serde_json::to_value(SecretsConfig::extract_from(&put)).expect("serialise")
+    }
+
+    fn secrets_of(config: &AppConfig) -> Value {
+        serde_json::to_value(SecretsConfig::extract_from(config)).expect("serialise")
+    }
+
+    /// What `GET /api/v1/config` returns: every secret left out.
+    fn masked() -> Value {
+        let mut config = node();
+        config.mask_secrets();
+        serde_json::to_value(config).expect("serialise")
+    }
+
+    #[test]
+    fn a_secret_left_out_is_kept_and_one_named_null_removed() {
+        assert_eq!(after_put(&masked()), secrets_of(&node()), "the masked GET body keeps every secret");
+
+        let cases: [(&str, fn(&mut AppConfig)); 13] = [
+            ("/manager/node_secret", |c| c.manager.as_mut().unwrap().node_secret = None),
+            // A secret is only good with its node ID, so it goes too.
+            ("/manager/node_id", |c| {
+                let mgr = c.manager.as_mut().unwrap();
+                mgr.node_id = None;
+                mgr.node_secret = None;
+            }),
+            ("/manager/registration_token", |c| c.manager.as_mut().unwrap().registration_token = None),
+            ("/server/tls", |c| c.server.tls = None),
+            ("/server/auth", |c| c.server.auth = None),
+            ("/nmos_registration/bearer_token", |c| c.nmos_registration.as_mut().unwrap().bearer_token = None),
+            ("/tunnels/0/tunnel_encryption_key", |c| c.tunnels[0].tunnel_encryption_key = None),
+            ("/tunnels/0/tunnel_bind_secret", |c| c.tunnels[0].tunnel_bind_secret = None),
+            ("/tunnels/0/tunnel_psk", |c| c.tunnels[0].tunnel_psk = None),
+            ("/tunnels/0/tls_cert_pem", |c| c.tunnels[0].tls_cert_pem = None),
+            ("/tunnels/0/tls_key_pem", |c| c.tunnels[0].tls_key_pem = None),
+            ("/cellular_uplinks/0/password", |c| c.cellular_uplinks[0].password = None),
+            // A null the body puts somewhere no secret lives removes nothing.
+            ("/device_name", |_| {}),
+        ];
+        for (pointer, remove) in cases {
+            let mut body = masked();
+            let (block, key) = pointer.rsplit_once('/').unwrap();
+            body.pointer_mut(block).unwrap().as_object_mut().unwrap().insert(key.into(), Value::Null);
+            let mut expected = node();
+            remove(&mut expected);
+            assert_eq!(after_put(&body), secrets_of(&expected), "{pointer}: null");
+        }
     }
 }

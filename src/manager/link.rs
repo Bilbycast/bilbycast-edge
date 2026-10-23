@@ -736,9 +736,10 @@ where
 /// presented the consumed registration token until a restart.
 ///
 /// The running `AppConfig` is never read back into this. It is what the
-/// files hold and what a restart presents, and a `PUT /api/v1/config` of the
-/// masked `GET` body leaves its `node_secret` empty — read back, that would
-/// have the next reconnect present no secret at all.
+/// files hold and what a restart presents, and it has not always held the
+/// secret: a `PUT /api/v1/config` of the masked `GET` body used to empty its
+/// `node_secret`, which read back here would have had the next reconnect
+/// present no secret at all.
 ///
 /// bilbycast-relay keeps the same model (its `LinkCredentials`).
 #[derive(Debug)]

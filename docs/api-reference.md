@@ -1222,6 +1222,26 @@ Replace the entire application configuration atomically. Stops all running flows
 
 A complete `AppConfig` JSON object (see [Configuration Guide](configuration-guide.md)). Flow parameters (SRT passphrases, RTSP credentials, RTMP keys, etc.) are stored in `config.json`. Infrastructure secrets (auth config, TLS) are stored in `secrets.json`.
 
+**Infrastructure secrets: left out is kept, `null` is removed.** A secret the body leaves out keeps the node's current value — which is what makes the body `GET /api/v1/config` returns, with every one of them left out, safe to edit and put back. (It used to replace them with nothing: the node kept running, but the next save with any secret in it wrote `secrets.json` without the node secret, and after a restart the node could not authenticate to its manager.)
+
+A secret is kept only **within a block the body keeps**: `server.tls` and `server.auth` (every body carries `server`), the node secret and registration token in the `manager` block, the bearer token in `nmos_registration`, a tunnel's keys in the tunnel of that `id`, and a router password in the cellular uplink of that `interface`. A body without the block, or with it `null`, removes the block and its secrets with it: a body with no `manager` block drops the node's manager credentials. A body that names a different `manager.node_id` but leaves the secret out keeps the running node ID: the secret brings the ID it was issued for.
+
+A secret the body **names** is set, validated like any field — `server.auth` and `server.tls` included, which a manager `update_config` push can never set. A secret the body names **`null`** is removed:
+
+| To remove | Send |
+|-----------|------|
+| The API's TLS (plain HTTP from the next restart) | `"server": { …, "tls": null }` |
+| The API's auth (the API is open from the next restart) | `"server": { …, "auth": null }`, or keep the block with `"enabled": false` |
+| The node's registration, to register again at the next restart | `"manager": { …, "node_id": null, "registration_token": "<new token>" }` — a `null` `node_id` removes the node secret with it, since a secret is only good with its own ID. `"node_secret": null` removes the secret alone. |
+| A spare registration token | `"manager": { …, "registration_token": null }` |
+| The NMOS registry bearer token | `"nmos_registration": { …, "bearer_token": null }` |
+| A tunnel key | `null` on `tunnel_bind_secret`, `tls_cert_pem` or `tls_key_pem` in that tunnel, or on `tunnel_encryption_key` in a direct tunnel. A relay tunnel's `tunnel_encryption_key` (its end-to-end encryption) and a direct tunnel's `tunnel_psk` cannot be removed while the tunnel stays: a body that does so is refused with 400. Remove the tunnel, or change its mode, instead. |
+| A cellular router's password | `"password": null` in that uplink |
+
+`server.auth` and `server.tls` take effect at the next restart, since the router reads them once. A body that names `setup_token` — a value or `null` — is refused: the node mints that token itself (set `setup_enabled: true` to re-open the setup wizard).
+
+A tunnel the body adds or changes is validated as [`POST /api/v1/tunnels`](#post-apiv1tunnels) validates it, and a direct tunnel must hold its `tunnel_psk` (that route refuses one without it when it starts the tunnel; a `PUT` starts none). A tunnel the body leaves as it runs is not checked again.
+
 **Response (200):**
 
 Returns the new configuration with infrastructure secrets stripped (flow parameters preserved).
@@ -1232,7 +1252,7 @@ A Hitless slot that validation refuses but an earlier release accepted is repair
 
 | Status | Condition |
 |--------|-----------|
-| 400 | Config validation failure (duplicate flow IDs, invalid addresses, etc.) |
+| 400 | The body is not a config, config validation failure (duplicate flow IDs, invalid addresses, etc.), a tunnel it adds or changes is invalid (a relay tunnel without its `tunnel_encryption_key`, a direct tunnel without its `tunnel_psk`), or the body names `setup_token` |
 | 500 | Failed to persist config or individual flows failed to start |
 
 **curl example:**

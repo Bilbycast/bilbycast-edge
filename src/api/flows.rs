@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 use crate::config::models::{AppConfig, FlowConfig};
 use crate::config::persistence::save_config_split_async;
+use crate::config::secrets::SecretsConfig;
 use crate::config::validation::{validate_config, validate_flow};
 use crate::manager::client::{OutputDetachRefusal, resolve_failed_output_removal};
 
@@ -724,27 +725,96 @@ pub async fn get_config(
 /// refuses is repaired first, as at load
 /// ([`crate::config::validation::repair_hitless_slots`]), and reported.
 ///
+/// # Infrastructure secrets
+///
+/// An infrastructure secret the body leaves out keeps the node's own value.
+/// [`get_config`] leaves every one of them out ([`AppConfig::mask_secrets`];
+/// there is no placeholder to recognise), so the body a client reads, edits
+/// and puts back carries none, and replacing the config wholesale used to
+/// empty them all: the node secret, `server.auth`, `server.tls`, the tunnel
+/// keys, the cellular routers' passwords. Only in memory at first —
+/// `secrets.json` was not written while it would hold nothing — but the next
+/// save with any secret in it rewrote the file without the node secret, and
+/// the node could not authenticate to its manager after a restart.
+/// They are kept by [`crate::config::secrets::SecretsConfig::merge_into`], as
+/// on the manager's `update_config`, from the running config under its write
+/// lock, so a rotation saved meanwhile is not written back over with the
+/// secret it replaced.
+///
+/// A secret is kept only within a block the body keeps, because that is where
+/// `merge_into` puts it back: `server.tls` and `server.auth` (every body
+/// carries `server`), the manager's in its `manager` block, the NMOS bearer
+/// token in `nmos_registration`, a tunnel's keys in the tunnel of that `id`
+/// and a router password in the cellular uplink of that `interface`. A body
+/// without the block, or with it `null`, removes the block and its secrets.
+/// A body that names a different `manager.node_id` and leaves the secret out
+/// keeps the running ID too: the secret brings the ID it was issued for.
+///
+/// An explicit `null` removes the secret it names
+/// ([`SecretsConfig::forget_nulled`]). serde reads `null` and an absent key
+/// alike, as `None`, so the body is taken as JSON and its nulls read there,
+/// as `update_config` reads its pushed JSON for `recording`. Without that a
+/// `PUT` could remove no secret at all, and nothing else turns `server.tls`
+/// off: it has only two paths, neither of which may be empty. A `null`
+/// `manager.node_id` removes the node secret with it, so a body naming a new
+/// `registration_token` registers again at the next restart rather than
+/// presenting the old pair. A tunnel the body adds or changes, a `null` key
+/// included, is validated as `POST /api/v1/tunnels` validates it
+/// (`validate_changed_tunnels`), so a relay tunnel's encryption key and a
+/// direct tunnel's PSK cannot be removed while the tunnel stays.
+///
+/// A secret the body names is set, subject to validation like any field. This
+/// is where a local admin parts from the manager, whose `update_config` may
+/// set neither `server.auth` nor `server.tls`
+/// ([`AppConfig::clear_node_local_secrets`]): these are the node's own API
+/// access, and an admin authenticated to that API is who owns them — they
+/// take effect at the next restart, since the router reads them once. A body
+/// that names the setup token, `null` included, is refused instead
+/// ([`ApiError::BadRequest`]): the node mints it, 256 random bits, to gate
+/// `/setup` before any other credential exists, and no caller needs to choose
+/// it — re-opening the wizard is `setup_enabled: true`, and the next start
+/// mints a fresh one if none is held.
+///
 /// # Errors
 ///
-/// - [`ApiError::BadRequest`] (400) if the new config fails validation (e.g., duplicate
-///   flow IDs, invalid addresses).
+/// - [`ApiError::BadRequest`] (400) if the body is not a config, the new config
+///   fails validation (e.g., duplicate flow IDs, invalid addresses), a tunnel
+///   it adds or changes fails the tunnel route's validation, or the body names
+///   `setup_token`.
 /// - [`ApiError::Internal`] (500) if persisting the config to disk fails, or if
 ///   individual flows fail to start (logged as errors but does not fail the request).
 pub async fn replace_config(
     _admin: RequireAdmin,
     State(state): State<AppState>,
-    Json(mut new_config): Json<AppConfig>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Json<ApiResponse<AppConfig>>, ApiError> {
+    if body.get("setup_token").is_some() {
+        return Err(ApiError::BadRequest(
+            "setup_token is minted by the node and cannot be set or cleared through the API; \
+             leave it out (set setup_enabled: true to re-open the setup wizard)"
+                .to_string(),
+        ));
+    }
+    // Typed from the JSON rather than by the extractor, which keeps the JSON
+    // for its nulls: see "Infrastructure secrets" above.
+    let mut new_config =
+        AppConfig::deserialize(&body).map_err(|e| ApiError::BadRequest(format!("not a valid config: {e}")))?;
     // A whole config repairs the Hitless slots earlier releases accepted
     // rather than being refused for them, as at load.
     let repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
+
+    // Held from here to the swap: see "Infrastructure secrets" above.
+    let mut config = state.config.write().await;
+    let mut kept = SecretsConfig::extract_from(&config);
+    kept.forget_nulled(&body);
+    kept.merge_into(&mut new_config);
     validate_config(&new_config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    validate_changed_tunnels(&config.tunnels, &new_config.tunnels)?;
     repairs.report(state.flow_manager.event_sender());
 
     // Stop all running flows
     state.flow_manager.stop_all().await;
 
-    let mut config = state.config.write().await;
     *config = new_config.clone();
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone()).await.map_err(|e| ApiError::Internal(e.to_string()))?;
 
@@ -773,6 +843,34 @@ pub async fn replace_config(
     let mut safe_config = new_config;
     safe_config.mask_secrets();
     Ok(Json(ApiResponse::ok(safe_config)))
+}
+
+/// Hold every tunnel a whole config adds or changes to what
+/// `POST /api/v1/tunnels` holds it to, so a `PUT` cannot leave one that will
+/// not start or that crosses a relay unencrypted: a `null` on a relay
+/// tunnel's `tunnel_encryption_key` (`forget_nulled`) used to be saved, and
+/// the next start forwarded its media in the clear.
+///
+/// The route refuses a direct tunnel without its `tunnel_psk` when it starts
+/// it, not in `validate_tunnel`; a `PUT` starts no tunnel, so that is checked
+/// here as well. A tunnel the body leaves as it runs is not checked:
+/// `validate_config` does not run these rules either, since it is also the
+/// boot gate, so a node may hold a tunnel they refuse, and refusing it here
+/// would refuse every edit put back around it.
+fn validate_changed_tunnels(
+    running: &[crate::tunnel::TunnelConfig],
+    new: &[crate::tunnel::TunnelConfig],
+) -> Result<(), ApiError> {
+    for tunnel in new.iter().filter(|t| !running.contains(t)) {
+        crate::config::validation::validate_tunnel(tunnel).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        if tunnel.mode == crate::tunnel::config::TunnelMode::Direct && tunnel.tunnel_psk.is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "Tunnel '{}': tunnel_psk is required for direct mode",
+                tunnel.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `POST /api/v1/config/reload` -- Reload configuration from disk.
@@ -963,8 +1061,9 @@ pub async fn set_output_active(
 
 #[cfg(test)]
 mod whole_config_tests {
-    //! The two REST routes that take a whole config repair a Hitless slot an
-    //! earlier release accepted, as the load does, instead of refusing it.
+    //! The two REST routes that take a whole config. Both repair a Hitless
+    //! slot an earlier release accepted, as the load does, instead of
+    //! refusing it; and a `PUT` keeps the infrastructure secrets it leaves out.
     use super::*;
 
     use std::sync::Arc;
@@ -1108,8 +1207,336 @@ mod whole_config_tests {
     async fn put_config_repairs_an_unsequenced_seq_aware_slot() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (state, mut events) = state(dir.path());
-        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(pre_upgrade_config())).await;
+        let body = serde_json::to_value(pre_upgrade_config()).expect("serialise");
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
         assert!(replaced.is_ok(), "a whole config is repaired, not refused: {}", refusal(replaced));
         assert_repaired(&state, &mut events).await;
+    }
+
+    // ── Infrastructure secrets ─────────────────────────────────────
+
+    const JWT_SECRET: &str = "node-local-jwt-secret-32-characters-long";
+
+    fn tunnel(id: &str, local_port: u16) -> crate::tunnel::TunnelConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "protocol": "udp", "mode": "direct", "direction": "egress",
+            "local_addr": format!("127.0.0.1:{local_port}"),
+            "peer_addr": "127.0.0.1:29911",
+            "tunnel_encryption_key": "a".repeat(64),
+            "tunnel_bind_secret": "b".repeat(64),
+            "tunnel_psk": "direct-tunnel-psk",
+        }))
+        .expect("tunnel fixture")
+    }
+
+    /// A relay tunnel, which carries its media end-to-end encrypted with
+    /// the key it holds.
+    fn relay_tunnel(id: &str, local_port: u16) -> crate::tunnel::TunnelConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "protocol": "udp", "mode": "relay", "direction": "egress",
+            "local_addr": format!("127.0.0.1:{local_port}"),
+            "relay_addrs": ["127.0.0.1:4433"],
+            "tunnel_encryption_key": "a".repeat(64),
+        }))
+        .expect("relay tunnel fixture")
+    }
+
+    /// Run `node` in `state`, as a load leaves it, with its files written.
+    async fn install(state: &AppState, node: AppConfig) {
+        crate::config::persistence::save_config_split(&state.config_path, &state.secrets_path, &node)
+            .expect("write the node's files");
+        *state.config.write().await = node;
+    }
+
+    /// Put the node in `state` as it runs after a load — registered with its
+    /// manager, its API behind auth and TLS, holding a tunnel's keys and its
+    /// setup token — with its files written.
+    async fn provision(state: &AppState, tunnel: crate::tunnel::TunnelConfig) {
+        let mut node = AppConfig {
+            manager: Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true,
+                    "urls": ["wss://manager.example/ws/node"],
+                    "node_id": "node-1",
+                    "node_secret": "node-secret",
+                }))
+                .expect("manager fixture"),
+            ),
+            setup_token: Some("node-minted-token".into()),
+            tunnels: vec![tunnel],
+            ..Default::default()
+        };
+        node.server.auth = Some(auth(JWT_SECRET));
+        node.server.tls = Some(crate::config::models::TlsConfig {
+            cert_path: "/etc/bilbycast/edge-cert.pem".into(),
+            key_path: "/etc/bilbycast/edge-key.pem".into(),
+        });
+        install(state, node).await;
+    }
+
+    fn auth(jwt_secret: &str) -> crate::api::auth::AuthConfig {
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "jwt_secret": jwt_secret,
+            "clients": [{ "client_id": "admin", "client_secret": "admin-secret", "role": "admin" }],
+        }))
+        .expect("auth fixture")
+    }
+
+    /// What `GET /api/v1/config` answers, as JSON, as a client over HTTP
+    /// reads it.
+    async fn masked_get_body(state: &AppState) -> serde_json::Value {
+        let Ok(Json(got)) = get_config(State(state.clone())).await else {
+            panic!("GET /api/v1/config failed");
+        };
+        let body = serde_json::to_value(&got).expect("serialise");
+        assert!(body["data"]["manager"].get("node_secret").is_none(), "the GET leaves the secret out: {body}");
+        body["data"].clone()
+    }
+
+    /// The running config, and what a restart reads.
+    async fn running_and_restarted(state: &AppState) -> [(&'static str, AppConfig); 2] {
+        let restarted = crate::config::persistence::load_config_split(&state.config_path, &state.secrets_path)
+            .expect("what a restart reads");
+        [("running", state.config.read().await.clone()), ("restarted", restarted)]
+    }
+
+    fn assert_holds_every_secret(config: &AppConfig, tunnel_id: &str, what: &str) {
+        let manager = config.manager.as_ref().unwrap_or_else(|| panic!("{what}: no manager section"));
+        assert_eq!(manager.node_id.as_deref(), Some("node-1"), "{what}");
+        assert_eq!(manager.node_secret.as_deref(), Some("node-secret"), "{what}: the node secret");
+        let auth = config.server.auth.as_ref().unwrap_or_else(|| panic!("{what}: the API auth is gone"));
+        assert!(auth.enabled, "{what}");
+        assert_eq!(auth.jwt_secret, JWT_SECRET, "{what}");
+        assert_eq!(config.setup_token.as_deref(), Some("node-minted-token"), "{what}");
+        let tunnel = config.tunnels.iter().find(|t| t.id == tunnel_id).unwrap_or_else(|| panic!("{what}: no tunnel"));
+        assert_eq!(tunnel.tunnel_encryption_key, Some("a".repeat(64)), "{what}: the tunnel key");
+        assert_eq!(tunnel.tunnel_bind_secret, Some("b".repeat(64)), "{what}: the bind secret");
+        assert!(config.server.tls.is_some(), "{what}: the API's TLS is gone");
+    }
+
+    /// `PUT` the masked `GET` body back, then save as any later change does.
+    /// The `PUT` emptied every infrastructure secret in memory; `secrets.json`
+    /// held on only while nothing was left to write, and the next save with a
+    /// secret in it — here a tunnel the manager creates — rewrote it without
+    /// the node secret, so a restart could not authenticate to the manager.
+    #[tokio::test]
+    async fn putting_back_the_masked_get_body_keeps_every_secret() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let existing = "11111111-2222-3333-4444-555555555555";
+        provision(&state, tunnel(existing, 29901)).await;
+
+        let body = masked_get_body(&state).await;
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+        assert!(replaced.is_ok(), "the masked GET body must be accepted: {}", refusal(replaced));
+
+        let saved = {
+            let mut running = state.config.write().await;
+            running.tunnels.push(tunnel("66666666-7777-8888-9999-000000000000", 29902));
+            running.clone()
+        };
+        crate::config::persistence::save_config_split(&state.config_path, &state.secrets_path, &saved)
+            .expect("the next save");
+        let restarted = crate::config::persistence::load_config_split(&state.config_path, &state.secrets_path)
+            .expect("what a restart reads");
+        assert_holds_every_secret(&restarted, existing, "secrets.json after the next save");
+        assert_holds_every_secret(&*state.config.read().await, existing, "the running config");
+    }
+
+    /// A local admin sets the API auth a `PUT` names — the manager may not —
+    /// and is refused a setup token, which only the node mints.
+    #[tokio::test]
+    async fn a_put_sets_the_auth_it_names_and_is_refused_a_setup_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        provision(&state, tunnel("11111111-2222-3333-4444-555555555555", 29903)).await;
+        let rotated = "rotated-jwt-secret-also-32-characters-long";
+
+        let mut body = masked_get_body(&state).await;
+        body["server"]["auth"] = serde_json::to_value(auth(rotated)).expect("serialise");
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+        assert!(replaced.is_ok(), "{}", refusal(replaced));
+        for (what, config) in running_and_restarted(&state).await {
+            assert_eq!(config.server.auth.as_ref().map(|a| a.jwt_secret.as_str()), Some(rotated), "{what}");
+            assert_eq!(config.manager.unwrap().node_secret.as_deref(), Some("node-secret"), "{what}");
+        }
+
+        // Neither set nor cleared: `null` names it too.
+        for named in [serde_json::json!("chosen-by-the-caller"), serde_json::Value::Null] {
+            let mut body = masked_get_body(&state).await;
+            body["setup_token"] = named.clone();
+            let refused = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+            assert!(refusal(refused).contains("setup_token"), "a PUT naming setup_token {named} must be refused");
+            assert_eq!(state.config.read().await.setup_token.as_deref(), Some("node-minted-token"));
+        }
+    }
+
+    /// An explicit `null` removes the secret it names, where leaving it out
+    /// keeps it. serde reads both as `None`, so every `null` used to be put
+    /// back: nothing a `PUT` could say turned the API's TLS off.
+    #[tokio::test]
+    async fn a_put_removes_the_secrets_it_names_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let id = "11111111-2222-3333-4444-555555555555";
+        provision(&state, tunnel(id, 29904)).await;
+
+        let mut body = masked_get_body(&state).await;
+        body["server"]["tls"] = serde_json::Value::Null;
+        body["server"]["auth"] = serde_json::Value::Null;
+        body["tunnels"][0]["tunnel_bind_secret"] = serde_json::Value::Null;
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+        assert!(replaced.is_ok(), "{}", refusal(replaced));
+
+        for (what, config) in running_and_restarted(&state).await {
+            assert!(config.server.tls.is_none(), "{what}: TLS named null is still configured");
+            assert!(config.server.auth.is_none(), "{what}: auth named null is still configured");
+            let tunnel = config.tunnels.iter().find(|t| t.id == id).expect("the tunnel");
+            assert!(tunnel.tunnel_bind_secret.is_none(), "{what}: the bind secret named null");
+            // What the body left out is kept.
+            assert_eq!(tunnel.tunnel_encryption_key, Some("a".repeat(64)), "{what}");
+            assert_eq!(config.manager.unwrap().node_secret.as_deref(), Some("node-secret"), "{what}");
+        }
+    }
+
+    /// A body that drops the node ID and names a new registration token
+    /// registers again at the next restart. Its secret, left out, was kept
+    /// and brought its node ID back, so the restart presented the old pair
+    /// and never the token.
+    #[tokio::test]
+    async fn a_put_dropping_the_node_id_registers_with_the_token_it_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        provision(&state, tunnel("11111111-2222-3333-4444-555555555555", 29905)).await;
+
+        let mut body = masked_get_body(&state).await;
+        body["manager"]["node_id"] = serde_json::Value::Null;
+        body["manager"]["registration_token"] = "new-registration-token".into();
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+        assert!(replaced.is_ok(), "{}", refusal(replaced));
+
+        for (what, config) in running_and_restarted(&state).await {
+            let manager = config.manager.expect("the manager block");
+            assert_eq!(manager.node_id, None, "{what}");
+            assert_eq!(manager.node_secret, None, "{what}: the secret outlived its node ID");
+            assert_eq!(manager.registration_token.as_deref(), Some("new-registration-token"), "{what}");
+        }
+    }
+
+    /// A `null` on the node's last infrastructure secret removes it at the
+    /// restart too. `secrets.json` was not written while it would hold
+    /// nothing, so the restart loaded the secret back from it.
+    #[tokio::test]
+    async fn a_put_removes_the_last_secret_it_names_null() {
+        let tls = || crate::config::models::TlsConfig {
+            cert_path: "/etc/bilbycast/edge-cert.pem".into(),
+            key_path: "/etc/bilbycast/edge-key.pem".into(),
+        };
+        let registered = AppConfig {
+            setup_enabled: false,
+            manager: Some(
+                serde_json::from_value(serde_json::json!({
+                    "enabled": true,
+                    "urls": ["wss://manager.example/ws/node"],
+                    "node_id": "node-1",
+                    "node_secret": "node-secret",
+                }))
+                .expect("manager fixture"),
+            ),
+            ..Default::default()
+        };
+        let mut standalone = AppConfig { setup_enabled: false, ..Default::default() };
+        standalone.server.tls = Some(tls());
+        let mut standalone_with_auth = standalone.clone();
+        standalone_with_auth.server.auth = Some(auth(JWT_SECRET));
+
+        for (node, nulled) in [
+            (&registered, &["manager", "node_secret"][..]),
+            (&registered, &["manager", "node_id"][..]),
+            (&standalone, &["server", "tls"][..]),
+            (&standalone_with_auth, &["server", "tls", "auth"][..]),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (state, _events) = state(dir.path());
+            install(&state, node.clone()).await;
+
+            let mut body = masked_get_body(&state).await;
+            for key in &nulled[1..] {
+                body[nulled[0]][*key] = serde_json::Value::Null;
+            }
+            let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+            assert!(replaced.is_ok(), "{nulled:?}: {}", refusal(replaced));
+
+            for (what, config) in running_and_restarted(&state).await {
+                let what = format!("{what}, {nulled:?} named null");
+                assert!(SecretsConfig::extract_from(&config).is_empty(), "{what}: a secret is still held");
+                assert!(config.server.tls.is_none() && config.server.auth.is_none(), "{what}");
+                if let Some(manager) = config.manager {
+                    assert_eq!(manager.node_secret, None, "{what}");
+                }
+            }
+        }
+    }
+
+    /// A tunnel the `PUT` adds or changes is validated as on
+    /// `POST /api/v1/tunnels`. A relay tunnel's key named `null` was saved,
+    /// and the next start forwarded its media across the relay unencrypted;
+    /// a direct tunnel's PSK named `null` left a tunnel that does not start.
+    #[tokio::test]
+    async fn a_put_cannot_leave_a_tunnel_that_will_not_start_or_is_unencrypted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let relay = "11111111-2222-3333-4444-555555555555";
+        let direct = "66666666-7777-8888-9999-000000000000";
+        provision(&state, relay_tunnel(relay, 29906)).await;
+        let mut node = state.config.read().await.clone();
+        node.tunnels.push(tunnel(direct, 29907));
+        install(&state, node).await;
+
+        let body = masked_get_body(&state).await;
+        let mut nulled_key = body.clone();
+        nulled_key["tunnels"][0]["tunnel_encryption_key"] = serde_json::Value::Null;
+        let mut nulled_psk = body.clone();
+        nulled_psk["tunnels"][1]["tunnel_psk"] = serde_json::Value::Null;
+        // Added under a new id, with no key: no null involved.
+        let mut added_keyless = body;
+        let mut keyless_relay = relay_tunnel("12121212-3434-5656-7878-909090909090", 29908);
+        keyless_relay.tunnel_encryption_key = None;
+        added_keyless["tunnels"].as_array_mut().unwrap().push(serde_json::to_value(keyless_relay).expect("serialise"));
+
+        for (names, body) in [
+            ("tunnel_encryption_key", nulled_key),
+            ("tunnel_psk", nulled_psk),
+            ("tunnel_encryption_key", added_keyless),
+        ] {
+            let refused = refusal(replace_config(RequireAdmin, State(state.clone()), Json(body)).await);
+            assert!(refused.contains(names), "a PUT leaving a tunnel without its {names} must be refused: {refused:?}");
+
+            for (what, config) in running_and_restarted(&state).await {
+                assert_eq!(config.tunnels.len(), 2, "{what}");
+                let held = |id: &str| config.tunnels.iter().find(|t| t.id == id).expect("the tunnel").clone();
+                assert_eq!(held(relay).tunnel_encryption_key, Some("a".repeat(64)), "{what}");
+                assert_eq!(held(direct).tunnel_psk.as_deref(), Some("direct-tunnel-psk"), "{what}");
+            }
+        }
+    }
+
+    /// A tunnel the body leaves as it runs is not validated again: a node may
+    /// hold one the tunnel route would refuse (the boot gate does not run
+    /// that validation), and every edit put back around it would be refused.
+    #[tokio::test]
+    async fn a_put_leaves_a_tunnel_it_does_not_change_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let mut keyless_relay = relay_tunnel("11111111-2222-3333-4444-555555555555", 29909);
+        keyless_relay.tunnel_encryption_key = None;
+        install(&state, AppConfig { tunnels: vec![keyless_relay], ..Default::default() }).await;
+
+        let mut body = masked_get_body(&state).await;
+        body["device_name"] = "renamed".into();
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+        assert!(replaced.is_ok(), "an unchanged tunnel must not refuse the edit: {}", refusal(replaced));
+        assert_eq!(state.config.read().await.device_name.as_deref(), Some("renamed"));
     }
 }

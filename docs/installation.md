@@ -909,6 +909,12 @@ to **stdout** — look for the banner:
 =================================================
 ```
 
+A token that cannot be saved (a full disk) is logged as a warning and
+the node starts anyway: the printed token gates the wizard until the
+process exits, `--print-setup-token` cannot show it, and the next
+start mints another. Saving it used to be fatal, so the node stopped
+before it reached its manager or started a flow.
+
 The token is required for any `POST /setup` arriving from a
 **non-loopback** address (LAN or internet). Loopback callers
 (`http://localhost:<port>/setup`, `127.0.0.1`, `[::1]`) bypass
