@@ -1063,7 +1063,23 @@ every segment. So the intake records when it took each packet off the
 broadcast, and both close sites, and the low-latency open row, date by
 `CmafState::arrival_now`: now, less the time the packet that closed the segment
 waited in the intake. While an output keeps up that is microseconds, and the
-sample is what it always was. Pinned by `a_backlog_in_the_intake_is_dated_by_arrival`.
+sample is what it always was. The pieces are pinned by
+`a_backlog_in_the_intake_is_dated_by_arrival`; the wiring by
+`engine::cmaf::arrival_tests`, which runs the whole output — plain and
+low-latency — against a local HTTP origin that holds one segment's PUT for
+12 s, longer than a 64-message broadcast ring holds the feed many times over,
+and checks that no packet is lost, every segment is published, no playlist
+declares a discontinuity, the flow's epoch never re-anchors, every row after
+the first carries a date, and every date sits within a frame or so of when
+that segment's first frame was published. Each of the three `arrival_now()`
+call sites edited back to `Utc::now()` fails it, and so does an intake too
+small to ride the stall. What it does not cover: the feed is synthetic H.264
+(real parameter sets, filler slices — a default build has no H.264 encoder, and
+passthrough never decodes a picture), so no re-encode; no audio, so no muxed
+fragments; no DASH, no encryption; one rendition and one stall; and it takes
+about 25 s of real time per path, since the dating it checks is wall-clock
+dating. Nor is it the field measurement: that a real origin's stalls on
+bilby-voyager stay within the budget is still to be measured there.
 
 ### A re-anchor reaches HLS only, not DASH
 

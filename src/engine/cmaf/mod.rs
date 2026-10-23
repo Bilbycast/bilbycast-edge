@@ -22,6 +22,8 @@
 //!   encode call in `tokio::task::block_in_place` only when called
 //!   from the subscriber loop.
 
+#[cfg(test)]
+mod arrival_tests;
 mod box_writer;
 mod cenc;
 mod cenc_boxes;
@@ -5031,11 +5033,10 @@ seg-00042.m4s?token=abc
     /// instead — now, less what the intake says the packet waited.
     ///
     /// This pins the pieces — the intake's wait, `arrival_now`, and what each
-    /// dating does to the flow's clock — not the wiring between them. No test
-    /// drives `push_video_sample` or `handle_ll_cmaf`, which need a segmenter
-    /// and an origin, so their two `closed_at = state.arrival_now()` lines are
-    /// held by review alone: either edited back to `Utc::now()` leaves this
-    /// test green.
+    /// dating does to the flow's clock — not the wiring between them, which
+    /// needs a segmenter and an origin: `arrival_tests` drives the whole
+    /// output against a stalling origin, and holds the `arrival_now()` lines
+    /// in `push_video_sample`, `handle_ll_cmaf` and `publish_ll_hls`.
     #[tokio::test]
     async fn a_backlog_in_the_intake_is_dated_by_arrival() {
         // What the output reads: the intake says how long a packet waited,
