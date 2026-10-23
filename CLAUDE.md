@@ -371,7 +371,7 @@ At runtime, both files merge into a single `AppConfig` in memory — all existin
 
 **Migration**: On first startup after upgrade, if `config.json` contains secrets and `secrets.json` does not exist, the system automatically splits them. Users don't need to take any action.
 
-**When adding new infrastructure secret fields**: Add the field to the appropriate secrets struct (`TunnelSecrets` or `SecretsConfig`), update `extract_from`/`merge_into`/`strip_secrets`, and update `has_secrets` for migration detection. Flow-level user parameters (passphrases, credentials, keys) should stay in `config.json`, not `secrets.json`.
+**When adding new infrastructure secret fields**: Add the field to the appropriate secrets struct (`TunnelSecrets` or `SecretsConfig`), update `extract_from`/`merge_into`/`strip_secrets`, `forget_nulled` (or a `PUT /api/v1/config` naming the new secret `null` keeps it), and update `has_secrets` for migration detection. Flow-level user parameters (passphrases, credentials, keys) should stay in `config.json`, not `secrets.json`.
 
 ## Remote upgrade
 
