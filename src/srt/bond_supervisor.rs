@@ -430,6 +430,14 @@ fn obs_healthy(o: &MemberObs) -> bool {
     matches!(o.member, MemberStatus::Idle | MemberStatus::Running) && !socket_terminal(o.socket)
 }
 
+/// Still handshaking: never re-added (one handshake per endpoint). Safe to
+/// wait on because it ends: libsrt fails a member whose handshake outlives
+/// the connect timeout, and a member libsrt leaves Pending *after* its
+/// handshake finished (a race in libsrt's own group connect) is replaced by
+/// `srt-transport` within about a second, with the same endpoint. When it
+/// was the group's only member up, it is closed only once its replacement
+/// is up, so the listing briefly shows two members with this token, and
+/// `decide` reads them together.
 fn obs_pending(o: &MemberObs) -> bool {
     o.member == MemberStatus::Pending && !socket_terminal(o.socket)
 }
