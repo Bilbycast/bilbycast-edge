@@ -255,25 +255,82 @@ Only if you run the edge from the packaged unit
 ([`packaging/bilbycast-edge.service`](../packaging/bilbycast-edge.service)).
 It runs `DevicePolicy=closed`, so device access is deny-by-default.
 
-Without this, a correctly built SDI binary **enumerates zero cards while still
-advertising the capability** — `api_available()` returns true (it only needs
-`libDeckLinkAPI.so`, which loads fine) but every device open is denied. Verified
-on hardware as the cause of exactly that confusing split.
+Without a grant for each of the card's device nodes, every open the SDK makes
+is denied (`EPERM`) and a correctly built SDI binary **enumerates zero cards**.
+`api_available()` still returns true (it only needs `libDeckLinkAPI.so`, which
+loads fine), but with no device in the status cache the edge does **not**
+advertise `sdi-decklink`, so the manager shows no SDI for the node at all. The
+boot log names each denied node (see the table below).
+
+The unit grants the node names confirmed on hardware
+([#168](https://github.com/Bilbycast/bilbycast-edge/issues/168)):
+
+| Nodes | Cards |
+|-------|-------|
+| `/dev/blackmagic/io0`…`io7` | Multi-channel cards: a DeckLink Quad 2 has one node per channel. |
+| `/dev/blackmagic/dv0`…`dv7` | Single-channel DeckLink SDI cards, one node per card. |
+
+These are `misc` character devices (major 10, minors assigned dynamically), so
+the unit's `DeviceAllow=char-blackmagic rwm` class rule cannot match them; the
+path rules are what grant access, as for `/dev/rga`. systemd does not glob
+device paths, so each node is listed. A listed path that does not exist when
+the unit starts is skipped with a log line, so the extras are harmless.
 
 - [ ] **1. Check what your card actually exposes:**
       ```bash
       ls /dev/blackmagic/
       ```
-- [ ] **2. Confirm the shipped unit covers them.** It grants
-      `char-blackmagic` plus `/dev/blackmagic/io0`…`io7`. If your host lists
-      names outside that set (e.g. `dvN`, or more than eight nodes), add the
-      matching `DeviceAllow=/dev/blackmagic/<node> rw` lines. Paths that do not
-      exist are ignored with a log warning, so extra entries are harmless.
-- [ ] **3. Reload and restart:**
+- [ ] **2. Confirm your unit covers them.** The unit shipped with this
+      release grants `io0`…`io7` and `dv0`…`dv7`. **A manager-driven upgrade
+      replaces only the binary, never the unit**, so a host installed from an
+      older release still runs the older list (`io0`…`io7` only, in every
+      release up to v0.116.0). For names outside the list — an older unit on
+      a `dvN` host, a second Quad 2's `io8`…, more than eight `dvN` nodes,
+      another prefix — add the rules in a drop-in, one per line with no
+      trailing comment (systemd reads a `#` after the value as part of it and
+      drops the rule):
+      ```bash
+      sudo systemctl edit bilbycast-edge
+      ```
+      ```ini
+      [Service]
+      DeviceAllow=/dev/blackmagic/dv0 rw
+      DeviceAllow=/dev/blackmagic/dv1 rw
+      ```
+      Alternatively refresh the unit itself with
+      `install-edge.sh --upgrade-installer` ([installation.md](installation.md)).
+      That **also moves the node to the latest release**, so prefer the
+      drop-in on a production node you are not ready to upgrade.
+- [ ] **3. Restart** (after a hand edit, `daemon-reload` first):
       ```bash
       sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge
       ```
-- [ ] **4. Confirm** `HealthPayload.sdi_devices[]` is now populated.
+      Path rules resolve when the unit **starts**. A node the driver creates
+      later (driver loaded after the edge, card hot-plugged) stays denied until
+      the next restart, even when the unit lists it.
+- [ ] **4. Confirm** `HealthPayload.sdi_devices[]` is now populated and the
+      boot log carries no `sdi.decklink` warning.
+
+**Reading the boot log.** Whenever the DeckLink API enumerates zero devices,
+or some device nodes are denied to the edge, the probe logs one `WARN` under
+target `sdi.decklink` (`journalctl -u bilbycast-edge | grep sdi.decklink`)
+saying which of these it found:
+
+| The warning says | Cause | Fix |
+|------------------|-------|-----|
+| `… are denied to this process by its device cgroup (EPERM): dv0, dv1 …` | The unit's `DeviceAllow=` list (in a container, the runtime's device rules) does not grant those nodes, or they appeared after the edge started. | Steps 2 and 3 above. |
+| `… are denied by file permissions or an AppArmor/SELinux policy (EACCES): …` | File mode and the service user's groups, or an LSM policy. | `ls -l /dev/blackmagic/`, `id bilbycast`, the LSM's audit log. |
+| `… although N device node(s) in /dev/blackmagic/ are present and accessible …` | The device nodes are reachable, so look past them: most often the card's firmware is older than the driver (`dmesg` shows `firmware version mismatch`), or Desktop Video's driver and library disagree. | `dmesg \| grep -i blackmagic`; `DesktopVideoUpdateTool --list`, update, reboot. |
+| `… /dev/blackmagic/ holds no device nodes …` | No card fitted, the Desktop Video kernel driver is not loaded, or (in a container) the nodes were not passed through. | `lspci \| grep -i blackmagic`, `lsmod \| grep blackmagic` (after a kernel upgrade DKMS rebuilds it on the next boot). |
+| `… could not be read (…)` | `/dev/blackmagic/` itself is unreadable: its permissions, or a container whose `/dev` is not the host's. | `ls -ld /dev/blackmagic/`. |
+
+With some nodes denied but other cards enumerating, the warning says how many
+devices did enumerate and that the ports behind the denied nodes are missing.
+Releases up to v0.116.0 logged a single `capability enabled but no devices
+enumerated — Desktop Video is installed; is a card fitted?` for all of these
+(and claimed a capability the node did not advertise); on those, start from
+`ls -l /dev/blackmagic/`: nodes present means step 2 above or the firmware row,
+none means the last-but-one row.
 
 ### How CI protects this going forward
 
@@ -455,10 +512,11 @@ verified to report idle ports as described above. Until #170 is fixed, treat an
 idle port's "no signal" as unknown rather than as an answer, and open the port
 in an enabled flow to get one.
 
-**Capability** — `sdi-decklink` on `HealthPayload.capabilities`, gated on the
-boot probe reaching the SDK. A card-less host with Desktop Video still
-advertises (the capability means "this edge can do SDI"; `sdi_devices` says
-which ports exist).
+**Capability** — `sdi-decklink` on `HealthPayload.capabilities`, advertised
+only while the boot probe reached the SDK **and** `sdi_devices` holds at least
+one port. A card-less host with Desktop Video advertises nothing (the
+capability means "this edge has SDI ports"), and neither does a host whose
+device nodes the edge cannot open — see Checklist C.
 
 ## SDI output (playout)
 

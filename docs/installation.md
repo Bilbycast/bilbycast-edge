@@ -320,7 +320,13 @@ To *use* SDI, install Blackmagic **Desktop Video** (the kernel driver plus
 <https://www.blackmagicdesign.com/support/> — search "Desktop Video",
 pick the Linux package for your distro — then reboot and restart the edge.
 No bilbycast reinstall or reconfiguration is needed; SDI appears on the
-next boot probe.
+next boot probe. Under the packaged systemd unit the card's device nodes
+must also be on the unit's `DeviceAllow=` list. The unit grants
+`/dev/blackmagic/io0`…`io7` and `dv0`…`dv7`, but a manager-driven upgrade
+never replaces the unit, so a host installed with v0.116.0 or earlier grants
+only `io0`…`io7` and a single-channel card (`dvN`) enumerates nothing. See
+[sdi.md Checklist C](sdi.md#checklist-c--grant-the-device-nodes-under-systemd);
+the boot log's `sdi.decklink` warning names any node it cannot open.
 
 ```bash
 # Verify Desktop Video is present and the card is visible before

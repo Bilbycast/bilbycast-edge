@@ -1,12 +1,18 @@
 //! DeckLink device probe + process-wide manager (mirrors `engine::mxl::domain`).
 //!
 //! The boot probe (run in `main.rs`) enumerates DeckLink devices via the
-//! Blackmagic DeckLink SDK. On success the `sdi-decklink` capability bit joins
-//! `HealthPayload.capabilities` and the flow spawn arms can resolve the
-//! manager via [`global`]. Unlike libmxl, there is no persistent native handle
-//! to own — the manager just holds the enumerated device list for validation
-//! and capability reporting.
+//! Blackmagic DeckLink SDK. On success it sets [`DECKLINK_PROBE_OK`] and the
+//! flow spawn arms can resolve the manager via [`global`]. That alone does not
+//! advertise anything: the `sdi-decklink` capability bit joins
+//! `HealthPayload.capabilities` only while the status cache
+//! (`super::status::cached()`) also holds at least one device, so a probe that
+//! enumerates zero cards offers no SDI in the manager at all. When it does
+//! enumerate zero — or when some of the card's device nodes are denied to this
+//! process — the boot log says why ([`super::nodes::diagnose`], #168). Unlike
+//! libmxl, there is no persistent native handle to own — the manager just
+//! holds the enumerated device list for validation and capability reporting.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,6 +65,13 @@ impl DecklinkDeviceManager {
     /// An unreachable API is different in kind. No card can appear on a host
     /// with no driver, so advertising the capability there would offer SDI on
     /// every node in a fleet running the same build.
+    ///
+    /// Once the API is reachable the probe also checks `/dev/blackmagic/`
+    /// ([`super::nodes`]) and warns with what it found whenever zero devices
+    /// enumerate, or some device nodes are denied to this process. Under the
+    /// packaged systemd unit a node created after the service started stays
+    /// denied until a restart, so "a card that appears after boot" is only
+    /// reachable without one on an unconfined edge.
     pub fn probe() -> Option<Arc<Self>> {
         if !decklink_rs::api_available() {
             info!(
@@ -71,13 +84,14 @@ impl DecklinkDeviceManager {
 
         let devices = decklink_rs::enumerate_devices();
 
-        if devices.is_empty() {
-            warn!(
-                target: "sdi.decklink",
-                "SDI (DeckLink) capability enabled but no devices enumerated — \
-                 Desktop Video is installed; is a card fitted?"
-            );
-        } else {
+        // The SDK reports only a count, so a zero (or a partial denial) is
+        // diagnosed from the device nodes themselves.
+        let nodes = super::nodes::scan(Path::new(super::nodes::BLACKMAGIC_DEV_DIR));
+        if let Some(msg) = super::nodes::diagnose(devices.len(), &nodes) {
+            warn!(target: "sdi.decklink", "SDI (DeckLink): {msg}");
+        }
+
+        if !devices.is_empty() {
             for d in &devices {
                 info!(target: "sdi.decklink", "  [{}] {}", d.index, d.name);
             }

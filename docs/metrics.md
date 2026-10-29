@@ -845,7 +845,11 @@ A host with Desktop Video but no card advertises nothing, and the manager
 hides the SDI surfaces entirely — the bit means "this edge has SDI ports",
 not "this edge could do SDI". The device list is re-probed every 10 s, so
 the bit tracks hot-plug in both directions: a card fitted at runtime starts
-offering SDI within a poll interval, with no edge restart.
+offering SDI within a poll interval, with no edge restart — on an unconfined
+edge. Under the packaged systemd unit the card's device nodes are granted by
+path when the service starts, so nodes the driver creates after that stay
+denied until a restart ([sdi.md](sdi.md#checklist-c--grant-the-device-nodes-under-systemd),
+Checklist C).
 
 Config schema: [`configuration-guide.md`](configuration-guide.md#sdi-input-blackmagic-decklink).
 Events: [`events-and-alarms.md`](events-and-alarms.md#sdi-input-flow-sdi-decklink-feature).
