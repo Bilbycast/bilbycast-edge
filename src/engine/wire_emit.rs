@@ -35,14 +35,17 @@
 //!
 //! - [`AnchorSource::Pcr`] (TS regime): the emitter parses each datagram
 //!   for an MPEG-TS PCR sample. PCR-bearing datagrams re-anchor the
-//!   wallclock target. Non-PCR datagrams pace by `bytes_since_anchor /
-//!   observed_rate_bps`. The rate comes exclusively from inter-PCR
-//!   observations (EMA, ~10 PCRs to 95 % convergence). There is no
-//!   "declared bitrate" parameter — open-loop pacing on a configured rate
-//!   drifts when the encoder runs above (or below) the configured target,
-//!   and that drift is what reverted the prior wire_emit integration on
-//!   2026-05-09. Closed-loop on observed rate is the universal fix
-//!   regardless of codec, rate-control mode, or encoder backend.
+//!   wallclock target. Non-PCR datagrams interpolate across the most
+//!   recently completed PCR interval — `wall_anchor + bytes_since_anchor
+//!   × prev_interval_ns / prev_interval_bytes`, capped at one interval —
+//!   so their spacing follows each interval's own byte count
+//!   (`observed_rate_bps`, an inter-PCR EMA, is telemetry on this path and
+//!   the servo's rate input). There is no "declared bitrate" parameter —
+//!   open-loop pacing on a configured rate drifts when the encoder runs
+//!   above (or below) the configured target, and that drift is what
+//!   reverted the prior wire_emit integration on 2026-05-09. Measuring
+//!   the interval from the stream itself is the universal fix regardless
+//!   of codec, rate-control mode, or encoder backend.
 //! - [`AnchorSource::St2110Raster`] (uncompressed video regime): the
 //!   caller computes a per-packet `target_tx_time_ns` from the active
 //!   ST 2110-21 frame raster and passes it on the [`WireDatagram`]. The
@@ -58,6 +61,17 @@
 //! If a PCR-driven target lands more than 5 ms behind real time (e.g.
 //! after an encoder pipeline burst), `wall_anchor` snaps to `now`. One
 //! one-time jitter step instead of a steady-state degradation.
+//!
+//! ## Ordering floor
+//!
+//! Successive targets never go backwards: one that would is lifted to the
+//! previous target + 1 µs. The floor lifts the *returned* instant only and
+//! never moves `wall_anchor`, which stays the PCR-implied instant of the
+//! latest anchor PCR. On the `clock_nanosleep` tier the emitter derives a
+//! datagram only after sleeping to the previous target, so the floor only
+//! ever fires on a target already in the past and changes no emission
+//! instant. Moving the anchor with it, as this code once did, folded every
+//! late wake into permanent egress latency (edge#157).
 //!
 //! ## Discontinuity
 //!
@@ -670,6 +684,11 @@ pub fn spawn_wire_emitter(
     // Compressed therefore always paces in userspace (`clock_nanosleep` on a
     // SCHED_FIFO thread, ~50–500 µs p99 — broadcast tier-2, ample for any
     // PCR-re-clocking receiver), with the closed-loop servo bounding latency.
+    //
+    // `TargetState::derive_target`'s ordering floor relies on this too: it
+    // leaves the pacing anchor alone only because the clock_nanosleep
+    // releaser never derives ahead of real time. Routing PCR-paced TS onto
+    // SO_TXTIME must revisit that floor (edge#157).
     let etf_eligible = matches!(pacing, WirePacingClass::EtfEligible);
     let releaser = if !force_nanosleep
         && enable_so_txtime
@@ -930,20 +949,37 @@ struct TargetState {
     /// `anchor_pid` stays pinned to the old input's PCR PID forever
     /// and the emitter runs unpaced (pcr=0) on every subsequent input.
     last_pcr_seen_ns: u64,
-    /// Last `tx-time` value returned by `derive_target` — used to
-    /// guarantee the kernel ETF qdisc never sees a tx-time that goes
-    /// backwards. Without this, an input switch (PCR discontinuity →
-    /// wall_anchor reset to "now") would hand the kernel a packet with
-    /// `target = now` while the qdisc still holds residue from before
-    /// the switch with `target = now + small_delta`. ETF sorts by
-    /// target time and releases earliest-first, so the new packet would
-    /// jump ahead of legitimately-queued residue, breaking HEVC
-    /// reference-frame integrity at the receiver. Guarding the return
-    /// with `>= last_returned_ns + EPSILON` emulates the strict-FIFO
-    /// behaviour of the clock_nanosleep tier on the SO_TXTIME path,
-    /// trading at most one wire-queue's worth of latency on the
-    /// discontinuity packet for spec-compliant ordering.
+    /// Last `tx-time` value returned by `derive_target` — the reference
+    /// for its ordering floor, which guarantees the kernel ETF qdisc
+    /// never sees a tx-time that goes backwards. Without it, an input
+    /// switch (PCR discontinuity → wall_anchor reset to "now") would hand
+    /// the kernel a packet with `target = now` while the qdisc still holds
+    /// residue from before the switch with `target = now + small_delta`.
+    /// ETF sorts by target time and releases earliest-first, so the new
+    /// packet would jump ahead of legitimately-queued residue, breaking
+    /// HEVC reference-frame integrity at the receiver. Flooring the return
+    /// at `last_returned_ns + EPSILON` emulates the strict-FIFO behaviour
+    /// of the clock_nanosleep tier on the SO_TXTIME path.
+    ///
+    /// The floor lifts the returned instant only. It never moves
+    /// `wall_anchor_ns` — see [`Self::derive_target`] for why that is
+    /// safe and what moving it cost (edge#157).
     last_returned_ns: u64,
+    /// Times the late-rebase snapped `wall_anchor_ns` to now, moving the
+    /// pacing timeline later for good. Diagnostic, cumulative; reported on
+    /// the emitter's 5 s diag log line as `rebase=` and nowhere else.
+    late_rebases: u64,
+    /// Times the future-lookahead ceiling pulled `wall_anchor_ns` in to
+    /// `now + lookahead`. Diagnostic, cumulative; `ceil=` on the diag line.
+    /// Together with `late_rebases`, a discontinuity and the residence-cap
+    /// shed (`egress_shed`), these are the only things that move the
+    /// anchor off the PCR timeline.
+    ceiling_clamps: u64,
+    /// Times the ordering floor lifted a returned target. Diagnostic,
+    /// cumulative; `floor=` on the diag line. It moves nothing — on a VBR
+    /// or ±1-datagram stream it engages on about every other PCR, so a
+    /// large value here is expected, not an anomaly.
+    order_floors: u64,
     /// Epoch-locked egress offset in ns, when the operator enabled it on
     /// this output. `None` = classic relative anchoring, byte-for-byte
     /// unchanged.
@@ -1072,9 +1108,15 @@ const EPOCH_REENGAGE_AFTER: u32 = 16;
 /// Minimum gap (ns) between consecutive `derive_target` returns when
 /// the natural computation would have produced a non-monotonic step.
 /// 1 µs is well below the wire-time of any real datagram (a 1316-byte
-/// datagram at 1 Gbps takes ~10 µs; at 10 Mbps takes ~1 ms), so the
-/// guard is invisible to a healthy stream and only kicks in on
-/// pathological re-anchor steps.
+/// datagram at 1 Gbps takes ~10 µs; at 10 Mbps takes ~1 ms).
+///
+/// The floor this sets is not rare. On the clock_nanosleep tier it
+/// engages whenever the emitter reaches a PCR-bearing datagram after that
+/// PCR's instant — on a VBR or ±1-datagram stream about every other PCR,
+/// because the tail of an interval fuller than the one before it is capped
+/// at the next PCR's instant and batched at the emitter's wake. It lifts
+/// the returned instant only and never moves the pacing anchor, so it
+/// changes no emission instant there.
 const MONOTONIC_TARGET_EPSILON_NS: u64 = 1_000;
 
 impl TargetState {
@@ -1213,20 +1255,41 @@ impl TargetState {
         }
     }
 
-    /// Compute the target wall instant (CLOCK_MONOTONIC ns) at which
-    /// the just-handed datagram should hit the wire. Mutates internal
-    /// anchors so the next call sees consistent state.
+    /// Compute the target wall instant (CLOCK_TAI ns, see
+    /// [`monotonic_now_ns`]) at which the just-handed datagram should hit
+    /// the wire. Mutates internal anchors so the next call sees consistent
+    /// state.
     ///
     /// The return is guaranteed monotonically non-decreasing across
     /// calls (with a `MONOTONIC_TARGET_EPSILON_NS` minimum step) — see
-    /// `last_returned_ns` for why. When the guard kicks in (typically
-    /// only at a PCR discontinuity / re-anchor) `wall_anchor_ns` is
-    /// also advanced so subsequent natural-paced calls compute targets
-    /// from the guarded point — without that follow-through, every
-    /// post-discontinuity datagram would clamp to `last_returned + N·ε`
-    /// and the kernel ETF qdisc would release them as a tight burst at
-    /// `last_returned`. With the follow-through, natural pacing
-    /// resumes seamlessly from the guarded anchor.
+    /// `last_returned_ns` for why. This **ordering floor** applies to the
+    /// returned instant only. It never moves `wall_anchor_ns`, which stays
+    /// the PCR-implied instant of the latest anchor PCR; the anchor is
+    /// re-seated only by a cold start, a PCR re-anchor, a discontinuity,
+    /// the late-rebase, the future-lookahead ceiling below and the
+    /// residence-cap shed in `run_emitter`.
+    ///
+    /// Leaving the anchor alone rests on how the `clock_nanosleep`
+    /// releaser drives this function: it derives a datagram only after
+    /// sleeping to the previous target, and batches one only when its
+    /// target is not in the future, so `now_ns >= last_returned_ns` at
+    /// every call. The floor therefore fires only on a target that is
+    /// already in the past, and what it returns (at most `now_ns + ε`)
+    /// leaves at the same instant the raw target would have; the datagrams
+    /// after it return to the PCR timeline. This function used to advance
+    /// `wall_anchor_ns` to the floor as well, which folded every late wake
+    /// into the anchor for good — on a VBR stream ~1 ms/s of egress
+    /// latency until the residence cap shed (edge#157).
+    ///
+    /// The argument does not hold on the SO_TXTIME releaser, which derives
+    /// at producer rate ahead of real time: there a floored run returns
+    /// `last_returned + N·ε` and the ETF qdisc releases it as one burst,
+    /// as long as the raw targets sit behind `last_returned`. No PCR-paced
+    /// TS reaches that releaser today — `Lossless` is never etf-eligible,
+    /// and the ST 2110-30/-31/-40 outputs that can use it carry no real
+    /// PCR, so the floor fires for them only on a false-positive PCR match
+    /// in their payload. Routing real PCR onto SO_TXTIME must revisit this
+    /// floor.
     fn derive_target(&mut self, now_ns: u64, datagram_pcr: Option<u64>, datagram_bytes: usize) -> u64 {
         self.epoch_anchor_applied = false;
         let raw = self.derive_target_raw(now_ns, datagram_pcr, datagram_bytes);
@@ -1234,24 +1297,24 @@ impl TargetState {
         // on every member, and `epoch_anchor_ns` has already floored it at
         // `now_ns`, so it can never ask the emitter to send in the past.
         // Running it through the backwards guard would replace it with
-        // `last_returned + 1 us` — a stale *local* value — and pin
-        // `wall_anchor` there, which is the one thing that must not happen
-        // to a target whose whole purpose is to be node-independent. The
-        // classic branches below reset `last_returned_ns` for exactly this
-        // reason (see the discontinuity and late-rebase resets); the epoch
-        // branch returns early and cannot, so it is handled here instead.
+        // `last_returned + 1 us` — a stale *local* value — which is the one
+        // thing that must not happen to a target whose whole purpose is to
+        // be node-independent. The classic branches below reset
+        // `last_returned_ns` for exactly this reason (see the discontinuity
+        // and late-rebase resets); the epoch branch returns early and
+        // cannot, so it is handled here instead.
         let guarded = if self.epoch_anchor_applied {
             self.last_returned_ns = raw;
             raw
         } else if raw < self.last_returned_ns {
-            // Strict backwards step — kernel ETF would reorder. Push
-            // forward to last_returned + epsilon and fast-forward the
-            // pacing anchor so subsequent natural-paced calls compute
-            // from the corrected baseline rather than re-clamping each
-            // packet.
-            let floor = self.last_returned_ns.saturating_add(MONOTONIC_TARGET_EPSILON_NS);
-            self.wall_anchor_ns = floor;
-            floor
+            // Strict backwards step — kernel ETF would reorder. Floor the
+            // RETURNED instant at last_returned + epsilon and leave
+            // `wall_anchor_ns` on the PCR timeline. On the clock_nanosleep
+            // tier this only fires for a target already in the past, so
+            // the floor moves no emission; carrying it into the anchor
+            // turned every late wake into permanent latency (edge#157).
+            self.order_floors = self.order_floors.saturating_add(1);
+            self.last_returned_ns.saturating_add(MONOTONIC_TARGET_EPSILON_NS)
         } else {
             // raw is monotonic with the previous return (equal is fine —
             // multiple cold-start preroll datagrams legitimately target
@@ -1300,6 +1363,7 @@ impl TargetState {
             if self.epoch_engaged {
                 self.epoch_clamped = self.epoch_clamped.saturating_add(1);
             }
+            self.ceiling_clamps = self.ceiling_clamps.saturating_add(1);
             self.wall_anchor_ns = max_future;
             max_future
         } else {
@@ -1309,10 +1373,10 @@ impl TargetState {
         final_target
     }
 
-    /// Inner derivation; may produce non-monotonic targets at PCR
-    /// discontinuities or under late-rebase. The outer `derive_target`
-    /// applies the monotonic guard before handing the value to the
-    /// caller.
+    /// Inner derivation; may produce non-monotonic targets — routinely for a
+    /// PCR the emitter reaches after its instant, and at discontinuities or
+    /// under late-rebase. The outer `derive_target` applies the ordering
+    /// floor to the returned value before handing it to the caller.
     fn derive_target_raw(&mut self, now_ns: u64, datagram_pcr: Option<u64>, datagram_bytes: usize) -> u64 {
         if !self.initialised {
             // Epoch lock anchors on the PCR itself, so a cold start needs
@@ -1402,18 +1466,17 @@ impl TargetState {
                 let delta_27 = crate::engine::ts_parse::pcr_diff_27mhz(pcr, prev);
                 // Discontinuity: backwards by any meaningful amount, or
                 // forward jump > 500 ms. Reset anchor to "now". Also
-                // reset `last_returned_ns` here so the outer monotonic
-                // guard (`derive_target`) doesn't fast-forward
-                // `wall_anchor` back to the previous in-flight target —
-                // that's the documented `wire-pacer collapse after 4-5
-                // input switches` regression: when the previous source
-                // was paced into the future and a new source's first
-                // PCR comes in, the guard would lift `wall_anchor` from
-                // `now` back to `last_returned + ε` (= future), every
-                // subsequent natural-paced packet would target further
-                // out, and the wire-emit channel would drown in drops.
-                // Resetting both makes the discontinuity reset complete
-                // — pacing genuinely restarts from `now`.
+                // reset `last_returned_ns` here so the outer ordering
+                // floor (`derive_target`) doesn't hold the new source at
+                // the previous in-flight target. When the floor still
+                // moved `wall_anchor` (before edge#157) that was the
+                // documented `wire-pacer collapse after 4-5 input
+                // switches` regression: the anchor was lifted from `now`
+                // back to `last_returned + ε` (= future), every subsequent
+                // natural-paced packet targeted further out, and the
+                // wire-emit channel drowned in drops. Resetting both makes
+                // the discontinuity reset complete — pacing genuinely
+                // restarts from `now`.
                 if !(0..=PCR_DISCONTINUITY_27MHZ).contains(&delta_27) {
                     self.pcr_anchor = Some(pcr);
                     self.wall_anchor_ns = now_ns;
@@ -1458,6 +1521,7 @@ impl TargetState {
                 if target + LATE_REBASE_THRESHOLD_NS < now_ns {
                     target = now_ns;
                     self.last_returned_ns = now_ns;
+                    self.late_rebases = self.late_rebases.saturating_add(1);
                 }
 
                 self.pcr_anchor = Some(pcr);
@@ -1747,8 +1811,8 @@ struct PendingDatagram {
 /// Re-anchor semantics mirror the PCR-discontinuity reset in
 /// `derive_target_raw`: clearing `initialised` routes the next datagram through
 /// the cold-start path, and resetting `last_returned_ns` stops the outer
-/// monotonic guard from dragging that fresh anchor back to the stale future
-/// target. `anchor_pid` (same stream) and `observed_rate_bps` (the recovered
+/// ordering floor from holding that fresh anchor's datagrams at the stale
+/// future target. `anchor_pid` (same stream) and `observed_rate_bps` (the recovered
 /// rate the Phase-2 servo reuses) are intentionally preserved.
 fn shed_stale_backlog(
     state: &mut TargetState,
@@ -2258,9 +2322,14 @@ fn run_emitter(
                 let mbps = dgms_per_s * 1316.0 * 8.0 / 1e6;
                 let sleep_pct = diag_sleep_ns as f64 / (now.saturating_sub(diag_last_ns)) as f64 * 100.0;
                 let depth = rx.depth.load(std::sync::atomic::Ordering::Relaxed);
+                // `rebase` / `ceil` / `floor` are cumulative. Only the first
+                // two move the pacing anchor; `floor` routinely runs at
+                // about half the PCR count on VBR streams and moves nothing
+                // (see `TargetState::derive_target`, edge#157).
                 tracing::info!(
-                    "wire-emit '{}' diag: {:.0} dgm/s ({:.2} Mbps)  pcr={}/5s  sleep={:.1}%  batch_avg={:.1}  depth={}",
-                    id, dgms_per_s, mbps, diag_pcr_events, sleep_pct, avg, depth
+                    "wire-emit '{}' diag: {:.0} dgm/s ({:.2} Mbps)  pcr={}/5s  sleep={:.1}%  batch_avg={:.1}  depth={}  rebase={}  ceil={}  floor={}",
+                    id, dgms_per_s, mbps, diag_pcr_events, sleep_pct, avg, depth,
+                    state.late_rebases, state.ceiling_clamps, state.order_floors
                 );
                 batch_count = 0;
                 batch_dgms_total = 0;
@@ -3199,8 +3268,8 @@ mod tests {
         assert_eq!(state.bytes_since_anchor, 0);
         assert_eq!(
             state.last_returned_ns, now_ns,
-            "last_returned reset so the monotonic guard can't drag the fresh \
-             anchor back to the stale future target"
+            "last_returned reset so the ordering floor can't hold the fresh \
+             anchor at the stale future target"
         );
     }
 
@@ -3464,5 +3533,533 @@ mod tests {
         let mut c = warmed_servo_state(6_000_000, now);
         let servo = c.derive_target_paced(now, None, 1316, 200, &DejitterConfig::servo());
         assert!(servo >= now, "servo target is sane");
+    }
+
+    // ── edge#157: the ordering floor never moves the pacing anchor ───────
+    //
+    // `derive_target`'s ordering floor used to write the floored instant
+    // into `wall_anchor_ns`. On the clock_nanosleep tier it only fires on a
+    // target already in the past, so every late wake was folded into the
+    // anchor for good: `egress_pacing: "pcr"` released ~1 ms/s further
+    // behind its own PCR until the residence cap shed. Every test in this
+    // section fails with that write put back, except where its doc says
+    // it pins unchanged behaviour.
+
+    /// What deriving one datagram costs on the virtual clock below. Not a
+    /// measurement — just non-zero, so the datagrams of one batch derive at
+    /// distinct, increasing instants, as they do on a real thread.
+    const VIRTUAL_DERIVE_COST_NS: u64 = 1_000;
+
+    /// PCR interval of the synthetic feeds: 40 ms, 25 PCRs/s.
+    const FEED_PCR_INTERVAL_NS: u64 = 40_000_000;
+
+    /// One datagram of a synthetic feed.
+    #[derive(Clone, Copy)]
+    struct FeedDatagram {
+        /// When it enters the wire thread's channel (ns, emitter clock).
+        arrival_ns: u64,
+        pcr: Option<u64>,
+        bytes: usize,
+    }
+
+    /// `run_emitter`'s clock_nanosleep discipline, replayed on a virtual
+    /// clock. It models the two invariants the edge#157 argument rests on
+    /// and nothing else: a datagram is derived only once it has arrived and
+    /// the previous one has left; a future target is then slept to
+    /// (`clock_nanosleep` returns at or after it — `slop_ns` after), and a
+    /// target not in the future leaves at once (the batch path).
+    struct VirtualEmitter {
+        now_ns: u64,
+        slop_ns: u64,
+    }
+
+    impl VirtualEmitter {
+        /// Derive and send one datagram; returns the instant it left.
+        fn emit(&mut self, s: &mut TargetState, d: FeedDatagram) -> u64 {
+            self.now_ns = self.now_ns.max(d.arrival_ns) + VIRTUAL_DERIVE_COST_NS;
+            let floors_before = s.order_floors;
+            let target = s.derive_target(self.now_ns, d.pcr, d.bytes);
+            if s.order_floors > floors_before {
+                // The fix's central claim: on this tier the floor fires only
+                // on a target already in the past, so the instant it returns
+                // holds nothing back.
+                assert!(
+                    target <= self.now_ns + MONOTONIC_TARGET_EPSILON_NS,
+                    "the ordering floor delayed an emission: target {target}, now {}",
+                    self.now_ns
+                );
+            }
+            if target > self.now_ns {
+                self.now_ns = target + self.slop_ns;
+            }
+            self.now_ns
+        }
+    }
+
+    /// A PCR-synchronous feed: a PCR-bearing datagram opens each 40 ms PCR
+    /// interval, then `counts[k % counts.len()]` non-PCR datagrams follow,
+    /// spread evenly across interval `k` at source time; every datagram is
+    /// 1316 B.
+    struct Feed<'a> {
+        /// Arrival of the first datagram (emitter clock).
+        start_ns: u64,
+        /// The first datagram's PCR (27 MHz); later ones wrap modularly.
+        pcr_origin: u64,
+        counts: &'a [u64],
+        /// The source's 27 MHz clock against the emitter's, in ppm.
+        /// Positive: the source runs fast, so its content — PCR and all —
+        /// arrives that much faster than the emitter's clock advances.
+        source_ppm: i64,
+        /// Every datagram of an interval is held by the same delay, drawn
+        /// per interval from a fixed LCG in `[0, jitter_max_ns)`, and
+        /// released in order behind the interval before it (a bonded
+        /// input's reassembly). 0 = no jitter.
+        jitter_max_ns: u64,
+    }
+
+    impl<'a> Feed<'a> {
+        fn steady(counts: &'a [u64]) -> Self {
+            Self {
+                start_ns: 1_000_000_000,
+                pcr_origin: 0,
+                counts,
+                source_ppm: 0,
+                jitter_max_ns: 0,
+            }
+        }
+
+        /// Hand each datagram of the first `intervals` intervals, in order,
+        /// to `f` with its interval index.
+        fn run(&self, intervals: u64, mut f: impl FnMut(u64, FeedDatagram)) {
+            let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
+            let mut last_arrival = 0u64;
+            for k in 0..intervals {
+                let hold = if self.jitter_max_ns == 0 {
+                    0
+                } else {
+                    lcg = lcg
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (lcg >> 33) % self.jitter_max_ns
+                };
+                let n = self.counts[(k % self.counts.len() as u64) as usize];
+                for j in 0..=n {
+                    let src_ns = k * FEED_PCR_INTERVAL_NS + j * FEED_PCR_INTERVAL_NS / (n + 1);
+                    let local_ns =
+                        src_ns as i128 - src_ns as i128 * self.source_ppm as i128 / 1_000_000;
+                    let arrival_ns = (self.start_ns + local_ns as u64 + hold).max(last_arrival);
+                    last_arrival = arrival_ns;
+                    let pcr = (j == 0).then(|| {
+                        (self.pcr_origin + src_ns * 27 / 1_000)
+                            % crate::engine::ts_parse::PCR_MODULUS_27MHZ
+                    });
+                    f(k, FeedDatagram { arrival_ns, pcr, bytes: 1316 });
+                }
+            }
+        }
+    }
+
+    /// What one replay showed.
+    struct Run {
+        /// Per interval, the instant its PCR-bearing datagram left.
+        pcr_emit_ns: Vec<u64>,
+        /// Per interval, that datagram's dwell (left − arrived).
+        pcr_dwell_ns: Vec<u64>,
+        /// Per interval, its residual against the output's own PCR
+        /// timeline: left − (first PCR left + PCR delta). Flat while the
+        /// output tracks its PCR; the edge#157 ratchet made it climb.
+        pcr_residual_ns: Vec<i64>,
+        /// Largest dwell of any datagram in each tenth of the run.
+        dwell_max_by_decile: [u64; 10],
+        /// Largest PCR residual in each tenth of the run.
+        residual_max_by_decile: [i64; 10],
+        /// Interval of the first late-rebase, if any.
+        first_rebase_interval: Option<u64>,
+        /// Every datagram left no earlier than the one before it.
+        monotone: bool,
+    }
+
+    impl Run {
+        /// Growth of the worst dwell from the second tenth (past warm-up)
+        /// to the last.
+        fn dwell_trend_ns(&self) -> i64 {
+            self.dwell_max_by_decile[9] as i64 - self.dwell_max_by_decile[1] as i64
+        }
+
+        /// Growth of the worst PCR residual over the same span.
+        fn residual_trend_ns(&self) -> i64 {
+            self.residual_max_by_decile[9] - self.residual_max_by_decile[1]
+        }
+
+        fn residual_abs_max_ns(&self) -> u64 {
+            self.pcr_residual_ns.iter().map(|r| r.unsigned_abs()).max().unwrap_or(0)
+        }
+
+        fn dwell_max_ns(&self) -> u64 {
+            *self.dwell_max_by_decile.iter().max().unwrap()
+        }
+    }
+
+    /// Replay `intervals` of `feed` through `s` on a virtual emitter that
+    /// wakes `slop_ns` late from every sleep.
+    fn replay(s: &mut TargetState, feed: &Feed<'_>, intervals: u64, slop_ns: u64) -> Run {
+        let mut emitter = VirtualEmitter { now_ns: 0, slop_ns };
+        let mut run = Run {
+            pcr_emit_ns: Vec::with_capacity(intervals as usize),
+            pcr_dwell_ns: Vec::with_capacity(intervals as usize),
+            pcr_residual_ns: Vec::with_capacity(intervals as usize),
+            dwell_max_by_decile: [0; 10],
+            residual_max_by_decile: [i64::MIN; 10],
+            first_rebase_interval: None,
+            monotone: true,
+        };
+        let mut first_pcr: Option<(u64, u64)> = None;
+        let mut last_emit = 0u64;
+        feed.run(intervals, |k, d| {
+            let rebases_before = s.late_rebases;
+            let emit = emitter.emit(s, d);
+            if s.late_rebases > rebases_before && run.first_rebase_interval.is_none() {
+                run.first_rebase_interval = Some(k);
+            }
+            run.monotone &= emit >= last_emit;
+            last_emit = emit;
+            let decile = (k * 10 / intervals) as usize;
+            let dwell = emit - d.arrival_ns;
+            run.dwell_max_by_decile[decile] = run.dwell_max_by_decile[decile].max(dwell);
+            if let Some(pcr) = d.pcr {
+                let (emit0, pcr0) = *first_pcr.get_or_insert((emit, pcr));
+                let delta_ns = crate::engine::ts_parse::pcr_diff_27mhz(pcr, pcr0) * 1000 / 27;
+                let residual = emit as i64 - emit0 as i64 - delta_ns;
+                run.residual_max_by_decile[decile] = run.residual_max_by_decile[decile].max(residual);
+                run.pcr_emit_ns.push(emit);
+                run.pcr_dwell_ns.push(dwell);
+                run.pcr_residual_ns.push(residual);
+            }
+        });
+        run
+    }
+
+    /// The defect, pinned step by step. A VBR interval that carries more
+    /// bytes than the one before caps its tail at the next PCR's instant;
+    /// the emitter wakes for it late, sends the rest of the tail at its
+    /// wake, and so reaches that PCR after its instant. The floor must keep
+    /// the return ordered without moving the anchor off the PCR timeline.
+    #[test]
+    fn the_ordering_floor_never_moves_the_pcr_anchor() {
+        let mut s = TargetState::default();
+        // Cold start on PCR 0: anchored 50 ms out.
+        assert_eq!(s.derive_target(0, Some(0), 1316), 50_000_000);
+        // Interval 0: 20 datagrams, derived after the emitter woke at 50 ms.
+        for i in 0..20u64 {
+            let now = 50_000_000 + (i + 1) * 1_000;
+            assert_eq!(s.derive_target(now, None, 1316), now);
+        }
+        // PCR at 40 ms closes interval 0 (20 x 1316 B over 40 ms): T1 = 90 ms.
+        assert_eq!(s.derive_target(50_100_000, Some(40 * TICK_PER_MS), 1316), 90_000_000);
+        // Interval 1 carries 24 datagrams, paced 2 ms apart off interval 0.
+        // Each is derived after waking 60 us late from the previous target.
+        for i in 1..=20u64 {
+            let now = 90_000_000 + (i - 1) * 2_000_000 + 60_000;
+            assert_eq!(s.derive_target(now, None, 1316), 90_000_000 + i * 2_000_000);
+        }
+        // Datagrams 21-24 cap at T1 + 40 ms = 130 ms, already past at the
+        // late wake, so each leaves at its derive instant.
+        for i in 0..4u64 {
+            let now = 130_060_000 + i * 1_000;
+            assert_eq!(s.derive_target(now, None, 1316), now);
+        }
+        assert_eq!(s.order_floors, 0);
+        // The PCR at 80 ms: its instant (130 ms) is behind what was just
+        // returned (130.063 ms), so the floor fires. Ordering is kept and
+        // the datagram leaves now, exactly as the raw target would have.
+        let now = 130_064_000;
+        let t = s.derive_target(now, Some(80 * TICK_PER_MS), 1316);
+        assert_eq!(t, 130_064_000, "ordering kept: last returned + 1 us");
+        assert_eq!(s.order_floors, 1);
+        assert_eq!(
+            s.wall_anchor_ns, 130_000_000,
+            "the anchor stays on the PCR timeline; the floor must not carry \
+             the emitter's lateness into it"
+        );
+        // The next datagram interpolates from the PCR instant (interval 1:
+        // 24 x 1316 B over 40 ms), not from the floored one.
+        let next = s.derive_target(130_200_000, None, 1316);
+        assert_eq!(next, 130_000_000 + 1316 * 40_000_000 / (24 * 1316));
+        // And the PCR after (derived once the emitter has slept to `next`)
+        // lands exactly one interval on. Before the fix it was 170.064 ms,
+        // and every late wake added to it for good.
+        assert_eq!(s.derive_target(131_700_000, Some(120 * TICK_PER_MS), 1316), 170_000_000);
+        assert_eq!(s.late_rebases, 0);
+        assert_eq!(s.ceiling_clamps, 0);
+    }
+
+    /// A PCR interval shorter than the one before (37 ms after 40) leaves
+    /// the previous interval's spacing running past the new PCR's instant.
+    /// The 3 ms overshoot is under the late-rebase threshold, so the floor
+    /// takes it — and the timeline must catch up, not carry it.
+    #[test]
+    fn a_shorter_pcr_interval_is_caught_up_not_carried() {
+        let mut s = TargetState::default();
+        assert_eq!(s.derive_target(0, Some(0), 1316), 50_000_000);
+        for i in 0..20u64 {
+            let _ = s.derive_target(50_000_000 + (i + 1) * 1_000, None, 1316);
+        }
+        assert_eq!(s.derive_target(50_100_000, Some(40 * TICK_PER_MS), 1316), 90_000_000);
+        // Interval 1: 20 datagrams paced 2 ms apart, the last at 130 ms.
+        for i in 1..=20u64 {
+            let now = 90_000_000 + (i - 1) * 2_000_000 + 60_000;
+            assert_eq!(s.derive_target(now, None, 1316), 90_000_000 + i * 2_000_000);
+        }
+        // But the PCR comes 37 ms on: its instant, 127 ms, is past.
+        let now = 130_060_000;
+        let t = s.derive_target(now, Some(77 * TICK_PER_MS), 1316);
+        assert_eq!(t, 130_001_000, "ordering kept: last returned + 1 us");
+        assert!(t <= now + MONOTONIC_TARGET_EPSILON_NS, "the floor held nothing back");
+        assert_eq!(s.late_rebases, 0, "3 ms of overshoot is not a rebase");
+        assert_eq!(s.wall_anchor_ns, 127_000_000, "the anchor is the PCR's instant");
+        // Interval 2 interpolates over the 37 ms interval from 127 ms: the
+        // first datagram's 1.85 ms is past and leaves at once, the second's
+        // 3.7 ms lands on the PCR timeline — not 3 ms behind it.
+        let first = s.derive_target(130_070_000, None, 1316);
+        assert_eq!(first, 130_070_000);
+        let second = s.derive_target(130_080_000, None, 1316);
+        assert_eq!(second, 127_000_000 + 2 * 37_000_000 / 20);
+    }
+
+    /// Unchanged behaviour, pinned: a PCR more than 5 ms late still re-seats
+    /// the anchor at now (a step later, kept), and is counted.
+    #[test]
+    fn late_rebase_still_snaps_beyond_5ms() {
+        let mut s = TargetState::default();
+        assert_eq!(s.derive_target(0, Some(0), 1316), 50_000_000);
+        assert_eq!(s.derive_target(50_100_000, Some(40 * TICK_PER_MS), 1316), 90_000_000);
+        // The 80 ms PCR's instant is 130 ms; the emitter reaches it at 136.
+        let t = s.derive_target(136_000_000, Some(80 * TICK_PER_MS), 1316);
+        assert_eq!(t, 136_000_000);
+        assert_eq!(s.wall_anchor_ns, 136_000_000);
+        assert_eq!(s.last_returned_ns, 136_000_000);
+        assert_eq!(s.late_rebases, 1);
+        assert_eq!(s.order_floors, 0, "a rebase is not a floor");
+        assert_eq!(s.derive_target(136_100_000, Some(120 * TICK_PER_MS), 1316), 176_000_000);
+    }
+
+    /// Unchanged behaviour, pinned: the future-lookahead ceiling still pulls
+    /// the anchor in, and is counted.
+    #[test]
+    fn the_future_ceiling_still_reseats_the_anchor_and_is_counted() {
+        let mut s = TargetState::default();
+        assert_eq!(s.derive_target(0, Some(0), 1316), 50_000_000);
+        // 450 ms of PCR inside 1 ms of wall time: 200 ms of lookahead caps it.
+        let t = s.derive_target(1_000_000, Some(450 * TICK_PER_MS), 1316);
+        assert_eq!(t, 1_000_000 + MAX_FUTURE_LOOKAHEAD_NS);
+        assert_eq!(s.wall_anchor_ns, t);
+        assert_eq!(s.ceiling_clamps, 1);
+        assert_eq!((s.late_rebases, s.order_floors), (0, 0));
+    }
+
+    /// Five minutes of PCR-synchronous feed through the emitter discipline,
+    /// on a ±2-datagram VBR mux and on an I-frame-burst pattern, at a
+    /// perfect wake, a SCHED_FIFO-like 60 us and a SCHED_OTHER-like 500 us.
+    /// Before the fix the PCR residual climbed 18.7 / 243.7 / 1893 ms on the
+    /// first pattern and 271 / 361 / 1021 ms on the second.
+    #[test]
+    fn pcr_paced_release_does_not_drift_under_wake_slop() {
+        for counts in [&[20u64, 24][..], &[20, 20, 20, 20, 200][..]] {
+            let burst = *counts.iter().max().unwrap();
+            for slop in [0u64, 60_000, 500_000] {
+                let ctx = format!("counts {counts:?}, wake slop {slop} ns");
+                let mut s = TargetState::default();
+                let run = replay(&mut s, &Feed::steady(counts), 7_500, slop);
+                assert!(run.monotone, "{ctx}: emissions out of order");
+                // The trigger is live, and nothing else re-seated the anchor.
+                assert!(s.order_floors > 0, "{ctx}: the floor never engaged");
+                assert_eq!((s.late_rebases, s.ceiling_clamps), (0, 0), "{ctx}");
+                // Every PCR leaves on its own timeline: off it by at most the
+                // wake slop plus the time to derive one interval's batch.
+                let residual_bound = slop + burst * VIRTUAL_DERIVE_COST_NS + 50_000;
+                assert!(
+                    run.residual_abs_max_ns() <= residual_bound,
+                    "{ctx}: PCR residual {} ns > {residual_bound}",
+                    run.residual_abs_max_ns()
+                );
+                assert!(
+                    run.residual_trend_ns() <= 20_000,
+                    "{ctx}: PCR residual grew {} ns",
+                    run.residual_trend_ns()
+                );
+                // Dwell: the preroll, plus up to one PCR interval of VBR tail
+                // capped at the next PCR's instant, plus the wake slop.
+                let dwell_bound = PREROLL_NS + FEED_PCR_INTERVAL_NS + slop + 1_000_000;
+                assert!(
+                    run.dwell_max_ns() <= dwell_bound,
+                    "{ctx}: dwell {} ns > {dwell_bound}",
+                    run.dwell_max_ns()
+                );
+                assert!(
+                    run.dwell_trend_ns() <= 100_000,
+                    "{ctx}: worst dwell grew {} ns over the run",
+                    run.dwell_trend_ns()
+                );
+            }
+        }
+    }
+
+    /// Datagrams spaced closer than the wake slop (200 per 40 ms at 500 us)
+    /// put the emitter past the next PCR's instant by phase alone. Before the
+    /// fix that drifted 452 ms in a minute.
+    #[test]
+    fn dense_stream_wake_slop_does_not_ratchet() {
+        let slop = 500_000;
+        let mut s = TargetState::default();
+        let run = replay(&mut s, &Feed::steady(&[200]), 1_500, slop);
+        assert!(run.monotone);
+        assert!(s.order_floors > 0, "the trigger must stay live");
+        assert_eq!((s.late_rebases, s.ceiling_clamps), (0, 0));
+        assert!(run.residual_abs_max_ns() <= slop + 200 * VIRTUAL_DERIVE_COST_NS + 50_000);
+        assert!(run.residual_trend_ns() <= 20_000, "grew {}", run.residual_trend_ns());
+        assert!(run.dwell_max_ns() <= PREROLL_NS + FEED_PCR_INTERVAL_NS + slop + 1_000_000);
+        assert!(run.dwell_trend_ns() <= 100_000, "grew {}", run.dwell_trend_ns());
+    }
+
+    /// 2022-7: two legs, two emitters, one feed. Each leg has its own pacing
+    /// state, so before the fix each ratcheted by its own wake slop and the
+    /// legs walked apart (~225 ms in 5 min at 20 vs 80 us). Now both track
+    /// the same PCR timeline and differ by the slop difference.
+    #[test]
+    fn two_2022_7_legs_stay_coherent_under_different_wake_slop() {
+        let feed = Feed::steady(&[20, 24]);
+        let mut red = TargetState::default();
+        let mut blue = TargetState::default();
+        let r = replay(&mut red, &feed, 7_500, 20_000);
+        let b = replay(&mut blue, &feed, 7_500, 80_000);
+        let worst = r
+            .pcr_emit_ns
+            .iter()
+            .zip(&b.pcr_emit_ns)
+            .map(|(x, y)| x.abs_diff(*y))
+            .max()
+            .unwrap();
+        assert!(worst <= 100_000, "legs {worst} ns apart");
+        assert!(red.order_floors > 0 && blue.order_floors > 0);
+    }
+
+    /// The epoch-lock fallback: with the analytic anchor disengaged (the
+    /// source's PCR is an hour off the group timeline), every PCR is paced
+    /// by the classic path — and must not drift either.
+    #[test]
+    fn the_disengaged_epoch_fallback_does_not_drift() {
+        let (pcr_now, anchor, now) = source_timeline();
+        let mut s = epoch_state(400, anchor);
+        // Already disengaged — `implausible_pcr_disengages_and_then_recovers`
+        // pins how it gets there.
+        s.epoch_disengaged = true;
+        s.epoch_implausible_run = EPOCH_DISENGAGE_AFTER;
+        let feed = Feed {
+            start_ns: now,
+            pcr_origin: pcr_plus_ms(pcr_now, 3_600_000),
+            ..Feed::steady(&[20, 24])
+        };
+        let slop = 60_000;
+        let run = replay(&mut s, &feed, 7_500, slop);
+        assert!(s.epoch_disengaged && !s.epoch_engaged, "stayed on the classic path");
+        assert!(s.order_floors > 0, "the trigger must stay live");
+        assert_eq!((s.late_rebases, s.ceiling_clamps), (0, 0));
+        assert!(run.residual_abs_max_ns() <= slop + 24 * VIRTUAL_DERIVE_COST_NS + 50_000);
+        assert!(run.residual_trend_ns() <= 20_000, "grew {}", run.residual_trend_ns());
+        assert!(run.dwell_max_ns() <= PREROLL_NS + FEED_PCR_INTERVAL_NS + slop + 1_000_000);
+    }
+
+    /// A source clock 30 ppm SLOW against the emitter's (the in-spec
+    /// extreme of ISO/IEC 13818-1): residence stays bounded. The PCR
+    /// timeline falls behind arrival, so the 50 ms preroll is consumed
+    /// (~28 min at 30 ppm); after that the output leaves on arrival (PCR_AC
+    /// becomes the input's PDV) and late-rebases about every 5 ms / 30 ppm
+    /// (~167 s). Those rebases are data-late, not an emitter stall. Before
+    /// the fix the ratchet outran the offset and dwell grew without bound.
+    #[test]
+    fn a_slow_source_clock_keeps_residence_bounded() {
+        let slop = 60_000;
+        let feed = Feed { source_ppm: -30, ..Feed::steady(&[20, 24]) };
+        let mut s = TargetState::default();
+        // 40 min.
+        let run = replay(&mut s, &feed, 60_000, slop);
+        assert!(run.monotone);
+        let dwell_bound = PREROLL_NS + FEED_PCR_INTERVAL_NS + slop + 1_000_000;
+        assert!(run.dwell_max_ns() <= dwell_bound, "dwell {} ns", run.dwell_max_ns());
+        // The preroll is used up: by the end PCRs leave on arrival.
+        let last = *run.pcr_dwell_ns.last().unwrap();
+        assert!(last <= 1_000_000, "end dwell {last} ns");
+        // No rebase while the preroll lasts (lag > 5 ms needs 55 ms / 30 ppm
+        // = 1833 s = interval ~45 833), then one every ~167 s.
+        let first = run.first_rebase_interval.expect("a 40 min slow source rebases");
+        assert!((45_000..=47_000).contains(&first), "first rebase at interval {first}");
+        assert!((3..=5).contains(&s.late_rebases), "{} rebases", s.late_rebases);
+        assert_eq!(s.ceiling_clamps, 0);
+    }
+
+    /// A source clock 30 ppm FAST against the emitter's. Residence is NOT
+    /// bounded by the pacer in this direction, before or after edge#157:
+    /// `pcr` mode releases on the source's PCR timeline, which outruns
+    /// arrival, so the egress queue grows at exactly the offset — 30 us/s,
+    /// ~108 ms/h. The bound is the residence cap in `run_emitter` (1000 ms
+    /// by default), reached after (1000 − 50) ms / 30 ppm ≈ 8.8 h, where it
+    /// sheds the backlog and re-anchors. That is the documented open-loop
+    /// limit (`servo` meters rate instead). What the fix guarantees, and
+    /// this pins, is that the queue grows at the source's offset and no
+    /// faster: before it, the ratchet added ~0.8 ms/s on top (at 60 us of
+    /// wake slop), which reaches the 1000 ms cap in ~20 min.
+    #[test]
+    fn a_fast_source_clock_grows_residence_at_its_own_offset_only() {
+        let slop = 60_000;
+        let feed = Feed { source_ppm: 30, ..Feed::steady(&[20, 24]) };
+        let mut s = TargetState::default();
+        // 30 min.
+        let intervals = 45_000;
+        let run = replay(&mut s, &feed, intervals, slop);
+        assert!(run.monotone);
+        // Every PCR still leaves on its own timeline...
+        assert!(run.residual_abs_max_ns() <= slop + 24 * VIRTUAL_DERIVE_COST_NS + 50_000);
+        assert_eq!((s.late_rebases, s.ceiling_clamps), (0, 0));
+        // ...and the PCR dwell grows by the offset times the source time
+        // elapsed: 30 ppm of 1799 s ≈ 54 ms.
+        let from = 25usize;
+        let to = intervals as usize - 1;
+        let growth = run.pcr_dwell_ns[to] as i64 - run.pcr_dwell_ns[from] as i64;
+        let expected = ((to - from) as i64 * FEED_PCR_INTERVAL_NS as i64) * 30 / 1_000_000;
+        assert!(
+            (growth - expected).abs() <= slop as i64 + 100_000,
+            "dwell grew {growth} ns over the run, expected {expected} ns (30 ppm)"
+        );
+    }
+
+    /// Arrival jitter (a bonded input's reassembly holds, per PCR interval).
+    /// Inside the 50 ms preroll it is absorbed: no rebase, no residual.
+    /// Beyond it, the late-rebase steps the anchor to the worst lateness
+    /// seen and holds it there — bounded steps, never a ratchet. Before the
+    /// fix both cases drifted ~240 ms in 5 min.
+    #[test]
+    fn arrival_jitter_is_absorbed_or_stepped_never_ratcheted() {
+        let slop = 60_000;
+        let inside = Feed { jitter_max_ns: 40_000_000, ..Feed::steady(&[20, 24]) };
+        let mut s = TargetState::default();
+        let run = replay(&mut s, &inside, 7_500, slop);
+        assert_eq!(s.late_rebases, 0, "jitter inside the preroll needs no rebase");
+        assert!(run.residual_abs_max_ns() <= slop + 24 * VIRTUAL_DERIVE_COST_NS + 50_000);
+        assert!(run.residual_trend_ns() <= 20_000);
+        let jitter = 80_000_000u64;
+        let beyond = Feed { jitter_max_ns: jitter, ..Feed::steady(&[20, 24]) };
+        let mut s = TargetState::default();
+        let run = replay(&mut s, &beyond, 7_500, slop);
+        // Each rebase is a step of more than 5 ms toward the worst lateness,
+        // which is at most the jitter less the preroll.
+        let max_rebases = (jitter - PREROLL_NS) / LATE_REBASE_THRESHOLD_NS + 1;
+        assert!(s.late_rebases <= max_rebases, "{} rebases", s.late_rebases);
+        let residual_bound = jitter - PREROLL_NS + slop + 1_000_000;
+        assert!(
+            run.residual_abs_max_ns() <= residual_bound,
+            "residual {} ns > {residual_bound}",
+            run.residual_abs_max_ns()
+        );
+        assert!(run.dwell_max_ns() <= PREROLL_NS + jitter + FEED_PCR_INTERVAL_NS + slop + 1_000_000);
     }
 }
