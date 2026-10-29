@@ -351,12 +351,12 @@ treat TS payloads as opaque bytes or maintain independent state.
   │  Public:    /health, /oauth/token,   │
   │             /setup (gated by config) │
   │  Read-only: GET /api/v1/* (any role)  │
-  │  Admin:     POST/PUT/DELETE on flows, │
-  │             inputs, outputs, config   │
-  │             (RequireAdmin extractor)  │
-  │  NOT admin-gated: PUT /api/v1/ptp,    │
-  │             POST+DELETE /api/v1/      │
-  │             tunnels, WHIP/WHEP        │
+  │  Admin:     every non-GET/HEAD/       │
+  │             OPTIONS on /api/v1/*      │
+  │             (method-keyed router      │
+  │             layer + RequireAdmin)     │
+  │  NOT admin-gated: WHIP/WHEP and NMOS  │
+  │             (own routers)             │
   └────────────┬───────────────────────────┘
                ▼
   ┌────────────────────────────────────────┐
@@ -386,9 +386,10 @@ treat TS payloads as opaque bytes or maintain independent state.
 ```
 
 Layer 3 is what the private API leans on when auth is off — which it is
-unless the config carries an `auth` block: `RequireAdmin` returns `Ok` when
-there are no claims, so route-level RBAC alone would let any page the operator
-has loaded take a flow off air. Detail
+unless the config carries an `auth` block: with no auth state there is no role
+to check, so the role layer and `RequireAdmin` both pass every request, and
+route-level RBAC alone would let any page the operator has loaded take a flow
+off air. Detail
 and the exact browser fingerprint tests:
 [api-security.md — Browser-origin policy](api-security.md#browser-origin-policy).
 

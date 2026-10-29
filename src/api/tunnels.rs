@@ -11,6 +11,7 @@ use axum::Json;
 use crate::config::persistence::save_config_split_async;
 use crate::tunnel::TunnelConfig;
 
+use super::auth::RequireAdmin;
 use super::server::AppState;
 
 /// GET /api/v1/tunnels — list all active tunnels.
@@ -37,8 +38,12 @@ pub async fn get_tunnel(
 /// survives an edge restart — mirroring the manager WS `create_tunnel` path
 /// and the inputs/outputs REST handlers. Without this the local REST create
 /// is non-durable: the tunnel would vanish on the next restart.
+///
+/// **Auth:** admin. An upsert by id re-points a running tunnel, so a `monitor`
+/// token is refused 403 before the body is parsed.
 pub async fn create_tunnel(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     Json(config): Json<TunnelConfig>,
 ) -> impl IntoResponse {
     if let Err(e) = crate::config::validation::validate_tunnel(&config) {
@@ -124,8 +129,12 @@ pub async fn create_tunnel(
 /// On success the tunnel is also removed from the in-memory `AppConfig` and the
 /// change persisted to `config.json`, so the removal is not resurrected on the
 /// next restart (mirrors the manager WS `delete_tunnel` path).
+///
+/// **Auth:** admin. A `monitor` token is refused 403 before the tunnel is
+/// touched.
 pub async fn delete_tunnel(
     State(state): State<AppState>,
+    _admin: RequireAdmin,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     // Idempotent: a tunnel that already self-evicted from the runtime registry

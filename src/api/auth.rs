@@ -6,7 +6,12 @@
 //! Provides:
 //! - JWT encode/decode using HMAC-SHA256
 //! - Auth middleware for axum that validates Bearer tokens
-//! - Role-based access control via the [`RequireAdmin`] extractor
+//! - Role-based access control via the [`RequireAdmin`] extractor, backed on
+//!   `/api/v1/**` (WHIP/WHEP excepted) by a method-keyed router layer
+//!   (`require_admin_for_writes` in `api::server`) that refuses every non-safe
+//!   method to a non-admin token whether or not the handler takes the
+//!   extractor. Both answer through `is_admin` and `admin_role_required`, so
+//!   there is one rule and one refusal body
 //! - OAuth 2.0 `/oauth/token` endpoint (client_credentials grant)
 //!
 //! When [`AuthConfig::enabled`] is `false` (or no `AuthState` is provided), all
@@ -307,10 +312,41 @@ pub async fn auth_middleware(
 // RequireAdmin extractor
 // ---------------------------------------------------------------------------
 
+/// True when a validated token may change node state: its role is `"admin"`.
+///
+/// The one definition of "may mutate", shared by [`RequireAdmin`] and the
+/// router-level layer on `/api/v1/**` (`require_admin_for_writes` in
+/// `api::server`), so the two cannot drift apart. The only other role
+/// validation admits is `"monitor"`, which is read-only.
+pub(crate) fn is_admin(claims: &Claims) -> bool {
+    claims.role == "admin"
+}
+
+/// The 403 answered to an authenticated caller whose role may not mutate.
+///
+/// Shared by [`RequireAdmin`] and the router-level layer, so a refusal reads
+/// the same whichever of the two answered it. A missing or invalid token is a
+/// 401 from [`auth_middleware`] instead, never this.
+pub(crate) fn admin_role_required() -> Response {
+    json_error(StatusCode::FORBIDDEN, "admin role required")
+}
+
 /// Axum extractor that requires the authenticated user to have the `"admin"` role.
 ///
 /// Extracts [`Claims`] from request extensions (inserted by [`auth_middleware`])
 /// and returns 403 if the role is not `"admin"`.
+///
+/// Every `/api/v1/**` mutation handler but WHIP/WHEP's takes it, and
+/// `require_admin_for_writes` in `api::server` applies the same rule as a
+/// router layer to every non-safe method on that same surface, so a handler
+/// that leaves this out is still refused to a `monitor` token. Take it anyway: it states the handler's
+/// requirement where the handler is read, and it refuses before any body
+/// extractor that follows it parses the request.
+///
+/// With no [`Claims`] in the extensions it returns `Ok`: [`auth_middleware`]
+/// inserts them on every request it admits, so their absence means auth is
+/// disabled. It cannot tell that apart from a router that forgot the auth
+/// layer, which is why the router-level layer keys on the auth state itself.
 pub struct RequireAdmin;
 
 impl<S: Send + Sync> FromRequestParts<S> for RequireAdmin {
@@ -318,18 +354,10 @@ impl<S: Send + Sync> FromRequestParts<S> for RequireAdmin {
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         // If no Claims in extensions, auth middleware didn't run (auth disabled) — allow through
-        let Some(claims) = parts.extensions.get::<Claims>() else {
-            return Ok(RequireAdmin);
-        };
-
-        if claims.role != "admin" {
-            return Err(json_error(
-                StatusCode::FORBIDDEN,
-                "admin role required",
-            ));
+        match parts.extensions.get::<Claims>() {
+            Some(claims) if !is_admin(claims) => Err(admin_role_required()),
+            _ => Ok(RequireAdmin),
         }
-
-        Ok(RequireAdmin)
     }
 }
 
@@ -536,6 +564,46 @@ mod tests {
             serde_json::from_slice(&decoded).expect("header should be valid JSON");
         assert_eq!(header["alg"], "HS256");
         assert_eq!(header["typ"], "JWT");
+    }
+
+    /// `RequireAdmin` and the router-level role layer answer through the same
+    /// predicate and the same refusal, so pin both, and the extractor's
+    /// three cases: no `Claims` (auth off) passes, admin passes, anything
+    /// else is the 403 body the API reference documents.
+    #[tokio::test]
+    async fn require_admin_admits_admin_and_auth_off_and_refuses_monitor() {
+        assert!(is_admin(&make_claims("admin", 60)));
+        assert!(!is_admin(&make_claims("monitor", 60)));
+        assert!(!is_admin(&make_claims("Admin", 60)), "the role is matched exactly");
+
+        let refused = admin_role_required();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(refused.into_body(), 1024)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({ "success": false, "error": "admin role required" })
+        );
+
+        /// The status the extractor refuses with, or `None` when it admits.
+        async fn extractor_refusal(claims: Option<Claims>) -> Option<StatusCode> {
+            let (mut parts, ()) = axum::http::Request::new(()).into_parts();
+            if let Some(claims) = claims {
+                parts.extensions.insert(claims);
+            }
+            RequireAdmin::from_request_parts(&mut parts, &())
+                .await
+                .err()
+                .map(|refused| refused.status())
+        }
+        assert_eq!(extractor_refusal(None).await, None, "no Claims means auth is off");
+        assert_eq!(extractor_refusal(Some(make_claims("admin", 60))).await, None);
+        assert_eq!(
+            extractor_refusal(Some(make_claims("monitor", 60))).await,
+            Some(StatusCode::FORBIDDEN)
+        );
     }
 
     #[test]

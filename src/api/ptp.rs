@@ -12,6 +12,7 @@ use axum::extract::Json;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
+use crate::api::auth::RequireAdmin;
 use crate::api::errors::ApiError;
 use crate::api::models::ApiResponse;
 use crate::util::ptp_config::{self, PtpMode, PtpSettings};
@@ -60,11 +61,21 @@ impl From<PtpSettings> for PtpStatusPayload {
     }
 }
 
+/// `GET /api/v1/ptp` — the node's PTP settings as `ptp.conf` holds them.
+///
+/// **Auth:** any role.
 pub async fn get_ptp() -> impl IntoResponse {
     Json(ApiResponse::ok(PtpStatusPayload::from(ptp_config::load())))
 }
 
+/// `PUT /api/v1/ptp` — validate and persist new PTP settings.
+///
+/// **Auth:** admin. The helper applies a saved mode within ~1 s, and a mode
+/// change (to grandmaster, say) reaches every node in the PTP domain, so a
+/// `monitor` token is refused 403 before the body is parsed or `ptp.conf`
+/// is touched.
 pub async fn put_ptp(
+    _admin: RequireAdmin,
     Json(req): Json<SetPtpRequest>,
 ) -> Result<Json<ApiResponse<PtpStatusPayload>>, ApiError> {
     let mode = match req.mode.to_ascii_lowercase().as_str() {

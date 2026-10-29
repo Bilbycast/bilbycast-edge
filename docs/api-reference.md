@@ -1324,7 +1324,7 @@ Return the current PTP settings. **Auth:** any role.
 
 ### PUT /api/v1/ptp
 
-Update PTP settings and persist them. **Auth:** any role — the handler takes no `RequireAdmin` extractor, so any valid JWT can change the node's PTP mode, interface, domain and priority1 when auth is enabled.
+Update PTP settings and persist them. **Auth:** admin. A `monitor` token is refused 403 (`admin role required`) before the body is read, so it cannot change the node's PTP mode, interface, domain or priority1. Releases up to 0.116.0 accepted any valid JWT here.
 
 **Request body:**
 
@@ -1511,7 +1511,7 @@ Get status of a specific tunnel.
 
 Create a new IP tunnel. The tunnel configuration is validated before creation.
 
-**Auth:** Requires a valid JWT (**any role**) when auth is enabled — unlike the inputs / outputs / flows write routes, this handler carries no `RequireAdmin` extractor, so a `monitor` token can create a tunnel and have it persisted to `config.json` / `secrets.json`.
+**Auth:** Requires a JWT with the `admin` role when auth is enabled, like every other write route; a `monitor` token is refused 403 (`admin role required`). Releases up to 0.116.0 accepted any valid JWT here, so a `monitor` token could create a tunnel, or re-point an existing one by reusing its `id`.
 
 **Request body:** A `TunnelConfig` JSON object. See [Tunnel Configuration](configuration-guide.md#tunnel-configuration) for all fields.
 
@@ -1558,7 +1558,7 @@ For a native SRT/RIST stream that should avoid QUIC, add `"transport": "udp"` (r
 
 Destroy a tunnel and clean up its connections.
 
-**Auth:** Requires a valid JWT (**any role**) when auth is enabled — this handler carries no `RequireAdmin` extractor either.
+**Auth:** Requires a JWT with the `admin` role when auth is enabled; a `monitor` token is refused 403. Releases up to 0.116.0 accepted any valid JWT here.
 
 **Response (200 OK):**
 
@@ -1759,15 +1759,15 @@ Handlers built on the shared `ApiError` type — inputs, outputs, flows, flow ac
 | DELETE | `/api/v1/flows/{flow_id}/whep/{session_id}` | Yes | any | WHEP: Disconnect viewer |
 | GET | `/api/v1/tunnels` | Yes | any | List all tunnels |
 | GET | `/api/v1/tunnels/{id}` | Yes | any | Get tunnel status |
-| POST | `/api/v1/tunnels` | Yes | any | Create tunnel |
-| DELETE | `/api/v1/tunnels/{id}` | Yes | any | Delete tunnel |
+| POST | `/api/v1/tunnels` | Yes | admin | Create tunnel |
+| DELETE | `/api/v1/tunnels/{id}` | Yes | admin | Delete tunnel |
 | GET | `/api/v1/stats` | Yes | any | All statistics |
 | GET | `/api/v1/stats/{flow_id}` | Yes | any | Single flow stats |
 | GET | `/api/v1/config` | Yes | any | Get running config (infrastructure secrets stripped; flow credentials in cleartext) |
 | PUT | `/api/v1/config` | Yes | admin | Replace entire config |
 | POST | `/api/v1/config/reload` | Yes | admin | Reload config from disk |
 | GET | `/api/v1/ptp` | Yes | any | Get PTP settings |
-| PUT | `/api/v1/ptp` | Yes | any | Update PTP settings |
+| PUT | `/api/v1/ptp` | Yes | admin | Update PTP settings |
 | GET | `/api/v1/ws/stats` | Yes | any | WebSocket stats stream |
 | GET | `/x-nmos/node/v1.3/` | Configurable | any | NMOS IS-04: Node API root |
 | GET | `/x-nmos/node/v1.3/self` | Configurable | any | NMOS IS-04: Node resource |
@@ -1803,6 +1803,6 @@ Handlers built on the shared `ApiError` type — inputs, outputs, flows, flow ac
 - "Configurable" for NMOS: requires JWT whenever `auth.enabled: true` (the secure-by-default). Set `nmos_require_auth: false` to opt out — a `SECURITY:` warning is logged at startup.
 - "Configurable" for `/metrics`: public by default, requires JWT when `public_metrics: false`
 - `/oauth/token` is rate-limited to 10 requests/minute per IP by default (configurable via `token_rate_limit_per_minute`)
-- The `admin` role is enforced by the `RequireAdmin` extractor on the handler itself, not by a router layer, so the three write routes that omit it — `POST /api/v1/tunnels`, `DELETE /api/v1/tunnels/{id}` and `PUT /api/v1/ptp` — accept any valid JWT. With auth off, `RequireAdmin` returns `Ok` anyway, so the distinction exists only on auth-enabled nodes
+- The `admin` role is enforced twice on `/api/v1`: by a router layer that refuses every method other than `GET` / `HEAD` / `OPTIONS` to any other role, whichever route it reaches, and by the `RequireAdmin` extractor each write handler takes. NMOS and the WHIP/WHEP routes sit on routers of their own, outside that layer, and keep the role rules in the notes around this one. A `monitor` token sending a method a path does not route gets 403 rather than 405. With auth off neither check applies, so the role distinction exists only on auth-enabled nodes. Releases up to 0.116.0 had the extractor alone, and three handlers lacked it — `POST /api/v1/tunnels`, `DELETE /api/v1/tunnels/{id}` and `PUT /api/v1/ptp` accepted any valid JWT there
 - WHIP/WHEP need only a valid JWT (any role) when auth is enabled. The per-flow `bearer_token` is the real gate and it covers the two SDP-offer routes only — the two session `DELETE`s validate no bearer token at all, so on an auth-off node (the shipped default) any caller who knows a session id can tear that session down
 - NMOS collection paths are registered both with and without a trailing slash, and the navigation roots (`/x-nmos/connection/v1.1/`, `/single`, `/single/senders/{id}`, `/single/receivers/{id}`, `/x-nmos/channelmapping/v1.0/`, `/map`, `/io/`, `/map/active/`, `/map/staged/`) are registered too. The table lists the canonical form only
