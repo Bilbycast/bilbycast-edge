@@ -2342,7 +2342,8 @@ async fn srt_output_bonded_loop(
                 )
                 .await?;
                 poller_cancel.cancel();
-                // Before the close (see the bonded caller input).
+                // Join the poller first: it hands back the supervisor whose
+                // member tracks the report is built from.
                 let members = if disconnected {
                     final_member_report(poller).await
                 } else {

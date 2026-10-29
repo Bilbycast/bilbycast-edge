@@ -1596,8 +1596,8 @@ async fn srt_input_bonded_caller_loop(
         )
         .await?;
         poller_cancel.cancel();
-        // Taken before the close, which would refuse a re-add still in
-        // flight and leave that as the member's error.
+        // Join the poller before the close: it hands back the supervisor
+        // whose member tracks the report is built from.
         let members = if disconnected {
             final_member_report(poller).await
         } else {

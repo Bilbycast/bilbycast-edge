@@ -270,35 +270,47 @@ pub(crate) fn member_sources_json(plans: &[BondMemberPlan]) -> serde_json::Value
 }
 
 /// A libsrt error from connecting members bound to `sources`, worded for
-/// the operator. libsrt reports a source it cannot bind as `SocketFail`
-/// ("unable to create/configure SRT socket"), naming neither the bind nor
-/// the address — and an address this host does not have (a typo, a static
-/// IP the DHCP server or carrier has since changed) is the usual cause once
-/// `local_addr` is really bound.
+/// the operator. libsrt reports a source it cannot open or bind as
+/// `SocketFail` ("unable to create/configure SRT socket"), naming neither
+/// the step nor the address. An address this host does not have (a typo, a
+/// static IP the DHCP server or carrier has since changed) is the usual
+/// cause once `local_addr` is really bound; a fixed source port already in
+/// use, or the process out of file descriptors, reads the same.
+///
+/// A whole-group connect fails only when libsrt spawned no member, and the
+/// bridge returns the first member error, so there `sources` is every bound
+/// member of the attempt: each one failed, though not necessarily for this
+/// reason.
 pub(crate) fn describe_connect_error(e: &SrtError, sources: &[SocketAddr]) -> String {
     if *e != SrtError::SocketFail || sources.is_empty() {
         return e.to_string();
     }
     let list: Vec<String> = sources.iter().map(|a| a.to_string()).collect();
+    let port = if sources.iter().any(|a| a.port() != 0) { ", with its port free" } else { "" };
     format!(
-        "could not open a socket on source {} — is {} assigned to this host? ({e})",
+        "could not open or bind a socket on source {} — is {} assigned to this host{port}? ({e})",
         list.join(", "),
         if sources.len() == 1 { "that address" } else { "each address" }
     )
 }
 
-/// Why a member handed to libsrt never went live: its handshake failed or
-/// timed out. With a bound source the usual cause is routing — the kernel
-/// sends by its table, not by the source address.
+/// Why a member handed to libsrt never went live: its handshake went
+/// unanswered or the peer rejected it. The group listing carries no reject
+/// reason, so the two read alike. Unanswered from a bound source is usually
+/// routing (the kernel sends by its table, not by the source address); a
+/// rejection is the peer's settings (passphrase, stream id).
 fn handshake_failed_reason(source: &str) -> String {
     if source.parse::<SocketAddr>().is_ok() {
         format!(
-            "the handshake did not complete from source {source}: check that the peer is \
-             reachable from that source (without source policy routing the kernel may send \
-             it out of another interface)"
+            "the handshake did not complete from source {source} (no answer, or the peer \
+             rejected it): check that the peer is reachable from that source (without source \
+             policy routing the kernel may send it out of another interface) and that it \
+             accepts this caller (passphrase, stream id)"
         )
     } else {
-        "the handshake did not complete: the peer did not answer on this path".to_string()
+        "the handshake did not complete (no answer, or the peer rejected it): check that the \
+         peer is reachable on this path and that it accepts this caller (passphrase, stream id)"
+            .to_string()
     }
 }
 
@@ -503,17 +515,26 @@ impl BondSupervisor {
     ) -> Self {
         let tracks = plans
             .iter()
-            .map(|plan| MemberTrack {
-                down_since: None,
-                next_attempt: started + FIRST_BACKOFF,
-                backoff: FIRST_BACKOFF,
-                awaiting_handshake: true,
-                was_live: false,
-                last_error: None,
+            .map(|plan| {
                 // As the connect that built this group resolved it a moment
                 // ago, so a group that fails before the first tick still
-                // reports it.
-                source: resolve_member_source(plan).describe(),
+                // reports it. A member whose NIC was missing was left out of
+                // that connect: it is not handshaking, and the NIC is its
+                // reason (as `note_source` records on the first tick).
+                let source = resolve_member_source(plan);
+                let unavailable = match &source {
+                    MemberSource::Unavailable(e) => Some(e.clone()),
+                    _ => None,
+                };
+                MemberTrack {
+                    down_since: None,
+                    next_attempt: started + FIRST_BACKOFF,
+                    backoff: FIRST_BACKOFF,
+                    awaiting_handshake: unavailable.is_none(),
+                    was_live: false,
+                    last_error: unavailable,
+                    source: source.describe(),
+                }
             })
             .collect();
         Self { plans, tracks, latch, events, degrade_after, sources_reported: false }
@@ -643,15 +664,33 @@ impl BondSupervisor {
         }
     }
 
-    /// Record how a re-add went: `Ok` = handed to libsrt, now handshaking.
-    fn note_readd(&mut self, idx: usize, result: Result<(), String>) {
+    /// Record how a re-add from `source` went: `Ok` = handed to libsrt, now
+    /// handshaking.
+    ///
+    /// `ConnectionLost` is the bridge refusing a re-add into a group with no
+    /// Idle or Running member left (or one it has seen break), or libsrt
+    /// naming no member error. It says nothing about this member, so a
+    /// reason the member already has is kept: if the group is failing
+    /// whole, that reason is what the disconnect event's report should show.
+    fn note_readd(&mut self, idx: usize, result: Result<(), SrtError>, source: Option<SocketAddr>) {
+        let Err(e) = result else {
+            self.tracks[idx].awaiting_handshake = true;
+            return;
+        };
+        let message = format!(
+            "re-adding the member failed: {}",
+            describe_connect_error(&e, source.as_slice())
+        );
+        tracing::warn!(
+            "{}: bonding member {} ({}): {message}",
+            self.events.subject(),
+            self.plans[idx].token,
+            self.plans[idx].addr
+        );
         let track = &mut self.tracks[idx];
-        match result {
-            Ok(()) => track.awaiting_handshake = true,
-            Err(e) => {
-                track.awaiting_handshake = false;
-                track.last_error = Some(e);
-            }
+        track.awaiting_handshake = false;
+        if e != SrtError::ConnectionLost || track.last_error.is_none() {
+            track.last_error = Some(message);
         }
     }
 
@@ -678,21 +717,8 @@ impl BondSupervisor {
                     let Some(ep) = group_endpoint(&self.plans[idx], &source) else {
                         continue;
                     };
-                    let result = group.add_member(ep).await.map_err(|e| {
-                        format!(
-                            "re-adding the member failed: {}",
-                            describe_connect_error(&e, ep.local_addr.as_slice())
-                        )
-                    });
-                    if let Err(e) = &result {
-                        tracing::warn!(
-                            "{}: bonding member {} ({}): {e}",
-                            self.events.subject(),
-                            token,
-                            self.plans[idx].addr
-                        );
-                    }
-                    self.note_readd(idx, result);
+                    let result = group.add_member(ep).await;
+                    self.note_readd(idx, result, ep.local_addr);
                 }
                 BondAction::Degraded { connected, configured, down } => {
                     self.emit_degraded(connected, configured, &down);
@@ -1407,6 +1433,12 @@ mod tests {
         let reason = down[0].last_error.as_deref().expect("no reason recorded");
         assert!(reason.contains("handshake did not complete"), "{reason}");
         assert!(reason.contains("192.168.2.2:0") && reason.contains("routing"), "{reason}");
+        // The listing carries no reject reason, so a peer that refused the
+        // handshake (wrong passphrase, stream id) reads the same: the text
+        // must not blame routing alone.
+        assert!(reason.contains("rejected") && reason.contains("passphrase"), "{reason}");
+        let unbound = handshake_failed_reason("unbound");
+        assert!(unbound.contains("rejected") && !unbound.contains("did not answer"), "{unbound}");
     }
 
     /// Every member pinned to a source the kernel cannot route to the peer:
@@ -1442,14 +1474,18 @@ mod tests {
     }
 
     /// A group that fails before the supervisor's first tick still reports
-    /// each member's source, as the connect resolved it.
+    /// each member's source, as the connect resolved it — and a member
+    /// whose NIC was missing, left out of that connect, its NIC rather than
+    /// a handshake it never had.
     #[test]
     fn the_final_report_has_sources_before_the_first_tick() {
         let mut first = ep("203.0.113.10:9000");
         first.local_addr = Some("192.0.2.10:0".into());
+        let mut gone = ep("203.0.113.12:9000");
+        gone.interface_binding = nic("no-such-nic0");
         let plans = plan_bond_members(&bond(
             SrtBondingMode::Broadcast,
-            vec![first, ep("203.0.113.11:9000")],
+            vec![first, ep("203.0.113.11:9000"), gone],
         ))
         .unwrap();
         let (sup, _rx) = supervisor(plans, Arc::default(), Instant::now());
@@ -1457,6 +1493,38 @@ mod tests {
         assert_eq!(report[0]["source"], "192.0.2.10:0");
         assert!(report[0]["last_error"].as_str().unwrap().contains("192.0.2.10:0"));
         assert_eq!(report[1]["source"], "unbound");
+        let why = report[2]["last_error"].as_str().expect("no reason");
+        assert!(why.contains("no-such-nic0") && !why.contains("handshake"), "{why}");
+    }
+
+    /// The bridge refuses a re-add with `ConnectionLost` once the group has
+    /// no live member left. That is the group failing, not this member, so
+    /// the member's own earlier reason survives for the disconnect report.
+    #[test]
+    fn a_refused_re_add_keeps_the_members_earlier_reason() {
+        let t0 = Instant::now();
+        let (mut sup, _rx) = supervisor(two_plans(), Arc::default(), t0);
+        let src: SocketAddr = "192.168.2.2:0".parse().unwrap();
+        sup.note_source(1, &MemberSource::Bound(src));
+        sup.decide(&[live(0), pending(1)], at(t0, 1000));
+        sup.decide(&[live(0)], at(t0, 2000));
+        let earlier = sup.tracks[1].last_error.clone().expect("no handshake reason");
+
+        sup.note_readd(1, Err(SrtError::ConnectionLost), Some(src));
+        assert_eq!(sup.tracks[1].last_error.as_deref(), Some(earlier.as_str()));
+        assert!(!sup.tracks[1].awaiting_handshake);
+
+        // An error about the member itself replaces it.
+        sup.note_readd(1, Err(SrtError::SocketFail), Some(src));
+        let now = sup.tracks[1].last_error.clone().unwrap();
+        assert!(now.contains("re-adding the member failed") && now.contains("192.168.2.2:0"), "{now}");
+
+        // With nothing earlier, the refusal is the reason.
+        sup.note_readd(0, Err(SrtError::ConnectionLost), None);
+        assert!(sup.tracks[0].last_error.as_deref().unwrap().contains("re-adding"));
+
+        sup.note_readd(1, Ok(()), Some(src));
+        assert!(sup.tracks[1].awaiting_handshake);
     }
 
     /// libsrt reports a source it cannot bind as `SocketFail` ("unable to
@@ -1466,7 +1534,12 @@ mod tests {
         let src: SocketAddr = "192.0.2.1:0".parse().unwrap();
         let msg = describe_connect_error(&SrtError::SocketFail, &[src]);
         assert!(msg.contains("192.0.2.1:0") && msg.contains("assigned to this host"), "{msg}");
+        assert!(msg.contains("open or bind") && !msg.contains("port"), "{msg}");
         assert!(msg.contains(&SrtError::SocketFail.to_string()), "{msg}");
+        // A fixed source port can be what is taken.
+        let fixed: SocketAddr = "192.0.2.1:5000".parse().unwrap();
+        let msg = describe_connect_error(&SrtError::SocketFail, &[fixed]);
+        assert!(msg.contains("192.0.2.1:5000") && msg.contains("port free"), "{msg}");
         let two = [src, "198.51.100.1:0".parse().unwrap()];
         let msg = describe_connect_error(&SrtError::SocketFail, &two);
         assert!(msg.contains("192.0.2.1:0, 198.51.100.1:0") && msg.contains("each address"), "{msg}");
