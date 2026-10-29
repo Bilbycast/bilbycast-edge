@@ -10,5 +10,9 @@
 //!   exponential backoff retry (500ms to 30s cap). Includes convenience wrappers
 //!   for input, output, and redundancy leg connections, plus optional AES
 //!   encryption setup.
+//! - [`bond_supervisor`] -- native libsrt socket-group bonding: per-member
+//!   source / weight planning, re-adding a member libsrt dropped as broken,
+//!   and the `srt_bond_member_down` / `srt_bond_member_restored` events.
 
+pub(crate) mod bond_supervisor;
 pub mod connection;

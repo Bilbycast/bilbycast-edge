@@ -4421,18 +4421,25 @@ pub struct SrtBondingEndpoint {
     /// local bind address for this member. In caller mode every endpoint
     /// must supply a remote address.
     pub addr: String,
-    /// Optional local bind address for caller members (e.g. to pin the
-    /// member to a specific NIC / source IP). Ignored in listener mode.
+    /// Optional source address for a caller member (to pin the member to
+    /// a specific NIC / source IP), bound before it connects. Wins over
+    /// `interface_binding`; `0.0.0.0:0` / `[::]:0` means unbound; one of the
+    /// other address family than `addr` is not applied (the member connects
+    /// unbound, with a `srt_bond_source_not_applied` warning). Rejected by
+    /// validation in listener mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_addr: Option<String>,
     /// Backup-mode member priority. Lower values are preferred. Ignored in
     /// broadcast mode. Default: 0 (all members equal — libsrt picks
-    /// deterministically).
+    /// deterministically). libsrt's weight runs the other way (greater is
+    /// preferred, 0..=32767), so the members' dense rank is what reaches
+    /// libsrt: see `srt::bond_supervisor::srt_weights_for`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u16>,
     /// Pin this bonding endpoint to a physical NIC (Phase 1: loose only).
-    /// When set, the resolved interface IP is used as `local_addr` if
-    /// `local_addr` is unset. See [`InterfaceBinding`].
+    /// When `local_addr` is unset the NIC's primary IPv4 is the member's
+    /// source, resolved again on every group connect and member re-add so
+    /// an address change is followed. See [`InterfaceBinding`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_binding: Option<InterfaceBinding>,
 }

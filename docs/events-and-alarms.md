@@ -325,7 +325,19 @@ debounced so a churning source doesn't flood the feed.
 | critical | SRT output '{id}' connection failed: {error} | Caller can't reach remote, or bind fails. `output_id` set on event | `{ mode, remote_addr, stream_id, error }` |
 | critical | SRT output '{id}' cannot reach its peer — {n} consecutive connection attempts failed, still retrying | Caller-mode output, `error_code: srt_output_peer_unreachable`. Fires once as the count crosses `CONNECT_FAILED_THRESHOLD` (5), then every 20th attempt (~10 min at the retry loop's 30 s cap). The output's stats `state` also flips to `connect_failed` (manager renders it red as "CONNECT FAILED"), re-arming on a successful connect — the output twin of the SRT-input row above. **Why:** the connect retry runs forever and was silent, so a peer that rebooted left the feed permanently dead reporting `idle`, which the manager also uses for a stopped flow (issue #100) | `{ error_code, output_id, remote_addr, attempts, error }` |
 
-**Source**: `src/engine/input_srt.rs`, `src/engine/output_srt.rs`
+#### SRT socket-group bonding members
+
+Native libsrt bonding (`bonding` block on an SRT input or output — not the `bonded` input/output type, whose events are under [Bonding](#bonding-bond)). Input events carry `flow_id` and `input_id`, output events `output_id`; every one has `{ mode: "caller-bonded" | "listener-bonded", bonding_mode }` in its details. The whole-group events above (`SRT bonded input disconnected, reconnecting`, `SRT bonded output '{id}' disconnected`) still cover losing **every** member.
+
+| Severity | Message | Trigger | Details |
+|----------|---------|---------|---------|
+| warning | SRT bonded {input\|output} '{id}': running on N of M bonding members (redundancy reduced) — member {i} down, re-adding | **Caller:** the group has run below its configured member count for `max(connect timeout + 2 s, 5 s)` while at least one member is still Idle or Running. The edge keeps re-adding the down members (1 s backoff doubling to 30 s). **Listener:** an accepted bonded session has run below the most live members it has had for as long; only the remote caller can re-add. Fires once per episode — a whole-group reconnect in between does not repeat it — and never while no member is live | `{ error_code: "srt_bond_member_down", configured, connected, down: [{ index, addr, source, down_secs, last_error }] }` (caller; `source` is the address the member last tried to connect from, or `unbound`, and `last_error` the reason — e.g. *the handshake did not complete from source …*, a missing NIC, or a re-add libsrt refused) or `{ error_code, configured: <peak>, connected, missing: [peer] }` (listener) |
+| info | SRT bonded {input\|output} '{id}': all M bonding members connected again / back to N bonding members | Every configured member (caller) or the session's peak member count (listener) is live again after an `srt_bond_member_down` | `{ error_code: "srt_bond_member_restored", configured, connected }` |
+| warning | SRT bonded {input\|output} '{id}': bonding member {i} ({addr}) connects without its configured source — {reason} | A caller member's configured source cannot be applied, so it connects unbound: a `local_addr` of the other address family than the peer, or an `interface_binding` NIC with no usable IPv4 address (or only IPv4 against an IPv6 peer). Once per member for the life of the input/output | `{ error_code: "srt_bond_source_not_applied", index, addr, local_addr, interface, reason }` |
+
+The bonded caller input's `SRT input connection failed` (above) also carries `members: [{ index, addr, source }]` — each member's source as that connect cycle resolved it — since a source with no route to the peer is the usual reason a NIC-pinned bond never connects.
+
+**Source**: `src/engine/input_srt.rs`, `src/engine/output_srt.rs`, `src/srt/bond_supervisor.rs`
 
 ---
 

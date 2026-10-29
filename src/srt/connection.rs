@@ -18,6 +18,10 @@ use crate::config::models::{
     SrtBondingConfig, SrtBondingMode, SrtInputConfig, SrtMode, SrtOutputConfig,
     SrtRedundancyConfig,
 };
+use crate::srt::bond_supervisor::{
+    BondHealthTracker, BondMemberPlan, BondSupervisor, bond_attempt_endpoints, observe_members,
+    plan_bond_members,
+};
 use crate::stats::collector::{SrtInputSocket, SrtInputStats};
 use crate::stats::models::{SrtBondingMemberStats, SrtBondingStats, SrtLegStats};
 
@@ -985,8 +989,8 @@ pub(crate) fn srt_bonding_mode_to_group_mode(m: &SrtBondingMode) -> GroupMode {
 }
 
 /// Build an [`SrtGroupBuilder`] (bonded caller) from the SRT options on the
-/// parent input/output config, plus the bonding mode. Endpoints are added
-/// by the caller with `.add_endpoint(...)`.
+/// parent input/output config, plus the bonding mode. Members are added by
+/// the caller with `.add_member(...)`.
 pub fn build_group_builder(p: &SrtConnectionParams, mode: GroupMode) -> SrtGroupBuilder {
     let timeout = if p.peer_idle_timeout_secs == 0 { 30 } else { p.peer_idle_timeout_secs };
     let mut builder = SrtGroup::builder(mode)
@@ -1052,7 +1056,10 @@ pub fn build_group_builder(p: &SrtConnectionParams, mode: GroupMode) -> SrtGroup
 
 /// Connect a bonded SRT group (caller side) given the parent SRT config
 /// and a bonding block. Each endpoint in `bond.endpoints` becomes one
-/// group member. With automatic retry on transient errors.
+/// group member, with its source (`local_addr`, else the address of the
+/// NIC named by `interface_binding`, resolved afresh on every attempt), its
+/// libsrt weight and its index as the member token — see
+/// [`crate::srt::bond_supervisor`]. With automatic retry on transient errors.
 pub async fn connect_srt_group(
     p: &SrtConnectionParams<'_>,
     bond: &SrtBondingConfig,
@@ -1073,14 +1080,8 @@ pub async fn connect_srt_group_observed(
     if !matches!(p.mode, SrtMode::Caller) {
         bail!("SRT bonding caller-connect requires caller mode");
     }
-    let mut builder = build_group_builder(p, srt_bonding_mode_to_group_mode(&bond.mode));
-    for ep in &bond.endpoints {
-        let sa: SocketAddr = ep
-            .addr
-            .parse()
-            .with_context(|| format!("parse bonding endpoint '{}'", ep.addr))?;
-        builder = builder.add_endpoint(sa);
-    }
+    let plans = plan_bond_members(bond)?;
+    let mode = srt_bonding_mode_to_group_mode(&bond.mode);
 
     // Retry with exponential back-off, same shape as single-socket connect.
     let mut delay_ms: u64 = 250;
@@ -1089,27 +1090,30 @@ pub async fn connect_srt_group_observed(
         if cancel.is_cancelled() {
             bail!("cancelled before SRT group connect");
         }
-        // `SrtGroupBuilder::connect` consumes self, so rebuild on retry.
-        let mut retry_builder =
-            build_group_builder(p, srt_bonding_mode_to_group_mode(&bond.mode));
-        for ep in &bond.endpoints {
-            let sa: SocketAddr = ep.addr.parse().unwrap();
-            retry_builder = retry_builder.add_endpoint(sa);
-        }
-        let attempt = builder.connect().await;
+        // Sources are resolved per attempt (a NIC's address may have
+        // changed), and a member whose NIC is missing is left out of this
+        // attempt rather than failing it — unless none is left.
+        let attempt = match bond_attempt_endpoints(&plans) {
+            Ok(members) => {
+                let mut builder = build_group_builder(p, mode);
+                for member in members {
+                    builder = builder.add_member(member);
+                }
+                builder.connect().await.map_err(|e| anyhow::anyhow!("{e}"))
+            }
+            Err(e) => Err(e),
+        };
         match attempt {
             Ok(group) => return Ok(group),
-            Err(e) => {
+            Err(err) => {
                 attempts += 1;
-                tracing::warn!("SRT group connect failed: {e}; retrying in {delay_ms}ms");
-                let err = anyhow::anyhow!("{e}");
+                tracing::warn!("SRT group connect failed: {err}; retrying in {delay_ms}ms");
                 on_attempt_failed(attempts, &err);
                 tokio::select! {
                     _ = cancel.cancelled() => bail!("cancelled during SRT group reconnect"),
                     _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
                 }
                 delay_ms = (delay_ms * 2).min(5000);
-                builder = retry_builder;
             }
         }
     }
@@ -1119,6 +1123,12 @@ pub async fn connect_srt_group_observed(
 /// every rate measured over the poll interval. `samplers` holds one
 /// [`IntervalSampler`] per member socket id and is pruned to the members
 /// present, so a member that leaves takes its baseline with it.
+///
+/// `plans` is the caller group's member plan, when there is one: a member's
+/// `weight` is then the **configured** weight of its endpoint (lower is
+/// preferred) rather than the rank libsrt was given. A listener's members
+/// have no plan and show the weight the remote caller sent (libsrt's,
+/// greater is preferred).
 fn bonding_snapshot(
     mode: &SrtBondingMode,
     agg_raw: &srt_protocol::stats::SrtStats,
@@ -1126,6 +1136,7 @@ fn bonding_snapshot(
     members: Vec<srt_transport::GroupMemberStats>,
     aggregate_rates: &mut IntervalSampler,
     samplers: &mut HashMap<i32, IntervalSampler>,
+    plans: Option<&[BondMemberPlan]>,
     now: Instant,
 ) -> SrtBondingStats {
     let mut aggregate = convert_srt_stats(agg_raw);
@@ -1154,11 +1165,14 @@ fn bonding_snapshot(
                 m.stats.byte_recv_total,
                 now,
             );
+            let weight = plans
+                .and_then(|plans| plans.iter().find(|p| p.token == m.token))
+                .map_or(m.weight, |p| p.configured_weight);
             SrtBondingMemberStats {
                 endpoint,
                 socket_status: socket_status_str(m.socket_status).to_string(),
                 member_status: member_status_str(m.member_status).to_string(),
-                weight: m.weight,
+                weight,
                 stats,
             }
         })
@@ -1177,14 +1191,21 @@ fn bonding_snapshot(
 /// `input` is the bonded SRT input the group serves, as on
 /// [`spawn_srt_stats_poller`], fed from the group's own drop count: inputs
 /// pass themselves, outputs `None`.
-pub fn spawn_srt_group_stats_poller(
+///
+/// `supervisor`, on a caller group, runs on the same tick after the
+/// snapshot is published: it re-adds members libsrt dropped as broken and
+/// raises the member down / restored events (see
+/// [`crate::srt::bond_supervisor`]).
+pub(crate) fn spawn_srt_group_stats_poller(
     group: Arc<SrtGroup>,
     mode: SrtBondingMode,
     cache: Arc<watch::Sender<Option<SrtBondingStats>>>,
     input: Option<Arc<SrtInputStats>>,
     cancel: CancellationToken,
+    supervisor: Option<BondSupervisor>,
 ) {
     tokio::spawn(async move {
+        let mut supervisor = supervisor;
         let mut interval = poll_interval();
         let mut cursor = LegCursor::default();
         let mut aggregate_rates = IntervalSampler::default();
@@ -1195,6 +1216,13 @@ pub fn spawn_srt_group_stats_poller(
                 _ = interval.tick() => {
                     let agg_raw = group.stats().await;
                     let members = group.member_stats().await;
+                    // One instant for the tick, taken straight after the
+                    // reads it describes. The supervisor's re-adds are
+                    // srt-io round trips (a UDP bind each) and run after
+                    // the snapshot is published, so they cannot stretch
+                    // the interval the rates are divided by.
+                    let now = Instant::now();
+                    let view = observe_members(&members);
                     let snapshot = bonding_snapshot(
                         &mode,
                         &agg_raw,
@@ -1202,9 +1230,13 @@ pub fn spawn_srt_group_stats_poller(
                         members,
                         &mut aggregate_rates,
                         &mut member_rates,
-                        Instant::now(),
+                        supervisor.as_ref().map(|s| s.plans()),
+                        now,
                     );
                     publish_bonding_stats(&cache, input.as_deref(), &mut cursor, snapshot);
+                    if let Some(supervisor) = supervisor.as_mut() {
+                        supervisor.tick(&group, &view, now).await;
+                    }
                 }
             }
         }
@@ -1220,15 +1252,18 @@ pub fn spawn_srt_group_stats_poller(
 /// be a group socket internally; `SrtSocket::member_stats()` returns the
 /// per-member data in that case and an empty vec for single-socket
 /// sessions (harmless for unbonded peers). `input` as for
-/// [`spawn_srt_group_stats_poller`].
-pub fn spawn_srt_socket_group_stats_poller(
+/// [`spawn_srt_group_stats_poller`]. `tracker` reports the session running
+/// below the most members it has had; only the remote caller can re-add.
+pub(crate) fn spawn_srt_socket_group_stats_poller(
     socket: Arc<SrtSocket>,
     mode: SrtBondingMode,
     cache: Arc<watch::Sender<Option<SrtBondingStats>>>,
     input: Option<Arc<SrtInputStats>>,
     cancel: CancellationToken,
+    tracker: Option<BondHealthTracker>,
 ) {
     tokio::spawn(async move {
+        let mut tracker = tracker;
         let mut interval = poll_interval();
         let mut cursor = LegCursor::default();
         let mut aggregate_rates = IntervalSampler::default();
@@ -1239,6 +1274,10 @@ pub fn spawn_srt_socket_group_stats_poller(
                 _ = interval.tick() => {
                     let agg_raw = socket.stats().await;
                     let members = socket.member_stats().await;
+                    let now = Instant::now();
+                    if let Some(tracker) = tracker.as_mut() {
+                        tracker.tick(&members, now);
+                    }
                     let snapshot = bonding_snapshot(
                         &mode,
                         &agg_raw,
@@ -1246,7 +1285,8 @@ pub fn spawn_srt_socket_group_stats_poller(
                         members,
                         &mut aggregate_rates,
                         &mut member_rates,
-                        Instant::now(),
+                        None,
+                        now,
                     );
                     publish_bonding_stats(&cache, input.as_deref(), &mut cursor, snapshot);
                 }
@@ -1406,6 +1446,51 @@ mod tests {
         };
         super::publish_bonding_stats(&cache, Some(&input), &mut fresh, snapshot);
         assert_eq!(input.recv_dropped(), 144);
+    }
+
+    /// A caller group shows each member's **configured** weight (lower is
+    /// preferred), not the rank libsrt was handed (greater is preferred);
+    /// a listener's members, which have no plan, show what libsrt holds.
+    #[test]
+    fn caller_group_member_reports_its_configured_weight() {
+        use crate::config::models::{SrtBondingConfig, SrtBondingEndpoint, SrtBondingMode};
+        let endpoint = |addr: &str, weight| SrtBondingEndpoint {
+            addr: addr.into(),
+            local_addr: None,
+            weight: Some(weight),
+            interface_binding: None,
+        };
+        let plans = crate::srt::bond_supervisor::plan_bond_members(&SrtBondingConfig {
+            mode: SrtBondingMode::Backup,
+            endpoints: vec![endpoint("10.0.0.1:9000", 0), endpoint("10.0.0.2:9000", 4)],
+        })
+        .unwrap();
+        assert_eq!(plans[0].srt_weight, 1);
+        let member = |token: i32, weight: u16| srt_transport::GroupMemberStats {
+            id: 100 + token,
+            peer_addr: None,
+            socket_status: srt_protocol::config::SocketStatus::Connected,
+            member_status: MemberStatus::Idle,
+            weight,
+            token,
+            stats: Default::default(),
+        };
+        let snapshot = |plans: Option<&[crate::srt::bond_supervisor::BondMemberPlan]>| {
+            super::bonding_snapshot(
+                &SrtBondingMode::Backup,
+                &Default::default(),
+                srt_protocol::config::SocketStatus::Connected,
+                vec![member(0, 1), member(1, 0)],
+                &mut super::IntervalSampler::default(),
+                &mut HashMap::new(),
+                plans,
+                Instant::now(),
+            )
+        };
+        let caller = snapshot(Some(&plans));
+        assert_eq!(caller.members.iter().map(|m| m.weight).collect::<Vec<_>>(), [0, 4]);
+        let listener = snapshot(None);
+        assert_eq!(listener.members.iter().map(|m| m.weight).collect::<Vec<_>>(), [1, 0]);
     }
 
     /// A leg poller's failed read is no sample for either counter: neither

@@ -935,7 +935,7 @@ Two release tiers, picked by `strict`:
 
 `name` must match an interface on the host (validated against `HealthPayload.network_interfaces`; manager UI populates the picker dropdown from the same list). The Linux `IFNAMSIZ` constraint applies: 1–15 bytes, alphanumeric + `._-`.
 
-Coexists with the legacy `interface_addr` / `bind_addr` / `local_addr` fields. Precedence: `interface_binding` wins when both are set; the legacy fields stay for backward compatibility (Validation logs a Warning event `interface_binding_legacy_addr_ignored` when both are set on the same struct).
+Coexists with the legacy `interface_addr` / `bind_addr` / `local_addr` fields. Precedence: `interface_binding` wins when both are set; the legacy fields stay for backward compatibility. **Exception — SRT and RIST surfaces (including SRT bonding endpoints): an explicit address wins** — `local_addr`, or on a RIST input a `bind_addr` with a specific IP — and the NIC is consulted only when it is unset (`srt_local_addr_from_binding`). No event is raised when both are set: `interface_binding_legacy_addr_ignored` was never implemented (see [`events-and-alarms.md`](events-and-alarms.md#per-nic-interface-binding)).
 
 **Capability advertisement:**
 
@@ -968,7 +968,7 @@ Same shape on `RtpOutputConfig.redundancy`, `SrtRedundancyConfig`, `RistInputRed
 }
 ```
 
-**Phase 1 scope:** UDP-based protocols only. SRT/RIST/SRT-bonding currently support **loose** mode only (the binding's NIC IP is injected as `local_addr` when unset); strict mode on those surfaces is rejected at validation with `srt_strict_binding_unsupported` until `bilbycast-libsrt-rs` and `librist` plumb `SRTO_BINDTODEVICE`. UDP/RTP/ST 2110 outputs and inputs honour both tiers today.
+**Phase 1 scope:** UDP-based protocols only. SRT/RIST/SRT-bonding currently support **loose** mode only (the binding's NIC IP is used as the source when `local_addr` is unset — for an SRT bonding member it is resolved again on every connect and member re-add); strict mode on those surfaces is rejected at validation with `srt_strict_binding_unsupported` until `bilbycast-libsrt-rs` and `librist` plumb `SRTO_BINDTODEVICE`. UDP/RTP/ST 2110 outputs and inputs honour both tiers today.
 
 **Granting strict mode:**
 
@@ -3632,8 +3632,9 @@ SRT inputs and outputs also support **native libsrt socket-group bonding** via a
 | `mode` | string | Yes | `"broadcast"` (all members active, libsrt dedups) or `"backup"` (primary/failover). |
 | `endpoints` | array | Yes | 2–8 member entries. |
 | `endpoints[].addr` | string | Yes | Caller mode: remote peer address. Listener mode: the list is advisory — the parent `local_addr` is the single bind (libsrt group handshake is multiplexed on one listener). |
-| `endpoints[].local_addr` | string | No | Caller-only: source bind for this member (use to pin each leg to a different NIC). |
-| `endpoints[].weight` | integer | No | Backup-mode priority; **lower is preferred**. Ignored in broadcast. Default 0 = equal. |
+| `endpoints[].local_addr` | string | No | Caller-only: the source address this member binds (its IP, and its port when non-zero) — use it to pin each leg to a different NIC. **Wins over `interface_binding`.** `0.0.0.0:0` / `[::]:0` means unbound. A source of the other address family than `addr` is not applied: the member connects unbound and a one-shot Warning `srt_bond_source_not_applied` says so. Prefer port `0`: two members bound to the same fixed `ip:port` share one libsrt multiplexer. |
+| `endpoints[].interface_binding` | object | No | Caller-only, loose only: when `local_addr` is unset, the member binds the primary IPv4 of this NIC as its source. **Resolved again on every connect and member re-add**, so a DHCP or cellular address change is followed. A NIC missing when the input/output starts aborts it (Critical, as on every SRT surface); one that disappears later leaves the member down and retried. Against an IPv6 peer the member connects unbound, with `srt_bond_source_not_applied`. See [Per-NIC Interface Binding](#per-nic-interface-binding). |
+| `endpoints[].weight` | integer | No | Backup-mode priority; **lower is preferred**. Ignored in broadcast. Default 0 = equal (and 0 is the most preferred value). libsrt's own weight runs the other way (greater is preferred, 0–32767), so the edge hands libsrt the members' **rank**: the lowest configured weight gets the highest libsrt weight, equal weights stay equal, and any value up to 65535 keeps its order. |
 
 **Rules:**
 - `bonding` and `redundancy` are **mutually exclusive** on the same SRT input/output — bonding replaces the app-layer 2022-7 with the wire-native group handshake.
@@ -3641,6 +3642,19 @@ SRT inputs and outputs also support **native libsrt socket-group bonding** via a
 - Bonded outputs compose with every other per-output stage: `program_number`, `audio_encode` (with optional companion `transcode`), `video_encode`, output `delay`, and `transport_mode: "audio_302m"`. The bonded path reuses the same forward-loop pipeline as the single-socket path — the only change is that packets land on `SrtGroup::send()` (caller mode) or on the accepted group-aware listener socket.
 - Every SRT option on the parent (latency, encryption, stream_id, packet_filter, MSS, payload_size, retransmit algo, etc.) applies to **all** members uniformly.
 - `rendezvous` mode does not support bonding (libsrt's group handshake has no rendezvous variant). Validation rejects the combination.
+
+**Member recovery (caller mode).** libsrt removes a member whose link breaks — after the peer idle timeout (`peer_idle_timeout_secs`, 30 s by default), which is therefore how long a dead link takes to be noticed — and never brings it back itself. The edge does: on its 1 s stats poll it re-adds any member that is missing or broken, with the same source and weight, backing off 1 s, 2 s, 4 s … up to 30 s, and back to immediate once the member is live again. A member that could not be reached when the group first connected is retried the same way, and a member whose NIC is missing is left out of a connect attempt rather than failing it (unless no member is left). The re-added member joins the running group in place, so the healthy members — and the media — are never interrupted.
+
+Re-adding happens **only while at least one member is still Idle or Running**. When every member is down, the group is torn down and redialled whole, exactly as before (`SRT bonded input disconnected, reconnecting` / `SRT bonded output '{id}' disconnected`): libsrt counts a member that is still handshaking as healthy, so a member added to a group with no live link would keep the dead group from ever being declared failed. The remaining window — the last live member breaks while a re-added one is still handshaking — is bounded by one connect timeout.
+
+Redundancy loss is reported: a Warning `srt_bond_member_down` once the group has run below its configured member count for `max(connect timeout + 2 s, 5 s)` while at least one member is live, naming each down member with its source and the last error, and an Info `srt_bond_member_restored` once every member is back. One pair per episode, carried across a whole-group reconnect. See [`events-and-alarms.md`](events-and-alarms.md#srt-srt).
+
+**Listener mode** cannot re-add a member — only the remote caller can, by re-connecting it into the same group. The edge raises the same Warning / Info pair when an accepted bonded session runs below the most members it has had.
+
+**Upgrading: source binding and weights are now applied.** Before this release, `local_addr`, `interface_binding` and `weight` on bonding endpoints were accepted and silently ignored: every member left by the host's default route, and libsrt chose the backup-mode primary. Now:
+
+- Each member really binds its source. This is loose binding: the kernel still routes by its table, not by the source address. On a multi-homed host **without source-based policy routing**, a member pinned to a NIC that is not the kernel's egress for its peer may never connect (an upstream that filters foreign source addresses, BCP 38, drops it). If **every** member is pinned that way, the whole bond can fail to connect — a configuration that "worked" over the default route before stops completely. Check each pinned member before upgrading with `ip route get <peer> from <source>`, and add a source rule where the egress is wrong (`ip rule add from <source> table <n>` plus a default route via that NIC's gateway in table `<n>`). The down event's `last_error` names the case: *the handshake did not complete from source …*.
+- In **backup** mode with distinct weights, the configured primary (lowest weight) is now enforced: once it is up libsrt switches to it, and a re-added higher-priority member takes over again when stable.
 
 **Per-leg stats** are surfaced via `srt_bonding_stats` on the input/output snapshot, present while the group is connected and absent while it reconnects or waits for a caller:
 ```json
@@ -3659,6 +3673,8 @@ SRT inputs and outputs also support **native libsrt socket-group bonding** via a
 ```
 
 `member_status` values: `running` (active), `idle` (standby backup), `pending` (negotiating), `broken`.
+
+`weight` on a **caller** group is the configured weight of the member's endpoint (lower is preferred). On a **listener** group it is the weight the remote caller sent in the group handshake, which is libsrt's (greater is preferred) — from a bilbycast caller, the rank described above (0–7), not its configured number.
 
 libsrt's group stats carry only the group's unique packet and byte counters and its drops, so RTT and latency are read per member; the aggregate's rates are measured on its unique bytes. On a bonded **input**, `aggregate.pkt_recv_drop_total` counts the packets no member delivered in time, and those reach `packets_lost` and the `srt_recv_dropped` health reason as a single-socket input's drops do. A member's own drop counter does not: on a broadcast group a member skips packets another member already delivered.
 
