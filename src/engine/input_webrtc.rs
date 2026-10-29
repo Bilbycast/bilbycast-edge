@@ -908,8 +908,14 @@ const AV_SYNC_PLAUSIBLE_90K: i128 = 180_000;
 /// How close (90 kHz) two estimates of where the audio belongs, from report
 /// pairs sharing neither report, must come before the audio is moved: 20 ms.
 /// Capture-clock reports (a browser, OBS, GStreamer, ffmpeg) agree to well
-/// under a millisecond; an edge's, taken at its write times, to about the
-/// spacing of its audio writes.
+/// under a millisecond. An edge's WHIP output takes its reports at its write
+/// times (str0m runs each on from its last write), so they carry its
+/// source's mux timing: the rig's AC-3 source led its PCR by 610–664 ms with
+/// its audio PES and by 664–736 ms with its video, which scatters estimates
+/// by up to about ±60 ms. Such a publish is moved once two of them happen to
+/// agree — at str0m's cadence (audio reports every 5 s, video every second)
+/// about 30 pairs are judged in the window — and one whose reports scatter
+/// wider may close it unsettled, keeping the first-arrival alignment.
 #[cfg(any(feature = "webrtc", test))]
 const AV_SYNC_AGREE_90K: i128 = 1_800;
 
@@ -929,6 +935,12 @@ const AV_SYNC_PCR_FLOOR_90K: i128 = 3_600;
 /// (ISO/IEC 13818-1 §2.4.2.6).
 #[cfg(any(feature = "webrtc", test))]
 const AV_SYNC_PCR_CEILING_90K: i128 = 81_000;
+
+/// The longest an Opus packet plays (90 kHz): 120 ms (RFC 6716 §3.2.5). It
+/// bounds how far past the last frame sent a backward step drops, should the
+/// frame it is judged on follow lost ones ([`AvSync::drop_until`]).
+#[cfg(any(feature = "webrtc", test))]
+const OPUS_MAX_PACKET_90K: i128 = 10_800;
 
 /// How old a sender report may be, in seconds of its track's RTP clock, and
 /// still be read at a frame.
@@ -1121,9 +1133,13 @@ struct AvSync {
     margins: MarginWindow,
     /// The highest audio PTS sent.
     last_audio_pts: Option<i128>,
-    /// Audio at or before this PTS is dropped: the overlap a backward step
-    /// leaves, which the muxer would otherwise bunch one tick past the last
-    /// PTS (`TsMuxer::clamp_audio_pts`).
+    /// Audio at or before this PTS is dropped: what a backward step puts
+    /// under the last frame sent, up to that frame's end. At or before its
+    /// start the muxer would have bunched a frame one tick past the last PTS
+    /// (`TsMuxer::clamp_audio_pts`); after it, short of its end, two frames
+    /// would have overlapped on the wire — every step is a mean of two
+    /// estimates, almost never a whole number of frames. Dropped by whole
+    /// frames, a step back leaves a gap under one frame instead.
     drop_until: Option<i128>,
     /// What the lip-sync came to, until the input takes it.
     outcome: Option<SyncOutcome>,
@@ -1196,8 +1212,8 @@ fn ns_to_90k(ns: i128) -> i128 {
 /// apart an audio frame and a video frame were captured. The video, and the
 /// PCR it carries, never move — a PCR discontinuity would cost every
 /// receiver. The audio takes one step: forward (a gap, which a decoder
-/// mutes) or back (the overlap is dropped, [`AvSync::drop_until`]). It is
-/// taken only:
+/// mutes) or back (the overlap is dropped by whole frames, leaving a gap
+/// under one frame, [`AvSync::drop_until`]). It is taken only:
 ///
 /// - on reports that map the track onto a wallclock
 ///   ([`SenderClock::from_report`]) and are no more than 15 s from the
@@ -1229,7 +1245,10 @@ fn ns_to_90k(ns: i128) -> i128 {
 /// are not followed. An edge's own WHIP output sends reports taken at its
 /// write times, not its source's PTS, so a publish from one is lined up on
 /// when it wrote each track: the first-frame outlier goes, its steady encode
-/// skew stays.
+/// skew stays. Those reports also scatter with its source's mux timing
+/// ([`AV_SYNC_AGREE_90K`]): the step waits for two that agree, lands within
+/// their scatter, and a publish that never sees two agree is reported
+/// unsettled and keeps the first-arrival alignment.
 #[cfg(any(feature = "webrtc", test))]
 #[derive(Debug, Default)]
 struct WhipClock {
@@ -1292,9 +1311,12 @@ impl WhipClock {
         Some((pts.max(0) as u64) & 0x1_FFFF_FFFF)
     }
 
-    /// Whether the lip-sync is still to be settled (it wants the PCR).
+    /// Whether the lip-sync is still to be settled (it wants the PCR): from
+    /// the publish's first audio frame until the step is taken or given up.
+    /// Only an audio frame settles it, so a publish whose audio never comes
+    /// would want it for good.
     fn syncing(&self) -> bool {
-        !self.sync.done
+        !self.sync.done && self.audio.is_some()
     }
 
     /// The last video frame, arrived `at`, went out with PCR `pcr_90k`.
@@ -1371,7 +1393,13 @@ impl WhipClock {
             audio.base += step;
         }
         if step < 0 {
-            self.sync.drop_until = self.sync.last_audio_pts;
+            // The last frame sent ends where this one began on the old
+            // timeline (no later than the longest Opus packet past it): what
+            // starts before that would overlap it.
+            self.sync.drop_until = self
+                .sync
+                .last_audio_pts
+                .map(|last| last.max(pts.min(last + OPUS_MAX_PACKET_90K) - 1));
         }
         Some(step)
     }
@@ -2211,6 +2239,22 @@ mod av_sync_tests {
         let wire = sim.audio_pes_pts();
         assert_eq!(wire.len(), sim.audio().filter(|f| f.pts.is_some()).count());
         assert!(wire.windows(2).all(|w| w[1] >= w[0] + 1_800), "an audio PES bunched on the wire");
+
+        // A step of no whole number of frames — the reports put the audio 7 ms
+        // later than it was captured, 293 ms back: the frame that would start
+        // 7 ms into the last one sent, overlapping its last 13 ms, is dropped
+        // too, leaving a 7 ms gap rather than two frames overlapping.
+        let sim = publish(6, A0, |c| c, |c| c.max(300), reports(2_500, A0, |_| 7));
+        assert_eq!(sim.outcomes, vec![(3_520, SyncOutcome::Applied { step_90k: -26_370 })]);
+        let dropped: Vec<u64> = sim.audio().filter(|f| f.pts.is_none()).map(|f| f.capture).collect();
+        assert_eq!(dropped, (3_520..=3_800).step_by(20).collect::<Vec<_>>());
+        for f in sim.audio().filter(|f| f.pts.is_some()) {
+            let moved = if f.arrive < 3_520 { 27_000 } else { 630 };
+            assert_eq!(f.pts, Some(LEAD + moved + f.capture as i128 * 90), "{f:?}");
+        }
+        let wire = sim.audio_pes_pts();
+        let steps: Vec<u64> = wire.windows(2).map(|w| w[1] - w[0]).filter(|s| *s != 1_800).collect();
+        assert_eq!(steps, vec![1_800 + 630], "one 7 ms gap, no overlap");
     }
 
     /// A publisher whose audio lags its video by 200 ms: lined up in full,
@@ -2393,6 +2437,7 @@ mod av_sync_tests {
         assert_eq!(audio_only.outcomes, vec![]);
         assert!(audio_only.audio().all(|f| f.pts == Some(LEAD + f.capture as i128 * 90)));
         assert_eq!(video_only.outcomes, vec![]);
+        assert!(!video_only.mux.clock.syncing(), "no audio: its video frames' PCR is never read");
     }
 
     /// One audio report 500 ms off: the pairs it is in agree with each other
@@ -2405,6 +2450,48 @@ mod av_sync_tests {
         assert_eq!(sim.outcomes, vec![(2_520, SyncOutcome::Applied { step_90k: 29_700 })]);
         assert!(sim.audio().filter(|f| f.arrive < 2_520).all(|f| f.pts == Some(LEAD + f.capture as i128 * 90)));
         assert_eq!(sim.pts(false, 3_000), sim.pts(true, 3_000));
+    }
+
+    /// The reported defect's publish from an edge's WHIP output, whose reports
+    /// are taken at its write times: str0m runs each on from its last write,
+    /// so each carries when that write left against its media time — the
+    /// source's mux timing. The rig's AC-3 source led its PCR by 610–664 ms
+    /// with its audio PES and 664–736 ms with its video, cycled here through
+    /// every phase of the two; reports at str0m's cadence, the audio's every
+    /// 5 s and the video's every second. Estimates scatter by up to ±64 ms,
+    /// past the 20 ms two must agree within, and still every phase is moved
+    /// once inside the window, to within that scatter of lip sync, with the
+    /// audio kept ahead of the PCR.
+    #[test]
+    fn write_time_reports_settle_once_within_their_scatter() {
+        const AUDIO_LEAD_MS: [i64; 5] = [610, 625, 628, 653, 664];
+        const VIDEO_LEAD_MS: [i64; 5] = [664, 700, 736, 682, 718];
+        const SCATTER_90K: i128 = 64 * 90;
+        for phase in 0..25 {
+            // A write leaves as far ahead of its media time as its PES led
+            // the PCR less the source's mean lead (636 ms audio, 700 video).
+            let reports: Reports = Box::new(move |arrive| {
+                let audio = latest(arrive, 1_000, 5_000).and_then(|at| {
+                    audio_report(A0, at, 636 - AUDIO_LEAD_MS[(at / 5_000 + phase) as usize % 5])
+                });
+                let video = latest(arrive, 300, 1_000).and_then(|at| {
+                    let ahead = 700 - VIDEO_LEAD_MS[(at / 1_000 + phase / 5) as usize % 5];
+                    SenderClock::from_report(ntp(at as i64 + ahead), V0 + at * 90, 100)
+                });
+                (audio, video)
+            });
+            let sim = publish(36, A0, |c| c.max(330), |c| c, reports);
+            let &[(at, SyncOutcome::Applied { step_90k })] = &sim.outcomes[..] else {
+                panic!("phase {phase}: {:?}", sim.outcomes);
+            };
+            assert!(at < 30_000, "phase {phase}: moved at {at} ms");
+            assert!((step_90k as i128 - 29_700).abs() <= SCATTER_90K, "phase {phase}: {step_90k}");
+            assert!(sim.audio().all(|f| f.pts.is_some()), "phase {phase}: a forward step drops nothing");
+            let pts: Vec<i128> = sim.audio().map(|f| f.pts.unwrap()).collect();
+            let steps: Vec<i128> = pts.windows(2).map(|w| w[1] - w[0]).filter(|s| *s != 1_800).collect();
+            assert_eq!(steps, vec![1_800 + step_90k as i128], "phase {phase}: one step");
+            assert!(sim.leads_from(at).all(|l| l >= AV_SYNC_PCR_FLOOR_90K), "phase {phase}");
+        }
     }
 
     /// The audio is moved only within 30 s of the first audio frame. Reports
@@ -2441,8 +2528,9 @@ mod av_sync_tests {
     /// rounding: str0m truncates a report's RTP time to a sample), and the
     /// audio leads the PCR. The publisher passes its writes the capture
     /// instant as their wallclock, which str0m builds its reports from; an
-    /// edge's WHIP output passes the write instant, the same thing once its
-    /// writes run on time.
+    /// edge's WHIP output passes the write instant, the same thing only as
+    /// far as its writes run on time
+    /// (`write_time_reports_settle_once_within_their_scatter`).
     #[cfg(feature = "webrtc")]
     #[tokio::test]
     async fn an_av_publish_is_lip_synced_by_its_sender_reports() {
@@ -2538,7 +2626,10 @@ mod av_sync_tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
 
         // Each PES's PTS by its frame number, and each audio PES's lead over
-        // the last PCR before it.
+        // the last PCR before it in stream order. That PCR is not run on by
+        // the time since it, as the unit sims' is (`Sim::frame`), so this
+        // lead reads up to a video frame (40 ms) high: a looser bound on the
+        // 40 ms floor than theirs, which this test only backs up.
         let untag = |b: &[u8]| (((b[0] & 0x3F) as u64) << 6) | (b[1] & 0x3F) as u64;
         let (mut video, mut audio, mut leads) = (Vec::new(), Vec::new(), Vec::new());
         let mut pcr = None;
