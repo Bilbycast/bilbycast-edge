@@ -517,7 +517,7 @@ pub fn spawn_srt_output(
         let result = if config.bonding.is_some() {
             srt_output_bonded_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, active_input_rx).await
         } else if config.redundancy.is_some() {
-            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx, active_input_rx).await
+            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx, active_input_rx, INITIAL_LEG2_CONNECT_BUDGET).await
         } else {
             srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, active_input_rx).await
         };
@@ -1511,12 +1511,13 @@ async fn srt_output_forward_loop(
 /// What the other leg of a 2022-7 SRT output pair is doing when one leg is
 /// lost: `details.other_leg` on the leg-lost event.
 ///
-/// This is deliberately **not** the forward loop's teardown verdict. That
-/// verdict counts a leg 2 whose connect is still pending as able to carry, so
-/// the pair is not torn down (dropping the leg-2 listener held inside the
-/// pending connect future) before leg 2 has had its budget. But such a leg
-/// carries nothing yet, and an event saying the output runs on it would be
-/// false at exactly the moment the output is dark.
+/// This is deliberately **not** the forward loop's teardown verdict
+/// ([`redundant_leg2_alive`]). That verdict counts a leg 2 whose connect is
+/// still pending as able to carry, so the pair is not torn down (dropping
+/// the leg-2 listener held inside the pending connect future) before leg 2
+/// has had its budget. But such a leg carries nothing yet, and an event
+/// saying the output runs on it would be false at exactly the moment the
+/// output is dark.
 ///
 /// `queued` is the outcome of handing the leg the current payload:
 /// `Some(true)` queued, or shed on backpressure (a full queue is a live leg);
@@ -1530,6 +1531,24 @@ fn redundant_other_leg_state(queued: Option<bool>, connect_done: bool) -> &'stat
         None if !connect_done => "connecting",
         None => "down",
     }
+}
+
+/// The forward loop's teardown verdict on leg 2 of a 2022-7 SRT output:
+/// whether it can still carry this cycle. The pair is torn down and
+/// reconnected once neither leg can.
+///
+/// Same inputs as [`redundant_other_leg_state`]. A leg 2 with no socket is
+/// alive while its connect is pending: it may yet connect and take over,
+/// and tearing down then would drop the leg-2 listener held inside the
+/// pending connect future. Once that connect has given up, leg 2 cannot
+/// attach this cycle, so it is gone. It used to count as alive then as
+/// well, and a lost leg 1 left the output dark until it was restarted,
+/// whether leg 1 went after leg 2 gave up or while leg 2 was connecting.
+///
+/// Alive exactly when the leg-lost event would not call it `down`, so the
+/// event and the teardown never disagree.
+fn redundant_leg2_alive(queued: Option<bool>, connect_done: bool) -> bool {
+    queued.unwrap_or(!connect_done)
 }
 
 /// Raise the Warning for a lost leg of a 2022-7 SRT output.
@@ -1579,7 +1598,10 @@ fn emit_redundant_output_leg_lost(
 /// A leg whose send task dies raises a `redundancy` Warning
 /// ([`emit_redundant_output_leg_lost`]) once per cycle. The lost leg stays
 /// down until the pair reconnects, which happens only once both legs are
-/// gone. The other leg carries on alone meanwhile.
+/// gone. The other leg carries on alone meanwhile. A leg 2 whose connect
+/// gave up within `leg2_connect_budget` counts as gone
+/// ([`redundant_leg2_alive`]), so losing leg 1 then reconnects the pair and
+/// leg 2 gets a fresh budget.
 ///
 /// Stats counting: while leg 1 is up, only leg 1 increments `packets_sent`,
 /// `bytes_sent` and the latency, to avoid double-counting, since both legs
@@ -1598,6 +1620,9 @@ async fn srt_output_redundant_loop(
     // Redundant 2022-7 path is passthrough-only (no replacers); kept
     // for signature parity with the single-leg loop.
     _active_input_rx: tokio::sync::watch::Receiver<String>,
+    // How long leg 2 is given to connect in each cycle:
+    // `INITIAL_LEG2_CONNECT_BUDGET`, shorter only in tests.
+    leg2_connect_budget: Duration,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
@@ -1672,7 +1697,7 @@ async fn srt_output_redundant_loop(
         );
 
         // Subscribe to broadcast and spawn leg 1 send task IMMEDIATELY.
-        // Leg 2 is brought up in parallel (below) with INITIAL_LEG2_CONNECT_BUDGET —
+        // Leg 2 is brought up in parallel (below) with `leg2_connect_budget` —
         // while that handshake is in progress we keep leg 1 hot so the receiver
         // keeps ACK'ing and the sender's libsrt send buffer never stalls
         // on an idle socket.
@@ -1721,7 +1746,7 @@ async fn srt_output_redundant_loop(
 
         // Leg-2 connect/accept future, pinned so we can poll it inside the
         // main packet select! and complete it exactly once per reconnect
-        // cycle. Bounded by INITIAL_LEG2_CONNECT_BUDGET so a dead leg-2 peer
+        // cycle. Bounded by `leg2_connect_budget` so a dead leg-2 peer
         // never gates leg-1. While this is pending, leg-1 is already pumping.
         let leg2_connect_fut = {
             let events = events.clone();
@@ -1732,7 +1757,7 @@ async fn srt_output_redundant_loop(
             async move {
                 let result: (Option<Arc<SrtSocket>>, Option<srt_transport::SrtListener>) = if let Some(ref mut listener) = listener_leg2_mut {
                     let r = tokio::time::timeout(
-                        INITIAL_LEG2_CONNECT_BUDGET,
+                        leg2_connect_budget,
                         accept_srt_connection(listener, &cancel),
                     ).await;
                     match r {
@@ -1745,16 +1770,16 @@ async fn srt_output_redundant_loop(
                         Err(_) => {
                             tracing::warn!(
                                 "SRT output '{}' leg2 did not come up within {:?} (accept timed out), running single-leg",
-                                output_id, INITIAL_LEG2_CONNECT_BUDGET,
+                                output_id, leg2_connect_budget,
                             );
                             events.emit_output_with_details(
                                 EventSeverity::Warning, category::SRT,
-                                format!("SRT output '{}' 2022-7 leg 2 did not connect within {:?}; running single-leg", output_id, INITIAL_LEG2_CONNECT_BUDGET),
+                                format!("SRT output '{}' 2022-7 leg 2 did not connect within {:?}; running single-leg", output_id, leg2_connect_budget),
                                 &output_id,
                                 serde_json::json!({
                                     "mode": format!("{:?}", redundancy.mode),
                                     "leg": 2, "reason": "accept timed out",
-                                    "budget_ms": INITIAL_LEG2_CONNECT_BUDGET.as_millis(),
+                                    "budget_ms": leg2_connect_budget.as_millis(),
                                 }),
                             );
                             (None, listener_leg2_mut)
@@ -1762,7 +1787,7 @@ async fn srt_output_redundant_loop(
                     }
                 } else {
                     match tokio::time::timeout(
-                        INITIAL_LEG2_CONNECT_BUDGET,
+                        leg2_connect_budget,
                         connect_srt_redundancy_leg(&redundancy, &cancel),
                     ).await {
                         Ok(Ok(s)) => (Some(s), None),
@@ -1774,16 +1799,16 @@ async fn srt_output_redundant_loop(
                         Err(_) => {
                             tracing::warn!(
                                 "SRT output '{}' leg2 did not come up within {:?} (caller connect retry budget exhausted), running single-leg",
-                                output_id, INITIAL_LEG2_CONNECT_BUDGET,
+                                output_id, leg2_connect_budget,
                             );
                             events.emit_output_with_details(
                                 EventSeverity::Warning, category::SRT,
-                                format!("SRT output '{}' 2022-7 leg 2 did not connect within {:?}; running single-leg", output_id, INITIAL_LEG2_CONNECT_BUDGET),
+                                format!("SRT output '{}' 2022-7 leg 2 did not connect within {:?}; running single-leg", output_id, leg2_connect_budget),
                                 &output_id,
                                 serde_json::json!({
                                     "mode": format!("{:?}", redundancy.mode),
                                     "leg": 2, "reason": "caller connect retry budget exhausted",
-                                    "budget_ms": INITIAL_LEG2_CONNECT_BUDGET.as_millis(),
+                                    "budget_ms": leg2_connect_budget.as_millis(),
                                 }),
                             );
                             (None, None)
@@ -2046,25 +2071,17 @@ async fn srt_output_redundant_loop(
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
                     }
                 });
-                // An absent leg 2 is "not connected yet", not "lost". Leg 2
-                // attaches lazily once its connect future resolves, and while
-                // it was counted as a dead leg a single rejection on leg 1 was
-                // enough to satisfy the teardown condition for the whole
-                // pre-connection window.
-                //
-                // Known gap, left for a follow-up: once the connect future
-                // has resolved with no socket (`leg2_done`), leg 2 never
-                // attaches this cycle, yet it still counts as alive here, so
-                // a lost leg 1 never tears the pair down and the output
-                // stays dark until it is restarted. That holds in either
-                // order: leg 1 lost after leg 2's connect gave up (its event
-                // read `other_leg: down`), or lost while leg 2 was still
-                // connecting (it read `connecting`) and leg 2 then gave up.
-                // The fix is this line, as
-                // `leg2_queued.unwrap_or(!leg2_done)`, which covers both. It
-                // is left to a change of its own because it alters what such
-                // an output does: it would then reconnect the pair.
-                let leg2_alive = leg2_queued.unwrap_or(true);
+                // An absent leg 2 is "not connected yet", not "lost", while
+                // its connect is pending. Leg 2 attaches lazily once its
+                // connect future resolves, and while it was counted as a
+                // dead leg a single rejection on leg 1 was enough to satisfy
+                // the teardown condition for the whole pre-connection
+                // window. Once the connect has resolved with no socket
+                // (`leg2_done`) it is gone, so a lost leg 1 reconnects the
+                // pair, whether leg 1 went after leg 2 gave up or while it
+                // was connecting: in that order the next payload after the
+                // give-up finds both gone.
+                let leg2_alive = redundant_leg2_alive(leg2_queued, leg2_done);
 
                 // Each leg's loss is raised here, at most once per cycle,
                 // and not from its send task: at teardown the sockets close
@@ -2709,6 +2726,29 @@ mod tests {
         assert_eq!(redundant_other_leg_state(None, true), "down");
     }
 
+    #[test]
+    fn a_leg_2_whose_connect_gave_up_is_gone() {
+        // Queued, or shed on backpressure: alive. Send task gone: not.
+        assert!(redundant_leg2_alive(Some(true), true));
+        assert!(!redundant_leg2_alive(Some(false), true));
+        // No socket, connect still pending: kept for its budget, so the
+        // pair is not torn down under it.
+        assert!(redundant_leg2_alive(None, false));
+        // No socket, connect given up: gone, so a lost leg 1 reconnects
+        // the pair. It counted as alive, and the output stayed dark.
+        assert!(!redundant_leg2_alive(None, true));
+        // The teardown and the leg-lost event agree on every input.
+        for queued in [Some(true), Some(false), None] {
+            for connect_done in [false, true] {
+                assert_eq!(
+                    redundant_leg2_alive(queued, connect_done),
+                    redundant_other_leg_state(queued, connect_done) != "down",
+                    "queued {queued:?}, connect done {connect_done}"
+                );
+            }
+        }
+    }
+
     /// A 2022-7 SRT output with both legs listening on loopback, fed a
     /// 1316-byte null-TS item every 2 ms, and the events it raised.
     struct PairHarness {
@@ -2727,6 +2767,18 @@ mod tests {
 
     impl PairHarness {
         fn start() -> Self {
+            Self::start_with(None)
+        }
+
+        /// Like [`PairHarness::start`], with leg 2 given `budget` to connect
+        /// in each cycle, so a test reaches its give-up without waiting
+        /// out the 15 s. It runs the redundant loop directly, which is
+        /// what `spawn_srt_output` runs for a 2022-7 output.
+        fn start_with_leg2_budget(budget: Duration) -> Self {
+            Self::start_with(Some(budget))
+        }
+
+        fn start_with(leg2_budget: Option<Duration>) -> Self {
             let free_port = || {
                 std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
             };
@@ -2746,20 +2798,41 @@ mod tests {
             let (tx, _rx) = broadcast::channel(4096);
             let (event_sender, events_rx) = crate::manager::events::event_channel();
             let cancel = CancellationToken::new();
-            let output = spawn_srt_output(
-                config,
-                &tx,
-                stats.clone(),
-                cancel.child_token(),
-                SrtOutputCtx {
-                    event_sender,
-                    flow_id: "f1".into(),
-                    input_format: None,
-                    compressed_audio_input: false,
-                    frame_rate_rx: None,
-                    active_input_rx: tokio::sync::watch::channel(String::new()).1,
-                },
-            );
+            let active_input_rx = tokio::sync::watch::channel(String::new()).1;
+            let output = match leg2_budget {
+                None => spawn_srt_output(
+                    config,
+                    &tx,
+                    stats.clone(),
+                    cancel.child_token(),
+                    SrtOutputCtx {
+                        event_sender,
+                        flow_id: "f1".into(),
+                        input_format: None,
+                        compressed_audio_input: false,
+                        frame_rate_rx: None,
+                        active_input_rx,
+                    },
+                ),
+                Some(budget) => {
+                    let (tx, stats, cancel) = (tx.clone(), stats.clone(), cancel.child_token());
+                    tokio::spawn(async move {
+                        srt_output_redundant_loop(
+                            &config,
+                            &tx,
+                            stats,
+                            cancel,
+                            &event_sender,
+                            "f1",
+                            None,
+                            active_input_rx,
+                            budget,
+                        )
+                        .await
+                        .expect("the 2022-7 output runs");
+                    })
+                }
+            };
             let published = Arc::new(AtomicU64::new(0));
             let (count, stop) = (published.clone(), cancel.clone());
             tokio::spawn(async move {
@@ -2855,6 +2928,26 @@ mod tests {
                     && e.severity == EventSeverity::Info
                     && event_leg(e) == Some(leg)
             })
+        }
+
+        /// How many times `leg` has connected: once per connect cycle.
+        fn connects(&self, leg: u64) -> usize {
+            self.events
+                .iter()
+                .filter(|e| {
+                    e.category == category::SRT
+                        && e.severity == EventSeverity::Info
+                        && event_leg(e) == Some(leg)
+                })
+                .count()
+        }
+
+        /// Leg 2's "did not connect" Warnings: one per cycle it gave up in.
+        fn leg_2_gave_up(&self) -> Vec<&crate::manager::events::Event> {
+            self.events
+                .iter()
+                .filter(|e| e.message.contains("2022-7 leg 2 did not connect within"))
+                .collect()
         }
 
         fn disconnected(&self) -> bool {
@@ -3044,6 +3137,87 @@ mod tests {
         h.pump_events();
         assert!(!h.disconnected(), "the pair waited for leg 2 rather than tearing down");
         assert_eq!(h.leg_lost(1).len(), 1);
+        h.stop().await;
+    }
+
+    /// Leg 2's connect budget in the give-up tests: long enough for a
+    /// loopback caller to connect inside it and for leg 1's loss to be seen
+    /// inside it, short enough not to wait out the 15 s.
+    const GIVE_UP_BUDGET: Duration = Duration::from_secs(4);
+
+    fn assert_leg_2_gave_up(event: &crate::manager::events::Event) {
+        assert_eq!(event.severity, EventSeverity::Warning);
+        assert_eq!(event.output_id.as_deref(), Some("o1"));
+        let details = event.details.as_ref().expect("details");
+        assert_eq!(details["leg"], 2);
+        assert_eq!(details["reason"], "accept timed out");
+        assert_eq!(details["budget_ms"], GIVE_UP_BUDGET.as_millis() as u64);
+    }
+
+    /// Leg 2 gives up, leg 1 carries on alone, then leg 1 is lost: the
+    /// event says leg 2 is down, and the pair reconnects, with leg 1
+    /// accepted again and leg 2 given a fresh budget it now connects in.
+    /// Before the fix a leg 2 whose connect had given up counted as alive,
+    /// so the pair never tore down and the output was dark until restarted.
+    #[tokio::test]
+    async fn a_2022_7_output_whose_leg_2_gave_up_reconnects_when_leg_1_is_lost() {
+        let mut h = PairHarness::start_with_leg2_budget(GIVE_UP_BUDGET);
+        let (leg1, received1) = h.connect(h.ports.0).await;
+        h.wait_until("leg 2 to give up", |h| !h.leg_2_gave_up().is_empty()).await;
+        assert_leg_2_gave_up(h.leg_2_gave_up()[0]);
+
+        // Giving up alone tears nothing down: leg 1 carries on.
+        let received_before = received1.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(received1.load(Ordering::Relaxed) > received_before, "leg 1 carries on alone");
+        h.pump_events();
+        assert!(!h.disconnected(), "leg 1 still carries, so the pair stays up");
+        assert!(h.leg_lost(1).is_empty() && h.leg_lost(2).is_empty());
+
+        leg1.close().await.unwrap();
+        h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
+        assert_leg_lost(h.leg_lost(1)[0], 1, "down");
+        h.wait_until("the pair to reconnect", PairHarness::disconnected).await;
+
+        // The next cycle: leg 1 is accepted again, and leg 2 tried again.
+        let (_leg1, received1) = h.connect(h.ports.0).await;
+        let (_leg2, received2) = h.connect(h.ports.1).await;
+        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
+        h.wait_until("leg 2 to connect in the new cycle", |h| h.connects(2) == 1).await;
+        assert_eq!(h.connects(1), 2, "leg 1 connects once per cycle");
+        h.wait_until("both legs to carry", |_| {
+            received1.load(Ordering::Relaxed) > 0 && received2.load(Ordering::Relaxed) > 0
+        })
+        .await;
+        assert!(h.leg_lost(2).is_empty(), "a leg 2 that never connected is never lost");
+        h.stop().await;
+    }
+
+    /// Leg 1 lost while leg 2 is still connecting, and leg 2 then gives up:
+    /// the pair waits out leg 2's budget, then reconnects. Before the fix
+    /// nothing followed the give-up and the output was dark until
+    /// restarted.
+    #[tokio::test]
+    async fn a_2022_7_output_losing_leg_1_before_leg_2_gives_up_reconnects() {
+        let mut h = PairHarness::start_with_leg2_budget(GIVE_UP_BUDGET);
+        let (leg1, _received1) = h.connect(h.ports.0).await;
+        h.wait_until("leg 1's stats", |h| h.stats.snapshot().srt_stats.is_some()).await;
+
+        leg1.close().await.unwrap();
+        h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
+        assert!(h.leg_2_gave_up().is_empty(), "leg 1 was lost inside leg 2's budget");
+        assert_leg_lost(h.leg_lost(1)[0], 1, "connecting");
+        assert!(!h.disconnected(), "the pair waits out leg 2's budget");
+
+        h.wait_until("leg 2 to give up", |h| !h.leg_2_gave_up().is_empty()).await;
+        assert_leg_2_gave_up(h.leg_2_gave_up()[0]);
+        h.wait_until("the pair to reconnect", PairHarness::disconnected).await;
+
+        let (_leg1, received1) = h.connect(h.ports.0).await;
+        h.wait_until("leg 1 to connect again", |h| h.connects(1) == 2).await;
+        h.wait_until("leg 1 to carry again", |_| received1.load(Ordering::Relaxed) > 0).await;
+        assert_eq!(h.leg_lost(1).len(), 1, "one loss in the first cycle");
+        assert!(h.leg_lost(2).is_empty(), "a leg 2 that never connected is never lost");
         h.stop().await;
     }
 }
