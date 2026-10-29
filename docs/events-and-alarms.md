@@ -449,7 +449,7 @@ shape as the encoder events below (structured `tracing::warn!` with an
 
 | `error_code` | Severity | Trigger | Fields | What it tells the operator |
 |---|---|---|---|---|
-| `rtmp_bframes_unsupported` | warn | An RTMP output's `video_encode.bframes` is non-zero. The encoder is opened with `bframes = 0` regardless — one warn per encoder open. | `requested` | FLV tags carry DTS in the tag timestamp and both tag writers hard-code the composition-time offset to 0 (the Enhanced-RTMP HEVC path has no CTS field), so a reordering encoder would stamp display-order PTS as DTS and drive it backwards — which most ingests answer by dropping the publisher. Remove `bframes` from the RTMP output's `video_encode` to silence it; there is no configuration that makes B-frames work on this path. |
+| `rtmp_bframes_unsupported` | warn | An RTMP output's `video_encode.bframes` is non-zero. The encoder is opened with `bframes = 0` regardless — one warn per encoder open. | `requested` | FLV tags carry DTS in the tag timestamp, and the re-encode path has none to give them: the encoder hands back no decode times, so its tag writers write composition time 0 (HEVC as Enhanced-RTMP `CodedFramesX`, which has no CTS field), and a reordering encoder would stamp display-order PTS as DTS and drive it backwards — which most ingests answer by dropping the publisher. (Passthrough of a B-frame source is unaffected: since edge#205 it carries the source's decode times and composition times.) Remove `bframes` from the RTMP output's `video_encode` to silence it; there is no configuration that makes B-frames work on this path. |
 
 **Source**: `src/engine/input_rtmp.rs` (input), `src/engine/output_rtmp.rs` +
 `src/engine/rtmp/client.rs` (output — `RtmpConnectError` carries the

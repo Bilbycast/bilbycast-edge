@@ -216,6 +216,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   - Demuxes H.264 or HEVC and AAC from MPEG-2 TS, muxes into FLV
   - Automatic AVC sequence header (SPS/PPS) and AAC config generation
   - **H.264 rides classic FLV; HEVC rides Enhanced RTMP v2** (extended VideoTagHeader, `hvc1` FourCC, hvcC assembled from cached VPS/SPS/PPS). Both passthrough and re-encode (`video_encode`) HEVC take the E-RTMP path
+  - **Decode order on a B-frame source (passthrough):** each FLV tag goes out at its picture's decode time (the PES DTS) with its composition time (PTS − DTS) — in the AVC tag's SI24 field, and for HEVC as an Enhanced-RTMP `CodedFrames` tag (a picture presenting at its decode time goes out as `CodedFramesX`), as OBS / x264 and FFmpeg publish. Before edge#205 every picture was tagged at its PTS with composition time 0, so the tags stepped back at each reordered picture. A re-encode (`video_encode`) runs without B-frames and writes composition time 0
   - Reconnection with configurable delay and max attempts
   - Non-blocking: uses mpsc bridge pattern, never blocks other outputs
   - **MPTS-aware:** on an MPTS input, selects program by `program_number` or (default) locks onto the lowest-numbered program in the PAT

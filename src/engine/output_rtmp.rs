@@ -461,12 +461,16 @@ async fn publish_loop(
 
         for frame in frames {
             match frame {
-                DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known, .. } => {
-                    let ts_ms = pts_to_ms(pts, &mut base_pts);
+                // Every field is named: a `..` here dropped the DTS when the
+                // demuxer started surfacing it, and the tags went out in
+                // presentation order (edge#205).
+                DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known, dts } => {
+                    let (ts_ms, cts_ms) = flv_video_time(pts, dts, &mut base_pts);
                     if process_video_frame(
                         VideoFrameSource::H264 { nalus: &nalus, is_keyframe, pts_known },
                         pts,
                         ts_ms,
+                        cts_ms,
                         &mut base_pts,
                         recv_time_us,
                         &demuxer,
@@ -483,12 +487,13 @@ async fn publish_loop(
                         // Success (or transient skip); nothing else to do.
                     }
                 }
-                DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known, .. } => {
-                    let ts_ms = pts_to_ms(pts, &mut base_pts);
+                DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known, dts } => {
+                    let (ts_ms, cts_ms) = flv_video_time(pts, dts, &mut base_pts);
                     if process_video_frame(
                         VideoFrameSource::H265 { nalus: &nalus, is_keyframe, pts_known },
                         pts,
                         ts_ms,
+                        cts_ms,
                         &mut base_pts,
                         recv_time_us,
                         &demuxer,
@@ -764,11 +769,14 @@ async fn publish_loop(
                         }
                         continue;
                     }
+                    // Re-encode only, which builds its own timeline: no
+                    // composition time to carry.
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
                     process_video_frame(
                         VideoFrameSource::Mpeg2 { es: &es, is_keyframe, pts_known },
                         pts,
                         ts_ms,
+                        0,
                         &mut base_pts,
                         recv_time_us,
                         &demuxer,
@@ -799,6 +807,45 @@ async fn publish_loop(
 fn pts_to_ms(pts: u64, base_pts: &mut Option<u64>) -> u32 {
     let base = *base_pts.get_or_insert(pts);
     rel_ms_wrapping(pts, base)
+}
+
+/// FLV timing of one passed-through H.264 / HEVC picture: `(tag timestamp,
+/// composition time)`, in ms on the connection's epoch (edge#205).
+///
+/// An FLV tag timestamp is the picture's **decode** time, and its composition
+/// time how much later it presents. On a B-frame source the tags therefore go
+/// out in decode order, and the receiver presents each picture at
+/// `timestamp + composition time`. Each picture used to be tagged at its PTS
+/// with composition time 0, so the tag stream stepped back at every reordered
+/// picture.
+///
+/// The decode time is the PTS less the composition offset that
+/// [`super::cmaf::composition_offset_90k`] reads off the PES's DTS, which is
+/// the judgement CMAF passthrough makes: a DTS after the PTS, or more than 2 s
+/// before it, counts as none. With no DTS (a stream without B-frames, every
+/// non-reference B-picture, a PES with no timestamp) the result is exactly
+/// [`pts_to_ms`] with composition time 0, byte for byte what went out before.
+///
+/// - The first essence anchors the epoch. A picture anchors it on its decode
+///   time, the earliest stamp any later picture carries; on its PTS, the
+///   pictures decoding before it clamped to 0.
+/// - The composition time is `pts_ms − dts_ms`, not the offset rounded on its
+///   own, so a picture presents at exactly the `floor((pts − epoch) / 90)`
+///   audio is mapped with. A/V sync is unchanged; only the decode time moves.
+/// - Behind an epoch audio anchored, a picture's decode time clamps to 0 and
+///   its composition time carries the whole of its PTS: still presented on
+///   time.
+/// - The decode time saturates at 0 rather than wrapping. A PTS just past the
+///   33-bit wrap, below its offset, would otherwise put the decode time (and,
+///   on a connection's first picture, the epoch) near 2^33, which
+///   [`rel_ms_wrapping`] reads as ~26.5 h ahead.
+fn flv_video_time(pts: u64, dts: Option<u64>, base_pts: &mut Option<u64>) -> (u32, u32) {
+    let offset = dts.map_or(0, |d| super::cmaf::composition_offset_90k(pts, d));
+    let dts = pts.saturating_sub(offset);
+    let base = *base_pts.get_or_insert(dts);
+    let dts_ms = rel_ms_wrapping(dts, base);
+    let pts_ms = rel_ms_wrapping(pts, base);
+    (dts_ms, pts_ms.saturating_sub(dts_ms))
 }
 
 /// Largest 33-bit PTS distance still read as "forward". Only meaningful for a
@@ -886,8 +933,10 @@ fn build_avc_sequence_header(sps: &[u8], pps: &[u8]) -> Vec<u8> {
     buf.to_vec()
 }
 
-/// Build an FLV video tag with length-prefixed NALUs.
-fn build_avc_nalu_tag(nalus: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
+/// Build an FLV video tag with length-prefixed NALUs, carrying the picture's
+/// composition time (ms after its decode time, the tag timestamp — see
+/// [`flv_video_time`]).
+fn build_avc_nalu_tag(nalus: &[Vec<u8>], is_keyframe: bool, cts_ms: u32) -> Vec<u8> {
     // Calculate total payload size
     let payload_size: usize = nalus.iter().map(|n| 4 + n.len()).sum();
     let mut buf = BytesMut::with_capacity(5 + payload_size);
@@ -896,9 +945,7 @@ fn build_avc_nalu_tag(nalus: &[Vec<u8>], is_keyframe: bool) -> Vec<u8> {
     let frame_type: u8 = if is_keyframe { 0x17 } else { 0x27 }; // keyframe/inter + AVC
     buf.put_u8(frame_type);
     buf.put_u8(0x01); // AVC NALU
-    buf.put_u8(0x00); // composition time offset
-    buf.put_u8(0x00);
-    buf.put_u8(0x00);
+    put_si24_composition_time(&mut buf, cts_ms);
 
     // Length-prefixed NALUs
     for nalu in nalus {
@@ -1007,20 +1054,43 @@ fn build_hvcc_from_annex_b(extradata: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Build an Enhanced RTMP v2 CodedFramesX tag payload for HEVC.
+/// Build an Enhanced RTMP v2 coded-frames tag payload for HEVC.
 ///
-/// Uses `PacketType=3` (CodedFramesX) which omits the 3-byte composition time
-/// offset that `CodedFrames` carries — we encode with `max_b_frames = 0`, so
-/// CTS ≡ PTS ≡ DTS and the field would always be zero anyway.
+/// A picture that presents at its decode time (`cts_ms` 0) goes out as
+/// `PacketType=3` (CodedFramesX), which has no composition-time field — every
+/// re-encoded picture (the encoder runs with `max_b_frames = 0`) and every
+/// passed-through picture of a source without B-frames. One that presents
+/// later (a reference picture of a B-frame source passed through) goes out as
+/// `PacketType=1` (CodedFrames) with the SI24 composition time after the
+/// FourCC. It used to go out as CodedFramesX too, presenting at its decode
+/// time (edge#205). The same choice FFmpeg's FLV muxer makes.
 ///
-/// Layout: `<0x93|0xA3> "hvc1" <AVCC-framed NAL units>`
-fn build_hevc_coded_frames_tag(avcc_nalus: &[u8], is_keyframe: bool) -> Vec<u8> {
+/// Layout: `<0x93|0xA3> "hvc1" <AVCC-framed NAL units>`, or
+/// `<0x91|0xA1> "hvc1" <SI24 composition time> <AVCC-framed NAL units>`
+fn build_hevc_coded_frames_tag(avcc_nalus: &[u8], is_keyframe: bool, cts_ms: u32) -> Vec<u8> {
     let frame_type: u8 = if is_keyframe { 1 } else { 2 };
-    let mut buf = BytesMut::with_capacity(5 + avcc_nalus.len());
-    buf.put_u8(0x80 | (frame_type << 4) | 3); // Ex | key/inter | PacketType=CodedFramesX
+    // PacketType: 1 = CodedFrames (carries a composition time), 3 = CodedFramesX.
+    let packet_type: u8 = if cts_ms == 0 { 3 } else { 1 };
+    let mut buf = BytesMut::with_capacity(8 + avcc_nalus.len());
+    buf.put_u8(0x80 | (frame_type << 4) | packet_type); // Ex | key/inter | PacketType
     buf.put_slice(&FOURCC_HVC1);
+    if packet_type == 1 {
+        put_si24_composition_time(&mut buf, cts_ms);
+    }
     buf.put_slice(avcc_nalus);
     buf.to_vec()
+}
+
+/// Largest composition time an FLV `SI24` field carries. The offset is capped
+/// at 2 s upstream ([`super::cmaf::composition_offset_90k`]), so this never
+/// binds; it only keeps the field from reading as negative.
+const MAX_FLV_COMPOSITION_TIME_MS: u32 = 0x7F_FFFF;
+
+/// Write an FLV composition time as the 24-bit big-endian SI24 field. It is
+/// never negative here: a picture presents at or after its decode time.
+fn put_si24_composition_time(buf: &mut BytesMut, cts_ms: u32) {
+    let cts_ms = cts_ms.min(MAX_FLV_COMPOSITION_TIME_MS);
+    buf.put_slice(&cts_ms.to_be_bytes()[1..]);
 }
 
 /// Build a classic-FLV `AVCPacketType=1` NALU tag from an already-AVCC-framed
@@ -1032,7 +1102,7 @@ fn build_avc_nalu_tag_raw(avcc_nalus: &[u8], is_keyframe: bool) -> Vec<u8> {
     let frame_type: u8 = if is_keyframe { 0x17 } else { 0x27 };
     buf.put_u8(frame_type);
     buf.put_u8(0x01); // AVCPacketType = NALU
-    buf.put_u8(0x00); // composition time offset (B-frames disabled at encoder)
+    buf.put_u8(0x00); // composition time 0 (B-frames disabled at encoder)
     buf.put_u8(0x00);
     buf.put_u8(0x00);
     buf.put_slice(avcc_nalus);
@@ -1090,7 +1160,7 @@ fn build_avc_sequence_header_from_avcc(extradata: &[u8]) -> Vec<u8> {
 ///
 /// Used on the output side for:
 /// - the classic-FLV AVC NALU tag body, and
-/// - the Enhanced-RTMP `hvc1` `CodedFramesX` tag body.
+/// - the Enhanced-RTMP `hvc1` `CodedFrames` / `CodedFramesX` tag body.
 pub(crate) fn annex_b_to_avcc(data: &[u8]) -> Vec<u8> {
     let nalus = super::ts_demux::split_annex_b_nalus(data);
     let mut out = Vec::with_capacity(data.len() + nalus.len() * 4);
@@ -1346,7 +1416,10 @@ fn resolve_backend_chain_for_config(
 async fn process_video_frame(
     src: VideoFrameSource<'_>,
     pts_90k: u64,
+    // The picture's FLV decode time and composition time (`flv_video_time`).
+    // Passthrough writes both; the re-encode builds its own timeline.
     ts_ms: u32,
+    cts_ms: u32,
     base_pts: &mut Option<u64>,
     recv_time_us: u64,
     demuxer: &TsDemuxer,
@@ -1360,7 +1433,7 @@ async fn process_video_frame(
 ) -> anyhow::Result<bool> {
     match video_state {
         VideoEncoderState::Disabled => {
-            passthrough_video(&src, ts_ms, recv_time_us, demuxer, sent_video_header, client, config, stats).await
+            passthrough_video(&src, ts_ms, cts_ms, recv_time_us, demuxer, sent_video_header, client, config, stats).await
         }
         VideoEncoderState::Failed => {
             // Decoder/encoder already failed once — drop video silently
@@ -1399,10 +1472,15 @@ async fn process_video_frame(
 }
 
 /// H.264 (classic FLV) or H.265 (Enhanced RTMP) passthrough — no re-encode.
+///
+/// Each picture goes out at its decode time `ts_ms` with its composition time
+/// `cts_ms` ([`flv_video_time`]). A sequence header sent ahead of a picture
+/// takes the picture's decode time and composition time 0, as FLV requires.
 #[allow(clippy::too_many_arguments)]
 async fn passthrough_video(
     src: &VideoFrameSource<'_>,
     ts_ms: u32,
+    cts_ms: u32,
     recv_time_us: u64,
     demuxer: &TsDemuxer,
     sent_video_header: &mut bool,
@@ -1440,7 +1518,7 @@ async fn passthrough_video(
                     let header = build_avc_sequence_header(sps, pps);
                     client.send_video(&header, ts_ms).await?;
                 }
-            let tag = build_avc_nalu_tag(nalus, is_keyframe);
+            let tag = build_avc_nalu_tag(nalus, is_keyframe, cts_ms);
             let tag_len = tag.len();
             client.send_video(&tag, ts_ms).await?;
             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -1473,7 +1551,7 @@ async fn passthrough_video(
             if avcc.is_empty() {
                 return Ok(true);
             }
-            let tag = build_hevc_coded_frames_tag(&avcc, is_keyframe);
+            let tag = build_hevc_coded_frames_tag(&avcc, is_keyframe, cts_ms);
             let tag_len = tag.len();
             client.send_video(&tag, ts_ms).await?;
             stats.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -1682,19 +1760,22 @@ fn open_video_active(
         _ => (false, crate::engine::video_encode_util::RATE_LOCK_FALLBACK),
     };
     // B-frames are pinned off on this path. FLV carries DTS in the tag
-    // timestamp and the two tag writers hard-code CTS = 0 (the Enhanced-RTMP
-    // HEVC path has no CTS field at all), so an encoder that reordered would
+    // timestamp, and the re-encode path has none to give it: the encoder hands
+    // back no decode times, so its tag writers write composition time 0 (HEVC
+    // as CodedFramesX, with no field at all). An encoder that reordered would
     // stamp display-order PTS as DTS and drive it backwards — which most
     // ingests answer by dropping the publisher. It is also the precondition
-    // for the source-PTS FIFO below being a plain queue. `webrtc_safe_
-    // video_encode` pins the same knob for the same class of reason.
+    // for the source-PTS FIFO below being a plain queue. (Passthrough is
+    // unaffected: it carries the source's DTS and composition times,
+    // edge#205.) `webrtc_safe_video_encode` pins the same knob for the same
+    // class of reason.
     let mut cfg = cfg.clone();
     if cfg.bframes.unwrap_or(0) != 0 {
         tracing::warn!(
             error_code = "rtmp_bframes_unsupported",
             requested = cfg.bframes.unwrap_or(0),
             "RTMP output '{}': video_encode.bframes is not supported on the RTMP path \
-             (FLV tags carry no composition-time offset) — encoding with bframes = 0",
+             (the re-encode path writes no FLV composition-time offset) — encoding with bframes = 0",
             config.id
         );
         cfg.bframes = Some(0);
@@ -1846,7 +1927,8 @@ async fn encode_one_frame(
         let avcc = annex_b_to_avcc(&annex_b_encoded);
         let tag = match active.target_family {
             video_codec::VideoCodec::H264 => build_avc_nalu_tag_raw(&avcc, keyframe),
-            video_codec::VideoCodec::Hevc => build_hevc_coded_frames_tag(&avcc, keyframe),
+            // Composition time 0: the encoder runs without B-frames.
+            video_codec::VideoCodec::Hevc => build_hevc_coded_frames_tag(&avcc, keyframe, 0),
             // Unreachable — RTMP encode targets are H.264 / HEVC. Treat
             // any phantom Mpeg2 family as h264 framing rather than
             // panicking.
@@ -2912,6 +2994,69 @@ mod rate_tests {
         assert_eq!(active.pipeline.fps(), (50, 1));
         assert_eq!(encoded, 40);
     }
+
+    /// edge#205 on the re-encode path: a B-frame source re-encoded for RTMP.
+    /// The epoch now anchors on the first picture's decode time rather than
+    /// its PTS — a constant shift of the connection's whole timeline, so the
+    /// first re-encoded picture goes out at its source PTS less that decode
+    /// time (it went out at 0). The re-encoded tags keep composition time 0
+    /// (the encoder runs without B-frames) and stay strictly increasing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_b_frame_source_re_encoded_for_rtmp_keeps_composition_time_zero() {
+        use super::flv_wire_tests::{publish, tag_cts};
+        use crate::engine::rtmp::ts_mux::TsMuxer;
+        use video_codec::{VideoEncoderCodec, VideoEncoderConfig, VideoPreset};
+        let (w, h, n) = (320usize, 240usize, 40usize);
+        let mut enc = video_engine::VideoEncoder::open(&VideoEncoderConfig {
+            codec: VideoEncoderCodec::X264,
+            width: w as u32,
+            height: h as u32,
+            fps_num: 25,
+            fps_den: 1,
+            gop_size: 25,
+            max_b_frames: 2,
+            // `zerolatency` would turn the B-frames off.
+            tune: String::new(),
+            preset: VideoPreset::Veryfast,
+            global_header: false,
+            ..VideoEncoderConfig::default()
+        })
+        .unwrap();
+        let mut aus = Vec::new();
+        for i in 0..n {
+            let y: Vec<u8> = (0..w * h)
+                .map(|k| (((k % w + i) * 7919 + (k / w) * 104_729) % 181) as u8 + 30)
+                .collect();
+            let c = vec![128u8; w / 2 * h / 2];
+            aus.extend(enc.encode_frame(&y, w, &c, w / 2, &c, w / 2, Some(i as i64)).unwrap());
+        }
+        aus.extend(enc.flush().unwrap());
+        assert!(aus.windows(2).any(|a| a[1].pts < a[0].pts), "the source reorders");
+        let at = |frames: i64| 900_000 + (frames + 10) as u64 * 3_600;
+        let (first_dts, first_pts) = (at(aus[0].dts), at(aus.iter().map(|a| a.pts).min().unwrap()));
+        assert!(first_dts < first_pts, "the source decodes ahead of presenting");
+        let mut mux = TsMuxer::new();
+        let mut ts = Vec::new();
+        for au in &aus {
+            ts.extend(mux.mux_video(&au.data, at(au.pts), at(au.dts), au.keyframe));
+        }
+        let end = at(n as i64 + 10);
+        ts.extend(mux.mux_video(&aus[n - 1].data, end, end, false));
+        let tags = publish(
+            ts,
+            serde_json::json!({
+                "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+                "video_encode": { "codec": "x264", "preset": "veryfast", "fps_num": 25, "fps_den": 1 }
+            }),
+        )
+        .await;
+        let pictures: Vec<(u32, u32)> =
+            tags.iter().filter(|t| t.video).filter_map(|t| Some((t.ts, tag_cts(&t.data)?))).collect();
+        assert!(pictures.len() >= n - 10, "{} pictures", pictures.len());
+        assert!(pictures.iter().all(|&(_, cts)| cts == 0), "composition time 0: {pictures:?}");
+        assert!(pictures.windows(2).all(|p| p[1].0 > p[0].0), "{pictures:?}");
+        assert_eq!(pictures[0].0, ((first_pts - first_dts) / 90) as u32, "{pictures:?}");
+    }
 }
 
 #[cfg(test)]
@@ -3020,6 +3165,522 @@ mod flv_timestamp_tests {
     fn a_wrapped_raw_source_pts_clamps_to_zero() {
         assert_eq!(rel_ms_wrapping(0, 90_000), 0, "one frame behind reads as a wrap");
         assert_eq!(rel_ms_wrapping(180_000, 90_000), 1000);
+    }
+
+    // ── edge#205: decode time + composition time ──────────────────────────
+
+    /// A source's first decode time, well clear of 0 and of the 33-bit wrap.
+    const T0: u64 = 900_000;
+
+    /// `(pts, dts)` of IBBP pictures in decode order on the frame grid `g`
+    /// (`g(k)` = the k-th frame instant): each I / P presents three frames
+    /// after it decodes and carries its DTS; each B presents as it decodes,
+    /// so its PES carries none — the `DemuxedFrame::dts` contract.
+    pub(super) fn ibbp(n: u64, g: impl Fn(u64) -> u64) -> Vec<(u64, Option<u64>)> {
+        (0..n)
+            .map(|j| {
+                let shown = if j % 3 == 0 { j + 2 } else { j - 1 };
+                let (pts, dts) = (g(shown + 1), g(j));
+                (pts, (dts != pts).then_some(dts))
+            })
+            .collect()
+    }
+
+    /// I B B B P with the middle B a reference (b-pyramid), then P B B B, in
+    /// decode order at 25 fps: the reference B carries its own DTS, and so
+    /// does one of the non-reference Bs (it presents a frame after it
+    /// decodes); the other presents as it decodes.
+    pub(super) fn b_pyramid() -> Vec<(u64, Option<u64>)> {
+        [(2, 0), (6, 1), (4, 2), (3, 3), (5, 4), (10, 5), (8, 6), (7, 7), (9, 8)]
+            .map(|(p, d): (u64, u64)| (T0 + p * STEP_25FPS, (p != d).then_some(T0 + d * STEP_25FPS)))
+            .to_vec()
+    }
+
+    /// The FLV ms a source instant maps to on an epoch at `base` — what
+    /// audio at that instant is stamped (`pts_to_ms`).
+    fn ms(t: u64, base: u64) -> u32 {
+        ((t - base) / 90) as u32
+    }
+
+    /// Run `pics` through `flv_video_time` on a fresh connection and check
+    /// FLV's contract against them: tags strictly in decode order from 0,
+    /// each picture presented (timestamp + composition time) at exactly the
+    /// ms its PTS maps to, and a composition time on exactly the pictures
+    /// presenting later than they decode.
+    fn assert_decode_order(pics: &[(u64, Option<u64>)]) {
+        let mut base = None;
+        let first_dts = pics[0].1.unwrap_or(pics[0].0);
+        let mut last: Option<u32> = None;
+        for (k, &(pts, dts)) in pics.iter().enumerate() {
+            let (ts, cts) = flv_video_time(pts, dts, &mut base);
+            assert_eq!(base, Some(first_dts), "the first decode time anchors the epoch");
+            assert_eq!(ts, ms(dts.unwrap_or(pts), first_dts), "picture {k}: tagged at its decode time");
+            assert_eq!(ts + cts, ms(pts, first_dts), "picture {k}: presented at its PTS");
+            assert_eq!(cts > 0, ms(pts, first_dts) > ms(dts.unwrap_or(pts), first_dts), "picture {k}");
+            assert!(last.is_none_or(|l| ts > l), "picture {k}: ts {ts} after {last:?}");
+            last = Some(ts);
+        }
+        assert_eq!(flv_video_time(pics[0].0, pics[0].1, &mut None).0, 0, "the first tag is at 0");
+    }
+
+    /// edge#205: on a B-frame source each picture was tagged with its PTS
+    /// and composition time 0, so the tags stepped back at every reordered
+    /// picture — and, the epoch anchored on the first PTS, the B-pictures
+    /// leading it were all stamped 0.
+    #[test]
+    fn a_b_frame_gop_is_tagged_in_decode_order() {
+        let pics = ibbp(12, |k| T0 + k * STEP_25FPS);
+        assert_eq!(pics[..4], [
+            (T0 + 3 * STEP_25FPS, Some(T0)),
+            (T0 + STEP_25FPS, None),
+            (T0 + 2 * STEP_25FPS, None),
+            (T0 + 6 * STEP_25FPS, Some(T0 + 3 * STEP_25FPS)),
+        ]);
+        assert_decode_order(&pics);
+        let mut base = None;
+        let got: Vec<(u32, u32)> = pics[..4].iter().map(|&(p, d)| flv_video_time(p, d, &mut base)).collect();
+        assert_eq!(got, [(0, 120), (40, 0), (80, 0), (120, 120)]);
+        assert_decode_order(&b_pyramid());
+    }
+
+    /// 29.97 fps (3003-tick frames) and 59.94 fps (alternately 1501 and
+    /// 1502 ticks): the frame lands on a fraction of a ms, and the tags
+    /// still go out strictly increasing, each picture presented on the ms
+    /// grid audio is mapped to.
+    #[test]
+    fn a_b_frame_source_at_a_fractional_rate_stays_in_decode_order() {
+        assert_decode_order(&ibbp(60, |k| T0 + k * 3003));
+        assert_decode_order(&ibbp(120, |k| T0 + k * 1501 + k / 2));
+    }
+
+    /// No DTS (a source without B-frames), or one equal to the PTS: the
+    /// timestamp is the PTS mapping it always was and the composition time
+    /// 0 — byte for byte what went out before edge#205. So is a picture
+    /// whose PES carried no PTS at all (`pts` 0, no DTS).
+    #[test]
+    fn a_source_without_b_frames_is_tagged_exactly_as_before() {
+        for with_dts in [false, true] {
+            let (mut base, mut before) = (None, None);
+            for k in 0..50u64 {
+                let pts = T0 + k * 3003;
+                let got = flv_video_time(pts, with_dts.then_some(pts), &mut base);
+                assert_eq!(got, (pts_to_ms(pts, &mut before), 0), "frame {k}");
+            }
+            assert_eq!(base, before);
+        }
+        assert_eq!(flv_video_time(0, None, &mut None), (0, 0));
+        let mut base = Some(T0);
+        assert_eq!(flv_video_time(0, None, &mut base), (rel_ms_wrapping(0, T0), 0));
+        assert_eq!(base, Some(T0));
+    }
+
+    /// A DTS the offset cannot be — after the PTS, or more than the 2 s cap
+    /// before it — is judged as CMAF judges it: as none.
+    #[test]
+    fn a_dts_that_cannot_be_an_offset_is_ignored() {
+        let pts = T0 + 180_001;
+        for dts in [pts + STEP_25FPS, pts - 180_001, pts - 900_000] {
+            let mut base = None;
+            assert_eq!(flv_video_time(pts, Some(dts), &mut base), (0, 0), "dts {dts}");
+            assert_eq!(base, Some(pts), "anchored on the PTS, as before");
+            assert_eq!(flv_video_time(pts + 3600, Some(dts + 3600), &mut base), (40, 0));
+        }
+        // 2 s exactly is an offset.
+        let mut base = None;
+        assert_eq!(flv_video_time(pts, Some(pts - 180_000), &mut base), (0, 2000));
+    }
+
+    /// The other essence anchored the epoch first (an AAC frame is handed
+    /// out the moment it is complete; a video PES only at the next PUSI on
+    /// its PID). A picture decoding before that epoch is tagged 0 — the tag
+    /// stream never steps back — and its composition time carries the rest,
+    /// so it is still presented at the ms audio at its PTS is.
+    #[test]
+    fn video_behind_an_audio_anchored_epoch_still_presents_at_its_pts() {
+        let a0 = T0 + 2 * STEP_25FPS;
+        let mut base = Some(a0);
+        let pics = ibbp(6, |k| T0 + k * STEP_25FPS);
+        let got: Vec<(u32, u32)> = pics.iter().map(|&(p, d)| flv_video_time(p, d, &mut base)).collect();
+        // I (decodes before a0, presents a frame after it), then a B before
+        // the epoch (clamped, as it was), a B on it, and the rest as usual.
+        assert_eq!(got, [(0, 40), (0, 0), (0, 0), (40, 120), (80, 0), (120, 0)]);
+        for (&(pts, _), (ts, cts)) in pics.iter().zip(&got) {
+            if pts >= a0 {
+                assert_eq!(ts + cts, pts_to_ms(pts, &mut Some(a0)));
+            }
+        }
+        assert_eq!(base, Some(a0), "video does not move an epoch audio set");
+    }
+
+    /// Anchored on the first picture's decode time, audio at that picture's
+    /// PTS maps to the ms the picture is presented at: the shared-epoch A/V
+    /// property, unchanged by moving the tag to the decode time.
+    #[test]
+    fn the_first_picture_anchors_the_epoch_on_its_decode_time() {
+        let (pts, dts) = (T0 + 7_200, T0);
+        let mut base = None;
+        let (ts, cts) = flv_video_time(pts, Some(dts), &mut base);
+        assert_eq!(base, Some(dts));
+        assert_eq!((ts, cts), (0, 80));
+        assert_eq!(pts_to_ms(pts, &mut base), ts + cts, "audio at the same instant");
+        assert_eq!(pts_to_ms(pts + 1920, &mut base), 101);
+    }
+
+    /// The composition time is `pts_ms − dts_ms`, not the offset rounded on
+    /// its own, so an offset under a ms can come out 0 or 1 depending on
+    /// where the two fall — either way the picture presents on audio's ms.
+    /// At 0 an HEVC picture keeps `CodedFramesX`.
+    #[test]
+    fn an_offset_under_a_millisecond_rounds_with_the_presentation_time() {
+        let mut base = Some(0);
+        let (ts, cts) = flv_video_time(170, Some(120), &mut base);
+        assert_eq!((ts, cts), (1, 0), "120 and 170 ticks are both in ms 1");
+        assert_eq!(build_hevc_coded_frames_tag(&[1, 2], false, cts)[0], 0xA3, "CodedFramesX");
+        let (ts, cts) = flv_video_time(100, Some(50), &mut base);
+        assert_eq!((ts, cts), (0, 1), "50 ticks in ms 0, 100 in ms 1");
+        assert_eq!(build_hevc_coded_frames_tag(&[1, 2], false, cts)[0], 0xA1, "CodedFrames");
+    }
+
+    /// The decode time saturates rather than wrapping. A connection whose
+    /// first picture presents just past the 33-bit wrap and decodes just
+    /// before it (PTS below its offset) would, wrapped, anchor the epoch
+    /// near 2^33 — and every later tag, audio and video, would then read as
+    /// a wrap and go out at 0 for up to ~26.5 h. The same holds behind an
+    /// epoch audio anchored just past the wrap: wrapped, the first picture
+    /// would be tagged ~26.5 h ahead and the next one step back.
+    #[test]
+    fn a_picture_straddling_the_33_bit_wrap_does_not_anchor_near_it() {
+        const WRAP: u64 = 1 << 33;
+        let mut base = None;
+        assert_eq!(flv_video_time(1_000, Some(WRAP - 2_000), &mut base), (0, 11));
+        assert_eq!(base, Some(0));
+        assert_eq!(flv_video_time(4_600, Some(1_600), &mut base), (17, 34));
+        assert_eq!(pts_to_ms(50_000, &mut base), 555, "audio after it is not pinned to 0");
+
+        let mut base = Some(1_000);
+        assert_eq!(flv_video_time(3_000, Some(WRAP - 500), &mut base), (0, 22));
+        assert_eq!(flv_video_time(6_600, Some(3_100), &mut base), (23, 39));
+    }
+}
+
+/// edge#205 end to end: MPEG-TS through `publish_loop` — the demuxer, the
+/// per-arm `flv_video_time`, `process_video_frame`, `passthrough_video`, the
+/// tag writers and the chunk writer — into the edge's own RTMP server, which
+/// hands back each tag with the timestamp it read off the wire.
+#[cfg(test)]
+pub(super) mod flv_wire_tests {
+    use super::flv_timestamp_tests::{b_pyramid, ibbp};
+    use super::*;
+    use crate::engine::rtmp::server::{RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
+    use crate::engine::rtmp::ts_mux::TsMuxer;
+    use bytes::Bytes;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    const F: u64 = 3_600; // one frame at 25 fps
+    const T0: u64 = 900_000;
+
+    /// One tag as the server read it off the wire.
+    pub(super) struct WireTag {
+        pub video: bool,
+        pub ts: u32,
+        pub data: Bytes,
+    }
+
+    /// Publish `ts` (one item per broadcast packet) through `publish_loop`
+    /// with the RTMP output `output` into a loopback server, and return what
+    /// the server read, in order.
+    pub(super) async fn publish(ts: Vec<Bytes>, output: serde_json::Value) -> Vec<WireTag> {
+        let cancel = CancellationToken::new();
+        let (media_tx, mut media_rx) = tokio::sync::mpsc::channel(4_096);
+        // A free port, found by binding one and letting it go; another
+        // process can take it in between, so a server that fails to bind
+        // is retried on a fresh one.
+        let mut client = 'connected: {
+            for _ in 0..20 {
+                let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+                let server = tokio::spawn(run_rtmp_server(
+                    RtmpServerConfig {
+                        listen_addr: format!("127.0.0.1:{port}"),
+                        expected_app: "live".into(),
+                        expected_stream_key: Some("k".into()),
+                    },
+                    media_tx.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                    cancel.child_token(),
+                ));
+                for _ in 0..200 {
+                    if server.is_finished() {
+                        break;
+                    }
+                    // Bounded: until the server's bind fails, whatever took
+                    // the port may answer and never complete a handshake.
+                    let url = format!("rtmp://127.0.0.1:{port}/live");
+                    if let Ok(Ok(c)) = tokio::time::timeout(Duration::from_secs(2), RtmpClient::connect(&url, "k")).await {
+                        break 'connected c;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                server.abort();
+            }
+            panic!("no loopback RTMP server came up");
+        };
+        drop(media_tx);
+        let config: RtmpOutputConfig = serde_json::from_value(output).unwrap();
+        let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let (tx, mut rx) = broadcast::channel(ts.len().max(1));
+        for (k, data) in ts.into_iter().enumerate() {
+            tx.send(RtpPacket {
+                data,
+                sequence_number: k as u16,
+                rtp_timestamp: 0,
+                recv_time_us: 0,
+                is_raw_ts: true,
+                upstream_seq: None,
+                upstream_leg_id: None,
+                sender_timestamp_us: None,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        // Returns once the channel is drained and closed.
+        publish_loop(&config, &mut client, &mut rx, &stats, &CancellationToken::new(), false, "f", &events)
+            .await
+            .expect("publish_loop");
+        client.close().await.unwrap();
+        let mut tags = Vec::new();
+        loop {
+            let msg = tokio::time::timeout(Duration::from_secs(20), media_rx.recv())
+                .await
+                .expect("the server hands back every tag, then the unpublish");
+            match msg {
+                Some(RtmpMediaMessage::Video { data, timestamp_ms }) => {
+                    tags.push(WireTag { video: true, ts: timestamp_ms, data })
+                }
+                Some(RtmpMediaMessage::Audio { data, timestamp_ms }) => {
+                    tags.push(WireTag { video: false, ts: timestamp_ms, data })
+                }
+                Some(RtmpMediaMessage::Metadata { .. }) => {}
+                Some(RtmpMediaMessage::Disconnected) | None => break,
+            }
+        }
+        cancel.cancel();
+        tags
+    }
+
+    /// A plain RTMP output: no `video_encode`, so video passes through.
+    fn passthrough_output() -> serde_json::Value {
+        serde_json::json!({ "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k" })
+    }
+
+    /// The composition time a video tag carries — `None` for a sequence
+    /// header. Classic AVC: SI24 at bytes 2..5 of every NALU tag. Enhanced
+    /// RTMP: SI24 after the FourCC on `CodedFrames` (1), none on
+    /// `CodedFramesX` (3).
+    pub(super) fn tag_cts(tag: &[u8]) -> Option<u32> {
+        let si24 = |b: &[u8]| {
+            let v = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+            assert_eq!(v & 0x80_0000, 0, "a negative composition time");
+            v
+        };
+        if tag[0] & 0x80 != 0 {
+            match tag[0] & 0x0F {
+                0 => None,
+                1 => Some(si24(&tag[5..8])),
+                3 => Some(0),
+                t => panic!("Enhanced-RTMP PacketType {t}"),
+            }
+        } else {
+            match tag[1] {
+                0 => {
+                    assert_eq!(&tag[2..5], &[0, 0, 0], "a sequence header's composition time is 0");
+                    None
+                }
+                1 => Some(si24(&tag[2..5])),
+                t => panic!("AVCPacketType {t}"),
+            }
+        }
+    }
+
+    /// An H.264 access unit, Annex B: AUD, then SPS + PPS + IDR for a key
+    /// picture, a non-IDR slice otherwise. The bytes are only ever passed
+    /// through, never decoded.
+    fn h264_au(key: bool, k: u8) -> Vec<u8> {
+        let mut au = vec![0, 0, 0, 1, 0x09, 0xF0];
+        if key {
+            au.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1E, 0xDA]);
+            au.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80]);
+            au.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, k + 1]);
+        } else {
+            au.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x22, k + 1]);
+        }
+        au
+    }
+
+    /// The HEVC counterpart: AUD, then VPS + SPS + PPS + IDR_W_RADL, or a
+    /// TRAIL_R slice.
+    fn h265_au(key: bool, k: u8) -> Vec<u8> {
+        let mut au = vec![0, 0, 0, 1, 0x46, 0x01, 0x50];
+        if key {
+            au.extend_from_slice(&[0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01]);
+            au.extend_from_slice(&[0, 0, 0, 1, 0x42, 0x01, 0x01, 0x01]);
+            au.extend_from_slice(&[0, 0, 0, 1, 0x44, 0x01, 0xC1, 0x72]);
+            au.extend_from_slice(&[0, 0, 0, 1, 0x26, 0x01, 0xAF, k + 1]);
+        } else {
+            au.extend_from_slice(&[0, 0, 0, 1, 0x02, 0x01, 0xD0, k + 1]);
+        }
+        au
+    }
+
+    /// `pics` (`(pts, dts)` in decode order; key pictures at the indices in
+    /// `keys`, the first among them) muxed as `TsMuxer` muxes any source —
+    /// the PES carries the DTS only where it differs from the PTS — plus a
+    /// closing picture, since the demuxer hands a video PES out only at the
+    /// next one on its PID.
+    fn video_ts(mux: &mut TsMuxer, hevc: bool, pics: &[(u64, Option<u64>)], keys: &[usize]) -> Vec<Bytes> {
+        if hevc {
+            mux.set_video_stream_type(0x24);
+        }
+        let au = |key: bool, k: usize| if hevc { h265_au(key, k as u8) } else { h264_au(key, k as u8) };
+        let mut out = Vec::new();
+        for (k, &(pts, dts)) in pics.iter().enumerate() {
+            let key = keys.contains(&k);
+            out.extend(mux.mux_video(&au(key, k), pts, dts.unwrap_or(pts), key));
+        }
+        let end = pics.iter().map(|p| p.0).max().unwrap() + F;
+        out.extend(mux.mux_video(&au(false, pics.len()), end, end, false));
+        out
+    }
+
+    /// The video tags of `tags` against the source pictures `pics` on an
+    /// epoch at `base`: every picture arrives once, in decode order, tagged
+    /// at its decode time (0 when that is before the epoch) and presented
+    /// (timestamp + composition time) on the ms its PTS maps to; every
+    /// sequence header goes out at the decode time of the key picture it
+    /// precedes, with composition time 0; the video timeline never steps
+    /// back. Returns how many pictures carried a composition time.
+    fn assert_wire_decode_order(tags: &[WireTag], pics: &[(u64, Option<u64>)], base: u64, hevc: bool) -> usize {
+        let ms = |t: u64| if t < base { 0 } else { ((t - base) / 90) as u32 };
+        let video: Vec<&WireTag> = tags.iter().filter(|t| t.video).collect();
+        assert!(video.windows(2).all(|w| w[0].ts <= w[1].ts), "the video timeline steps back");
+        let mut pictures = Vec::new();
+        for (i, tag) in video.iter().enumerate() {
+            assert_eq!(tag.data[0] & 0x80 != 0, hevc, "classic FLV for H.264, Enhanced RTMP for HEVC");
+            match tag_cts(&tag.data) {
+                Some(cts) => pictures.push((tag.ts, cts, tag.data[0])),
+                None => {
+                    let picture = video[i + 1..]
+                        .iter()
+                        .find(|t| tag_cts(&t.data).is_some())
+                        .expect("a header ahead of a picture");
+                    assert_eq!(tag.ts, picture.ts, "a header takes its picture's decode time");
+                }
+            }
+        }
+        assert_eq!(pictures.len(), pics.len(), "every picture once");
+        let mut with_cts = 0;
+        for (k, (&(pts, dts), &(ts, cts, head))) in pics.iter().zip(&pictures).enumerate() {
+            assert_eq!(ts, ms(dts.unwrap_or(pts)), "picture {k}: tagged at its decode time");
+            assert_eq!(ts + cts, ms(pts), "picture {k}: presented at its PTS");
+            if hevc {
+                assert_eq!(head & 0x0F, if cts == 0 { 3 } else { 1 }, "picture {k}: PacketType");
+            }
+            with_cts += usize::from(cts > 0);
+        }
+        with_cts
+    }
+
+    /// edge#205, the reported failure: a B-frame source passed through to
+    /// RTMP — H.264 and HEVC, IBBP and b-pyramid. Every picture was tagged
+    /// with its PTS and composition time 0, so the tags went out in
+    /// presentation order and stepped back at every reordered picture
+    /// (the epoch, anchored on the first PTS, also stamped the B-pictures
+    /// leading it 0); HEVC went out as `CodedFramesX` whatever the picture.
+    ///
+    /// A second key picture mid-stream re-sends the sequence header: at that
+    /// picture's decode time, never ahead of the tag after it.
+    #[tokio::test]
+    async fn a_b_frame_ts_source_reaches_flv_in_decode_order() {
+        for hevc in [false, true] {
+            for (pics, keys) in [(ibbp(12, |k| T0 + k * F), [0, 6]), (b_pyramid(), [0, 5])] {
+                let ts = video_ts(&mut TsMuxer::new(), hevc, &pics, &keys);
+                let tags = publish(ts, passthrough_output()).await;
+                let base = pics[0].1.unwrap_or(pics[0].0);
+                let with_cts = assert_wire_decode_order(&tags, &pics, base, hevc);
+                assert!(with_cts >= 3, "hevc {hevc}: the fixture lost its DTS ({with_cts})");
+                let headers = tags.iter().filter(|t| t.video && tag_cts(&t.data).is_none()).count();
+                assert_eq!(headers, 3, "hevc {hevc}: a header, then a re-send on each key picture");
+            }
+        }
+    }
+
+    /// A source without B-frames goes out exactly as it did: each picture at
+    /// its PTS, composition time 0, HEVC as `CodedFramesX`.
+    #[tokio::test]
+    async fn a_source_without_b_frames_reaches_flv_unchanged() {
+        let pics: Vec<(u64, Option<u64>)> = (0..10).map(|k| (T0 + k * 3_003, None)).collect();
+        for hevc in [false, true] {
+            let tags = publish(video_ts(&mut TsMuxer::new(), hevc, &pics, &[0, 5]), passthrough_output()).await;
+            assert_eq!(assert_wire_decode_order(&tags, &pics, T0, hevc), 0, "hevc {hevc}");
+        }
+    }
+
+    /// Audio anchored the epoch (an ADTS frame is handed out the moment it
+    /// is complete; a video PES only at the next PUSI on its PID), and the
+    /// first pictures decode before it. They go out at 0 — the timeline does
+    /// not step back — and each picture presents on the ms the audio at its
+    /// PTS is stamped.
+    #[tokio::test]
+    async fn video_behind_an_audio_anchored_epoch_presents_with_its_audio() {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let a0 = T0 + 2 * F;
+        let mut mux = TsMuxer::new();
+        mux.set_has_audio(true);
+        let mut ts = Vec::new();
+        let (mut off, mut pts) = (0usize, a0);
+        for _ in 0..4 {
+            let len = (usize::from(ADTS[off + 3] & 0x03) << 11)
+                | (usize::from(ADTS[off + 4]) << 3)
+                | (usize::from(ADTS[off + 5]) >> 5);
+            ts.extend(mux.mux_audio_pre_adts(&ADTS[off..off + len], pts));
+            off += len;
+            pts += 1_920;
+        }
+        let pics = ibbp(9, |k| T0 + k * F);
+        ts.extend(video_ts(&mut mux, false, &pics, &[0]));
+        let tags = publish(ts, passthrough_output()).await;
+        let audio: Vec<u32> = tags.iter().filter(|t| !t.video && t.data[1] == 1).map(|t| t.ts).collect();
+        assert_eq!(audio, [0, 21, 42, 64], "audio anchors the epoch");
+        assert!(assert_wire_decode_order(&tags, &pics, a0, false) > 0);
+        let first = tags.iter().find(|t| t.video && tag_cts(&t.data).is_some()).unwrap();
+        assert_eq!((first.ts, tag_cts(&first.data)), (0, Some(40)), "the I picture, a frame after the epoch");
+    }
+
+    /// Edge to edge: a B-frame H.264 publish into the edge's RTMP input is
+    /// muxed with the PTS and DTS its FLV tags carried (`input_rtmp`: DTS
+    /// = the tag timestamp, PTS = DTS + composition time, on its fixed
+    /// timeline start). Re-published through an RTMP output it carries the
+    /// same decode times and composition times out.
+    #[tokio::test]
+    async fn an_flv_composition_time_survives_an_edge_to_edge_hop() {
+        const START_90K: u64 = 900_000; // input_rtmp's TIMELINE_START_90K
+        // (tag timestamp, composition time) as an x264 / OBS publisher
+        // sends IBBP at 25 fps: decode order I P B B P B B P B, two frames
+        // of decode delay, so every picture — a B too — carries one.
+        let flv: [(u64, u64); 9] =
+            [(0, 80), (40, 160), (80, 40), (120, 40), (160, 160), (200, 40), (240, 40), (280, 160), (320, 40)];
+        let pics: Vec<(u64, Option<u64>)> = flv
+            .iter()
+            .map(|&(dts, cts)| (START_90K + (dts + cts) * 90, (cts > 0).then_some(START_90K + dts * 90)))
+            .collect();
+        let tags = publish(video_ts(&mut TsMuxer::new(), false, &pics, &[0]), passthrough_output()).await;
+        let out: Vec<(u64, u64)> = tags
+            .iter()
+            .filter(|t| t.video)
+            .filter_map(|t| Some((u64::from(t.ts), u64::from(tag_cts(&t.data)?))))
+            .collect();
+        assert_eq!(out, flv);
     }
 }
 
@@ -3316,12 +3977,50 @@ pub(crate) mod tests {
 
     #[test]
     fn build_hevc_coded_frames_tag_shape() {
+        // Composition time 0 — every re-encoded picture, every picture of a
+        // source without B-frames — keeps the bytes it always had.
         let avcc = [0x01, 0x02];
-        let kf = build_hevc_coded_frames_tag(&avcc, true);
+        let kf = build_hevc_coded_frames_tag(&avcc, true, 0);
         assert_eq!(kf[0], 0x93, "IsEx | keyframe | PacketType=CodedFramesX");
         assert_eq!(&kf[1..5], b"hvc1");
-        let inter = build_hevc_coded_frames_tag(&avcc, false);
+        assert_eq!(&kf[5..], &avcc, "no composition-time field");
+        let inter = build_hevc_coded_frames_tag(&avcc, false, 0);
         assert_eq!(inter[0], 0xA3, "IsEx | inter | PacketType=CodedFramesX");
+        assert_eq!(&inter[5..], &avcc);
+    }
+
+    /// edge#205: a picture that presents after it decodes goes out as
+    /// Enhanced-RTMP `CodedFrames` (PacketType 1), whose SI24 composition
+    /// time follows the FourCC. It went out as `CodedFramesX`, which has no
+    /// such field, so the receiver presented it at its decode time.
+    #[test]
+    fn an_hevc_picture_with_a_composition_time_is_coded_frames() {
+        let avcc = [0x00, 0x00, 0x00, 0x02, 0x26, 0x01];
+        let kf = build_hevc_coded_frames_tag(&avcc, true, 80);
+        assert_eq!(kf[0], 0x91, "IsEx | keyframe | PacketType=CodedFrames");
+        assert_eq!(&kf[1..5], b"hvc1");
+        assert_eq!(&kf[5..8], &[0, 0, 80], "SI24 composition time");
+        assert_eq!(&kf[8..], &avcc);
+        let inter = build_hevc_coded_frames_tag(&avcc, false, 2000);
+        assert_eq!(inter[0], 0xA1, "IsEx | inter | PacketType=CodedFrames");
+        assert_eq!(&inter[5..8], &[0x00, 0x07, 0xD0]);
+        assert_eq!(&inter[8..], &avcc);
+    }
+
+    /// edge#205: the classic AVC NALU tag carries the picture's composition
+    /// time in its SI24 field, where it hard-coded 0. Composition time 0
+    /// writes the bytes it always wrote.
+    #[test]
+    fn build_avc_nalu_tag_carries_the_composition_time() {
+        let nalus = vec![vec![0x41, 0x9A, 0x22]];
+        let tag = build_avc_nalu_tag(&nalus, false, 80);
+        assert_eq!(&tag[..5], &[0x27, 0x01, 0, 0, 80]);
+        assert_eq!(&tag[5..], &[0, 0, 0, 3, 0x41, 0x9A, 0x22]);
+        assert_eq!(&build_avc_nalu_tag(&nalus, true, 2000)[..5], &[0x17, 0x01, 0x00, 0x07, 0xD0]);
+        assert_eq!(
+            build_avc_nalu_tag(&nalus, true, 0),
+            vec![0x17, 0x01, 0, 0, 0, 0, 0, 0, 3, 0x41, 0x9A, 0x22],
+        );
     }
 
     /// Total reconnect attempts in 60 s of wall clock should be ≤ 7
