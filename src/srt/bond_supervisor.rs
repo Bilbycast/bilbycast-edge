@@ -435,7 +435,8 @@ fn obs_healthy(o: &MemberObs) -> bool {
 /// the connect timeout, and a member libsrt leaves Pending *after* its
 /// handshake finished (a race in libsrt's own group connect) is replaced by
 /// `srt-transport` with the same endpoint, within about a second, or once
-/// another member's handshake has resolved (at most one connect timeout).
+/// another member's handshake, or the replacement of one libsrt lists
+/// Broken, has resolved (up to about a second past a connect timeout).
 /// When no other member was up at the peer, it is closed only once its
 /// replacement is up, so the listing briefly shows two members with this
 /// token, and `decide` reads them together.
