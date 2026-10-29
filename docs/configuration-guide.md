@@ -1435,11 +1435,71 @@ tag to the first one's time; a TS or CMAF receiver found the audio hours off
 its clock). Both tracks now run on one timeline: the publish's first frame
 of either track at the muxer's 100 ms lead, the other track's first frame as
 much later as it arrived later, each on its own RTP clock from there
-(`WhipClock`). Audio and picture are then as far apart as their first
-frames' arrival — the sender's capture-to-send difference and the network's,
-typically tens of milliseconds — not arbitrarily; the RTCP sender reports'
-NTP ↔ RTP mapping, which would take out even that, is not used yet (known
-limitation). Every IDR carries an SPS and PPS
+(`WhipClock`). That alone leaves audio and picture as far apart as their
+first frames' arrival, which is not how far apart they were captured: a
+track whose first frame came late — a sending encoder opened lazily — stays
+that late for the whole publish. Edge to edge, a publish's audio sat 228 ms
+(p50) *behind* the PCR, which a strict decoder underflows on (edge#155).
+
+So the **audio is then lined up with the video by the publisher's RTCP
+sender reports**, once, as the reports come in (libwebrtc and str0m send an
+audio report every 5 s, so typically 5–15 s into the publish; never later than
+30 s): each report maps its track's RTP
+time to an instant on the sender's one wallclock (RFC 3550 §6.4.1), so a pair
+of them says how far apart an audio frame and a video frame were captured.
+The video, and the PCR it carries, never move; the audio takes one step —
+forward, a one-time gap a decoder mutes, or back, the overlap dropped by
+whole frames (leaving a gap under one frame) rather than bunched at one PTS.
+The step is taken only when:
+
+- the reports map a track onto a wallclock: one sent before any media
+  (packet count 0 — ffmpeg's WHIP muxer sends its first report so) or with
+  no wallclock behind it (NTP before 2000-01-01; RFC 3550 lets such a sender
+  send NTP 0, which the WebRTC stack reads as exactly the Unix epoch) is
+  ignored, as is one more than 15 s from the frame;
+- two report pairs that share neither report agree within 20 ms. A pair is
+  judged once, when either report changes — never again at the next frame —
+  so one bad report, or a sender re-anchoring as it is read, moves nothing;
+- the move is under 2 s; a pair asking for more raises a Warning
+  `webrtc_av_sync_implausible` and is ignored;
+- it is within **30 s** of the publish's first audio frame — a programme is
+  never stepped minutes in. Reports that never agreed by then raise a Warning
+  `webrtc_av_sync_unsettled`, and the audio stays on first arrival;
+- and only as far as the PCR allows: afterwards every audio frame of the last
+  second (the least lead over a burst of them, not one frame's) leads the PCR
+  by at least 40 ms and none by more than 0.9 s. A publisher whose audio lags
+  its video by more than about 60 ms is lined up only that far, the rest
+  reported in a Warning `webrtc_av_sync_partial` (`residual_ms`): lined up in
+  full, its audio would sit behind the PCR.
+
+A browser, OBS, GStreamer and ffmpeg send reports on their capture clock, so
+their audio and video captured at one instant leave with one PTS. **An edge's
+own WHIP output** sends reports taken at its write times rather than its
+source's PTS, so a publish from one is lined up on when that edge wrote each
+track: when it settles, the first-frame outlier goes and the audio leads the
+PCR by about the muxer's 100 ms, but the sending edge's steady difference
+between its video and audio encode times stays (a follow-up makes the WHIP
+output report on its source's PTS). Those reports also carry the jitter of
+the sending edge's source: each says when a write left, and the writes
+follow the source's mux timing. On the test rig's source, whose audio PES
+led its PCR by about 604–669 ms and its video by 664–736 ms in decode time
+(664–935 ms in presentation time), a model built from those audio and
+decode-time leads has report pairs disagreeing by up to about ±70 ms; that
+is a model, not a measurement on the wire. It also leaves out a term: the
+sending edge re-frames each 96 ms AC-3 PES into 20 ms Opus frames, and the
+last frame written, which its audio report runs on from, starts a different
+distance into its PES each time, so the real spread may be wider still.
+Such a publish is moved once two of its pairs happen to agree within 20 ms,
+so the step lands anywhere in that spread; one whose
+pairs never agree in the 30 s raises `webrtc_av_sync_unsettled` and keeps
+the first-arrival alignment as before — on the reported publish, its audio
+behind the PCR. How often an edge-to-edge publish ends that way has not been
+measured yet. A publisher that sends no usable report, and an audio-only or
+video-only publish, keep the first-arrival alignment, as before. A sender
+clock step after the alignment, and drift between a publisher's audio and
+video clocks over a publish, are not followed.
+
+Every IDR carries an SPS and PPS
 — the last ones the stream sent — when the sender did not repeat them (only
 libwebrtc does so reliably), and IDRs are marked keyframes (PAT/PMT ahead of
 each, the random-access flag set): the frame was read as a NAL from the

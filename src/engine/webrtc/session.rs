@@ -91,7 +91,7 @@ const H264_LEVEL_5_1: [(u8, u8, bool, u32); 7] = [
 /// until it expires. Without retransmission, one lost packet then stalls video
 /// about twice as long as 0.23 did. `None` restores 0.23's release by frame
 /// count, which is what this pipeline was tuned against.
-fn rtc_config(ice_lite: bool) -> RtcConfig {
+pub(crate) fn rtc_config(ice_lite: bool) -> RtcConfig {
     let mut config = Rtc::builder()
         .set_ice_lite(ice_lite)
         .set_reordering_timeout_video(None)
@@ -275,6 +275,12 @@ pub enum SessionEvent {
         rtp_time: MediaTime,
         network_time: Instant,
         contiguous: bool,
+        /// The sender's latest RTCP sender report on this track when the
+        /// frame's first packet arrived (RFC 3550 §6.4.1: an NTP instant and
+        /// the RTP time it corresponds to), `None` until one has come. The
+        /// WHIP input lines a publish's audio up with its video by them
+        /// (`input_webrtc::WhipClock`).
+        sender_info: Option<str0m::rtp::rtcp::SenderInfo>,
     },
     /// ICE connection state changed.
     IceStateChange(IceConnectionState),
@@ -969,6 +975,7 @@ impl WebrtcSession {
                     rtp_time: data.time,
                     network_time: data.network_time,
                     contiguous: data.contiguous,
+                    sender_info: data.last_sender_info,
                 })
             }
             Event::KeyframeRequest(kf) => {
@@ -2469,6 +2476,86 @@ mod liveness_tests {
         .await;
         assert_eq!(while_down, 0, "frames written while ICE was down were sent");
         assert!(once_up > 0, "nothing written once ICE was back up was heard");
+    }
+
+    /// A received frame carries the sender's latest report on its track, as
+    /// str0m read it — which the WHIP input's lip-sync reads, and which was
+    /// dropped when the event was built. The report maps the frame's RTP time
+    /// onto the wallclock its sender wrote it with: here 300 ms before the
+    /// write, so a report taken off the write instant would be 300 ms out.
+    #[tokio::test]
+    async fn media_data_carries_the_senders_report() {
+        let reporting = rtc_config(true).set_rtcp_report_interval_video(Duration::from_millis(200));
+        let config = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: true };
+        let mut server = WebrtcSession::with_rtc_config(&config, reporting).await.unwrap();
+        let mut viewer = session(false).await;
+        let (offer, pending) = viewer.create_offer(true, false, false).unwrap();
+        let answer = server.accept_offer(&offer).unwrap();
+        viewer.apply_answer(&answer, pending).unwrap();
+        let cancel = CancellationToken::new();
+        let (mut server_up, mut viewer_up) = (false, false);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !(server_up && viewer_up) {
+                tokio::select! {
+                    e = server.poll_event(&cancel) => server_up |= matches!(e, SessionEvent::Connected),
+                    e = viewer.poll_event(&cancel) => viewer_up |= matches!(e, SessionEvent::Connected),
+                }
+            }
+        })
+        .await
+        .expect("the viewer never connected");
+        let (server_video, viewer_video) = (server.video_mid.unwrap(), viewer.video_mid.unwrap());
+        let pt = server.get_pt(server_video).unwrap();
+
+        // Picture `k`, captured `40 k` ms after `capture0`, tagged with `k`.
+        let capture0 = Instant::now() - Duration::from_millis(300);
+        let picture = |k: u64| {
+            let mut au = vec![0, 0, 0, 1, 0x67, 0x42, 0xc0, 0x1e, 0xd9, 0x01, 0x41, 0xfb, 0x01, 0x10];
+            au.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xce, 0x3c, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x84]);
+            au.extend_from_slice(&[0x40 | (k >> 6) as u8, 0x40 | (k & 0x3F) as u8]);
+            au.extend(std::iter::repeat_n(0x5a, 300));
+            au
+        };
+        let mut tick = tokio::time::interval(Duration::from_millis(40));
+        let mut k = 0u64;
+        let read = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    e = viewer.poll_event(&cancel) => {
+                        if let SessionEvent::MediaData { mid, data, rtp_time, sender_info: Some(info), .. } = e
+                            && mid == viewer_video
+                        {
+                            let at = data.windows(3).position(|w| w == [0x65, 0x88, 0x84]).expect("the IDR") + 3;
+                            let k = (((data[at] & 0x3F) as u64) << 6) | (data[at + 1] & 0x3F) as u64;
+                            break (k, rtp_time.numer(), info);
+                        }
+                    }
+                    _ = tick.tick() => {
+                        let at = MediaTime::new(k * 3_600, str0m::media::Frequency::NINETY_KHZ);
+                        server.write_media(server_video, pt, capture0 + Duration::from_millis(k * 40), at, &picture(k)).unwrap();
+                        k += 1;
+                        server.drain_outputs().await;
+                        server.drive_udp_io().await;
+                    }
+                }
+            }
+        })
+        .await;
+        let (k, rtp, info) = read.expect("no frame carried a sender report");
+        assert!(info.sender_packet_count > 0);
+        // The report's instant run on to the frame's RTP time, against the
+        // instant the frame was written with (as wallclock time).
+        let ticks = (rtp as u32).wrapping_sub(info.rtp_time.numer() as u32) as i32;
+        assert!(ticks.abs() < 2 * 90_000, "a report {ticks} ticks from the frame: not this track's");
+        let reported = if ticks >= 0 {
+            info.ntp_time + Duration::from_nanos(ticks as u64 * 1_000_000_000 / 90_000)
+        } else {
+            info.ntp_time - Duration::from_nanos(ticks.unsigned_abs() as u64 * 1_000_000_000 / 90_000)
+        };
+        let captured = capture0 + Duration::from_millis(k * 40);
+        let captured = std::time::SystemTime::now() - Instant::now().duration_since(captured);
+        let off = reported.duration_since(captured).unwrap_or_else(|e| e.duration());
+        assert!(off < Duration::from_millis(5), "the report puts picture {k} {off:?} off its wallclock");
     }
 
     /// A viewer's keyframe request (PLI) is kept until the send loop takes
