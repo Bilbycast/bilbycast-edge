@@ -35,7 +35,10 @@
 //! short (a PES truncated by loss can end on a one-byte NAL), an id out of the
 //! codec's range, or an HEVC set for a layer other than the base layer — is
 //! ignored, never stored: it cannot be matched to what a slice names, and in
-//! an init it is a record a strict decoder may refuse whole.
+//! an init it is a record a strict decoder may refuse whole. So is one longer
+//! than a configuration record's 16-bit length can describe: real ones are a
+//! few hundred bytes at most, and with nothing else bounding an entry the
+//! table could hold hundreds of them as long as a PES.
 //!
 //! Every read of source bytes here is bounds-checked: these NALs come off the
 //! wire, and a panic would take the output's task down with it.
@@ -57,6 +60,12 @@ const AVCC_MAX_PPS: usize = 255;
 /// mandatory syntax and the stop bit — four bytes. Anything shorter is a
 /// fragment of one.
 const MIN_PARAM_SET_LEN: usize = 4;
+
+/// The longest NAL taken for a parameter set: each `avcC` / `hvcC` entry
+/// carries its length in sixteen bits, so a longer one cannot be written
+/// into an init — it would go in under a truncated length, a malformed
+/// record. A real parameter set is nowhere near it; one this long is corrupt.
+const MAX_PARAM_SET_LEN: usize = u16::MAX as usize;
 
 /// One parameter set: its id, and the NAL (no start code, no length prefix).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,10 +229,11 @@ fn cap(codec: VideoCodec, kind: Kind) -> usize {
 }
 
 /// The kind and id of a parameter set, or `None` for any other NAL, and for a
-/// parameter set that is too short to be one, names no id in range, or (HEVC)
-/// belongs to a layer other than the base layer.
+/// parameter set that is too short to be one, too long for a configuration
+/// record, names no id in range, or (HEVC) belongs to a layer other than the
+/// base layer.
 fn classify(codec: VideoCodec, nal: &[u8]) -> Option<(Kind, u32)> {
-    if nal.len() < MIN_PARAM_SET_LEN {
+    if !(MIN_PARAM_SET_LEN..=MAX_PARAM_SET_LEN).contains(&nal.len()) {
         return None;
     }
     let kind = match codec {
@@ -640,6 +650,50 @@ pub(super) mod tests {
         let mut col = ParamSetCollector::default();
         col.observe(VideoCodec::H265, &[sps[..9].to_vec()], true);
         assert_eq!(table(&col, VideoCodec::H265), ParamSets::default());
+
+        // An id field opening with 32 zero bits. No `00 00 0x` start code
+        // ends such a NAL, so the demuxer hands it over whole; read as an
+        // Exp-Golomb code it is `1 << 32` — a shift overflow, which panicked
+        // the output's task under overflow checks and stored garbage as id 0
+        // without them.
+        let zeros = [0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0xA5];
+        let cases = [
+            (VideoCodec::H264, [&[0x68][..], &zeros].concat()),
+            (VideoCodec::H264, [&[0x67, 0x64, 0x00, 0x28][..], &zeros].concat()),
+            (VideoCodec::H265, [&[0x44, 0x01][..], &zeros].concat()),
+        ];
+        for (codec, nal) in cases {
+            assert_eq!(classify(codec, &nal), None, "{nal:02x?}");
+            let mut col = ParamSetCollector::default();
+            col.observe(codec, std::slice::from_ref(&nal), true);
+            col.observe(codec, std::slice::from_ref(&nal), false);
+            assert_eq!(table(&col, codec), ParamSets::default());
+        }
+    }
+
+    /// A parameter set longer than a configuration record's 16-bit length is
+    /// never stored: written into an init it would carry a truncated length,
+    /// and nothing else bounds what one entry can hold.
+    #[test]
+    fn a_parameter_set_too_long_for_the_record_is_never_stored() {
+        let c = VideoCodec::H264;
+        let sized = |len: usize, tag: u8| {
+            let mut nal = h264_pps(1, tag);
+            nal.resize(len, 0xA5);
+            nal
+        };
+        assert_eq!(classify(c, &sized(MAX_PARAM_SET_LEN, 1)), Some((Kind::Pps, 1)));
+        assert_eq!(classify(c, &sized(MAX_PARAM_SET_LEN + 1, 1)), None);
+        let mut col = ParamSetCollector::default();
+        col.observe(c, &au(&[&h264_sps(0, 1), &h264_pps(0, 1), &H264_IDR]), true);
+        let before = table(&col, c);
+        let oversize = sized(MAX_PARAM_SET_LEN + 1, 2);
+        // Merged between random-access points, and as the only PPS of a
+        // random-access point — which therefore does not carry its kind.
+        col.observe(c, &au(&[&oversize, &H264_P]), false);
+        assert_eq!(table(&col, c), before);
+        col.observe(c, &au(&[&h264_sps(0, 1), &oversize, &H264_IDR]), true);
+        assert_eq!(table(&col, c), before);
     }
 
     #[test]
@@ -759,7 +813,8 @@ pub(super) mod tests {
     }
 
     /// `avcC` counts SPS in five bits and PPS in eight; a source past either
-    /// keeps the lowest ids that fit rather than writing a count that wraps.
+    /// keeps the first ids it sent that fit rather than writing a count that
+    /// wraps — the lowest ones, for a source sending them in id order.
     #[test]
     fn the_avcc_caps_hold() {
         let c = VideoCodec::H264;

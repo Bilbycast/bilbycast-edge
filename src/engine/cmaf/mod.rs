@@ -2068,13 +2068,21 @@ async fn handle_frame(
         // A stream discontinuity: a PMT version bump, which
         // `TsContinuityFixer` makes on every input switch. The segmenter
         // advances on its own GoP cadence and opens a new init generation
-        // when the new source's parameter sets differ; what must not happen
-        // is the old source's sets carrying over into the new source's
-        // table, where an id the new source never sends would sit in every
-        // later init. The demuxer drops its own cached sets on a change of
-        // video PID or codec; this goes further, to every switch. Until the
-        // new source's first parameter sets the table is incomplete, so the
-        // track stays as it is.
+        // when the new source's parameter sets differ; this drops what the
+        // old source sent before the switch, so its extra ids do not sit in
+        // the new source's table and every later init. The demuxer drops its
+        // own cached sets on a change of video PID or codec; this goes
+        // further, to every switch. Until the next parameter sets arrive the
+        // table is incomplete, so the track stays as it is.
+        //
+        // It is not a clean cut. On a switch that keeps the video PID and
+        // codec, the old source's last picture is still in the demuxer's PES
+        // assembler and comes out *after* this frame, completed by the new
+        // source's first PES — so any parameter sets it carries land in the
+        // fresh table. The new source's first random-access access unit that
+        // carries a kind replaces that kind; a new source that sends its sets
+        // only outside a random-access point merges them in by id beside the
+        // old picture's, as it would have with no reset at all.
         DemuxedFrame::Discontinuity => {
             state.source_params = ParamSetCollector::default();
         }

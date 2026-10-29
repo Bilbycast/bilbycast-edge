@@ -389,24 +389,9 @@ fn a_source_switch_rotates_once_and_drops_the_old_extra_pps() {
     out.assert_every_sample_decodable();
 }
 
-/// The same switch where the new source sends its sets ahead of its IDR,
-/// in an access unit of their own, and the IDR carries none — which a
-/// random-access point alone cannot clean up: merged by id, the old source's
-/// PPS1 would stay in the table and the new init. The demuxer's discontinuity
-/// (the PMT version bump every operator switch makes) starts the table again.
-#[tokio::test]
-async fn a_discontinuity_starts_the_table_again() {
-    let mut out = Out::new(VideoCodec::H264);
-    let a = [h264_sps(0, 0xA1), h264_pps(0, 0xA1), h264_pps(1, 0xA1)];
-    let b = [h264_sps(0, 0xB2), h264_pps(0, 0xB2)];
-    for _ in 0..2 {
-        out.feed(vec![a[0].clone(), a[1].clone(), a[2].clone(), h264_slice(true, 0)], true);
-        for i in 1..25 {
-            out.feed(vec![h264_slice(false, i % 2)], false);
-        }
-    }
-
-    // The switch, through the output's own frame handler.
+/// A stream discontinuity — the PMT version bump every operator switch
+/// makes — through the output's own frame handler.
+async fn discontinuity(out: &mut Out) {
     let mut demuxer = TsDemuxer::new(None);
     let stats = OutputStatsAccumulator::new("o".into(), "o".into(), "cmaf".into());
     let (events, _rx) = crate::manager::events::event_channel();
@@ -429,6 +414,27 @@ async fn a_discontinuity_starts_the_table_again() {
         0,
     )
     .await;
+}
+
+/// The same switch where the new source sends its sets ahead of its IDR,
+/// in an access unit of their own, and the IDR carries none — which a
+/// random-access point alone cannot clean up: merged by id, the old source's
+/// PPS1 would stay in the table and the new init. The demuxer's discontinuity
+/// (the PMT version bump every operator switch makes) starts the table again.
+#[tokio::test]
+async fn a_discontinuity_starts_the_table_again() {
+    let mut out = Out::new(VideoCodec::H264);
+    let a = [h264_sps(0, 0xA1), h264_pps(0, 0xA1), h264_pps(1, 0xA1)];
+    let b = [h264_sps(0, 0xB2), h264_pps(0, 0xB2)];
+    for _ in 0..2 {
+        out.feed(vec![a[0].clone(), a[1].clone(), a[2].clone(), h264_slice(true, 0)], true);
+        for i in 1..25 {
+            out.feed(vec![h264_slice(false, i % 2)], false);
+        }
+    }
+
+    // The switch, through the output's own frame handler.
+    discontinuity(&mut out).await;
     assert!(out.state.source_params.sets(VideoCodec::H264).is_none(), "the table starts again");
 
     // Until the new source's sets arrive nothing changes, keyframe or not.
@@ -450,6 +456,55 @@ async fn a_discontinuity_starts_the_table_again() {
     assert_eq!(sets.sps.iter().map(|s| &s.nal).collect::<Vec<_>>(), vec![&b[0]]);
     let pps: Vec<&Vec<u8>> = sets.pps.iter().map(|s| &s.nal).collect();
     assert_eq!(pps, vec![&b[1]], "no PPS1 of the old source");
+}
+
+/// What the reset does not cover. On a switch that keeps the video PID and
+/// codec, the old source's last picture is still in the demuxer's PES
+/// assembler when the PMT bump is seen, and comes out after the
+/// discontinuity — completed by the new source's first PES — so its
+/// parameter sets land in the fresh table. A new source whose random-access
+/// point re-sends each kind replaces them; one that sends its sets only
+/// outside a random-access point merges them in beside the old picture's,
+/// and the old source's extra PPS reaches the next init, as it would have
+/// with no reset (docs/cmaf.md, Every parameter set, by id).
+#[tokio::test]
+async fn the_old_sources_last_picture_after_a_discontinuity() {
+    let a = [h264_sps(0, 0xA1), h264_pps(0, 0xA1), h264_pps(1, 0xA1)];
+    let b = [h264_sps(0, 0xB2), h264_pps(0, 0xB2)];
+    for sets_at_the_idr in [true, false] {
+        let mut out = Out::new(VideoCodec::H264);
+        for _ in 0..2 {
+            out.feed(vec![a[0].clone(), a[1].clone(), a[2].clone(), h264_slice(true, 0)], true);
+            for i in 1..25 {
+                out.feed(vec![h264_slice(false, i % 2)], false);
+            }
+        }
+        discontinuity(&mut out).await;
+        // The old source's last picture: it re-sent its sets mid-GOP.
+        out.feed(vec![a[0].clone(), a[1].clone(), a[2].clone(), h264_slice(false, 1)], false);
+        let table = out.state.source_params.sets(VideoCodec::H264).unwrap();
+        assert_eq!(table.pps.len(), 2, "the old picture's sets are in the fresh table");
+        if sets_at_the_idr {
+            out.feed(vec![b[0].clone(), b[1].clone(), h264_slice(true, 0)], true);
+        } else {
+            out.feed(vec![b[0].clone(), b[1].clone()], false);
+            out.feed(vec![h264_slice(true, 0)], true);
+        }
+        for _ in 1..25 {
+            out.feed(vec![h264_slice(false, 0)], false);
+        }
+        out.feed(vec![h264_slice(true, 0)], true);
+        assert_eq!(out.generation(), 1, "exactly one rotation");
+        let sets = &out.track().param_sets;
+        assert_eq!(sets.sps.iter().map(|s| &s.nal).collect::<Vec<_>>(), vec![&b[0]]);
+        let pps: Vec<&Vec<u8>> = sets.pps.iter().map(|s| &s.nal).collect();
+        if sets_at_the_idr {
+            assert_eq!(pps, vec![&b[1]], "the IDR's PPS replaced the old picture's");
+        } else {
+            assert_eq!(pps, vec![&b[1], &a[2]], "the old source's PPS1 stays beside the new PPS0");
+        }
+        out.assert_every_sample_decodable();
+    }
 }
 
 /// A PPS re-sent with new content between IDRs takes effect at the next
@@ -509,15 +564,49 @@ fn same_id_churn_rotates_only_on_the_raps_own_change() {
 /// The track is built from the parameter sets sent up to the picture being
 /// handled — never from a later picture's. The demuxer's cache was read after
 /// the whole datagram had been demuxed, so the first IDR's track could take
-/// a PPS from a picture behind it in the same batch.
+/// a PPS from a picture behind it in the same batch. Here the IDR (PPS0
+/// first content) and the P picture after it (PPS0 re-sent with other
+/// content) reach the output in one datagram, through the real muxer and
+/// demuxer: on the code before this fix the track took the P picture's PPS0.
 #[test]
 fn parameter_sets_are_read_per_frame_not_per_batch() {
+    use crate::engine::rtmp::ts_mux::TsMuxer;
+    let aus = [
+        (vec![h264_sps(0, 1), h264_pps(0, 1), h264_slice(true, 0)], true),
+        (vec![h264_pps(0, 2), h264_slice(false, 0)], false),
+        (vec![h264_slice(false, 0)], false),
+        (vec![h264_slice(false, 0)], false),
+    ];
+    let mut mux = TsMuxer::new();
+    let mut batch = Vec::new();
+    for (frame, (nals, key)) in aus.iter().enumerate() {
+        let mut annex_b = Vec::new();
+        for n in nals {
+            annex_b.extend_from_slice(&[0, 0, 0, 1]);
+            annex_b.extend_from_slice(n);
+        }
+        let pts = 900_000 + frame as u64 * FRAME_90K;
+        batch.extend(mux.mux_video(&annex_b, pts, pts, *key).iter().flat_map(|p| p.iter().copied()));
+    }
+    let mut demuxer = TsDemuxer::new(None);
+    let frames: Vec<_> = demuxer
+        .demux(&batch)
+        .into_iter()
+        .filter_map(|f| match f {
+            DemuxedFrame::H264 { nalus, is_keyframe, .. } => Some((nalus, is_keyframe)),
+            _ => None,
+        })
+        .collect();
+    assert!(frames.len() >= 2, "fixture: the IDR and the P picture in one batch");
     let mut out = Out::new(VideoCodec::H264);
-    out.feed(vec![h264_sps(0, 1), h264_pps(0, 1), h264_slice(true, 0)], true);
-    assert_eq!(out.track().param_sets.pps[0].nal, h264_pps(0, 1));
-    out.feed(vec![h264_pps(0, 2), h264_slice(false, 0)], false);
-    assert_eq!(out.track().param_sets.pps[0].nal, h264_pps(0, 1), "the first IDR's own");
-    assert!(!out.state.video_seg.as_ref().unwrap().rotation_pending());
+    for (i, (nalus, is_keyframe)) in frames.into_iter().enumerate() {
+        out.feed(nalus, is_keyframe);
+        if i == 0 {
+            assert_eq!(out.track().param_sets.pps[0].nal, h264_pps(0, 1), "the IDR's own PPS0");
+        }
+    }
+    assert_eq!(out.track().param_sets.pps[0].nal, h264_pps(0, 1), "not the P picture's");
+    assert!(!out.state.video_seg.as_ref().unwrap().rotation_pending(), "nothing mid-GOP");
 }
 
 /// With more than one SPS, the one the track's dimensions, configuration

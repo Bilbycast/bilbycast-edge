@@ -569,10 +569,10 @@ the edge advertises — see `bilbycast-relay/docs/distribution.md`.
 
 ## Init generations
 
-The video track is built from the parameter sets the source has sent by its
-first IDR — every one of them, by id (see [Every parameter set, by
-id](#every-parameter-set-by-id) below) — and it used to stay that way for
-life — which is true right up until the encoder upstream changes
+The video track is built as soon as the source has sent a complete set of
+parameter sets — every one it has sent by then, by id (see [Every parameter
+set, by id](#every-parameter-set-by-id) below); the samples before its first
+IDR are dropped — and it used to stay that way for life — which is true right up until the encoder upstream changes
 underneath: an operator pinning a codec, `h264_auto` falling between NVENC
 and x264, a contribution encoder rebooting into a different profile. Every
 sample after that decodes against different parameter sets from the ones in
@@ -626,7 +626,8 @@ sample entry carries them out of band only — the samples are stripped of
 theirs — so the init's `avcC` / `hvcC` holds **every** SPS and PPS (and HEVC
 VPS) the source has sent, one entry per id, in id order. ISO/IEC 14496-15
 allows up to 31 SPS and 255 PPS in an `avcC` (a source past either keeps the
-lowest ids that fit), and an `hvcC` array counts in sixteen bits.
+first ids it sent that fit — the lowest, sent in id order — rather than
+writing a count that wraps), and an `hvcC` array counts in sixteen bits.
 
 It used to carry one of each kind, the last one the demuxer had seen. A source
 whose random-access points carry more than one PPS — the 770_H capture sends
@@ -653,16 +654,24 @@ unit merges its sets in by id. So:
 - A source that changes underneath drops its predecessor's extra ids at its
   first random-access point that re-sends them. And every stream
   discontinuity the demuxer reports — the PMT version bump each operator
-  switch makes — starts the table again, so a new source that sends its sets
-  in an access unit of their own, ahead of an IDR that carries none, does not
-  inherit the old source's extra PPS either. Until the new source's first sets
-  arrive the table is incomplete and the track stays as it is.
+  switch makes — starts the table again, dropping what the old source sent
+  before the switch. Until the next sets arrive the table is incomplete and
+  the track stays as it is. It is not a clean cut: on a switch that keeps the
+  video PID and codec, the old source's last picture is still being
+  reassembled when the switch is seen, and reaches the table after the
+  reset. If it carries parameter sets they are in the new table; the new
+  source's first random-access point that re-sends a kind replaces them, but
+  a new source that sends its sets only outside a random-access point merges
+  its sets in beside them, and an extra PPS of the old source's can reach
+  the next init — as it could with no reset at all.
 
 A parameter set is stored under the id it names. One that names none — cut
 short (a PES truncated by loss can end on a one-byte NAL), an id out of the
 codec's range, or an HEVC set for a layer other than the base layer — is
 ignored, never stored: it could not be matched to a slice, and in an init it
-is a record a strict decoder may refuse whole.
+is a record a strict decoder may refuse whole. So is one over 65 535 bytes,
+which a configuration record's 16-bit length cannot describe (a real one is a
+few hundred bytes at most).
 
 The configuration record's profile / level header bytes, the track's
 dimensions and the DASH `@codecs` string are read from the **lowest-id
@@ -1791,7 +1800,11 @@ backward decode steps to none.
   that re-sends that kind without it drops it again; slices naming it are
   undecodable meanwhile, as they were before. A PPS re-sent mid-GOP with new
   content leaves the pictures after it decoding against the old content until
-  the next IDR. The `sky-sports-arena` capture does this to its only PPS: 104
+  the next IDR. The lab's `BTS204.ts` (PID 0x111) does the first: its IDRs
+  carry SPS0 and PPS0, PPS1 arrives only in access units between them, and
+  the 15 pictures of the 529 in its first 40 MiB that name PPS1 do not
+  decode — as before edge#204, when the init held PPS0 alone too. The
+  `sky-sports-arena` capture does the second to its only PPS: 104
   distinct contents of PPS0 in its first 80 MiB, 23 of them on its 44 IDRs, so
   its init rotates at almost every IDR and its mid-GOP pictures decode against
   a stale PPS0 — no better and no worse than before edge#204, though the IDR
