@@ -1081,13 +1081,13 @@ Every field from `active_input_id` down is `skip_serializing_if`-guarded: its **
 | `output_name` | string | Display name |
 | `output_type` | string | Free-form output type string — common values include `"udp"`, `"rtp"`, `"srt"`, `"rist"`, `"rtmp"`, `"hls"`, `"cmaf"`, `"webrtc"`, `"rtp_audio"`, `"bonded"`, `"display"`, `"sdi"`, `"st2110_20/23/30/31/40"` (full list under [Outputs](#outputs)) |
 | `state` | string | Connection state |
-| `packets_sent` | integer | Total packets sent |
-| `bytes_sent` | integer | Total bytes sent |
+| `packets_sent` | integer | Total packets sent. On a SMPTE 2022-7 SRT output, which sends every packet on both legs, each is counted once: by leg 1, or by leg 2 once leg 1 has been lost, so a pair carried by leg 2 alone still counts |
+| `bytes_sent` | integer | Total bytes sent, counted as `packets_sent` is |
 | `bitrate_bps` | integer | Current bitrate in bits/sec |
 | `packets_dropped` | integer | Packets dropped (channel full) |
 | `fec_packets_sent` | integer | FEC packets sent |
-| `srt_stats` | object/null | SRT leg 1 stats (if SRT output) |
-| `srt_leg2_stats` | object/null | SRT leg 2 stats (if redundancy) |
+| `srt_stats` | object/null | SRT stats of a single-socket SRT output, or of leg 1 of a SMPTE 2022-7 one. Present while the socket is connected; absent while it reconnects, and on a 2022-7 output from the moment leg 1 is lost until the pair reconnects |
+| `srt_leg2_stats` | object/null | Leg 2's (the `redundancy` leg's) SRT stats on a SMPTE 2022-7 SRT output. Present while leg 2 is connected; absent before it connects, and from the moment it is lost until the pair reconnects |
 
 **SRT leg stats fields:**
 

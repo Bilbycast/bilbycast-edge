@@ -1508,6 +1508,61 @@ async fn srt_output_forward_loop(
 // Dual-leg SRT output with SMPTE 2022-7 duplication
 // ---------------------------------------------------------------------------
 
+/// What the other leg of a 2022-7 SRT output pair is doing when one leg is
+/// lost: `details.other_leg` on the leg-lost event.
+///
+/// This is deliberately **not** the forward loop's teardown verdict. That
+/// verdict counts a leg 2 whose connect is still pending as able to carry, so
+/// the pair is not torn down (dropping the leg-2 listener held inside the
+/// pending connect future) before leg 2 has had its budget. But such a leg
+/// carries nothing yet, and an event saying the output runs on it would be
+/// false at exactly the moment the output is dark.
+///
+/// `queued` is the outcome of handing the leg the current payload:
+/// `Some(true)` queued, or shed on backpressure (a full queue is a live leg);
+/// `Some(false)` its send task is gone; `None` no socket attached.
+/// `connect_done` is whether the leg's connect has resolved this cycle.
+/// Leg 1 is connected before a cycle starts, so it always passes `true`.
+fn redundant_other_leg_state(queued: Option<bool>, connect_done: bool) -> &'static str {
+    match queued {
+        Some(true) => "carrying",
+        Some(false) => "down",
+        None if !connect_done => "connecting",
+        None => "down",
+    }
+}
+
+/// Raise the Warning for a lost leg of a 2022-7 SRT output.
+///
+/// The message is fixed per leg. The manager folds an unacknowledged event
+/// into an existing row with the same message, and `details` are not part of
+/// that key, so a message that varied with the other leg's state would split
+/// one leg's losses across rows. The other leg's state rides in `details`.
+///
+/// The error code is distinct from the RTP input's flow-scoped
+/// `redundancy_leg_dropped`, so a manager Routine filtered on that code does
+/// not start firing on an output's legs as well.
+fn emit_redundant_output_leg_lost(
+    events: &EventSender,
+    output_id: &str,
+    leg: u8,
+    mode: SrtMode,
+    other_leg: &'static str,
+) {
+    events.emit_output_with_details(
+        EventSeverity::Warning,
+        category::REDUNDANCY,
+        format!("SRT output '{output_id}' 2022-7 leg {leg} lost; down until the pair reconnects"),
+        output_id,
+        serde_json::json!({
+            "error_code": "redundancy_output_leg_lost",
+            "leg": leg,
+            "mode": format!("{mode:?}"),
+            "other_leg": other_leg,
+        }),
+    );
+}
+
 /// Core send loop for dual-leg SRT output with SMPTE 2022-7 packet duplication.
 ///
 /// Connects two independent SRT legs (leg 1 from the main config, leg 2 from
@@ -1517,8 +1572,21 @@ async fn srt_output_forward_loop(
 /// Listener-mode legs bind once and re-accept on disconnect; caller-mode legs
 /// reconnect with exponential back-off.
 ///
-/// Stats counting: only leg 1 increments `packets_sent` and `bytes_sent` to
-/// avoid double-counting, since both legs carry identical data.
+/// Each leg runs its own SRT stats poller: leg 1 publishes `srt_stats`, leg 2
+/// `srt_leg2_stats`. A leg's poller is cancelled, which clears its stats,
+/// when the leg is lost and at the end of every connect cycle.
+///
+/// A leg whose send task dies raises a `redundancy` Warning
+/// ([`emit_redundant_output_leg_lost`]) once per cycle. The lost leg stays
+/// down until the pair reconnects, which happens only once both legs are
+/// gone. The other leg carries on alone meanwhile.
+///
+/// Stats counting: while leg 1 is up, only leg 1 increments `packets_sent`,
+/// `bytes_sent` and the latency, to avoid double-counting, since both legs
+/// carry identical data. Once leg 1's send fails, leg 2's send task counts
+/// instead, so a pair carried by leg 2 alone does not read `idle`. Around the
+/// handoff a packet can be counted twice or not at all, bounded by how far
+/// the two legs' queues were apart. That is stats only.
 async fn srt_output_redundant_loop(
     config: &SrtOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
@@ -1610,10 +1678,27 @@ async fn srt_output_redundant_loop(
         // on an idle socket.
         let mut rx = broadcast_tx.subscribe();
 
+        // Leg 1's stats until it is lost or the cycle ends; leg 2's from
+        // when it attaches.
+        let leg1_poller = cancel.child_token();
+        spawn_srt_stats_poller(socket_leg1.clone(), stats.srt_stats_cache.clone(), None, leg1_poller.clone());
+        let leg2_poller = cancel.child_token();
+        // Set by leg 1's send task when a send fails. From then on leg 2's
+        // task counts what the output sends, so a pair carried by leg 2
+        // alone never reads idle. It is set only on a send error, never when
+        // the queue closes at teardown, so a normal stop does not make leg 2
+        // count what it drains on top of what leg 1 drained. An AtomicBool,
+        // not a CancellationToken: leg 2's task reads it per item, and
+        // `is_cancelled` takes a lock.
+        let leg1_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Each leg raises its leg-lost event at most once per cycle.
+        let (mut leg1_up, mut leg2_up) = (true, false);
+
         let (send_tx_leg1, mut send_rx_leg1) = send_queue();
         let send_socket1 = socket_leg1.clone();
         let send_stats1 = stats.clone();
         let output_id1 = config.id.clone();
+        let leg1_lost_tx = leg1_lost.clone();
         let send_handle1 = tokio::spawn(async move {
             while let Some((data, recv_time_us)) = send_rx_leg1.recv().await {
                 match srt_send_chunked(&send_socket1, &data).await {
@@ -1627,6 +1712,7 @@ async fn srt_output_redundant_loop(
                     }
                     Err(e) => {
                         tracing::warn!("SRT output '{}' leg1 send error: {e}", output_id1);
+                        leg1_lost_tx.store(true, Ordering::Relaxed);
                         break;
                     }
                 }
@@ -1769,19 +1855,37 @@ async fn srt_output_redundant_loop(
                         listener_leg2 = returned_listener;
                     }
                     if let Some(sock2) = sock {
+                        spawn_srt_stats_poller(sock2.clone(), stats.srt_leg2_stats_cache.clone(), None, leg2_poller.clone());
                         let (tx2, mut rx2) = send_queue();
                         let send_socket2 = sock2.clone();
+                        let send_stats2 = stats.clone();
+                        let leg1_lost2 = leg1_lost.clone();
                         let output_id2 = config.id.clone();
                         tokio::spawn(async move {
-                            while let Some((data, _recv_time_us)) = rx2.recv().await {
+                            while let Some((data, recv_time_us)) = rx2.recv().await {
+                                // While leg 1 is up it counts what the pair
+                                // sends, so leg 2 counts nothing. Once leg
+                                // 1's send has failed, leg 2 counts.
+                                let counts = leg1_lost2.load(Ordering::Relaxed);
                                 match srt_send_chunked(&send_socket2, &data).await {
-                                    Ok(_) => { /* leg 1 already counted — avoid double-count */ }
+                                    Ok(sent) => {
+                                        if counts {
+                                            send_stats2.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                            send_stats2.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                                            send_stats2.record_latency(recv_time_us);
+                                        }
+                                    }
                                     Err(e) if is_transient_backpressure(&e) => {
                                         // Transient Rust-side channel pressure
                                         // on leg 2 only. Drop this packet and
-                                        // continue — leg 1 carries the dupe
-                                        // under 2022-7 so the receiver merge
-                                        // is unaffected.
+                                        // continue. While leg 1 is up it
+                                        // carries the dupe under 2022-7, so
+                                        // the receiver merge is unaffected
+                                        // and nothing is counted; once leg 1
+                                        // is lost the drop is the output's.
+                                        if counts {
+                                            send_stats2.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                     Err(e) => {
                                         tracing::warn!("SRT output '{}' leg2 send error: {e}", output_id2);
@@ -1792,6 +1896,19 @@ async fn srt_output_redundant_loop(
                         });
                         socket_leg2 = Some(sock2);
                         send_tx_leg2_opt = Some(tx2);
+                        leg2_up = true;
+                        // Its own message: the manager folds an event into
+                        // an unacknowledged row with the same message, so
+                        // leg 1's text would hide this one in leg 1's row.
+                        events.emit_output_with_details(
+                            EventSeverity::Info, category::SRT,
+                            format!("SRT output '{}' 2022-7 leg 2 connected", config.id), &config.id,
+                            serde_json::json!({
+                                "mode": format!("{:?}", redundancy.mode),
+                                "leg": 2,
+                                "local_addr": redundancy.local_addr.as_deref().unwrap_or("auto"),
+                            }),
+                        );
                     }
                     continue;
                 }
@@ -1918,22 +2035,59 @@ async fn srt_output_redundant_loop(
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
                 };
 
-                // An absent leg 2 is "not connected yet", not "lost". Leg 2
-                // attaches lazily once its connect future resolves, and while
-                // it was counted as a dead leg a single rejection on leg 1 was
-                // enough to satisfy the teardown condition for the whole
-                // pre-connection window.
-                let leg2_alive = match send_tx_leg2_opt {
-                    Some(ref tx2) => match tx2.try_send((payload, recv_time_us)) {
+                // `None` while no leg-2 socket is attached.
+                let leg2_queued = send_tx_leg2_opt.as_ref().map(|tx2| {
+                    match tx2.try_send((payload, recv_time_us)) {
                         Ok(()) => true,
                         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                             stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                             true
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-                    },
-                    None => true,
-                };
+                    }
+                });
+                // An absent leg 2 is "not connected yet", not "lost". Leg 2
+                // attaches lazily once its connect future resolves, and while
+                // it was counted as a dead leg a single rejection on leg 1 was
+                // enough to satisfy the teardown condition for the whole
+                // pre-connection window.
+                //
+                // Known gap, left for a follow-up: once the connect future
+                // has resolved with no socket (`leg2_done`), leg 2 never
+                // attaches this cycle, yet it still counts as alive here, so
+                // a leg 1 lost after that never tears the pair down and the
+                // output stays dark until it is restarted. The fix is this
+                // line, as `leg2_queued.unwrap_or(!leg2_done)`. It is left
+                // to a change of its own because it alters what such an
+                // output does: it would then reconnect the pair.
+                let leg2_alive = leg2_queued.unwrap_or(true);
+
+                // Each leg's loss is raised here, at most once per cycle,
+                // and not from its send task: at teardown the sockets close
+                // while leg 2's task, which is never awaited, may still be
+                // draining, and its send error then is no lost leg.
+                if leg1_up && !leg1_alive {
+                    leg1_up = false;
+                    leg1_poller.cancel();
+                    emit_redundant_output_leg_lost(
+                        events,
+                        &config.id,
+                        1,
+                        config.mode,
+                        redundant_other_leg_state(leg2_queued, leg2_done),
+                    );
+                }
+                if leg2_up && !leg2_alive {
+                    leg2_up = false;
+                    leg2_poller.cancel();
+                    emit_redundant_output_leg_lost(
+                        events,
+                        &config.id,
+                        2,
+                        redundancy.mode,
+                        redundant_other_leg_state(Some(leg1_alive), true),
+                    );
+                }
 
                 if !leg1_alive && !leg2_alive {
                     // Reaching here now means both legs' send tasks are
@@ -1962,7 +2116,12 @@ async fn srt_output_redundant_loop(
             }
         }
 
-        // Cleanup sockets before reconnect (listeners stay open)
+        // Cleanup sockets before reconnect (listeners stay open). The
+        // pollers go first, so neither leg's stats outlive its socket. (On
+        // the cancel arm above they are already gone: both are children of
+        // `cancel`.)
+        leg1_poller.cancel();
+        leg2_poller.cancel();
         drop(send_tx_leg1);
         drop(send_tx_leg2_opt);
         let _ = send_handle1.await;
@@ -2529,5 +2688,350 @@ mod tests {
             }
             Ok(()) => panic!("a closed channel must not accept"),
         }
+    }
+
+    // ── SMPTE 2022-7 output legs (edge#181) ──────────────────────────
+
+    #[test]
+    fn the_other_leg_is_reported_by_what_it_carries() {
+        // Queued, or shed on backpressure: a full queue is a live leg.
+        assert_eq!(redundant_other_leg_state(Some(true), true), "carrying");
+        // Its send task is gone.
+        assert_eq!(redundant_other_leg_state(Some(false), true), "down");
+        // No socket yet and its connect still pending. The pair is kept up
+        // for it, but it carries nothing, so it must not read as carrying.
+        assert_eq!(redundant_other_leg_state(None, false), "connecting");
+        // No socket, and its connect has given up.
+        assert_eq!(redundant_other_leg_state(None, true), "down");
+    }
+
+    /// A 2022-7 SRT output with both legs listening on loopback, fed a
+    /// 1316-byte null-TS item every 2 ms, and the events it raised.
+    struct PairHarness {
+        stats: Arc<OutputStatsAccumulator>,
+        events_rx: tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        events: Vec<crate::manager::events::Event>,
+        published: Arc<AtomicU64>,
+        ports: (u16, u16),
+        cancel: CancellationToken,
+        output: Option<JoinHandle<()>>,
+    }
+
+    fn event_leg(event: &crate::manager::events::Event) -> Option<u64> {
+        event.details.as_ref().and_then(|d| d["leg"].as_u64())
+    }
+
+    impl PairHarness {
+        fn start() -> Self {
+            let free_port = || {
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+            };
+            let ports = (free_port(), free_port());
+            // A latency well above loopback scheduling jitter on a loaded
+            // test host, so libsrt drops nothing of its own.
+            let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
+                "id": "o1", "name": "o1", "mode": "listener",
+                "local_addr": format!("127.0.0.1:{}", ports.0), "latency_ms": 200,
+                "redundancy": {
+                    "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.1),
+                    "latency_ms": 200
+                }
+            }))
+            .expect("SRT output fixture");
+            let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+            let (tx, _rx) = broadcast::channel(4096);
+            let (event_sender, events_rx) = crate::manager::events::event_channel();
+            let cancel = CancellationToken::new();
+            let output = spawn_srt_output(
+                config,
+                &tx,
+                stats.clone(),
+                cancel.child_token(),
+                SrtOutputCtx {
+                    event_sender,
+                    flow_id: "f1".into(),
+                    input_format: None,
+                    compressed_audio_input: false,
+                    frame_rate_rx: None,
+                    active_input_rx: tokio::sync::watch::channel(String::new()).1,
+                },
+            );
+            let published = Arc::new(AtomicU64::new(0));
+            let (count, stop) = (published.clone(), cancel.clone());
+            tokio::spawn(async move {
+                let mut ts = Vec::with_capacity(1316);
+                for _ in 0..7 {
+                    ts.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+                    ts.extend_from_slice(&[0xFF; 184]);
+                }
+                let data = Bytes::from(ts);
+                let mut tick = tokio::time::interval(Duration::from_millis(2));
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = tick.tick() => {
+                            // Counted before it is offered, so what the
+                            // output sent can never run ahead of it.
+                            count.fetch_add(1, Ordering::Relaxed);
+                            let _ = tx.send(RtpPacket {
+                                data: data.clone(),
+                                sequence_number: 0,
+                                rtp_timestamp: 0,
+                                recv_time_us: now_us(),
+                                is_raw_ts: true,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
+                                sender_timestamp_us: None,
+                            });
+                        }
+                    }
+                }
+            });
+            Self {
+                stats,
+                events_rx,
+                events: Vec::new(),
+                published,
+                ports,
+                cancel,
+                output: Some(output),
+            }
+        }
+
+        /// A receiver calling `port`, drained by a task counting what it
+        /// receives.
+        async fn connect(&self, port: u16) -> (Arc<SrtSocket>, Arc<AtomicU64>) {
+            let config: crate::config::models::SrtInputConfig =
+                serde_json::from_value(serde_json::json!({
+                    "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"),
+                    "latency_ms": 200
+                }))
+                .expect("SRT caller fixture");
+            let socket = crate::srt::connection::connect_srt_input(&config, &self.cancel)
+                .await
+                .expect("caller connects");
+            let received = Arc::new(AtomicU64::new(0));
+            let (drain, count) = (socket.clone(), received.clone());
+            tokio::spawn(async move {
+                while drain.recv().await.is_ok() {
+                    count.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            (socket, received)
+        }
+
+        fn pump_events(&mut self) {
+            while let Ok(event) = self.events_rx.try_recv() {
+                self.events.push(event);
+            }
+        }
+
+        async fn wait_until(&mut self, what: &str, cond: impl Fn(&Self) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                self.pump_events();
+                if cond(self) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        fn leg_lost(&self, leg: u64) -> Vec<&crate::manager::events::Event> {
+            self.events
+                .iter()
+                .filter(|e| e.category == category::REDUNDANCY && event_leg(e) == Some(leg))
+                .collect()
+        }
+
+        fn connected(&self, leg: u64) -> Option<&crate::manager::events::Event> {
+            self.events.iter().find(|e| {
+                e.category == category::SRT
+                    && e.severity == EventSeverity::Info
+                    && event_leg(e) == Some(leg)
+            })
+        }
+
+        fn disconnected(&self) -> bool {
+            self.events.iter().any(|e| e.message.ends_with("disconnected"))
+        }
+
+        fn both_legs_report(&self) -> bool {
+            let snap = self.stats.snapshot();
+            snap.srt_stats.is_some() && snap.srt_leg2_stats.is_some()
+        }
+
+        /// Stop the output and wait for it to return.
+        async fn stop(&mut self) {
+            self.cancel.cancel();
+            if let Some(output) = self.output.take() {
+                tokio::time::timeout(Duration::from_secs(10), output)
+                    .await
+                    .expect("the output stops")
+                    .expect("the output task does not panic");
+            }
+        }
+    }
+
+    impl Drop for PairHarness {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    fn assert_leg_lost(event: &crate::manager::events::Event, leg: u64, other_leg: &str) {
+        assert_eq!(event.severity, EventSeverity::Warning);
+        assert_eq!(event.output_id.as_deref(), Some("o1"));
+        assert_eq!(event.flow_id, None, "an output event");
+        assert_eq!(
+            event.message,
+            format!("SRT output 'o1' 2022-7 leg {leg} lost; down until the pair reconnects"),
+            "fixed per leg, whatever the other leg is doing"
+        );
+        let details = event.details.as_ref().expect("details");
+        assert_eq!(details["error_code"], "redundancy_output_leg_lost");
+        assert_eq!(details["mode"], "Listener");
+        assert_eq!(details["other_leg"], other_leg);
+    }
+
+    /// Both legs report their own SRT stats; leg 2 announces itself in a
+    /// row of its own; the pair counts each item once; and when leg 1 is
+    /// lost the output says so, drops leg 1's stats, and goes on counting
+    /// what leg 2 carries, so it does not read idle. Before edge#181 a
+    /// 2022-7 output published no SRT stats for either leg, raised nothing
+    /// until both legs were gone, and read idle on leg 2 alone.
+    #[tokio::test]
+    async fn a_2022_7_output_reports_both_legs_and_survives_leg_1_loss() {
+        let mut h = PairHarness::start();
+        let (leg1, _received1) = h.connect(h.ports.0).await;
+        let (_leg2, received2) = h.connect(h.ports.1).await;
+
+        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
+        h.wait_until("leg 2's connected event", |h| h.connected(2).is_some()).await;
+        let (leg1_up, leg2_up) = (h.connected(1).unwrap(), h.connected(2).unwrap());
+        assert_eq!(leg1_up.message, "SRT output 'o1' connected");
+        assert_eq!(leg2_up.message, "SRT output 'o1' 2022-7 leg 2 connected");
+        assert_eq!(leg2_up.output_id.as_deref(), Some("o1"));
+
+        // Both legs up: leg 1 alone counts, so the pair counts each item
+        // once, not twice.
+        let (published0, sent0) =
+            (h.published.load(Ordering::Relaxed), h.stats.packets_sent.load(Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let published = h.published.load(Ordering::Relaxed) - published0;
+        let sent = h.stats.packets_sent.load(Ordering::Relaxed) - sent0;
+        assert!(
+            sent * 2 > published && sent * 4 < published * 5,
+            "both legs up, the pair counts each item once: {sent} sent for {published} published"
+        );
+
+        leg1.close().await.unwrap();
+        h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
+        assert_leg_lost(h.leg_lost(1)[0], 1, "carrying");
+        h.wait_until("leg 1's stats to clear", |h| h.stats.snapshot().srt_stats.is_none()).await;
+        assert!(h.stats.snapshot().srt_leg2_stats.is_some(), "leg 2 still reports");
+
+        // A rate window that opens only once leg 1 is gone: the snapshot
+        // samples the byte count at most once a second, so let a second
+        // pass, sample, and read the rate over the next window.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let before = h.stats.snapshot();
+        let received_before = received2.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let after = h.stats.snapshot();
+        assert_eq!(after.state, "active", "the output carried on leg 2 is not idle");
+        assert!(after.bitrate_bps > 0);
+        assert!(after.packets_sent > before.packets_sent, "leg 2 now counts what it sends");
+        assert!(received2.load(Ordering::Relaxed) > received_before, "leg 2 still carries");
+
+        h.pump_events();
+        assert!(!h.disconnected(), "leg 2 carries, so the pair is not torn down");
+        assert!(h.leg_lost(2).is_empty());
+        h.stop().await;
+    }
+
+    /// Losing leg 2 raises its own event once, drops leg 2's stats, and
+    /// leaves leg 1 carrying and counting.
+    #[tokio::test]
+    async fn a_2022_7_output_reports_leg_2_loss_and_keeps_leg_1() {
+        let mut h = PairHarness::start();
+        let (_leg1, received1) = h.connect(h.ports.0).await;
+        let (leg2, _received2) = h.connect(h.ports.1).await;
+        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
+
+        leg2.close().await.unwrap();
+        h.wait_until("leg 2's loss", |h| !h.leg_lost(2).is_empty()).await;
+        assert_leg_lost(h.leg_lost(2)[0], 2, "carrying");
+        h.wait_until("leg 2's stats to clear", |h| h.stats.snapshot().srt_leg2_stats.is_none())
+            .await;
+        assert!(h.stats.snapshot().srt_stats.is_some(), "leg 1 still reports");
+
+        let (received_before, sent_before) =
+            (received1.load(Ordering::Relaxed), h.stats.packets_sent.load(Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(received1.load(Ordering::Relaxed) > received_before, "leg 1 still carries");
+        assert!(h.stats.packets_sent.load(Ordering::Relaxed) > sent_before);
+        assert_eq!(h.stats.snapshot().state, "active");
+
+        h.pump_events();
+        assert_eq!(h.leg_lost(2).len(), 1, "a lost leg is raised once per cycle");
+        assert!(h.leg_lost(1).is_empty());
+        assert!(!h.disconnected());
+        h.stop().await;
+    }
+
+    /// A stop is no lost leg: stopping the output with both legs up raises
+    /// no leg-lost event, and clears both legs' stats.
+    #[tokio::test]
+    async fn a_2022_7_output_stopping_raises_no_leg_loss_and_clears_both_legs() {
+        let mut h = PairHarness::start();
+        let (_leg1, _received1) = h.connect(h.ports.0).await;
+        let (_leg2, _received2) = h.connect(h.ports.1).await;
+        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
+
+        h.stop().await;
+        h.wait_until("both legs' stats to clear", |h| {
+            let snap = h.stats.snapshot();
+            snap.srt_stats.is_none() && snap.srt_leg2_stats.is_none()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.pump_events();
+        assert!(
+            h.events.iter().all(|e| e.category != category::REDUNDANCY),
+            "a stop raised a leg-lost event: {:?}",
+            h.events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    /// Leg 1 lost while leg 2 is still connecting: the event says leg 2 is
+    /// connecting, not carrying; the pair waits for it rather than tearing
+    /// down; and when leg 2 attaches it counts what it sends from the start.
+    #[tokio::test]
+    async fn a_2022_7_output_losing_leg_1_while_leg_2_connects_waits_and_hands_over() {
+        let mut h = PairHarness::start();
+        let (leg1, _received1) = h.connect(h.ports.0).await;
+        h.wait_until("leg 1's stats", |h| h.stats.snapshot().srt_stats.is_some()).await;
+
+        leg1.close().await.unwrap();
+        h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
+        assert_leg_lost(h.leg_lost(1)[0], 1, "connecting");
+        h.wait_until("leg 1's stats to clear", |h| h.stats.snapshot().srt_stats.is_none()).await;
+
+        // Well inside leg 2's 15 s connect budget.
+        let sent_before = h.stats.packets_sent.load(Ordering::Relaxed);
+        let (_leg2, received2) = h.connect(h.ports.1).await;
+        h.wait_until("leg 2's stats", |h| h.stats.snapshot().srt_leg2_stats.is_some()).await;
+        h.wait_until("leg 2 to count what it sends", |h| {
+            h.stats.packets_sent.load(Ordering::Relaxed) > sent_before
+        })
+        .await;
+        h.wait_until("leg 2 to carry", |_| received2.load(Ordering::Relaxed) > 0).await;
+
+        h.pump_events();
+        assert!(!h.disconnected(), "the pair waited for leg 2 rather than tearing down");
+        assert_eq!(h.leg_lost(1).len(), 1);
+        h.stop().await;
     }
 }

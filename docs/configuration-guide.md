@@ -3569,6 +3569,8 @@ Each leg reports its own SRT stats — `srt_stats` is leg 1, `srt_leg2_stats` le
 
 For output: packets are duplicated and sent on both legs simultaneously.
 
+Each output leg reports its own SRT stats too: `srt_stats` is leg 1 and `srt_leg2_stats` leg 2, each present while its leg is connected. Leg 2 is brought up beside leg 1 and given 15 s to connect; it announces itself with an Info `srt` event, `SRT output '{id}' 2022-7 leg 2 connected`. When one leg's send fails the output raises a Warning `redundancy` event, `SRT output '{id}' 2022-7 leg {n} lost; down until the pair reconnects` (`error_code: redundancy_output_leg_lost`, with `details.other_leg` saying whether the other leg is `carrying`, still `connecting`, or `down`), and that leg's stats disappear. The other leg carries on alone. A lost leg is not redialled on its own: it comes back when the pair reconnects, which happens once both legs are gone, so until then the output runs unprotected. One case does not reconnect yet: when leg 2 did not connect within its 15 s, a later loss of leg 1 leaves the output down until it is restarted (the leg-1 event then reads `other_leg: down`). `packets_sent` and `bytes_sent` count each packet once, by leg 1, and by leg 2 once leg 1 has been lost, so an output carried by leg 2 alone still reads `active`.
+
 ```json
 {
   "redundancy": {
