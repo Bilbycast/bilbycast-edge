@@ -24,15 +24,21 @@ use uuid::Uuid;
 use super::crypto::TunnelCipher;
 use super::protocol::{self, try_decode_udp_control, UdpRelayControl};
 
-/// 32 MB socket buffers on the loopback bridge sockets. High-bitrate
-/// contribution overruns the kernel default (~200 KB) — the same gate-#11
-/// hazard the relay already sizes for — and an overrun on the loopback hop
-/// shows up downstream as spurious loss + retransmit jitter on a Tier-1 path.
-const FORWARDER_SOCK_BUF_BYTES: usize = 32 * 1024 * 1024;
+/// 32 MB socket buffers on every tunnel datagram socket: the loopback bridge
+/// sockets here and the carrier sockets that face the relay or the peer
+/// (`udp_relay_client`, `quic`). High-bitrate contribution overruns the kernel
+/// default (~200 KB) — the same gate-#11 hazard the relay already sizes for.
+/// An overrun on the loopback hop shows up downstream as spurious loss +
+/// retransmit jitter on a Tier-1 path; on the carrier socket, which sat at the
+/// default until edge#165, the kernel dropped a steady 20–25 % of an
+/// 8.5 Mbit/s feed that SRT then retransmitted. Best-effort: the kernel clamps
+/// the request to `net.core.{r,w}mem_max` (`util::socket::set_socket_buffers`
+/// warns once when it does).
+pub(crate) const FORWARDER_SOCK_BUF_BYTES: usize = 32 * 1024 * 1024;
 
 /// Bind a UDP socket with large send/recv buffers (best-effort; the kernel may
 /// clamp to `net.core.{r,w}mem_max`). Mirrors the relay's `build_relay_udp_socket`.
-fn bind_buffered_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+pub(crate) fn bind_buffered_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let domain = match addr.ip() {
         IpAddr::V4(_) => Domain::IPV4,
@@ -42,8 +48,7 @@ fn bind_buffered_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     if matches!(addr.ip(), IpAddr::V6(_)) {
         let _ = socket.set_only_v6(true);
     }
-    let _ = socket.set_recv_buffer_size(FORWARDER_SOCK_BUF_BYTES);
-    let _ = socket.set_send_buffer_size(FORWARDER_SOCK_BUF_BYTES);
+    crate::util::socket::set_socket_buffers(&socket, FORWARDER_SOCK_BUF_BYTES, FORWARDER_SOCK_BUF_BYTES);
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     UdpSocket::from_std(socket.into())
@@ -57,8 +62,12 @@ fn bind_buffered_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
 /// the native plain-UDP carrier ([`PlainUdpLink`]) with one implementation —
 /// the encrypt / frame / `AtomicPeerAddr` / stats logic is transport-agnostic.
 pub trait DatagramLink: Send + Sync {
-    /// Send one framed datagram. Best-effort: a full buffer is dropped (not an
-    /// error) just like QUIC datagrams — media transports own their own recovery.
+    /// Send one framed datagram. Best-effort: never blocks, and the caller
+    /// treats `Err` as non-fatal — it counts it in `send_errors` and keeps
+    /// forwarding; media transports own their own recovery. `Err` means the
+    /// datagram did not leave, a full send buffer on the plain-UDP carrier
+    /// included. On QUIC a full datagram buffer is absorbed by quinn (it
+    /// drops the oldest queued datagram), so that impl returns `Ok`.
     fn send_datagram(&self, data: Bytes) -> Result<()>;
     /// Receive the next inbound framed media datagram. Control datagrams (the
     /// nil-UUID-prefixed [`UdpRelayControl`]) are consumed internally and never
@@ -124,8 +133,13 @@ impl DatagramLink for PlainUdpLink {
     fn send_datagram(&self, data: Bytes) -> Result<()> {
         match self.sock.try_send(&data) {
             Ok(_) => Ok(()),
-            // Buffer full → drop, matching QUIC datagram best-effort semantics.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+            // Buffer full → the datagram is dropped, matching QUIC datagram
+            // best-effort semantics. Reported as an error so the caller counts
+            // it in `send_errors` rather than `packets_sent`: it never left.
+            // The caller does not stop or log above debug on it.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(anyhow::anyhow!("udp datagram dropped: socket send buffer full"))
+            }
             Err(e) => Err(anyhow::anyhow!("udp datagram send: {e}")),
         }
     }
@@ -247,6 +261,53 @@ pub struct UdpForwarderStats {
     /// `RUST_LOG=debug` into a write amplifier — the same reasoning
     /// `decrypt_errors` next door already follows.
     pub framing_errors: AtomicU64,
+    /// Datagrams the kernel dropped on the carrier socket before the edge
+    /// read them — receive-buffer overflows, summed over every socket the
+    /// tunnel has opened (one per relay attempt). Sampled once a second off
+    /// the data path by [`spawn_kernel_drop_sampler`]; nothing else here can
+    /// see this loss, which SRT's ARQ hides until its latency budget runs out
+    /// (edge#165). Stays 0 where the platform exposes no such counter.
+    pub kernel_rx_drops: AtomicU64,
+}
+
+/// How often [`spawn_kernel_drop_sampler`] reads the socket's drop counter.
+const KERNEL_DROP_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Add the kernel's drops on `sock` to `stats.kernel_rx_drops` once a second
+/// until `cancel` fires. `sock` must be freshly opened: its counter starts at
+/// zero, so every drop it reports is this tunnel's. Exits at once where the
+/// platform has no drop counter.
+pub(crate) fn spawn_kernel_drop_sampler(
+    sock: Arc<UdpSocket>,
+    stats: Arc<UdpForwarderStats>,
+    cancel: CancellationToken,
+) {
+    if crate::util::socket::socket_drops(sock.as_ref()).is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut last = 0u32;
+        let mut tick = tokio::time::interval(KERNEL_DROP_SAMPLE_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            // Sample once more on the way out, so drops in the last partial
+            // second before a rotation are not lost with the socket.
+            let stopping = tokio::select! {
+                _ = cancel.cancelled() => true,
+                _ = tick.tick() => false,
+            };
+            if let Some(now) = crate::util::socket::socket_drops(sock.as_ref()) {
+                let delta = now.wrapping_sub(last);
+                last = now;
+                if delta > 0 {
+                    stats.kernel_rx_drops.fetch_add(u64::from(delta), Ordering::Relaxed);
+                }
+            }
+            if stopping {
+                return;
+            }
+        }
+    });
 }
 
 /// Run the UDP forwarder for an **egress** tunnel.
@@ -613,5 +674,47 @@ mod tunnel_prefix_tests {
 
         cancel.cancel();
         let _ = timeout(PATIENCE, task).await;
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod kernel_drop_sampler_tests {
+    //! edge#165: what the kernel drops on a carrier socket reaches the
+    //! tunnel's stats, which is the only place it can be seen.
+    use super::*;
+
+    #[tokio::test]
+    async fn drops_on_the_socket_reach_the_tunnel_stats() {
+        let s = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        s.set_recv_buffer_size(1).unwrap();
+        s.set_nonblocking(true).unwrap();
+        s.bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into()).unwrap();
+        let sock = Arc::new(UdpSocket::from_std(s.into()).unwrap());
+        let to = sock.local_addr().unwrap();
+
+        let stats = Arc::new(UdpForwarderStats::default());
+        let cancel = CancellationToken::new();
+        spawn_kernel_drop_sampler(sock.clone(), stats.clone(), cancel.clone());
+
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..2_000 {
+            let _ = tx.send_to(&[0u8; 1316], to);
+        }
+        let kernel = crate::util::socket::socket_drops(sock.as_ref()).unwrap();
+        assert!(kernel > 0);
+
+        // The sampler reads once a second; give it two.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while stats.kernel_rx_drops.load(Ordering::Relaxed) < u64::from(kernel) {
+            assert!(tokio::time::Instant::now() < deadline, "the sampler never caught up");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(stats.kernel_rx_drops.load(Ordering::Relaxed), u64::from(kernel));
+        cancel.cancel();
     }
 }

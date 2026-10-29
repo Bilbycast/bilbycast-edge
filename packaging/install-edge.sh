@@ -550,9 +550,11 @@ fi
 # ── Kernel tuning (sysctl.d) ──────────────────────────────────────────
 # net.core.rmem_max: SO_RCVBUF ceiling. The ST 2110-20 ingest requests
 # 64 MB per leg (the distro-default 4 MB cap holds ~8 ms at 2160p50 —
-# one scheduler hiccup overflows it into kernel drops). Installed as a
-# persistent sysctl.d drop-in and applied immediately; harmless for
-# non-2110 deployments (a ceiling, not an allocation).
+# one scheduler hiccup overflows it into kernel drops), and every tunnel
+# datagram socket 32 MB. net.core.wmem_max: the SO_SNDBUF ceiling for the
+# 4 MB raw UDP/RTP and 32 MB tunnel requests. Installed as a persistent
+# sysctl.d drop-in and applied immediately; harmless for deployments that
+# use neither (a ceiling, not an allocation).
 SYSCTL_DEST="/etc/sysctl.d/90-bilbycast-edge.conf"
 if [[ -f "${VERSION_DIR}/packaging/90-bilbycast-edge.conf" ]]; then
     install -m 0644 "${VERSION_DIR}/packaging/90-bilbycast-edge.conf" "${SYSCTL_DEST}"

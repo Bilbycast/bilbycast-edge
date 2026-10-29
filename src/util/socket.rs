@@ -81,7 +81,7 @@ fn report_clamp(
 /// Both directions are read back — a write-only `SO_SNDBUF` tells you
 /// nothing, and the send side is the one that matters on a high-bitrate
 /// egress.
-fn set_socket_buffers(socket: &Socket, recv_size: usize, send_size: usize) {
+pub(crate) fn set_socket_buffers(socket: &Socket, recv_size: usize, send_size: usize) {
     match socket.set_recv_buffer_size(recv_size) {
         Err(e) => tracing::warn!(
             "Failed to set SO_RCVBUF to {} bytes: {e}. \
@@ -110,6 +110,55 @@ fn set_socket_buffers(socket: &Socket, recv_size: usize, send_size: usize) {
             &SNDBUF_CLAMP_WARNED,
         ),
     }
+}
+
+/// `SO_MEMINFO`: not exported by the `libc` crate. 55 is its value in the
+/// generic `asm/socket.h` every architecture this edge ships for uses.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm", target_arch = "riscv64")
+))]
+const SO_MEMINFO: libc::c_int = 55;
+
+/// Datagrams the kernel has dropped on this socket since it was created —
+/// the `d` of `ss -m`'s `skmem`, `sk_drops` in the kernel, read through
+/// `SO_MEMINFO`. Almost all of them are receive-buffer overflows: the reader
+/// fell behind and the kernel threw the datagram away before the edge saw it,
+/// which no counter of the edge's own can show.
+///
+/// A 32-bit counter that wraps; take deltas with `wrapping_sub`. `None` where
+/// the platform has no such counter or the call fails.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm", target_arch = "riscv64")
+))]
+pub(crate) fn socket_drops(socket: &impl std::os::fd::AsRawFd) -> Option<u32> {
+    const VARS: usize = libc::SK_MEMINFO_DROPS as usize + 1;
+    let mut mem = [0u32; VARS];
+    let mut len = std::mem::size_of_val(&mem) as libc::socklen_t;
+    // SAFETY: `mem` is a live buffer of `len` bytes for the kernel to fill,
+    // and `len` is a live `socklen_t` it writes the filled length back to.
+    let rc = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            SO_MEMINFO,
+            mem.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 || (len as usize) < std::mem::size_of_val(&mem) {
+        return None;
+    }
+    Some(mem[libc::SK_MEMINFO_DROPS as usize])
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86", target_arch = "arm", target_arch = "riscv64")
+)))]
+pub(crate) fn socket_drops<T>(_socket: &T) -> Option<u32> {
+    None
 }
 
 /// Create a UDP socket bound to the given address with multicast support.
@@ -910,5 +959,46 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod socket_drops_tests {
+    use super::*;
+
+    /// The counter `ss -m` shows as `d`: zero on a fresh socket, and it moves
+    /// when the receive buffer overflows (edge#165).
+    #[test]
+    fn socket_drops_counts_receive_buffer_overflow() {
+        let rx = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        // The smallest buffer the kernel allows, so a burst overflows it.
+        rx.set_recv_buffer_size(1).unwrap();
+        rx.bind(&SockAddr::from("127.0.0.1:0".parse::<SocketAddr>().unwrap())).unwrap();
+        let rx: std::net::UdpSocket = rx.into();
+        assert_eq!(socket_drops(&rx), Some(0));
+
+        let to = rx.local_addr().unwrap();
+        let tx = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let payload = [0u8; 1316];
+        for _ in 0..2_000 {
+            let _ = tx.send_to(&payload, to);
+        }
+        let drops = socket_drops(&rx).expect("SO_MEMINFO on Linux");
+        assert!(drops > 0, "a 2 000-datagram burst into a minimal buffer must overflow it");
+    }
+
+    /// `set_socket_buffers` asks for what it is given, and the kernel keeps
+    /// at least as much as `net.core.rmem_max` allows.
+    #[test]
+    fn set_socket_buffers_raises_the_receive_buffer_to_the_host_ceiling() {
+        let requested = 32 * 1024 * 1024;
+        let rmem_max: usize = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(requested);
+        let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+        set_socket_buffers(&s, requested, requested);
+        let stored = effective_buffer_size(s.recv_buffer_size().unwrap());
+        assert_eq!(stored, requested.min(rmem_max));
     }
 }

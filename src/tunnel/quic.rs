@@ -41,7 +41,12 @@ pub fn make_client_endpoint(alpn: &[u8]) -> anyhow::Result<Endpoint> {
     ));
     client_config.transport_config(Arc::new(transport));
 
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    // What `Endpoint::client("0.0.0.0:0")` builds, with the tunnel's socket
+    // buffers: quinn leaves the UDP socket at the kernel default, which the
+    // datagram carrier overruns at contribution bitrates (edge#165).
+    let socket = sized_udp_socket("0.0.0.0:0".parse()?)?;
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("no async runtime for quinn"))?;
+    let mut endpoint = Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)?;
     endpoint.set_default_client_config(client_config);
 
     Ok(endpoint)
@@ -103,8 +108,28 @@ pub fn make_server_endpoint(
     ));
     server_config.transport_config(Arc::new(transport));
 
-    let endpoint = Endpoint::server(server_config, bind_addr)?;
+    // What `Endpoint::server` builds, with the tunnel's socket buffers (see
+    // `make_client_endpoint`).
+    let socket = sized_udp_socket(bind_addr)?;
+    let runtime = quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("no async runtime for quinn"))?;
+    let endpoint = Endpoint::new(quinn::EndpointConfig::default(), Some(server_config), socket, runtime)?;
     Ok(endpoint)
+}
+
+/// A UDP socket bound to `addr` with the tunnel's socket buffers. Otherwise
+/// the socket `std::net::UdpSocket::bind` makes, which is what quinn's own
+/// `Endpoint::client` / `Endpoint::server` bind for an IPv4 or a fixed
+/// address: no `SO_REUSEADDR`, the host's `IPV6_V6ONLY` default.
+fn sized_udp_socket(addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))?;
+    crate::util::socket::set_socket_buffers(
+        &socket,
+        super::udp_forwarder::FORWARDER_SOCK_BUF_BYTES,
+        super::udp_forwarder::FORWARDER_SOCK_BUF_BYTES,
+    );
+    socket.bind(&addr.into())?;
+    Ok(socket.into())
 }
 
 /// TLS certificate verifier that accepts any server certificate.

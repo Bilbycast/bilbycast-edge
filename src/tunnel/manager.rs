@@ -76,6 +76,10 @@ pub struct TunnelStatsSnapshot {
     /// Inbound AEAD decrypt failures (native-UDP carrier). Sustained growth
     /// with flat `packets_received` ⇒ `tunnel_encryption_key` mismatch.
     pub decrypt_errors: u64,
+    /// Datagrams the kernel dropped on the native-UDP carrier socket before
+    /// the edge read them (receive-buffer overrun). Only the native-UDP
+    /// carrier samples it; 0 on QUIC and where the platform has no counter.
+    pub kernel_rx_drops: u64,
     pub connections_total: u64,
     pub connections_active: u64,
 }
@@ -218,6 +222,13 @@ impl TunnelManager {
         // key-mismatch (every packet drops on AEAD decrypt) into a Critical
         // event. Cancelled with the tunnel.
         if let Some(stats) = watchdog_stats {
+            tokio::spawn(kernel_drop_watchdog(
+                tunnel_id_str.clone(),
+                tunnel_name.clone(),
+                stats.clone(),
+                self.event_sender.clone(),
+                watchdog_cancel.clone(),
+            ));
             tokio::spawn(decrypt_skew_watchdog(
                 tunnel_id_str,
                 tunnel_name,
@@ -698,6 +709,7 @@ fn build_status(runtime: &TunnelRuntime) -> TunnelStatus {
         stats.bytes_received = udp.bytes_received.load(Ordering::Relaxed);
         stats.send_errors = udp.send_errors.load(Ordering::Relaxed);
         stats.decrypt_errors = udp.decrypt_errors.load(Ordering::Relaxed);
+        stats.kernel_rx_drops = udp.kernel_rx_drops.load(Ordering::Relaxed);
     }
     if let Some(ref tcp) = runtime.tcp_stats {
         stats.bytes_sent = tcp.bytes_sent.load(Ordering::Relaxed);
@@ -805,6 +817,71 @@ async fn decrypt_skew_watchdog(
                         }),
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Per-tunnel kernel-drop watchdog (edge#165).
+///
+/// The kernel drops datagrams on a carrier socket whose receive buffer
+/// overflows, before the edge reads them, so no counter of the tunnel's own
+/// moves — and SRT retransmits the loss until its latency budget runs out, so
+/// nothing downstream moves either. `kernel_rx_drops` is the only sign of it;
+/// this raises one Warning `tunnel_kernel_rx_drops` when it moves, and again
+/// only after a minute without drops. The message is the same every time and
+/// the numbers ride `details`, so the manager folds repeats into one row.
+async fn kernel_drop_watchdog(
+    tunnel_id: String,
+    tunnel_name: String,
+    stats: Arc<UdpForwarderStats>,
+    event_sender: EventSender,
+    cancel: CancellationToken,
+) {
+    const WINDOW: Duration = Duration::from_secs(10);
+    const CLEAN_WINDOWS_TO_REARM: u32 = 6;
+
+    let mut last = stats.kernel_rx_drops.load(Ordering::Relaxed);
+    let mut armed = true;
+    let mut clean_windows = 0u32;
+    let mut tick = tokio::time::interval(WINDOW);
+    tick.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tick.tick() => {
+                let now = stats.kernel_rx_drops.load(Ordering::Relaxed);
+                let dropped = now.saturating_sub(last);
+                last = now;
+                if dropped == 0 {
+                    clean_windows = clean_windows.saturating_add(1);
+                    if clean_windows >= CLEAN_WINDOWS_TO_REARM {
+                        armed = true;
+                    }
+                    continue;
+                }
+                clean_windows = 0;
+                if !armed {
+                    continue;
+                }
+                armed = false;
+                event_sender.emit_flow_with_details(
+                    EventSeverity::Warning,
+                    category::TUNNEL,
+                    format!(
+                        "Tunnel '{tunnel_name}': the kernel is dropping datagrams on the carrier \
+                         socket before the edge reads them (receive buffer overrun)"
+                    ),
+                    &tunnel_id,
+                    serde_json::json!({
+                        "error_code": "tunnel_kernel_rx_drops",
+                        "tunnel_name": tunnel_name,
+                        "dropped_window": dropped,
+                        "dropped_total": now,
+                        "window_secs": WINDOW.as_secs(),
+                    }),
+                );
             }
         }
     }
@@ -1288,5 +1365,71 @@ mod destroy_tunnel_tests {
             matches!(r, Ok(false)),
             "deleting an absent tunnel should be Ok(false), got {r:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod kernel_drop_watchdog_tests {
+    //! edge#165: kernel drops on the carrier socket are the one loss nothing
+    //! else on the tunnel can see, so they must reach the operator — once,
+    //! not once every ten seconds.
+    use super::*;
+    use crate::manager::events::event_channel;
+
+    async fn windows(n: u32) {
+        for _ in 0..n {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drops_raise_one_warning_and_rearm_after_a_clean_minute() {
+        let (tx, mut rx) = event_channel();
+        let stats = Arc::new(UdpForwarderStats::default());
+        let cancel = CancellationToken::new();
+        tokio::spawn(kernel_drop_watchdog(
+            "t1".into(),
+            "contribution".into(),
+            stats.clone(),
+            tx,
+            cancel.clone(),
+        ));
+        tokio::task::yield_now().await;
+
+        // A clean window raises nothing.
+        windows(1).await;
+        assert!(rx.try_recv().is_err());
+
+        // Drops in a window raise one Warning carrying the numbers.
+        stats.kernel_rx_drops.fetch_add(1_700, Ordering::Relaxed);
+        windows(1).await;
+        let ev = rx.try_recv().expect("a Warning for the drops");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::TUNNEL);
+        assert_eq!(ev.flow_id.as_deref(), Some("t1"));
+        let d = ev.details.expect("details");
+        assert_eq!(d["error_code"], "tunnel_kernel_rx_drops");
+        assert_eq!(d["dropped_window"], 1_700);
+        assert_eq!(d["dropped_total"], 1_700);
+
+        // Still dropping: no repeat.
+        stats.kernel_rx_drops.fetch_add(50, Ordering::Relaxed);
+        windows(1).await;
+        assert!(rx.try_recv().is_err(), "a continuing episode is one event");
+
+        // Five clean windows are not enough to rearm…
+        windows(5).await;
+        stats.kernel_rx_drops.fetch_add(5, Ordering::Relaxed);
+        windows(1).await;
+        assert!(rx.try_recv().is_err(), "rearmed before a clean minute");
+
+        // …six are.
+        windows(6).await;
+        stats.kernel_rx_drops.fetch_add(3, Ordering::Relaxed);
+        windows(1).await;
+        let ev = rx.try_recv().expect("a new episode after a clean minute");
+        assert_eq!(ev.details.unwrap()["dropped_window"], 3);
+        cancel.cancel();
     }
 }

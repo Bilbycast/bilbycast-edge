@@ -470,6 +470,14 @@ async fn connect_socket(
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_nonblocking(true)?;
     socket.set_reuse_address(true)?;
+    // Sized before bind, like every other tunnel socket. At the kernel default
+    // (~208 KB) this socket dropped 20–25 % of an 8.5 Mbit/s SRT feed on a
+    // receiving edge, silently, until SRT's retransmissions ran out (edge#165).
+    crate::util::socket::set_socket_buffers(
+        &socket,
+        udp_forwarder::FORWARDER_SOCK_BUF_BYTES,
+        udp_forwarder::FORWARDER_SOCK_BUF_BYTES,
+    );
 
     // NIC pin must precede bind. Prefer SO_BINDTODEVICE, fall back to the
     // unprivileged IP_UNICAST_IF hint when the edge lacks CAP_NET_RAW (the
@@ -701,6 +709,11 @@ pub async fn run_native_relay_tunnel(
         last_ack.store(udp_forwarder::now_epoch_ms(), Ordering::Relaxed);
 
         let attempt_cancel = cancel.child_token();
+        // Every exit from this attempt ends its register task and drop
+        // sampler, which hold the attempt's socket: a forwarder that errors
+        // ends the attempt as surely as a dead relay does.
+        let _attempt_guard = attempt_cancel.clone().drop_guard();
+        udp_forwarder::spawn_kernel_drop_sampler(sock.clone(), stats.clone(), attempt_cancel.clone());
 
         // Register / keepalive + liveness watchdog task.
         {
@@ -782,6 +795,9 @@ pub async fn run_native_relay_tunnel(
             }
         };
 
+        // End the attempt now, not after the retry delay: the abandoned
+        // socket must stop registering, or the relay can latch back onto it.
+        attempt_cancel.cancel();
         state_tx.send_replace(RelayTunnelState::Down);
         if cancel.is_cancelled() {
             break 'outer Ok(());
@@ -920,6 +936,11 @@ pub async fn run_native_relay_leg_inproc(
         last_ack.store(udp_forwarder::now_epoch_ms(), Ordering::Relaxed);
 
         let attempt_cancel = cancel.child_token();
+        // Ends this attempt's register task on every exit (see
+        // `run_native_relay_tunnel`). No kernel-drop sampler here: this
+        // leg's `UdpForwarderStats` has no reader, and a carrier overrun
+        // shows up as leg loss in the bond's own path stats.
+        let _attempt_guard = attempt_cancel.clone().drop_guard();
 
         // Register / keepalive + liveness watchdog (mirrors run_native_relay_tunnel,
         // minus the RelayTunnelState watch — bond leg health is the bond's own job).
@@ -1043,6 +1064,8 @@ pub async fn run_native_relay_leg_inproc(
             }
         }
 
+        // End the attempt before the retry delay, as the tunnel path does.
+        attempt_cancel.cancel();
         if cancel.is_cancelled() {
             break 'outer Ok(());
         }
@@ -1112,6 +1135,11 @@ pub async fn run_native_direct_tunnel(
                 // PSK-authenticated register/keepalive toward the listener.
                 let token = super::auth::generate_token(&tunnel_id.to_string(), &tunnel_psk);
                 let attempt_cancel = cancel.child_token();
+                // Every exit (an `Err` from `run_egress` included — a caller
+                // that starts before its listener sees ECONNREFUSED) ends the
+                // register task and the drop sampler, which hold the socket.
+                let _attempt_guard = attempt_cancel.clone().drop_guard();
+                udp_forwarder::spawn_kernel_drop_sampler(sock.clone(), stats.clone(), attempt_cancel.clone());
                 {
                     let reg_sock = sock.clone();
                     let reg_cancel = attempt_cancel.clone();
@@ -1169,6 +1197,23 @@ pub async fn run_native_direct_tunnel(
     }
 }
 
+/// Bind the direct-mode listener's public port with the tunnel's socket
+/// buffers. Otherwise exactly what `UdpSocket::bind` did here before
+/// edge#165: no `SO_REUSEADDR`, and a v6 address keeps the host's
+/// `IPV6_V6ONLY` default.
+fn bind_direct_listener(listen_addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(listen_addr), Type::DGRAM, Some(Protocol::UDP))?;
+    crate::util::socket::set_socket_buffers(
+        &socket,
+        udp_forwarder::FORWARDER_SOCK_BUF_BYTES,
+        udp_forwarder::FORWARDER_SOCK_BUF_BYTES,
+    );
+    socket.set_nonblocking(true)?;
+    socket.bind(&listen_addr.into())?;
+    UdpSocket::from_std(socket.into())
+}
+
 /// Direct-mode listener: bind the public UDP port, authenticate the caller's
 /// register (PSK), latch its source address, and bridge tunnel ↔ loopback.
 ///
@@ -1192,12 +1237,21 @@ async fn run_native_direct_listener(
     event_sender: EventSender,
     mut hold_down: SlotHoldDown,
 ) -> Result<()> {
-    let public = UdpSocket::bind(listen_addr).await.map_err(|e| {
+    let public = bind_direct_listener(listen_addr).map_err(|e| {
         crate::util::port_error::annotate_bind_error(e, listen_addr, "native-UDP direct listener")
     })?;
     let public = Arc::new(public);
     // Ephemeral socket to deliver to / receive return traffic from loopback.
-    let loop_sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let loop_sock = Arc::new(udp_forwarder::bind_buffered_udp(
+        "0.0.0.0:0".parse().expect("valid wildcard addr"),
+    )?);
+    // The sampler holds `public`, so it is tied to this run, not the tunnel:
+    // every return, an error included, releases the port before the retry
+    // re-binds it. On the tunnel's token it kept the port, and the retry's
+    // bind failed EADDRINUSE as a port conflict that evicted the tunnel.
+    let sampler_cancel = cancel.child_token();
+    let _sampler_guard = sampler_cancel.clone().drop_guard();
+    udp_forwarder::spawn_kernel_drop_sampler(public.clone(), stats.clone(), sampler_cancel);
     state_tx.send_replace(RelayTunnelState::Connecting);
     tracing::info!(%tunnel_id, listen = %listen_addr, "native-UDP direct listener started");
 
@@ -1337,9 +1391,15 @@ async fn run_native_direct_listener(
                     None => buf_loop[..n].to_vec(),
                 };
                 let datagram = protocol::encode_udp_datagram(&tunnel_id, &payload);
-                let _ = public.send_to(&datagram, dest).await;
-                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                stats.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                match public.send_to(&datagram, dest).await {
+                    Ok(_) => {
+                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
         }
     }
@@ -2197,5 +2257,43 @@ mod direct_listener_wire_tests {
         h.expect_forwarded(&caller, b"ours").await;
 
         h.shutdown().await;
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod carrier_socket_buffer_tests {
+    //! edge#165: every socket a native-UDP tunnel faces the network with asks
+    //! for the tunnel's buffers. At the kernel default the carrier socket lost
+    //! 20–25 % of an 8.5 Mbit/s feed on a receiving edge.
+    use super::*;
+
+    /// What the kernel keeps of a `FORWARDER_SOCK_BUF_BYTES` request on this
+    /// host: the request, or `net.core.rmem_max` when that is lower.
+    fn expected_rcvbuf() -> usize {
+        let rmem_max: usize = std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(udp_forwarder::FORWARDER_SOCK_BUF_BYTES);
+        udp_forwarder::FORWARDER_SOCK_BUF_BYTES.min(rmem_max)
+    }
+
+    fn stored_rcvbuf(sock: &UdpSocket) -> usize {
+        // Linux reports twice what it stored.
+        socket2::SockRef::from(sock).recv_buffer_size().unwrap() / 2
+    }
+
+    #[tokio::test]
+    async fn the_relay_facing_socket_asks_for_the_tunnel_buffers() {
+        let sock = connect_socket("127.0.0.1:9".parse().unwrap(), None, None).await.unwrap();
+        assert_eq!(stored_rcvbuf(&sock), expected_rcvbuf());
+    }
+
+    #[test]
+    fn the_direct_listener_asks_for_the_tunnel_buffers() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let sock = bind_direct_listener("127.0.0.1:0".parse().unwrap()).unwrap();
+            assert_eq!(stored_rcvbuf(&sock), expected_rcvbuf());
+        });
     }
 }

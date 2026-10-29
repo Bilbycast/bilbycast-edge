@@ -471,8 +471,9 @@ Each entry is a `TunnelStatus` — `id`, `name`, `protocol`, `mode`,
 | `packets_sent` / `packets_received` | Datagram counts in each direction. |
 | `bytes_sent` / `bytes_received` | Byte counts in each direction. |
 | `bitrate_in_bps` / `bitrate_out_bps` | Estimated throughput each way. |
-| `send_errors` | Transmit failures on the carrier socket. |
+| `send_errors` | Transmit failures on the carrier socket, including a datagram dropped because the socket's send buffer was full (counted in `packets_sent` before edge#165, though it never left). |
 | `decrypt_errors` | Inbound AEAD failures (native-UDP carrier). Sustained growth with flat `packets_received` ⇒ `tunnel_encryption_key` mismatch. |
+| `kernel_rx_drops` | Datagrams the kernel dropped on the native-UDP carrier socket before the edge read them — receive-buffer overrun, the `d` of `ss -m`'s `skmem`, summed over every socket the tunnel has opened. Sampled once a second (`SO_MEMINFO`, Linux). Nothing else on the tunnel moves when this happens, and SRT retransmits the loss until its latency runs out, so this is the only sign of it. 0 on the QUIC carrier and on other platforms. |
 | `connections_total` / `connections_active` | Cumulative and current carrier connections. |
 
 There is **no per-tunnel RTT on any surface** — `TunnelStatsSnapshot` has no

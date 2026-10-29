@@ -172,15 +172,18 @@ broken down by release variant and architecture. Tested on Ubuntu 24.04 LTS
 > `packaging/90-bilbycast-edge.conf`) setting
 > `net.core.rmem_max = 67108864` — the `SO_RCVBUF` ceiling the
 > ST 2110-20 ingest needs for burst headroom at uncompressed-video
-> rates (distro defaults clamp it to 4 MB ≈ 8 ms at 2160p50). Manual
+> rates (distro defaults clamp it to 4 MB ≈ 8 ms at 2160p50) — and
+> `net.core.wmem_max = 67108864`, the matching `SO_SNDBUF` ceiling. Manual
 > installs should apply the same file; see
 > [st2110.md → Host kernel tuning](st2110.md#host-kernel-tuning-receive-side).
 >
-> **The send side needs the same treatment, and the shipped file does
-> not cover it.** Every socket the edge opens *itself* for raw UDP / RTP —
-> unicast input, multicast input and output alike — requests a 4 MiB
-> `SO_SNDBUF`, reads the value back, and warns once per process when the
-> kernel clamped it:
+> Every UDP / RTP socket the edge opens *itself* — unicast input,
+> multicast input and output alike — requests a 4 MiB `SO_SNDBUF`, and
+> every socket a tunnel carries datagrams on (the native-UDP carrier
+> facing the relay or peer, the direct-mode listener, the loopback bridge
+> and both QUIC endpoints) requests 32 MiB in each direction. Each reads
+> the value back and the edge warns once per process per direction when
+> the kernel clamped it:
 >
 > ```
 > SO_SNDBUF clamped by the kernel: requested 4194304 bytes, got 212992.
@@ -188,15 +191,17 @@ broken down by release variant and architecture. Tested on Ubuntu 24.04 LTS
 > ```
 >
 > (Truncated — the real line continues with the bursty-loss note and the
-> `RUST_LOG=debug` hint repeated below.) SRT, RIST and QUIC sockets are
-> opened by their own stacks and never pass through this code, so they
-> neither request the 4 MiB nor produce this warning; they still benefit
-> from a raised `wmem_max`.
+> `RUST_LOG=debug` hint repeated below. Whichever socket is clamped first
+> names its own request, so `requested` reads 4194304 or 33554432.) Only
+> SRT and RIST sockets are opened by their own stacks and bypass this
+> code; they never produce the warning but still benefit from the raised
+> ceilings.
 >
-> The distro default `net.core.wmem_max` is 212992 bytes, so on a stock
-> host that warning fires as soon as a UDP output starts. Undersized send
-> buffers surface as bursty loss under load rather than as an error, so
-> add the matching line yourself until the packaged drop-in carries it:
+> The distro default `net.core.wmem_max` is 212992 bytes, so on a host
+> without the drop-in that warning fires as soon as a UDP output or a
+> tunnel starts. Undersized buffers surface as bursty loss under load
+> rather than as an error. An install made before the drop-in carried
+> `wmem_max` can add the line by hand:
 >
 > ```bash
 > echo 'net.core.wmem_max = 67108864' | sudo tee -a /etc/sysctl.d/90-bilbycast-edge.conf
