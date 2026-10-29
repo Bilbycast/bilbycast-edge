@@ -67,9 +67,12 @@ pub const PCR_MAX_SAMPLE_INTERVAL_US: u64 = 500_000;
 /// state needed to compute |observed − expected| on each PCR sample.
 ///
 /// Thread-safety: the sampler's state is behind a single `Mutex`. The
-/// only writer is the output's send task (one task per output), and
-/// the only reader is the 1 Hz stats snapshot path — contention is
-/// negligible.
+/// only writer is the output's wire-emit thread (one per output). The
+/// readers are the 1 Hz stats snapshot (the output's own and the flow's
+/// `pcr_trust_flow` rollup) and the 5 s A/V quality watch
+/// (`cumulative_samples` on each poll, a snapshot only once it judges
+/// the reservoir). A snapshot copies the reservoir under the lock and
+/// sorts outside it, so contention is negligible.
 pub struct PcrTrustSampler {
     state: Mutex<PcrTrustState>,
 }

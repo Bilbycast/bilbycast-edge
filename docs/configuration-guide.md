@@ -2207,20 +2207,25 @@ warns too; acknowledge it if the latency matters more.
 The fix the warning names is `egress_pacing: "pcr"`, which releases each
 packet at its PCR-implied instant. What it costs and assumes:
 
-- **Latency.** At least 50 ms (the pacer's preroll), plus each late
-  re-anchor it takes when a transcode stall makes a PCR target more than
-  5 ms late — kept for good, so latency grows to the longest stall seen,
-  at most about 200 ms. The warning's `estimated_added_latency_ms` is that
-  arithmetic on the measured worst sample. A once-per-epoch lowering of
-  the transcode PCR offset (`ts_pcr_remux`) is kept as latency too, up to
-  200 ms, because the pacer ignores the discontinuity.
+- **Latency.** About 50 ms (the pacer's preroll) to begin with. A
+  transcode stall that makes a PCR more than 5 ms later than that takes
+  a late re-anchor, which replaces the preroll rather than adding to it
+  and is kept for good, so latency grows to the longest stall seen, at
+  most about 200 ms. The warning's `estimated_added_latency_ms` is that
+  arithmetic on the measured worst sample — the larger of 50 ms and that
+  sample, capped at 200 ms — and a floor where an encoder falls behind
+  over several PCRs, since each sample sees one PCR interval. A
+  once-per-epoch lowering of the transcode PCR offset (`ts_pcr_remux`)
+  is kept as latency too, up to 200 ms, because the pacer ignores the
+  discontinuity.
 - **Long stalls are beyond it.** After 200 ms with no PCR the pacer
   re-anchors, so stalls of 200 ms or more (x265 at a slow preset, a
-  whole-MPTS transcode on a loaded host) stay above 30 ms on `"pcr"` too.
-  The warning says so instead of naming `"pcr"` when the forward p99 is
-  160 ms or more (`pcr_expected_to_reach_limit: false`): bring the
-  encoder's load down first. An MPTS output's sampler covers one program's
-  PCR only.
+  whole-MPTS transcode on a loaded host) may stay above 30 ms on `"pcr"`
+  too, and need a lighter encode; the warning's message says so. Its
+  `pcr_expected_to_reach_limit` is `false` when the forward p99 is
+  160 ms or more — a heuristic not yet checked on the rig, so measure
+  the output on `"pcr"` rather than relying on it. An MPTS output's
+  sampler covers one program's PCR only.
 - **It is open-loop.** `"pcr"` follows the source's clock, so a live source
   fast against the host grows the egress queue at its offset (about 108
   ms/h at 30 ppm) until the 1000 ms residence cap sheds it, and a large

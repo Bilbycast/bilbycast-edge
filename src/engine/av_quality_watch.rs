@@ -33,8 +33,8 @@
 //!   transcode chain emits them, and its
 //!   `pcr_trust` p99 can sit above the 30 ms gate-4 tier-2 limit. Over
 //!   it for two polls → Warning `egress_pcr_accuracy_exceeded`, naming
-//!   `egress_pacing: "pcr"` as the fix and its latency cost (or, when
-//!   the stalls are longer than `pcr` pacing absorbs, saying so).
+//!   `egress_pacing: "pcr"` as the fix, its latency cost and the stall
+//!   length past which it stops absorbing them.
 //!   Recovery below 20 ms, or the output restarting as anything other
 //!   than a forward-paced video re-encode → Info
 //!   `egress_pcr_accuracy_recovered`. Judged only once the reservoir has
@@ -43,6 +43,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -94,12 +95,42 @@ const PCR_PACING_PREROLL_MS: u64 = 50;
 /// 200 ms with no PCR, and `MAX_FUTURE_LOOKAHEAD_NS` caps how far ahead
 /// it may run, also 200 ms. Both private to wire_emit; keep in step.
 const PCR_PACING_ABSORBS_US: u64 = 200_000;
-/// A forward-paced p99 at or above this says the stalls themselves reach
-/// what `pcr` pacing absorbs: on `forward` a stall of S reads as about
-/// S − ΔPCR, and ΔPCR is at most about 40 ms on the sources that reach
-/// this watch. So `pcr` is not expected to bring such an output under the
-/// limit, and the warning says to reduce the encoder's load instead.
+/// A forward-paced p99 at or above this suggests the stalls themselves
+/// reach what `pcr` pacing absorbs: on `forward` a stall of S reads as
+/// about S − ΔPCR, and ΔPCR is at most about 40 ms on the sources that
+/// reach this watch. A heuristic, not validated on the rig: it sets
+/// `details.pcr_expected_to_reach_limit` only, and the message names
+/// `pcr` either way.
 const PCR_AC_BEYOND_PCR_PACING_US: u64 = PCR_PACING_ABSORBS_US - 40_000;
+
+/// The added egress latency `pcr` pacing is expected to settle at, in
+/// ms, from a forward-paced output's worst PCR send-jitter sample. It
+/// starts at the 50 ms preroll. A PCR that arrives later than that (plus
+/// wire_emit's 5 ms late-rebase threshold) snaps the anchor to now, which
+/// *replaces* the preroll rather than adding to it, and the pacer then
+/// holds that lateness for good. So it settles at the larger of the two,
+/// never their sum, capped where the lookahead ceiling stops it. On
+/// `forward` a PCR's lateness shows up as its sample, so `max_us` stands
+/// in for the worst lateness. It is a floor when an encoder falls behind
+/// over several PCRs, since each sample sees one PCR interval only.
+fn estimated_pcr_pacing_latency_ms(max_us: u64) -> u64 {
+    PCR_PACING_PREROLL_MS.max(max_us.min(PCR_PACING_ABSORBS_US) / 1_000)
+}
+
+/// The Warning's message: one constant text per output (the manager
+/// coalesces a repeat into one row with a count), so every number rides
+/// in `details` and the log line instead.
+fn pcr_accuracy_exceeded_message(output_id: &str, flow_id: &str) -> String {
+    format!(
+        "Output '{output_id}' (flow '{flow_id}'): PCR send jitter (pcr_trust p99) is above the \
+         30 ms gate-4 tier-2 limit. The output re-encodes video and is forward-paced, so its \
+         packets leave as the transcode chain emits them; egress_pacing \"pcr\" re-paces them \
+         onto the PCR timeline, at the cost of added egress latency (about 50 ms, rising to \
+         the longest transcode stall it absorbs, at most about 200 ms). Stalls longer than \
+         that are beyond it and need a lighter encode (a faster preset, a lower resolution or \
+         a hardware encoder)"
+    )
+}
 
 /// What one skew poll changes.
 #[derive(Debug, PartialEq, Eq)]
@@ -155,31 +186,40 @@ enum PcrAcGate {
     /// between its stats registering and its pacing resolving.
     NotPaced,
     /// Re-paced (`pcr` / `servo`), or forward-paced and sending with no
-    /// video re-encode.
+    /// video re-encode (with or without a PCR).
     NotApplicable,
     /// A forward-paced output not yet sending (its transcode chain may
     /// still be building, so whether it re-encodes is not yet known), or
-    /// a forward-paced video re-encode whose reservoir still holds its
-    /// startup.
+    /// a forward-paced video re-encode whose reservoir is empty or still
+    /// holds its startup.
     Warming,
     /// A forward-paced video re-encode with a settled reservoir: read it.
     Measure,
 }
 
 /// Classify one output from what its stats say. `cumulative_samples` is
-/// its PCR sampler's lifetime count (cheap; nothing is sorted).
+/// its PCR sampler's lifetime count (cheap; nothing is sorted), and
+/// `sending` whether its wire emitter has sent any datagram.
 fn pcr_accuracy_gate(
     pacing: Option<EgressPacingMode>,
     reencodes_video: bool,
     cumulative_samples: u64,
+    sending: bool,
 ) -> PcrAcGate {
     match pacing {
         None => PcrAcGate::NotPaced,
         Some(EgressPacingMode::Pcr | EgressPacingMode::Servo) => PcrAcGate::NotApplicable,
-        // The send loop starts only once the transcode chain is built, so
-        // an output with no sample yet may still turn out to re-encode.
+        // The UDP / RTP send loops build their transcode chain before they
+        // hand the wire emitter its first datagram, so once anything has
+        // gone out (a PCR sample, or any datagram at all: an output that
+        // carries no PCR records none) whether the output re-encodes is
+        // settled. Until then it may still turn out to.
+        Some(EgressPacingMode::Forward)
+            if !reencodes_video && (sending || cumulative_samples > 0) =>
+        {
+            PcrAcGate::NotApplicable
+        }
         Some(EgressPacingMode::Forward) if cumulative_samples == 0 => PcrAcGate::Warming,
-        Some(EgressPacingMode::Forward) if !reencodes_video => PcrAcGate::NotApplicable,
         Some(EgressPacingMode::Forward) if cumulative_samples < PCR_AC_WARMUP_SAMPLES => {
             PcrAcGate::Warming
         }
@@ -302,13 +342,15 @@ fn poll_egress_pcr_accuracy(
             latches.remove(output_id);
             continue;
         }
-        let cumulative = if pacing == Some(EgressPacingMode::Forward) {
+        let forward = pacing == Some(EgressPacingMode::Forward);
+        let cumulative = if forward {
             out.pcr_trust_sampler().cumulative_samples()
         } else {
             0
         };
+        let sending = forward && out.packets_sent.load(Ordering::Relaxed) > 0;
         let mut snap = None;
-        let obs = match pcr_accuracy_gate(pacing, reencodes_video, cumulative) {
+        let obs = match pcr_accuracy_gate(pacing, reencodes_video, cumulative, sending) {
             PcrAcGate::NotPaced => PcrAcObservation::NotPaced,
             PcrAcGate::NotApplicable => PcrAcObservation::NotApplicable,
             PcrAcGate::Warming => PcrAcObservation::Warming,
@@ -349,28 +391,10 @@ fn emit_pcr_accuracy_exceeded(
     out: &OutputStatsAccumulator,
     s: &PcrTrustStats,
 ) {
+    // A heuristic, in details only: the message names `pcr` either way,
+    // with the stall length past which it stops absorbing them.
     let pcr_reaches_limit = s.p99_us < PCR_AC_BEYOND_PCR_PACING_US;
-    // The message is constant per output (per variant): the manager
-    // coalesces a repeat into one row with a count. The numbers ride in
-    // `details` and the log line.
-    let msg = if pcr_reaches_limit {
-        format!(
-            "Output '{output_id}' (flow '{flow_id}'): PCR send jitter (pcr_trust p99) is above \
-             the 30 ms gate-4 tier-2 limit. The output re-encodes video and is forward-paced, \
-             so its packets leave as the transcode chain emits them; egress_pacing \"pcr\" \
-             re-paces them onto the PCR timeline, at the cost of added egress latency (at \
-             least 50 ms, plus up to the longest transcode stall it absorbs, at most about \
-             200 ms)"
-        )
-    } else {
-        format!(
-            "Output '{output_id}' (flow '{flow_id}'): PCR send jitter (pcr_trust p99) is above \
-             the 30 ms gate-4 tier-2 limit, and the output's transcode chain stalls for about \
-             200 ms or longer, past what egress_pacing \"pcr\" absorbs, so pcr pacing alone is \
-             not expected to bring it under the limit. Reduce the encoder's load first (a \
-             faster preset, a lower resolution or a hardware encoder)"
-        )
-    };
+    let msg = pcr_accuracy_exceeded_message(output_id, flow_id);
     let pacing = out.egress_pacing_effective.get().cloned();
     let tier = out.wire_pacing_tier.get().cloned();
     tracing::warn!(
@@ -407,9 +431,8 @@ fn emit_pcr_accuracy_exceeded(
             "threshold_us": PCR_AC_ALERT_US,
             "recover_below_us": PCR_AC_RECOVER_US,
             "pcr_expected_to_reach_limit": pcr_reaches_limit,
-            "suggested_egress_pacing": if pcr_reaches_limit { Some("pcr") } else { None },
-            "estimated_added_latency_ms":
-                PCR_PACING_PREROLL_MS + s.max_us.min(PCR_PACING_ABSORBS_US) / 1_000,
+            "suggested_egress_pacing": "pcr",
+            "estimated_added_latency_ms": estimated_pcr_pacing_latency_ms(s.max_us),
             "transcode_pcr": transcode_pcr,
         }),
     );
@@ -752,22 +775,37 @@ mod tests {
         use EgressPacingMode::*;
         let full = PCR_AC_WARMUP_SAMPLES;
         for video in [false, true] {
-            assert_eq!(pcr_accuracy_gate(None, video, full), PcrAcGate::NotPaced);
-            assert_eq!(pcr_accuracy_gate(Some(Pcr), video, full), PcrAcGate::NotApplicable);
-            assert_eq!(pcr_accuracy_gate(Some(Servo), video, 0), PcrAcGate::NotApplicable);
+            for sending in [false, true] {
+                assert_eq!(pcr_accuracy_gate(None, video, full, sending), PcrAcGate::NotPaced);
+                assert_eq!(
+                    pcr_accuracy_gate(Some(Pcr), video, full, sending),
+                    PcrAcGate::NotApplicable
+                );
+                assert_eq!(
+                    pcr_accuracy_gate(Some(Servo), video, 0, sending),
+                    PcrAcGate::NotApplicable
+                );
+            }
             // Not sending yet: whether it re-encodes is not settled.
-            assert_eq!(pcr_accuracy_gate(Some(Forward), video, 0), PcrAcGate::Warming);
+            assert_eq!(pcr_accuracy_gate(Some(Forward), video, 0, false), PcrAcGate::Warming);
         }
-        assert_eq!(pcr_accuracy_gate(Some(Forward), false, 1), PcrAcGate::NotApplicable);
-        assert_eq!(pcr_accuracy_gate(Some(Forward), false, full), PcrAcGate::NotApplicable);
-        assert_eq!(pcr_accuracy_gate(Some(Forward), true, 1), PcrAcGate::Warming);
+        // Sending with no video re-encode is settled, PCR or none (an
+        // audio_302m output sends no PCR).
+        assert_eq!(pcr_accuracy_gate(Some(Forward), false, 0, true), PcrAcGate::NotApplicable);
+        assert_eq!(pcr_accuracy_gate(Some(Forward), false, 1, true), PcrAcGate::NotApplicable);
+        assert_eq!(pcr_accuracy_gate(Some(Forward), false, full, true), PcrAcGate::NotApplicable);
+        // A PCR sample means it sent, whatever the packet counter says.
+        assert_eq!(pcr_accuracy_gate(Some(Forward), false, 1, false), PcrAcGate::NotApplicable);
+        // A video re-encode that has sent no PCR yet is warming.
+        assert_eq!(pcr_accuracy_gate(Some(Forward), true, 0, true), PcrAcGate::Warming);
+        assert_eq!(pcr_accuracy_gate(Some(Forward), true, 1, true), PcrAcGate::Warming);
         // A full reservoir still holding its startup is not judged.
         assert_eq!(
-            pcr_accuracy_gate(Some(Forward), true, PCR_TRUST_RESERVOIR_SIZE as u64),
+            pcr_accuracy_gate(Some(Forward), true, PCR_TRUST_RESERVOIR_SIZE as u64, true),
             PcrAcGate::Warming
         );
-        assert_eq!(pcr_accuracy_gate(Some(Forward), true, full - 1), PcrAcGate::Warming);
-        assert_eq!(pcr_accuracy_gate(Some(Forward), true, full), PcrAcGate::Measure);
+        assert_eq!(pcr_accuracy_gate(Some(Forward), true, full - 1, true), PcrAcGate::Warming);
+        assert_eq!(pcr_accuracy_gate(Some(Forward), true, full, true), PcrAcGate::Measure);
     }
 
     /// Feed `n` PCR sends at a 40 ms PCR spacing; every 10th leaves
@@ -878,7 +916,10 @@ mod tests {
             assert_eq!(d["recover_below_us"], 20_000);
             assert!(d["p99_us"].as_u64().unwrap() > 30_000, "{d}");
             assert_eq!(d["samples"], PCR_TRUST_RESERVOIR_SIZE as u64);
-            assert_eq!(d["estimated_added_latency_ms"], 90, "50 ms preroll + the 40 ms worst");
+            assert_eq!(
+                d["estimated_added_latency_ms"], 50,
+                "a 40 ms worst is inside the 50 ms preroll: no late re-anchor"
+            );
             assert!(e.message.contains("egress_pacing \"pcr\""), "{}", e.message);
             assert!(!e.message.contains("40"), "numbers stay out of the message: {}", e.message);
         }
@@ -1013,10 +1054,12 @@ mod tests {
         assert_ne!(details(&second[0])["p99_us"], details(&first[0])["p99_us"]);
     }
 
-    /// Stalls past what pcr pacing absorbs get the other message: pcr is
-    /// not offered as the fix.
+    /// Stalls past what pcr pacing absorbs still get the one message,
+    /// which names pcr and the stall length it stops at; the heuristic
+    /// rides in details, and the latency estimate stops at the 200 ms the
+    /// pacer can hold.
     #[test]
-    fn stalls_beyond_pcr_pacing_say_so() {
+    fn long_stalls_keep_the_one_message_and_flag_the_heuristic() {
         let flow = FlowStatsAccumulator::new("f".into(), "flow".into(), "udp".into());
         let (events, mut rx) = crate::manager::events::event_channel();
         let tx = register(&flow, "tx", "udp", Some((EgressPacingMode::Forward, true)), true);
@@ -1029,8 +1072,55 @@ mod tests {
         let d = details(&got[0]);
         assert_eq!(d["error_code"], "egress_pcr_accuracy_exceeded");
         assert_eq!(d["pcr_expected_to_reach_limit"], false);
-        assert!(d["suggested_egress_pacing"].is_null());
-        assert_eq!(d["estimated_added_latency_ms"], 250, "capped at what pcr absorbs");
-        assert!(got[0].message.contains("Reduce the encoder's load"), "{}", got[0].message);
+        assert_eq!(d["suggested_egress_pacing"], "pcr");
+        assert_eq!(d["estimated_added_latency_ms"], 200, "capped at what pcr holds");
+        assert_eq!(got[0].message, pcr_accuracy_exceeded_message("tx", "f"));
+        assert!(got[0].message.contains("egress_pacing \"pcr\""), "{}", got[0].message);
+        assert!(got[0].message.contains("at most about 200 ms"), "{}", got[0].message);
+    }
+
+    /// The estimate is the larger of the preroll and the worst lateness,
+    /// never their sum, and never past the 200 ms the pacer holds.
+    #[test]
+    fn estimated_latency_is_the_preroll_or_the_worst_stall() {
+        assert_eq!(estimated_pcr_pacing_latency_ms(0), 50);
+        assert_eq!(estimated_pcr_pacing_latency_ms(40_000), 50);
+        assert_eq!(estimated_pcr_pacing_latency_ms(50_000), 50);
+        assert_eq!(estimated_pcr_pacing_latency_ms(97_000), 97);
+        assert_eq!(estimated_pcr_pacing_latency_ms(200_000), 200);
+        assert_eq!(estimated_pcr_pacing_latency_ms(431_600), 200);
+    }
+
+    /// An alerted output re-added under its id as a forward-paced UDP
+    /// output that neither re-encodes video nor carries a PCR (an
+    /// audio_302m output, say) closes the alert once it is sending, not
+    /// before: until then its transcode chain may still be building.
+    #[test]
+    fn poll_clears_the_alert_when_the_output_comes_back_without_pcr() {
+        let flow = FlowStatsAccumulator::new("f".into(), "flow".into(), "udp".into());
+        let (events, mut rx) = crate::manager::events::event_channel();
+        let tx = register(&flow, "tx", "udp", Some((EgressPacingMode::Forward, true)), true);
+        let mut latches = HashMap::new();
+        feed(&tx, &mut None, PCR_AC_WARMUP_SAMPLES, 40);
+        poll_egress_pcr_accuracy("f", &flow, &mut latches, &events);
+        poll_egress_pcr_accuracy("f", &flow, &mut latches, &events);
+        assert_eq!(drain(&mut rx).len(), 1);
+        flow.unregister_output("tx");
+        let tx = register(&flow, "tx", "udp", Some((EgressPacingMode::Forward, true)), false);
+        for _ in 0..3 {
+            poll_egress_pcr_accuracy("f", &flow, &mut latches, &events);
+        }
+        assert!(drain(&mut rx).is_empty(), "not sending yet: may still re-encode");
+        assert!(latches.get("tx").is_some_and(|l| l.alerted));
+        tx.packets_sent.fetch_add(7, Ordering::Relaxed);
+        poll_egress_pcr_accuracy("f", &flow, &mut latches, &events);
+        let got = drain(&mut rx);
+        assert_eq!(got.len(), 1, "{got:?}");
+        let d = details(&got[0]);
+        assert_eq!(d["reason"], "no_longer_applies");
+        assert!(d["p99_us"].is_null(), "no PCR sent");
+        poll_egress_pcr_accuracy("f", &flow, &mut latches, &events);
+        assert!(drain(&mut rx).is_empty());
+        assert!(latches.is_empty());
     }
 }

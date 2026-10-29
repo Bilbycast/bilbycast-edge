@@ -708,7 +708,7 @@ One lightweight task per bus key maintains a `PerEsAccumulator` on `FlowStatsAcc
 
 ### Output-side PCR accuracy sampler (`stats/pcr_trust.rs`)
 
-Fixed-size rotating reservoir (4096 samples) on every TS-bearing output's send path. On each successful `socket.send_to` of a datagram containing a PCR-bearing TS packet, the sampler records `|ΔPCR_µs − Δwall_µs|` — then exposes exact percentiles (p50 / p95 / p99 / max) on snapshot. Sample-skip rule: Δ > 500 ms on either side discards and resets state (filters startup jitter, keyframe gaps, restarts, 33-bit wrap). Wired from `engine/wire_emit.rs`, the release path of every UDP/RTP output, in every pacing mode. Flow-level rollup on `FlowStats.pcr_trust_flow` aggregates across outputs. `engine/av_quality_watch.rs` watches it on forward-paced outputs that re-encode video (Warning `egress_pcr_accuracy_exceeded` above 30 ms p99).
+Fixed-size rotating reservoir (4096 samples) on every UDP/RTP output's wire emitter (SRT, RIST, HLS and the other TS-carrying outputs are not sampled). On each successful send of a datagram carrying a PCR on the emitter's anchor PCR PID, the sampler records `|ΔPCR_µs − Δwall_µs|` — so an MPTS output's figure covers one program — then exposes exact percentiles (p50 / p95 / p99 / max) on snapshot. Sample-skip rule: Δ > 500 ms on either side discards and resets state (filters startup jitter, keyframe gaps, restarts, 33-bit wrap). Wired from `engine/wire_emit.rs`, the release path of every UDP/RTP output, in every pacing mode. Flow-level rollup on `FlowStats.pcr_trust_flow` aggregates across outputs. `engine/av_quality_watch.rs` watches it on forward-paced outputs that re-encode video (Warning `egress_pcr_accuracy_exceeded` above 30 ms p99).
 
 ### Runtime plumbing (`engine/flow.rs`)
 
