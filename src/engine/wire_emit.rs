@@ -59,18 +59,22 @@
 //! ## Late-rebase
 //!
 //! If a PCR-driven target lands more than 5 ms behind real time (e.g.
-//! after an encoder pipeline burst), `wall_anchor` snaps to `now`. One
-//! one-time jitter step instead of a steady-state degradation.
+//! after an encoder pipeline burst), `wall_anchor` snaps to `now`: a step
+//! later instead of every following PCR leaving late. Nothing moves the
+//! anchor back, so a cause that recurs (a VBR / I-frame tail whose batch
+//! takes over 5 ms to send on every GOP) stacks one step per occurrence
+//! until the residence cap sheds.
 //!
 //! ## Ordering floor
 //!
-//! Successive targets never go backwards: one that would is lifted to the
-//! previous target + 1 µs. The floor lifts the *returned* instant only and
-//! never moves `wall_anchor`, which stays the PCR-implied instant of the
-//! latest anchor PCR. On the `clock_nanosleep` tier the emitter derives a
-//! datagram only after sleeping to the previous target, so the floor only
-//! ever fires on a target already in the past and changes no emission
-//! instant. Moving the anchor with it, as this code once did, folded every
+//! Successive targets never go backwards (a discontinuity or a late-rebase
+//! restarts the timeline from `now` on purpose): one that would is lifted
+//! to the previous target + 1 µs. The floor lifts the *returned* instant
+//! only and never moves `wall_anchor`, which stays the PCR-implied instant
+//! of the latest anchor PCR. On the `clock_nanosleep` tier the emitter
+//! derives a datagram only after sleeping to the previous target, so the
+//! floor only ever fires on a target already in the past and changes no
+//! emission instant. Moving the anchor with it, as this code once did, folded every
 //! late wake into permanent egress latency (edge#157).
 //!
 //! ## Discontinuity
@@ -2307,10 +2311,10 @@ fn run_emitter(
                 }
             }
             // Diagnostic accounting — running average batch size over a
-            // 5 s window, emitted at DEBUG level so operators can confirm
-            // the sendmmsg optimisation is firing on bursty TS outputs
-            // (`RUST_LOG=bilbycast_edge::engine::wire_emit=debug`). Silent
-            // at default log level.
+            // 5 s window, emitted at INFO every 5 s on this batch path
+            // (clock_nanosleep tier, PCR anchor) so operators can confirm
+            // the sendmmsg optimisation is firing on bursty TS outputs,
+            // with the cumulative rebase / ceil / floor counters.
             diag_dgms = diag_dgms.saturating_add(batch.len() as u64);
             batch_count = batch_count.saturating_add(1);
             batch_dgms_total = batch_dgms_total.saturating_add(batch.len() as u64);
@@ -2597,12 +2601,15 @@ mod tests {
     /// `wall_anchor_ns` AND the `last_returned_ns` (the outer monotonic
     /// guard's reference). The discontinuity branch already sets
     /// `wall_anchor = now`; if we don't ALSO reset `last_returned`,
-    /// the outer guard fast-forwards the returned target back to
-    /// `last_returned + ε` (= the previously-queued future value),
-    /// which is the documented "wire pacer collapses to ~0.5 Mbps after
-    /// 4-5 input switches" regression — the new input then paces from
-    /// that future anchor, every subsequent natural-paced packet
-    /// targets further out, and the wire-emit channel drowns in drops.
+    /// the outer guard lifts the returned target back to
+    /// `last_returned + ε` (= the previously-queued future value), and
+    /// keeps the new input's returns at `last_returned + N·ε` until its
+    /// own timeline passes that target. Before edge#157 the guard also
+    /// moved the anchor there, which was the documented "wire pacer
+    /// collapses to ~0.5 Mbps after 4-5 input switches" regression —
+    /// the new input paced from that future anchor, every subsequent
+    /// natural-paced packet targeted further out, and the wire-emit
+    /// channel drowned in drops.
     #[test]
     fn discontinuity_resets_pacing_to_now() {
         let mut s = TargetState::default();
@@ -3613,7 +3620,8 @@ mod tests {
         /// Every datagram of an interval is held by the same delay, drawn
         /// per interval from a fixed LCG in `[0, jitter_max_ns)`, and
         /// released in order behind the interval before it (a bonded
-        /// input's reassembly). 0 = no jitter.
+        /// input's reassembly). Interval 0 is never held, so the cold
+        /// start's cushion is the preroll alone. 0 = no jitter.
         jitter_max_ns: u64,
     }
 
@@ -3640,7 +3648,11 @@ mod tests {
                     lcg = lcg
                         .wrapping_mul(6_364_136_223_846_793_005)
                         .wrapping_add(1_442_695_040_888_963_407);
-                    (lcg >> 33) % self.jitter_max_ns
+                    // Interval 0 is drawn (so the sequence after it is
+                    // fixed) but never held: the cold start anchors on its
+                    // arrival, and a held first interval would hand every
+                    // later one its hold as extra cushion over the preroll.
+                    if k == 0 { 0 } else { (lcg >> 33) % self.jitter_max_ns }
                 };
                 let n = self.counts[(k % self.counts.len() as u64) as usize];
                 for j in 0..=n {
@@ -4035,8 +4047,9 @@ mod tests {
     /// Arrival jitter (a bonded input's reassembly holds, per PCR interval).
     /// Inside the 50 ms preroll it is absorbed: no rebase, no residual.
     /// Beyond it, the late-rebase steps the anchor to the worst lateness
-    /// seen and holds it there — bounded steps, never a ratchet. Before the
-    /// fix both cases drifted ~240 ms in 5 min.
+    /// seen and holds it there — bounded steps, never a ratchet (3 steps,
+    /// ~30 ms of residual here). Before the fix the PCR residual reached
+    /// ~244 ms (inside) and ~270 ms (beyond) in 5 min.
     #[test]
     fn arrival_jitter_is_absorbed_or_stepped_never_ratcheted() {
         let slop = 60_000;
@@ -4050,6 +4063,9 @@ mod tests {
         let beyond = Feed { jitter_max_ns: jitter, ..Feed::steady(&[20, 24]) };
         let mut s = TargetState::default();
         let run = replay(&mut s, &beyond, 7_500, slop);
+        // Holds beyond the preroll must actually make PCRs late — without
+        // this the case can quietly collapse into the one above.
+        assert!(s.late_rebases > 0, "jitter beyond the preroll never rebased");
         // Each rebase is a step of more than 5 ms toward the worst lateness,
         // which is at most the jitter less the preroll.
         let max_rebases = (jitter - PREROLL_NS) / LATE_REBASE_THRESHOLD_NS + 1;
