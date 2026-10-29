@@ -1901,10 +1901,13 @@ commit message or release note and delete the bullet.
 4. **No B-frames on RTMP or CMAF.** `bframes` is configurable (0–16) on the
    TS paths, but the RTMP output pins it to 0 and warns
    (`rtmp_bframes_unsupported`) if asked otherwise: FLV carries DTS in the
-   tag timestamp and both tag writers hard-code the composition-time offset
-   to 0 (the Enhanced-RTMP HEVC path has no CTS field at all), so a
-   reordering encoder would drive DTS backwards and most ingests answer that
-   by dropping the publisher. The CMAF re-encode pins it too
+   tag timestamp and the re-encode path has none to give it — the encoder
+   hands back no decode times, so its tag writers write composition time 0
+   (the HEVC re-encode goes out as Enhanced-RTMP `CodedFramesX`, which has
+   no CTS field) — and a reordering encoder would drive DTS backwards; most
+   ingests answer that by dropping the publisher. (RTMP *passthrough* of a
+   B-frame source carries the source's decode times and composition times —
+   edge#205.) The CMAF re-encode pins it too
    (`cmaf_bframes_unsupported`): the re-encode path hands the segmenter each
    frame's presentation stamp and no decode time, so it writes no
    composition offsets.

@@ -99,7 +99,7 @@ pub enum DemuxedFrame {
         /// PTS — MPEG-TS leaves it out then, which is every picture of a
         /// stream without B-frames and every B-picture of one with them —
         /// or that the PES carried no timestamp at all. Only a consumer that
-        /// writes decode order needs it (CMAF passthrough; the replay
+        /// writes decode order needs it (CMAF and RTMP passthrough; the replay
         /// export's no-encoder fallback would, but does not read it yet); one
         /// that decodes does not, since the decoder reorders by PTS.
         dts: Option<u64>,

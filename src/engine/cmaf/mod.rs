@@ -2362,7 +2362,8 @@ async fn handle_video(
 /// A picture's composition offset — PTS − DTS, on the 33-bit 90 kHz clock —
 /// from the timestamps its PES carried. 0 for a DTS the offset cannot be:
 /// one after its PTS, or more than [`MAX_COMPOSITION_OFFSET_90K`] before it.
-fn composition_offset_90k(pts: u64, dts: u64) -> u64 {
+/// The RTMP output judges a source DTS with this too (edge#205).
+pub(crate) fn composition_offset_90k(pts: u64, dts: u64) -> u64 {
     const MASK_33: u64 = (1 << 33) - 1;
     let offset = pts.wrapping_sub(dts) & MASK_33;
     if offset > MAX_COMPOSITION_OFFSET_90K { 0 } else { offset }
