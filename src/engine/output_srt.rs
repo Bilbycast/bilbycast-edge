@@ -16,6 +16,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{SrtMode, SrtOutputConfig};
 use crate::manager::events::{EventSender, EventSeverity, category};
+use crate::srt::bond_supervisor::{
+    BondEventScope, BondEvents, BondHealthTracker, BondLatch, BondSupervisor, degrade_after,
+    final_member_report, plan_bond_members,
+};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_bonded_output, bind_srt_listener_for_output,
     bind_srt_listener_for_redundancy, connect_srt_group, connect_srt_output,
@@ -408,9 +412,12 @@ impl SrtSendSink {
     }
 }
 
-/// Resolve `interface_binding` → `local_addr` for the primary leg, the
-/// 2022-7 redundancy leg, and every bonding endpoint. Mutates `config`
-/// in place. Phase 1: loose only — strict requests are returned as Err.
+/// Resolve `interface_binding` → `local_addr` for the primary leg and the
+/// 2022-7 redundancy leg, mutating `config` in place, and check every
+/// bonding endpoint's binding. Bonding endpoints are checked only: their
+/// NIC address is resolved again on every group connect and member re-add
+/// (`srt::bond_supervisor`), so a member follows a NIC whose address
+/// changes. Phase 1: loose only — strict requests are returned as Err.
 fn apply_srt_output_interface_bindings(config: &mut SrtOutputConfig) -> anyhow::Result<()> {
     if let Some(addr) = crate::util::socket::srt_local_addr_from_binding(
         config.interface_binding.as_ref(),
@@ -425,15 +432,8 @@ fn apply_srt_output_interface_bindings(config: &mut SrtOutputConfig) -> anyhow::
         )? {
             red.local_addr = Some(addr);
         }
-    if let Some(bonding) = config.bonding.as_mut() {
-        for ep in bonding.endpoints.iter_mut() {
-            if let Some(addr) = crate::util::socket::srt_local_addr_from_binding(
-                ep.interface_binding.as_ref(),
-                ep.local_addr.as_deref(),
-            )? {
-                ep.local_addr = Some(addr);
-            }
-        }
+    if let Some(bonding) = config.bonding.as_ref() {
+        crate::srt::bond_supervisor::check_bond_endpoint_bindings(bonding)?;
     }
     Ok(())
 }
@@ -2403,6 +2403,15 @@ async fn srt_output_bonded_loop(
                     stats.srt_bonding_stats_cache.clone(),
                     None,
                     poller_cancel.clone(),
+                    Some(BondHealthTracker::new(
+                        BondEvents::new(
+                            BondEventScope::Output { output_id: config.id.clone() },
+                            events.clone(),
+                            bond.mode,
+                            "listener-bonded",
+                        ),
+                        degrade_after(config.connect_timeout_secs),
+                    )),
                 );
 
                 let mut rx = broadcast_tx.subscribe();
@@ -2439,6 +2448,17 @@ async fn srt_output_bonded_loop(
             }
         }
         _ => {
+            // Validation guarantees the plan; if it cannot be made, the
+            // connect below fails with the same error.
+            let plans = plan_bond_members(&bond).unwrap_or_default();
+            // Outlives each connected group (see `BondLatch`).
+            let latch = Arc::new(BondLatch::default());
+            let bond_events = BondEvents::new(
+                BondEventScope::Output { output_id: config.id.clone() },
+                events.clone(),
+                bond.mode,
+                "caller-bonded",
+            );
             loop {
                 let params = SrtConnectionParams::from(config);
                 let group = match connect_srt_group(&params, &bond, &cancel).await {
@@ -2473,12 +2493,22 @@ async fn srt_output_bonded_loop(
                 );
 
                 let poller_cancel = cancel.child_token();
-                spawn_srt_group_stats_poller(
+                let supervisor = (!plans.is_empty()).then(|| {
+                    BondSupervisor::new(
+                        plans.clone(),
+                        bond_events.clone(),
+                        latch.clone(),
+                        degrade_after(params.connect_timeout_secs),
+                        std::time::Instant::now(),
+                    )
+                });
+                let poller = spawn_srt_group_stats_poller(
                     group.clone(),
                     bond.mode,
                     stats.srt_bonding_stats_cache.clone(),
                     None,
                     poller_cancel.clone(),
+                    supervisor,
                 );
 
                 let mut rx = broadcast_tx.subscribe();
@@ -2492,6 +2522,13 @@ async fn srt_output_bonded_loop(
                 )
                 .await?;
                 poller_cancel.cancel();
+                // Join the poller first: it hands back the supervisor whose
+                // member tracks the report is built from.
+                let members = if disconnected {
+                    final_member_report(poller).await
+                } else {
+                    serde_json::Value::Null
+                };
                 let _ = group.close().await;
 
                 if !disconnected {
@@ -2502,7 +2539,7 @@ async fn srt_output_bonded_loop(
                     category::SRT,
                     format!("SRT bonded output '{}' disconnected", config.id),
                     &config.id,
-                    serde_json::json!({ "mode": "caller-bonded" }),
+                    serde_json::json!({ "mode": "caller-bonded", "members": members }),
                 );
                 tokio::select! {
                     _ = cancel.cancelled() => return Ok(()),
@@ -2517,6 +2554,51 @@ async fn srt_output_bonded_loop(
 mod tests {
     use super::*;
     use tokio::sync::mpsc::error::TrySendError;
+
+    fn bonded_caller_output(endpoints: serde_json::Value) -> SrtOutputConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "o1",
+            "name": "o1",
+            "mode": "caller",
+            "remote_addr": "127.0.0.1:9000",
+            "bonding": { "mode": "broadcast", "endpoints": endpoints },
+        }))
+        .expect("SrtOutputConfig")
+    }
+
+    /// A bonding member's NIC address is no longer baked into the config at
+    /// spawn: it is resolved again on every connect and re-add, so a member
+    /// follows a NIC whose address changes, and an explicit `local_addr` can
+    /// still be told apart from a resolved one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bonding_endpoints_are_checked_not_baked_in() {
+        let mut config = bonded_caller_output(serde_json::json!([
+            { "addr": "127.0.0.1:9000", "interface_binding": { "name": "lo" } },
+            { "addr": "127.0.0.1:9001" },
+        ]));
+        apply_srt_output_interface_bindings(&mut config).unwrap();
+        let bonding = config.bonding.unwrap();
+        assert!(bonding.endpoints.iter().all(|ep| ep.local_addr.is_none()));
+    }
+
+    /// The spawn-time abort is unchanged: a bonding endpoint whose NIC is
+    /// missing still refuses to start the output, unless it has an explicit
+    /// `local_addr`, which wins and leaves the NIC unread.
+    #[test]
+    fn a_bonding_endpoint_on_a_missing_nic_still_refuses_to_start() {
+        let mut config = bonded_caller_output(serde_json::json!([
+            { "addr": "127.0.0.1:9000", "interface_binding": { "name": "no-such-nic0" } },
+            { "addr": "127.0.0.1:9001" },
+        ]));
+        assert!(apply_srt_output_interface_bindings(&mut config).is_err());
+        let mut config = bonded_caller_output(serde_json::json!([
+            { "addr": "127.0.0.1:9000", "local_addr": "127.0.0.1:0",
+              "interface_binding": { "name": "no-such-nic0" } },
+            { "addr": "127.0.0.1:9001" },
+        ]));
+        assert!(apply_srt_output_interface_bindings(&mut config).is_ok());
+    }
 
     fn item(bytes: usize) -> (Bytes, u64) {
         (Bytes::from(vec![0u8; bytes]), 0)

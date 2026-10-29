@@ -2221,7 +2221,11 @@ pub struct SrtBondingMemberStats {
     /// Group-level member status — `"running"` (active), `"idle"` (standby
     /// backup), `"pending"` (negotiating), `"broken"`.
     pub member_status: String,
-    /// Backup-mode priority; lower is preferred. 0 in broadcast mode.
+    /// Backup-mode priority. On a **caller** group: the configured weight
+    /// of the member's endpoint, where lower is preferred (0 in broadcast
+    /// mode). On a **listener** group: the weight the remote caller sent in
+    /// the group handshake, which is libsrt's — greater is preferred (from
+    /// a bilbycast caller, the members' rank 0-7, not its configured value).
     pub weight: u16,
     /// Full SRT stats for this member link.
     pub stats: SrtLegStats,

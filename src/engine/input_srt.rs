@@ -19,6 +19,10 @@ use tokio_util::sync::CancellationToken;
 use crate::config::models::{SrtInputConfig, SrtMode, SrtRedundancyConfig};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
+use crate::srt::bond_supervisor::{
+    BondEventScope, BondEvents, BondHealthTracker, BondLatch, BondSupervisor, degrade_after,
+    final_member_report, member_sources_json, plan_bond_members,
+};
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_bonded_input,
     bind_srt_listener_for_input, bind_srt_listener_for_redundancy, connect_srt_group_observed,
@@ -241,32 +245,23 @@ pub fn spawn_srt_input(
                 }
             }
         }
-        // Apply per-endpoint binding for SRT bonding members. Each member
+        // Check per-endpoint binding for SRT bonding members. Each member
         // can pin a different NIC — the whole point of bonding for path
-        // diversity.
-        if let Some(bonding) = config.bonding.as_mut() {
-            for ep in bonding.endpoints.iter_mut() {
-                match crate::util::socket::srt_local_addr_from_binding(
-                    ep.interface_binding.as_ref(),
-                    ep.local_addr.as_deref(),
-                ) {
-                    Ok(Some(addr)) => {
-                        ep.local_addr = Some(addr);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::error!("SRT input '{input_id}' bonding endpoint: {e}");
-                        event_sender.emit_flow_with_details(
-                            EventSeverity::Critical,
-                            crate::manager::events::category::SRT,
-                            format!("SRT input '{input_id}' bonding endpoint rejected: {e}"),
-                            &flow_id,
-                            serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
-                        );
-                        return;
-                    }
-                }
-            }
+        // diversity. Checked only: the NIC's address is resolved again on
+        // every group connect and member re-add (`srt::bond_supervisor`),
+        // so a member follows a NIC whose address changes.
+        if let Some(bonding) = config.bonding.as_ref()
+            && let Err(e) = crate::srt::bond_supervisor::check_bond_endpoint_bindings(bonding)
+        {
+            tracing::error!("SRT input '{input_id}' bonding endpoint: {e}");
+            event_sender.emit_flow_with_details(
+                EventSeverity::Critical,
+                crate::manager::events::category::SRT,
+                format!("SRT input '{input_id}' bonding endpoint rejected: {e}"),
+                &flow_id,
+                serde_json::json!({"error_code": "srt_strict_binding_unsupported"}),
+            );
+            return;
         }
         // Build ingress transcoder once per connection cycle so PMT discovery
         // state and codec buffers persist across reconnects within a single
@@ -1463,7 +1458,7 @@ async fn srt_input_bonded_loop(
     match config.mode {
         SrtMode::Listener => {
             srt_input_bonded_listener_loop(
-                config, publisher, stats, srt, cancel, events, flow_id, transcoder, post,
+                config, publisher, stats, srt, cancel, events, flow_id, input_id, transcoder, post,
             )
             .await
         }
@@ -1490,6 +1485,18 @@ async fn srt_input_bonded_caller_loop(
 ) -> anyhow::Result<()> {
     let bond = config.bonding.as_ref().expect("bonding must be set").clone();
     let mut recv_state = SrtRecvState::new();
+    // Validation guarantees the plan; if it cannot be made, the connect
+    // below fails with the same error and reports it.
+    let plans = plan_bond_members(&bond).unwrap_or_default();
+    // Outlives each connected group, so a whole-group reconnect neither
+    // repeats a warning nor loses a pending "restored".
+    let latch = Arc::new(BondLatch::default());
+    let bond_events = BondEvents::new(
+        BondEventScope::Input { flow_id: flow_id.to_string(), input_id: input_id.to_string() },
+        events.clone(),
+        bond.mode,
+        "caller-bonded",
+    );
 
     // Group-connect consecutive-failure counter (contract C3 /
     // `connect_failed` state) — one counter per input, bumped per
@@ -1511,6 +1518,10 @@ async fn srt_input_bonded_caller_loop(
                 "mode": "caller-bonded",
                 "bonding_mode": format!("{:?}", bond.mode),
                 "endpoints": bond.endpoints.iter().map(|e| &e.addr).collect::<Vec<_>>(),
+                // Each member's source as this connect cycle resolves it: a
+                // source with no route to the peer is the usual reason a
+                // NIC-pinned bond never connects.
+                "members": member_sources_json(&plans),
             }),
         );
         let group = match connect_srt_group_observed(&params, &bond, &cancel, &mut on_attempt_failed).await {
@@ -1555,12 +1566,22 @@ async fn srt_input_bonded_caller_loop(
         );
 
         let poller_cancel = cancel.child_token();
-        spawn_srt_group_stats_poller(
+        let supervisor = (!plans.is_empty()).then(|| {
+            BondSupervisor::new(
+                plans.clone(),
+                bond_events.clone(),
+                latch.clone(),
+                degrade_after(params.connect_timeout_secs),
+                std::time::Instant::now(),
+            )
+        });
+        let poller = spawn_srt_group_stats_poller(
             group.clone(),
             bond.mode,
             srt.bonding.clone(),
             Some(srt.clone()),
             poller_cancel.clone(),
+            supervisor,
         );
 
         let disconnected = srt_bonded_group_recv_loop(
@@ -1575,18 +1596,28 @@ async fn srt_input_bonded_caller_loop(
         )
         .await?;
         poller_cancel.cancel();
+        // Join the poller before the close: it hands back the supervisor
+        // whose member tracks the report is built from.
+        let members = if disconnected {
+            final_member_report(poller).await
+        } else {
+            serde_json::Value::Null
+        };
         let _ = group.close().await;
 
         if !disconnected {
             break;
         }
 
+        // Each member's source and, for one never live, why: a bond whose
+        // handshakes never complete connects and fails whole, and this is
+        // the only event that reports it.
         events.emit_flow_with_details(
             EventSeverity::Warning,
             category::SRT,
             "SRT bonded input disconnected, reconnecting",
             flow_id,
-            serde_json::json!({ "mode": "caller-bonded" }),
+            serde_json::json!({ "mode": "caller-bonded", "members": members }),
         );
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -1605,6 +1636,7 @@ async fn srt_input_bonded_listener_loop(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    input_id: &str,
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
@@ -1660,6 +1692,18 @@ async fn srt_input_bonded_listener_loop(
             srt.bonding.clone(),
             Some(srt.clone()),
             poller_cancel.clone(),
+            Some(BondHealthTracker::new(
+                BondEvents::new(
+                    BondEventScope::Input {
+                        flow_id: flow_id.to_string(),
+                        input_id: input_id.to_string(),
+                    },
+                    events.clone(),
+                    bond.mode,
+                    "listener-bonded",
+                ),
+                degrade_after(config.connect_timeout_secs),
+            )),
         );
 
         let disconnected = srt_input_recv_loop(
