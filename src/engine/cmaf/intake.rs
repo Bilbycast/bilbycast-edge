@@ -4,8 +4,8 @@
 //! origin's answer to the upload, and publishing the init or a playlist awaits
 //! a PUT. While it waits, nothing reads the broadcast, and the flow keeps
 //! publishing into a channel sized in packets — 16,384 for a standard flow,
-//! about 2.4 s of an SDI feed that broadcasts one 188-byte TS packet per
-//! message. A wait longer than that came back as `Lagged`: those packets were
+//! about 2.4 s of an SDI feed when it broadcast one 188-byte TS packet per
+//! message (until edge#166; about 17 s now, seven to a message). A wait longer than that came back as `Lagged`: those packets were
 //! gone, and the viewer saw a hole in the picture. On bilby-voyager
 //! (2026-10-22) every output of five sessions lagged in the same millisecond,
 //! several times a minute, losing 3–4 s each time.
@@ -54,8 +54,8 @@ use crate::util::byte_budget::{Charge, NodeBudget, QueueBudget};
 
 /// Memory an output may hold unread before the intake drops, held only while
 /// the output is behind: each packet is charged its payload plus
-/// [`ITEM_OVERHEAD_BYTES`]. In time that is ~15 s of a 10 Mbit/s SDI feed
-/// (one 188-byte TS packet per message), ~24 s of 1316-byte datagrams at
+/// [`ITEM_OVERHEAD_BYTES`]. In time that is ~15 s of a 10 Mbit/s feed of
+/// 188-byte messages (SDI's shape until edge#166), ~24 s of 1316-byte datagrams at
 /// 10 Mbit/s, and more on a frame-per-message feed (RTMP, RTSP). Per output:
 /// the renditions of a flow share one origin connection, so a stall that
 /// fills one tends to fill them all — which is why the node's intakes are
@@ -144,8 +144,8 @@ impl Floor {
 /// What a queued packet costs beyond its payload: the queue's own slot for it
 /// (the packet header and its arrival instant), the shared header the
 /// broadcast's clone gave its `Bytes`, and the allocator's overhead on the
-/// payload. A 188-byte SDI packet is no bigger than all of that put
-/// together, so counting the payload alone let an SDI feed's queue reach
+/// payload. A 188-byte packet is no bigger than all of that put together, so
+/// counting the payload alone let a feed of them (SDI before edge#166) reach
 /// well over one and a half times the budget it was said to be held to.
 const ITEM_OVERHEAD_BYTES: usize = std::mem::size_of::<Item>() + 64;
 

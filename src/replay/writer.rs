@@ -141,15 +141,16 @@ const SYNC_BYTE: u8 = 0x47;
 /// before memory is in question.
 ///
 /// Counted in bytes, because a message is not a fixed size. An SDI flow
-/// broadcasts one 188-byte TS packet per message, about 6,900 a second at
-/// 10 Mbit/s; an RTMP or RTSP flow broadcasts a whole frame per message, tens
-/// of kilobytes. A cap in messages — 1024 until bilby-voyager's five recorders
+/// broadcast one 188-byte TS packet per message until edge#166, about 6,900 a
+/// second at 10 Mbit/s (a UDP / RTP feed sending one TS packet per datagram
+/// still does); an RTMP or RTSP flow broadcasts a whole frame per message,
+/// tens of kilobytes. A cap in messages — 1024 until bilby-voyager's five recorders
 /// dropped ~2.5 % of their packets at every load (2026-10-22), then 16,384 —
 /// was ~150 ms and then ~2.4 s of the first, but let the second hold hundreds
 /// of megabytes on a stalled disk. Each message is charged its payload plus
-/// [`MESSAGE_OVERHEAD`], so in time the budget is ~17 s of that SDI feed,
-/// ~25 s of 1316-byte datagrams at 10 Mbit/s and ~27 s of a 10 Mbit/s
-/// frame-per-message feed.
+/// [`MESSAGE_OVERHEAD`], so in time the budget is ~17 s of a feed of 188-byte
+/// messages, ~25 s of 1316-byte datagrams (SDI's shape since edge#166) at
+/// 10 Mbit/s and ~27 s of a 10 Mbit/s frame-per-message feed.
 const WRITER_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 /// What every recorder's queue on the node may hold between them: eight
 /// recorders' full budgets.
@@ -180,8 +181,9 @@ const WRITER_QUEUE_FLOOR_BYTES: usize = WRITER_QUEUE_BYTES / 8;
 /// What one queued message costs beyond its payload: its slot in the queue,
 /// the shared header the broadcast's clone gave its `Bytes`, and the
 /// allocator's own overhead on the payload. Negligible beside a frame, and
-/// half again a 188-byte SDI packet, so counting the payload alone
-/// understated what an SDI recorder's queue really held by a third.
+/// half again a 188-byte packet, so counting the payload alone understated
+/// what a recorder of 188-byte messages (SDI before edge#166) really held by
+/// a third.
 const MESSAGE_OVERHEAD: usize = 96;
 /// The queue's capacity in messages — a backstop only. It is what the byte
 /// budget admits at the smallest message that records anything, one TS
@@ -3510,10 +3512,11 @@ mod tests {
         assert!(handle.finished(Duration::from_secs(10)).await);
     }
 
-    /// The recorder against an SDI flow's message rate, measured.
+    /// The recorder against the message rate an SDI flow had before edge#166,
+    /// measured — still the worst case a TS feed can present.
     ///
-    /// An SDI flow broadcasts one 188-byte TS packet per message, about 6,900
-    /// a second at 10 Mbit/s — the shape that made every recorder on
+    /// An SDI flow then broadcast one 188-byte TS packet per message, about
+    /// 6,900 a second at 10 Mbit/s — the shape that made every recorder on
     /// bilby-voyager drop ~2.5 % of its packets (#190), five sessions to one
     /// volume. This runs five recorders at that rate for 25 s with 2 s
     /// segments, so each rolls a dozen times, and reports what they dropped

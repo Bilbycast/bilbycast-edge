@@ -61,8 +61,9 @@ project-wide "never block the data path" invariant.
   output's loop. The loop awaits the origin in places — the low-latency
   segment close (`finish()`), the init and playlist PUTs — and while it
   waits nothing else reads the broadcast, whose ring is sized in packets:
-  16,384 on a standard flow, about 2.4 s of an SDI feed that broadcasts one
-  188-byte TS packet per message. A longer wait used to come back as
+  16,384 on a standard flow, about 2.4 s of an SDI feed when it broadcast
+  one 188-byte TS packet per message (until edge#166; seven to a message
+  since, about 17 s). A longer wait used to come back as
   `Lagged`, a hole in every rendition (bilby-voyager, 2026-10-22: every
   output of five sessions lagged in the same millisecond, 3–4 s at a time).
   With the intake, a waiting output falls behind and catches up instead.
@@ -71,8 +72,8 @@ project-wide "never block the data path" invariant.
     plus its overhead — the queue slot holding the packet and its arrival
     time, the shared header of its `Bytes`, the allocator's own — because a
     188-byte packet is no bigger than those together. In time that is about
-    15 s of a 10 Mbit/s SDI feed and 24 s of 1316-byte datagrams at the same
-    rate.
+    15 s of a 10 Mbit/s feed of 188-byte messages and 24 s of 1316-byte
+    datagrams — SDI's shape since edge#166 — at the same rate.
   - **And 256 MiB between every intake on the node** (`NODE_INTAKES`,
     `NODE_INTAKE_BUDGET_BYTES`), because the per-output budget alone bounds
     nothing node-wide: the renditions of a flow share one origin

@@ -73,14 +73,16 @@ section.)
   held only while the writer is behind, each message charged its payload
   plus a fixed 96 bytes for its queue slot, its shared `Bytes` header and
   the allocator. Bytes rather than messages because a message is not a
-  fixed size: an SDI flow broadcasts one 188-byte TS packet per message,
-  about 6,900 a second at 10 Mbit/s, while an RTMP or RTSP flow broadcasts
-  a whole frame per message. A cap of 1,024 messages was ~150 ms of the SDI
+  fixed size: an SDI flow broadcast one 188-byte TS packet per message
+  until edge#166, about 6,900 a second at 10 Mbit/s (it now publishes up to
+  seven to a message, 1316 B), while an RTMP or RTSP flow broadcasts a whole
+  frame per message. A cap of 1,024 messages was ~150 ms of the SDI
   feed — five recorders on bilby-voyager dropped ~2.5 % of their packets at
   every load (#190) — and the 16,384 that replaced it was 2.4 s of that feed
   but hundreds of megabytes of frames on a stalled disk. 32 MiB is about
-  17 s of a 10 Mbit/s SDI feed, 25 s of 1316-byte datagrams and 27 s of a
-  frame-per-message feed at the same rate.
+  17 s of a 10 Mbit/s feed of 188-byte messages, 25 s of 1316-byte
+  datagrams (SDI's shape now) and 27 s of a frame-per-message feed at the
+  same rate.
 - **And every recorder's queue on the node shares 256 MiB**
   (`NODE_RECORDER_QUEUE_BYTES`), because every recorder writes under the one
   replay root: a disk that stalls stalls them all, and the per-recorder

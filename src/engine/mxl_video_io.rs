@@ -286,7 +286,8 @@ fn video_input_blocking_loop(
                     Ok(frames) => {
                         for ef in frames {
                             let ts_packets = ts_mux.mux_video(&ef.data, ef.pts as u64, ef.dts as u64, ef.keyframe);
-                            for ts in ts_packets {
+                            // Seven to an item, not one (edge#166).
+                            for ts in crate::engine::packet::bundle_ts_packets(ts_packets) {
                                 let ts_len = ts.len() as u64;
                                 let pkt = RtpPacket {
                                     data: ts,

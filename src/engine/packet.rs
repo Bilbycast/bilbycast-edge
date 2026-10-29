@@ -75,3 +75,77 @@ pub struct RtpPacket {
     /// are not affected by TSBPD release cadence at the receiver.
     pub sender_timestamp_us: Option<i64>,
 }
+
+/// TS packets per broadcast item for a source that muxes its own transport
+/// stream: 7 × 188 = 1316 bytes, the payload every datagram output sends (SRT
+/// live mode, UDP, RTP) and what the media player, the multiviewer and the
+/// test pattern already publish.
+pub const TS_PACKETS_PER_ITEM: usize = 7;
+
+/// Group the 188-byte TS packets one mux call produced into broadcast items of
+/// up to [`TS_PACKETS_PER_ITEM`] packets, in order.
+///
+/// A source that published each packet as its own item (SDI did, until
+/// edge#166) left the edge as one datagram per TS packet: 5,800 datagrams a
+/// second of 204 bytes for an 8.5 Mbit/s SRT feed instead of ~830 of 1332,
+/// 23 % wire overhead, and every buffer sized in packets — libsrt's, the
+/// flow's broadcast ring, quinn's datagram queue — seven times shallower in
+/// time than its number reads. SRT's output splits large items but never joins
+/// small ones, so it has to happen here.
+///
+/// Only the packets of one call are grouped — a call is one access unit, one
+/// audio frame or one section — so nothing waits for the next call. A batch
+/// of one is passed on as it is, without a copy.
+pub fn bundle_ts_packets(packets: Vec<Bytes>) -> Vec<Bytes> {
+    if packets.len() <= 1 {
+        return packets;
+    }
+    packets
+        .chunks(TS_PACKETS_PER_ITEM)
+        .map(|group| {
+            if group.len() == 1 {
+                return group[0].clone();
+            }
+            let mut item = bytes::BytesMut::with_capacity(group.iter().map(Bytes::len).sum());
+            for p in group {
+                item.extend_from_slice(p);
+            }
+            item.freeze()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    fn ts(n: u8) -> Bytes {
+        let mut p = vec![n; 188];
+        p[0] = 0x47;
+        Bytes::from(p)
+    }
+
+    #[test]
+    fn packets_are_grouped_seven_to_an_item_in_order() {
+        let packets: Vec<Bytes> = (0..16).map(ts).collect();
+        let items = bundle_ts_packets(packets.clone());
+        assert_eq!(items.iter().map(Bytes::len).collect::<Vec<_>>(), [1316, 1316, 376]);
+        let flat: Vec<u8> = items.iter().flat_map(|b| b.iter().copied()).collect();
+        let want: Vec<u8> = packets.iter().flat_map(|b| b.iter().copied()).collect();
+        assert_eq!(flat, want, "bytes and order unchanged");
+    }
+
+    #[test]
+    fn small_batches_pass_through() {
+        assert!(bundle_ts_packets(Vec::new()).is_empty());
+        let one = ts(1);
+        let items = bundle_ts_packets(vec![one.clone()]);
+        assert_eq!(items, std::slice::from_ref(&one));
+        assert_eq!(items[0].as_ptr(), one.as_ptr(), "a lone packet is not copied");
+        let seven: Vec<Bytes> = (0..7).map(ts).collect();
+        assert_eq!(bundle_ts_packets(seven).len(), 1);
+        let eight: Vec<Bytes> = (0..8).map(ts).collect();
+        let items = bundle_ts_packets(eight);
+        assert_eq!(items.iter().map(Bytes::len).collect::<Vec<_>>(), [1316, 188]);
+    }
+}

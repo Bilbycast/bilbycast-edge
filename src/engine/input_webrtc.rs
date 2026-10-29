@@ -311,7 +311,8 @@ async fn whip_input_loop(
                     ) else {
                         continue;
                     };
-                    for ts_data in ts_chunks {
+                    // Seven TS packets to an item, not one (edge#166).
+                    for ts_data in crate::engine::packet::bundle_ts_packets(ts_chunks) {
                         let pkt = RtpPacket {
                             data: ts_data,
                             sequence_number: seq_num,
@@ -574,7 +575,7 @@ async fn whep_input_loop(
                         let (annex_b, is_keyframe) = param_sets.access_unit(&data);
                         let ts_chunks = ts_muxer.mux_video(&annex_b, pts_90khz, pts_90khz, is_keyframe);
 
-                        for ts_data in ts_chunks {
+                        for ts_data in crate::engine::packet::bundle_ts_packets(ts_chunks) {
                             let pkt = RtpPacket {
                                 data: ts_data,
                                 sequence_number: seq_num,

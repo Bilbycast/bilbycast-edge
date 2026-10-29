@@ -823,8 +823,10 @@ the essence bitrate class via [`crate::config::models::BandwidthProfile`]:
 
 Each slot holds one `RtpPacket`. The memory column above assumes ≈1316 B
 per slot (7×188 TS in RTP), which holds for the UDP / RTP / SRT passthrough
-publishers **only** — the bound is on *items*, not bytes. SDI and WebRTC
-publish one 188-byte TS packet per slot (so the real figure is ~7× smaller),
+publishers, and since edge#166 for SDI, WebRTC, MXL and ST 2110-20/-23
+video too, which mux their own TS and publish seven packets per slot
+(`packet::bundle_ts_packets`; until then one 188-byte packet per slot, ~7×
+smaller) — the bound is on *items*, not bytes,
 while RTMP and RTSP bundle a whole access unit per slot (tens of KB — the
 figure is then an order of magnitude *larger*). Tracked in #98, which is
 **still open for these channels**: the SRT egress queue above now carries a

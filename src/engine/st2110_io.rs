@@ -396,6 +396,14 @@ fn forward_audio_packet(
         Some(p) => {
             let outs = tokio::task::block_in_place(|| p.process(&packet));
             let shape_change = p.shape_change();
+            // An encoded TS output comes back one 188-byte packet each;
+            // publish it seven to an item (edge#166). PCM-RTP out is left
+            // as it is: each buffer is already one RTP packet.
+            let outs = if shape_change {
+                crate::engine::packet::bundle_ts_packets(outs)
+            } else {
+                outs
+            };
             for data_out in outs {
                 let out_pkt = RtpPacket {
                     data: data_out,

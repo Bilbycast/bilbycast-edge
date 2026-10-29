@@ -118,8 +118,10 @@ fn audio_pts_90k(base: u64, samples_total: u64, sample_rate: u32) -> u64 {
 }
 
 /// Publish a batch of freshly-muxed 188-byte TS packets onto the flow's
-/// broadcast channel. Shared by the video and audio mux paths so both essences
-/// ride the same A+V transport stream.
+/// broadcast channel, seven to an item (`bundle_ts_packets`). Shared by the
+/// video and audio mux paths so both essences ride the same A+V transport
+/// stream. One packet per item, as it was until edge#166, put 5,800 SRT
+/// datagrams a second on the wire for an 8.5 Mbit/s feed.
 #[cfg(feature = "media-codecs")]
 fn publish_ts(
     ts_packets: Vec<Bytes>,
@@ -127,7 +129,7 @@ fn publish_ts(
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     flow_stats: &Arc<FlowStatsAccumulator>,
 ) {
-    for ts in ts_packets {
+    for ts in crate::engine::packet::bundle_ts_packets(ts_packets) {
         let ts_len = ts.len() as u64;
         let pkt = RtpPacket {
             data: ts,
@@ -1311,6 +1313,38 @@ fn run_capture_session(
 
 #[cfg(all(test, feature = "media-codecs"))]
 mod tests {
+    /// edge#166: a mux call's packets reach the flow seven to an item. One
+    /// per item put 5,800 SRT datagrams a second on the wire at 8.5 Mbit/s.
+    #[test]
+    fn publish_ts_sends_seven_packets_to_an_item() {
+        use super::*;
+        use std::sync::atomic::Ordering;
+        let (tx, mut rx) = broadcast::channel(64);
+        let stats = Arc::new(FlowStatsAccumulator::new(
+            "f".to_string(),
+            "flow".to_string(),
+            "sdi".to_string(),
+        ));
+        let packets: Vec<Bytes> = (0..16u8)
+            .map(|n| {
+                let mut p = vec![n; 188];
+                p[0] = 0x47;
+                Bytes::from(p)
+            })
+            .collect();
+        publish_ts(packets, 1234, &tx, &stats);
+
+        let mut sizes = Vec::new();
+        while let Ok(pkt) = rx.try_recv() {
+            assert!(pkt.is_raw_ts);
+            assert_eq!(pkt.rtp_timestamp, 1234);
+            sizes.push(pkt.data.len());
+        }
+        assert_eq!(sizes, [1316, 1316, 376]);
+        assert_eq!(stats.input_packets.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.input_bytes.load(Ordering::Relaxed), 16 * 188);
+    }
+
     use super::{audio_pts_90k, frame_pts_90k, unpack_uyvy422};
     use crate::engine::video_encode_util::resolve_chroma;
 

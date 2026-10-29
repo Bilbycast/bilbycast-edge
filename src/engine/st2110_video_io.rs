@@ -930,12 +930,13 @@ fn encode_worker(
         for ef in frames {
             encode_stats.output_frames.fetch_add(1, Ordering::Relaxed);
             let ts_packets = ts_mux.mux_video(&ef.data, ef.pts as u64, ef.dts as u64, ef.keyframe);
-            for ts in ts_packets {
+            // Seven to an item, not one (edge#166).
+            for ts in crate::engine::packet::bundle_ts_packets(ts_packets) {
                 let ts_len = ts.len() as u64;
-                // `ts` is `Bytes` (from TsMuxer) — `Bytes::clone()` is a
-                // refcount bump, not a memcpy. Keep that semantics
-                // explicit so future refactors don't accidentally
-                // reintroduce a deep clone here.
+                // `ts` is one item from `bundle_ts_packets`: up to seven
+                // TsMuxer packets copied once into one buffer (a lone
+                // packet passes through uncopied). Moving it into the
+                // RtpPacket is not a copy — don't add a second one here.
                 let pkt = RtpPacket {
                     data: ts,
                     sequence_number: 0,
@@ -964,7 +965,7 @@ fn encode_worker(
                 encode_stats.output_frames.fetch_add(1, Ordering::Relaxed);
                 let ts_packets =
                     ts_mux.mux_video(&ef.data, ef.pts as u64, ef.dts as u64, ef.keyframe);
-                for ts in ts_packets {
+                for ts in crate::engine::packet::bundle_ts_packets(ts_packets) {
                     let ts_len = ts.len() as u64;
                     let pkt = RtpPacket {
                         data: ts,

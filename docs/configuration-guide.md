@@ -1303,10 +1303,13 @@ the same holds for RTSP and WebRTC. The media player's audio-only MP4 and the
 PCM-encode input send each AU at its own instant, and each filler at the
 instant its value names (sent with the next AU, as first shipped, it put that
 jitter on a path that otherwise holds PCR accuracy at +0). On the wire, the
-UDP / RTP / SRT outputs send whole seven-packet datagrams, so a low-rate
-audio-only programme's PCRs leave as each datagram fills — about every 82 ms
-at 128 kbps — whatever the input did: arrival-based PCR_repetition and PCR
-jitter on such a programme are set by that re-chunking, not by the muxer.
+UDP / RTP / RIST outputs re-chunk into whole seven-packet datagrams, so a
+low-rate audio-only programme's PCRs leave as each datagram fills — about
+every 82 ms at 128 kbps — whatever the input did: arrival-based
+PCR_repetition and PCR jitter on such a programme are set by that
+re-chunking, not by the muxer. The SRT output has no re-chunker: it sends
+each item the input published as one message (splitting only those over
+1316 bytes).
 The other audio-only
 programmes `TsMuxer` builds (RTSP, the PCM-encode input, an audio-only MP4 in
 the media player, the WebRTC input's Opus, and the SMPTE 302M PES of an

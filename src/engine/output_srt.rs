@@ -45,9 +45,13 @@ use super::ts_program_filter::TsProgramFilter;
 /// recommended live-mode default).
 ///
 /// UDP/RTP-sourced broadcast packets are typically already 1316 bytes and
-/// pass through unchanged. RTMP/RTSP/WebRTC-sourced packets can be much
-/// larger (a TsMuxer-bundled I-frame can be tens of KB) and need to be
-/// split before they hit the SRT socket.
+/// pass through unchanged. RTMP/RTSP-sourced packets can be much larger (a
+/// TsMuxer-bundled I-frame can be tens of KB) and need to be split before
+/// they hit the SRT socket. Nothing here joins *small* items: a source that
+/// publishes fewer than seven TS packets per item leaves as that many small
+/// SRT messages, so every source that muxes its own TS bundles before it
+/// publishes (`packet::bundle_ts_packets`; SDI published one packet per item
+/// until edge#166, 5,800 SRT datagrams a second at 8.5 Mbit/s).
 const SRT_LIVE_MAX_MSG_BYTES: usize = SRT_TS_DATAGRAM_BYTES;
 
 /// Maximum time we wait for the SMPTE 2022-7 leg-2 socket to complete its
@@ -97,25 +101,30 @@ async fn srt_send_chunked(socket: &Arc<SrtSocket>, data: &[u8]) -> Result<usize,
 /// item is a whole upstream `RtpPacket`, and the three publishing shapes in
 /// the tree differ by ~800×:
 ///
-/// - **SDI** (`sdi_io::publish_ts`) and **WebRTC** publish **one 188-byte TS
-///   packet per item**. 4096 slots is ~770 KB / ~0.77 s at 8 Mbps.
-/// - **UDP / RTP / SRT passthrough** publish ~1316 B (7 × 188). ~5.4 MB.
+/// - **UDP / RTP / SRT passthrough** publish ~1316 B (7 × 188), and so, since
+///   edge#166, do the sources that mux their own TS — **SDI**
+///   (`sdi_io::publish_ts`), **WebRTC**, **MXL** and **ST 2110-20/-23** video —
+///   seven packets to an item (`packet::bundle_ts_packets`; a call with a
+///   single packet, a lone audio frame or PCR, is one 188 B item). ~5.4 MB.
+///   Until edge#166 SDI and WebRTC published **one 188-byte TS packet per
+///   item**, when 4096 slots was ~770 KB / ~0.77 s at 8 Mbps.
 /// - **RTMP** (`input_rtmp.rs`) and **RTSP** bundle a whole access unit into
 ///   one item, "tens of KB" as the chunking note above warns. 4096 slots is
 ///   then ~164 MB / ~164 s at the same bitrate. Those sources never overflowed
 ///   at 256 either, so they gain nothing here and pay the depth — bounding
 ///   this queue in bytes rather than slots is tracked in #98.
 ///
-/// That granularity is what makes the measured failure inevitable rather than
-/// merely unlucky: on the SDI path a single 123–144 KB IDR is **654–766
-/// items**, so it overran the old 256-slot queue roughly 3× *on its own*,
+/// That granularity is what made the measured failure inevitable rather than
+/// merely unlucky: on the SDI path as it then published, a single 123–144 KB
+/// IDR was **654–766 items** (94–110 since edge#166), so it overran the old 256-slot queue roughly 3× *on its own*,
 /// once per GOP. Hardware-measured on bilby-z440 feeding four SRT outputs:
 /// 2149 discards in 60 s with **zero** broadcast-`Lagged` warnings, i.e. every
 /// one came from `try_send` returning `Full` here. Halving the source's IDR
 /// count (`gop_size` 50 → 100) halved the discards and restoring it restored
 /// them, confirming the IDR burst as the driver rather than a coincidence.
 ///
-/// 4096 leaves ~5 IDRs of headroom on that path while staying bounded. It
+/// 4096 left ~5 IDRs of headroom on that path at 188 B an item (~37 since
+/// edge#166) while staying bounded. It
 /// mirrors the fix already applied one layer down in the libsrt wrapper, where
 /// the caller → `srt-io` channel was raised 256 → 8192 for this same class of
 /// stall (`srt-transport::socket::SEND_CHANNEL_CAPACITY`, commit `7cce767`);
@@ -131,8 +140,7 @@ const SRT_SEND_QUEUE_CAPACITY: usize = 4096;
 ///
 /// | publisher | bytes per item |
 /// |---|---|
-/// | SDI, WebRTC | one 188 B TS packet |
-/// | UDP / RTP / SRT passthrough | ~1316 B (7 × 188) |
+/// | UDP / RTP / SRT passthrough; SDI, WebRTC, MXL / ST 2110-20 video (since edge#166) | ~1316 B (7 × 188); 188 B for a single-packet mux call |
 /// | RTMP, RTSP | a **whole access unit** — measured IDRs 123–144 KB |
 ///
 /// So 4096 slots is ~5.4 MB of TS-class traffic but up to ~164 MB of
@@ -140,7 +148,8 @@ const SRT_SEND_QUEUE_CAPACITY: usize = 4096;
 /// slots either, so they gain nothing from the depth and pay for all of it.
 ///
 /// 8 MiB is chosen so the slot cap still binds first for the two item shapes
-/// #95 actually measured: 4096 × 1316 B ≈ 5.4 MB and 4096 × 188 B ≈ 0.8 MB
+/// #95 actually measured (the second was SDI's before edge#166): 4096 ×
+/// 1316 B ≈ 5.4 MB and 4096 × 188 B ≈ 0.8 MB
 /// are both under it, so the TS-class behaviour measured there (0 drops
 /// across 10.6 M packets) is preserved exactly. For whole-AU items the byte
 /// cap binds first — at the 123–144 KB IDRs actually measured that is 56–66
@@ -2336,7 +2345,7 @@ mod tests {
     // ── Egress queue byte bound (issue #98) ──────────────────────────
     //
     // An item is a whole upstream `RtpPacket`, and its size is set by the
-    // publisher: 188 B from SDI, ~1316 B from TS passthrough, a whole
+    // publisher: 188 B from SDI before edge#166, ~1316 B from TS passthrough, a whole
     // access unit (123-144 KB measured) from RTMP/RTSP. A slot count is
     // therefore not a memory bound.
 
