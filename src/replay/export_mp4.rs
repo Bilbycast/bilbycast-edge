@@ -70,6 +70,7 @@ use crate::engine::cmaf::fmp4::{
     build_progressive_mp4, video_sample_from_nalus,
 };
 use crate::engine::cmaf::nalu::{filter_frame_nalus_h264, filter_frame_nalus_h265};
+use crate::engine::cmaf::param_sets::{ParamSetCollector, ParamSets};
 use crate::engine::ts_demux::{DemuxedFrame, TsDemuxer};
 
 /// MPEG-TS stream_type values relevant to the export format selection.
@@ -389,12 +390,20 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     // codec sync word and assign per-frame PTS by extrapolating from the
     // PES PTS using the parsed frame's sample rate + frame size.
     let mut other_audio: Vec<(u64, u8, Vec<u8>)> = Vec::new();
+    // Every parameter set the window carries, by id, for the passthrough
+    // fallback's sample entry: its samples are stripped of theirs, and a
+    // source whose slices name more than one PPS needs them all
+    // (`cmaf::param_sets`). Each frame by its own variant, so a window that
+    // changes codec never reads one codec's NALs as the other's.
+    let mut params = ParamSetCollector::default();
     for f in frames {
         match f {
             DemuxedFrame::H264 { nalus, pts, is_keyframe, .. } => {
+                params.observe(CmafVideoCodec::H264, &nalus, is_keyframe);
                 video_pts.push((pts, nalus, is_keyframe));
             }
             DemuxedFrame::H265 { nalus, pts, is_keyframe, .. } => {
+                params.observe(CmafVideoCodec::H265, &nalus, is_keyframe);
                 video_pts.push((pts, nalus, is_keyframe));
             }
             DemuxedFrame::Aac { data, pts } => {
@@ -423,40 +432,9 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
         bail!("replay_no_video_frames");
     }
 
-    // Build the right `VideoTrack` flavour from the cached parameter
-    // sets. `demux.video_stream_type()` is the authoritative codec
-    // identifier — it reflects the PMT, not the heuristics.
-    let video_track = match demux.video_stream_type() {
-        STREAM_TYPE_H264 => {
-            let sps = demux
-                .cached_sps()
-                .ok_or_else(|| anyhow!("replay_export_failed: missing H.264 SPS"))?
-                .to_vec();
-            let pps = demux
-                .cached_pps()
-                .ok_or_else(|| anyhow!("replay_export_failed: missing H.264 PPS"))?
-                .to_vec();
-            VideoTrack::from_h264(sps, pps)
-        }
-        STREAM_TYPE_H265 => {
-            let vps = demux
-                .cached_h265_vps()
-                .ok_or_else(|| anyhow!("replay_export_failed: missing HEVC VPS"))?
-                .to_vec();
-            let sps = demux
-                .cached_h265_sps()
-                .ok_or_else(|| anyhow!("replay_export_failed: missing HEVC SPS"))?
-                .to_vec();
-            let pps = demux
-                .cached_h265_pps()
-                .ok_or_else(|| anyhow!("replay_export_failed: missing HEVC PPS"))?
-                .to_vec();
-            VideoTrack::from_h265(vps, sps, pps)
-        }
-        _ => {
-            bail!("replay_export_format_unsupported");
-        }
-    };
+    // The source's track. `demux.video_stream_type()` is the authoritative
+    // codec identifier — it reflects the PMT, not the heuristics.
+    let video_track = video_track_from_params(demux.video_stream_type(), &params)?;
 
     // Build the audio track + per-sample list. AAC takes the
     // already-split frames; AC-3 / E-AC-3 / MP2 split each PES blob on
@@ -704,6 +682,32 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
         &audio_samples,
     );
     Ok(buf)
+}
+
+/// The export's video track from the parameter sets the window carried:
+/// every one, by id, so a source whose slices name several PPS decodes in the
+/// passthrough fallback (bilbycast-edge#204). The re-encode builds its own.
+/// Refused, naming the kind, when one the codec needs is missing.
+fn video_track_from_params(stream_type: u8, params: &ParamSetCollector) -> Result<VideoTrack> {
+    let codec = match stream_type {
+        STREAM_TYPE_H264 => CmafVideoCodec::H264,
+        STREAM_TYPE_H265 => CmafVideoCodec::H265,
+        _ => bail!("replay_export_format_unsupported"),
+    };
+    let sets: ParamSets = params.sets(codec).cloned().unwrap_or_default();
+    let missing = match codec {
+        CmafVideoCodec::H264 if sets.sps.is_empty() => Some("H.264 SPS"),
+        CmafVideoCodec::H264 if sets.pps.is_empty() => Some("H.264 PPS"),
+        CmafVideoCodec::H265 if sets.vps.is_empty() => Some("HEVC VPS"),
+        CmafVideoCodec::H265 if sets.sps.is_empty() => Some("HEVC SPS"),
+        CmafVideoCodec::H265 if sets.pps.is_empty() => Some("HEVC PPS"),
+        _ => None,
+    };
+    if let Some(kind) = missing {
+        bail!("replay_export_failed: missing {kind}");
+    }
+    VideoTrack::from_param_sets(codec, sets)
+        .ok_or_else(|| anyhow!("replay_export_failed: incomplete parameter sets"))
 }
 
 /// How many leading audio samples and leading video samples to drop so the
@@ -1357,6 +1361,62 @@ mod tests {
 
         clear_cache();
     }
+
+    /// The passthrough fallback's track carries every parameter set the
+    /// window did, by id — a source whose slices name several PPS decodes —
+    /// and refuses a window missing a kind with the same reason it always
+    /// gave (bilbycast-edge#204).
+    #[test]
+    fn the_export_track_carries_every_pps() {
+        let sps = vec![0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9];
+        let pps = [
+            vec![0x68, 0xEE, 0x3C, 0x80],
+            vec![0x68, 0x5B, 0x8F, 0x20],
+            vec![0x68, 0x6A, 0x11, 0x80],
+        ];
+        let idr = vec![0x65, 0x88, 0x84, 0x21];
+        let mut params = ParamSetCollector::default();
+        let rap = vec![sps.clone(), pps[0].clone(), pps[1].clone(), pps[2].clone(), idr.clone()];
+        params.observe(CmafVideoCodec::H264, &rap, true);
+        params.observe(CmafVideoCodec::H264, &[vec![0x41, 0x9A, 0x02, 0x21]], false);
+        let track = video_track_from_params(STREAM_TYPE_H264, &params).unwrap();
+        let ids: Vec<u32> = track.param_sets.pps.iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec![0, 1, 2]);
+        assert_eq!(track.param_sets.pps[1].nal, pps[1]);
+
+        let err = |stream_type: u8, params: &ParamSetCollector| {
+            match video_track_from_params(stream_type, params) {
+                Ok(_) => panic!("refused"),
+                Err(e) => e.to_string(),
+            }
+        };
+        // The reasons a window without its parameter sets was refused with.
+        let mut no_pps = ParamSetCollector::default();
+        no_pps.observe(CmafVideoCodec::H264, &[sps.clone(), idr.clone()], true);
+        assert_eq!(err(STREAM_TYPE_H264, &no_pps), "replay_export_failed: missing H.264 PPS");
+        let mut no_sps = ParamSetCollector::default();
+        no_sps.observe(CmafVideoCodec::H264, &[pps[0].clone(), idr.clone()], true);
+        assert_eq!(err(STREAM_TYPE_H264, &no_sps), "replay_export_failed: missing H.264 SPS");
+        assert_eq!(
+            err(STREAM_TYPE_H264, &ParamSetCollector::default()),
+            "replay_export_failed: missing H.264 SPS"
+        );
+        assert_eq!(err(0x02, &params), "replay_export_format_unsupported");
+
+        // A window that changes codec: the sets are the codec the window
+        // ends on, each frame read as its own codec. Its H.264 sets do not
+        // stand in for the HEVC ones it never sent.
+        let hevc_vps = vec![0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF];
+        let hevc_pps = vec![0x44, 0x01, 0xC1, 0x72];
+        let mut mixed = ParamSetCollector::default();
+        mixed.observe(CmafVideoCodec::H264, &rap, true);
+        mixed.observe(CmafVideoCodec::H265, &[hevc_vps.clone(), hevc_pps.clone()], true);
+        assert_eq!(err(STREAM_TYPE_H265, &mixed), "replay_export_failed: missing HEVC SPS");
+        assert_eq!(err(STREAM_TYPE_H264, &mixed), "replay_export_failed: missing H.264 SPS");
+        let mut no_vps = ParamSetCollector::default();
+        no_vps.observe(CmafVideoCodec::H265, std::slice::from_ref(&hevc_pps), true);
+        assert_eq!(err(STREAM_TYPE_H265, &no_vps), "replay_export_failed: missing HEVC VPS");
+    }
 }
 
 #[cfg(all(test, feature = "video-encoder-x264", feature = "video-encoder-x265"))]
@@ -1439,9 +1499,7 @@ mod open_gop_tests {
         assert!(leading > 0, "fixture: the CRA has leading pictures");
         let track = VideoTrack {
             codec: CmafVideoCodec::H265,
-            sps: Vec::new(),
-            pps: Vec::new(),
-            vps: Vec::new(),
+            param_sets: ParamSets::default(),
             timescale: 90_000,
             width: 320,
             height: 240,

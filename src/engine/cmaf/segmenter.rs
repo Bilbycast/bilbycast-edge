@@ -1248,7 +1248,7 @@ mod tests {
         assert!(out.new_segment_started);
         assert!(!s.rotation_pending());
         assert_eq!(s.generation(), 1);
-        assert_eq!(s.track.sps, vec![0x67, 0x64, 0x00, 0x1F]);
+        assert_eq!(s.track.sps(), &[0x67, 0x64, 0x00, 0x1F]);
         assert!(s.open_segment_first_of_generation(), "the open segment is the first of the new one");
         assert_eq!(s.samples.len(), 1, "the IDR itself opens the new segment");
 
