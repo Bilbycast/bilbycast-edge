@@ -2055,11 +2055,15 @@ async fn srt_output_redundant_loop(
                 // Known gap, left for a follow-up: once the connect future
                 // has resolved with no socket (`leg2_done`), leg 2 never
                 // attaches this cycle, yet it still counts as alive here, so
-                // a leg 1 lost after that never tears the pair down and the
-                // output stays dark until it is restarted. The fix is this
-                // line, as `leg2_queued.unwrap_or(!leg2_done)`. It is left
-                // to a change of its own because it alters what such an
-                // output does: it would then reconnect the pair.
+                // a lost leg 1 never tears the pair down and the output
+                // stays dark until it is restarted. That holds in either
+                // order: leg 1 lost after leg 2's connect gave up (its event
+                // read `other_leg: down`), or lost while leg 2 was still
+                // connecting (it read `connecting`) and leg 2 then gave up.
+                // The fix is this line, as
+                // `leg2_queued.unwrap_or(!leg2_done)`, which covers both. It
+                // is left to a change of its own because it alters what such
+                // an output does: it would then reconnect the pair.
                 let leg2_alive = leg2_queued.unwrap_or(true);
 
                 // Each leg's loss is raised here, at most once per cycle,
@@ -2983,6 +2987,14 @@ mod tests {
 
     /// A stop is no lost leg: stopping the output with both legs up raises
     /// no leg-lost event, and clears both legs' stats.
+    ///
+    /// What this pins is narrow. The publisher stops on the same token as
+    /// the output, so leg 2's queue is about empty at the stop and its task
+    /// leaves on an empty queue, not on a send error: it guards the forward
+    /// loop raising nothing at a stop, not a backlogged leg 2 draining into
+    /// a closed socket. The caches clear because both pollers are children
+    /// of the output's token; the explicit poller cancels at the end of a
+    /// connect cycle are not reached here.
     #[tokio::test]
     async fn a_2022_7_output_stopping_raises_no_leg_loss_and_clears_both_legs() {
         let mut h = PairHarness::start();
