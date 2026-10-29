@@ -2209,23 +2209,35 @@ packet at its PCR-implied instant. What it costs and assumes:
 
 - **Latency.** About 50 ms (the pacer's preroll) to begin with. A
   transcode stall that makes a PCR more than 5 ms later than that takes
-  a late re-anchor, which replaces the preroll rather than adding to it
-  and is kept for good, so latency grows to the longest stall seen, at
-  most about 200 ms. The warning's `estimated_added_latency_ms` is that
-  arithmetic on the measured worst sample — the larger of 50 ms and that
-  sample, capped at 200 ms — and a floor where an encoder falls behind
-  over several PCRs, since each sample sees one PCR interval. A
-  once-per-epoch lowering of the transcode PCR offset (`ts_pcr_remux`)
-  is kept as latency too, up to 200 ms, because the pacer ignores the
-  discontinuity.
-- **Long stalls are beyond it.** After 200 ms with no PCR the pacer
-  re-anchors, so stalls of 200 ms or more (x265 at a slow preset, a
-  whole-MPTS transcode on a loaded host) may stay above 30 ms on `"pcr"`
-  too, and need a lighter encode; the warning's message says so. Its
-  `pcr_expected_to_reach_limit` is `false` when the forward p99 is
-  160 ms or more — a heuristic not yet checked on the rig, so measure
-  the output on `"pcr"` rather than relying on it. An MPTS output's
-  sampler covers one program's PCR only.
+  a late re-anchor, which replaces the preroll rather than adding to it.
+  The pacer then replays the backlog the stall left at the PCR rate, so
+  the stall is kept as latency for good: latency grows to the longest
+  stall seen (and 50 ms more when the stall leaves the pacer no PCR for
+  200 ms, since it then re-anchors with a fresh preroll). The 200 ms
+  lookahead does not bound it — the pacer checks that against the moment
+  it takes each datagram off its queue, and the backlog waits in the
+  queue. Only the 1000 ms residence cap does: past it the queue is shed
+  (`egress_shed`) and pacing re-anchors. That includes the **encoder's
+  open** when the output restarts, which switching to `"pcr"` does: the
+  PCR carriers that went out ahead of it are paced, the stream behind
+  the open queues, and an encoder whose open takes most of a second
+  (some hardware encoders) can leave the output close to 1 s late. The
+  warning's `estimated_added_latency_ms` is the larger of 50 ms and the
+  measured worst sample, and a floor: each sample sees one PCR interval,
+  so an encoder that falls behind over several PCRs reads short; the
+  sampler discards a gap over 500 ms; and the restart's encoder open is
+  not in it. A once-per-epoch lowering of the transcode PCR offset
+  (`ts_pcr_remux`) is kept as latency too, up to about 200 ms (that one
+  is a forward PCR step, which the lookahead does clamp), because the
+  pacer ignores the discontinuity.
+- **Long stalls cost latency, not jitter.** Each new longest stall puts
+  one late PCR on the wire when it happens; after that the pacer holds
+  the latency and smooths every shorter stall. So stalls up to the
+  residence cap (x265 at a slow preset, a whole-MPTS transcode on a
+  loaded host) are expected to reach the limit on `"pcr"`, at that
+  latency; a lighter encode keeps the latency down. Stalls approaching
+  1 s shed instead. Measure the output on `"pcr"` before relying on it.
+  An MPTS output's sampler covers one program's PCR only.
 - **It is open-loop.** `"pcr"` follows the source's clock, so a live source
   fast against the host grows the egress queue at its offset (about 108
   ms/h at 30 ppm) until the 1000 ms residence cap sheds it, and a large
