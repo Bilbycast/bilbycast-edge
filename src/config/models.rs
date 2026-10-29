@@ -3665,7 +3665,10 @@ pub struct RtpOutputConfig {
     /// bonded input (re-smooths the reassembly burst cadence), else
     /// `forward` (emit at input cadence — the default every other
     /// output should keep unless it has a genuinely bursty unpaced
-    /// ingress or a strict-T-STD receiver).
+    /// ingress or a strict-T-STD receiver). An output with
+    /// `video_encode` stays `forward` under auto too; the edge warns
+    /// `egress_pcr_accuracy_exceeded` when its PCR send jitter says it
+    /// needs `pcr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_pacing: Option<EgressPacingMode>,
     /// Egress de-jitter buffer setpoint (ms of content). See
@@ -3694,7 +3697,13 @@ pub struct RtpOutputConfig {
 ///   encoder) has already paced the stream and the receiver re-clocks from
 ///   PCR, so re-metering only adds latency and holds I-frame bursts
 ///   (measured: receiver-buffer underrun → periodic freezing on a clean
-///   feed). Lowest latency; output PCR accuracy ≈ input PDV.
+///   feed). Lowest latency; output PCR accuracy ≈ input PDV — except on
+///   an output that re-encodes video, whose packets leave as the
+///   transcode chain emits them: its PCR send jitter then follows the
+///   encoder's bursts and stalls (`pcr_trust` p99 measured from about 11 ms
+///   to over 400 ms on the test rig, depending on source and encoder). Auto keeps such an output
+///   on `forward`; `engine::av_quality_watch` raises
+///   `egress_pcr_accuracy_exceeded` when its p99 passes 30 ms.
 /// - **`pcr`**: open-loop PCR-delta re-pacing — emit each packet at its
 ///   PCR-implied wall instant. For 2022-7 dual-leg coherence, a
 ///   strict-T-STD receiver that can't ride input burst cadence, or a
@@ -4032,7 +4041,10 @@ pub struct UdpOutputConfig {
     /// bonded input (re-smooths the reassembly burst cadence), else
     /// `forward` (emit at input cadence — the default every other
     /// output should keep unless it has a genuinely bursty unpaced
-    /// ingress or a strict-T-STD receiver).
+    /// ingress or a strict-T-STD receiver). An output with
+    /// `video_encode` stays `forward` under auto too; the edge warns
+    /// `egress_pcr_accuracy_exceeded` when its PCR send jitter says it
+    /// needs `pcr`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_pacing: Option<EgressPacingMode>,
     /// Egress de-jitter buffer setpoint, in milliseconds of content. Seeds

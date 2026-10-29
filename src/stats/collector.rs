@@ -163,6 +163,12 @@ pub struct OutputStatsAccumulator {
     /// at spawn. Only set on UDP/RTP-family outputs (the knob exists
     /// only there).
     pub egress_pacing_effective: OnceLock<String>,
+    /// The same resolution, typed: the mode itself, without the
+    /// "auto (…)" wrapping. Set together with
+    /// [`Self::egress_pacing_effective`] (first wins for both), read by
+    /// `engine::av_quality_watch` to tell a forward-paced output from a
+    /// re-paced one.
+    egress_pacing_mode: OnceLock<crate::config::models::EgressPacingMode>,
     /// EOVERFLOW count from the SO_TXTIME error queue: kernel rejected
     /// the datagram because its target tx time landed in the past.
     /// Incremented from the wire thread on each errqueue drain. This is a
@@ -1079,6 +1085,7 @@ impl OutputStatsAccumulator {
             transcode_pcr: std::sync::OnceLock::new(),
             wire_pacing_tier: OnceLock::new(),
             egress_pacing_effective: OnceLock::new(),
+            egress_pacing_mode: OnceLock::new(),
             wire_pacing_late: AtomicU64::new(0),
             epoch_lock_offset_us: OnceLock::new(),
             epoch_lock_group: OnceLock::new(),
@@ -1182,9 +1189,41 @@ impl OutputStatsAccumulator {
 
     /// Register the resolved egress pacing mode for this output.
     /// Called once at output spawn by `engine::flow::start_output`
-    /// (UDP/RTP-family only). Subsequent calls are no-ops (first wins).
-    pub fn set_egress_pacing_effective(&self, label: String) {
-        let _ = self.egress_pacing_effective.set(label);
+    /// (UDP/RTP-family only). `auto` is whether the config field was
+    /// unset: the label then reads "auto (forward)" / "auto (pcr)", and
+    /// the bare mode otherwise — the manager prints it verbatim. Subsequent calls are
+    /// no-ops (first wins), for the label and the typed mode alike: the
+    /// mode is set only when the label was, so the two never disagree.
+    pub fn set_egress_pacing_effective(
+        &self,
+        mode: crate::config::models::EgressPacingMode,
+        auto: bool,
+    ) {
+        let label = if auto {
+            format!("auto ({})", mode.as_str())
+        } else {
+            mode.as_str().to_string()
+        };
+        if self.egress_pacing_effective.set(label).is_ok() {
+            let _ = self.egress_pacing_mode.set(mode);
+        }
+    }
+
+    /// The egress pacing mode this output runs, resolved at spawn.
+    /// `Some` only on UDP/RTP-family outputs — the only ones whose wire
+    /// emitter the knob drives — and only once
+    /// [`Self::set_egress_pacing_effective`] has run.
+    pub fn egress_pacing_mode(&self) -> Option<crate::config::models::EgressPacingMode> {
+        self.egress_pacing_mode.get().copied()
+    }
+
+    /// Whether this output re-encodes video: its TS video replacer was
+    /// actually built (`transcode_chain::build_for_output` registers its
+    /// stats only then). A `video_encode` whose chain failed to build
+    /// runs as passthrough and reads `false`. RTMP and WebRTC outputs
+    /// set the same handle for their own re-encoders.
+    pub fn reencodes_video(&self) -> bool {
+        self.video_encode_stats.get().is_some()
     }
 
     /// Register the wire-emit queue-depth gauge so the snapshot path can
@@ -1253,6 +1292,11 @@ impl OutputStatsAccumulator {
     /// when it re-encodes nothing.
     pub fn av_skew_snapshot(&self) -> Option<crate::stats::models::AvSkewStats> {
         self.av_skew.get().map(|r| r.snapshot())
+    }
+
+    /// This output's transcode PCR stage counters, when it has one.
+    pub fn transcode_pcr_snapshot(&self) -> Option<TranscodePcrStats> {
+        self.transcode_pcr.get().map(|s| s.snapshot())
     }
 
     /// Register this output's transcode PCR stage counters (set by
@@ -8278,5 +8322,59 @@ mod srt_input_stats_tests {
         assert_eq!(snap.input.packets_lost, 12);
         let reason = srt_reason(&snap).unwrap();
         assert!(reason.contains("latency 250 ms, RTT 65 ms"), "{reason}");
+    }
+}
+
+#[cfg(test)]
+mod egress_pacing_label_tests {
+    use super::*;
+    use crate::config::models::EgressPacingMode;
+
+    fn output() -> OutputStatsAccumulator {
+        OutputStatsAccumulator::new("o".to_string(), "out".to_string(), "udp".to_string())
+    }
+
+    /// The label the manager prints and the typed mode the quality watch
+    /// reads are set together, first wins for both, and the label is
+    /// byte-identical to what the edge reported before the typed mode
+    /// existed.
+    #[test]
+    fn egress_pacing_label_and_mode_are_set_together() {
+        let o = output();
+        assert_eq!(o.egress_pacing_mode(), None, "unset until spawn resolves it");
+        o.set_egress_pacing_effective(EgressPacingMode::Forward, true);
+        assert_eq!(o.egress_pacing_effective.get().map(String::as_str), Some("auto (forward)"));
+        assert_eq!(o.egress_pacing_mode(), Some(EgressPacingMode::Forward));
+        // First wins, for both halves.
+        o.set_egress_pacing_effective(EgressPacingMode::Pcr, false);
+        assert_eq!(o.egress_pacing_effective.get().map(String::as_str), Some("auto (forward)"));
+        assert_eq!(o.egress_pacing_mode(), Some(EgressPacingMode::Forward));
+
+        let o = output();
+        o.set_egress_pacing_effective(EgressPacingMode::Servo, false);
+        assert_eq!(o.egress_pacing_effective.get().map(String::as_str), Some("servo"));
+        assert_eq!(o.egress_pacing_mode(), Some(EgressPacingMode::Servo));
+        let o = output();
+        o.set_egress_pacing_effective(EgressPacingMode::Pcr, true);
+        assert_eq!(o.egress_pacing_effective.get().map(String::as_str), Some("auto (pcr)"));
+    }
+
+    /// `reencodes_video` is the runtime truth: false until the TS video
+    /// replacer registered its stats.
+    #[test]
+    fn reencodes_video_follows_the_video_encode_handle() {
+        let o = output();
+        assert!(!o.reencodes_video());
+        o.set_video_encode_stats(
+            Arc::new(crate::engine::ts_video_replace::VideoEncodeStats::default()),
+            "h264",
+            "h264",
+            1920,
+            1080,
+            25.0,
+            5_000,
+            "x264",
+        );
+        assert!(o.reencodes_video());
     }
 }
