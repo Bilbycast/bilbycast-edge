@@ -11,7 +11,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 - **Transport:** UDP unicast or multicast, IPv4 and IPv6
 - **Payload:** MPEG-2 Transport Stream in RTP per SMPTE ST 2022-2
 - **Features:**
-  - SMPTE 2022-1 FEC decode (column + row parity)
+  - SMPTE 2022-1 FEC decode (column + row parity); a single-leg input publishes only the repairs that arrive ahead of what it has already published, a 2022-7 input with `path_differential_ms` releases every repair in order
   - IGMP/MLD multicast group join with interface selection
   - Source IP allow-list filtering (RP 2129 C5)
   - RTP payload type filtering (RP 2129 U4)
@@ -148,7 +148,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 - **Transport:** UDP unicast or multicast
 - **Payload:** RTP-wrapped MPEG-TS packets with RTP headers
 - **Features:**
-  - SMPTE 2022-1 FEC encode
+  - SMPTE 2022-1 FEC encode (column + row parity over the datagrams as sent; bilbycast `BCFE` framing on the media port, read by a bilbycast `fec_decode` input, not by third-party 2022-1 decoders; columns and rows 0-7 only, so at most `8 x 8` is fully protected — see [configuration-guide.md](configuration-guide.md#smpte-2022-1-fec-configuration))
   - DSCP/QoS marking (default: 46 Expedited Forwarding)
   - Multicast with interface selection
   - **MPTS passthrough** (default) or optional MPTS→SPTS program filter via `program_number`

@@ -169,8 +169,8 @@ If neither file exists at startup, an empty default configuration is used. Both 
       "bind_addr": "239.1.1.1:5000",
       "interface_addr": "192.168.1.100",
       "fec_decode": {
-        "columns": 10,
-        "rows": 10
+        "columns": 8,
+        "rows": 8
       },
       "allowed_sources": ["10.0.0.1", "10.0.0.2"],
       "allowed_payload_types": [33],
@@ -186,8 +186,8 @@ If neither file exists at startup, an empty default configuration is used. Both 
       "dest_addr": "192.168.1.50:5004",
       "interface_addr": "192.168.1.100",
       "fec_encode": {
-        "columns": 10,
-        "rows": 10
+        "columns": 8,
+        "rows": 8
       },
       "dscp": 46
     },
@@ -1025,8 +1025,8 @@ Receives RTP-wrapped MPEG-TS packets (SMPTE ST 2022-2). Requires valid RTP v2 he
   "interface_addr": "192.168.1.100",
   "source_addr": "10.0.0.5",
   "fec_decode": {
-    "columns": 10,
-    "rows": 10
+    "columns": 8,
+    "rows": 8
   },
   "allowed_sources": ["10.0.0.1"],
   "allowed_payload_types": [33],
@@ -2122,8 +2122,8 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
   "bind_addr": "192.168.1.100:0",
   "interface_addr": "192.168.1.100",
   "fec_encode": {
-    "columns": 10,
-    "rows": 10
+    "columns": 8,
+    "rows": 8
   },
   "dscp": 46
 }
@@ -3540,8 +3540,8 @@ Forward Error Correction parameters used by `fec_decode` (on RTP inputs) and `fe
 
 ```json
 {
-  "columns": 10,
-  "rows": 10
+  "columns": 8,
+  "rows": 8
 }
 ```
 
@@ -3550,12 +3550,23 @@ Forward Error Correction parameters used by `fec_decode` (on RTP inputs) and `fe
 | `columns` | integer | Yes | 1-20 | L parameter: number of columns in the FEC matrix. |
 | `rows` | integer | Yes | 4-20 | D parameter: number of rows in the FEC matrix. |
 
-The FEC matrix protects `columns x rows` media packets with `columns + rows` parity packets. Larger matrices provide better protection at the cost of higher latency and bandwidth overhead.
+The FEC matrix protects `columns x rows` media packets with up to `columns + rows` parity packets: one per column (the XOR of its D packets) and one per row (the XOR of its L packets). A single lost packet is rebuilt from the parity of its column or its row, and a rebuilt packet can complete another column or row in turn. Larger matrices cost less bandwidth but take longer to repair a loss.
 
 Common configurations:
-- `5 x 5` -- Low overhead, moderate protection
-- `10 x 10` -- Good balance of overhead and protection
-- `20 x 20` -- Maximum protection, higher latency
+- `5 x 5` -- 40 % overhead, short repair delay
+- `8 x 8` -- 25 % overhead; the largest matrix every column and row of which carries FEC
+- `4 x 8` (`columns: 4`, `rows: 8`) -- column FEC repairs a burst of up to 4 consecutive losses
+
+What the encoder protects, and what it does not:
+- **The datagrams as sent.** FEC is computed over each RTP datagram the output actually puts on the wire: its sequence number and the bytes after its 12-byte RTP header. A packet sits in the matrix at its sequence number minus the matrix's base, on the encoder exactly as on the decoder, so a sequence number that never went out (a 2022-7 output forwarding RTP from an upstream with losses) leaves its column and row without FEC instead of shifting every later packet.
+- **Only the first 8 columns and 8 rows.** The FEC header names its column or row in 3 bits, so a column or row from 8 up gets no FEC of its own: with `columns` or `rows` above 8, a packet in column 8 or later is protected only by its row, one in row 8 or later only by its column, and one in both is not protected at all. The output logs a warning at start when it is configured that way. `10 x 10` therefore sends 16 parity packets per 100, not 20.
+- **`columns: 1` sends column FEC only.** A one-packet row's parity is a copy of that packet, which a receiver that has already closed the matrix would publish a second time.
+- **A column or row of mixed packet sizes gets no FEC.** The parity is padded to its longest packet and carries no length recovery, so a shorter packet would be rebuilt with a trailing run of zero bytes. Datagrams the output builds from raw TS are all 1316 bytes; mixed sizes come from RTP forwarded or re-wrapped as it arrived — notably with `program_number`, `pid_map` or `pid_overrides`, which drop TS packets from datagrams. On a 2022-7 output fed RTP, such groups lose all protection, including the rebuild of a group's longest packet that came out exact before.
+- **Bilbycast's own framing.** FEC datagrams travel on the media port behind a `BCFE` magic and a 10-byte header with no length, timestamp or mask recovery. Only a bilbycast RTP input with `fec_decode` reads them; a third-party SMPTE 2022-1 decoder does not.
+
+**Where a repaired packet lands.** Column FEC follows the last row of its column, so a loss outside the last row is rebuilt up to (rows - 1) x columns datagrams after newer ones (about 60 ms at 8 x 8 and 10 Mbit/s). A **2022-7 RTP input with `path_differential_ms`** at least that long releases repairs in sequence order, so every repair reaches its outputs. A **single-leg RTP input** publishes a rebuilt packet only when it is ahead of every packet it has already published: a late one is withheld (it stays in the matrix, where it can still help rebuild others) and is not counted in `packets_recovered_fec`, because a datagram out of order is worse downstream — continuity errors, and a PCR that steps back — than the loss it repairs. On a single-leg input, therefore, FEC repairs in practice a single loss in the last row of the matrix (about 1 in `rows` of them), and a received datagram FEC has already rebuilt is not published twice. Releasing every repair in order would need a single-leg input to hold each packet back for the matrix's span, which it does not do; a 2022-7 input with `path_differential_ms` is the way to get full repair today. A 2022-7 input without `path_differential_ms` publishes repairs as they come, late or not.
+
+**History and upgrade order.** Before edge#206 the encoder computed FEC over the flow's broadcast items — the input's sequence numbers and bytes — rather than the datagrams it sent, so `fec_encode` protected nothing except on a 2022-7 output fed RTP, and there only while upstream numbering had no gaps. Now that FEC repairs real losses, upgrade every edge receiving with `fec_decode` **before** the edges sending with `fec_encode`: an older single-leg receiver publishes every repair the moment it is rebuilt, out of order. An older sender feeding a new receiver behaves as before (its FEC rarely lines up and is mostly ignored).
 
 ---
 
@@ -3855,8 +3866,8 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "bind_addr": "239.1.1.1:5000",
       "interface_addr": "10.0.0.100",
       "fec_decode": {
-        "columns": 10,
-        "rows": 10
+        "columns": 8,
+        "rows": 8
       },
       "allowed_sources": ["10.0.0.1"],
       "allowed_payload_types": [33],
@@ -3872,8 +3883,8 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "dest_addr": "239.1.2.1:5004",
       "interface_addr": "10.0.0.100",
       "fec_encode": {
-        "columns": 10,
-        "rows": 10
+        "columns": 8,
+        "rows": 8
       },
       "dscp": 46
     }
@@ -4057,8 +4068,8 @@ Use `POST /api/v1/config/reload` to re-read both `config.json` and `secrets.json
       "bind_addr": "239.1.1.1:5000",
       "interface_addr": "10.0.0.100",
       "fec_decode": {
-        "columns": 10,
-        "rows": 10
+        "columns": 8,
+        "rows": 8
       }
     }
   ],
