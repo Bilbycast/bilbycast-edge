@@ -319,7 +319,9 @@ debounced so a churning source doesn't flood the feed.
 
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
-| info | SRT output '{id}' connected | Peer connected (listener) or caller connected. `output_id` set on event | `{ mode, local_addr, remote_addr, stream_id }` |
+| info | SRT output '{id}' connected | Peer connected (listener) or caller connected. `output_id` set on event. On a SMPTE 2022-7 output this is leg 1, with `leg: 1` in its details | `{ mode, local_addr, remote_addr, stream_id }`; on a 2022-7 output `{ mode, leg, local_addr }` |
+| info | SRT output '{id}' 2022-7 leg 2 connected | Leg 2 (the `redundancy` leg) of a SMPTE 2022-7 output connected, once per connect cycle. Its own message, not leg 1's: the manager folds an event into an unacknowledged row with the same message and does not compare details, so leg 1's text would hide it as a count on leg 1's row. `output_id` set on event | `{ mode, leg, local_addr }` |
+| warning | SRT output '{id}' 2022-7 leg 2 did not connect within 15s; running single-leg | Leg 2 of a SMPTE 2022-7 output did not accept a caller, or reach its peer, within its 15 s connect budget. Leg 2 counts as gone for the rest of the cycle, so leg 1, if it is still up, carries on alone, and its loss reconnects the pair, which tries leg 2 again with a fresh budget. If leg 1 was already lost while leg 2 was connecting (its leg-lost event read `other_leg: connecting`), nothing is carrying any more and the pair reconnects at once: this Warning is followed by the `disconnected` row below. Until 2026-10 a leg 2 that gave up still counted as alive, so the pair never reconnected and either case left the output down until it was restarted. `output_id` set on event | `{ mode, leg, reason, budget_ms }` |
 | warning | SRT output '{id}' disconnected | Peer disconnected or connection lost. `output_id` set on event | `{ mode, local_addr/remote_addr }` |
 | warning | SRT output '{id}' stale connection detected | No ACK received after timeout, re-accepting. `output_id` set on event | |
 | critical | SRT output '{id}' connection failed: {error} | Caller can't reach remote, or bind fails. `output_id` set on event | `{ mode, remote_addr, stream_id, error }` |
@@ -406,9 +408,11 @@ and event generation live inside `bilbycast-bonding` at
 | critical | Both redundant legs lost | No data from either leg, will reconnect |
 | warning | SRT redundancy on raw TS: running active-leg failover, not hitless dedup | An SRT redundant input carries **raw TS** (no shared cross-leg RTP sequence), so the merger can't do 2022-7 seq-aware dedup and falls back to active-leg failover. Configure the publisher to send RTP/TS (SMPTE ST 2022-2) for true hitless behaviour. Details: `{ error_code: "redundancy_failover_mode", format: "raw_ts", fix_hint }` |
 | warning | SMPTE 2022-7: leg SSRC mismatch — both legs must carry byte-identical RTP including SSRC | A 2022-7 dual-leg merge saw the two RTP legs carry different SSRCs; hitless dedup needs byte-identical RTP (including SSRC) on both legs. Details: `{ error_code: "redundancy_ssrc_mismatch", mismatch_count }` |
+| warning | SRT output '{id}' 2022-7 leg {n} lost; down until the pair reconnects | A leg of a SMPTE 2022-7 **SRT output** failed a send (its peer closed or the connection broke), raised once per leg per connect cycle. That leg's stats (`srt_stats` for leg 1, `srt_leg2_stats` for leg 2) disappear with it. A lost leg is not redialled on its own: it returns when the pair reconnects, which happens once both legs are gone, so until then the output runs on the other leg alone, unprotected. When leg 1 is lost, leg 2 takes over counting `packets_sent` / `bytes_sent`, so the output still reads `active`. **Output-scoped** (`output_id` set, no `flow_id`), and its code is distinct from the RTP input's flow-scoped `redundancy_leg_dropped`, so a Routine filtered on either fires on its own side only. The message is fixed per leg, so each leg's losses fold into one row; the other leg's state is in `details.other_leg`: `carrying`; `connecting` (leg 2 still inside its 15 s connect budget, carrying nothing yet; it takes over if it connects in time); or `down`, which is followed by the pair reconnecting and the `disconnected` row under SRT Output. A leg 2 that did not connect within its 15 s is `down` too: a leg 1 lost after it gave up reconnects the pair at once, and one lost while it was still connecting (`connecting`) reconnects the pair when leg 2 runs out of its budget, after the `did not connect within 15s` Warning under SRT Output. Until 2026-10 a leg 2 that gave up still counted as alive, and in either order the output stayed down until it was restarted. Details: `{ error_code: "redundancy_output_leg_lost", leg, mode, other_leg }` |
 
 **Source**: `src/engine/input_srt.rs` (`redundancy_failover_mode`),
-`src/engine/input_rtp.rs` (`redundancy_ssrc_mismatch`)
+`src/engine/input_rtp.rs` (`redundancy_ssrc_mismatch`),
+`src/engine/output_srt.rs` (`redundancy_output_leg_lost`)
 
 ---
 
@@ -1119,8 +1123,8 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 |----------|-------|-------------|
 | `flow` | unaudited | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update, media-player start/source-failed/playlist-exhausted/pacer-lagging/pacer-recovered) + source PCR/PTS/DTS discontinuity + PID-bus PID cap reached (`pid_bus_pid_cap_reached`) + AC-4 on a display output (`display_audio_ac4_undecodable` — category is `flow`, not `display`) + multiviewer wall stopped / tile self-reference / tile source missing (`multiviewer` builds) + config-only output detach (`output_detached_without_runtime_removal`) + the two config-diff restart failures (message-only, no `error_code`) + the two `update_input` restart outcomes (`input_update_flow_restart_failed`, `input_update_rollback_failed`) |
 | `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
-| `srt` | 9 | SRT input and output connection state (now with structured details) |
-| `redundancy` | 5 | SMPTE 2022-7 dual-leg status + raw-TS active-leg failover (`redundancy_failover_mode`) + leg SSRC mismatch (`redundancy_ssrc_mismatch`) |
+| `srt` | 12 | SRT input and output connection state (now with structured details), including a 2022-7 output's leg 2 connecting or missing its connect budget |
+| `redundancy` | 6 | SMPTE 2022-7 dual-leg status + raw-TS active-leg failover (`redundancy_failover_mode`) + leg SSRC mismatch (`redundancy_ssrc_mismatch`) + a 2022-7 SRT output's lost leg (`redundancy_output_leg_lost`, output-scoped) |
 | `rtmp` | 3 + 7 | RTMP publisher connections (input) + output connection lifecycle and `codec_needs_encode` (output-scoped) |
 | `rtsp` | 2 | RTSP input state (now with structured details) |
 | `hls` | 2 | HLS output failures |
