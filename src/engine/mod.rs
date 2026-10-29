@@ -400,7 +400,12 @@ pub mod output_mxl_video;
 /// Boot probe lives in `engine::decklink::domain::DecklinkDeviceManager::probe`.
 /// Off by default — gated by the `sdi-decklink` Cargo feature. See
 /// `docs/sdi.md` and `bilbycast-decklink-rs/CLAUDE.md`.
-#[cfg(feature = "sdi-decklink")]
+///
+/// Also compiled under `test`: its `nodes` submodule (the boot-time
+/// `/dev/blackmagic` diagnosis) is plain std + libc, so the default
+/// `cargo test` / `cargo clippy --all-targets` cover it. `domain` and `status`
+/// need the SDK crate and stay behind the feature.
+#[cfg(any(test, feature = "sdi-decklink"))]
 pub mod decklink;
 #[cfg(feature = "sdi-decklink")]
 pub mod output_sdi;

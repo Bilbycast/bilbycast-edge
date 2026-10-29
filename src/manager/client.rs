@@ -1712,7 +1712,10 @@ pub fn edge_capabilities() -> Vec<&'static str> {
     // from the status poller, so it tracks hot-plug in both directions rather
     // than freezing whatever was true at boot. A host with no card therefore
     // never offers SDI in the manager UI, and one that gains a card starts
-    // offering it within a poll interval without a restart.
+    // offering it within a poll interval without a restart — unless it runs
+    // under the packaged systemd unit, whose `DeviceAllow=` path rules resolve
+    // when the service starts, so device nodes created after that stay denied
+    // (and enumerate nothing) until a restart.
     #[cfg(feature = "sdi-decklink")]
     {
         if crate::engine::decklink::domain::probe_succeeded()

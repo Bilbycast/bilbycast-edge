@@ -64,19 +64,35 @@ DeviceAllow=char-nvidia-uvm rwm
 DeviceAllow=/dev/rga rwm
 DeviceAllow=/dev/mpp_service rwm
 # Blackmagic DeckLink SDI capture/playout (`sdi-decklink` feature). Without
-# these the hardened unit enumerates ZERO cards while still advertising the
-# capability — api_available() returns true (CreateDeckLinkIteratorInstance
-# succeeds, it only needs libDeckLinkAPI.so) but every device open is denied,
-# so the node offers SDI and then finds nothing. Confirmed on hardware
-# (bilby-z440, DeckLink Quad 2) as the cause of that exact split.
+# these every open of a card's device node fails EPERM, so the DeckLink API
+# enumerates ZERO cards although Desktop Video is installed (api_available()
+# only needs libDeckLinkAPI.so, which loads fine), and the node does not
+# advertise `sdi-decklink` at all: the manager shows no SDI for it. The boot
+# log (target `sdi.decklink`) names each denied node.
 #
-# Both forms are listed on purpose. The class form covers any card count and
-# survives renumbering; the path forms are the pattern already proven to work
-# on this unit when a class name failed to resolve (see /dev/rga above).
-# NOTE: the path list is io0..io7 (Quad 2 = 8 devices) and is NOT verified
-# on hardware here. Check `ls /dev/blackmagic/` on your host — if your card
-# exposes `dvN` nodes, or more than 8, add those paths too. Paths that do
-# not exist are ignored with a log warning, so extras are harmless.
+# Node names, both confirmed on hardware (bilbycast-edge#168):
+#   io0..io7  multi-channel cards; a DeckLink Quad 2 has one node per channel
+#   dv0..dv7  single-channel DeckLink SDI cards, one node per card (4x
+#             bdbd:a11b, Desktop Video 16.0.1a2 created dv0..dv3)
+# These are `misc` nodes (char major 10, minors assigned dynamically), so
+# `char-blackmagic` cannot match them, the same failure as /dev/rga above;
+# the path rules are what grant access. The class rule is kept for any model
+# whose driver registers a dedicated `blackmagic` major.
+#
+# - systemd does not glob device paths, so each node is listed.
+# - Path rules resolve when the unit STARTS. A path that does not exist then
+#   is skipped with a log line (harmless: most hosts have few or none of
+#   these), and a node the driver creates later (driver loaded late, card
+#   hot-plugged) stays denied until the service is restarted.
+# - More nodes than these (a second Quad 2's io8.., dv8.., another prefix):
+#   add them in a drop-in (`sudo systemctl edit bilbycast-edge`), one
+#   `DeviceAllow=/dev/blackmagic/<node> rw` line each, then restart.
+# - A manager-driven upgrade replaces only the binary, never this file. An
+#   existing host gets these rules from such a drop-in, or by refreshing the
+#   unit with `install-edge.sh --upgrade-installer` (which also moves the node
+#   to the latest release).
+# - Keep each rule on its own line with no trailing comment: systemd reads a
+#   `#` after the value as part of it and silently drops the rule.
 DeviceAllow=char-blackmagic rwm
 DeviceAllow=/dev/blackmagic/io0 rw
 DeviceAllow=/dev/blackmagic/io1 rw
@@ -86,6 +102,14 @@ DeviceAllow=/dev/blackmagic/io4 rw
 DeviceAllow=/dev/blackmagic/io5 rw
 DeviceAllow=/dev/blackmagic/io6 rw
 DeviceAllow=/dev/blackmagic/io7 rw
+DeviceAllow=/dev/blackmagic/dv0 rw
+DeviceAllow=/dev/blackmagic/dv1 rw
+DeviceAllow=/dev/blackmagic/dv2 rw
+DeviceAllow=/dev/blackmagic/dv3 rw
+DeviceAllow=/dev/blackmagic/dv4 rw
+DeviceAllow=/dev/blackmagic/dv5 rw
+DeviceAllow=/dev/blackmagic/dv6 rw
+DeviceAllow=/dev/blackmagic/dv7 rw
 SupplementaryGroups=video render audio
 # CAP_NET_ADMIN — required by kernel ≥ 6.x for setsockopt(SO_TXTIME)
 # with CLOCK_TAI. Without it, wire-emit falls back to clock_nanosleep.

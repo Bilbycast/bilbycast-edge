@@ -168,7 +168,7 @@ tooltip.
 | `video-decoder-rkmpp` | `video-decoder-rkmpp` + runtime probe | RKMPP decode available (Rockchip RK3568/RK3588); shipped in the `*-aarch64-linux-rockchip` artefact |
 | `display` | `display` + ≥ 1 KMS connector enumerated | Local-display output usable |
 | `mv-compositor` | `multiviewer` + one of `video-encoder-{x264,x265,nvenc,qsv}` | Mosaic compositor (multiviewer wall) usable. Only those four satisfy the gate — a build whose only encoder is VAAPI or RKMPP advertises nothing |
-| `sdi-decklink` | `sdi-decklink` + boot probe reached the SDK + ≥ 1 card in the status poller's cache | SDI capture / playout usable. Card presence comes from the poller, so it tracks hot-plug in both directions rather than freezing the boot enumeration |
+| `sdi-decklink` | `sdi-decklink` + boot probe reached the SDK + ≥ 1 card in the status poller's cache | SDI capture / playout usable. Card presence comes from the poller, so it tracks hot-plug in both directions rather than freezing the boot enumeration — except that under the packaged systemd unit a card's device nodes created after the service started stay denied until a restart ([sdi.md](sdi.md#checklist-c--grant-the-device-nodes-under-systemd), Checklist C) |
 | `fdk-aac` | `fdk-aac` | In-process AAC family |
 | `media-codecs` | `media-codecs` (default on) | libavcodec for video decode + Opus / MP2 / AC-3 audio decode |
 | `webrtc` | `webrtc` (default on) | WHIP / WHEP supported |
