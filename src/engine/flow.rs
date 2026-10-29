@@ -6015,18 +6015,19 @@ fn spawn_ts_es_demuxer_consumer(
     })
 }
 
-/// Build topology-display metadata from an output config.
-///
-/// Used both at initial flow creation and when hot-adding outputs so that
-/// stats snapshots always reflect the current output address/port.
 /// Resolve a UDP/RTP-family output's `egress_pacing` at spawn time:
 /// explicit operator values pass through; unset (`None` = auto)
 /// resolves via [`EgressPacingMode::resolve_auto`] — `pcr` when the
-/// flow has a bonded input, else `forward` (the historical default).
-/// Records the decision on `OutputStats.egress_pacing_effective`
-/// ("auto (pcr)" vs a bare explicit mode) so the manager UI shows what
-/// an auto output actually landed on. Returns `Some` always so the
-/// spawn modules' `unwrap_or_default()` sites see the resolved mode.
+/// flow has a bonded input, else `forward` (the historical default; an
+/// output that re-encodes video stays `forward` too, and
+/// `engine::av_quality_watch` warns `egress_pcr_accuracy_exceeded` when
+/// its PCR send jitter shows it needs `pcr`).
+/// Records the decision on the output's stats — the label
+/// `OutputStats.egress_pacing_effective` ("auto (pcr)" vs a bare
+/// explicit mode) so the manager UI shows what an auto output actually
+/// landed on, and the typed mode the quality watch reads. Returns
+/// `Some` always so the spawn modules' `unwrap_or_default()` sites see
+/// the resolved mode.
 fn resolve_egress_pacing_auto(
     explicit: Option<crate::config::models::EgressPacingMode>,
     flow_has_bonded_input: bool,
@@ -6036,11 +6037,11 @@ fn resolve_egress_pacing_auto(
 ) -> Option<crate::config::models::EgressPacingMode> {
     use crate::config::models::EgressPacingMode;
     if let Some(mode) = explicit {
-        stats.set_egress_pacing_effective(mode.as_str().to_string());
+        stats.set_egress_pacing_effective(mode, false);
         return explicit;
     }
     let resolved = EgressPacingMode::resolve_auto(None, flow_has_bonded_input);
-    stats.set_egress_pacing_effective(format!("auto ({})", resolved.as_str()));
+    stats.set_egress_pacing_effective(resolved, true);
     if resolved == EgressPacingMode::Pcr {
         tracing::info!(
             "output '{output_id}' (flow '{flow_id}'): egress_pacing unset → auto-resolved \
@@ -6051,6 +6052,10 @@ fn resolve_egress_pacing_auto(
     Some(resolved)
 }
 
+/// Build topology-display metadata from an output config.
+///
+/// Used both at initial flow creation and when hot-adding outputs so that
+/// stats snapshots always reflect the current output address/port.
 fn build_output_config_meta(config: &OutputConfig) -> OutputConfigMeta {
     match config {
         OutputConfig::Srt(c) => OutputConfigMeta {
@@ -8380,5 +8385,41 @@ mod assembly_plan_tests {
             .expect("nothing reads the channels of a gone assembler");
         let err = reserve_plan_slot(&plan_tx, "f1", &events, wait).await.expect_err("a gone assembler");
         assert_eq!(code(&err), None, "is not a stall");
+    }
+}
+
+#[cfg(test)]
+mod egress_pacing_resolution_tests {
+    use super::*;
+    use crate::config::models::EgressPacingMode;
+    use crate::stats::collector::OutputStatsAccumulator;
+
+    /// The function both start_output arms (RTP, UDP) call records the
+    /// label the manager prints and the typed mode the quality watch
+    /// reads, and they agree.
+    #[test]
+    fn resolve_egress_pacing_auto_records_label_and_typed_mode() {
+        let case = |explicit, bonded| {
+            let o = OutputStatsAccumulator::new("o".into(), "out".into(), "udp".into());
+            let got = resolve_egress_pacing_auto(explicit, bonded, "o", "f", &o);
+            (got, o.egress_pacing_effective.get().cloned(), o.egress_pacing_mode())
+        };
+        assert_eq!(
+            case(Some(EgressPacingMode::Forward), false),
+            (Some(EgressPacingMode::Forward), Some("forward".into()), Some(EgressPacingMode::Forward)),
+        );
+        assert_eq!(
+            case(None, false),
+            (Some(EgressPacingMode::Forward), Some("auto (forward)".into()), Some(EgressPacingMode::Forward)),
+        );
+        assert_eq!(
+            case(None, true),
+            (Some(EgressPacingMode::Pcr), Some("auto (pcr)".into()), Some(EgressPacingMode::Pcr)),
+        );
+        // An explicit mode wins over a bonded input.
+        assert_eq!(
+            case(Some(EgressPacingMode::Servo), true),
+            (Some(EgressPacingMode::Servo), Some("servo".into()), Some(EgressPacingMode::Servo)),
+        );
     }
 }

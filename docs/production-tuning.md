@@ -24,7 +24,14 @@ The default `install-edge.sh` already configures:
 | **CLOCK_TAI pacing** | `engine::wire_emit` reads + sleeps on CLOCK_TAI | Compatible with PTP-disciplined NICs |
 
 **Expected PCR_AC p99 at this layer**: ~50–500 µs (the `clock_nanosleep_fifo` tier
-of `engine::wire_emit`).
+of `engine::wire_emit`) on a `pcr`-paced output. These layers bound the edge's
+own release jitter; they do not smooth a source's. A `forward` output (the
+auto default on any flow without a bonded input) leaves at its input's
+cadence, so it carries that input's own arrival jitter — a few ms on a
+paced feed, and tens to hundreds of ms on an output that re-encodes video,
+which leaves as its encoder delivers. The edge warns
+`egress_pcr_accuracy_exceeded` when it measures the latter (see
+[Outputs that re-encode video](configuration-guide.md#outputs-that-re-encode-video)).
 
 **Verify**:
 - `journalctl -u bilbycast-edge -g 'wire-emit'` should show one

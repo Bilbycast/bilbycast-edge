@@ -2201,7 +2201,7 @@ Sends RTP-wrapped MPEG-TS packets to a unicast or multicast destination. Support
 | `dscp` | integer | No | `46` | DSCP value for QoS marking (RP 2129 C10). Range 0-63. Default 46 = Expedited Forwarding (RFC 4594). |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Applied before FEC, so the receiver's FEC protects the filtered SPTS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `delay` | object | No | `null` | Output delay for stream synchronization. Modes: `{"mode":"fixed","ms":N}` adds constant delay; `{"mode":"target_ms","ms":N}` targets end-to-end latency (self-adjusting); `{"mode":"target_frames","frames":N,"fallback_ms":M}` targets latency in video frames (auto-detected fps). |
-| `egress_pacing` | string | No | auto | Egress pacing model for the wire emitter: `"forward"` (emit at input cadence, no re-pacing; lowest latency, recommended for clean upstreams), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers / bond-reassembled cadence), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). **Unset = auto**: resolves to `"pcr"` when the flow has a `bonded` input, else `"forward"` (see [Egress pacing auto-resolution](#egress-pacing-auto-resolution)). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
+| `egress_pacing` | string | No | auto | Egress pacing model for the wire emitter: `"forward"` (emit at input cadence, no re-pacing; lowest latency, recommended for clean upstreams), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers / bond-reassembled cadence), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). **Unset = auto**: resolves to `"pcr"` when the flow has a `bonded` input, else `"forward"` (see [Egress pacing auto-resolution](#egress-pacing-auto-resolution)). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. An output with `video_encode` stays `"forward"` under auto, and the edge raises `egress_pcr_accuracy_exceeded` when its PCR send jitter is above 30 ms — see [Outputs that re-encode video](#outputs-that-re-encode-video). |
 | `cbr_pad_to_kbps` | integer | No | `null` | Pad the output to a constant wire bitrate (kbps) by injecting PID `0x1FFF` NULL packets between the transcoder pipeline and the wire emitter, so the rate is stable regardless of the encoder's natural VBR output — for downstream multiplexers and legacy receivers that expect CBR. Range **1000–1000000**. When the output declares `audio_encode.bitrate_kbps` and/or `video_encode.bitrate_kbps`, the target must exceed their sum by at least **5 %**: a target at or below the encoder budget would never inject a single NULL, so it is rejected at save time rather than silently doing nothing. **Incompatible with `epoch_lock`** — see [Epoch-locked egress](#epoch-locked-egress-cross-node-alignment). |
 | `egress_buffer_ms` | integer | No | `null` | Servo de-jitter cushion (ms of content). **Only valid with `egress_pacing: "servo"`** — rejected otherwise. Seeds and holds ~this much content in the egress queue, absorbing arrival jitter at the cost of that latency. Range 20-2000. `null` = no cushion (servo rate-trims only). |
 | `epoch_lock` | object | No | `null` | Epoch-locked egress — release this output's datagrams on a **group-shared timeline** so independent nodes forwarding the same feed emit the same content at the same wall instant. See [Epoch-locked egress](#epoch-locked-egress-cross-node-alignment). |
@@ -2239,6 +2239,88 @@ their spawn-time resolution and the edge emits a Warning
 (`egress_pacing_auto_stale`) listing the affected outputs; restart them (or
 the flow) to re-resolve.
 
+##### Outputs that re-encode video
+
+Auto does **not** pick `"pcr"` because an output re-encodes video: on a
+flow without a bonded input such an output stays `"forward"`, the lowest
+latency, and its packets leave as the transcode chain emits them. An encoder delivers in bursts and stalls, so
+the output's PCR send jitter (`OutputStats.pcr_trust`) follows them. On
+the test rig its p99 ranged from about 11 ms to over 400 ms depending on
+source and encoder — witness about 37 ms, VH1 about 65 ms, an HEVC re-encode
+about 100 ms, a whole-MPTS HEVC transcode 230–430 ms — where audio-only
+transcodes and passthrough outputs of the same media-player feeds measured
+a few ms. Gate 4's operational tier 2 is 30 ms. (A forward output also
+carries whatever burstiness its input brings: passthrough outputs of an
+RTMP publish measured near 200 ms on the same rig. This warning does not
+cover that case; it watches an output's own video re-encode only.)
+
+The edge says when an output needs more: a forward-paced UDP/RTP output
+whose video replacer is running warns `egress_pcr_accuracy_exceeded` once
+its p99 has been above 30 ms for two consecutive 5 s polls, and clears it
+with `egress_pcr_accuracy_recovered` under 20 ms or when the output
+restarts on another pacing (see
+[events-and-alarms.md](events-and-alarms.md)). It judges only a reservoir
+that has rotated the output's first 1024 samples out, a few minutes after
+start, so an encoder's open does not raise it. An explicit `"forward"`
+warns too; acknowledge it if the latency matters more.
+
+The fix the warning names is `egress_pacing: "pcr"`, which releases each
+packet at its PCR-implied instant. What it costs and assumes:
+
+- **Latency.** About 50 ms (the pacer's preroll) to begin with. A
+  transcode stall that makes a PCR more than 5 ms later than that takes
+  a late re-anchor, which replaces the preroll rather than adding to it.
+  The pacer then replays the backlog the stall left at the PCR rate, so
+  the stall is kept as latency for good: latency grows to the longest
+  stall seen (and 50 ms more when the stall leaves the pacer no PCR for
+  200 ms, since it then re-anchors with a fresh preroll). The 200 ms
+  lookahead does not bound it — the pacer checks that against the moment
+  it takes each datagram off its queue, and the backlog waits in the
+  queue. Only the 1000 ms residence cap does: past it the queue is shed
+  (`egress_shed`) and pacing re-anchors. That includes the **encoder's
+  open** when the output restarts, which switching to `"pcr"` does: the
+  PCR carriers that went out ahead of it are paced, the stream behind
+  the open queues, and an encoder whose open takes most of a second
+  (some hardware encoders) can leave the output close to 1 s late. The
+  warning's `estimated_added_latency_ms` is the larger of 50 ms and the
+  measured worst sample, and a floor: each sample sees one PCR interval,
+  so an encoder that falls behind over several PCRs reads short; the
+  sampler discards a gap over 500 ms; and the restart's encoder open is
+  not in it. A once-per-epoch lowering of the transcode PCR offset
+  (`ts_pcr_remux`) is kept as latency too, up to about 200 ms (that one
+  is a forward PCR step, which the lookahead does clamp), because the
+  pacer ignores the discontinuity.
+- **Long stalls cost latency, not jitter.** Each new longest stall puts
+  one late PCR on the wire when it happens; after that the pacer holds
+  the latency and smooths every shorter stall. So stalls up to the
+  residence cap (x265 at a slow preset, a whole-MPTS transcode on a
+  loaded host) are expected to reach the limit on `"pcr"`, at that
+  latency; a lighter encode keeps the latency down. Stalls approaching
+  1 s shed instead. Measure the output on `"pcr"` before relying on it.
+  An MPTS output's sampler covers one program's PCR only.
+- **It is open-loop.** `"pcr"` follows the source's clock, so a live source
+  fast against the host grows the egress queue at its offset (about 108
+  ms/h at 30 ppm) until the 1000 ms residence cap sheds it, and a large
+  VBR I-frame tail costing more than 5 ms on every GOP steps the latency
+  once per GOP until the same cap sheds. Watch `OutputStats.latency`
+  (flat on a healthy `pcr` output) and `egress_shed`, not only the p99 —
+  see the pacing rules under [Architecture](wire-pacing.md#architecture)
+  in wire-pacing.md and its `rebase=` diag counter.
+- **It holds I-frame bursts to their PCR instant.** A receiver with a
+  shallow buffer has underrun on that before (latency swinging on the GOP
+  cadence), so verify the receiver after switching.
+- **RTP timestamps.** On an RTP output the RTP timestamp is stamped before
+  the pacer, so a receiver that de-jitters on it sees the re-paced spread.
+- **The advice assumes the `clock_nanosleep_fifo` tier**
+  (`OutputStats.wire_pacing_tier`, also in the warning's details); a
+  wire thread without SCHED_FIFO can add its own late re-anchors on a
+  busy transcoding host.
+
+`pcr_trust` measures at the edge's own socket, so network PDV only adds to
+it: the warning's absence is not proof of tier 2 at the receiver. The
+sampler also discards any pair more than 500 ms apart, so stalls longer
+than that leave no sample at all and a p99 that looks clean.
+
 ### UDP Output
 
 Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188 = 1316 bytes). If the input is RTP-wrapped, RTP headers are automatically stripped. Compatible with ffplay, VLC, and standard IP/TS multicast receivers.
@@ -2264,7 +2346,7 @@ Sends raw MPEG-TS over UDP without RTP headers. Datagrams are TS-aligned (7×188
 | `dscp` | integer | No | `46` | DSCP value for QoS marking. Range 0-63. |
 | `program_number` | integer | No | `null` | MPTS → SPTS program filter. `null` = full MPTS passthrough; `Some(N)` = forward only program N as a rewritten single-program TS. Must be `> 0`. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `delay` | object | No | `null` | Output delay for stream synchronization (same modes as RTP output). Incompatible with `transport_mode: "audio_302m"`. |
-| `egress_pacing` | string | No | auto | Egress pacing model for the wire emitter: `"forward"` (emit at input cadence, no re-pacing; lowest latency, recommended for clean upstreams), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers / bond-reassembled cadence), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). **Unset = auto**: resolves to `"pcr"` when the flow has a `bonded` input, else `"forward"` (see [Egress pacing auto-resolution](#egress-pacing-auto-resolution)). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. |
+| `egress_pacing` | string | No | auto | Egress pacing model for the wire emitter: `"forward"` (emit at input cadence, no re-pacing; lowest latency, recommended for clean upstreams), `"pcr"` (open-loop re-pacing at PCR-implied instants, for SMPTE 2022-7 dual-leg coherence / strict-T-STD receivers / bond-reassembled cadence), `"servo"` (closed-loop release-rate servo for a genuinely bursty unpaced ingress). **Unset = auto**: resolves to `"pcr"` when the flow has a `bonded` input, else `"forward"` (see [Egress pacing auto-resolution](#egress-pacing-auto-resolution)). A bounded residence cap guards against latency runaway in every mode. Manager-configurable; UI gated on the `egress_pacing` capability. An output with `video_encode` stays `"forward"` under auto, and the edge raises `egress_pcr_accuracy_exceeded` when its PCR send jitter is above 30 ms — see [Outputs that re-encode video](#outputs-that-re-encode-video). |
 | `cbr_pad_to_kbps` | integer | No | `null` | Pad the output to a constant wire bitrate (kbps) by injecting PID `0x1FFF` NULL packets between the transcoder pipeline and the wire emitter, so the rate is stable regardless of the encoder's natural VBR output — for downstream multiplexers and legacy receivers that expect CBR. Range **1000–1000000**. When the output declares `audio_encode.bitrate_kbps` and/or `video_encode.bitrate_kbps`, the target must exceed their sum by at least **5 %**: a target at or below the encoder budget would never inject a single NULL, so it is rejected at save time rather than silently doing nothing. **Incompatible with `epoch_lock`** — see [Epoch-locked egress](#epoch-locked-egress-cross-node-alignment). |
 | `egress_buffer_ms` | integer | No | `null` | Servo de-jitter cushion (ms of content). **Only valid with `egress_pacing: "servo"`** — rejected otherwise. Seeds and holds ~this much content in the egress queue, absorbing arrival jitter at the cost of that latency. Range 20-2000. `null` = no cushion (servo rate-trims only). |
 | `epoch_lock` | object | No | `null` | Epoch-locked egress — release this output's datagrams on a **group-shared timeline** so independent nodes forwarding the same feed emit the same content at the same wall instant. See [Epoch-locked egress](#epoch-locked-egress-cross-node-alignment). |

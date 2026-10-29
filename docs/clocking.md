@@ -711,7 +711,10 @@ input is the program's `pcr_source`; the assembler re-anchors otherwise —
 as before. Wire pacing in the default `auto` (forward) egress mode still
 releases each chunk when the codec thread produces it, so PCR arrival
 jitter keeps the codec thread's burstiness; `egress_pacing: "pcr"` is what
-removes it.
+removes it. An output that re-encodes video raises Warning
+`egress_pcr_accuracy_exceeded` when that jitter puts its `pcr_trust` p99
+above 30 ms — see [Outputs that re-encode video](configuration-guide.md#outputs-that-re-encode-video)
+for what `pcr` costs.
 
 **Telemetry.** `transcode_pcr` on each transcoding output's stats and, for
 the active input's ingress transcode, on the flow's: `offset_ms` (the

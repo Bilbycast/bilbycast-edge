@@ -25,8 +25,11 @@
 //! packets (≤ 50 Hz on worst-case MPEG-TS; 25 Hz typical). Each update is
 //! one Mutex lock + one VecDeque push-back (O(1) amortised when full —
 //! pop_front evicts the oldest). No allocation on the hot path once the
-//! reservoir is initialised. Snapshot takes one lock, clones into a Vec
-//! (<= 32 KB), sorts, and computes percentiles — bounded work.
+//! reservoir is initialised. Snapshot takes one lock just long enough to
+//! copy the reservoir out (<= 32 KB), then sorts and computes percentiles
+//! with the lock released — the send thread that records into it is a
+//! SCHED_FIFO wire thread, and the snapshot's caller is an ordinary
+//! runtime worker that can be preempted mid-sort.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -64,9 +67,12 @@ pub const PCR_MAX_SAMPLE_INTERVAL_US: u64 = 500_000;
 /// state needed to compute |observed − expected| on each PCR sample.
 ///
 /// Thread-safety: the sampler's state is behind a single `Mutex`. The
-/// only writer is the output's send task (one task per output), and
-/// the only reader is the 1 Hz stats snapshot path — contention is
-/// negligible.
+/// only writer is the output's wire-emit thread (one per output). The
+/// readers are the 1 Hz stats snapshot (the output's own and the flow's
+/// `pcr_trust_flow` rollup) and the 5 s A/V quality watch
+/// (`cumulative_samples` on each poll, a snapshot only once it judges
+/// the reservoir). A snapshot copies the reservoir under the lock and
+/// sorts outside it, so contention is negligible.
 pub struct PcrTrustSampler {
     state: Mutex<PcrTrustState>,
 }
@@ -174,51 +180,61 @@ impl PcrTrustSampler {
         state.last_sample_wall_us = Some(now_us);
     }
 
+    /// Drift samples recorded since this sampler was created — the
+    /// reservoir's lifetime count, without copying or sorting anything.
+    /// A reading of `n` over [`PCR_TRUST_RESERVOIR_SIZE`] means the first
+    /// `n − PCR_TRUST_RESERVOIR_SIZE` samples have been evicted.
+    pub fn cumulative_samples(&self) -> u64 {
+        match self.state.lock() {
+            Ok(g) => g.cumulative_samples,
+            Err(poisoned) => poisoned.into_inner().cumulative_samples,
+        }
+    }
+
     /// Take a point-in-time snapshot. Produces `None` when the reservoir
     /// is empty (the first PCR observation only primes state — no drift
     /// Δ available yet). The caller should omit `pcr_trust` from the
     /// output's wire shape in that case.
     pub fn snapshot(&self) -> Option<PcrTrustStats> {
-        let state = match self.state.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
+        // Copy out under the lock; sort with it released.
+        let (mut full, cumulative_samples, cumulative_drift_us) = {
+            let state = match self.state.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if state.samples.is_empty() {
+                return None;
+            }
+            let full: Vec<u64> = state.samples.iter().copied().collect();
+            (full, state.cumulative_samples, state.cumulative_drift_us)
         };
-        if state.samples.is_empty() {
-            return None;
-        }
-        let mut full: Vec<u64> = state.samples.iter().copied().collect();
+        // Short-window p95 over the last WINDOW_SAMPLES: the copy is in
+        // arrival order, so the window is its tail — taken before the
+        // sort reorders it.
+        let window_len = full.len().min(PCR_TRUST_WINDOW_SAMPLES);
+        let mut window: Vec<u64> = full[full.len() - window_len..].to_vec();
         full.sort_unstable();
         let p50_us = percentile(&full, 50.0);
         let p95_us = percentile(&full, 95.0);
         let p99_us = percentile(&full, 99.0);
         let max_us = *full.last().unwrap_or(&0);
 
-        // Short-window p95 over the last WINDOW_SAMPLES. Iterate the
-        // deque's tail directly — avoids a second full clone.
-        let window_len = full.len().min(PCR_TRUST_WINDOW_SAMPLES);
         let window_p95_us = if window_len >= 2 {
-            let mut window: Vec<u64> = state
-                .samples
-                .iter()
-                .rev()
-                .take(window_len)
-                .copied()
-                .collect();
             window.sort_unstable();
             percentile(&window, 95.0)
         } else {
             p95_us
         };
 
-        let avg_us = if state.cumulative_samples > 0 {
-            state.cumulative_drift_us / state.cumulative_samples
+        let avg_us = if cumulative_samples > 0 {
+            cumulative_drift_us / cumulative_samples
         } else {
             0
         };
 
         Some(PcrTrustStats {
             samples: full.len() as u64,
-            cumulative_samples: state.cumulative_samples,
+            cumulative_samples,
             avg_us,
             p50_us,
             p95_us,
@@ -354,6 +370,34 @@ mod tests {
         s.record(27_000_000, 1_000_000); // 1 s forward
         let snap = s.snapshot();
         assert!(snap.is_none(), "large-gap sample should have been skipped");
+    }
+
+    /// The short window is the most recent samples, not the largest:
+    /// the snapshot copies the reservoir out in arrival order and takes
+    /// the window before sorting. `cumulative_samples()` agrees with the
+    /// snapshot's count.
+    #[test]
+    fn window_is_the_newest_samples_and_cumulative_agrees() {
+        let s = PcrTrustSampler::new();
+        assert_eq!(s.cumulative_samples(), 0);
+        s.record(0, 0);
+        // 1000 samples of 30 ms drift, then the window's worth of clean ones.
+        let mut wall = 0u64;
+        let n_bad = 1000u64;
+        for i in 1..=n_bad {
+            wall += 70_000;
+            s.record(i * 1_080_000, wall);
+        }
+        for i in 1..=PCR_TRUST_WINDOW_SAMPLES as u64 {
+            wall += 40_000;
+            s.record((n_bad + i) * 1_080_000, wall);
+        }
+        let snap = s.snapshot().unwrap();
+        assert_eq!(snap.window_samples, PCR_TRUST_WINDOW_SAMPLES as u64);
+        assert_eq!(snap.window_p95_us, 0, "the window holds only the clean tail");
+        assert_eq!(snap.p99_us, 30_000, "the full reservoir still holds the bad run");
+        assert_eq!(s.cumulative_samples(), snap.cumulative_samples);
+        assert_eq!(snap.cumulative_samples, n_bad + PCR_TRUST_WINDOW_SAMPLES as u64);
     }
 
     #[test]

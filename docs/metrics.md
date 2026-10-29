@@ -290,7 +290,7 @@ Shipped on the WS `stats` message as `FlowStats.per_es: Vec<PerEsStats>` — not
 
 ## PCR accuracy trust (`pcr_trust`)
 
-Per-output and flow-rollup PCR accuracy metric. Measures `|ΔPCR_µs − Δwall_µs|` on every successful `socket.send_to` of a PCR-bearing TS packet, fed into a fixed-size rotating reservoir (4096 samples) with exact percentiles computed on snapshot. Catches muxer clock drift, kernel scheduling stalls that slip packets past their PCR cadence, and upstream feeds whose PCRs don't match wall-clock reality.
+Per-output and flow-rollup PCR accuracy metric. Measures `|ΔPCR_µs − Δwall_µs|` on every successful send of a PCR-bearing TS packet, fed into a fixed-size rotating reservoir (4096 samples) with exact percentiles computed on snapshot. Catches muxer clock drift, kernel scheduling stalls that slip packets past their PCR cadence, and upstream feeds whose PCRs don't match wall-clock reality.
 
 Reported in microseconds. Exposed per-output on `OutputStats.pcr_trust` (MPTS UDP + raw-TS-over-RTP + RTP-wrapped TS paths only; 302M / RTP-ES / non-PCR outputs carry no samples). Flow rollup on `FlowStats.pcr_trust_flow` aggregates every output's reservoir — max p50 / p95 / p99 / max across outputs.
 
@@ -303,12 +303,14 @@ Reported in microseconds. Exposed per-output on `OutputStats.pcr_trust` (MPTS UD
 | `p95_us` | 95th percentile. |
 | `p99_us` | 99th percentile. |
 | `max_us` | Worst sample in the reservoir. |
-| `window_samples` | Samples in the last ~1 s rolling window. |
+| `window_samples` | Samples in the most recent window: the last 256 (about 10 s at 25 PCR/s). |
 | `window_p95_us` | p95 on that window — faster-reacting signal for live dashboards. |
 
 **Sample-skip rules** (important for clean percentiles): the sampler discards and resets state when Δ exceeds 500 ms in either direction. This filters startup jitter, keyframe PCR gaps, stream restarts, and 33-bit PCR wrap. The metric is meaningful only for adjacent PCR-bearing packets within a normal PCR cadence (≤ 100 ms per broadcast standard).
 
-**Source:** `src/stats/pcr_trust.rs`, wired into `OutputStatsAccumulator.pcr_trust`. Recorded from `src/engine/output_udp.rs` (MPTS path) and `src/engine/output_rtp.rs` (raw-TS-over-RTP + RTP-wrapped TS passthrough path).
+**Source:** `src/stats/pcr_trust.rs`, wired into `OutputStatsAccumulator.pcr_trust`. Recorded by the output's wire emitter (`src/engine/wire_emit.rs`) on every PCR-bearing send of a UDP / RTP output, in every egress pacing mode; it records the emitter's anchor PCR PID only, so an MPTS output's figure covers one program.
+
+**Watched** per output by `src/engine/av_quality_watch.rs` on a forward-paced UDP/RTP output that re-encodes video: `p99_us` above 30 ms on two consecutive 5 s polls raises Warning `egress_pcr_accuracy_exceeded`, under 20 ms clears it — see [events-and-alarms.md](events-and-alarms.md) and [configuration-guide.md](configuration-guide.md#outputs-that-re-encode-video).
 
 ## Master-clock telemetry (`FlowStats.master_clock`)
 
