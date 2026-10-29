@@ -22,10 +22,15 @@
 //! is switched onto a stream numbered nearby, forwarded unchanged by a
 //! 2022-7 output): the encoder keeps the first copy and a receiver whichever
 //! reached it first. So from then on no FEC goes out for that cell's column
-//! or row in that matrix. FEC already sent over the first copy stays as
-//! sent; a receiver that lost the first copy and holds the second can
-//! still rebuild from it a packet that was never sent, which only happens
-//! when the step back lands in a group whose FEC has already gone.
+//! or row in that matrix. A full matrix keeps its cells until the next
+//! matrix starts, so a step back into one the encoder has finished is a
+//! repeat of every cell it touches and sends nothing: a receiver whose own
+//! matrix is still open (it has a loss it could not rebuild) may hold the
+//! first copies, and new parity over the second would let it rebuild bytes
+//! never sent. FEC already sent over the first copy stays as sent; a
+//! receiver that lost the first copy and holds the second can still rebuild
+//! from it a packet that was never sent, which only happens when the step
+//! back lands in a group whose FEC has already gone.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,8 +58,6 @@ pub struct FecEncoder {
     matrix_size: u16,
     /// Base RTP sequence number (SNBase) of the current matrix
     base_seq: u16,
-    /// Cells holding a packet in the current matrix
-    filled: u16,
     /// Columns (bit c) and rows (bit r) of the current matrix holding a
     /// cell whose sequence number came again with other bytes: they get no
     /// further FEC in this matrix. L and D are at most 20.
@@ -77,7 +80,6 @@ impl FecEncoder {
             matrix: FecMatrix::new(columns, rows),
             matrix_size,
             base_seq: 0,
-            filled: 0,
             unprotected_cols: 0,
             unprotected_rows: 0,
             stats_fec_sent,
@@ -128,7 +130,6 @@ impl FecEncoder {
             return Vec::new();
         }
         self.matrix.insert_media(position, payload);
-        self.filled += 1;
 
         let mut fec_packets = Vec::new();
         let columns = self.matrix.columns;
@@ -167,13 +168,13 @@ impl FecEncoder {
             }
         }
 
-        // A full matrix is done with, as the decoder's is: clear it but keep
-        // SNBase, so the next packet past the window starts the next matrix
-        // at its own number. A matrix with a hole stays open, so a late
-        // packet that fills it is still filed under this SNBase.
-        if self.filled >= self.matrix_size {
-            self.reset_matrix();
-        }
+        // A matrix -- full or with a hole -- is kept until the next packet
+        // past the window starts the next one at its own number, the
+        // decoder's rollover. A late packet that fills a hole is still filed
+        // under this SNBase; a step back into a full matrix is a repeat of
+        // every cell, so no FEC goes out under this SNBase once it is full
+        // (the decoder closes its matrix as it fills, a receiver with a loss
+        // keeps its open, and it may hold either copy of a re-sent number).
 
         if !fec_packets.is_empty() {
             self.stats_fec_sent
@@ -182,10 +183,9 @@ impl FecEncoder {
         fec_packets
     }
 
-    /// Empty the matrix, keeping SNBase.
+    /// Empty the matrix for the next one.
     fn reset_matrix(&mut self) {
         self.matrix.reset();
-        self.filled = 0;
         self.unprotected_cols = 0;
         self.unprotected_rows = 0;
     }
@@ -458,6 +458,31 @@ mod tests {
             out.extend(feed(&mut enc, seq));
         }
         assert_eq!(out.len(), 2 + 4);
+    }
+
+    /// A step back into a matrix the encoder has finished (L=2 D=4:
+    /// 100..=107, then 102..=107 again, changed) sends nothing: a receiver
+    /// still holding that matrix open may keep the first copies, and row
+    /// FEC over the second would rebuild a cell from bytes never sent. The
+    /// next matrix starts at the window's end and is protected in full.
+    #[test]
+    fn a_step_back_into_a_finished_matrix_sends_nothing() {
+        let mut enc = FecEncoder::new(2, 4, Arc::new(AtomicU64::new(0)));
+        let mut out = Vec::new();
+        for seq in 100u16..108 {
+            out.extend(feed(&mut enc, seq));
+        }
+        assert_eq!(out.len(), 2 + 4);
+        let changed = |s: u16| payload(s).iter().map(|b| b ^ 0xFF).collect::<Vec<u8>>();
+        for seq in 102u16..108 {
+            assert!(enc.process(seq, &changed(seq)).is_empty(), "{seq} again");
+        }
+        let mut out = Vec::new();
+        for seq in 108u16..116 {
+            out.extend(feed(&mut enc, seq));
+        }
+        assert_eq!(out.len(), 2 + 4);
+        assert!(out.iter().all(|f| f.sn_base == 108), "{out:?}");
     }
 
     /// L=1: a row is one cell, so row FEC would be a copy of a packet. Only
