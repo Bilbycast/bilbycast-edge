@@ -1481,10 +1481,16 @@ PCR by about the muxer's 100 ms, but the sending edge's steady difference
 between its video and audio encode times stays (a follow-up makes the WHIP
 output report on its source's PTS). Those reports also carry the jitter of
 the sending edge's source: each says when a write left, and the writes
-follow the source's mux timing — on the test rig's source, whose audio PES
-led its PCR by 610–664 ms and its video by 664–736 ms, report pairs disagree
-by up to about ±60 ms. Such a publish is moved once two of its pairs happen
-to agree within 20 ms, so the step lands anywhere in that spread; one whose
+follow the source's mux timing. On the test rig's source, whose audio PES
+led its PCR by about 604–669 ms and its video by 664–736 ms in decode time
+(664–935 ms in presentation time), a model built from those audio and
+decode-time leads has report pairs disagreeing by up to about ±70 ms; that
+is a model, not a measurement on the wire. It also leaves out a term: the
+sending edge re-frames each 96 ms AC-3 PES into 20 ms Opus frames, and the
+last frame written, which its audio report runs on from, starts a different
+distance into its PES each time, so the real spread may be wider still.
+Such a publish is moved once two of its pairs happen to agree within 20 ms,
+so the step lands anywhere in that spread; one whose
 pairs never agree in the 30 s raises `webrtc_av_sync_unsettled` and keeps
 the first-arrival alignment as before — on the reported publish, its audio
 behind the PCR. How often an edge-to-edge publish ends that way has not been

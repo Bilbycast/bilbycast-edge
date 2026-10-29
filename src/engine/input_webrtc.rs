@@ -827,8 +827,8 @@ impl WhipMux {
     /// RTP timestamp `rtp` on a `rate` Hz clock, arrived at `arrival`, with
     /// the track's latest usable sender report `sr` — as TS packets and the
     /// PTS it was stamped at; `None` for a frame with no payload, and for an
-    /// audio frame a backward lip-sync step put at or behind audio already
-    /// sent ([`WhipClock`]).
+    /// audio frame a backward lip-sync step put to start before the end of
+    /// the last audio frame sent ([`WhipClock`], [`AvSync::drop_until`]).
     fn frame(
         &mut self,
         video: bool,
@@ -910,12 +910,18 @@ const AV_SYNC_PLAUSIBLE_90K: i128 = 180_000;
 /// Capture-clock reports (a browser, OBS, GStreamer, ffmpeg) agree to well
 /// under a millisecond. An edge's WHIP output takes its reports at its write
 /// times (str0m runs each on from its last write), so they carry its
-/// source's mux timing: the rig's AC-3 source led its PCR by 610–664 ms with
-/// its audio PES and by 664–736 ms with its video, which scatters estimates
-/// by up to about ±60 ms. Such a publish is moved once two of them happen to
-/// agree — at str0m's cadence (audio reports every 5 s, video every second)
-/// about 30 pairs are judged in the window — and one whose reports scatter
-/// wider may close it unsettled, keeping the first-arrival alignment.
+/// source's mux timing. The rig's AC-3 source led its PCR by 604–669 ms with
+/// its audio PES and by 664–736 ms with its video's decode time (664–935 ms
+/// by presentation time); modelled from those audio and decode-time leads —
+/// not measured on the wire — estimates scatter by up to about ±70 ms. The
+/// model leaves out a term: the sending edge re-frames each 96 ms AC-3 PES
+/// into 20 ms Opus frames, and the last one written, which its report runs
+/// on from, starts a different distance into its PES each time, so the
+/// scatter may be wider still. Such a publish is moved once two estimates
+/// happen to agree — at str0m's cadence (audio reports every 5 s, video
+/// every second) about 30 pairs are judged in the window — and one whose
+/// reports scatter wider may close it unsettled, keeping the first-arrival
+/// alignment.
 #[cfg(any(feature = "webrtc", test))]
 const AV_SYNC_AGREE_90K: i128 = 1_800;
 
@@ -1264,8 +1270,8 @@ impl WhipClock {
     /// The PTS (90 kHz, 33 bits) of a frame of the video or audio track: its
     /// RTP timestamp `rtp` (unwrapped) on a `rate` Hz clock, arrived at
     /// `arrival`, `sr` the track's latest usable sender report; `None` for an
-    /// audio frame a backward lip-sync step left at or behind the audio
-    /// already sent.
+    /// audio frame a backward lip-sync step left starting before the end of
+    /// the last audio frame sent ([`AvSync::drop_until`]).
     fn pts_90k(
         &mut self,
         video: bool,
@@ -1314,7 +1320,8 @@ impl WhipClock {
     /// Whether the lip-sync is still to be settled (it wants the PCR): from
     /// the publish's first audio frame until the step is taken or given up.
     /// Only an audio frame settles it, so a publish whose audio never comes
-    /// would want it for good.
+    /// would want it for good; one whose audio stops inside the window still
+    /// reads the PCR off every video frame (its PES's first packet: cheap).
     fn syncing(&self) -> bool {
         !self.sync.done && self.audio.is_some()
     }
@@ -2455,13 +2462,16 @@ mod av_sync_tests {
     /// The reported defect's publish from an edge's WHIP output, whose reports
     /// are taken at its write times: str0m runs each on from its last write,
     /// so each carries when that write left against its media time — the
-    /// source's mux timing. The rig's AC-3 source led its PCR by 610–664 ms
-    /// with its audio PES and 664–736 ms with its video, cycled here through
-    /// every phase of the two; reports at str0m's cadence, the audio's every
-    /// 5 s and the video's every second. Estimates scatter by up to ±64 ms,
-    /// past the 20 ms two must agree within, and still every phase is moved
-    /// once inside the window, to within that scatter of lip sync, with the
-    /// audio kept ahead of the PCR.
+    /// source's mux timing. The rig's AC-3 source led its PCR by 604–669 ms
+    /// with its audio PES and by 664–736 ms with its video's decode time. Its
+    /// first five-PES cycle of audio leads (610–664 ms) and five video leads
+    /// spread over 664–736 ms are cycled here through every phase of the two;
+    /// reports at str0m's cadence, the audio's every 5 s and the video's
+    /// every second. A model of such reports, not a capture of them, and one
+    /// without the Opus re-framing term ([`AV_SYNC_AGREE_90K`]): in it
+    /// estimates scatter by up to ±64 ms, past the 20 ms two must agree
+    /// within, and still every phase is moved once inside the window, to
+    /// within that scatter of lip sync, with the audio kept ahead of the PCR.
     #[test]
     fn write_time_reports_settle_once_within_their_scatter() {
         const AUDIO_LEAD_MS: [i64; 5] = [610, 625, 628, 653, 664];
