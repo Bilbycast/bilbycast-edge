@@ -827,8 +827,8 @@ fn pts_to_ms(pts: u64, base_pts: &mut Option<u64>) -> u32 {
 /// [`pts_to_ms`] with composition time 0, byte for byte what went out before.
 ///
 /// - The first essence anchors the epoch. A picture anchors it on its decode
-///   time, the earliest stamp any later picture carries; on its PTS, the
-///   pictures decoding before it clamped to 0.
+///   time, the earliest stamp any later picture carries; anchored on its PTS
+///   instead, every picture decoding before that PTS would clamp to 0.
 /// - The composition time is `pts_ms − dts_ms`, not the offset rounded on its
 ///   own, so a picture presents at exactly the `floor((pts − epoch) / 90)`
 ///   audio is mapped with. A/V sync is unchanged; only the decode time moves.
@@ -3661,10 +3661,12 @@ pub(super) mod flv_wire_tests {
     /// muxed with the PTS and DTS its FLV tags carried (`input_rtmp`: DTS
     /// = the tag timestamp, PTS = DTS + composition time, on its fixed
     /// timeline start). Re-published through an RTMP output it carries the
-    /// same decode times and composition times out.
+    /// same decode times and composition times out. The test reproduces
+    /// that muxing by hand rather than driving `input_rtmp`.
     #[tokio::test]
     async fn an_flv_composition_time_survives_an_edge_to_edge_hop() {
-        const START_90K: u64 = 900_000; // input_rtmp's TIMELINE_START_90K
+        // input_rtmp's TIMELINE_START_90K.
+        const START_90K: u64 = crate::engine::rtmp::ts_mux::PCR_LEAD_90K;
         // (tag timestamp, composition time) as an x264 / OBS publisher
         // sends IBBP at 25 fps: decode order I P B B P B B P B, two frames
         // of decode delay, so every picture — a B too — carries one.
