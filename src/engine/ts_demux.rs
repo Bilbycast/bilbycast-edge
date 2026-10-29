@@ -1875,6 +1875,53 @@ mod tests {
         );
     }
 
+    /// A switch that keeps the video PID and codec (a PMT version bump, what
+    /// `TsContinuityFixer::on_switch` makes) leaves the PES assembler as it
+    /// is, and a PES completes only at its PID's next PUSI — so the old
+    /// source's last picture comes out *after* the Discontinuity, completed
+    /// by the new source's first PES. The CMAF output's switch reset is
+    /// documented on that ordering (its `DemuxedFrame::Discontinuity` arm;
+    /// docs/cmaf.md): flushing the assembler on a version bump would make
+    /// the reset a clean cut and that description wrong. Pinned for one
+    /// datagram and for one packet per datagram.
+    #[test]
+    fn old_source_last_picture_follows_the_discontinuity() {
+        use crate::engine::rtmp::ts_mux::TsMuxer;
+        let idr: &[u8] = &[0, 0, 0, 1, 0x65, 0x88, 0x84, 0x21];
+        let p: &[u8] = &[0, 0, 0, 1, 0x41, 0x9A, 0x02, 0x11];
+        let mut mux = TsMuxer::new();
+        let mut ts = Vec::new();
+        let mut push = |mux: &mut TsMuxer, au: &[u8], pts: u64, key: bool| {
+            for pkt in mux.mux_video(au, pts, pts, key) {
+                ts.extend_from_slice(&pkt);
+            }
+        };
+        push(&mut mux, idr, 900_000, true); // old source: IDR
+        push(&mut mux, p, 903_600, false); // old source: its last picture
+        mux.set_pmt_version(1); // the switch: same PIDs, same codec
+        push(&mut mux, idr, 5_000_000, true); // new source: PAT + PMT v1 ahead
+        push(&mut mux, p, 5_003_600, false); // completes the new IDR
+
+        let label = |f: &DemuxedFrame| match f {
+            DemuxedFrame::Discontinuity => Some("discontinuity".to_string()),
+            DemuxedFrame::H264 { pts, .. } => Some(format!("h264@{pts}")),
+            _ => None,
+        };
+        let want = ["h264@900000", "discontinuity", "h264@903600", "h264@5000000"];
+
+        let mut demux = TsDemuxer::new(None);
+        let one_batch: Vec<_> = demux.demux(&ts).iter().filter_map(label).collect();
+        assert_eq!(one_batch, want, "one datagram");
+
+        let mut demux = TsDemuxer::new(None);
+        let per_packet: Vec<_> = ts
+            .chunks(TS_PACKET_SIZE)
+            .flat_map(|pkt| demux.demux(pkt))
+            .filter_map(|f| label(&f))
+            .collect();
+        assert_eq!(per_packet, want, "one packet per datagram");
+    }
+
     /// Build a 188-byte PMT TS packet declaring one H.264 video PID and
     /// one private-data audio PID with a single ES descriptor of `tag` /
     /// `payload`. Used to exercise the DVB AC-3 / E-AC-3 / Opus routing

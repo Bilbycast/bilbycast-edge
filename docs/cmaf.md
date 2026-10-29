@@ -1802,7 +1802,7 @@ backward decode steps to none.
   content leaves the pictures after it decoding against the old content until
   the next IDR. The lab's `BTS204.ts` (PID 0x111) does the first: its IDRs
   carry SPS0 and PPS0, PPS1 arrives only in access units between them, and
-  the 15 pictures of the 529 in its first 40 MiB that name PPS1 do not
+  the 15 pictures of the 558 in its first 40 MiB that name PPS1 do not
   decode — as before edge#204, when the init held PPS0 alone too. The
   `sky-sports-arena` capture does the second to its only PPS: 104
   distinct contents of PPS0 in its first 80 MiB, 23 of them on its 44 IDRs, so

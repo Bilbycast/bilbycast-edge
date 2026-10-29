@@ -2082,7 +2082,9 @@ async fn handle_frame(
         // fresh table. The new source's first random-access access unit that
         // carries a kind replaces that kind; a new source that sends its sets
         // only outside a random-access point merges them in by id beside the
-        // old picture's, as it would have with no reset at all.
+        // old picture's, as it would have with no reset at all. The demuxer
+        // ordering this rests on is pinned by
+        // `ts_demux::tests::old_source_last_picture_follows_the_discontinuity`.
         DemuxedFrame::Discontinuity => {
             state.source_params = ParamSetCollector::default();
         }

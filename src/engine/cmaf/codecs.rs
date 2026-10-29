@@ -268,9 +268,11 @@ impl<'a> BitReader<'a> {
         let mut leading_zeros = 0u32;
         while !self.bit()? {
             leading_zeros += 1;
-            // Malformed: no u32 needs 32 leading zeros, and `1 << 32` below
-            // would overflow — a panic under overflow checks. Parameter-set
-            // ids are read with this from every access unit off the wire.
+            // A 32nd leading zero would need `1 << 32` below — a shift
+            // overflow, a panic under overflow checks — so the largest value
+            // this returns is 2^32 - 2 and a 32nd zero is refused as
+            // malformed. Parameter-set ids are read with this from every
+            // access unit off the wire.
             if leading_zeros > 31 {
                 return None;
             }

@@ -598,6 +598,13 @@ fn parameter_sets_are_read_per_frame_not_per_batch() {
         })
         .collect();
     assert!(frames.len() >= 2, "fixture: the IDR and the P picture in one batch");
+    // What the code before this fix read: once the batch is demuxed the
+    // cache holds the P picture's PPS0, not the IDR's.
+    assert_eq!(
+        demuxer.cached_pps(),
+        Some(&h264_pps(0, 2)[..]),
+        "fixture: the batch look-ahead the old code read"
+    );
     let mut out = Out::new(VideoCodec::H264);
     for (i, (nalus, is_keyframe)) in frames.into_iter().enumerate() {
         out.feed(nalus, is_keyframe);
