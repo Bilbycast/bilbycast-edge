@@ -19,8 +19,8 @@ use crate::config::models::{
     SrtRedundancyConfig,
 };
 use crate::srt::bond_supervisor::{
-    BondHealthTracker, BondMemberPlan, BondSupervisor, bond_attempt_endpoints, observe_members,
-    plan_bond_members,
+    BondHealthTracker, BondMemberPlan, BondSupervisor, bond_attempt_endpoints,
+    describe_connect_error, observe_members, plan_bond_members,
 };
 use crate::stats::collector::{SrtInputSocket, SrtInputStats};
 use crate::stats::models::{SrtBondingMemberStats, SrtBondingStats, SrtLegStats};
@@ -1095,11 +1095,15 @@ pub async fn connect_srt_group_observed(
         // attempt rather than failing it — unless none is left.
         let attempt = match bond_attempt_endpoints(&plans) {
             Ok(members) => {
+                let sources: Vec<SocketAddr> = members.iter().filter_map(|m| m.local_addr).collect();
                 let mut builder = build_group_builder(p, mode);
                 for member in members {
                     builder = builder.add_member(member);
                 }
-                builder.connect().await.map_err(|e| anyhow::anyhow!("{e}"))
+                builder
+                    .connect()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{}", describe_connect_error(&e, &sources)))
             }
             Err(e) => Err(e),
         };
@@ -1195,7 +1199,9 @@ fn bonding_snapshot(
 /// `supervisor`, on a caller group, runs on the same tick after the
 /// snapshot is published: it re-adds members libsrt dropped as broken and
 /// raises the member down / restored events (see
-/// [`crate::srt::bond_supervisor`]).
+/// [`crate::srt::bond_supervisor`]). The task hands it back once `cancel`
+/// fires, for the disconnect event's member report
+/// ([`crate::srt::bond_supervisor::final_member_report`]).
 pub(crate) fn spawn_srt_group_stats_poller(
     group: Arc<SrtGroup>,
     mode: SrtBondingMode,
@@ -1203,7 +1209,7 @@ pub(crate) fn spawn_srt_group_stats_poller(
     input: Option<Arc<SrtInputStats>>,
     cancel: CancellationToken,
     supervisor: Option<BondSupervisor>,
-) {
+) -> tokio::task::JoinHandle<Option<BondSupervisor>> {
     tokio::spawn(async move {
         let mut supervisor = supervisor;
         let mut interval = poll_interval();
@@ -1243,7 +1249,8 @@ pub(crate) fn spawn_srt_group_stats_poller(
         // The group is gone; its members' last "running" states and RTTs
         // would stand for the whole reconnect.
         cache.send_replace(None);
-    });
+        supervisor
+    })
 }
 
 /// Listener-side bonding stats poller.

@@ -18,7 +18,7 @@ use crate::config::models::{SrtMode, SrtOutputConfig};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::srt::bond_supervisor::{
     BondEventScope, BondEvents, BondHealthTracker, BondLatch, BondSupervisor, degrade_after,
-    plan_bond_members,
+    final_member_report, plan_bond_members,
 };
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_bonded_output, bind_srt_listener_for_output,
@@ -2322,7 +2322,7 @@ async fn srt_output_bonded_loop(
                         std::time::Instant::now(),
                     )
                 });
-                spawn_srt_group_stats_poller(
+                let poller = spawn_srt_group_stats_poller(
                     group.clone(),
                     bond.mode,
                     stats.srt_bonding_stats_cache.clone(),
@@ -2342,6 +2342,12 @@ async fn srt_output_bonded_loop(
                 )
                 .await?;
                 poller_cancel.cancel();
+                // Before the close (see the bonded caller input).
+                let members = if disconnected {
+                    final_member_report(poller).await
+                } else {
+                    serde_json::Value::Null
+                };
                 let _ = group.close().await;
 
                 if !disconnected {
@@ -2352,7 +2358,7 @@ async fn srt_output_bonded_loop(
                     category::SRT,
                     format!("SRT bonded output '{}' disconnected", config.id),
                     &config.id,
-                    serde_json::json!({ "mode": "caller-bonded" }),
+                    serde_json::json!({ "mode": "caller-bonded", "members": members }),
                 );
                 tokio::select! {
                     _ = cancel.cancelled() => return Ok(()),

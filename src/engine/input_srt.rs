@@ -21,7 +21,7 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
 use crate::srt::bond_supervisor::{
     BondEventScope, BondEvents, BondHealthTracker, BondLatch, BondSupervisor, degrade_after,
-    member_sources_json, plan_bond_members,
+    final_member_report, member_sources_json, plan_bond_members,
 };
 use crate::srt::connection::{
     accept_srt_connection, bind_srt_listener_for_bonded_input,
@@ -1575,7 +1575,7 @@ async fn srt_input_bonded_caller_loop(
                 std::time::Instant::now(),
             )
         });
-        spawn_srt_group_stats_poller(
+        let poller = spawn_srt_group_stats_poller(
             group.clone(),
             bond.mode,
             srt.bonding.clone(),
@@ -1596,18 +1596,28 @@ async fn srt_input_bonded_caller_loop(
         )
         .await?;
         poller_cancel.cancel();
+        // Taken before the close, which would refuse a re-add still in
+        // flight and leave that as the member's error.
+        let members = if disconnected {
+            final_member_report(poller).await
+        } else {
+            serde_json::Value::Null
+        };
         let _ = group.close().await;
 
         if !disconnected {
             break;
         }
 
+        // Each member's source and, for one never live, why: a bond whose
+        // handshakes never complete connects and fails whole, and this is
+        // the only event that reports it.
         events.emit_flow_with_details(
             EventSeverity::Warning,
             category::SRT,
             "SRT bonded input disconnected, reconnecting",
             flow_id,
-            serde_json::json!({ "mode": "caller-bonded" }),
+            serde_json::json!({ "mode": "caller-bonded", "members": members }),
         );
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),

@@ -36,7 +36,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use srt_protocol::config::{MemberStatus, SocketStatus};
+use srt_protocol::error::SrtError;
 use srt_transport::{GroupEndpoint, GroupMemberStats, SrtGroup};
+use tokio::task::JoinHandle;
 
 use crate::config::models::{InterfaceBinding, SrtBondingConfig, SrtBondingMode};
 use crate::manager::events::{Event, EventSender, EventSeverity, category};
@@ -267,6 +269,39 @@ pub(crate) fn member_sources_json(plans: &[BondMemberPlan]) -> serde_json::Value
     )
 }
 
+/// A libsrt error from connecting members bound to `sources`, worded for
+/// the operator. libsrt reports a source it cannot bind as `SocketFail`
+/// ("unable to create/configure SRT socket"), naming neither the bind nor
+/// the address — and an address this host does not have (a typo, a static
+/// IP the DHCP server or carrier has since changed) is the usual cause once
+/// `local_addr` is really bound.
+pub(crate) fn describe_connect_error(e: &SrtError, sources: &[SocketAddr]) -> String {
+    if *e != SrtError::SocketFail || sources.is_empty() {
+        return e.to_string();
+    }
+    let list: Vec<String> = sources.iter().map(|a| a.to_string()).collect();
+    format!(
+        "could not open a socket on source {} — is {} assigned to this host? ({e})",
+        list.join(", "),
+        if sources.len() == 1 { "that address" } else { "each address" }
+    )
+}
+
+/// Why a member handed to libsrt never went live: its handshake failed or
+/// timed out. With a bound source the usual cause is routing — the kernel
+/// sends by its table, not by the source address.
+fn handshake_failed_reason(source: &str) -> String {
+    if source.parse::<SocketAddr>().is_ok() {
+        format!(
+            "the handshake did not complete from source {source}: check that the peer is \
+             reachable from that source (without source policy routing the kernel may send \
+             it out of another interface)"
+        )
+    } else {
+        "the handshake did not complete: the peer did not answer on this path".to_string()
+    }
+}
+
 /// Spawn-time check of every bonding endpoint's `interface_binding`: strict
 /// mode is refused and a missing NIC aborts the input/output, exactly as
 /// before. The resolved address is **not** written into the config any
@@ -416,6 +451,8 @@ struct MemberTrack {
     /// A connect or re-add of this member was handed to libsrt and its
     /// handshake has not been seen to finish either way.
     awaiting_handshake: bool,
+    /// Seen Idle or Running at least once in this group.
+    was_live: bool,
     last_error: Option<String>,
     /// The source the member last tried to connect from.
     source: String,
@@ -466,13 +503,17 @@ impl BondSupervisor {
     ) -> Self {
         let tracks = plans
             .iter()
-            .map(|_| MemberTrack {
+            .map(|plan| MemberTrack {
                 down_since: None,
                 next_attempt: started + FIRST_BACKOFF,
                 backoff: FIRST_BACKOFF,
                 awaiting_handshake: true,
+                was_live: false,
                 last_error: None,
-                source: "unbound".to_string(),
+                // As the connect that built this group resolved it a moment
+                // ago, so a group that fails before the first tick still
+                // reports it.
+                source: resolve_member_source(plan).describe(),
             })
             .collect();
         Self { plans, tracks, latch, events, degrade_after, sources_reported: false }
@@ -513,6 +554,7 @@ impl BondSupervisor {
                 track.next_attempt = now;
                 track.backoff = FIRST_BACKOFF;
                 track.awaiting_handshake = false;
+                track.was_live = true;
                 track.last_error = None;
                 continue;
             }
@@ -521,22 +563,9 @@ impl BondSupervisor {
                 continue;
             }
             if track.awaiting_handshake {
-                // Handed to libsrt, never seen live, and now gone: the
-                // handshake failed or timed out. With a bound source the
-                // usual cause is routing — the kernel sends by its table,
-                // not by the source address.
+                // Handed to libsrt, never seen live, and now gone.
                 track.awaiting_handshake = false;
-                track.last_error = Some(if track.source.parse::<SocketAddr>().is_ok() {
-                    format!(
-                        "the handshake did not complete from source {}: check that the peer is \
-                         reachable from that source (without source policy routing the kernel \
-                         may send it out of another interface)",
-                        track.source
-                    )
-                } else {
-                    "the handshake did not complete: the peer did not answer on this path"
-                        .to_string()
-                });
+                track.last_error = Some(handshake_failed_reason(&track.source));
             }
             if connected > 0 && now >= track.next_attempt {
                 actions.push(BondAction::Readd(plan.token));
@@ -649,10 +678,12 @@ impl BondSupervisor {
                     let Some(ep) = group_endpoint(&self.plans[idx], &source) else {
                         continue;
                     };
-                    let result = group
-                        .add_member(ep)
-                        .await
-                        .map_err(|e| format!("re-adding the member failed: {e}"));
+                    let result = group.add_member(ep).await.map_err(|e| {
+                        format!(
+                            "re-adding the member failed: {}",
+                            describe_connect_error(&e, ep.local_addr.as_slice())
+                        )
+                    });
                     if let Err(e) = &result {
                         tracing::warn!(
                             "{}: bonding member {} ({}): {e}",
@@ -721,6 +752,51 @@ impl BondSupervisor {
             }),
         );
     }
+
+    /// Every member as this group ended, for the caller loop's whole-group
+    /// disconnect event: the source it last tried, whether it was ever live
+    /// in this group, and why not.
+    ///
+    /// That event is the only report of a bond whose members open but never
+    /// complete a handshake — every member pinned to a source the kernel
+    /// routes out of the wrong interface, say. Its connect succeeds (libsrt
+    /// returns once the members are spawned), so no `connect_failed` fires,
+    /// and with no member ever live neither does `srt_bond_member_down`.
+    pub(crate) fn final_report(&self) -> serde_json::Value {
+        serde_json::Value::Array(
+            self.plans
+                .iter()
+                .zip(&self.tracks)
+                .map(|(plan, t)| {
+                    // A connect or re-add still handshaking when the group
+                    // failed never completed.
+                    let last_error = t.last_error.clone().or_else(|| {
+                        t.awaiting_handshake.then(|| handshake_failed_reason(&t.source))
+                    });
+                    serde_json::json!({
+                        "index": plan.token,
+                        "addr": plan.addr.to_string(),
+                        "source": t.source,
+                        "was_live": t.was_live,
+                        "last_error": last_error,
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Wait for a caller group's stats poller to stop (its token already
+/// cancelled) and take its supervisor's [`BondSupervisor::final_report`] —
+/// `null` with no supervisor, or if the poller has not stopped within 2 s
+/// (it stops between ticks, and a tick is a few srt-io round trips).
+pub(crate) async fn final_member_report(
+    poller: JoinHandle<Option<BondSupervisor>>,
+) -> serde_json::Value {
+    match tokio::time::timeout(Duration::from_secs(2), poller).await {
+        Ok(Ok(Some(supervisor))) => supervisor.final_report(),
+        _ => serde_json::Value::Null,
+    }
 }
 
 // ── Listener-side observer ───────────────────────────────────────────────
@@ -736,29 +812,39 @@ pub(crate) enum TrackerAction {
 /// can — so this only reports: running below the most live members the
 /// session has had, for at least `degrade_after`, with at least one still
 /// live (a session with none is the disconnect the listener loop already
-/// reports).
+/// reports). One tracker per accepted session: a session that drops and is
+/// re-accepted starts afresh.
 pub(crate) struct BondHealthTracker {
     events: BondEvents,
     degrade_after: Duration,
     peak: usize,
-    seen: Vec<String>,
+    /// The peers live at the last tick the session was at its peak: what a
+    /// later loss is measured against. Replaced, never added to — a remote
+    /// caller re-adds a member from a new source port, and the old port
+    /// must not stay listed as missing.
+    peak_peers: Vec<String>,
     down_since: Option<Instant>,
     degraded: bool,
 }
 
 impl BondHealthTracker {
     pub(crate) fn new(events: BondEvents, degrade_after: Duration) -> Self {
-        Self { events, degrade_after, peak: 0, seen: Vec::new(), down_since: None, degraded: false }
+        Self {
+            events,
+            degrade_after,
+            peak: 0,
+            peak_peers: Vec::new(),
+            down_since: None,
+            degraded: false,
+        }
     }
 
     /// The pure half: `live` is the peer of every Idle / Running member.
     pub(crate) fn decide(&mut self, live: &[String], now: Instant) -> Option<TrackerAction> {
-        for peer in live {
-            if !self.seen.contains(peer) {
-                self.seen.push(peer.clone());
-            }
+        if live.len() >= self.peak {
+            self.peak = live.len();
+            self.peak_peers = live.to_vec();
         }
-        self.peak = self.peak.max(live.len());
         if live.is_empty() {
             return None;
         }
@@ -766,7 +852,7 @@ impl BondHealthTracker {
             let since = *self.down_since.get_or_insert(now);
             if !self.degraded && now.saturating_duration_since(since) >= self.degrade_after {
                 self.degraded = true;
-                let missing = self.seen.iter().filter(|p| !live.contains(p)).cloned().collect();
+                let missing = self.peak_peers.iter().filter(|p| !live.contains(p)).cloned().collect();
                 return Some(TrackerAction::Degraded { connected: live.len(), peak: self.peak, missing });
             }
             return None;
@@ -1323,6 +1409,78 @@ mod tests {
         assert!(reason.contains("192.168.2.2:0") && reason.contains("routing"), "{reason}");
     }
 
+    /// Every member pinned to a source the kernel cannot route to the peer:
+    /// the group connects, no member ever goes live, and it fails whole.
+    /// Neither `connect_failed` nor `srt_bond_member_down` can fire, so the
+    /// disconnect event's report is what says why — and it must not blame
+    /// a member that did carry.
+    #[test]
+    fn the_final_report_says_why_a_member_never_went_live() {
+        let t0 = Instant::now();
+        let (mut sup, _rx) = supervisor(two_plans(), Arc::default(), t0);
+        sup.note_source(0, &MemberSource::Bound("192.168.1.2:0".parse().unwrap()));
+        sup.note_source(1, &MemberSource::Bound("192.168.2.2:0".parse().unwrap()));
+        assert!(sup.decide(&[pending(0), pending(1)], at(t0, 1000)).is_empty());
+        let report = sup.final_report();
+        for (i, src) in [(0, "192.168.1.2:0"), (1, "192.168.2.2:0")] {
+            assert_eq!(report[i]["index"], i);
+            assert_eq!(report[i]["addr"], two_plans()[i].addr.to_string());
+            assert_eq!(report[i]["source"], src);
+            assert_eq!(report[i]["was_live"], false);
+            let why = report[i]["last_error"].as_str().expect("no reason");
+            assert!(why.contains("handshake did not complete") && why.contains(src), "{why}");
+        }
+
+        // A member that was live leaves no reason: the group lost it with
+        // the rest, it did not fail to connect.
+        sup.decide(&[live(0), pending(1)], at(t0, 2000));
+        let report = sup.final_report();
+        assert_eq!(report[0]["was_live"], true);
+        assert!(report[0]["last_error"].is_null(), "{}", report[0]);
+        assert_eq!(report[1]["was_live"], false);
+        assert!(report[1]["last_error"].is_string());
+    }
+
+    /// A group that fails before the supervisor's first tick still reports
+    /// each member's source, as the connect resolved it.
+    #[test]
+    fn the_final_report_has_sources_before_the_first_tick() {
+        let mut first = ep("203.0.113.10:9000");
+        first.local_addr = Some("192.0.2.10:0".into());
+        let plans = plan_bond_members(&bond(
+            SrtBondingMode::Broadcast,
+            vec![first, ep("203.0.113.11:9000")],
+        ))
+        .unwrap();
+        let (sup, _rx) = supervisor(plans, Arc::default(), Instant::now());
+        let report = sup.final_report();
+        assert_eq!(report[0]["source"], "192.0.2.10:0");
+        assert!(report[0]["last_error"].as_str().unwrap().contains("192.0.2.10:0"));
+        assert_eq!(report[1]["source"], "unbound");
+    }
+
+    /// libsrt reports a source it cannot bind as `SocketFail` ("unable to
+    /// create/configure SRT socket"); the operator needs the address.
+    #[test]
+    fn an_unbindable_source_is_named_in_the_error() {
+        let src: SocketAddr = "192.0.2.1:0".parse().unwrap();
+        let msg = describe_connect_error(&SrtError::SocketFail, &[src]);
+        assert!(msg.contains("192.0.2.1:0") && msg.contains("assigned to this host"), "{msg}");
+        assert!(msg.contains(&SrtError::SocketFail.to_string()), "{msg}");
+        let two = [src, "198.51.100.1:0".parse().unwrap()];
+        let msg = describe_connect_error(&SrtError::SocketFail, &two);
+        assert!(msg.contains("192.0.2.1:0, 198.51.100.1:0") && msg.contains("each address"), "{msg}");
+        // Unbound, or any other error: libsrt's own text.
+        assert_eq!(
+            describe_connect_error(&SrtError::SocketFail, &[]),
+            SrtError::SocketFail.to_string()
+        );
+        assert_eq!(
+            describe_connect_error(&SrtError::ConnectionLost, &[src]),
+            SrtError::ConnectionLost.to_string()
+        );
+    }
+
     #[test]
     fn source_not_applied_warns_once_per_member() {
         let t0 = Instant::now();
@@ -1410,6 +1568,33 @@ mod tests {
             Some(TrackerAction::Restored { connected: 2 })
         );
         assert_eq!(tr.decide(std::slice::from_ref(&a), at(t0, 22_000)), None);
+    }
+
+    /// A remote caller re-adds an unbound member from a new source port.
+    /// The next loss must list only the member missing now — not the port
+    /// the earlier episode already replaced.
+    #[test]
+    fn listener_tracker_lists_only_the_member_missing_now() {
+        let t0 = Instant::now();
+        let (mut tr, _rx) = tracker();
+        let a = "198.51.100.1:5000".to_string();
+        let b = "198.51.100.2:5000".to_string();
+        let b_again = "198.51.100.2:5001".to_string();
+        assert_eq!(tr.decide(&[a.clone(), b.clone()], t0), None);
+        let first: Vec<_> = (1000..=20000)
+            .step_by(1000)
+            .filter_map(|ms| tr.decide(std::slice::from_ref(&a), at(t0, ms)))
+            .collect();
+        assert_eq!(first, [TrackerAction::Degraded { connected: 1, peak: 2, missing: vec![b] }]);
+        assert_eq!(
+            tr.decide(&[a.clone(), b_again.clone()], at(t0, 21_000)),
+            Some(TrackerAction::Restored { connected: 2 })
+        );
+        let second: Vec<_> = (22_000..=40_000)
+            .step_by(1000)
+            .filter_map(|ms| tr.decide(std::slice::from_ref(&b_again), at(t0, ms)))
+            .collect();
+        assert_eq!(second, [TrackerAction::Degraded { connected: 1, peak: 2, missing: vec![a] }]);
     }
 
     #[test]
