@@ -16,6 +16,7 @@
 use super::box_writer::{BoxWriter, patch_u32};
 use super::codecs::{parse_sps_resolution, write_avcc, write_esds, write_hvcc};
 use super::nalu::to_length_prefixed;
+use super::param_sets::ParamSets;
 
 /// Codec family for a track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,31 +28,26 @@ pub enum VideoCodec {
 /// Video track metadata needed to build the init segment.
 pub struct VideoTrack {
     pub codec: VideoCodec,
-    /// SPS bytes (no start code, no length prefix).
-    pub sps: Vec<u8>,
-    /// PPS bytes.
-    pub pps: Vec<u8>,
-    /// HEVC VPS (unused for H.264).
-    pub vps: Vec<u8>,
+    /// Every parameter set the sample entry carries, by id (no start code, no
+    /// length prefix). A passthrough source's slices may name more than one
+    /// PPS — or SPS, or VPS — and the samples carry none of their own, so the
+    /// `avcC` / `hvcC` holds them all (`param_sets`). One of each for an
+    /// encoder's output.
+    pub param_sets: ParamSets,
     /// 90 kHz timescale — matches MPEG-TS PTS clock.
     pub timescale: u32,
-    /// Derived from SPS. Falls back to (1280, 720) if parsing fails.
+    /// Derived from the primary SPS ([`Self::sps`]). Falls back to
+    /// (1280, 720) for H.264 and (1920, 1080) for HEVC if parsing fails.
     pub width: u32,
     pub height: u32,
 }
 
 impl VideoTrack {
     pub fn from_h264(sps: Vec<u8>, pps: Vec<u8>) -> Self {
-        let (width, height) = parse_sps_resolution(&sps).unwrap_or((1280, 720));
-        Self {
-            codec: VideoCodec::H264,
-            sps,
-            pps,
-            vps: Vec::new(),
-            timescale: 90_000,
-            width,
-            height,
-        }
+        Self::with_param_sets(
+            VideoCodec::H264,
+            ParamSets::single(VideoCodec::H264, Vec::new(), sps, pps),
+        )
     }
 
     /// Build an HEVC video track. Width/height are parsed from the SPS
@@ -59,16 +55,32 @@ impl VideoTrack {
     /// so the init segment is still playable (players derive actual
     /// dimensions from the embedded SPS anyway).
     pub fn from_h265(vps: Vec<u8>, sps: Vec<u8>, pps: Vec<u8>) -> Self {
-        let (width, height) = parse_hevc_sps_resolution(&sps).unwrap_or((1920, 1080));
-        Self {
-            codec: VideoCodec::H265,
-            sps,
-            pps,
-            vps,
-            timescale: 90_000,
-            width,
-            height,
-        }
+        Self::with_param_sets(VideoCodec::H265, ParamSets::single(VideoCodec::H265, vps, sps, pps))
+    }
+
+    /// A track carrying every one of `sets` — what a passthrough source has
+    /// sent (`param_sets::ParamSetCollector`). `None` unless `sets` hold an
+    /// SPS and a PPS, and for HEVC a VPS.
+    pub fn from_param_sets(codec: VideoCodec, sets: ParamSets) -> Option<Self> {
+        sets.is_complete(codec).then(|| Self::with_param_sets(codec, sets))
+    }
+
+    fn with_param_sets(codec: VideoCodec, param_sets: ParamSets) -> Self {
+        let sps = param_sets.sps.first().map_or(&[][..], |s| &s.nal[..]);
+        let (width, height) = match codec {
+            VideoCodec::H264 => parse_sps_resolution(sps).unwrap_or((1280, 720)),
+            VideoCodec::H265 => parse_hevc_sps_resolution(sps).unwrap_or((1920, 1080)),
+        };
+        Self { codec, param_sets, timescale: 90_000, width, height }
+    }
+
+    /// The primary SPS: the lowest id. The track's dimensions, the
+    /// configuration record's profile / level header and the manifests'
+    /// codec strings are read from it — the one SPS on any source with only
+    /// one, and on a source with several, one that does not depend on which
+    /// arrived last. Empty if the track has none.
+    pub fn sps(&self) -> &[u8] {
+        self.param_sets.sps.first().map_or(&[], |s| &s.nal)
     }
 }
 
@@ -539,9 +551,10 @@ fn write_video_stsd(
         entry.u16(0x0018); // depth = 24
         entry.i16(-1); // pre_defined
 
+        let sets = &v.param_sets;
         match v.codec {
-            VideoCodec::H264 => write_avcc(&mut entry, &v.sps, &v.pps),
-            VideoCodec::H265 => write_hvcc(&mut entry, &v.vps, &v.sps, &v.pps),
+            VideoCodec::H264 => write_avcc(&mut entry, &sets.sps, &sets.pps),
+            VideoCodec::H265 => write_hvcc(&mut entry, &sets.vps, &sets.sps, &sets.pps),
         }
 
         // CENC sinf wrapper inside the encv sample entry.
@@ -1631,6 +1644,161 @@ fn write_progressive_audio_trak(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A single-set track writes the init it always wrote, byte for byte.
+    ///
+    /// Load-bearing: a restart compares this run's init with the one the
+    /// origin holds (`restored_init_differs`), and an init that differs opens
+    /// a new generation — an `#EXT-X-DISCONTINUITY` on every running DVR
+    /// stream at the upgrade, and clip windows across it refused. The SHA-256
+    /// of each init here was taken from the builder at edge 95f1e75, before
+    /// tracks carried more than one parameter set of a kind (edge#204), from
+    /// real parameter sets: the sky-witness capture's H.264 SPS / PPS and the
+    /// 770_H capture's HEVC VPS / SPS / PPS0.
+    ///
+    /// Both ways a passthrough track can be built are held to it: the
+    /// single-set constructors, and the production path — the access unit
+    /// through `ParamSetCollector`, then `from_param_sets`.
+    #[test]
+    fn a_single_set_init_is_byte_identical_to_main() {
+        use super::super::cenc::Scheme;
+        use super::super::param_sets::ParamSetCollector;
+        use sha2::{Digest, Sha256};
+        fn hx(s: &str) -> Vec<u8> {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        }
+        fn sha(b: &[u8]) -> String {
+            Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect()
+        }
+        let sps264 = hx(concat!(
+            "67640028ad843588742050b041074421ac47361882a210ffa69a4d5a31526c862c92c8a431cb10",
+            "4111251c28c716161d1e09050b05d06d087fd7af93f11fd7e6f8af0870d608a0a0b290078044fd",
+            "e036a020202800000300080000030194a0",
+        ));
+        let pps264 = hx("68ef3cb0");
+        let vps = hx("40010c01ffff02200000030060000003000003007b0c190240");
+        let sps265 = hx(concat!(
+            "42010102200000030060000003000003007ba003c080221f6d8d0c199246f843fff91421ff",
+            "fc8a10fffffffffffffffe45087fffffffffffffff22843fffffffffffffffc8a10fffffff",
+            "fffffffff22843fffffffffffffffe10ffffffffffffffff5780a1010101eff00000030010",
+            "000003032080",
+        ));
+        let pps265 = hx("4401c02524f87640");
+        let aac = AudioTrack::aac([0x11, 0x90], 48_000, 2, 128_000);
+        let kid = [0x11u8; 16];
+        let cenc = CencInitParams { scheme: Scheme::Cenc, key_id: &kid, extra_pssh: Vec::new() };
+        let cbcs = CencInitParams { scheme: Scheme::Cbcs, key_id: &kid, extra_pssh: Vec::new() };
+        let samples: Vec<Sample> = (0..3)
+            .map(|i| Sample {
+                duration: 3600,
+                data: vec![0xAB; 16],
+                composition_time_offset: 0,
+                is_sync: i == 0,
+            })
+            .collect();
+
+        let collected = |codec: VideoCodec, au: Vec<Vec<u8>>| {
+            let mut c = ParamSetCollector::default();
+            c.observe(codec, &au, true);
+            VideoTrack::from_param_sets(codec, c.complete_sets(codec).unwrap().clone()).unwrap()
+        };
+        let idr264 = vec![0x65, 0x88, 0x84, 0x21];
+        let idr265 = vec![0x26, 0x01, 0xAF, 0x21];
+        let h264 = [
+            VideoTrack::from_h264(sps264.clone(), pps264.clone()),
+            collected(VideoCodec::H264, vec![sps264.clone(), pps264.clone(), idr264]),
+        ];
+        let h265 = [
+            VideoTrack::from_h265(vps.clone(), sps265.clone(), pps265.clone()),
+            collected(VideoCodec::H265, vec![vps.clone(), sps265.clone(), pps265.clone(), idr265]),
+        ];
+        for (path, t) in ["from_h264", "collected"].iter().zip(&h264) {
+            assert_eq!((t.width, t.height), (1920, 1080), "{path}");
+            let check = |name: &str, bytes: Vec<u8>, want: &str| {
+                assert_eq!(sha(&bytes), want, "{path}: {name} differs from main's");
+            };
+            check(
+                "video",
+                build_init_segment(t, None),
+                "7decf00c18c093d871209caef935ac995e052d1259decba1eca7f61b7b7fc840",
+            );
+            check(
+                "video + AAC",
+                build_init_segment(t, Some(&aac)),
+                "41e287c63358c597d61725a430b195fa02b05fb87e4c22ff9256cd1ceabe4000",
+            );
+            check(
+                "cenc video + AAC",
+                build_encrypted_init_segment(t, Some(&aac), &cenc),
+                "32c27e77636921dcc69b993206a2d9bd400ea9dfe37fc0cc3a9268d93c747efa",
+            );
+            check(
+                "progressive",
+                build_progressive_mp4(t, &samples, None, &[]),
+                "ac971fbd6ca05e73fd8182db53978a36795f327de98152bef183259e33f58e18",
+            );
+        }
+        for (path, t) in ["from_h265", "collected"].iter().zip(&h265) {
+            assert_eq!((t.width, t.height), (1920, 544), "{path}");
+            let check = |name: &str, bytes: Vec<u8>, want: &str| {
+                assert_eq!(sha(&bytes), want, "{path}: {name} differs from main's");
+            };
+            check(
+                "video",
+                build_init_segment(t, None),
+                "8b261b53e9d94f787c98f1ba9df106ce404c378e6da968018d5fa4612aff72b8",
+            );
+            check(
+                "video + AAC",
+                build_init_segment(t, Some(&aac)),
+                "2e755484998164e7c13a7b12f590a27f850874906451ed00bfdbeacf3b0d9ef7",
+            );
+            check(
+                "cbcs video",
+                build_encrypted_init_segment(t, None, &cbcs),
+                "d950c58004de290d91decb56f7f20f11ff8f00e10b8f6ca87d915018c01aadb4",
+            );
+            check(
+                "progressive",
+                build_progressive_mp4(t, &samples, None, &[]),
+                "a8531d26f85ced6020d7ff1182ffca3f639492370990ef9545539c9e5cb09537",
+            );
+        }
+
+        // The degenerate tracks the tests and fallbacks build: a 4-byte SPS
+        // whose id cannot be read, an SPS too short for a profile (the zeroed
+        // record), and an HEVC SPS too short for its PTL (default header).
+        let tiny = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let zero = VideoTrack::from_h264(vec![0x67], vec![0x68]);
+        let short = VideoTrack::from_h265(vec![0x40, 0x01], vec![0x42, 0x01], vec![0x44, 0x01]);
+        assert_eq!((tiny.width, tiny.height), (1280, 720));
+        assert_eq!((short.width, short.height), (1920, 1080));
+        assert_eq!(
+            sha(&build_init_segment(&tiny, None)),
+            "fc51ca0a8bfe26522402c26ae661f17a0120e617e8922a7df37ed7c1c87be668"
+        );
+        assert_eq!(
+            sha(&build_init_segment(&zero, None)),
+            "72aefe44b5ac853dcef019bcf4882f42ab5a56f5c081bc0dadec1ca731f4c9af"
+        );
+        assert_eq!(
+            sha(&build_init_segment(&short, None)),
+            "6c869e245fbd7041f8ae5d8b5790ee237ad6b86f5939458fc94e3f7beb8dc830"
+        );
+        // `from_param_sets` falls back to the same dimensions, and writes the
+        // same bytes, as the constructors it stands beside.
+        let single = |codec, v: &[u8], s: &[u8], p: &[u8]| {
+            VideoTrack::from_param_sets(codec, ParamSets::single(codec, v.to_vec(), s.to_vec(), p.to_vec()))
+                .unwrap()
+        };
+        let tiny2 = single(VideoCodec::H264, &[], &[0x67, 0x42, 0xC0, 0x1E], &[0x68, 0xCE]);
+        let short2 = single(VideoCodec::H265, &[0x40, 0x01], &[0x42, 0x01], &[0x44, 0x01]);
+        assert_eq!((tiny2.width, tiny2.height), (1280, 720));
+        assert_eq!((short2.width, short2.height), (1920, 1080));
+        assert_eq!(build_init_segment(&tiny2, None), build_init_segment(&tiny, None));
+        assert_eq!(build_init_segment(&short2, None), build_init_segment(&short, None));
+        assert!(VideoTrack::from_param_sets(VideoCodec::H265, ParamSets::default()).is_none());
+    }
 
     /// Each track declares its own length, and the movie the longer of them.
     ///

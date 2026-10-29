@@ -36,6 +36,9 @@ pub(crate) mod fmp4;
 mod manifest;
 #[allow(dead_code)]
 pub(crate) mod nalu;
+pub(crate) mod param_sets;
+#[cfg(test)]
+mod param_set_tests;
 mod segmenter;
 // The thumbnail track reuses the replay filmstrip's capture and JPEG
 // encoding rather than duplicating them, so it exists only when `replay` does.
@@ -69,6 +72,7 @@ use manifest::{
     build_dash_mpd, build_hls_playlist, default_segment_uri, init_generation_of,
     init_object_name, required_target_duration,
 };
+use param_sets::ParamSetCollector;
 use segmenter::{
     AudioSegmenter, CompletedSegment, MAX_COMPOSITION_OFFSET_90K, PushOutcome, SegmentKind,
     VideoSegmenter,
@@ -821,6 +825,11 @@ struct CmafState {
     /// The codec-family-change Warning has been raised; it does not repeat
     /// on every frame of a source that is not coming back.
     family_change_warned: bool,
+    /// Every parameter set the passthrough source has sent, by id, fed each
+    /// access unit before the track is built from it or checked against it
+    /// (`param_sets`). Started again at a stream discontinuity. Unused with
+    /// `video_encode`, whose track is the encoder's.
+    source_params: ParamSetCollector,
     /// True while init.mp4 uploads are failing. Two jobs: it shortens the
     /// republish interval to a retry interval, and it makes the manager
     /// Warning fire once per failure *episode* rather than once per attempt.
@@ -1355,6 +1364,7 @@ impl CmafState {
             restored_current_init: None,
             ll_put_failing: false,
             family_change_warned: false,
+            source_params: ParamSetCollector::default(),
             init_upload_failing: false,
             init_last_upload: None,
             playlist: VecDeque::new(),
@@ -1951,7 +1961,6 @@ async fn handle_frame(
         DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known, dts: cto } => {
             handle_video(
                 state,
-                demuxer,
                 VideoCodec::H264,
                 nalus,
                 pts,
@@ -1976,7 +1985,6 @@ async fn handle_frame(
         DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known, dts: cto } => {
             handle_video(
                 state,
-                demuxer,
                 VideoCodec::H265,
                 nalus,
                 pts,
@@ -2057,10 +2065,30 @@ async fn handle_frame(
                 }
             }
         }
-        // Stream discontinuity is metadata for stateful decoders; the
-        // CMAF segmenter advances on its own GoP cadence and re-issues
-        // an init segment on codec change.
-        DemuxedFrame::Discontinuity | DemuxedFrame::Scte35(_) => {}
+        // A stream discontinuity: a PMT version bump, which
+        // `TsContinuityFixer` makes on every input switch. The segmenter
+        // advances on its own GoP cadence and opens a new init generation
+        // when the new source's parameter sets differ; this drops what the
+        // old source sent before the switch, so its extra ids do not sit in
+        // the new source's table and every later init. The demuxer drops its
+        // own cached sets on a change of video PID or codec; this goes
+        // further, to every switch. Until the next parameter sets arrive the
+        // table is incomplete, so the track stays as it is.
+        //
+        // It is not a clean cut. On a switch that keeps the video PID and
+        // codec, the old source's last picture is still in the demuxer's PES
+        // assembler and comes out *after* this frame, completed by the new
+        // source's first PES — so any parameter sets it carries land in the
+        // fresh table. The new source's first random-access access unit that
+        // carries a kind replaces that kind; a new source that sends its sets
+        // only outside a random-access point merges them in by id beside the
+        // old picture's, as it would have with no reset at all. The demuxer
+        // ordering this rests on is pinned by
+        // `ts_demux::tests::old_source_last_picture_follows_the_discontinuity`.
+        DemuxedFrame::Discontinuity => {
+            state.source_params = ParamSetCollector::default();
+        }
+        DemuxedFrame::Scte35(_) => {}
     }
 }
 
@@ -2238,7 +2266,6 @@ fn handle_other_audio_frame(
 #[allow(clippy::too_many_arguments)]
 async fn handle_video(
     state: &mut CmafState,
-    demuxer: &TsDemuxer,
     codec: VideoCodec,
     nalus: Vec<Vec<u8>>,
     pts: u64,
@@ -2259,7 +2286,7 @@ async fn handle_video(
     recv_time_us: u64,
 ) {
     // Passthrough: the samples we forward ARE the source stream, so the
-    // demuxer's cached parameter sets describe them and the track can be built
+    // parameter sets it has sent describe them and the track can be built
     // now. With `video_encode` the samples are the re-encoder's output, whose
     // SPS/PPS differ (resolution, profile, level, coding tools) — building the
     // track from the source sets would hand the decoder parameter sets that do
@@ -2297,16 +2324,7 @@ async fn handle_video(
         return;
     }
     if state.video_reencoder.is_none()
-        && !ensure_video_segmenter(
-            state.resume_seq,
-            state.init_generation,
-            &mut state.video_seg,
-            codec,
-            demuxer,
-            is_keyframe,
-            config.segment_duration_secs,
-            &config.id,
-        )
+        && !passthrough_track_ready(state, codec, &nalus, is_keyframe, config)
     {
         return;
     }
@@ -2934,8 +2952,9 @@ fn build_muxed_segment_for_seq(
 
 /// Build the video track from parameter sets carried in an encoded frame.
 ///
-/// Used for the `video_encode` path, where [`ensure_video_segmenter`]'s
-/// demuxer-cached sets describe the *source* rather than what is being written.
+/// Used for the `video_encode` path, where the source's parameter sets that
+/// [`ensure_video_segmenter`] builds from describe the *source* rather than
+/// what is being written.
 /// Returns false until a frame carrying the sets shows up, which for a
 /// `global_header = false` encoder is its first IDR.
 fn ensure_video_segmenter_from_nalus(
@@ -3350,26 +3369,66 @@ async fn publish_init_if_due(
     state.init_uploaded
 }
 
-/// Build the video track from the demuxer's cached parameter sets, or, once
-/// it exists, notice that those sets have changed.
+/// Passthrough: take this access unit's parameter sets into the output's
+/// table, then build the track from the table or notice that it has changed.
+/// False until the track exists.
+///
+/// In that order, one access unit at a time: the track is built from the sets
+/// the stream has sent up to and including this picture. It used to be built
+/// from the demuxer's cache, read after the whole datagram had been demuxed,
+/// so the sets it held could belong to a picture later in the batch.
+fn passthrough_track_ready(
+    state: &mut CmafState,
+    codec: VideoCodec,
+    nalus: &[Vec<u8>],
+    is_keyframe: bool,
+    config: &CmafOutputConfig,
+) -> bool {
+    state.source_params.observe(codec, nalus, is_keyframe);
+    ensure_video_segmenter(
+        state.resume_seq,
+        state.init_generation,
+        &mut state.video_seg,
+        codec,
+        &state.source_params,
+        is_keyframe,
+        config.segment_duration_secs,
+        &config.id,
+    )
+}
+
+/// Build the video track from every parameter set the source has sent
+/// (`params`, by id — see `param_sets`), or, once it exists, notice that the
+/// source's sets are no longer all in it.
 ///
 /// Returns false until the sets are available. The check for a change runs
 /// only on an IDR: that is where new parameter sets take effect, a
-/// non-IDR frame decodes against the sets its GOP started with whatever the
-/// cache says, and comparing on every frame would rotate on a source that
+/// non-IDR frame decodes against the sets its GOP started with whatever was
+/// re-sent since, and comparing on every frame would rotate on a source that
 /// re-sends a differing PPS between IDRs. The first IDR's sets used to be
 /// taken as the stream's for life, which is true right up until an encoder
 /// changes underneath — an operator pinning a codec, `h264_auto` falling
 /// between NVENC and x264 — and then every sample after it decodes against
 /// the wrong SPS. Browsers reject that outright: `bufferAppendError`, five
 /// frames, then nothing, with the buffer filling normally the whole time.
+///
+/// A change is a set the track does not hold — a new id, or an id whose bytes
+/// differ. A random-access point that leaves out an id the track carries is
+/// not one: the track keeps it, and an encoder re-sending a varying subset
+/// does not churn generations.
+///
+/// The track carries every id, not one of each kind: the track used to be
+/// built from a cache holding the last SPS and PPS seen, and a source whose
+/// IRAPs carry PPS0, PPS1 and PPS2 while its slices name PPS0 and PPS1 got an
+/// init holding PPS2 alone — every frame "PPS id out of range"
+/// (bilbycast-edge#204).
 #[allow(clippy::too_many_arguments)]
 fn ensure_video_segmenter(
     resume_seq: u64,
     resume_generation: u32,
     slot: &mut Option<VideoSegmenter>,
     codec: VideoCodec,
-    demuxer: &TsDemuxer,
+    params: &ParamSetCollector,
     is_keyframe: bool,
     segment_duration_secs: f64,
     output_id: &str,
@@ -3379,83 +3438,46 @@ fn ensure_video_segmenter(
             return true;
         }
         // Borrowed, not copied: this runs on every IDR for the life of the
-        // stream, and the sets are equal on all but a handful of them.
-        let changed = match codec {
-            VideoCodec::H264 => match (demuxer.cached_sps(), demuxer.cached_pps()) {
-                (Some(sps), Some(pps)) => sps != seg.track.sps || pps != seg.track.pps,
-                _ => false,
-            },
-            VideoCodec::H265 => match (
-                demuxer.cached_h265_vps(),
-                demuxer.cached_h265_sps(),
-                demuxer.cached_h265_pps(),
-            ) {
-                (Some(vps), Some(sps), Some(pps)) => {
-                    vps != seg.track.vps || sps != seg.track.sps || pps != seg.track.pps
-                }
-                _ => false,
-            },
+        // stream, and the sets are unchanged on all but a handful of them.
+        let Some(sets) = params.complete_sets(codec) else {
+            return true;
         };
-        if !changed {
+        if seg.track.param_sets.contains_all(sets) {
             return true;
         }
-        let track = match codec {
-            VideoCodec::H264 => VideoTrack::from_h264(
-                demuxer.cached_sps().map(<[u8]>::to_vec).unwrap_or_default(),
-                demuxer.cached_pps().map(<[u8]>::to_vec).unwrap_or_default(),
-            ),
-            VideoCodec::H265 => VideoTrack::from_h265(
-                demuxer.cached_h265_vps().map(<[u8]>::to_vec).unwrap_or_default(),
-                demuxer.cached_h265_sps().map(<[u8]>::to_vec).unwrap_or_default(),
-                demuxer.cached_h265_pps().map(<[u8]>::to_vec).unwrap_or_default(),
-            ),
+        let Some(track) = VideoTrack::from_param_sets(codec, sets.clone()) else {
+            return true;
         };
         tracing::warn!(
-            "CMAF output '{}': the source's parameter sets changed ({}x{} -> {}x{}); \
-             cutting the open segment and publishing a new init so what is written \
-             stays decodable",
+            "CMAF output '{}': the source's parameter sets changed ({}x{} -> {}x{}, \
+             {} SPS / {} PPS); cutting the open segment and publishing a new init \
+             so what is written stays decodable",
             output_id,
             seg.track.width,
             seg.track.height,
             track.width,
             track.height,
+            track.param_sets.sps.len(),
+            track.param_sets.pps.len(),
         );
         // Applied at this IDR by `push`, which cuts the open segment first
         // so nothing already queued is described by the new sets.
         seg.rotate_track(track);
         return true;
     }
-    let track = match codec {
-        VideoCodec::H264 => {
-            let sps = match demuxer.cached_sps() {
-                Some(s) => s.to_vec(),
-                None => return false,
-            };
-            let pps = match demuxer.cached_pps() {
-                Some(p) => p.to_vec(),
-                None => return false,
-            };
-            VideoTrack::from_h264(sps, pps)
-        }
-        VideoCodec::H265 => {
-            let vps = match demuxer.cached_h265_vps() {
-                Some(v) => v.to_vec(),
-                None => return false,
-            };
-            let sps = match demuxer.cached_h265_sps() {
-                Some(s) => s.to_vec(),
-                None => return false,
-            };
-            let pps = match demuxer.cached_h265_pps() {
-                Some(p) => p.to_vec(),
-                None => return false,
-            };
-            VideoTrack::from_h265(vps, sps, pps)
-        }
+    let Some(track) =
+        params.complete_sets(codec).and_then(|s| VideoTrack::from_param_sets(codec, s.clone()))
+    else {
+        return false;
     };
     tracing::info!(
-        "CMAF output '{}': video track detected {:?} {}x{}",
-        output_id, track.codec, track.width, track.height,
+        "CMAF output '{}': video track detected {:?} {}x{} ({} SPS / {} PPS)",
+        output_id,
+        track.codec,
+        track.width,
+        track.height,
+        track.param_sets.sps.len(),
+        track.param_sets.pps.len(),
     );
     let mut seg = VideoSegmenter::new_from_seq(track, segment_duration_secs, resume_seq);
     seg.set_generation(resume_generation);
@@ -3934,7 +3956,7 @@ async fn publish_ll_dash(
         .max(0.0);
     let video_rep = DashVideoRep {
         codec: v.track.codec,
-        sps: &v.track.sps,
+        sps: v.track.sps(),
         width: v.track.width,
         height: v.track.height,
         timescale: v.track.timescale,
@@ -4262,7 +4284,7 @@ async fn publish_manifests(
         && let Some(v) = state.video_seg.as_ref() {
             let video_rep = DashVideoRep {
                 codec: v.track.codec,
-                sps: &v.track.sps,
+                sps: v.track.sps(),
                 width: v.track.width,
                 height: v.track.height,
                 timescale: v.track.timescale,

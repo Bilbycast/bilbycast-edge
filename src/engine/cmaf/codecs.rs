@@ -9,6 +9,7 @@
 //! dimension fields.
 
 use super::box_writer::BoxWriter;
+use super::param_sets::ParamSet;
 
 // ────────────────────────────────────────────────────────────────────────
 //  H.264 avcC box
@@ -24,18 +25,25 @@ use super::box_writer::BoxWriter;
 /// - `AVCLevelIndication (u8)` — from SPS byte 3.
 /// - `lengthSizeMinusOne (u8 bit-packed)` — we always emit 3 (4-byte
 ///   length prefix) + `0xFC` reserved bits in the upper 6.
-/// - `numOfSequenceParameterSets (u8 bit-packed)` — always 1 + `0xE0`
-///   reserved bits in the upper 3.
-/// - `sequenceParameterSetLength (u16)` + SPS bytes.
-/// - `numOfPictureParameterSets (u8)` — always 1.
-/// - `pictureParameterSetLength (u16)` + PPS bytes.
+/// - `numOfSequenceParameterSets (u8 bit-packed)` — every SPS given, at most
+///   31, + `0xE0` reserved bits in the upper 3.
+/// - per SPS: `sequenceParameterSetLength (u16)` + SPS bytes.
+/// - `numOfPictureParameterSets (u8)` — every PPS given, at most 255.
+/// - per PPS: `pictureParameterSetLength (u16)` + PPS bytes.
+///
+/// The profile, compatibility and level bytes come from the first SPS, the
+/// lowest id (as FFmpeg's `ff_isom_write_avcc` takes them). Every parameter
+/// set goes in, in id order: a slice may name any of them, and an `avc1`
+/// sample carries none of its own. With one of each the record is the
+/// single-entry one this writer always wrote.
 ///
 /// (For profiles 100/110/122/244/44 the spec adds three more bytes —
 /// `chroma_format_idc`, `bit_depth_luma_minus8`, `bit_depth_chroma_minus8` —
 /// but most browsers tolerate the short form for those profiles and we
 /// defer that extension to when we need 10-bit HDR.)
-pub fn write_avcc(parent: &mut BoxWriter<'_>, sps: &[u8], pps: &[u8]) {
+pub fn write_avcc(parent: &mut BoxWriter<'_>, sps_list: &[ParamSet], pps_list: &[ParamSet]) {
     let mut b = parent.child(*b"avcC");
+    let sps: &[u8] = sps_list.first().map_or(&[], |s| &s.nal);
     if sps.len() < 4 {
         // Can't derive profile/level; emit a zeroed config. This should
         // never happen because validation requires a source SPS.
@@ -53,12 +61,18 @@ pub fn write_avcc(parent: &mut BoxWriter<'_>, sps: &[u8], pps: &[u8]) {
     b.u8(sps[2]); // compat
     b.u8(sps[3]); // level
     b.u8(0xFF); // reserved(6)='111111'b | lengthSizeMinusOne=3
-    b.u8(0xE1); // reserved(3)='111'b | numOfSequenceParameterSets=1
-    b.u16(sps.len() as u16);
-    b.bytes(sps);
-    b.u8(1); // numOfPictureParameterSets
-    b.u16(pps.len() as u16);
-    b.bytes(pps);
+    let sps_list = &sps_list[..sps_list.len().min(31)];
+    let pps_list = &pps_list[..pps_list.len().min(255)];
+    b.u8(0xE0 | sps_list.len() as u8); // reserved(3)='111'b | numOfSequenceParameterSets
+    for s in sps_list {
+        b.u16(s.nal.len() as u16);
+        b.bytes(&s.nal);
+    }
+    b.u8(pps_list.len() as u8); // numOfPictureParameterSets
+    for p in pps_list {
+        b.u16(p.nal.len() as u16);
+        b.bytes(&p.nal);
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -171,7 +185,8 @@ pub fn parse_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
 /// byte stripping. Not a full RBSP parser — just enough to walk an H.264
 /// SPS to the resolution fields.
 ///
-/// Also reused by the HEVC SPS parser in `fmp4.rs` for `hvcC` creation.
+/// Also reused by the HEVC SPS parser in `fmp4.rs` for `hvcC` creation, and
+/// by `param_sets` to read each parameter set's id.
 pub(super) struct BitReader<'a> {
     data: &'a [u8],
     /// Index of the next raw (pre-EPB-stripping) byte in `data`.
@@ -253,8 +268,13 @@ impl<'a> BitReader<'a> {
         let mut leading_zeros = 0u32;
         while !self.bit()? {
             leading_zeros += 1;
-            if leading_zeros > 32 {
-                return None; // malformed
+            // A 32nd leading zero would need `1 << 32` below — a shift
+            // overflow, a panic under overflow checks — so the largest value
+            // this returns is 2^32 - 2 and a 32nd zero is refused as
+            // malformed. Parameter-set ids are read with this from every
+            // access unit off the wire.
+            if leading_zeros > 31 {
+                return None;
             }
         }
         if leading_zeros == 0 {
@@ -310,13 +330,23 @@ impl<'a> BitReader<'a> {
 /// Players derive the actual profile/level from the decoded SPS inside
 /// the array of VPS/SPS/PPS that hvcC embeds, so the cover-page bytes
 /// only need to be *consistent* with the embedded SPS, not verbatim.
+///
+/// Each array carries every parameter set given, in id order — a slice
+/// may name any PPS, and `array_completeness` = 1 below promises an `hvc1`
+/// decoder that every one it needs is here. The header bytes come from the
+/// first SPS (the lowest id) alone; ISO/IEC 14496-15 asks for the highest
+/// level and tier, and the AND of the compatibility flags, across every SPS,
+/// which a source with more than one SPS of different levels does not get
+/// (docs/cmaf.md, Known limitations). With one of each the record is the
+/// single-entry one this writer always wrote.
 pub fn write_hvcc(
     parent: &mut BoxWriter<'_>,
-    vps: &[u8],
-    sps: &[u8],
-    pps: &[u8],
+    vps_list: &[ParamSet],
+    sps_list: &[ParamSet],
+    pps_list: &[ParamSet],
 ) {
     let mut b = parent.child(*b"hvcC");
+    let sps: &[u8] = sps_list.first().map_or(&[], |s| &s.nal);
     // configurationVersion(8) = 1
     b.u8(1);
 
@@ -383,18 +413,18 @@ pub fn write_hvcc(
 
     // numOfArrays(8) — three arrays: VPS, SPS, PPS.
     b.u8(3);
-    write_hvcc_array(&mut b, 32, &[vps]); // VPS
-    write_hvcc_array(&mut b, 33, &[sps]); // SPS
-    write_hvcc_array(&mut b, 34, &[pps]); // PPS
+    write_hvcc_array(&mut b, 32, vps_list); // VPS
+    write_hvcc_array(&mut b, 33, sps_list); // SPS
+    write_hvcc_array(&mut b, 34, pps_list); // PPS
 }
 
-fn write_hvcc_array(b: &mut BoxWriter<'_>, nal_unit_type: u8, nalus: &[&[u8]]) {
+fn write_hvcc_array(b: &mut BoxWriter<'_>, nal_unit_type: u8, nalus: &[ParamSet]) {
     // array_completeness(1)=1 | reserved(1)=0 | NAL_unit_type(6)
     b.u8(0x80 | (nal_unit_type & 0x3F));
     b.u16(nalus.len() as u16);
     for nalu in nalus {
-        b.u16(nalu.len() as u16);
-        b.bytes(nalu);
+        b.u16(nalu.nal.len() as u16);
+        b.bytes(&nalu.nal);
     }
 }
 
@@ -893,7 +923,11 @@ mod tests {
         let mut buf = Vec::new();
         {
             let mut parent = BoxWriter::open(&mut buf, *b"avc1");
-            write_avcc(&mut parent, &sps, &pps);
+            write_avcc(
+                &mut parent,
+                &[ParamSet { id: 0, nal: sps.clone() }],
+                &[ParamSet { id: 0, nal: pps.clone() }],
+            );
         }
         // Expect: avc1(size,type) + avcC nested.
         // Locate the avcC box by scanning for its fourcc.
@@ -923,6 +957,80 @@ mod tests {
 
     fn find_fourcc(buf: &[u8], fc: [u8; 4]) -> Option<usize> {
         buf.windows(4).position(|w| w == fc)
+    }
+
+    /// The body of the first `fourcc` box in `buf`.
+    fn box_body(buf: &[u8], fc: [u8; 4]) -> &[u8] {
+        let pos = find_fourcc(buf, fc).expect("box not found");
+        let size = u32::from_be_bytes(buf[pos - 4..pos].try_into().unwrap()) as usize;
+        &buf[pos + 4..pos - 4 + size]
+    }
+
+    /// Read `n` u16-length-prefixed NAL units from `body` at `at`; returns
+    /// them and the position after them.
+    fn read_nals(body: &[u8], mut at: usize, n: usize) -> (Vec<Vec<u8>>, usize) {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let len = u16::from_be_bytes([body[at], body[at + 1]]) as usize;
+            out.push(body[at + 2..at + 2 + len].to_vec());
+            at += 2 + len;
+        }
+        (out, at)
+    }
+
+    fn sets(nals: &[Vec<u8>]) -> Vec<ParamSet> {
+        nals.iter().enumerate().map(|(i, n)| ParamSet { id: i as u32, nal: n.clone() }).collect()
+    }
+
+    /// A source whose slices name three PPS gets all three in its `avcC`, in
+    /// id order, with the header bytes from the SPS — not the one PPS that
+    /// happened to arrive last (bilbycast-edge#204).
+    #[test]
+    fn avcc_carries_every_parameter_set() {
+        let sps = vec![vec![0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9]];
+        let pps = vec![vec![0x68, 0xEE, 0x3C, 0x80], vec![0x68, 0x5B, 0x8F, 0x20], vec![0x68, 0x6A, 0x11]];
+        let mut buf = Vec::new();
+        {
+            let mut parent = BoxWriter::open(&mut buf, *b"avc1");
+            write_avcc(&mut parent, &sets(&sps), &sets(&pps));
+        }
+        let body = box_body(&buf, *b"avcC");
+        assert_eq!(&body[..5], &[1, 0x64, 0x00, 0x28, 0xFF]);
+        assert_eq!(body[5], 0xE1, "one SPS");
+        let (got_sps, at) = read_nals(body, 6, 1);
+        assert_eq!(got_sps, sps);
+        assert_eq!(body[at], 3, "three PPS");
+        let (got_pps, end) = read_nals(body, at + 1, 3);
+        assert_eq!(got_pps, pps);
+        assert_eq!(end, body.len());
+    }
+
+    /// The same for `hvcC`: every VPS / SPS / PPS in its array, each array
+    /// still declaring itself complete — which, for `hvc1`, is the promise
+    /// that no parameter set arrives in-band.
+    #[test]
+    fn hvcc_carries_every_parameter_set() {
+        let vps = vec![vec![0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF]];
+        let sps = vec![vec![0x42, 0x01, 0x01, 0x02, 0x20, 0x00]];
+        let pps = vec![vec![0x44, 0x01, 0xC0, 0x25], vec![0x44, 0x01, 0x50, 0x09], vec![0x44, 0x01, 0x70, 0x09]];
+        let mut buf = Vec::new();
+        {
+            let mut parent = BoxWriter::open(&mut buf, *b"hvc1");
+            write_hvcc(&mut parent, &sets(&vps), &sets(&sps), &sets(&pps));
+        }
+        let body = box_body(&buf, *b"hvcC");
+        // 22 bytes of configuration header, then numOfArrays.
+        assert_eq!(body[22], 3);
+        let mut at = 23;
+        for (nal_type, want) in [(32u8, &vps), (33, &sps), (34, &pps)] {
+            assert_eq!(body[at], 0x80 | nal_type, "array_completeness set, type {nal_type}");
+            let n = u16::from_be_bytes([body[at + 1], body[at + 2]]) as usize;
+            assert_eq!(n, want.len());
+            let (got, next) = read_nals(body, at + 3, n);
+            assert_eq!(&got, want);
+            at = next;
+        }
+        assert_eq!(at, body.len());
     }
 
     #[test]

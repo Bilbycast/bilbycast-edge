@@ -569,8 +569,10 @@ the edge advertises — see `bilbycast-relay/docs/distribution.md`.
 
 ## Init generations
 
-The video track is built from the first IDR's SPS/PPS, and it used to stay
-that way for life — which is true right up until the encoder upstream changes
+The video track is built as soon as the source has sent a complete set of
+parameter sets — every one it has sent by then, by id (see [Every parameter
+set, by id](#every-parameter-set-by-id) below); the samples before its first
+IDR are dropped — and it used to stay that way for life — which is true right up until the encoder upstream changes
 underneath: an operator pinning a codec, `h264_auto` falling between NVENC
 and x264, a contribution encoder rebooting into a different profile. Every
 sample after that decodes against different parameter sets from the ones in
@@ -580,8 +582,8 @@ and zero errors reported by the pipeline (edge #150).
 
 So the parameter sets are re-checked **on every IDR** (only there: that is
 where new sets take effect, and a source that re-sends a differing PPS
-between IDRs must not rotate on every frame). When they differ from the
-track's:
+between IDRs must not rotate on every frame). When the source has sent a set
+the track does not hold — a new id, or an id whose bytes differ:
 
 - The segment open at that IDR is **cut first**, whatever the elapsed time
   says, so no segment ever carries samples from both sides of the change. A
@@ -615,6 +617,72 @@ track's:
   above. The older inits the restored rows name are read back from the
   origin at restore (a few kilobytes each, two-second budget) so the
   republish covers them too.
+
+### Every parameter set, by id
+
+A decoder keeps parameter sets by id, and each slice names the PPS it decodes
+against (which names its SPS, which in HEVC names its VPS). An `avc1` / `hvc1`
+sample entry carries them out of band only — the samples are stripped of
+theirs — so the init's `avcC` / `hvcC` holds **every** SPS and PPS (and HEVC
+VPS) the source has sent, one entry per id, in id order. ISO/IEC 14496-15
+allows up to 31 SPS and 255 PPS in an `avcC` (a source past either keeps the
+first ids it sent that fit — the lowest, sent in id order — rather than
+writing a count that wraps), and an `hvcC` array counts in sixteen bits.
+
+It used to carry one of each kind, the last one the demuxer had seen. A source
+whose random-access points carry more than one PPS — the 770_H capture sends
+VPS0, SPS0, PPS0, PPS1, PPS2 at every IRAP, and its slices name PPS0 and PPS1,
+never PPS2 — got an init holding PPS2 alone, and every frame failed to decode
+with "PPS id out of range" (bilbycast-edge#204). That cache was also read after
+the whole datagram had been demuxed, so the sets it held could belong to a
+picture later in the batch than the one being handled; the table is now fed
+one access unit at a time, before that access unit is checked or segmented.
+
+The table (`engine/cmaf/param_sets.rs`) follows one rule: **a random-access
+access unit defines each kind of parameter set it carries.** After it, that
+kind holds exactly the sets the access unit carried (the last of an id within
+it winning); kinds it does not carry are left as they were. Any other access
+unit merges its sets in by id. So:
+
+- The table always holds the last set seen of every kind, with its bytes —
+  never less than the single-slot cache the track used to be built from.
+- A source that sends the same sets at every random-access point holds one
+  stable table and never rotates.
+- A random-access point that **leaves out** an id the track carries is not a
+  change: the track keeps it. Rotation is on a set the track does not hold,
+  so an encoder that re-sends a varying subset does not churn generations.
+- A source that changes underneath drops its predecessor's extra ids at its
+  first random-access point that re-sends them. And every stream
+  discontinuity the demuxer reports — the PMT version bump each operator
+  switch makes — starts the table again, dropping what the old source sent
+  before the switch. Until the next sets arrive the table is incomplete and
+  the track stays as it is. It is not a clean cut: on a switch that keeps the
+  video PID and codec, the old source's last picture is still being
+  reassembled when the switch is seen, and reaches the table after the
+  reset. If it carries parameter sets they are in the new table; the new
+  source's first random-access point that re-sends a kind replaces them, but
+  a new source that sends its sets only outside a random-access point merges
+  its sets in beside them, and an extra PPS of the old source's can reach
+  the next init — as it could with no reset at all.
+
+A parameter set is stored under the id it names. One that names none — cut
+short (a PES truncated by loss can end on a one-byte NAL), an id out of the
+codec's range, or an HEVC set for a layer other than the base layer — is
+ignored, never stored: it could not be matched to a slice, and in an init it
+is a record a strict decoder may refuse whole. So is one over 65 535 bytes,
+which a configuration record's 16-bit length cannot describe (a real one is a
+few hundred bytes at most).
+
+The configuration record's profile / level header bytes, the track's
+dimensions and the DASH `@codecs` string are read from the **lowest-id
+SPS**. That is the only SPS on almost every source; see [Known
+limitations](#known-limitations) for a source with several.
+
+A single-set source writes the init it always wrote, byte for byte (a test pins the SHA-256 of each init against the
+builder before this change), so an upgrade opens no new generation on a
+running stream. A multi-set source's init differs, so its first run on the
+new edge opens one, with `#EXT-X-DISCONTINUITY` at the join; the rows
+restored from before it keep the init they name, which never decoded.
 
 What it does not cover:
 
@@ -1468,7 +1536,10 @@ dash.js 4.x. Edge cases:
 ## HEVC `hvc1` vs `hev1`
 
 The init segment emits `hvc1` sample entries — parameter sets (VPS /
-SPS / PPS) live only in the init, never in-band. Rationale:
+SPS / PPS) live only in the init, never in-band: each `hvcC` array carries
+every set of its kind the source has sent, one entry per id, and declares
+itself complete (`array_completeness` = 1), as `hvc1` requires. See [Every
+parameter set, by id](#every-parameter-set-by-id). Rationale:
 
 - iOS Safari **requires** `hvc1` and rejects `hev1`.
 - Modern Chrome / Edge / Shaka accept both.
@@ -1620,7 +1691,11 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
 ## Testing
 
 - **Unit tests** (`cargo test cmaf::`): 156 tests covering `BoxWriter`
-  round-trips, `avcC` / `hvcC` / `esds` shape, SPS resolution parsing,
+  round-trips, `avcC` / `hvcC` / `esds` shape (every parameter set, one entry
+  per id, and a single-set init pinned byte for byte to the builder before
+  edge#204), the parameter-set table and its id parsers (`param_sets`, and
+  `param_set_tests`, which drives the 770_H case and source switches through
+  the segmenter), SPS resolution parsing,
   m3u8 and MPD golden files, media-segment `data_offset` patching,
   `tfdt` base DTS, AES-CTR / AES-CBC round-trips, CENC subsample
   splitter, PTS 33-bit unwrap, IDR-cut segmenter, HLS part rows, the
@@ -1717,6 +1792,34 @@ backward decode steps to none.
 
 ## Known limitations
 
+- **A parameter set first sent outside a random-access point, or one whose
+  content changes between IDRs, is not followed until the next IDR that
+  carries it.** `avc1` / `hvc1` samples carry no parameter sets, and the init
+  can change only at an IDR (a new [generation](#init-generations)). A new id
+  sent mid-GOP is merged into the table, but the next random-access point
+  that re-sends that kind without it drops it again; slices naming it are
+  undecodable meanwhile, as they were before. A PPS re-sent mid-GOP with new
+  content leaves the pictures after it decoding against the old content until
+  the next IDR. The lab's `BTS204.ts` (PID 0x111) does the first: its IDRs
+  carry SPS0 and PPS0, PPS1 arrives only in access units between them, and
+  the 15 pictures of the 558 in its first 40 MiB that name PPS1 do not
+  decode — as before edge#204, when the init held PPS0 alone too. The
+  `sky-sports-arena` capture does the second to its only PPS: 104
+  distinct contents of PPS0 in its first 80 MiB, 23 of them on its 44 IDRs, so
+  its init rotates at almost every IDR and its mid-GOP pictures decode against
+  a stale PPS0 — no better and no worse than before edge#204, though the IDR
+  a rotation lands on can differ, since the comparison now reads each IDR's
+  own PPS rather than the demuxer's look-ahead. Following both needs in-band
+  parameter sets (`avc3` / `hev1` sample entries), which iOS Safari refuses
+  for HEVC (see [HEVC `hvc1` vs `hev1`](#hevc-hvc1-vs-hev1)).
+- **A source with several SPS is described by its lowest-id one.** The
+  `avcC` / `hvcC` profile, tier, level and compatibility bytes and the DASH
+  `@codecs` string are read from the lowest-id SPS. For `avcC` that is what
+  FFmpeg does; for `hvcC`, ISO/IEC 14496-15 asks for the highest level and
+  tier and the AND of the compatibility flags across every SPS, so an HEVC
+  source whose SPS differ in level is under-declared there. Every SPS is in
+  the record, and the decoder configures itself from the one each picture
+  names.
 - **The RTSP input carries no DTS.** It muxes each camera frame with DTS =
   PTS (RTP carries presentation times only), so a camera that codes B-frames
   arrives with its pictures' decode order lost and a passthrough CMAF output
