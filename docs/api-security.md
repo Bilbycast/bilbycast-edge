@@ -190,6 +190,12 @@ bilbycast-edge supports two roles:
 | `/api/v1/config` | GET | Yes | Yes | Yes |
 | `/api/v1/config` | PUT | Yes | **No (403)** | Yes |
 | `/api/v1/config/reload` | POST | Yes | **No (403)** | Yes |
+| `/api/v1/ptp` | GET | Yes | Yes | Yes |
+| `/api/v1/ptp` | PUT | Yes | **No (403)** | Yes |
+| `/api/v1/tunnels` | GET | Yes | Yes | Yes |
+| `/api/v1/tunnels/{id}` | GET | Yes | Yes | Yes |
+| `/api/v1/tunnels` | POST | Yes | **No (403)** | Yes |
+| `/api/v1/tunnels/{id}` | DELETE | Yes | **No (403)** | Yes |
 | `/api/v1/ws/stats` | GET | Yes | Yes | Yes |
 | `/api/v1/flows/{id}/whip` | POST | Yes | Yes | Yes |
 | `/api/v1/flows/{id}/whip/{sid}` | DELETE | Yes | Yes | Yes |
@@ -197,12 +203,14 @@ bilbycast-edge supports two roles:
 | `/api/v1/flows/{id}/whep/{sid}` | DELETE | Yes | Yes | Yes |
 
 **Note:** This table is illustrative, not exhaustive. The role rule holds for
-most routes: `GET /api/v1/*` is read-only (any role), and mutating
-`POST`/`PUT`/`DELETE` under `/api/v1/*` requires `admin`. Newer routes not
-listed above generally follow it too — e.g. the top-level inputs/outputs CRUD
-(`/api/v1/inputs`, `/api/v1/outputs` and their `{id}` variants), flow assembly
-(`PUT /api/v1/flows/{id}/assembly`) and per-output active-flow management
-(`/api/v1/outputs/{id}/active`).
+every route under `/api/v1/*` except the four WHIP/WHEP routes: `GET` (and
+`HEAD` / `OPTIONS`) is any role, and every other method requires `admin`. It is
+enforced by a router layer keyed on the method, so routes not listed above
+follow it whether or not they are named here — e.g. the top-level
+inputs/outputs CRUD (`/api/v1/inputs`, `/api/v1/outputs` and their `{id}`
+variants), flow assembly (`PUT /api/v1/flows/{id}/assembly`) and per-output
+active-flow management (`/api/v1/outputs/{id}/active`). A `monitor` token
+sending a method a path does not route gets 403, where an `admin` gets 405.
 
 **Note:** `POST /setup` is not open just because `setup_enabled` is true. A
 non-loopback caller must also present `Authorization: Bearer <setup_token>`,
@@ -212,18 +220,17 @@ callers bypass the check. See "Securing the setup wizard" in
 (`--print-setup-token`, the first-boot banner, and automatic clearing on
 registration).
 
-**Exceptions (as shipped).** `RequireAdmin` is a per-handler extractor, not a
-router layer, and three write handlers do not take it: `PUT /api/v1/ptp`,
-`POST /api/v1/tunnels` and `DELETE /api/v1/tunnels/{id}`. Their only layers are
-`guard_cross_origin_write` and `auth_middleware`, and the middleware just
-decodes the JWT — so a `monitor` token reaches them and they execute, changing
-the node's PTP mode (persisted via `ptp_config::save`) or creating/destroying a
-tunnel and persisting the change to `config.json`. Treat a `monitor` token as
-able to do all three until the extractor is added to `ptp::put_ptp`,
-`tunnels::create_tunnel` and `tunnels::delete_tunnel`. The four WHIP/WHEP
-routes are the fourth exception, for the different reason below.
+**Releases up to 0.116.0.** The role check was the per-handler `RequireAdmin`
+extractor alone, and three write handlers did not take it: `PUT /api/v1/ptp`,
+`POST /api/v1/tunnels` and `DELETE /api/v1/tunnels/{id}`. On those releases a
+`monitor` token reaches all three and they execute — changing the node's PTP
+mode (persisted via `ptp_config::save`) or creating, re-pointing or destroying
+a tunnel and persisting the change to `config.json`. Later releases refuse
+them to a `monitor` like every other write, both in the handler and in the
+router layer. The four WHIP/WHEP routes remain the one `/api/v1` exception, for
+the different reason below.
 
-**Note:** The WHIP/WHEP routes carry no role gate either — any valid JWT (or
+**Note:** The WHIP/WHEP routes carry no role gate — any valid JWT (or
 any caller when auth is disabled) reaches them, which is why the `monitor`
 column reads Yes. The only additional check is the optional per-flow
 `bearer_token` on the two **offer** endpoints, configured in the flow's WebRTC
@@ -235,9 +242,10 @@ is never same-origin), so they never emit 403 from any path.
 
 **How RBAC works internally:**
 
-- The auth middleware validates the JWT and inserts the `Claims` (including `role`) into the request extensions.
-- Most write endpoints use a `RequireAdmin` extractor that checks `claims.role == "admin"` and returns HTTP 403 if not — see the exception list above for the ones that do not.
-- When auth is disabled (no `AuthState`), the `RequireAdmin` extractor creates a synthetic `admin` identity, allowing all operations.
+- The auth middleware validates the JWT and inserts the `Claims` (including `role`) into the request extensions. A missing or invalid token is **401** here, before any role check.
+- Inside it, on `/api/v1/**` (WHIP/WHEP excepted), a router layer refuses every method other than `GET` / `HEAD` / `OPTIONS` with HTTP 403 unless `claims.role == "admin"`. It applies to every route on that surface, so a write route cannot miss it; a route a `monitor` is meant to write would have to be mounted outside it deliberately.
+- Every write handler also takes the `RequireAdmin` extractor, which makes the same check and returns the same 403 body before the request body is parsed.
+- When auth is disabled (no `AuthState`), both checks pass every request — there is no identity to check, and neither substitutes one. A mutation then meets only the browser-origin guard below, which refuses browser-initiated requests and nothing else.
 
 ---
 

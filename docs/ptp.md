@@ -57,14 +57,19 @@ priority1, click **Apply**. The change takes effect within ~1 second.
 
 ### Direct REST against the edge
 
+With `server.auth` enabled, the `GET` accepts a token of either role, while
+the `PUT` needs a token from an `admin`-role client — a `monitor` token is
+refused 403 (`admin role required`). Releases up to 0.116.0 accepted any valid
+token on the `PUT`.
+
 ```bash
-# Read current settings
+# Read current settings (any role)
 curl https://edge:8443/api/v1/ptp \
      -H "Authorization: Bearer $TOKEN"
 
-# Switch to slave-only on eno4
+# Switch to slave-only on eno4 (admin role)
 curl -X PUT https://edge:8443/api/v1/ptp \
-     -H "Authorization: Bearer $TOKEN" \
+     -H "Authorization: Bearer $ADMIN_TOKEN" \
      -H "Content-Type: application/json" \
      -d '{"mode":"slave-only","iface":"eno4","domain":127}'
 ```

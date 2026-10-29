@@ -390,6 +390,80 @@ async fn guard_cross_origin_write(
         .into_response()
 }
 
+/// Refuse every non-safe method on `/api/v1/**` to a caller without the
+/// `admin` role, whether or not the handler takes [`auth::RequireAdmin`].
+///
+/// This is the documented role rule — `GET` is any role, every mutation needs
+/// `admin` — stated once for the whole private surface, keyed on the method
+/// rather than on which sub-router a route was registered in. Without it the
+/// rule was opt-in per handler: `PUT /api/v1/ptp`, `POST /api/v1/tunnels` and
+/// `DELETE /api/v1/tunnels/{id}` never took the extractor, and a `monitor`
+/// token ran all three. A route a `monitor` is meant to write must be mounted
+/// outside [`private_api_layers`] on purpose; nothing inside it can opt out.
+///
+/// It keys "auth is off" on the auth state itself, not on missing
+/// [`auth::Claims`] the way the extractor must: with auth on, a non-safe
+/// request that arrives without `Claims` is refused. So if a later edit runs
+/// this outside [`auth::auth_middleware`], it fails closed — admin writes come
+/// back 403 and unauthenticated ones 403 instead of 401, which the tests on
+/// the real router see — rather than silently admitting every token.
+///
+/// Every refusal is [`auth::admin_role_required`], the same body the
+/// extractor sends. A `monitor` sending a method the path does not route gets
+/// that 403 too, not the 405 an `admin` gets: `route_layer` wraps each path's
+/// method-not-allowed fallback along with its handlers.
+async fn require_admin_for_writes(
+    State(auth): State<Option<Arc<AuthState>>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if auth.is_some()
+        && !is_safe_method(req.method())
+        && !req
+            .extensions()
+            .get::<auth::Claims>()
+            .is_some_and(auth::is_admin)
+    {
+        return auth::admin_role_required();
+    }
+    next.run(req).await
+}
+
+/// Every layer the private `/api/v1` surface carries, in the one order that
+/// works.
+///
+/// `route_layer` wraps inward-out, so the layer added first runs last. A
+/// request therefore meets, from the outside in:
+///
+/// 1. [`auth::auth_middleware`] — 401 for a missing or invalid token, and the
+///    [`auth::Claims`] the two layers inside it read;
+/// 2. [`guard_cross_origin_write`] — 403 for a browser-initiated mutation that
+///    carries no token (the auth-off case);
+/// 3. [`require_admin_for_writes`] — 403 for a mutation by any role but
+///    `admin`.
+///
+/// One function so [`build_router`] and the tests apply exactly the same
+/// stack: the tests put a handler with no [`auth::RequireAdmin`] behind it.
+fn private_api_layers(
+    routes: Router<AppState>,
+    auth_state: Option<Arc<AuthState>>,
+    policy: BrowserWritePolicy,
+) -> Router<AppState> {
+    routes
+        .route_layer(middleware::from_fn_with_state(
+            auth_state.clone(),
+            require_admin_for_writes,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            policy,
+            guard_cross_origin_write,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            auth_state,
+            auth::auth_middleware,
+        ))
+}
+
 /// Explicit router-wide fallback.
 ///
 /// Without one, `Router::merge` inherits the *layered* default fallback of
@@ -410,9 +484,15 @@ async fn not_found() -> Response {
 /// When auth is enabled, the router is split into:
 /// - **Public routes**: `/health`, `/oauth/token`, and optionally `/metrics` — no auth required
 /// - **Read-only routes**: GET endpoints — require valid JWT (any role)
-/// - **Admin routes**: POST/PUT/DELETE mutation endpoints — require `admin` role
+/// - **Admin routes**: POST/PUT/DELETE mutation endpoints — require `admin` role,
+///   enforced for every non-safe method on the private surface by the
+///   `require_admin_for_writes` router layer and again by each handler's
+///   [`auth::RequireAdmin`]
 ///
 /// When auth is disabled (no `auth` config or `enabled: false`), all routes are open.
+/// NMOS (IS-05 / IS-08 connection management is any role by design) and the
+/// WHIP/WHEP routes (any role, own per-flow token) sit on routers of their own
+/// and carry no role layer.
 ///
 /// Browser reachability is a separate axis from auth. Exactly two surfaces
 /// emit any `Access-Control-*` header — `/x-nmos/**` and the four WHIP / WHEP
@@ -480,8 +560,12 @@ pub fn build_router(state: AppState, nmos_browser_control: &[String]) -> Router 
         read_routes
     };
 
-    // Write routes: require admin role (enforced by RequireAdmin extractor in handlers,
-    // middleware just validates the JWT is present and not expired)
+    // Write routes: require the admin role. `private_api_layers` refuses every
+    // non-safe method to any other role (`require_admin_for_writes`), so a
+    // route added here is covered whether or not its handler takes the
+    // `RequireAdmin` extractor — each one does anyway, so the requirement is
+    // stated where the handler is read and is checked before its body is
+    // parsed.
     let write_routes = Router::new()
         .route("/api/v1/inputs", post(inputs::create_input))
         .route(
@@ -559,32 +643,30 @@ pub fn build_router(state: AppState, nmos_browser_control: &[String]) -> Router 
             .layer(whip_whep_cors())
     };
 
-    // Combine protected routes with the cross-origin write guard and the auth
-    // middleware.
+    // Combine protected routes with the auth middleware, the cross-origin
+    // write guard and the admin-role layer — see `private_api_layers` for the
+    // order, which is the only one that works.
     //
-    // `route_layer` wraps inward-out, so the guard added first sits INSIDE the
-    // auth layer added second and can read the `Claims` auth inserts — the
-    // ordering `nmos_routes` uses. The guard is on `/api/v1` and not only on
+    // The guard sits inside auth so it can read the `Claims` auth inserts —
+    // the ordering `nmos_routes` uses. It is on `/api/v1` and not only on
     // `/x-nmos/**` because the damage here is worse: `POST
     // /api/v1/flows/{id}/stop` and `POST /api/v1/config/reload` take no body
     // extractor, so they are CORS-*simple* requests that no preflight ever
-    // sees, and `RequireAdmin` returns `Ok` when auth is off (the shipped
-    // default). Any web page the operator loaded could take a live flow off
-    // air. The WHIP/WHEP sub-router is deliberately merged at top level and
-    // NOT caught by this — cross-origin POST/DELETE from a player page is its
-    // documented mode of operation and it carries its own per-flow
+    // sees, and the role check passes when auth is off (the shipped default).
+    // Any web page the operator loaded could take a live flow off air. The
+    // WHIP/WHEP sub-router is deliberately merged at top level and NOT caught
+    // by this — cross-origin POST/DELETE from a player page is its documented
+    // mode of operation, any role may use it, and it carries its own per-flow
     // `bearer_token` check.
-    let protected_routes = Router::new()
-        .merge(read_routes)
-        .merge(write_routes)
-        .route_layer(middleware::from_fn_with_state(
-            private_api_policy,
-            guard_cross_origin_write,
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            auth_state.clone(),
-            auth::auth_middleware,
-        ));
+    //
+    // The layers are applied after the merge, so a path registered in both
+    // `read_routes` and `write_routes` has every method — and its 405
+    // fallback — wrapped by all three.
+    let protected_routes = private_api_layers(
+        Router::new().merge(read_routes).merge(write_routes),
+        auth_state.clone(),
+        private_api_policy,
+    );
 
     // NMOS IS-04, IS-05, and IS-08 routes — optionally protected by JWT auth.
     // Default is public (no auth) for backward compatibility with NMOS controllers.
@@ -731,8 +813,8 @@ mod browser_origin_tests {
         state
     }
 
-    /// Mint a valid admin Bearer token for the auth-enabled fixture.
-    fn admin_token() -> String {
+    /// Mint a valid Bearer token carrying `role` for the auth-enabled fixture.
+    fn token_for(role: &str) -> String {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -740,7 +822,7 @@ mod browser_origin_tests {
         auth::jwt_encode(
             &auth::Claims {
                 sub: "ci".into(),
-                role: "admin".into(),
+                role: role.into(),
                 iat: now,
                 exp: now + 3600,
                 iss: "bilbycast-edge".into(),
@@ -748,6 +830,11 @@ mod browser_origin_tests {
             JWT_SECRET.as_bytes(),
         )
         .expect("encode")
+    }
+
+    /// Mint a valid admin Bearer token for the auth-enabled fixture.
+    fn admin_token() -> String {
+        token_for("admin")
     }
 
     /// Bind the real router on an ephemeral loopback port and return its base
@@ -1420,6 +1507,436 @@ mod browser_origin_tests {
             .await
             .expect("request");
         assert_eq!(resp.status().as_u16(), 401);
+    }
+
+    // ── The admin role on the private API ──
+
+    /// The body every `PUT /api/v1/ptp` probe sends: an unknown mode, which
+    /// the handler refuses before `ptp_config::save` writes the host's
+    /// `ptp.conf`. Never send a valid mode from a test.
+    const PTP_PROBE: &str = r#"{"mode":"not-a-mode"}"#;
+
+    /// Every mutation `write_routes` registers, as `(method, path, body)`,
+    /// with dummy ids. Kept in step with `build_router` by hand, so it can
+    /// drift — a route missing here is still covered, because the role check
+    /// is a method-keyed router layer, which
+    /// `a_write_route_without_require_admin_is_still_refused` pins on a route
+    /// that does not take `RequireAdmin` at all.
+    ///
+    /// Each body is chosen so a request that does reach its handler — the
+    /// admin and auth-off sweeps — is refused before it changes anything:
+    ///
+    /// - `0` fails every typed `Json` extractor.
+    /// - `PUT /api/v1/config` takes `Json<Value>`, which `0` would pass, so it
+    ///   sends a `setup_token` key, which the handler refuses on its first
+    ///   line, before it deserialises, locks or saves.
+    /// - `PUT /api/v1/ptp` sends an unknown mode, refused before
+    ///   `ptp_config::save` writes the host's `ptp.conf`.
+    ///
+    /// Handlers with no body hit unknown ids (404), or the fixture's tempdir
+    /// (`config/reload`; the tunnel delete finds no tunnel and saves nothing).
+    const PRIVATE_WRITE_ROUTES: &[(&str, &str, &str)] = &[
+        ("POST", "/api/v1/inputs", "0"),
+        ("PUT", "/api/v1/inputs/i1", "0"),
+        ("DELETE", "/api/v1/inputs/i1", "0"),
+        ("POST", "/api/v1/outputs", "0"),
+        ("PUT", "/api/v1/outputs/o1", "0"),
+        ("DELETE", "/api/v1/outputs/o1", "0"),
+        ("POST", "/api/v1/flows", "0"),
+        ("PUT", "/api/v1/flows/f1", "0"),
+        ("DELETE", "/api/v1/flows/f1", "0"),
+        ("PUT", "/api/v1/flows/f1/assembly", "0"),
+        ("POST", "/api/v1/flows/f1/start", "0"),
+        ("POST", "/api/v1/flows/f1/stop", "0"),
+        ("POST", "/api/v1/flows/f1/restart", "0"),
+        ("POST", "/api/v1/flows/f1/outputs", "0"),
+        ("DELETE", "/api/v1/flows/f1/outputs/o1", "0"),
+        ("POST", "/api/v1/flows/f1/activate-input", "0"),
+        ("POST", "/api/v1/outputs/o1/active", "0"),
+        ("PUT", "/api/v1/config", r#"{"setup_token":null}"#),
+        ("POST", "/api/v1/config/reload", "0"),
+        ("PUT", "/api/v1/ptp", PTP_PROBE),
+        ("POST", "/api/v1/tunnels", "0"),
+        ("DELETE", "/api/v1/tunnels/t1", "0"),
+    ];
+
+    /// Bind an already-built router on an ephemeral loopback port and return
+    /// its base URL.
+    async fn serve_router(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        format!("http://{addr}")
+    }
+
+    /// Send one `(method, path, body)` probe as JSON, with `token` as the
+    /// Bearer when there is one. No `Origin` and no `Sec-Fetch-*`, so the
+    /// browser guard is never what answers.
+    async fn send_probe(
+        client: &reqwest::Client,
+        base: &str,
+        (method, path, body): (&str, &str, &str),
+        token: Option<&str>,
+    ) -> reqwest::Response {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).expect("method");
+        let mut req = client
+            .request(method, format!("{base}{path}"))
+            .header("content-type", "application/json")
+            .body(body.to_owned());
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        req.send().await.expect("request")
+    }
+
+    /// The `error` string of a JSON error body (the whole body when it has
+    /// none), so a role refusal is told apart from the browser guard's 403.
+    async fn error_text(resp: reqwest::Response) -> String {
+        let body = resp.text().await.expect("body");
+        serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_owned))
+            .unwrap_or(body)
+    }
+
+    /// A `monitor` token is read-only by the documented role model, yet it
+    /// ran `PUT /api/v1/ptp`, `POST /api/v1/tunnels` and
+    /// `DELETE /api/v1/tunnels/{id}`: those handlers never took
+    /// `RequireAdmin`, and no layer checked the role. Every write refuses it
+    /// now, with the role refusal's own message.
+    #[tokio::test]
+    async fn monitor_token_is_refused_on_every_private_api_write() {
+        let (base, _dir) = serve_with(true, &[]).await;
+        let client = reqwest::Client::new();
+        let monitor = token_for("monitor");
+        for &probe in PRIVATE_WRITE_ROUTES {
+            let resp = send_probe(&client, &base, probe, Some(&monitor)).await;
+            let status = resp.status().as_u16();
+            let error = error_text(resp).await;
+            assert_eq!(
+                (status, error.as_str()),
+                (403, "admin role required"),
+                "{} {} must refuse a monitor token",
+                probe.0,
+                probe.1
+            );
+        }
+    }
+
+    /// An `admin` token reaches every write handler.
+    ///
+    /// This is also a canary for the role layer's position, so do not relax
+    /// it: the layer reads auth being on from the auth state, not from
+    /// `Claims`, so if it ever ran outside `auth_middleware` it would see no
+    /// `Claims` yet and refuse the admin here.
+    #[tokio::test]
+    async fn admin_token_reaches_every_private_api_write() {
+        let (base, _dir) = serve_with(true, &[]).await;
+        let client = reqwest::Client::new();
+        let admin = admin_token();
+        for &probe in PRIVATE_WRITE_ROUTES {
+            let resp = send_probe(&client, &base, probe, Some(&admin)).await;
+            let status = resp.status().as_u16();
+            let error = error_text(resp).await;
+            assert!(
+                status != 401 && status != 403,
+                "{} {} must reach its handler for an admin, got {status}: {error}",
+                probe.0,
+                probe.1
+            );
+            if probe.1 == "/api/v1/ptp" {
+                // The handler ran and refused the mode — before
+                // `ptp_config::save`, so nothing was written.
+                assert_eq!(status, 400, "{error}");
+                assert!(error.contains("Unknown mode"), "{error}");
+            }
+        }
+    }
+
+    /// With auth on, a write without a token is a 401 from `auth_middleware`,
+    /// never a 403 from a layer inside it.
+    ///
+    /// Also a canary for layer order, so do not relax it: run outside
+    /// `auth_middleware`, the role layer would answer these 403.
+    #[tokio::test]
+    async fn unauthenticated_private_api_writes_are_401() {
+        let (base, _dir) = serve_with(true, &[]).await;
+        let client = reqwest::Client::new();
+        for &probe in PRIVATE_WRITE_ROUTES {
+            let resp = send_probe(&client, &base, probe, None).await;
+            assert_eq!(
+                resp.status().as_u16(),
+                401,
+                "{} {} without a token",
+                probe.0,
+                probe.1
+            );
+        }
+    }
+
+    /// Auth off is the shipped default, and there the role layer must not
+    /// fail closed: a non-browser caller with no token still reaches every
+    /// write handler, exactly as before.
+    #[tokio::test]
+    async fn auth_off_private_api_writes_still_reach_the_handler() {
+        let (base, _dir) = serve().await;
+        let client = reqwest::Client::new();
+        for &probe in PRIVATE_WRITE_ROUTES {
+            let resp = send_probe(&client, &base, probe, None).await;
+            let status = resp.status().as_u16();
+            let error = error_text(resp).await;
+            assert!(
+                status != 401 && status != 403,
+                "{} {} must reach its handler with auth off, got {status}: {error}",
+                probe.0,
+                probe.1
+            );
+        }
+    }
+
+    /// The role layer is keyed on the method: a `monitor` keeps every read,
+    /// and every safe method, on paths that also carry writes.
+    ///
+    /// `GET /api/v1/ptp` is left out because it reads the host's `ptp.conf`
+    /// (and probes its directory for write access); the safe-method split it
+    /// would exercise is the same one the others do.
+    #[tokio::test]
+    async fn monitor_token_still_reads_the_private_api() {
+        let (base, _dir) = serve_with(true, &[]).await;
+        let client = reqwest::Client::new();
+        let monitor = token_for("monitor");
+        for path in [
+            "/api/v1/inputs",
+            "/api/v1/outputs",
+            "/api/v1/flows",
+            "/api/v1/flows/f1",
+            "/api/v1/stats",
+            "/api/v1/config",
+            "/api/v1/tunnels",
+            "/api/v1/tunnels/t1",
+        ] {
+            let resp = client
+                .get(format!("{base}{path}"))
+                .header("authorization", format!("Bearer {monitor}"))
+                .send()
+                .await
+                .expect("request");
+            let status = resp.status().as_u16();
+            assert!(
+                status != 401 && status != 403,
+                "GET {path} must stay readable by a monitor, got {status}"
+            );
+        }
+
+        // HEAD is answered by the GET route; OPTIONS has no route here, so it
+        // is the path's 405 — not the role layer's 403.
+        let resp = client
+            .head(format!("{base}/api/v1/config"))
+            .header("authorization", format!("Bearer {monitor}"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status().as_u16(), 200, "HEAD /api/v1/config");
+        let resp = client
+            .request(reqwest::Method::OPTIONS, format!("{base}/api/v1/config"))
+            .header("authorization", format!("Bearer {monitor}"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status().as_u16(), 405, "OPTIONS /api/v1/config");
+    }
+
+    /// The point of the router layer: a write route whose handler does not
+    /// take `RequireAdmin` — the omission that let a `monitor` token change
+    /// PTP mode and tunnels — is refused to a `monitor` all the same, while
+    /// an `admin`, and anyone with auth off, still reach it.
+    #[tokio::test]
+    async fn a_write_route_without_require_admin_is_still_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let canary = ("POST", "/api/v1/canary", "");
+        let client = reqwest::Client::new();
+
+        for auth_on in [true, false] {
+            let state = test_state(dir.path());
+            let state = if auth_on { with_auth(state) } else { state };
+            let routes = Router::new()
+                .route(canary.1, post(|| async { StatusCode::NO_CONTENT }));
+            let router = private_api_layers(
+                routes,
+                state.auth_state.clone(),
+                BrowserWritePolicy::default(),
+            )
+            .with_state(state);
+            let base = serve_router(router).await;
+
+            if auth_on {
+                let resp =
+                    send_probe(&client, &base, canary, Some(&token_for("monitor"))).await;
+                let status = resp.status().as_u16();
+                let error = error_text(resp).await;
+                assert_eq!((status, error.as_str()), (403, "admin role required"));
+
+                let resp = send_probe(&client, &base, canary, Some(&admin_token())).await;
+                assert_eq!(resp.status().as_u16(), 204, "admin");
+
+                let resp = send_probe(&client, &base, canary, None).await;
+                assert_eq!(resp.status().as_u16(), 401, "no token, auth on");
+            } else {
+                let resp = send_probe(&client, &base, canary, None).await;
+                assert_eq!(resp.status().as_u16(), 204, "no token, auth off");
+            }
+        }
+    }
+
+    /// The three handlers that lacked `RequireAdmin` take it now, which the
+    /// router-level tests cannot show: the role layer answers first. Behind
+    /// auth alone, with no role layer, they still refuse a `monitor` — and
+    /// the PTP refusal is a 403, not the handler's 400 for an unknown mode,
+    /// so it came before the body was parsed.
+    #[tokio::test]
+    async fn the_tunnel_and_ptp_handlers_refuse_a_monitor_on_their_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = with_auth(test_state(dir.path()));
+        let router = Router::new()
+            .route("/api/v1/ptp", put(ptp::put_ptp))
+            .route("/api/v1/tunnels", post(tunnels::create_tunnel))
+            .route("/api/v1/tunnels/{id}", delete(tunnels::delete_tunnel))
+            .route_layer(middleware::from_fn_with_state(
+                state.auth_state.clone(),
+                auth::auth_middleware,
+            ))
+            .with_state(state);
+        let base = serve_router(router).await;
+        let client = reqwest::Client::new();
+        let monitor = token_for("monitor");
+
+        for probe in [
+            ("PUT", "/api/v1/ptp", PTP_PROBE),
+            ("POST", "/api/v1/tunnels", "0"),
+            ("DELETE", "/api/v1/tunnels/t1", ""),
+        ] {
+            let resp = send_probe(&client, &base, probe, Some(&monitor)).await;
+            let status = resp.status().as_u16();
+            let error = error_text(resp).await;
+            assert_eq!(
+                (status, error.as_str()),
+                (403, "admin role required"),
+                "{} {} must refuse a monitor in the handler itself",
+                probe.0,
+                probe.1
+            );
+        }
+
+        // The same PTP probe with an admin token does reach the handler.
+        let resp = send_probe(
+            &client,
+            &base,
+            ("PUT", "/api/v1/ptp", PTP_PROBE),
+            Some(&admin_token()),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), 400);
+    }
+
+    /// `route_layer` wraps a path's method-not-allowed fallback along with its
+    /// handlers, so a `monitor` sending an unrouted mutation verb gets the
+    /// role refusal. An `admin`, and anyone with auth off, still get the 405.
+    #[tokio::test]
+    async fn an_unrouted_mutation_verb_is_405_unless_the_role_refuses_it() {
+        let client = reqwest::Client::new();
+        let probe = ("PATCH", "/api/v1/inputs", "0");
+
+        let (base, _dir) = serve_with(true, &[]).await;
+        let resp = send_probe(&client, &base, probe, Some(&token_for("monitor"))).await;
+        let status = resp.status().as_u16();
+        let error = error_text(resp).await;
+        assert_eq!((status, error.as_str()), (403, "admin role required"));
+        let resp = send_probe(&client, &base, probe, Some(&admin_token())).await;
+        assert_eq!(resp.status().as_u16(), 405, "admin");
+
+        let (base, _dir) = serve().await;
+        let resp = send_probe(&client, &base, probe, None).await;
+        assert_eq!(resp.status().as_u16(), 405, "auth off");
+    }
+
+    /// An authenticated browser caller passes the cross-origin guard, so a
+    /// `monitor` token sent from a foreign page meets the role layer next and
+    /// gets its refusal, not the guard's.
+    #[tokio::test]
+    async fn a_monitor_from_a_foreign_page_gets_the_role_refusal() {
+        let (base, _dir) = serve_with(true, &[]).await;
+        let resp = reqwest::Client::new()
+            .delete(format!("{base}/api/v1/tunnels/t1"))
+            .header("origin", EVIL)
+            .header("sec-fetch-site", "cross-site")
+            .header("authorization", format!("Bearer {}", token_for("monitor")))
+            .send()
+            .await
+            .expect("request");
+        let status = resp.status().as_u16();
+        let error = error_text(resp).await;
+        assert_eq!((status, error.as_str()), (403, "admin role required"));
+    }
+
+    /// IS-05 / IS-08 connection management is any role by design
+    /// (`docs/api-security.md`), and NMOS sits on a router of its own: the
+    /// role layer on `/api/v1` must not reach it.
+    #[tokio::test]
+    async fn a_monitor_may_still_drive_nmos_connection_management() {
+        let (base, _dir) = serve_with(true, &[]).await;
+        let resp = reqwest::Client::new()
+            .patch(format!(
+                "{base}/x-nmos/connection/v1.1/single/senders/{UNKNOWN_SENDER}/staged"
+            ))
+            .header("authorization", format!("Bearer {}", token_for("monitor")))
+            .header("content-type", "application/json")
+            .body(r#"{"transport_params":[]}"#)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "no such sender — the point is that the NMOS handler answered"
+        );
+    }
+
+    /// WHIP/WHEP is any role by design and sits on a router of its own: the
+    /// role layer on the rest of `/api/v1` must not reach it.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_monitor_may_still_use_whip_whep() {
+        let (base, _dir) = serve_with(true, &[]).await;
+        let client = reqwest::Client::new();
+        let monitor = token_for("monitor");
+        for (method, path) in [
+            (reqwest::Method::POST, "/api/v1/flows/f1/whep"),
+            (reqwest::Method::DELETE, "/api/v1/flows/f1/whep/s1"),
+            (reqwest::Method::POST, "/api/v1/flows/f1/whip"),
+            (reqwest::Method::DELETE, "/api/v1/flows/f1/whip/s1"),
+        ] {
+            let resp = client
+                .request(method.clone(), format!("{base}{path}"))
+                .header("authorization", format!("Bearer {monitor}"))
+                .header("content-type", "application/sdp")
+                .body("v=0\r\n")
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(
+                resp.status().as_u16(),
+                404,
+                "{method} {path}: no such flow or session — the WHIP/WHEP handler answered"
+            );
+        }
     }
 
     // ── Pure helpers ──
