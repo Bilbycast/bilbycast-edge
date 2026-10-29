@@ -35,7 +35,8 @@
 //!   received. What the caller does with it is the caller's: a single-leg
 //!   RTP input publishes only one ahead of everything already published
 //!   (`engine::input_rtp::RepairOrder`), using [`FecDecoder::holds_payload`]
-//!   to drop a received datagram the matrix already holds.
+//!   to drop a received datagram the matrix already holds, and its own
+//!   memory of recent repairs for one whose matrix has since closed.
 use bytes::Bytes;
 
 use crate::engine::packet::RtpPacket;
@@ -770,6 +771,63 @@ mod tests {
         let got = receive(4, 4, &wire, &[3990], |_| false);
         assert!(got.contains(&3990), "{got:?}");
         assert!(got.iter().all(|s| *s == 3990), "{got:?}");
+    }
+
+    /// The sender steps back a little, into the open matrix, with new bytes
+    /// under numbers it already sent (L=2 D=4: 100..=105, then 102..=111
+    /// changed) -- an upstream restart a 2022-7 output forwards unchanged.
+    /// A receiver holds whichever copy of such a number reached it, so the
+    /// encoder sends no FEC over those cells: whatever two datagrams the
+    /// link loses, nothing rebuilt differs from a datagram sent under its
+    /// number, and a loss the untouched rows cover is still rebuilt.
+    #[test]
+    fn a_number_resent_with_other_bytes_is_never_rebuilt_from_the_other_copy() {
+        let sent: Vec<(u16, Bytes)> = (100u16..106)
+            .map(|s| (s, body(s, 16)))
+            .chain((102u16..112).map(|s| (s, body(s ^ 0x5A5A, 16))))
+            .map(|(s, p)| (s, make_rtp_packet(s, 0, &p)))
+            .collect();
+        let mut enc = FecEncoder::new(2, 4, Arc::new(AtomicU64::new(0)));
+        let mut wire = Vec::new();
+        for (i, (seq, dg)) in sent.iter().enumerate() {
+            wire.push((Some(i), *seq, dg.clone()));
+            for f in enc.process(*seq, &dg[RTP_HEADER_LEN..]) {
+                wire.push((None, 0, f));
+            }
+        }
+        let rebuilt_without = |lost: &[usize]| {
+            let mut dec = FecDecoder::new(2, 4);
+            let mut rebuilt = Vec::new();
+            for (index, seq, dg) in &wire {
+                let out = match index {
+                    Some(i) if lost.contains(i) => continue,
+                    Some(_) => {
+                        let mut out = dec.process_media(*seq, 0, dg);
+                        out.remove(0);
+                        out
+                    }
+                    None => dec.process_fec(dg),
+                };
+                for p in out {
+                    assert!(
+                        sent.iter().any(|(s, d)| *s == p.sequence_number
+                            && d[RTP_HEADER_LEN..] == p.data[RTP_HEADER_LEN..]),
+                        "seq {} rebuilt with bytes never sent under it (lost {lost:?})",
+                        p.sequence_number,
+                    );
+                    rebuilt.push(p.sequence_number);
+                }
+            }
+            rebuilt
+        };
+        for i in 0..sent.len() {
+            for j in i..sent.len() {
+                rebuilt_without(&[i, j]);
+            }
+        }
+        // The first 102 and the (only) 106: row 3 (106/107, never re-sent)
+        // still rebuilds 106.
+        assert_eq!(rebuilt_without(&[2, 10]), vec![106]);
     }
 
     /// `holds_payload` tells a datagram the matrix already holds -- received

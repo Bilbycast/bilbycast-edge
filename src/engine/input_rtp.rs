@@ -286,6 +286,11 @@ fn seq_is_ahead(seq: u16, of: u16) -> bool {
 /// neither published nor counted. A 2022-7 input is not gated: its merger
 /// takes the repairs and, with `path_differential_ms`, releases them in
 /// order.
+///
+/// It also remembers the last [`RECENT_REPAIRS`] repairs it let out, so the
+/// original of one, arriving late after the decoder has closed its matrix
+/// (where [`FecDecoder::holds_payload`] can no longer see it), is not
+/// published a second time.
 struct RepairOrder {
     /// The newest sequence number published, as a modular maximum.
     newest: Option<u16>,
@@ -294,16 +299,34 @@ struct RepairOrder {
     /// sequence number), not a reorder: the decoder starts a new matrix on
     /// it, and `newest` follows it there.
     window: u16,
+    /// Packets published so far: the clock `repairs` are aged by.
+    published: u64,
+    /// The last repairs published, each with `published` as it went out.
+    repairs: [Option<(u16, u64)>; RECENT_REPAIRS],
+    /// Where the next repair is written in `repairs`.
+    next_repair: usize,
 }
+
+/// How many published repairs [`RepairOrder`] remembers. Only a repair
+/// ahead of everything published goes out -- in practice the last-row
+/// cells of each matrix -- so this covers several matrices' worth.
+const RECENT_REPAIRS: usize = 32;
 
 impl RepairOrder {
     fn new(window: u16) -> Self {
-        Self { newest: None, window }
+        Self {
+            newest: None,
+            window,
+            published: 0,
+            repairs: [None; RECENT_REPAIRS],
+            next_repair: 0,
+        }
     }
 
     /// A received packet, which is published: moves `newest` forward, never
     /// back, except onto a stream that moved.
     fn received(&mut self, seq: u16) {
+        self.published += 1;
         match self.newest {
             Some(n) if !seq_is_ahead(seq, n) && n.wrapping_sub(seq) < self.window => {}
             _ => self.newest = Some(seq),
@@ -317,9 +340,31 @@ impl RepairOrder {
             Some(n) if !seq_is_ahead(seq, n) => false,
             _ => {
                 self.newest = Some(seq);
+                self.published += 1;
+                self.repairs[self.next_repair] = Some((seq, self.published));
+                self.next_repair = (self.next_repair + 1) % RECENT_REPAIRS;
                 true
             }
         }
+    }
+
+    /// Whether a received packet is the late original of a repair already
+    /// published: behind `newest`, within the window (not a stream that
+    /// moved), and published as a repair within the last two windows'
+    /// worth of packets (so not a number from a lap of the sequence space
+    /// ago). Scans only for a packet that arrives behind `newest`.
+    fn already_repaired(&self, seq: u16) -> bool {
+        let Some(n) = self.newest else {
+            return false;
+        };
+        if seq_is_ahead(seq, n) || n.wrapping_sub(seq) >= self.window {
+            return false;
+        }
+        let horizon = 2 * self.window as u64;
+        self.repairs
+            .iter()
+            .flatten()
+            .any(|&(s, at)| s == seq && self.published - at < horizon)
     }
 }
 
@@ -328,7 +373,9 @@ impl RepairOrder {
 /// exact payload the decoder already holds under its sequence number -- a
 /// packet FEC rebuilt before it arrived, or a copy of one received -- is a
 /// duplicate of something already published or deliberately withheld, and
-/// is dropped. Returns the number of rebuilt packets published.
+/// is dropped; so is the late original of a repair published from a matrix
+/// the decoder has since closed. Returns the number of rebuilt packets
+/// published.
 fn publish_fec_media(
     decoder: &mut FecDecoder,
     order: &mut RepairOrder,
@@ -337,7 +384,7 @@ fn publish_fec_media(
     data: &Bytes,
     mut publish: impl FnMut(RtpPacket),
 ) -> u64 {
-    let duplicate = decoder.holds_payload(seq, data);
+    let duplicate = decoder.holds_payload(seq, data) || order.already_repaired(seq);
     let mut packets = decoder.process_media(seq, ts, data).into_iter();
     if let Some(received) = packets.next()
         && !duplicate
@@ -1143,6 +1190,39 @@ mod tests {
         let original = &wire.iter().find(|(s, _)| *s == Some(1029)).unwrap().1;
         let rebuilt = &published.iter().find(|(s, _)| *s == 1029).unwrap().1;
         assert_eq!(&rebuilt[12..], &original[12..]);
+    }
+
+    /// A last-row datagram is delayed past the end of its matrix: its
+    /// column FEC rebuilds it in order, the decoder then closes the matrix,
+    /// and the original, arriving after that, is not published again.
+    #[test]
+    fn a_repaired_datagram_arriving_after_its_matrix_closed_is_published_once() {
+        let mut wire = sent(4, 4, 1000..1040);
+        let i = wire.iter().position(|(s, _)| *s == Some(1029)).unwrap();
+        let late = wire.remove(i);
+        let next = wire.iter().position(|(s, _)| *s == Some(1032)).unwrap();
+        wire.insert(next, late);
+        let (published, recovered) = single_leg(4, 4, &wire);
+        let seqs: Vec<u16> = published.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, (1000..1040).collect::<Vec<_>>());
+        assert_eq!(recovered, 1);
+    }
+
+    /// The repairs remembered age out: a packet published as a repair a lap
+    /// of the sequence space ago does not hide a reordered packet that
+    /// carries the same number now.
+    #[test]
+    fn a_repair_from_a_lap_ago_hides_nothing() {
+        let mut order = RepairOrder::new(16);
+        order.received(99);
+        assert!(order.recovered(100));
+        order.received(101);
+        assert!(order.already_repaired(100), "the late original of a fresh repair");
+        for k in 1..=0x1_0000u32 {
+            order.received(101u16.wrapping_add(k as u16));
+        }
+        assert_eq!(order.newest, Some(101));
+        assert!(!order.already_repaired(100), "a reorder one lap on, not that repair");
     }
 
     /// The network swaps a last-row datagram and the column FEC right after

@@ -113,11 +113,10 @@ fn new_fec_encoder(
         fec.columns,
         fec.rows
     );
-    if fec.columns > FEC_INDEXED_GROUPS || fec.rows > FEC_INDEXED_GROUPS {
+    if let Some(lost) = fec_groups_past_the_index(fec.columns, fec.rows) {
         tracing::warn!(
             "RTP output '{}': FEC {}x{} is larger than the FEC header can name ({n} columns, \
-             {n} rows): columns from {n} up get no column FEC and rows from {n} up no row FEC, \
-             so a packet in both is unprotected; use at most {n}x{n}",
+             {n} rows): {lost}; use at most {n} columns and {n} rows",
             output_id,
             fec.columns,
             fec.rows,
@@ -125,6 +124,23 @@ fn new_fec_encoder(
         );
     }
     FecEncoder::new(fec.columns, fec.rows, fec_sent_counter)
+}
+
+/// What an L x D matrix loses to the 3-bit FEC header index, or `None` when
+/// every column and row it sends FEC for can be named. A one-column matrix
+/// sends no row FEC at all, so its row count costs nothing.
+fn fec_groups_past_the_index(columns: u8, rows: u8) -> Option<&'static str> {
+    let cols_lost = columns > FEC_INDEXED_GROUPS;
+    let rows_lost = rows > FEC_INDEXED_GROUPS && columns > 1;
+    match (cols_lost, rows_lost) {
+        (true, true) => Some(
+            "columns from 8 up get no column FEC and rows from 8 up no row FEC, \
+             so a packet in both is unprotected",
+        ),
+        (true, false) => Some("columns from 8 up get no column FEC, so their packets are protected by their row only"),
+        (false, true) => Some("rows from 8 up get no row FEC, so their packets are protected by their column only"),
+        (false, false) => None,
+    }
 }
 
 /// SMPTE 2022-1 protection for one media datagram, exactly as it goes to
@@ -1219,6 +1235,17 @@ mod tests {
         (u16::from_be_bytes([b[0], b[1]]), b[8] & 0x40 != 0, b[8] & 0x07, &b[FEC_HEADER_LEN..])
     }
 
+    /// The start-up warning names only what a shape actually loses to the
+    /// 3-bit header index.
+    #[test]
+    fn the_index_warning_names_only_what_is_lost() {
+        assert_eq!(fec_groups_past_the_index(8, 8), None);
+        assert_eq!(fec_groups_past_the_index(1, 20), None, "L=1 sends no row FEC");
+        assert!(fec_groups_past_the_index(10, 10).unwrap().contains("a packet in both is unprotected"));
+        assert!(fec_groups_past_the_index(10, 4).unwrap().contains("by their row only"));
+        assert!(fec_groups_past_the_index(4, 10).unwrap().contains("by their column only"));
+    }
+
     /// The FEC goes out under the wire sequence number and covers the bytes
     /// after the RTP header -- not the input item's number or bytes.
     #[test]
@@ -1363,18 +1390,39 @@ mod tests {
         let (events, _events_rx) = crate::manager::events::event_channel();
         let (_active_tx, active_rx) = tokio::sync::watch::channel(String::new());
         let task = spawn_rtp_output(config, &tx, stats, cancel.clone(), None, events, active_rx);
-        for it in items {
-            tx.send(it).unwrap();
-        }
-        // Both legs are read at once, so neither waits in its socket buffer.
-        let captured = tokio::task::spawn_blocking(move || {
+        // Every leg is read from before the first item goes in, both at
+        // once, and the items go in a few at a time, so no burst waits in a
+        // socket buffer: on a host with the stock rmem_max (a ~416 KiB
+        // buffer, about 180 of these datagrams) a burst sent ahead of its
+        // reader, or faster than a reader sharing its CPU gets to run,
+        // overflows it.
+        let leg_count = legs.len();
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let readers = tokio::task::spawn_blocking(move || {
             std::thread::scope(|scope| {
-                let readers: Vec<_> = legs.iter().map(|s| scope.spawn(move || drain_leg(s, expect_media))).collect();
+                let readers: Vec<_> = legs
+                    .iter()
+                    .map(|s| {
+                        let ready = ready_tx.clone();
+                        scope.spawn(move || {
+                            let _ = ready.send(());
+                            drain_leg(s, expect_media)
+                        })
+                    })
+                    .collect();
                 readers.into_iter().map(|r| r.join().unwrap()).collect::<Vec<_>>()
             })
-        })
-        .await
-        .unwrap();
+        });
+        for _ in 0..leg_count {
+            ready_rx.recv().await.expect("a leg reader started");
+        }
+        for (i, it) in items.into_iter().enumerate() {
+            tx.send(it).unwrap();
+            if i % 4 == 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        let captured = readers.await.unwrap();
         cancel.cancel();
         let _ = task.await;
         captured
