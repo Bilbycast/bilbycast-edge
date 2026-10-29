@@ -94,6 +94,15 @@ pub enum DemuxedFrame {
         /// 0, which is neither the picture's time nor a frame to measure a
         /// rate on.
         pts_known: bool,
+        /// Decode timestamp (90 kHz), when the PES carried one apart from
+        /// its PTS (`PTS_DTS_flags` = 3). `None` means the DTS equals the
+        /// PTS — MPEG-TS leaves it out then, which is every picture of a
+        /// stream without B-frames and every B-picture of one with them —
+        /// or that the PES carried no timestamp at all. Only a consumer that
+        /// writes decode order needs it (CMAF passthrough; the replay
+        /// export's no-encoder fallback would, but does not read it yet); one
+        /// that decodes does not, since the decoder reorders by PTS.
+        dts: Option<u64>,
     },
     /// Complete H.265 / HEVC access unit (one or more NALUs in Annex B format).
     H265 {
@@ -106,6 +115,8 @@ pub enum DemuxedFrame {
         is_keyframe: bool,
         /// Whether the PES carried a PTS (see `H264::pts_known`).
         pts_known: bool,
+        /// Decode timestamp when the PES carried one (see `H264::dts`).
+        dts: Option<u64>,
     },
     /// Complete MPEG-1 / MPEG-2 video access unit. The bitstream is fed
     /// to the libavcodec `mpeg2video` decoder verbatim — there are no
@@ -1221,6 +1232,14 @@ impl TsDemuxer {
         } else {
             None
         };
+        // The DTS follows the PTS, in the same 5-byte layout, only when it
+        // differs from it (flags = 3) — and only inside the header the PES
+        // declares.
+        let dts = if pts_dts_flags == 3 && header_data_len >= 10 && pes.len() >= 19 {
+            Some(parse_pts(&pes[14..19]))
+        } else {
+            None
+        };
 
         let es_data = &pes[es_start..];
 
@@ -1250,6 +1269,7 @@ impl TsDemuxer {
                     pts: pts.unwrap_or(0),
                     is_keyframe,
                     pts_known: pts.is_some(),
+                    dts,
                 }]
             }
             STREAM_TYPE_H265 => {
@@ -1273,6 +1293,7 @@ impl TsDemuxer {
                     pts: pts.unwrap_or(0),
                     is_keyframe,
                     pts_known: pts.is_some(),
+                    dts,
                 }]
             }
             STREAM_TYPE_PRIVATE if Some(pid) == self.audio_pid => {
@@ -1482,6 +1503,63 @@ mod tests {
         ts.extend_from_slice(&pmt_pkt);
         demux.demux(&ts);
         assert_eq!(demux.video_pid(), None, "shared PID: exact match only");
+    }
+
+    /// edge#156: a video PES carrying a DTS apart from its PTS
+    /// (`PTS_DTS_flags` = 3) surfaces it; one carrying only a PTS — every
+    /// B-picture, and every picture of a stream without B-frames — leaves it
+    /// `None`. Decode order is what CMAF passthrough writes, and at DTS = PTS
+    /// a reordered picture decoded as an error.
+    #[test]
+    fn a_video_pes_dts_is_surfaced_when_it_differs_from_the_pts() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        fn stamp(prefix: u8, v: u64) -> [u8; 5] {
+            [
+                prefix | ((v >> 29) as u8 & 0x0E) | 1,
+                (v >> 22) as u8,
+                ((v >> 14) as u8 & 0xFE) | 1,
+                (v >> 7) as u8,
+                ((v << 1) as u8) | 1,
+            ]
+        }
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[])]);
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let au: &[u8] = &[0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x41, 0x9A, 0x00];
+        // I/P with a DTS 2 frames earlier, then a B with its PTS alone, then
+        // a closing PES so the second is complete.
+        let pes_list: [(u64, Option<u64>); 3] =
+            [(907_200, Some(900_000)), (903_600, None), (918_000, Some(910_800))];
+        for (cc, (pts, dts)) in pes_list.into_iter().enumerate() {
+            let mut pes = vec![0, 0, 1, 0xE0, 0, 0, 0x80];
+            match dts {
+                Some(d) => {
+                    pes.extend_from_slice(&[0xC0, 10]);
+                    pes.extend_from_slice(&stamp(0x30, pts));
+                    pes.extend_from_slice(&stamp(0x10, d));
+                }
+                None => {
+                    pes.extend_from_slice(&[0x80, 5]);
+                    pes.extend_from_slice(&stamp(0x20, pts));
+                }
+            }
+            pes.extend_from_slice(au);
+            let stuffing = 184 - pes.len();
+            let mut pkt = vec![0x47, 0x41, 0x00, 0x30 | cc as u8, (stuffing - 1) as u8, 0x00];
+            pkt.extend(std::iter::repeat_n(0xFF, stuffing - 2));
+            pkt.extend_from_slice(&pes);
+            ts.extend_from_slice(&pkt);
+        }
+        let mut demux = TsDemuxer::new(None);
+        let got: Vec<(u64, Option<u64>)> = demux
+            .demux(&ts)
+            .into_iter()
+            .filter_map(|f| match f {
+                DemuxedFrame::H264 { pts, dts, .. } => Some((pts, dts)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![(907_200, Some(900_000)), (903_600, None)]);
     }
 
     /// A video PES without a PTS (MPEG-TS needs one only every 700 ms; some

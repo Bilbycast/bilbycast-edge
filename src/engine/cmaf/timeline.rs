@@ -4,9 +4,9 @@
 //! One continuous media timeline for a CMAF output, whatever the source's
 //! timestamps do.
 //!
-//! The segmenters take a sample's timestamp as its decode time and a sample's
-//! duration as the step to the next one, and a fragment's `tfdt` from its
-//! first sample. A source whose timestamps jump — a `media_player` loop, an
+//! The segmenters write a sample at its decode time (a video picture's PTS
+//! less its composition offset, since edge#156) with its duration the step
+//! to the next one, and take a fragment's `tfdt` from its first sample. A source whose timestamps jump — a `media_player` loop, an
 //! input switch, a restarted encoder, a PES stamped on the wrong clock — put
 //! the jump into the published media: at a loop of the 29.97 fps VH1 clip one
 //! video sample ran +16 543.6 s and the IDR after it repeated the frame before

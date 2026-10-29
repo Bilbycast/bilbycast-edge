@@ -161,8 +161,10 @@ measured 3 % with zero broadcast lag events
 
 CMAF segments must begin with an IDR / RAP. The segmenter:
 
-1. Tracks the media-timeline DTS (the source's unwrapped 90 kHz PTS) of
-   the first sample of the current segment (`segment_base_dts`).
+1. Tracks the media-timeline decode time of the first sample of the
+   current segment (`segment_base_dts`): the source's unwrapped 90 kHz PTS
+   less the picture's composition offset (see "Decode order"), and its
+   presentation time beside it (`segment_base_pts`).
 2. On each arriving IDR / RAP, checks whether the segment has reached
    the target — within a frame of it: `dts - base + frame >
    target_duration_90k`, `frame` the median step between the segment's
@@ -209,8 +211,9 @@ stamping only its I pictures) is stamped from the one before it plus a frame
 — it used to carry 0 — the frame measured from the spans between the
 pictures that carried one (the encoder's rate only until a span is known),
 so the stamps never overrun the next real PTS. `video_encode.bframes` is pinned to 0 on this path
-(warning `cmaf_bframes_unsupported`): the segmenter takes a sample's stamp as
-its decode time and writes no composition offsets. (`gop_size: 1` is how the
+(warning `cmaf_bframes_unsupported`): the re-encoder hands back no decode
+times, so its samples go in with no composition offset (passthrough keeps the
+source's own — see [Decode order](#decode-order)). (`gop_size: 1` is how the
 DVR proxy asks for all-intra; see [the proxy section](#why-the-proxy-rendition-is-x264-on-nvidia-hosts).)
 
 ### One media timeline, whatever the source does
@@ -702,12 +705,17 @@ segment closed. That records when the edge got round to writing the segment,
 not when the content happened, so the tag carried whatever scheduling and
 pipeline delay sat between the two.
 
-It is derived now: `seg.base_dts_90k` — the source's own 90 kHz PTS, which
-`PtsUnwrap` does not rebase — placed against a wall-clock epoch consulted
-**once per flow**. `FLOW_EPOCHS` is keyed on the flow rather than the output
-precisely so that two renditions of one source, which see the same RTP packets
-and therefore the same `base_dts_90k`, publish *identical* dates — subject to
-one qualification about the 33-bit PTS wrap, below. A sample implying an epoch
+It is derived now: `seg.base_dts_90k` — the first sample's decode time on the
+source's own 90 kHz clock, which no unwrapper rebases — placed against a
+wall-clock epoch consulted **once per flow**. The decode time, because that is
+where a player anchors the tag: hls.js takes a fragment's start from its
+`tfdt` and dates a picture as the tag plus (PTS − start). `FLOW_EPOCHS` is
+keyed on the flow rather than the output precisely so that two renditions of
+one source, which see the same RTP packets, date every picture *identically* —
+subject to one qualification about the 33-bit PTS wrap, below. A segment is
+recognised across the two by its first presentation time (`base_pts_90k`),
+since with B-frames the first decode time differs between a passthrough
+rendition and its all-intra proxy. A sample implying an epoch
 more than ten seconds from the held one is a source restart or a PTS
 discontinuity rather than jitter, so it re-anchors, logs, and declares itself on
 the playlist.
@@ -915,10 +923,11 @@ coming from the config — see [Target duration](#target-duration-ext-x-targetdu
 ### One flow, one lap of the PTS clock
 
 The epoch is keyed on the flow because two renditions see the same RTP packets
-and `PtsUnwrap` does not rebase, so `base_dts_90k` is the same number in both.
-That holds only while both outputs have counted the same 33-bit PTS wraps, and
-`PtsUnwrap` lives in the segmenter — one per output *and* per track, counting
-from whenever that output started.
+and no unwrapper rebases, so a picture sits at the same media position in
+both. That holds only while both outputs have counted the same 33-bit PTS
+wraps, and the unwrappers live in the segmenter (`PtsUnwrap` for audio,
+`NearestLapUnwrap` for video) — one per output *and* per track, counting from
+whenever that output started.
 
 An MPEG-TS PTS wraps every 2^33 ticks: **26 h 30 m** at 90 kHz. Add a second
 rendition to a 24/7 channel after that, or let an `UpdateFlow` restart one, and
@@ -932,7 +941,7 @@ segment forever, naming a cause that never happened.
 `FlowClock::align` corrects it where it is only a presentation detail: an
 incoming position is moved by whole laps until it lands within half a lap of the
 flow's last one. A wrap *inside* one output is already counted by that output's
-own `PtsUnwrap` and passes through untouched; a genuine restart moves by minutes
+own unwrapper and passes through untouched; a genuine restart moves by minutes
 or hours, nowhere near the 13-hour half-lap, and reaches the re-anchor test
 unchanged.
 
@@ -1003,7 +1012,8 @@ published the *identical* hour-long jump with a clean `#EXTINF:2.000` step and
 no `#EXT-X-DISCONTINUITY` at all — and from then on the two disagreed about
 `#EXT-X-DISCONTINUITY-SEQUENCE`, which RFC 8216 §4.3.3.3 makes a number a player
 carries with it across a rendition switch. `recent` therefore holds
-`(base_dts_90k, epoch, discontinuity)`: the sibling reproduces both, exactly, or
+`(base_pts_90k, epoch, discontinuity)`, keyed on the first presentation time
+that both renditions share: the sibling reproduces both, exactly, or
 neither.
 
 The low-latency in-progress row never *declares* a discontinuity — one is
@@ -1661,17 +1671,58 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
   saves the body under the last path component. Reusable for local
   development against edge CMAF output.
 
+## Decode order
+
+Passthrough writes the source's own decode order. The demuxer reads each video
+PES's DTS when it carries one apart from its PTS (`PTS_DTS_flags` = 3; MPEG-TS
+leaves it out when it equals the PTS, which every B-picture's does) and the
+output's timeline maps the PTS while the composition offset (PTS − DTS) rides
+along unchanged, so each sample is written at its DTS with that offset in the
+fragment's `trun` (`VideoSegmenter::push`). The offset is capped at two
+seconds (`MAX_COMPOSITION_OFFSET_90K`); a DTS implying more is ignored. Presentation
+times are unwrapped across the 33-bit wrap to the *nearest* lap
+(`segmenter::NearestLapUnwrap`), and the decode time is the offset before
+that: presentation times swing back by the reorder, and the forward-only
+`PtsUnwrap` took a B-picture presenting just before the wrap, decoded after a
+P-picture just past it, for a whole lap (26.5 h) ahead. The presentation time
+rather than the decode time, so the video starts on the lap the audio's
+`PtsUnwrap` starts on; a decode time that would fall before zero (the
+stream's first pictures presenting within their offset of it) is taken at
+zero. Segments are cut, and measured, on decode time; the picture's position
+for the audio track (`newest_pts_90k`) is still its presentation time. A
+segment's `#EXT-X-PROGRAM-DATE-TIME` stays on its first decode time, which is
+where hls.js anchors it (a fragment's `tfdt`), so each picture is dated at its
+presentation time in a B-frame rendition and its all-intra proxy alike; the
+flow clock recognises the segment across the two by its first presentation
+time (`CompletedSegment::base_pts_90k`), which they share where the decode
+time does not. A picture whose
+PES carried no timestamp is placed one frame after the last decode time,
+presenting as it decodes (it used to be pushed at 0, a sample stepping back to
+the epoch); the frame is learned only from two consecutive stamped decode
+times 5–200 ms apart, never from a picture placed or held, and is 3003 ticks
+until one has been seen. A decode time that steps back within three seconds of
+the last (the offset cap plus a second) — a broken stamp — is held one tick
+past it so no sample ends before it starts; further back is a restart and is
+followed.
+
+Until edge#156 the segmenter took each picture's PTS as its decode time, and a
+reordering source's decode-order PTS stepped back at every B-picture: zero
+sample durations, `tfdt` falling back 1.4 s at each cut on the 29.97 fps VH1
+clip, and over a thousand ffmpeg decode errors in 140 s. Measured through a
+plain and a low-latency output after the fix (40 s each, `ffmpeg -v error`
+over the joined init + segments): a progressive H.264 source with B-frames
+went from 195 errors and 266 backward decode steps to none, a 1080i25 PAFF
+source from 281 errors to none, and an HEVC source with B-frames from 462
+backward decode steps to none.
+
 ## Known limitations
 
-- **Passthrough of a source with B-frames is not decodable in order.** The
-  demuxer hands the segmenter each access unit's PTS only, and the segmenter
-  takes it as the decode time (`VideoSegmenter::push`): a reordering source's
-  decode-order PTS steps back at every B picture, so its samples get zero
-  durations and its fragments' `tfdt` fall back 1.4 s at each cut on the
-  29.97 fps VH1 clip (ffmpeg: 1 174 non-monotonic DTS in 140 s). Measured in
-  2026-09, on v0.111.0 too; it wants the PES DTS carried to the segmenter
-  and written as the decode time, with composition offsets. `video_encode`
-  (B-frames pinned off) is the workaround.
+- **The RTSP input carries no DTS.** It muxes each camera frame with DTS =
+  PTS (RTP carries presentation times only), so a camera that codes B-frames
+  arrives with its pictures' decode order lost and a passthrough CMAF output
+  of it does not decode in order. Most IP cameras code none. `video_encode`
+  (B-frames pinned off) is the workaround. CMAF passthrough of a TS source
+  with B-frames is not affected: see *Decode order* below.
 - **`EXT-X-PART` rows are emitted after their own segment's `#EXTINF`.**
   RFC 8216bis §4.4.4.9 places a segment's partial-segment rows *before*
   its `#EXTINF`; trailing parts belong to the next, not-yet-complete

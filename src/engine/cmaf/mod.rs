@@ -70,7 +70,8 @@ use manifest::{
     init_object_name, required_target_duration,
 };
 use segmenter::{
-    AudioSegmenter, CompletedSegment, PushOutcome, SegmentKind, VideoSegmenter,
+    AudioSegmenter, CompletedSegment, MAX_COMPOSITION_OFFSET_90K, PushOutcome, SegmentKind,
+    VideoSegmenter,
 };
 use upload::{ChunkedPutHandle, chunked_put, http_put};
 
@@ -247,14 +248,24 @@ fn hex_nibble(c: u8) -> Result<u8, String> {
 ///
 /// Keyed on the **flow**, not the output, and that is the point: two
 /// renditions of one source are two CMAF outputs of one flow, they see the
-/// same RTP packets, and `PtsUnwrap` does not rebase — so `base_dts_90k` is
-/// the same number in both. Given one shared epoch they therefore publish the
-/// *same* date for the same content, which is what lets a player put a
-/// full-resolution still over a low-resolution picture and land on the frame
-/// it replaced.
+/// same RTP packets, and neither unwrapper rebases — so a picture sits at the
+/// same position on the media timeline in both. Given one shared epoch they
+/// therefore publish the *same* date for the same content, which is what lets
+/// a player put a full-resolution still over a low-resolution picture and
+/// land on the frame it replaced.
+///
+/// A segment's date is that of its first sample's **decode** time
+/// (`base_dts_90k`), because that is what a player anchors the tag on:
+/// hls.js takes a fragment's start from its `tfdt` and reads a picture's date
+/// as the tag plus (PTS − start), so a tag on the decode time dates every
+/// picture at its presentation time in both renditions, B-frames or not. The
+/// segment is *recognised* across renditions by its first sample's
+/// **presentation** time (the `key`), which is the same number in both where
+/// the decode time is not: a passthrough rendition with B-frames decodes its
+/// first picture a frame or two before the all-intra proxy does.
 ///
 /// "The same number in both" holds only while both outputs have counted the
-/// same 33-bit PTS wraps, and `PtsUnwrap` is per output. A rendition added —
+/// same 33-bit wraps, and the unwrappers are per output. A rendition added —
 /// or restarted under `UpdateFlow` — after a wrap counts none and reports the
 /// same content 2^33 ticks lower, so [`FlowClock::align`] puts an incoming
 /// position back on the flow's own lap before anything else looks at it.
@@ -305,8 +316,9 @@ struct FlowClock {
     /// positions are brought onto the same 33-bit lap as this one — see
     /// [`FlowClock::align`].
     dts_ref: u64,
-    /// `(base_dts_90k, epoch used, whether that segment re-anchored)`, oldest
-    /// first.
+    /// `(key, epoch used, whether that segment re-anchored)`, oldest first —
+    /// the key being the segment's first presentation time (see
+    /// [`FLOW_EPOCHS`]).
     ///
     /// The flag is remembered alongside the epoch because a re-anchor is
     /// discovered exactly once — by whichever rendition closes the segment
@@ -472,11 +484,13 @@ impl FlowClock {
     fn date_closed_segment(
         &mut self,
         base_dts_90k: u64,
+        key_90k: u64,
         seg_secs: f64,
         now: chrono::DateTime<chrono::Utc>,
         flow_id: &str,
     ) -> (chrono::DateTime<chrono::Utc>, bool) {
         let base = self.align(base_dts_90k);
+        let key = self.align(key_90k);
         self.dts_ref = base;
         let media_secs = base as f64 / 90_000.0;
         // What this sample says the epoch is: the segment closed about now, so
@@ -496,7 +510,7 @@ impl FlowClock {
         let off = (implied - self.epoch).num_milliseconds().abs() as f64 / 1000.0;
         if off > EPOCH_REANCHOR_SECS {
             self.reanchor(implied, now, flow_id);
-            self.remember(base, true);
+            self.remember(key, true);
             return (self.epoch + secs(media_secs), true);
         }
 
@@ -510,7 +524,7 @@ impl FlowClock {
         // never trips the test above; it falls through to this cache and
         // published the identical hour-long jump with a clean `#EXTINF` step
         // and no tag at all.
-        if let Some((_, was, disc)) = self.recent.iter().find(|(d, _, _)| *d == base) {
+        if let Some((_, was, disc)) = self.recent.iter().find(|(k, _, _)| *k == key) {
             return (*was + secs(media_secs), *disc);
         }
 
@@ -528,7 +542,7 @@ impl FlowClock {
         let step = err.clamp(-EPOCH_SLEW_SECS, EPOCH_SLEW_SECS);
         self.epoch += chrono::Duration::nanoseconds((step * 1e9) as i64);
 
-        self.remember(base, false);
+        self.remember(key, false);
         (self.epoch + secs(media_secs), false)
     }
 
@@ -571,6 +585,7 @@ impl FlowClock {
     fn date_open_segment(
         &self,
         base_dts_90k: u64,
+        key_90k: u64,
         seg_secs: f64,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Option<(chrono::DateTime<chrono::Utc>, bool)> {
@@ -593,7 +608,8 @@ impl FlowClock {
         // If a sibling has already dated this segment, reproduce its answer —
         // and the discontinuity it declared — for the same reason a closing
         // segment does.
-        if let Some((_, was, disc)) = self.recent.iter().find(|(d, _, _)| *d == base) {
+        let key = self.align(key_90k);
+        if let Some((_, was, disc)) = self.recent.iter().find(|(k, _, _)| *k == key) {
             return Some((*was + secs(media_secs), *disc));
         }
         // Nothing has closed this segment, so nothing has found a re-anchor
@@ -665,8 +681,8 @@ impl FlowClock {
     /// Remember the epoch this segment was dated with — and whether dating it
     /// re-anchored the timeline — so the flow's other rendition reproduces
     /// both exactly.
-    fn remember(&mut self, base_dts_90k: u64, discontinuity: bool) {
-        self.recent.push_back((base_dts_90k, self.epoch, discontinuity));
+    fn remember(&mut self, key_90k: u64, discontinuity: bool) {
+        self.recent.push_back((key_90k, self.epoch, discontinuity));
         while self.recent.len() > FLOW_CLOCK_HISTORY {
             self.recent.pop_front();
         }
@@ -674,7 +690,9 @@ impl FlowClock {
 }
 
 /// The date to publish for a closed segment starting at `base_dts_90k`, and
-/// whether the media timeline re-anchored under it.
+/// whether the media timeline re-anchored under it. `key_90k` — the first
+/// sample's presentation time — is how a sibling rendition's dating of the
+/// same segment is recognised (see [`FLOW_EPOCHS`]).
 ///
 /// This used to be `Utc::now() - segment_duration`, sampled afresh for every
 /// segment. That records when the edge got round to closing the segment, not
@@ -696,6 +714,7 @@ impl FlowClock {
 fn segment_date_marking(
     flow_id: &str,
     base_dts_90k: u64,
+    key_90k: u64,
     seg_secs: f64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (chrono::DateTime<chrono::Utc>, bool) {
@@ -703,7 +722,7 @@ fn segment_date_marking(
     let clock = guard
         .entry(flow_id.to_string())
         .or_insert_with(|| FlowClock::new(base_dts_90k, seg_secs, now));
-    clock.date_closed_segment(base_dts_90k, seg_secs, now, flow_id)
+    clock.date_closed_segment(base_dts_90k, key_90k, seg_secs, now, flow_id)
 }
 
 /// [`segment_date_marking`] without the discontinuity flag. Every caller in
@@ -715,7 +734,7 @@ fn segment_date(
     seg_secs: f64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
-    segment_date_marking(flow_id, base_dts_90k, seg_secs, now).0
+    segment_date_marking(flow_id, base_dts_90k, base_dts_90k, seg_secs, now).0
 }
 
 /// The date to publish for a segment that has just opened, and whether a
@@ -725,11 +744,12 @@ fn segment_date(
 fn open_segment_date(
     flow_id: &str,
     base_dts_90k: u64,
+    key_90k: u64,
     seg_secs: f64,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<(chrono::DateTime<chrono::Utc>, bool)> {
     let guard = lock_flow_clocks();
-    guard.get(flow_id)?.date_open_segment(base_dts_90k, seg_secs, now)
+    guard.get(flow_id)?.date_open_segment(base_dts_90k, key_90k, seg_secs, now)
 }
 
 /// Mid-loop output state.
@@ -1302,6 +1322,9 @@ struct LlSegment {
     /// made the in-progress row disagree with every row around it by whatever
     /// the pipeline delay happened to be at that instant.
     base_dts_90k: u64,
+    /// 90 kHz PTS of this segment's first sample: the key a sibling
+    /// rendition recognises it by (see `FLOW_EPOCHS`).
+    base_pts_90k: u64,
     /// The init generation this segment was opened under, and whether it is
     /// the first of it — read off the segmenter at open, so the row this
     /// segment contributes is right whatever the output's state says by the
@@ -1784,9 +1807,9 @@ async fn run(
             _ = silence_tick => {
                 if let Some(reenc) = state.audio_reencoder.as_mut() {
                     // Silence accompanies a picture, so it is laid down to
-                    // where the picture is — the newest video DTS — and no
+                    // where the picture is — the newest video PTS — and no
                     // further: nothing is emitted until video has arrived.
-                    let target = state.video_seg.as_ref().and_then(VideoSegmenter::last_dts_90k);
+                    let target = state.video_seg.as_ref().and_then(VideoSegmenter::newest_pts_90k);
                     match crate::timed_block_in_place!(
                         "cmaf.audio_silence_encode",
                         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
@@ -1890,15 +1913,19 @@ async fn handle_frame(
     // (`timeline`): a source that jumps is published as one timeline, where
     // the jump used to become a sample hours long. A picture whose PES
     // carried no PTS keeps its 0 and its flag, for the re-encoder to stamp.
+    // A DTS is not mapped on its own: it rides as the picture's composition
+    // offset (PTS − DTS), which the mapping — an offset — does not change.
     let frame = match frame {
-        DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known } => DemuxedFrame::H264 {
+        DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known, dts } => DemuxedFrame::H264 {
             pts: if pts_known { state.map_timestamp(timeline::Track::Video, pts, &config.id) } else { pts },
+            dts: dts.map(|d| composition_offset_90k(pts, d)),
             nalus,
             is_keyframe,
             pts_known,
         },
-        DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known } => DemuxedFrame::H265 {
+        DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known, dts } => DemuxedFrame::H265 {
             pts: if pts_known { state.map_timestamp(timeline::Track::Video, pts, &config.id) } else { pts },
+            dts: dts.map(|d| composition_offset_90k(pts, d)),
             nalus,
             is_keyframe,
             pts_known,
@@ -1920,7 +1947,8 @@ async fn handle_frame(
         other => other,
     };
     match frame {
-        DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known } => {
+        // `dts` carries the composition offset from here on (see above).
+        DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known, dts: cto } => {
             handle_video(
                 state,
                 demuxer,
@@ -1928,6 +1956,7 @@ async fn handle_frame(
                 nalus,
                 pts,
                 pts_known,
+                cto.unwrap_or(0),
                 is_keyframe,
                 config,
                 base_url,
@@ -1944,7 +1973,7 @@ async fn handle_frame(
             )
             .await;
         }
-        DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known } => {
+        DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known, dts: cto } => {
             handle_video(
                 state,
                 demuxer,
@@ -1952,6 +1981,7 @@ async fn handle_frame(
                 nalus,
                 pts,
                 pts_known,
+                cto.unwrap_or(0),
                 is_keyframe,
                 config,
                 base_url,
@@ -2015,9 +2045,9 @@ async fn handle_frame(
                 Ok(frames) => {
                     for out in frames {
                         push_video_sample(
-                            state, family, out.nalus, out.pts.unwrap_or(pts), out.is_keyframe, config,
-                            base_url, init_url, init_name, m3u8_url, mpd_url, publish_hls, publish_dash,
-                            stats, event_sender, flow_id, recv_time_us,
+                            state, family, out.nalus, out.pts.or(pts_known.then_some(pts)), 0, out.is_keyframe,
+                            config, base_url, init_url, init_name, m3u8_url, mpd_url, publish_hls,
+                            publish_dash, stats, event_sender, flow_id, recv_time_us,
                         )
                         .await;
                     }
@@ -2129,7 +2159,7 @@ fn handle_other_audio_frame(
 
     // CMAF wants AAC on the wire — without `audio_encode` we have no
     // way to transmux a non-AAC source.
-    let video_at = state.video_seg.as_ref().and_then(VideoSegmenter::last_dts_90k);
+    let video_at = state.video_seg.as_ref().and_then(VideoSegmenter::newest_pts_90k);
     let Some(reenc) = state.audio_reencoder.as_mut() else {
         return;
     };
@@ -2213,6 +2243,7 @@ async fn handle_video(
     nalus: Vec<Vec<u8>>,
     pts: u64,
     pts_known: bool,
+    composition_offset_90k: u64,
     is_keyframe: bool,
     config: &CmafOutputConfig,
     base_url: &str,
@@ -2296,11 +2327,13 @@ async fn handle_video(
         );
         match recoded {
             Ok(frames) => {
+                // The re-encoder runs without B-frames (`cmaf_bframes_unsupported`),
+                // so its pictures decode in presentation order: no offset.
                 for out in frames {
                     push_video_sample(
-                        state, codec, out.nalus, out.pts.unwrap_or(pts), out.is_keyframe, config,
-                        base_url, init_url, init_name, m3u8_url, mpd_url, publish_hls, publish_dash,
-                        stats, event_sender, flow_id, recv_time_us,
+                        state, codec, out.nalus, out.pts.or(pts_known.then_some(pts)), 0, out.is_keyframe,
+                        config, base_url, init_url, init_name, m3u8_url, mpd_url, publish_hls,
+                        publish_dash, stats, event_sender, flow_id, recv_time_us,
                     )
                     .await;
                 }
@@ -2314,11 +2347,25 @@ async fn handle_video(
         }
         return;
     }
+    // Passthrough keeps the source's decode order: each picture goes in at
+    // its DTS with its presentation offset. A picture whose PES carried no
+    // PTS is placed one frame after the last (`VideoSegmenter::push`); fed
+    // its 0 it used to become a sample stepping back to the epoch.
     push_video_sample(
-        state, codec, nalus, pts, is_keyframe, config, base_url, init_url, init_name, m3u8_url,
-        mpd_url, publish_hls, publish_dash, stats, event_sender, flow_id, recv_time_us,
+        state, codec, nalus, pts_known.then_some(pts), composition_offset_90k, is_keyframe,
+        config, base_url, init_url, init_name, m3u8_url, mpd_url, publish_hls, publish_dash,
+        stats, event_sender, flow_id, recv_time_us,
     )
     .await;
+}
+
+/// A picture's composition offset — PTS − DTS, on the 33-bit 90 kHz clock —
+/// from the timestamps its PES carried. 0 for a DTS the offset cannot be:
+/// one after its PTS, or more than [`MAX_COMPOSITION_OFFSET_90K`] before it.
+fn composition_offset_90k(pts: u64, dts: u64) -> u64 {
+    const MASK_33: u64 = (1 << 33) - 1;
+    let offset = pts.wrapping_sub(dts) & MASK_33;
+    if offset > MAX_COMPOSITION_OFFSET_90K { 0 } else { offset }
 }
 
 /// One access unit into the video segmenter — the source's own, or one the
@@ -2328,7 +2375,8 @@ async fn push_video_sample(
     state: &mut CmafState,
     codec: VideoCodec,
     pushed_nalus: Vec<Vec<u8>>,
-    pts: u64,
+    pts: Option<u64>,
+    composition_offset_90k: u64,
     pushed_is_keyframe: bool,
     config: &CmafOutputConfig,
     base_url: &str,
@@ -2377,7 +2425,7 @@ async fn push_video_sample(
     let outcome: PushOutcome = state
         .video_seg
         .as_mut()
-        .map(|s| s.push(&pushed_nalus, pts, pushed_is_keyframe))
+        .map(|s| s.push(&pushed_nalus, pts, composition_offset_90k, pushed_is_keyframe))
         .unwrap_or(PushOutcome {
             completed_video: None,
             new_segment_started: false,
@@ -2559,9 +2607,13 @@ async fn push_video_sample(
         // scheduling and pipeline delay into the tag, and because only one
         // date is written per playlist it anchored the whole window on that
         // one sample.
+        // Dated by the first sample's decode time, which is where a player
+        // anchors the tag, and recognised across renditions by its
+        // presentation time — see `FLOW_EPOCHS`.
         let (pdt, discontinuity) = segment_date_marking(
             flow_id,
             seg.base_dts_90k,
+            seg.base_pts_90k,
             seg_secs,
             closed_at,
         );
@@ -2749,7 +2801,7 @@ fn handle_audio_frame(
 
     // Phase 3: audio_encode hook — pump the source AAC frame through
     // the AudioReencoder and substitute the re-encoded frame(s).
-    let video_at = state.video_seg.as_ref().and_then(VideoSegmenter::last_dts_90k);
+    let video_at = state.video_seg.as_ref().and_then(VideoSegmenter::newest_pts_90k);
     let frames_to_buffer: Vec<(Vec<u8>, u64)> = if let Some(reenc) = state.audio_reencoder.as_mut() {
         // Reset the silent-fallback drop watchdog — real audio is flowing —
         // and let it measure the picture's lead over the audio.
@@ -3558,6 +3610,7 @@ async fn handle_ll_cmaf(
             let uri = ll.uri.clone();
             let seq = ll.sequence_number;
             let base_dts_90k = ll.base_dts_90k;
+            let base_pts_90k = ll.base_pts_90k;
             // The tail: the samples the chunker had not taken when the IDR
             // cut the segment. `push()` snapshots them into the completed
             // segment and clears them, and this path never read that, so
@@ -3648,6 +3701,7 @@ async fn handle_ll_cmaf(
                     seq,
                     uri,
                     base_dts_90k,
+                    base_pts_90k,
                     next_base_dts_90k,
                     config.segment_duration_secs,
                     closed_at,
@@ -3702,6 +3756,7 @@ async fn handle_ll_cmaf(
                 chunks_emitted: 0,
                 parts: Vec::new(),
                 base_dts_90k: vs.open_segment_base_dts_90k().unwrap_or(0),
+                base_pts_90k: vs.open_segment_base_pts_90k().unwrap_or(0),
                 generation: vs.generation(),
                 first_of_generation: vs.open_segment_first_of_generation(),
                 uri,
@@ -3935,7 +3990,10 @@ struct OpenSegmentRow<'a> {
     sequence_number: u64,
     uri: &'a str,
     parts: &'a [HlsPartEntry],
+    /// The first sample's decode time, which dates the row, and its
+    /// presentation time, which recognises it across renditions.
     base_dts_90k: u64,
+    base_pts_90k: u64,
     generation: u32,
     /// The open segment breaks the decode chain from the last closed row:
     /// it opened a generation, or names a different init from that row's,
@@ -4006,7 +4064,8 @@ fn ll_playlist_entries(
         // from t = 12.2 s to the close — the last fifteen manifest publishes at
         // 200 ms chunks — and dated throughout once the figure tracks the parts
         // already written.
-        let dated = open_segment_date(flow_id, open.base_dts_90k, open_secs, now);
+        let dated =
+            open_segment_date(flow_id, open.base_dts_90k, open.base_pts_90k, open_secs, now);
         entries.push(M3u8Entry {
             sequence_number: open.sequence_number,
             // At least the nominal target, and at least what the parts under
@@ -4032,7 +4091,9 @@ fn ll_playlist_entries(
 /// The playlist row a low-latency segment contributes when it closes.
 ///
 /// `next_base_dts_90k` is where the *following* segment starts, which is how
-/// long this one actually ran. The segmenter cuts on the first IDR at or past
+/// long this one actually ran. `base_pts_90k`, the first sample's
+/// presentation time, is the key a sibling rendition recognises the segment
+/// by (see `FLOW_EPOCHS`). The segmenter cuts on the first IDR at or past
 /// the target, so that equals the target only when the GOP divides it; a 1.5 s
 /// GOP against a 2 s target produces 3 s segments. Passing the nominal figure
 /// instead — which is what this did — tells the flow clock a segment closed
@@ -4050,6 +4111,7 @@ fn closed_ll_entry(
     sequence_number: u64,
     uri: String,
     base_dts_90k: u64,
+    base_pts_90k: u64,
     next_base_dts_90k: Option<u64>,
     nominal_segment_secs: f64,
     now: chrono::DateTime<chrono::Utc>,
@@ -4063,7 +4125,8 @@ fn closed_ll_entry(
     // From the media timeline, through the flow's shared epoch — see
     // `segment_date_marking`, and the plain path, which has always passed the
     // segment's real duration here.
-    let (pdt, discontinuity) = segment_date_marking(flow_id, base_dts_90k, seg_secs, now);
+    let (pdt, discontinuity) =
+        segment_date_marking(flow_id, base_dts_90k, base_pts_90k, seg_secs, now);
     M3u8Entry {
         sequence_number,
         duration_secs: seg_secs,
@@ -4090,6 +4153,7 @@ async fn publish_ll_hls(
             uri: &ll.uri,
             parts: &ll.parts,
             base_dts_90k: ll.base_dts_90k,
+            base_pts_90k: ll.base_pts_90k,
             generation: ll.generation,
             // Peeked, not taken: the close is what consumes the restore flag.
             breaks_chain: ll.first_of_generation
@@ -4585,7 +4649,7 @@ seg-00042.m4s?token=abc
         let mut seg = VideoSegmenter::new(track, 2.0);
         seg.rotate_track(VideoTrack::from_h264(vec![0x67, 0x64, 0x00, 0x1f], vec![0x68, 0xee]));
         // Applied at the next IDR.
-        seg.push(&[vec![0x65, 0x88]], 0, true);
+        seg.push(&[vec![0x65, 0x88]], Some(0), 0, true);
         assert_eq!(seg.generation(), 1);
         state.video_seg = Some(seg);
 
@@ -4617,7 +4681,7 @@ seg-00042.m4s?token=abc
             2.0,
         );
         seg.rotate_track(VideoTrack::from_h264(vec![0x67, 0x64, 0x00, 0x1f], vec![0x68, 0xee]));
-        seg.push(&[vec![0x65, 0x88]], 0, true);
+        seg.push(&[vec![0x65, 0x88]], Some(0), 0, true);
         fresh.video_seg = Some(seg);
         assert!(adopt_generation(&mut fresh, "out"));
         assert_eq!(fresh.init_history.len(), 1, "kept for the row still to come");
@@ -4678,7 +4742,7 @@ seg-00042.m4s?token=abc
             for n in 0..(3 * 2 * fps + 1) {
                 let dts = n * frame_90k;
                 let is_idr = n % (2 * fps) == 0;
-                let out = seg.push(if is_idr { &idr } else { &p }, dts, is_idr);
+                let out = seg.push(if is_idr { &idr } else { &p }, Some(dts), 0, is_idr);
                 if let (Some(done), Some((_, _, tail))) =
                     (out.completed_video.as_ref(), out.completed_video_samples.as_ref())
                 {
@@ -5023,6 +5087,37 @@ seg-00042.m4s?token=abc
         base + secs(secs_f)
     }
 
+    /// edge#156: a passthrough rendition with B-frames and its all-intra
+    /// proxy date the same picture the same.
+    ///
+    /// A player anchors the tag on a fragment's `tfdt` — the decode time —
+    /// and dates a picture as the tag plus (PTS − that start). So the main
+    /// rendition's tag sits on its first decode time, a frame or two before
+    /// the proxy's, and the two must still be recognised as one segment so
+    /// the second reproduces the first's epoch and any discontinuity: by the
+    /// first presentation time, which they share.
+    #[test]
+    fn a_b_frame_rendition_and_its_proxy_date_a_picture_alike() {
+        let seg = 2.0;
+        let origin = ts("2026-10-29T00:00:00.000Z");
+        let cto = 7_200u64;
+        let mut clock = FlowClock::new(0, seg, at(origin, seg));
+        for n in 1..6u64 {
+            let pts = n * 180_000 + cto;
+            let main_dts = pts - cto;
+            // The main rendition closes first, the proxy 40 ms later — the
+            // epoch may slew in between, and the proxy must not see it.
+            let closed = at(origin, (n + 1) as f64 * seg);
+            let (main_pdt, main_disc) = clock.date_closed_segment(main_dts, pts, seg, closed, "flow-pair");
+            let (proxy_pdt, proxy_disc) =
+                clock.date_closed_segment(pts, pts, seg, closed + secs(0.04), "flow-pair");
+            assert_eq!(main_disc, proxy_disc);
+            // The same picture, through each rendition's tag.
+            let main_picture = main_pdt + secs((pts - main_dts) as f64 / 90_000.0);
+            assert_eq!(main_picture, proxy_pdt, "segment {n}");
+        }
+    }
+
     /// A backlog in the intake must not reach the flow's epoch.
     ///
     /// The intake lets an output fall behind its feed — seconds behind, on a
@@ -5079,10 +5174,10 @@ seg-00042.m4s?token=abc
             let processed = if (5..13).contains(&n) { 27.0 + (n - 5) as f64 * 0.01 } else { arrived };
             let waited = secs(processed - arrived);
 
-            let (_, disc) = by_processing.date_closed_segment(base, seg, at(origin, processed), "flow-backlog-a");
+            let (_, disc) = by_processing.date_closed_segment(base, base, seg, at(origin, processed), "flow-backlog-a");
             reanchored_by_processing |= disc;
 
-            let (pdt, disc) = by_arrival.date_closed_segment(base, seg, at(origin, processed) - waited, "flow-backlog-b");
+            let (pdt, disc) = by_arrival.date_closed_segment(base, base, seg, at(origin, processed) - waited, "flow-backlog-b");
             assert!(!disc, "segment {n}: a backlog re-anchored the flow's timeline");
             let err = (pdt - at(origin, n as f64 * seg)).num_milliseconds();
             assert!(err.abs() <= 5, "segment {n} dated {err} ms off its content");
@@ -5141,7 +5236,7 @@ seg-00042.m4s?token=abc
             let mut chunks = 1u32;
             while chunks as f64 * chunk <= seg {
                 let now = at(opened, chunks as f64 * chunk);
-                if let Some((got, disc)) = open_segment_date(flow, base, seg, now) {
+                if let Some((got, disc)) = open_segment_date(flow, base, base, seg, now) {
                     assert!(!disc, "segment {n} chunk {chunks}: the read-only path invented a discontinuity");
                     let err = (got - opened).num_milliseconds();
                     assert!(
@@ -5153,7 +5248,7 @@ seg-00042.m4s?token=abc
                 chunks += 1;
             }
             // Then it closes — the only sample allowed to steer the clock.
-            let (closed, disc) = segment_date_marking(flow, base, seg, at(opened, seg));
+            let (closed, disc) = segment_date_marking(flow, base, base, seg, at(opened, seg));
             let err = (closed - opened).num_milliseconds();
             assert!(err.abs() <= 5, "segment {n} closed {err}ms off its own content");
             assert!(!disc, "segment {n} claimed a discontinuity");
@@ -5178,13 +5273,13 @@ seg-00042.m4s?token=abc
         let mut clock = FlowClock::new(0, 2.0, at(origin, 2.0));
         let epoch_before = clock.epoch;
         for j in 1..=10 {
-            let _ = clock.date_open_segment(180_000, 2.0, at(origin, 2.0 + j as f64 * 0.2));
+            let _ = clock.date_open_segment(180_000, 180_000, 2.0, at(origin, 2.0 + j as f64 * 0.2));
         }
         assert_eq!(clock.epoch, epoch_before, "reading the clock steered it");
         assert!(clock.recent.is_empty(), "reading the clock filled the per-segment cache");
         // So the sample taken when the segment does close is the one that
         // decides, and it puts the date on the content.
-        let (got, _) = clock.date_closed_segment(180_000, 2.0, at(origin, 4.0), "flow-readonly");
+        let (got, _) = clock.date_closed_segment(180_000, 180_000, 2.0, at(origin, 4.0), "flow-readonly");
         assert_eq!(got, at(origin, 2.0), "the close-time sample was discarded");
     }
 
@@ -5207,14 +5302,14 @@ seg-00042.m4s?token=abc
             let opened = at(origin, n as f64 * seg);
             // The low-latency output republishes on every 200 ms chunk.
             for j in 1..=10 {
-                let _ = open_segment_date(flow, base, seg, at(opened, j as f64 * 0.2));
+                let _ = open_segment_date(flow, base, base, seg, at(opened, j as f64 * 0.2));
             }
-            let (ll, _) = segment_date_marking(flow, base, seg, at(opened, seg));
+            let (ll, _) = segment_date_marking(flow, base, base, seg, at(opened, seg));
             // The plain rendition closes the same content 45 ms later, as
             // measured on the rig.
             let (plain, _) = segment_date_marking(
                 flow,
-                base,
+                base, base,
                 seg,
                 at(opened, seg) + chrono::Duration::milliseconds(45),
             );
@@ -5242,11 +5337,11 @@ seg-00042.m4s?token=abc
     #[test]
     fn a_restart_onto_a_remembered_segment_still_re_anchors() {
         let flow = "flow-restart-cached";
-        segment_date_marking(flow, 0, 2.0, ts("2026-08-27T00:00:02.000Z"));
-        segment_date_marking(flow, 180_000, 2.0, ts("2026-08-27T00:00:04.000Z"));
+        segment_date_marking(flow, 0, 0, 2.0, ts("2026-08-27T00:00:02.000Z"));
+        segment_date_marking(flow, 180_000, 180_000, 2.0, ts("2026-08-27T00:00:04.000Z"));
         // An hour later the source restarts, back at a position the cache
         // still holds.
-        let (after, disc) = segment_date_marking(flow, 0, 2.0, ts("2026-08-27T01:00:02.000Z"));
+        let (after, disc) = segment_date_marking(flow, 0, 0, 2.0, ts("2026-08-27T01:00:02.000Z"));
         assert!(disc, "a restart onto a remembered position was absorbed silently");
         assert_eq!(
             after,
@@ -5271,12 +5366,12 @@ seg-00042.m4s?token=abc
         let lap = PTS_LAP_90K;
         let t0 = ts("2026-08-28T03:00:10.000Z");
         // The established output has counted the wrap.
-        let (a, disc_a) = segment_date_marking(flow, lap + 900_000, 2.0, t0);
+        let (a, disc_a) = segment_date_marking(flow, lap + 900_000, lap + 900_000, 2.0, t0);
         assert!(!disc_a);
         // The new one has not, and reports the same content a lap lower.
         let (b, disc_b) = segment_date_marking(
             flow,
-            900_000,
+            900_000, 900_000,
             2.0,
             t0 + chrono::Duration::milliseconds(45),
         );
@@ -5284,7 +5379,7 @@ seg-00042.m4s?token=abc
         assert_eq!(a, b, "the two renditions dated one segment 26.5 hours apart");
         // And the flow's own clock is intact: the next segment is 2 s on, not
         // re-founded on a collapsed epoch.
-        let (c, disc_c) = segment_date_marking(flow, lap + 1_080_000, 2.0, at(t0, 2.0));
+        let (c, disc_c) = segment_date_marking(flow, lap + 1_080_000, lap + 1_080_000, 2.0, at(t0, 2.0));
         assert!(!disc_c);
         let step = (c - a).num_milliseconds();
         assert!(
@@ -5339,7 +5434,7 @@ seg-00042.m4s?token=abc
         let mut prev: Option<chrono::DateTime<chrono::Utc>> = None;
         for n in 0..900u64 {
             let wall = at(origin, (n as f64 + 1.0) * seg * (1.0 + ppm / 1e6));
-            let (got, disc) = segment_date_marking(flow, n * 180_000, seg, wall);
+            let (got, disc) = segment_date_marking(flow, n * 180_000, n * 180_000, seg, wall);
             if disc {
                 snapped += 1;
             } else if let Some(p) = prev {
@@ -5391,6 +5486,7 @@ seg-00042.m4s?token=abc
                 n,
                 default_segment_uri(n),
                 base,
+                base,
                 Some(base + ticks),
                 nominal,
                 at(opened, real),
@@ -5440,10 +5536,10 @@ seg-00042.m4s?token=abc
             };
             // The main rendition closes first; the proxy 45 ms later, as
             // measured on the rig.
-            let (a_pdt, a_disc) = segment_date_marking(flow, base, seg, closed_at);
+            let (a_pdt, a_disc) = segment_date_marking(flow, base, base, seg, closed_at);
             let (b_pdt, b_disc) = segment_date_marking(
                 flow,
-                base,
+                base, base,
                 seg,
                 closed_at + chrono::Duration::milliseconds(45),
             );
@@ -5515,6 +5611,7 @@ seg-00042.m4s?token=abc
                 uri: "seg-00000.m4s",
                 parts: &[],
                 base_dts_90k: 0,
+                base_pts_90k: 0,
                     generation: 0,
                     breaks_chain: false,
             }),
@@ -5565,6 +5662,7 @@ seg-00042.m4s?token=abc
                         uri: &uri,
                         parts: &[],
                         base_dts_90k: base,
+                    base_pts_90k: base,
                     generation: 0,
                     breaks_chain: false,
                     }),
@@ -5589,6 +5687,7 @@ seg-00042.m4s?token=abc
                 flow,
                 n,
                 uri,
+                base,
                 base,
                 Some(base + 180_000),
                 seg,
@@ -5644,7 +5743,7 @@ seg-00042.m4s?token=abc
                 .video_seg
                 .as_mut()
                 .expect("segmenter")
-                .push(&idr, n * gop_90k, true);
+                .push(&idr, Some(n * gop_90k), 0, true);
             let Some(seg) = outcome.completed_video else {
                 continue;
             };
@@ -5658,6 +5757,7 @@ seg-00042.m4s?token=abc
                 seg.sequence_number,
                 default_segment_uri(seg.sequence_number),
                 seg.base_dts_90k,
+                seg.base_pts_90k,
                 next_base,
                 nominal,
                 at(opened, real_secs),
@@ -5713,6 +5813,7 @@ seg-00042.m4s?token=abc
                 uri: "seg-00000.m4s",
                 parts: &few,
                 base_dts_90k: 0,
+                base_pts_90k: 0,
                     generation: 0,
                     breaks_chain: false,
             }),
@@ -5732,6 +5833,7 @@ seg-00042.m4s?token=abc
                 uri: "seg-00000.m4s",
                 parts: &many,
                 base_dts_90k: 0,
+                base_pts_90k: 0,
                     generation: 0,
                     breaks_chain: false,
             }),
@@ -5849,7 +5951,7 @@ seg-00042.m4s?token=abc
                 } else {
                     (n - restart_at) * 180_000
                 };
-                let got = segment_date_marking(&flow, base, seg, at(origin, t));
+                let got = segment_date_marking(&flow, base, base, seg, at(origin, t));
                 if is_leader {
                     leader.insert(n, got);
                 } else {
@@ -5896,7 +5998,7 @@ seg-00042.m4s?token=abc
         let real = 15.0;
         let origin = ts("2026-08-27T00:00:00.000Z");
         // One closed segment, so the flow has a clock to read.
-        segment_date_marking(flow, 0, real, at(origin, real));
+        segment_date_marking(flow, 0, 0, real, at(origin, real));
 
         let base = (real * 90_000.0) as u64;
         let mut dated = 0usize;
@@ -5916,6 +6018,7 @@ seg-00042.m4s?token=abc
                     uri: "seg-00001.m4s",
                     parts: &parts,
                     base_dts_90k: base,
+                    base_pts_90k: base,
                     generation: 0,
                     breaks_chain: false,
                 }),

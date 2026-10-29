@@ -68,6 +68,85 @@ impl Default for PtsUnwrap {
     }
 }
 
+/// The 33-bit clock unwrapped to the lap nearest the last value — for video
+/// presentation times.
+///
+/// [`PtsUnwrap`] counts a wrap only on a step *forward* across it, which is
+/// right for a clock that only moves forward. Video presentation times do
+/// not: they swing back by the reorder depth, and a B-picture presenting just
+/// before the wrap, decoded after a P-picture presenting just past it, was
+/// taken a whole lap (26.5 hours) ahead. This takes either direction across
+/// the wrap. It unwraps the presentation time rather than the decode time so
+/// that video starts on the lap the audio's [`PtsUnwrap`] starts on: a first
+/// picture presenting just past the wrap decodes just before it, and its
+/// decode time, unwrapped first, put the whole video track a lap ahead of the
+/// audio in every muxed fragment.
+pub struct NearestLapUnwrap {
+    last: Option<u64>,
+}
+
+impl NearestLapUnwrap {
+    pub fn new() -> Self {
+        Self { last: None }
+    }
+
+    pub fn unwrap(&mut self, ts33: u64) -> u64 {
+        const LAP: i64 = 1 << 33;
+        let ts = ts33 & (LAP as u64 - 1);
+        let out = match self.last {
+            None => ts,
+            Some(last) => {
+                // The step from the last value's place on the lap, taken the
+                // short way round: within ±half a lap.
+                let mut step = ts as i64 - (last as i64).rem_euclid(LAP);
+                if step >= LAP / 2 {
+                    step -= LAP;
+                } else if step < -LAP / 2 {
+                    step += LAP;
+                }
+                match u64::try_from(last as i64 + step) {
+                    Ok(v) => v,
+                    // Back past zero, with no lap before it to land on. A
+                    // reorder's reach — a leading picture presenting before
+                    // the first one — is held at zero; anything further is a
+                    // jump, taken on the first lap as `PtsUnwrap` takes it.
+                    Err(_) if -step <= REORDER_SLACK_90K as i64 => 0,
+                    Err(_) => ts,
+                }
+            }
+        };
+        self.last = Some(out);
+        out
+    }
+}
+
+impl Default for NearestLapUnwrap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The largest composition offset (PTS − DTS, 90 kHz) a video sample may
+/// carry: two seconds, far past any reorder an encoder uses (a few frames)
+/// and well short of anything a broken or wrapped DTS would produce. The
+/// demuxer's caller takes no larger offset from a source; [`VideoSegmenter::push`]
+/// clamps to it besides, and sizes its reorder tolerance from it.
+pub const MAX_COMPOSITION_OFFSET_90K: u64 = 2 * 90_000;
+
+/// How far a timestamp may step back within one stream before it is taken
+/// for a restart: the largest presentation swing a reorder can cause, plus a
+/// second for a broken stamp.
+const REORDER_SLACK_90K: u64 = MAX_COMPOSITION_OFFSET_90K + 90_000;
+
+/// The frame step learned from the source's own stamps is believed between
+/// these (200 fps to 5 fps); outside them it is a gap, a splice or a restart,
+/// and an unstamped picture placed by it would land seconds away.
+const PLAUSIBLE_FRAME_STEP_90K: std::ops::RangeInclusive<u64> = 450..=18_000;
+
+/// Where an unstamped picture goes before the source has shown a frame step:
+/// one frame at 29.97 fps.
+const NOMINAL_FRAME_STEP_90K: u64 = 3_003;
+
 /// One completed media segment to upload.
 pub struct CompletedSegment {
     pub sequence_number: u64,
@@ -76,6 +155,13 @@ pub struct CompletedSegment {
     pub kind: SegmentKind,
     /// 90 kHz DTS of the first sample in the segment.
     pub base_dts_90k: u64,
+    /// 90 kHz PTS of the first sample in the segment — how the flow clock
+    /// recognises the segment across renditions. The date itself is taken
+    /// from `base_dts_90k`, where a player anchors it (a fragment's `tfdt`);
+    /// but with B-frames the first sample decodes a frame or two before it
+    /// presents, so the decode time is not the number the all-intra proxy
+    /// has for the same picture, and the presentation time is.
+    pub base_pts_90k: u64,
     /// Which init this segment's samples decode against — see
     /// [`VideoSegmenter::generation`]. Stamped by the segmenter at the cut,
     /// not read off the output's state by the caller, because the segment
@@ -116,9 +202,11 @@ pub enum SegmentKind {
 pub struct VideoSegmenter {
     pub track: VideoTrack,
     target_duration_90k: u64,
-    pts_unwrap: PtsUnwrap,
+    pts_unwrap: NearestLapUnwrap,
     samples: Vec<PendingVideoSample>,
     segment_base_dts: Option<u64>,
+    /// The presentation time of the open segment's first sample.
+    segment_base_pts: Option<u64>,
     next_seq: u64,
     /// How many times the parameter sets have changed under this stream,
     /// counting from whatever the restored window said. Zero is the ordinary
@@ -132,8 +220,18 @@ pub struct VideoSegmenter {
     pending_track: Option<VideoTrack>,
     /// Set at the swap, carried onto the next segment to close.
     open_first_of_generation: bool,
-    /// The newest DTS pushed, whether or not a segment is open.
-    last_dts: Option<u64>,
+    /// The newest presentation timestamp pushed, whether or not a segment is
+    /// open — where the picture is (see [`Self::newest_pts_90k`]).
+    newest_pts: Option<u64>,
+    /// The decode time of the last sample pushed, and whether it was the
+    /// source's own (stamped, and not held): where a picture whose PES
+    /// carried no timestamp goes, and whether the next step can teach the
+    /// frame step.
+    last_decode: Option<u64>,
+    last_decode_stamped: bool,
+    /// One frame, learned from consecutive stamped decode times — never
+    /// from a placed or held one, which would teach it what it placed.
+    frame_step: Option<u64>,
 }
 
 struct PendingVideoSample {
@@ -179,14 +277,18 @@ impl VideoSegmenter {
         Self {
             track,
             target_duration_90k,
-            pts_unwrap: PtsUnwrap::new(),
+            pts_unwrap: NearestLapUnwrap::new(),
             samples: Vec::new(),
             segment_base_dts: None,
+            segment_base_pts: None,
             next_seq: 0,
             generation: 0,
             pending_track: None,
             open_first_of_generation: false,
-            last_dts: None,
+            newest_pts: None,
+            last_decode: None,
+            last_decode_stamped: false,
+            frame_step: None,
         }
     }
 
@@ -215,10 +317,11 @@ impl VideoSegmenter {
         self.generation = self.generation.saturating_add(1);
     }
 
-    /// 90 kHz timestamp of the newest sample pushed, if any — where the
-    /// picture is, for a track that has to keep up with it. Monotonic.
-    pub fn last_dts_90k(&self) -> Option<u64> {
-        self.last_dts
+    /// 90 kHz presentation timestamp of the newest sample pushed, if any —
+    /// where the picture is, for a track that has to keep up with it.
+    /// Monotonic.
+    pub fn newest_pts_90k(&self) -> Option<u64> {
+        self.newest_pts
     }
 
     /// The source's parameter sets changed. Swap the track in at the next
@@ -242,26 +345,82 @@ impl VideoSegmenter {
         self.open_first_of_generation
     }
 
-    /// Push one access unit. Returns `PushOutcome` describing any
-    /// segment that closed and whether a new segment started.
+    /// Push one access unit, in decode order. Returns `PushOutcome`
+    /// describing any segment that closed and whether a new segment started.
+    ///
+    /// `pts90k` is the picture's presentation time on the 33-bit clock and
+    /// `composition_offset_90k` how far it presents after it decodes
+    /// (PTS − DTS: 0 without B-frames). Samples are written at their decode
+    /// time with that offset, which is what a source with B-frames needs: at
+    /// DTS = PTS, as before edge#156, its samples stepped back in decode
+    /// order and every reordered picture decoded as an error. A picture whose
+    /// PES carried no timestamp (`None`) is placed one frame after the last,
+    /// presenting as it decodes; before any timestamp has been seen it is
+    /// dropped, there being nowhere to put it.
     pub fn push(
         &mut self,
         nalus: &[Vec<u8>],
-        pts90k: u64,
+        pts90k: Option<u64>,
+        composition_offset_90k: u64,
         is_keyframe: bool,
     ) -> PushOutcome {
-        let unwrapped = self.pts_unwrap.unwrap(pts90k);
-        let dts = unwrapped;
-        // The newest, not the last: with B-frames the pushed timestamps
-        // swing by the reorder depth, and a track measured against them
-        // would swing with them. A step back further than any reorder —
-        // a source restarting below its old timeline, short of a wrap —
-        // is followed, or the picture's position would stay stale until
-        // it climbed past the old maximum.
-        const REORDER_SLACK_90K: u64 = 90_000;
-        self.last_dts = Some(match self.last_dts {
-            Some(d) if dts + REORDER_SLACK_90K >= d => d.max(dts),
-            _ => dts,
+        // The presentation time is unwrapped to its nearest lap — see
+        // `NearestLapUnwrap` — and the decode time is the offset before it,
+        // on the same lap by construction. One that would fall before zero
+        // (the stream's first pictures presenting within their offset of it)
+        // is taken at zero, and the hold below keeps the next ones moving.
+        let offset = composition_offset_90k.min(MAX_COMPOSITION_OFFSET_90K);
+        let (unwrapped, dts) = match pts90k {
+            Some(p) => {
+                let pts = self.pts_unwrap.unwrap(p);
+                (pts, pts.saturating_sub(offset))
+            }
+            None => match self.last_decode {
+                Some(last) => {
+                    let dts = last + self.frame_step.unwrap_or(NOMINAL_FRAME_STEP_90K);
+                    (dts, dts)
+                }
+                None => {
+                    return PushOutcome {
+                        completed_video: None,
+                        new_segment_started: false,
+                        completed_video_samples: None,
+                    };
+                }
+            },
+        };
+        // Decode times only move forward within a stream; one that does not
+        // is a source restarting below its old timeline (followed — the
+        // segment cut that follows starts a fresh base) or a broken stamp
+        // within a reorder's reach of the last, which is held one tick on so
+        // no sample ends before it starts.
+        let held = matches!(
+            self.last_decode,
+            Some(last) if dts <= last && dts + REORDER_SLACK_90K > last
+        );
+        let (unwrapped, dts) = match self.last_decode {
+            Some(last) if held => (unwrapped.max(last + 1), last + 1),
+            _ => (unwrapped, dts),
+        };
+        let stamped = pts90k.is_some() && !held;
+        if let Some(last) = self.last_decode
+            && stamped
+            && self.last_decode_stamped
+            && PLAUSIBLE_FRAME_STEP_90K.contains(&dts.wrapping_sub(last))
+        {
+            self.frame_step = Some(dts - last);
+        }
+        self.last_decode = Some(dts);
+        self.last_decode_stamped = stamped;
+        // The newest, not the last: presentation timestamps swing by the
+        // reorder depth, and a track measured against them would swing with
+        // them. A step back further than any reorder — a source restarting
+        // below its old timeline, short of a wrap — is followed, or the
+        // picture's position would stay stale until it climbed past the old
+        // maximum.
+        self.newest_pts = Some(match self.newest_pts {
+            Some(d) if unwrapped + REORDER_SLACK_90K >= d => d.max(unwrapped),
+            _ => unwrapped,
         });
 
         let mut completed = None;
@@ -286,6 +445,7 @@ impl VideoSegmenter {
                 let reached = elapsed + frame > self.target_duration_90k;
                 if (reached || rotating) && !self.samples.is_empty() {
                     let first_pending_dts_90k = self.samples[0].dts;
+                    let base_pts_90k = self.segment_base_pts.unwrap_or(base);
                     let (seq, sb, samples) = self.snapshot_samples(dts);
                     completed = Some(CompletedSegment {
                         sequence_number: seq,
@@ -293,6 +453,7 @@ impl VideoSegmenter {
                         bytes: super::fmp4::build_video_segment(seq as u32, sb, &samples),
                         kind: SegmentKind::Video,
                         base_dts_90k: sb,
+                        base_pts_90k,
                         generation: self.generation,
                         first_of_generation: std::mem::take(&mut self.open_first_of_generation),
                         codec: self.track.codec,
@@ -301,11 +462,13 @@ impl VideoSegmenter {
                     completed_samples = Some((seq, sb, samples));
                     self.samples.clear();
                     self.segment_base_dts = Some(dts);
+                    self.segment_base_pts = Some(unwrapped);
                     new_segment_started = true;
                 }
             }
             if self.segment_base_dts.is_none() {
                 self.segment_base_dts = Some(dts);
+                self.segment_base_pts = Some(unwrapped);
                 new_segment_started = true;
             }
             if let Some(track) = self.pending_track.take() {
@@ -397,6 +560,13 @@ impl VideoSegmenter {
     /// before `CompletedSegment` exists to carry it.
     pub fn open_segment_base_dts_90k(&self) -> Option<u64> {
         self.segment_base_dts
+    }
+
+    /// 90 kHz PTS of the currently-open segment's first sample — how the
+    /// segment is recognised across renditions (see
+    /// [`CompletedSegment::base_pts_90k`]).
+    pub fn open_segment_base_pts_90k(&self) -> Option<u64> {
+        self.segment_base_pts
     }
 
     /// LL-CMAF: take *a subset* of the pending samples that span at
@@ -696,6 +866,7 @@ impl AudioSegmenter {
             bytes,
             kind: SegmentKind::Audio,
             base_dts_90k: base * 90_000 / self.track.sample_rate as u64,
+            base_pts_90k: base * 90_000 / self.track.sample_rate as u64,
             // Audio-only segments are cut on the video's signal and never
             // rotate: the audio track is committed at the first init and the
             // audio-only segment path has no init generation of its own.
@@ -728,15 +899,262 @@ mod tests {
         let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
         let mut s = VideoSegmenter::new(v, 2.0);
         let p_frame = vec![vec![0x41, 0x00]];
-        let outcome = s.push(&p_frame, 0, false);
+        let outcome = s.push(&p_frame, Some(0), 0, false);
         assert!(outcome.completed_video.is_none());
         assert!(!outcome.new_segment_started);
         assert!(s.samples.is_empty());
         let idr = vec![vec![0x65, 0xB8]];
-        let outcome = s.push(&idr, 3000, true);
+        let outcome = s.push(&idr, Some(3000), 0, true);
         assert!(outcome.completed_video.is_none());
         assert!(outcome.new_segment_started);
         assert_eq!(s.samples.len(), 1);
+    }
+
+    /// edge#156: a source with B-frames is written in decode order. Each
+    /// sample sits at its DTS — one frame after the last — and carries its
+    /// presentation offset. At DTS = PTS, as before, the reordered pictures
+    /// stepped back and every B-picture decoded as an error.
+    #[test]
+    fn a_b_frame_gop_is_written_in_decode_order_with_its_offsets() {
+        const F: u64 = 3_600;
+        let base = 900_000u64;
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 0.2);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        // Decode order I0 P3 B1 B2 P6 B4 B5, then the next IDR: display index
+        // d presents at base + (d + 1)·F, decode position k at base + k·F.
+        let gop: [(u64, bool); 8] =
+            [(0, true), (3, false), (1, false), (2, false), (6, false), (4, false), (5, false), (7, true)];
+        let mut cut = None;
+        for (k, (d, key)) in gop.into_iter().enumerate() {
+            let pts = base + (d + 1) * F;
+            let dts = base + k as u64 * F;
+            let out = s.push(if key { &idr } else { &p }, Some(pts), pts - dts, key);
+            if let Some(samples) = out.completed_video_samples {
+                cut = Some(samples);
+            }
+        }
+        let (_seq, seg_base, samples) = cut.expect("the second IDR closes the segment");
+        assert_eq!(seg_base, base, "the segment starts at the IDR's decode time");
+        assert!(samples.iter().all(|x| x.duration == F as u32), "one frame each, in decode order");
+        let offsets: Vec<i32> = samples.iter().map(|x| x.composition_time_offset).collect();
+        assert_eq!(offsets, [F as i32, 3 * F as i32, 0, 0, 3 * F as i32, 0, 0]);
+        assert_eq!(s.newest_pts_90k(), Some(base + 8 * F), "where the picture is: the newest PTS");
+    }
+
+    /// Timestamps unwrap to the nearest lap, in either direction: a step
+    /// back across the wrap stays on its lap rather than jumping a whole one
+    /// ahead. Back past zero there is no lap: a reorder's reach is held at
+    /// zero, a jump is taken on the first lap.
+    #[test]
+    fn nearest_lap_unwrap_takes_the_nearest_lap() {
+        const LAP: u64 = 1 << 33;
+        let mut u = NearestLapUnwrap::new();
+        assert_eq!(u.unwrap(LAP - 3_600), LAP - 3_600);
+        assert_eq!(u.unwrap(0), LAP, "forward across the wrap");
+        assert_eq!(u.unwrap(LAP - 1_800), LAP - 1_800, "back across it, on its lap");
+        assert_eq!(u.unwrap(7_200), LAP + 7_200);
+        let mut u = NearestLapUnwrap::new();
+        assert_eq!(u.unwrap(1_000), 1_000);
+        assert_eq!(u.unwrap(LAP - 500), 0, "a leading picture before zero: held at zero");
+        let mut u = NearestLapUnwrap::new();
+        assert_eq!(u.unwrap(1_000), 1_000);
+        assert_eq!(u.unwrap(LAP - 900_000), LAP - 900_000, "ten seconds back: a jump, first lap");
+    }
+
+    /// A stream whose first picture presents just past the wrap decodes just
+    /// before it. Its video must start on the lap its audio starts on —
+    /// unwrapping the decode time first put the video a whole lap ahead.
+    #[test]
+    fn a_first_picture_just_past_the_wrap_starts_on_the_first_lap() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 60.0);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        // PTS 1000, DTS 2^33 − 2003.
+        s.push(&idr, Some(1_000), 3_003, true);
+        s.push(&p, Some(1_000 + 3 * 3_003), 3 * 3_003, false);
+        s.push(&p, Some(1_000 + 3_003), 0, false);
+        assert_eq!(s.newest_pts_90k(), Some(1_000 + 3 * 3_003));
+        let d: Vec<u64> = s.samples.iter().map(|x| x.dts).collect();
+        assert!(d.iter().all(|t| *t < 90_000), "first lap: {d:?}");
+        assert!(d.windows(2).all(|w| w[1] > w[0]), "decode times move forward: {d:?}");
+        assert!(s.samples.iter().all(|x| x.pts >= x.dts));
+    }
+
+    /// edge#156 at the 33-bit wrap: a B-frame GOP straddling it, at every
+    /// position in the GOP, on a stream that began a GOP earlier.
+    /// Presentation times swing back by the reorder, and a forward-only
+    /// unwrap of them took a B-picture presenting just before the wrap,
+    /// after a P-picture just past it, for a whole lap ahead. Every sample
+    /// stays one frame on, its offset intact.
+    #[test]
+    fn a_b_frame_gop_straddling_the_wrap_stays_continuous() {
+        const F: u64 = 3_600;
+        const MASK: u64 = (1 << 33) - 1;
+        // Display index of each decode position: I0 P3 B1 B2 P6 B4 B5.
+        const ORDER: [u64; 7] = [0, 3, 1, 2, 6, 4, 5];
+        for at in 0..7u64 {
+            // Decode position `at` of the second GOP is the first past the wrap.
+            let start = (1u64 << 33) - (7 + at) * F;
+            let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+            let mut s = VideoSegmenter::new(v, 0.1);
+            let idr = vec![vec![0x65, 0xB8]];
+            let p = vec![vec![0x41, 0x00]];
+            let mut cuts = Vec::new();
+            let mut newest = 0;
+            for n in 0..15u64 {
+                let (gop, k) = (n / 7, n % 7);
+                let d = if n == 14 { 0 } else { ORDER[k as usize] };
+                let key = k == 0;
+                let dts = start + n * F;
+                let pts = start + (gop * 7 + d + 1) * F;
+                let out = s.push(if key { &idr } else { &p }, Some(pts & MASK), pts - dts, key);
+                if let Some(c) = out.completed_video_samples {
+                    cuts.push(c);
+                }
+                let now = s.newest_pts_90k().expect("pushed");
+                assert!(now >= newest && now <= start + 15 * F, "wrap at {at}: newest {now}");
+                newest = now;
+            }
+            let (_, seg_base, samples) = cuts.pop().unwrap_or_else(|| panic!("wrap at {at}: no cut"));
+            assert_eq!(seg_base, start + 7 * F, "wrap at {at}");
+            assert!(samples.iter().all(|x| x.duration == F as u32), "wrap at {at}");
+            let offsets: Vec<i32> = samples.iter().map(|x| x.composition_time_offset).collect();
+            assert_eq!(offsets, [F as i32, 3 * F as i32, 0, 0, 3 * F as i32, 0, 0], "wrap at {at}");
+        }
+    }
+
+    /// A segment carries its first sample's presentation time beside its
+    /// decode time: the flow clock recognises a segment across renditions by
+    /// it, and with B-frames the IDR decodes a frame before it presents, so
+    /// the decode time differs from the all-intra proxy's.
+    #[test]
+    fn a_segment_carries_its_first_presentation_time() {
+        const F: u64 = 3_600;
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 0.2);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        let base = 900_000u64;
+        // I0 P3 B1 B2 P6 B4 B5, then the next IDR.
+        let gop: [(u64, bool); 8] =
+            [(0, true), (3, false), (1, false), (2, false), (6, false), (4, false), (5, false), (7, true)];
+        let mut done = None;
+        for (k, (d, key)) in gop.into_iter().enumerate() {
+            let pts = base + (d + 1) * F;
+            let dts = base + k as u64 * F;
+            s.push(if key { &idr } else { &p }, Some(pts), pts - dts, key);
+            if k == 0 {
+                assert_eq!(s.open_segment_base_dts_90k(), Some(base));
+                assert_eq!(s.open_segment_base_pts_90k(), Some(base + F));
+            }
+            if key && k > 0 {
+                done = s.open_segment_base_pts_90k();
+            }
+        }
+        assert_eq!(done, Some(base + 8 * F), "the next segment opens at its IDR's presentation");
+        // And the closed one carries both.
+        let mut s2 = VideoSegmenter::new(
+            VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]),
+            0.2,
+        );
+        let mut seg = None;
+        for (k, (d, key)) in gop.into_iter().enumerate() {
+            let pts = base + (d + 1) * F;
+            let dts = base + k as u64 * F;
+            if let Some(c) = s2.push(if key { &idr } else { &p }, Some(pts), pts - dts, key).completed_video {
+                seg = Some(c);
+            }
+        }
+        let seg = seg.expect("cut");
+        assert_eq!(seg.base_dts_90k, base);
+        assert_eq!(seg.base_pts_90k, base + F);
+    }
+
+    /// The step an unstamped picture is placed by is learned only from two
+    /// consecutive stamped decode times a frame apart: not from a held
+    /// sample's one tick, not from a jump of seconds, and not from a
+    /// picture it placed itself.
+    #[test]
+    fn an_unstamped_picture_steps_by_a_learned_frame_only() {
+        const F: u64 = 3_600;
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 60.0);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        s.push(&idr, Some(90_000), 0, true);
+        // Nothing learned yet: one nominal frame.
+        s.push(&p, None, 0, false);
+        assert_eq!(s.samples.last().unwrap().dts, 90_000 + NOMINAL_FRAME_STEP_90K);
+        s.push(&p, Some(200_000), 0, false);
+        s.push(&p, Some(200_000 + F), 0, false);
+        // A held stamp (one tick on) and then a jump of ten seconds teach
+        // nothing: the step stays one frame.
+        s.push(&p, Some(200_000), 0, false);
+        s.push(&p, Some(200_000 + 10 * 90_000), 0, false);
+        s.push(&p, None, 0, false);
+        let d: Vec<u64> = s.samples.iter().rev().take(2).map(|x| x.dts).collect();
+        assert_eq!(d[0] - d[1], F, "{d:?}");
+        // Placed pictures place the next by the same step.
+        s.push(&p, None, 0, false);
+        let d: Vec<u64> = s.samples.iter().rev().take(2).map(|x| x.dts).collect();
+        assert_eq!(d[0] - d[1], F);
+    }
+
+    /// An offset past two seconds is clamped, so a sample never presents
+    /// further from its decode time than the reorder tolerance allows for.
+    #[test]
+    fn a_composition_offset_is_clamped() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 60.0);
+        s.push(&[vec![0x65, 0xB8]], Some(9_000_000), 10 * 90_000, true);
+        let x = s.samples.last().unwrap();
+        assert_eq!(x.pts - x.dts, MAX_COMPOSITION_OFFSET_90K);
+        assert_eq!(x.pts, 9_000_000);
+    }
+
+    /// A picture whose PES carried no timestamp is placed a frame after the
+    /// last decode time; fed its 0 it used to be a sample stepping back to
+    /// the epoch. Before any timestamp there is nowhere to put it.
+    #[test]
+    fn an_unstamped_picture_follows_the_last_one() {
+        const F: u64 = 3_600;
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 0.1);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        assert!(!s.push(&idr, None, 0, true).new_segment_started, "nowhere to put it yet");
+        s.push(&idr, Some(90_000), 0, true);
+        s.push(&p, Some(90_000 + F), 0, false);
+        s.push(&p, None, 0, false);
+        s.push(&p, None, 0, false);
+        let out = s.push(&idr, Some(90_000 + 4 * F), 0, true);
+        let (_, base, samples) = out.completed_video_samples.expect("the IDR cuts");
+        assert_eq!(base, 90_000);
+        assert_eq!(samples.len(), 4);
+        assert!(samples.iter().all(|x| x.duration == F as u32), "{:?}", samples.iter().map(|x| x.duration).collect::<Vec<_>>());
+    }
+
+    /// A decode time that steps back within a reorder's reach — a broken
+    /// stamp — is held one tick past the last, so no sample ends before it
+    /// starts; a step back past that is a restart and is followed.
+    #[test]
+    fn decode_times_never_step_back_within_a_stream() {
+        let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
+        let mut s = VideoSegmenter::new(v, 10.0);
+        let idr = vec![vec![0x65, 0xB8]];
+        let p = vec![vec![0x41, 0x00]];
+        s.push(&idr, Some(9_000_000), 0, true);
+        s.push(&p, Some(9_003_600), 0, false);
+        // DTS 9_000_000 again: held to 9_003_601.
+        s.push(&p, Some(9_007_200), 7_200, false);
+        let dts: Vec<u64> = s.samples.iter().map(|x| x.dts).collect();
+        assert_eq!(dts, [9_000_000, 9_003_600, 9_003_601]);
+        // A step back of a minute is a restart, followed.
+        s.push(&p, Some(9_000_000 - 5_400_000), 0, false);
+        assert_eq!(s.samples.last().unwrap().dts, 9_000_000 - 5_400_000);
     }
 
     #[test]
@@ -745,13 +1163,13 @@ mod tests {
         let mut s = VideoSegmenter::new(v, 2.0);
         let idr = vec![vec![0x65, 0xB8]];
         let p = vec![vec![0x41, 0x00]];
-        s.push(&idr, 0, true);
+        s.push(&idr, Some(0), 0, true);
         for i in 1..60 {
             let pts = (i * 3000) as u64;
-            assert!(s.push(&p, pts, false).completed_video.is_none(), "frame {i}");
+            assert!(s.push(&p, Some(pts), 0, false).completed_video.is_none(), "frame {i}");
         }
         let boundary_pts = 2 * 90_000;
-        let outcome = s.push(&idr, boundary_pts, true);
+        let outcome = s.push(&idr, Some(boundary_pts), 0, true);
         let seg = outcome.completed_video.expect("segment should cut here");
         assert_eq!(seg.sequence_number, 0);
         assert!(seg.duration_90k > 0);
@@ -771,22 +1189,22 @@ mod tests {
         let idr = vec![vec![0x65, 0xB8]];
         let p = vec![vec![0x41, 0x00]];
         let mut s = VideoSegmenter::new(v, 2.0);
-        s.push(&idr, 0, true);
+        s.push(&idr, Some(0), 0, true);
         for i in 1..60u64 {
             // Frame 20 came 1 809 ticks early: the splice.
             let pts = i * 3_003 - if i >= 20 { 1_809 } else { 0 };
-            assert!(s.push(&p, pts, false).completed_video.is_none(), "frame {i}");
+            assert!(s.push(&p, Some(pts), 0, false).completed_video.is_none(), "frame {i}");
         }
-        let seg = s.push(&idr, 60 * 3_003 - 1_809, true).completed_video.expect("cut at the tiling IDR");
+        let seg = s.push(&idr, Some(60 * 3_003 - 1_809), 0, true).completed_video.expect("cut at the tiling IDR");
         assert_eq!(seg.duration_90k, 178_371);
 
         let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
         let mut s = VideoSegmenter::new(v, 2.0);
-        s.push(&idr, 0, true);
+        s.push(&idr, Some(0), 0, true);
         for i in 1..49u64 {
-            s.push(&p, i * 3_600, false);
+            s.push(&p, Some(i * 3_600), 0, false);
         }
-        assert!(s.push(&idr, 49 * 3_600, true).completed_video.is_none(), "a frame short: no cut");
+        assert!(s.push(&idr, Some(49 * 3_600), 0, true).completed_video.is_none(), "a frame short: no cut");
     }
 
     /// A track rotation cuts the open segment at the IDR that carries the new
@@ -806,9 +1224,9 @@ mod tests {
         let mut s = VideoSegmenter::new(v, 2.0);
         let idr = vec![vec![0x65, 0xB8]];
         let p = vec![vec![0x41, 0x00]];
-        s.push(&idr, 0, true);
+        s.push(&idr, Some(0), 0, true);
         for i in 1..10 {
-            s.push(&p, (i * 3000) as u64, false);
+            s.push(&p, Some((i * 3000) as u64), 0, false);
         }
         assert_eq!(s.generation(), 0);
         assert!(!s.open_segment_first_of_generation());
@@ -817,12 +1235,12 @@ mod tests {
         // happens until an IDR.
         s.rotate_track(VideoTrack::from_h264(vec![0x67, 0x64, 0x00, 0x1F], vec![0x68, 0xEE]));
         assert!(s.rotation_pending());
-        let out = s.push(&p, 30_000, false);
+        let out = s.push(&p, Some(30_000), 0, false);
         assert!(out.completed_video.is_none());
         assert_eq!(s.generation(), 0);
 
         // Well short of the 2 s target, the IDR still cuts.
-        let out = s.push(&idr, 33_000, true);
+        let out = s.push(&idr, Some(33_000), 0, true);
         let seg = out.completed_video.expect("the rotation forces a cut");
         assert_eq!(seg.generation, 0, "the closed segment is the old generation");
         assert!(!seg.first_of_generation);
@@ -836,9 +1254,9 @@ mod tests {
 
         // The next ordinary cut carries the mark, and only that one does.
         for i in 1..61 {
-            s.push(&p, 33_000 + (i * 3000) as u64, false);
+            s.push(&p, Some(33_000 + (i * 3000) as u64), 0, false);
         }
-        let out = s.push(&idr, 33_000 + 2 * 90_000, true);
+        let out = s.push(&idr, Some(33_000 + 2 * 90_000), 0, true);
         let seg = out.completed_video.expect("an ordinary cut");
         assert_eq!(seg.generation, 1);
         assert!(seg.first_of_generation);
@@ -854,23 +1272,25 @@ mod tests {
         let mut s = VideoSegmenter::new(v, 2.0);
         let idr = vec![vec![0x65, 0xB8]];
         let p = vec![vec![0x41, 0x00]];
-        s.push(&idr, 0, true);
-        for i in 1..61 {
-            s.push(&p, (i * 3000) as u64, false);
+        s.push(&idr, Some(0), 0, true);
+        // 59 frames after each IDR, so the next IDR is the 60th: one more
+        // would share the IDR's timestamp.
+        for i in 1..60 {
+            s.push(&p, Some((i * 3000) as u64), 0, false);
         }
-        let a = s.push(&idr, 2 * 90_000, true).completed_video.expect("A");
+        let a = s.push(&idr, Some(2 * 90_000), 0, true).completed_video.expect("A");
         assert_eq!(a.generation, 0);
         s.bump_generation();
         assert!(!s.open_segment_first_of_generation());
-        for i in 1..61 {
-            s.push(&p, 2 * 90_000 + (i * 3000) as u64, false);
+        for i in 1..60 {
+            s.push(&p, Some(2 * 90_000 + (i * 3000) as u64), 0, false);
         }
-        let b = s.push(&idr, 4 * 90_000, true).completed_video.expect("B");
+        let b = s.push(&idr, Some(4 * 90_000), 0, true).completed_video.expect("B");
         assert_eq!(b.generation, 1);
         assert!(!b.first_of_generation);
         assert_eq!(b.codec, VideoCodec::H264);
         assert_eq!(b.first_pending_dts_90k, 2 * 90_000, "nothing was drained: the tail is the segment");
-        assert_eq!(s.last_dts_90k(), Some(4 * 90_000));
+        assert_eq!(s.newest_pts_90k(), Some(4 * 90_000));
     }
 
     /// On the low-latency path chunks are drained as they fill, so what the
@@ -882,9 +1302,9 @@ mod tests {
         let mut s = VideoSegmenter::new(v, 2.0);
         let idr = vec![vec![0x65, 0xB8]];
         let p = vec![vec![0x41, 0x00]];
-        s.push(&idr, 0, true);
+        s.push(&idr, Some(0), 0, true);
         for i in 1..50 {
-            s.push(&p, (i * 3600) as u64, false); // 25 fps
+            s.push(&p, Some((i * 3600) as u64), 0, false); // 25 fps
         }
         // 500 ms chunks: three go out, at frames 0..13, 13..26, 26..39.
         let mut drained = 0;
@@ -894,7 +1314,7 @@ mod tests {
         assert_eq!(drained, 3);
         let tail_first = s.samples[0].dts;
         assert_eq!(tail_first, 39 * 3600);
-        let seg = s.push(&idr, 50 * 3600, true).completed_video.expect("the cut");
+        let seg = s.push(&idr, Some(50 * 3600), 0, true).completed_video.expect("the cut");
         assert_eq!(seg.first_pending_dts_90k, tail_first);
         assert_eq!(seg.base_dts_90k, 0, "the segment still starts where it started");
         let tail: u64 = seg.duration_90k;
@@ -908,7 +1328,7 @@ mod tests {
         let v = VideoTrack::from_h264(vec![0x67, 0x42, 0xC0, 0x1E], vec![0x68, 0xCE]);
         let mut s = VideoSegmenter::new(v, 2.0);
         s.rotate_track(VideoTrack::from_h264(vec![0x67, 0x64, 0x00, 0x1F], vec![0x68, 0xEE]));
-        let out = s.push(&[vec![0x65, 0xB8]], 0, true);
+        let out = s.push(&[vec![0x65, 0xB8]], Some(0), 0, true);
         assert!(out.completed_video.is_none());
         assert!(out.new_segment_started);
         assert_eq!(s.generation(), 1);
@@ -938,15 +1358,15 @@ mod tests {
         assert_eq!(s.open_segment_base_dts_90k(), None);
 
         let gop = 90_000 + 45_000; // 1.5 s
-        s.push(&idr, 0, true);
+        s.push(&idr, Some(0), 0, true);
         assert_eq!(s.open_segment_base_dts_90k(), Some(0));
         // 1.5 s in: past a GOP, short of the 2 s target, so no cut.
-        assert!(s.push(&idr, gop, true).completed_video.is_none());
+        assert!(s.push(&idr, Some(gop), 0, true).completed_video.is_none());
         assert_eq!(s.open_segment_base_dts_90k(), Some(0));
 
         // 3 s in: the first IDR at or past the target closes the segment.
         let seg = s
-            .push(&idr, 2 * gop, true)
+            .push(&idr, Some(2 * gop), 0, true)
             .completed_video
             .expect("the second IDR past the target closes the segment");
         assert_eq!(seg.base_dts_90k, 0);
@@ -962,7 +1382,7 @@ mod tests {
         // and an off-by-one in either direction would still land somewhere
         // plausible.
         let seg = s
-            .push(&idr, 4 * gop, true)
+            .push(&idr, Some(4 * gop), 0, true)
             .completed_video
             .expect("segment two closes on the same rule");
         assert_eq!(seg.base_dts_90k, 2 * gop);

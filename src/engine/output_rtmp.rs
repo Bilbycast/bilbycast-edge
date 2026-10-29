@@ -461,7 +461,7 @@ async fn publish_loop(
 
         for frame in frames {
             match frame {
-                DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known } => {
+                DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known, .. } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
                     if process_video_frame(
                         VideoFrameSource::H264 { nalus: &nalus, is_keyframe, pts_known },
@@ -483,7 +483,7 @@ async fn publish_loop(
                         // Success (or transient skip); nothing else to do.
                     }
                 }
-                DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known } => {
+                DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known, .. } => {
                     let ts_ms = pts_to_ms(pts, &mut base_pts);
                     if process_video_frame(
                         VideoFrameSource::H265 { nalus: &nalus, is_keyframe, pts_known },

@@ -30,13 +30,14 @@
 //!   Opus surfaces `replay_export_format_unsupported` because
 //!   `engine::ts_demux` doesn't yet extract Opus PES payload.
 //! - **PTS == DTS assumption, on the fallback path only.** ts_demux
-//!   recovers PTS but not DTS. The all-intra re-encode is unaffected: the
+//!   surfaces each picture's DTS (`DemuxedFrame::H264::dts`, edge#156), but
+//!   this exporter does not read it yet. The all-intra re-encode is unaffected: the
 //!   decoder is fed in the order the transport carried the frames and its
 //!   output is labelled in display order, and what it emits has no B-frames.
 //!   When the re-encode is unavailable the source samples are written in
 //!   display order with DTS == PTS, so a B-frame source (most main / high
-//!   profile broadcast) may decode in the wrong order in some players. The
-//!   follow-up to recover DTS through PES parsing is tracked separately.
+//!   profile broadcast) may decode in the wrong order in some players.
+//!   Writing the fallback in decode order from that DTS is a follow-up.
 //! - **The two tracks open on the same instant, by PTS.** A transport
 //!   stream muxes video ahead of its PTS by the VBV delay and audio by much
 //!   less, so at any byte position the first audio frame is earlier than the

@@ -1123,7 +1123,7 @@ given: a clip opening on an open-GOP random access point (an HEVC CRA, whose
 leading pictures reference the GOP before the cut) has those pictures dropped by
 the decoder, so every later frame took the label of the one ahead of it and the
 whole clip — and the audio aligned against it — shifted by the pictures dropped. Only the no-encoder fallback
-assumes PTS == DTS (DTS recovery via PES parsing is a follow-up). The audio and
+assumes PTS == DTS: the demuxer surfaces each picture's DTS since edge#156, but this path does not use it yet. The audio and
 video tracks are aligned **by PTS**: a transport stream muxes video ahead of
 its PTS by the VBV delay and audio by much less, so the first audio frame in a
 range is earlier than the first picture by hundreds of milliseconds, and it is

@@ -83,7 +83,7 @@ pub struct AudioReencoder {
     input_anchor_pts: Option<u64>,
     input_since_anchor: u64,
     input_sr: u32,
-    /// How far the newest video DTS runs ahead of the newest audio PTS, the
+    /// How far the newest video PTS runs ahead of the newest audio PTS, the
     /// largest seen over the current run of real audio. A hardware encoder
     /// sends video ahead of its DTS by its VBV delay and audio close to its
     /// PTS, so filling silence to the picture's position would run it past
@@ -276,7 +276,7 @@ impl AudioReencoder {
     /// Produce silent AAC frames `(data, pts)` if the drop watchdog says real
     /// audio is absent or stalled — as many as it takes to bring the silence
     /// up to where the audio would be, given where the picture is
-    /// (`video_pts_90k`, the newest video DTS). Idempotent and cheap when
+    /// (`video_pts_90k`, the newest video PTS). Idempotent and cheap when
     /// audio is flowing: an empty vec when `silent_fallback` is off, when
     /// real audio arrived within the grace window, or when the silence has
     /// already reached the picture. The PTS on each frame is the encoder's
@@ -536,7 +536,7 @@ impl AudioReencoder {
 
     /// Reset the drop watchdog on a real source AAC frame so silence goes
     /// quiet for the grace window after it, and measure the picture's lead
-    /// over the audio — `video_pts_90k` is the newest video DTS — for the
+    /// over the audio — `video_pts_90k` is the newest video PTS — for the
     /// next fill to stop short by.
     pub fn mark_real_audio(&mut self, pts: u64, video_pts_90k: Option<u64>) {
         if let Some(sg) = self.silence.as_mut() {
@@ -787,12 +787,14 @@ impl VideoReencoder {
             (Some(n), Some(d)) => (true, (n, d)),
             _ => (false, crate::engine::video_encode_util::RATE_LOCK_FALLBACK),
         };
-        // B-frames are pinned off, as on RTMP: the segmenter takes each
-        // pushed timestamp as the sample's decode time and writes no
-        // composition offsets, so an encoder that reordered (x264 without
-        // `zerolatency`, or any hardware encoder asked for `bframes`) gave
-        // it display-order stamps in decode order — a timeline stepping
-        // back and sample durations of zero.
+        // B-frames are pinned off, as on RTMP: this path hands the segmenter
+        // each frame's presentation stamp and no decode time, so it writes
+        // the frame at that stamp with no composition offset. An encoder
+        // that reordered (x264 without `zerolatency`, or any hardware
+        // encoder asked for `bframes`) would give it display-order stamps in
+        // decode order — a timeline stepping back. (Passthrough carries the
+        // source's DTS and its offsets since edge#156; the re-encoder does
+        // not surface its packets' DTS.)
         let mut cfg = cfg.clone();
         if cfg.bframes.unwrap_or(0) != 0 {
             tracing::warn!(

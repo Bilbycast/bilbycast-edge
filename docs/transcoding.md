@@ -432,7 +432,7 @@ Required whenever:
 On CMAF the silence is **measured against the picture, not ticked by
 the clock**. The 500 ms grace is the trigger; once it has elapsed, each
 tick lays down as much silence as it takes to bring the audio up to
-where the audio would be — the newest video DTS less the picture's lead
+where the audio would be — the newest video PTS less the picture's lead
 over the audio, measured over the preceding run of real audio (a
 hardware encoder sends video ahead of its DTS by its VBV delay) — and no
 further. So a delivery stall inserts nothing (neither track moves), a
@@ -1844,9 +1844,11 @@ commit message or release note and delete the bullet.
      …): each is found by its counter, and an entry 32 frames behind the one
      coming back is taken as dropped (all those behind it were, and every
      B-frame lost its PTS). **CMAF pins `bframes` to 0**, as RTMP does, and
-     warns `cmaf_bframes_unsupported`: its segmenter takes each stamp as
-     the sample's decode time and writes no composition offsets, so
-     display-order stamps in decode order stepped its timeline back.
+     warns `cmaf_bframes_unsupported`: the re-encode path hands the segmenter
+     each frame's presentation stamp and no decode time, so it writes no
+     composition offsets, and display-order stamps in decode order would
+     step its timeline back. (CMAF *passthrough* of a B-frame source carries
+     the source's DTS and offsets — edge#156.)
    - **CMAF's default GOP tiles the segment** at the rate the encoder
      opens at (`cmaf::encode::cmaf_default_gop`): the fewest GOPs of at
      most 2 s that cover `segment_duration_secs`, each rounded **up** to a
@@ -1903,8 +1905,9 @@ commit message or release note and delete the bullet.
    to 0 (the Enhanced-RTMP HEVC path has no CTS field at all), so a
    reordering encoder would drive DTS backwards and most ingests answer that
    by dropping the publisher. The CMAF re-encode pins it too
-   (`cmaf_bframes_unsupported`): the segmenter takes each re-encoded
-   frame's stamp as its decode time and writes no composition offsets.
+   (`cmaf_bframes_unsupported`): the re-encode path hands the segmenter each
+   frame's presentation stamp and no decode time, so it writes no
+   composition offsets.
    (WebRTC and clip export were already pinned.) Elsewhere
    `max_b_frames = 0` is the default to simplify decoder interop. Enabling them later would improve quality at a
    given bitrate.
