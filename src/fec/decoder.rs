@@ -27,6 +27,16 @@
 //!   timestamp as a best-effort value.
 //! - Recovery is disabled while the matrix is uninitialised, so the first
 //!   cycle after startup can drop losses without repair.
+//! - The header names a column or row in 3 bits, so a parity packet is
+//!   filed under its index modulo 8. The encoder sends none for columns or
+//!   rows from 8 up ([`super::encoder::FEC_INDEXED_GROUPS`]); one from an
+//!   older encoder that did is filed in the wrong slot.
+//! - A packet rebuilt here is usually rebuilt after newer ones were
+//!   received. What the caller does with it is the caller's: a single-leg
+//!   RTP input publishes only one ahead of everything already published
+//!   (`engine::input_rtp::RepairOrder`), using [`FecDecoder::holds_payload`]
+//!   to drop a received datagram the matrix already holds, and its own
+//!   memory of recent repairs for one whose matrix has since closed.
 use bytes::Bytes;
 
 use crate::engine::packet::RtpPacket;
@@ -120,6 +130,20 @@ impl FecDecoder {
     #[allow(dead_code)]
     pub fn recovered_count(&self) -> u64 {
         self.recovered_count
+    }
+
+    /// Whether the current matrix already holds exactly this media
+    /// datagram's payload under its sequence number: a copy of a packet
+    /// received before, or one FEC has already rebuilt. Ask it before
+    /// [`Self::process_media`], which files the datagram by the same rule
+    /// (a datagram outside the window starts a new matrix, so is never held).
+    pub fn holds_payload(&self, seq: u16, data: &[u8]) -> bool {
+        if !self.initialized || data.len() <= RTP_HEADER_LEN {
+            return false;
+        }
+        let diff = seq.wrapping_sub(self.base_seq);
+        diff < self.matrix_size
+            && self.matrix.cell(diff as usize) == Some(&data[RTP_HEADER_LEN..])
     }
 
     /// Process an incoming RTP media packet.
@@ -562,5 +586,262 @@ mod tests {
         let mut dec = FecDecoder::new(2, 2);
         assert!(dec.process_fec(&[0, 1, 2]).is_empty());
         assert!(dec.process_fec(&[0; 32]).is_empty()); // wrong magic
+    }
+
+    // ── edge#206: encoder and decoder end to end ────────────────────────
+
+    /// A payload of `len` bytes, distinct per sequence number.
+    fn body(seq: u16, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (seq as usize * 131 + i * 7 + (i >> 3) * 29) as u8 ^ (seq >> 8) as u8)
+            .collect()
+    }
+
+    enum Wire {
+        Media(u16, Bytes),
+        Fec(Bytes),
+    }
+
+    /// What an output sends for `seqs`: each media datagram, then the FEC
+    /// it completes. A header-only datagram is not given to the encoder, as
+    /// `output_rtp::fec_for_datagram` does not.
+    fn send(l: u8, d: u8, seqs: &[u16], len: impl Fn(u16) -> usize) -> Vec<Wire> {
+        let mut enc = FecEncoder::new(l, d, Arc::new(AtomicU64::new(0)));
+        let mut wire = Vec::new();
+        for &seq in seqs {
+            let p = body(seq, len(seq));
+            let fec = if p.is_empty() { Vec::new() } else { enc.process(seq, &p) };
+            wire.push(Wire::Media(seq, make_rtp_packet(seq, 0, &p)));
+            wire.extend(fec.into_iter().map(Wire::Fec));
+        }
+        wire
+    }
+
+    /// Replay `wire` through a fresh decoder, leaving out the media of
+    /// `lost` and the FEC datagrams `drop_fec` names (by their order among
+    /// the FEC). Asserts every packet the decoder rebuilds is byte for byte
+    /// the one sent under its sequence number, and returns their numbers.
+    fn receive(
+        l: u8,
+        d: u8,
+        wire: &[Wire],
+        lost: &[u16],
+        drop_fec: impl Fn(usize) -> bool,
+    ) -> Vec<u16> {
+        let sent: std::collections::HashMap<u16, &Bytes> = wire
+            .iter()
+            .filter_map(|w| match w {
+                Wire::Media(s, b) => Some((*s, b)),
+                Wire::Fec(_) => None,
+            })
+            .collect();
+        let mut dec = FecDecoder::new(l, d);
+        let mut rebuilt = Vec::new();
+        let mut fec_index = 0;
+        for w in wire {
+            let out = match w {
+                Wire::Media(seq, data) => {
+                    if lost.contains(seq) {
+                        continue;
+                    }
+                    let mut out = dec.process_media(*seq, 0, data);
+                    out.remove(0);
+                    out
+                }
+                Wire::Fec(f) => {
+                    fec_index += 1;
+                    if drop_fec(fec_index - 1) {
+                        continue;
+                    }
+                    dec.process_fec(f)
+                }
+            };
+            for p in out {
+                let original = sent
+                    .get(&p.sequence_number)
+                    .unwrap_or_else(|| panic!("rebuilt seq {} was never sent", p.sequence_number));
+                assert_eq!(
+                    &p.data[RTP_HEADER_LEN..],
+                    &original[RTP_HEADER_LEN..],
+                    "seq {} rebuilt with other bytes than were sent",
+                    p.sequence_number,
+                );
+                rebuilt.push(p.sequence_number);
+            }
+        }
+        rebuilt
+    }
+
+    /// Sequence numbers with an upstream gap of 3 inside the second
+    /// matrix (what a 2022-7 output forwarding RTP sends when its upstream
+    /// lost packets): both ends file every cell at seq - SNBase, so a loss
+    /// in a whole column is rebuilt exactly and nothing is made up.
+    #[test]
+    fn encoder_and_decoder_agree_across_an_upstream_gap() {
+        let seqs: Vec<u16> = (1000u16..1048).filter(|s| !(1018..=1020).contains(s)).collect();
+        let wire = send(4, 4, &seqs, |_| 16);
+        assert!(receive(4, 4, &wire, &[], |_| false).is_empty(), "no loss, no rebuild");
+        // 1025: column 1 of the gapped matrix (1017/1021/1025/1029, all sent).
+        // 1040: the third matrix.
+        assert_eq!(receive(4, 4, &wire, &[1025, 1040], |_| false), vec![1025, 1040]);
+        // 1022 shares column 2 and row 1 with the gap: nothing protects it.
+        assert!(receive(4, 4, &wire, &[1022], |_| false).is_empty());
+    }
+
+    /// L=1: the encoder sends no row FEC, so a decoder that has closed a
+    /// complete matrix never rebuilds one of its packets a second time.
+    #[test]
+    fn one_column_stream_is_never_duplicated() {
+        let seqs: Vec<u16> = (2000u16..2012).collect();
+        let wire = send(1, 4, &seqs, |_| 16);
+        let mut dec = FecDecoder::new(1, 4);
+        let mut published = 0;
+        for w in &wire {
+            published += match w {
+                Wire::Media(seq, data) => dec.process_media(*seq, 0, data).len(),
+                Wire::Fec(f) => dec.process_fec(f).len(),
+            };
+        }
+        assert_eq!(published, seqs.len(), "every packet published exactly once");
+        assert_eq!(receive(1, 4, &wire, &[2006], |_| false), vec![2006]);
+    }
+
+    /// Matrices larger than the 3-bit header index can name (10x10, the
+    /// documented shape, and 20x20): column 8's parity is never filed in
+    /// column 0's slot, so no rebuild is ever made from another group's
+    /// parity, and a packet with neither a column nor a row FEC stays lost.
+    #[test]
+    fn matrices_past_eight_never_fabricate_a_packet() {
+        for (l, d) in [(10u8, 10u8), (20, 20)] {
+            let (lu, du) = (l as u16, d as u16);
+            let base = 64_000u16;
+            let seqs: Vec<u16> = (0..2 * lu * du).map(|i| base.wrapping_add(i)).collect();
+            let wire = send(l, d, &seqs, |_| 24);
+            let at = |m: u16, r: u16, c: u16| base.wrapping_add(m * lu * du + r * lu + c);
+            assert!(receive(l, d, &wire, &[], |_| false).is_empty());
+            // Two losses in column 0, rows 0 and 1: their rows rebuild them.
+            let mut got = receive(l, d, &wire, &[at(1, 0, 0), at(1, 1, 0)], |_| false);
+            got.sort_unstable();
+            assert_eq!(got, vec![at(1, 0, 0), at(1, 1, 0)], "{l}x{d}");
+            // One loss in column 0 and that column's FEC lost too: row 0.
+            let col0 = |i: usize| i == (l.min(8) + d.min(8)) as usize; // matrix 1's first FEC
+            assert_eq!(receive(l, d, &wire, &[at(1, 0, 0)], col0), vec![at(1, 0, 0)], "{l}x{d}");
+            // Two losses in row 0: columns 0 and 1 rebuild them.
+            let mut got = receive(l, d, &wire, &[at(1, 0, 0), at(1, 0, 1)], |_| false);
+            got.sort_unstable();
+            assert_eq!(got, vec![at(1, 0, 0), at(1, 0, 1)], "{l}x{d}");
+            // Column 8, last row: no column FEC (index 8) and no row FEC
+            // (row >= 8): stays lost, and nothing is made up for it.
+            assert!(receive(l, d, &wire, &[at(1, du - 1, 8)], |_| false).is_empty(), "{l}x{d}");
+            // Column 9, row 2: row 2's FEC rebuilds it.
+            assert_eq!(receive(l, d, &wire, &[at(1, 2, 9)], |_| false), vec![at(1, 2, 9)]);
+        }
+    }
+
+    /// A header-only datagram, mid-matrix and as a matrix's last cell: the
+    /// decoder files nothing for it, so the encoder protects nothing that
+    /// holds it (a matrix whose last cell is header-only sends no row FEC),
+    /// nothing is made up, and the next matrix starts at the same number on
+    /// both ends.
+    #[test]
+    fn header_only_datagrams_are_never_protected_or_fabricated() {
+        let seqs: Vec<u16> = (3000u16..3032).collect();
+        let len = |s: u16| if s == 3005 || s == 3015 { 0 } else { 16 };
+        let wire = send(4, 4, &seqs, len);
+        assert!(receive(4, 4, &wire, &[], |_| false).is_empty());
+        // Column 1 holds 3005; row 0 has no FEC, the matrix's last cell
+        // being header-only.
+        assert!(receive(4, 4, &wire, &[3001], |_| false).is_empty());
+        // Column 2 is whole.
+        assert_eq!(receive(4, 4, &wire, &[3002], |_| false), vec![3002]);
+        // The next matrix, at 3016 on both ends.
+        assert_eq!(receive(4, 4, &wire, &[3016], |_| false), vec![3016]);
+        assert_eq!(receive(4, 4, &wire, &[3031], |_| false), vec![3031]);
+    }
+
+    /// The sender steps back mid-matrix (an upstream restarting on an
+    /// earlier number) and the first packet after the step is lost on the
+    /// link: the decoder's FEC-driven rebase lands on the same matrix the
+    /// encoder opened there, so the loss is rebuilt exactly.
+    #[test]
+    fn a_step_back_with_its_first_packet_lost_rebuilds_exactly() {
+        let seqs: Vec<u16> = (4000u16..4011).chain(3990..4040).collect();
+        let wire = send(4, 4, &seqs, |_| 16);
+        assert!(receive(4, 4, &wire, &[], |_| false).is_empty());
+        let got = receive(4, 4, &wire, &[3990], |_| false);
+        assert!(got.contains(&3990), "{got:?}");
+        assert!(got.iter().all(|s| *s == 3990), "{got:?}");
+    }
+
+    /// The sender steps back a little, into the open matrix, with new bytes
+    /// under numbers it already sent (L=2 D=4: 100..=105, then 102..=111
+    /// changed) -- an upstream restart a 2022-7 output forwards unchanged.
+    /// A receiver holds whichever copy of such a number reached it, so the
+    /// encoder sends no FEC over those cells: whatever two datagrams the
+    /// link loses, nothing rebuilt differs from a datagram sent under its
+    /// number, and a loss the untouched rows cover is still rebuilt.
+    #[test]
+    fn a_number_resent_with_other_bytes_is_never_rebuilt_from_the_other_copy() {
+        let sent: Vec<(u16, Bytes)> = (100u16..106)
+            .map(|s| (s, body(s, 16)))
+            .chain((102u16..112).map(|s| (s, body(s ^ 0x5A5A, 16))))
+            .map(|(s, p)| (s, make_rtp_packet(s, 0, &p)))
+            .collect();
+        let mut enc = FecEncoder::new(2, 4, Arc::new(AtomicU64::new(0)));
+        let mut wire = Vec::new();
+        for (i, (seq, dg)) in sent.iter().enumerate() {
+            wire.push((Some(i), *seq, dg.clone()));
+            for f in enc.process(*seq, &dg[RTP_HEADER_LEN..]) {
+                wire.push((None, 0, f));
+            }
+        }
+        let rebuilt_without = |lost: &[usize]| {
+            let mut dec = FecDecoder::new(2, 4);
+            let mut rebuilt = Vec::new();
+            for (index, seq, dg) in &wire {
+                let out = match index {
+                    Some(i) if lost.contains(i) => continue,
+                    Some(_) => {
+                        let mut out = dec.process_media(*seq, 0, dg);
+                        out.remove(0);
+                        out
+                    }
+                    None => dec.process_fec(dg),
+                };
+                for p in out {
+                    assert!(
+                        sent.iter().any(|(s, d)| *s == p.sequence_number
+                            && d[RTP_HEADER_LEN..] == p.data[RTP_HEADER_LEN..]),
+                        "seq {} rebuilt with bytes never sent under it (lost {lost:?})",
+                        p.sequence_number,
+                    );
+                    rebuilt.push(p.sequence_number);
+                }
+            }
+            rebuilt
+        };
+        for i in 0..sent.len() {
+            for j in i..sent.len() {
+                rebuilt_without(&[i, j]);
+            }
+        }
+        // The first 102 and the (only) 106: row 3 (106/107, never re-sent)
+        // still rebuilds 106.
+        assert_eq!(rebuilt_without(&[2, 10]), vec![106]);
+    }
+
+    /// `holds_payload` tells a datagram the matrix already holds -- received
+    /// before, or rebuilt -- from a new one, and from one with other bytes.
+    #[test]
+    fn holds_payload_tells_a_held_datagram() {
+        let mut dec = FecDecoder::new(2, 4);
+        let a = make_rtp_packet(10, 0, &[1, 2, 3, 4]);
+        assert!(!dec.holds_payload(10, &a), "nothing held before the first media");
+        dec.process_media(10, 0, &a);
+        assert!(dec.holds_payload(10, &a));
+        assert!(!dec.holds_payload(10, &make_rtp_packet(10, 0, &[9, 9, 9, 9])));
+        assert!(!dec.holds_payload(11, &make_rtp_packet(11, 0, &[1, 2, 3, 4])));
+        assert!(!dec.holds_payload(10 + 8, &make_rtp_packet(18, 0, &[1, 2, 3, 4])), "outside the window");
+        assert!(!dec.holds_payload(10, &a[..RTP_HEADER_LEN]), "header only");
     }
 }

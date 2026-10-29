@@ -158,7 +158,6 @@ impl FecMatrix {
     }
 
     /// Borrow a cell payload if present.
-    #[allow(dead_code)]
     pub fn cell(&self, position: usize) -> Option<&[u8]> {
         self.cells
             .get(position)

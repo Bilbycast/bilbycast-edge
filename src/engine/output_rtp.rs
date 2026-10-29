@@ -11,10 +11,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use super::wire_emit::{AnchorSource, WireDatagram, WirePacingClass, spawn_wire_emitter};
+use super::wire_emit::{AnchorSource, WireDatagram, WirePacingClass, WireTxHandle, spawn_wire_emitter};
 
-use crate::config::models::RtpOutputConfig;
-use crate::fec::encoder::FecEncoder;
+use crate::config::models::{FecConfig, RtpOutputConfig};
+use crate::fec::encoder::{FEC_INDEXED_GROUPS, FecEncoder};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::socket::create_udp_output;
@@ -99,6 +99,127 @@ impl RtpWrapState {
     }
 }
 
+/// The FEC encoder an output with `fec_encode` runs, with a warning when
+/// its matrix is wider or deeper than the FEC header can name: columns and
+/// rows from [`FEC_INDEXED_GROUPS`] up carry no FEC of their own.
+fn new_fec_encoder(
+    output_id: &str,
+    fec: &FecConfig,
+    fec_sent_counter: Arc<AtomicU64>,
+) -> FecEncoder {
+    tracing::info!(
+        "FEC encode enabled for output '{}': L={} D={}",
+        output_id,
+        fec.columns,
+        fec.rows
+    );
+    if let Some(lost) = fec_groups_past_the_index(fec.columns, fec.rows) {
+        tracing::warn!(
+            "RTP output '{}': FEC {}x{} is larger than the FEC header can name ({n} columns, \
+             {n} rows): {lost}; use at most {n} columns and {n} rows",
+            output_id,
+            fec.columns,
+            fec.rows,
+            n = FEC_INDEXED_GROUPS,
+        );
+    }
+    FecEncoder::new(fec.columns, fec.rows, fec_sent_counter)
+}
+
+/// What an L x D matrix loses to the 3-bit FEC header index, or `None` when
+/// every column and row it sends FEC for can be named. A one-column matrix
+/// sends no row FEC at all, so its row count costs nothing.
+fn fec_groups_past_the_index(columns: u8, rows: u8) -> Option<&'static str> {
+    let cols_lost = columns > FEC_INDEXED_GROUPS;
+    let rows_lost = rows > FEC_INDEXED_GROUPS && columns > 1;
+    match (cols_lost, rows_lost) {
+        (true, true) => Some(
+            "columns from 8 up get no column FEC and rows from 8 up no row FEC, \
+             so a packet in both is unprotected",
+        ),
+        (true, false) => Some("columns from 8 up get no column FEC, so their packets are protected by their row only"),
+        (false, true) => Some("rows from 8 up get no row FEC, so their packets are protected by their column only"),
+        (false, false) => None,
+    }
+}
+
+/// SMPTE 2022-1 protection for one media datagram, exactly as it goes to
+/// the wire.
+///
+/// `fec::decoder` files a received datagram under the sequence number in
+/// its RTP header and XORs every byte after the first 12, so the encoder is
+/// given those two things -- not the broadcast item the datagram was made
+/// from, whose sequence number is the input's and whose bytes need not map
+/// one to one onto datagrams (edge#206). A header-only datagram is never
+/// filed by the decoder, so it is left out here too: its column and row go
+/// unprotected for that matrix on both ends.
+fn fec_for_datagram(encoder: &mut FecEncoder, datagram: &[u8]) -> Vec<Bytes> {
+    if datagram.len() <= RTP_HEADER_SIZE {
+        return Vec::new();
+    }
+    let seq = u16::from_be_bytes([datagram[2], datagram[3]]);
+    encoder.process(seq, &datagram[RTP_HEADER_SIZE..])
+}
+
+/// A datagram for the wire-emit queue. FEC rides the same queue: its bytes
+/// past the RTP-sized offset are XOR parity, so the pacer's PCR scan finds
+/// nothing and treats it as a between-PCR datagram (emit ASAP, riding the
+/// previous PCR anchor).
+fn wire_datagram(bytes: Bytes, recv_time_us: u64) -> WireDatagram {
+    WireDatagram {
+        bytes,
+        recv_time_us,
+        enqueue_us: 0,
+        target_tx_time_ns: None,
+        ts_offset: RTP_HEADER_SIZE,
+    }
+}
+
+/// Send one media datagram on a single-leg output, then the FEC it
+/// completes. The FEC is computed before the send, so a datagram the queue
+/// then drops is still protected: the receiver sees a loss FEC can repair,
+/// and every later cell keeps its place. A drop of either counts in
+/// `packets_dropped`.
+fn send_single(
+    wire_tx: &WireTxHandle,
+    fec_encoder: Option<&mut FecEncoder>,
+    bytes: Bytes,
+    recv_time_us: u64,
+    stats: &OutputStatsAccumulator,
+) {
+    let repair = fec_encoder.map(|e| fec_for_datagram(e, &bytes));
+    if wire_tx.try_send(wire_datagram(bytes, recv_time_us)).is_err() {
+        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    for fec_pkt in repair.into_iter().flatten() {
+        if wire_tx.try_send(wire_datagram(fec_pkt, recv_time_us)).is_err() {
+            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Send one media datagram on both legs of a 2022-7 output (the same bytes,
+/// a refcount bump), then the FEC it completes on both. Only a leg-1 media
+/// drop counts in `packets_dropped`, as leg 1 alone reports.
+fn send_dual(
+    leg1: &WireTxHandle,
+    leg2: &WireTxHandle,
+    fec_encoder: Option<&mut FecEncoder>,
+    bytes: Bytes,
+    recv_time_us: u64,
+    stats: &OutputStatsAccumulator,
+) {
+    let repair = fec_encoder.map(|e| fec_for_datagram(e, &bytes));
+    if leg1.try_send(wire_datagram(bytes.clone(), recv_time_us)).is_err() {
+        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = leg2.try_send(wire_datagram(bytes, recv_time_us));
+    for fec_pkt in repair.into_iter().flatten() {
+        let _ = leg1.try_send(wire_datagram(fec_pkt.clone(), recv_time_us));
+        let _ = leg2.try_send(wire_datagram(fec_pkt, recv_time_us));
+    }
+}
+
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// RTP packets out over a UDP socket. If FEC encode is configured,
 /// FEC packets are also generated and sent. If redundancy is configured,
@@ -145,8 +266,8 @@ pub fn spawn_rtp_output(
 ///
 /// Subscribes to the flow's broadcast channel and, for every received
 /// [`RtpPacket`], sends it as a UDP datagram to the configured destination
-/// address. If FEC encoding is enabled, additional FEC repair packets are
-/// generated and sent after each media packet.
+/// address. If FEC encoding is enabled, each FEC repair packet is generated
+/// from the datagrams as sent and follows the datagram that completes it.
 ///
 /// **Broadcast lag handling**: if this output cannot keep up with the input
 /// rate (e.g., due to transient network stalls), the broadcast receiver
@@ -209,8 +330,8 @@ async fn rtp_output_loop(
     );
 
     // RTP wrap state lives on the encoder task. Sequence + SSRC are
-    // owned here so FEC packets and media packets can share a coherent
-    // numbering space (FEC carries its own SSRC, separate seq).
+    // owned here; FEC is computed over the sequence numbers and bytes of
+    // the datagrams this builds (`send_single`), never the input's.
     let mut rtp_wrap = RtpWrapState::new();
 
     // Optional FEC encoder (SMPTE 2022-1).
@@ -219,19 +340,10 @@ async fn rtp_output_loop(
     // counter so the encoder can increment it internally and we periodically
     // copy the value back to the stats accumulator without borrow conflicts.
     let fec_sent_counter = Arc::new(AtomicU64::new(0));
-    let mut fec_encoder = config.fec_encode.as_ref().map(|fec_config| {
-        tracing::info!(
-            "FEC encode enabled for output '{}': L={} D={}",
-            config.id,
-            fec_config.columns,
-            fec_config.rows
-        );
-        FecEncoder::new(
-            fec_config.columns,
-            fec_config.rows,
-            fec_sent_counter.clone(),
-        )
-    });
+    let mut fec_encoder = config
+        .fec_encode
+        .as_ref()
+        .map(|fec| new_fec_encoder(&config.id, fec, fec_sent_counter.clone()));
 
     // Buffer for re-aligning raw TS data into 188-byte aligned datagrams.
     // SRT may deliver data in chunks that don't align to TS packet boundaries
@@ -637,16 +749,13 @@ async fn rtp_output_loop(
                         let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + ts_datagram_size);
                         buf.extend_from_slice(&header);
                         buf.extend_from_slice(&datagram);
-                        let dg = WireDatagram {
-                            bytes: Bytes::from(buf),
-                            recv_time_us: packet.recv_time_us,
-                            enqueue_us: 0,
-                            target_tx_time_ns: None,
-                            ts_offset: RTP_HEADER_SIZE,
-                        };
-                        if wire_tx.try_send(dg).is_err() {
-                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        }
+                        send_single(
+                            &wire_tx,
+                            fec_encoder.as_mut(),
+                            Bytes::from(buf),
+                            packet.recv_time_us,
+                            &stats,
+                        );
                     }
                 }
             } else {
@@ -663,48 +772,20 @@ async fn rtp_output_loop(
                 let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + inner_ts.len());
                 buf.extend_from_slice(&header);
                 buf.extend_from_slice(inner_ts);
-                let dg = WireDatagram {
-                    bytes: Bytes::from(buf),
-                    recv_time_us: packet.recv_time_us,
-                    enqueue_us: 0,
-                    target_tx_time_ns: None,
-                    ts_offset: RTP_HEADER_SIZE,
-                };
-                if wire_tx.try_send(dg).is_err() {
-                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                }
+                send_single(
+                    &wire_tx,
+                    fec_encoder.as_mut(),
+                    Bytes::from(buf),
+                    packet.recv_time_us,
+                    &stats,
+                );
             }
 
-            // Generate and send FEC packets if enabled. FEC packets
-            // are RTP-wrapped by the FecEncoder (separate SSRC,
-            // independent seq). Flow them through the same wire-emit
-            // instance — single socket owner, FEC paced as non-PCR
-            // datagrams (no PCR carried in FEC payloads).
-            if let Some(ref mut encoder) = fec_encoder {
-                let rtp_header_len = 12;
-                let payload = if packet.data.len() > rtp_header_len {
-                    &packet.data[rtp_header_len..]
-                } else {
-                    &packet.data[..]
-                };
-
-                let fec_packets = encoder.process(packet.sequence_number, payload);
-                for fec_pkt in fec_packets {
-                    let dg = WireDatagram {
-                        bytes: fec_pkt,
-                        recv_time_us: packet.recv_time_us,
-                        enqueue_us: 0,
-                        target_tx_time_ns: None,
-                        // FEC payload after the RTP header is XOR
-                        // parity, not TS — PCR scan correctly returns
-                        // None and the pacer treats FEC as between-PCR
-                        // (emit ASAP, riding the previous PCR anchor).
-                        ts_offset: RTP_HEADER_SIZE,
-                    };
-                    if wire_tx.try_send(dg).is_err() {
-                        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+            // FEC went out with each datagram it protects (`send_single`);
+            // publish the running count. FEC packets carry the BCFE magic,
+            // not an RTP header, and ride the same wire-emit instance as the
+            // media -- single socket owner, paced as non-PCR datagrams.
+            if fec_encoder.is_some() {
                 let sent = fec_sent_counter.load(Ordering::Relaxed);
                 stats.fec_packets_sent.store(sent, Ordering::Relaxed);
             }
@@ -832,19 +913,10 @@ async fn rtp_output_redundant_loop(
 
     // FEC encoder (shared — same repair data sent to both legs)
     let fec_sent_counter = Arc::new(AtomicU64::new(0));
-    let mut fec_encoder = config.fec_encode.as_ref().map(|fec_config| {
-        tracing::info!(
-            "FEC encode enabled for output '{}': L={} D={}",
-            config.id,
-            fec_config.columns,
-            fec_config.rows
-        );
-        FecEncoder::new(
-            fec_config.columns,
-            fec_config.rows,
-            fec_sent_counter.clone(),
-        )
-    });
+    let mut fec_encoder = config
+        .fec_encode
+        .as_ref()
+        .map(|fec| new_fec_encoder(&config.id, fec, fec_sent_counter.clone()));
 
     // Raw TS re-alignment buffer (shared for both legs)
     let mut ts_realign_buf = BytesMut::new();
@@ -1030,81 +1102,36 @@ async fn rtp_output_redundant_loop(
                         let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + ts_datagram_size);
                         buf.extend_from_slice(&header);
                         buf.extend_from_slice(&datagram);
-                        let bytes = Bytes::from(buf);
                         // Both legs receive the same Bytes (refcount
                         // bump only — no copy).
-                        let dg1 = WireDatagram {
-                            bytes: bytes.clone(),
-                            recv_time_us: packet.recv_time_us,
-                            enqueue_us: 0,
-                            target_tx_time_ns: None,
-                            ts_offset: RTP_HEADER_SIZE,
-                        };
-                        let dg2 = WireDatagram {
-                            bytes,
-                            recv_time_us: packet.recv_time_us,
-                            enqueue_us: 0,
-                            target_tx_time_ns: None,
-                            ts_offset: RTP_HEADER_SIZE,
-                        };
-                        if wire_tx_leg1.try_send(dg1).is_err() {
-                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let _ = wire_tx_leg2.try_send(dg2);
+                        send_dual(
+                            &wire_tx_leg1,
+                            &wire_tx_leg2,
+                            fec_encoder.as_mut(),
+                            Bytes::from(buf),
+                            packet.recv_time_us,
+                            &stats,
+                        );
                     }
                 }
             } else {
-                let bytes = Bytes::from(packet.data.to_vec());
-                let dg1 = WireDatagram {
-                    bytes: bytes.clone(),
-                    recv_time_us: packet.recv_time_us,
-                    enqueue_us: 0,
-                    target_tx_time_ns: None,
-                    ts_offset: RTP_HEADER_SIZE,
-                };
-                let dg2 = WireDatagram {
-                    bytes,
-                    recv_time_us: packet.recv_time_us,
-                    enqueue_us: 0,
-                    target_tx_time_ns: None,
-                    ts_offset: RTP_HEADER_SIZE,
-                };
-                if wire_tx_leg1.try_send(dg1).is_err() {
-                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                let _ = wire_tx_leg2.try_send(dg2);
+                // Already-RTP data goes out as it came, upstream header
+                // and all, so FEC is over the upstream sequence numbers --
+                // which may skip, repeat or step back; the encoder files
+                // each datagram by its number, as the decoder does.
+                send_dual(
+                    &wire_tx_leg1,
+                    &wire_tx_leg2,
+                    fec_encoder.as_mut(),
+                    Bytes::from(packet.data.to_vec()),
+                    packet.recv_time_us,
+                    &stats,
+                );
             }
 
-            // FEC: generate identical FEC packets, dispatch to both
-            // legs through their wire-emit instances.
-            if let Some(ref mut encoder) = fec_encoder {
-                let rtp_header_len = 12;
-                let payload = if packet.data.len() > rtp_header_len {
-                    &packet.data[rtp_header_len..]
-                } else {
-                    &packet.data[..]
-                };
-
-                let fec_packets = encoder.process(packet.sequence_number, payload);
-                for fec_pkt in fec_packets {
-                    let bytes = fec_pkt;
-                    let dg1 = WireDatagram {
-                        bytes: bytes.clone(),
-                        recv_time_us: packet.recv_time_us,
-                        enqueue_us: 0,
-                        target_tx_time_ns: None,
-                        ts_offset: RTP_HEADER_SIZE,
-                    };
-                    let dg2 = WireDatagram {
-                        bytes,
-                        recv_time_us: packet.recv_time_us,
-                        enqueue_us: 0,
-                        target_tx_time_ns: None,
-                        ts_offset: RTP_HEADER_SIZE,
-                    };
-                    let _ = wire_tx_leg1.try_send(dg1);
-                    let _ = wire_tx_leg2.try_send(dg2);
-                }
+            // FEC went out on both legs with each datagram it protects
+            // (`send_dual`); publish the running count.
+            if fec_encoder.is_some() {
                 let sent = fec_sent_counter.load(Ordering::Relaxed);
                 stats.fec_packets_sent.store(sent, Ordering::Relaxed);
             }
@@ -1184,5 +1211,398 @@ mod tests {
         // (cold start — nothing better to claim).
         let mut cold = RtpWrapState::new();
         assert_eq!(ts_of(&cold.build_header(0)), 0);
+    }
+
+    // ── edge#206: FEC over the datagrams as sent ────────────────────────
+
+    use crate::fec::decoder::{FecDecoder, is_fec_packet};
+    use crate::fec::{FEC_HEADER_LEN, FEC_MAGIC};
+
+    /// One RTP datagram the way the output builds it.
+    fn datagram(wrap: &mut RtpWrapState, payload: &[u8]) -> Vec<u8> {
+        let mut dg = wrap.build_header(90_000).to_vec();
+        dg.extend_from_slice(payload);
+        dg
+    }
+
+    fn seq_of(dg: &[u8]) -> u16 {
+        u16::from_be_bytes([dg[2], dg[3]])
+    }
+
+    /// (SNBase, is_column, index, parity) of a FEC datagram.
+    fn fec_fields(f: &[u8]) -> (u16, bool, u8, &[u8]) {
+        let b = &f[FEC_MAGIC.len()..];
+        (u16::from_be_bytes([b[0], b[1]]), b[8] & 0x40 != 0, b[8] & 0x07, &b[FEC_HEADER_LEN..])
+    }
+
+    /// The start-up warning names only what a shape actually loses to the
+    /// 3-bit header index.
+    #[test]
+    fn the_index_warning_names_only_what_is_lost() {
+        assert_eq!(fec_groups_past_the_index(8, 8), None);
+        assert_eq!(fec_groups_past_the_index(1, 20), None, "L=1 sends no row FEC");
+        assert!(fec_groups_past_the_index(10, 10).unwrap().contains("a packet in both is unprotected"));
+        assert!(fec_groups_past_the_index(10, 4).unwrap().contains("by their row only"));
+        assert!(fec_groups_past_the_index(4, 10).unwrap().contains("by their column only"));
+    }
+
+    /// The FEC goes out under the wire sequence number and covers the bytes
+    /// after the RTP header -- not the input item's number or bytes.
+    #[test]
+    fn fec_for_datagram_uses_the_wire_seq_and_bytes() {
+        let mut wrap = RtpWrapState::new();
+        wrap.seq = 0xFFFE; // across the wrap
+        let mut enc = FecEncoder::new(1, 4, Arc::new(AtomicU64::new(0)));
+        let mut sent = Vec::new();
+        let mut fec = Vec::new();
+        for i in 0..4u8 {
+            let dg = datagram(&mut wrap, &[i.wrapping_mul(37) ^ 0x47; 1316]);
+            fec.extend(fec_for_datagram(&mut enc, &dg));
+            sent.push(dg);
+        }
+        assert_eq!(fec.len(), 1);
+        let (sn_base, is_column, index, parity) = fec_fields(&fec[0]);
+        assert_eq!(sn_base, 0xFFFE);
+        assert!(is_column);
+        assert_eq!(index, 0);
+        let mut xor = vec![0u8; 1316];
+        for dg in &sent {
+            for (x, b) in xor.iter_mut().zip(&dg[RTP_HEADER_SIZE..]) {
+                *x ^= b;
+            }
+        }
+        assert_eq!(parity, &xor[..]);
+    }
+
+    /// A header-only datagram is never filed by the decoder, so the encoder
+    /// leaves it out too: its matrix sends nothing that covers it, and the
+    /// next matrix starts at the same number on both ends.
+    #[test]
+    fn fec_for_datagram_leaves_header_only_datagrams_unprotected() {
+        let mut wrap = RtpWrapState::new();
+        let first = wrap.seq;
+        let mut enc = FecEncoder::new(1, 4, Arc::new(AtomicU64::new(0)));
+        let mut fec = Vec::new();
+        for i in 0..8u16 {
+            let payload: &[u8] = if i == 1 { &[] } else { &[0x47; 188] };
+            fec.extend(fec_for_datagram(&mut enc, &datagram(&mut wrap, payload)));
+        }
+        assert_eq!(fec.len(), 1, "only the second matrix is protected");
+        assert_eq!(fec_fields(&fec[0]).0, first.wrapping_add(4));
+    }
+
+    // Loopback runs of the real output loops: what goes on the wire, then a
+    // FEC decoder replaying it with one datagram lost.
+
+    /// `n` 188-byte TS packets on PID 0x100, each with distinct payload bytes.
+    fn ts_stream(n: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n * TS_PACKET_SIZE);
+        for k in 0..n {
+            out.extend_from_slice(&[TS_SYNC_BYTE, 0x01, 0x00, 0x10 | (k & 0x0F) as u8]);
+            out.extend((0..184).map(|j| (k * 7 + j * 13) as u8 ^ (k >> 8) as u8));
+        }
+        out
+    }
+
+    fn item(data: Vec<u8>, seq: u16, is_raw_ts: bool) -> RtpPacket {
+        RtpPacket {
+            data: Bytes::from(data),
+            sequence_number: seq,
+            rtp_timestamp: 90_000 + seq as u32 * 3_000,
+            recv_time_us: now_us(),
+            is_raw_ts,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        }
+    }
+
+    /// Raw-TS items cut from `ts` at the sizes `sizes` cycles through, with
+    /// an input sequence counter that has nothing to do with the wire's.
+    fn raw_ts_items(ts: &[u8], sizes: &[usize]) -> Vec<RtpPacket> {
+        let mut items = Vec::new();
+        let mut at = 0;
+        for k in 0.. {
+            if at >= ts.len() {
+                break;
+            }
+            let end = (at + sizes[k % sizes.len()]).min(ts.len());
+            items.push(item(ts[at..end].to_vec(), 5_000 + k as u16, true));
+            at = end;
+        }
+        items
+    }
+
+    /// An RTP datagram from upstream: a foreign SSRC and its own numbers.
+    fn upstream_rtp(seq: u16, payload: &[u8]) -> RtpPacket {
+        let mut dg = vec![0x80, 33, (seq >> 8) as u8, seq as u8, 0, 0, 0x10, 0, 0xDE, 0xAD, 0xBE, 0xEF];
+        dg.extend_from_slice(payload);
+        item(dg, seq, false)
+    }
+
+    /// Read one leg until `expect_media` media datagrams and the FEC after
+    /// them have arrived.
+    fn drain_leg(sock: &std::net::UdpSocket, expect_media: usize) -> Vec<Vec<u8>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut buf = vec![0u8; 4096];
+        let (mut out, mut media) = (Vec::new(), 0);
+        loop {
+            let quiet = if media >= expect_media { 300 } else { 1_000 };
+            sock.set_read_timeout(Some(Duration::from_millis(quiet))).unwrap();
+            match sock.recv(&mut buf) {
+                Ok(n) => {
+                    if !is_fec_packet(&buf[..n]) {
+                        media += 1;
+                    }
+                    out.push(buf[..n].to_vec());
+                }
+                Err(_) if media >= expect_media || std::time::Instant::now() > deadline => break,
+                Err(_) => {}
+            }
+        }
+        out
+    }
+
+    /// Run `items` through a real RTP output with `fec_encode` L x D
+    /// (2022-7 with `dual`) on loopback; returns each leg's datagrams in
+    /// arrival order.
+    async fn capture(l: u8, d: u8, dual: bool, items: Vec<RtpPacket>, expect_media: usize) -> Vec<Vec<Vec<u8>>> {
+        let legs: Vec<std::net::UdpSocket> = (0..if dual { 2 } else { 1 })
+            .map(|_| {
+                let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+                socket2::SockRef::from(&s).set_recv_buffer_size(32 << 20).unwrap();
+                s
+            })
+            .collect();
+        let mut config = serde_json::json!({
+            "id": "fec-206",
+            "name": "fec-206",
+            "dest_addr": legs[0].local_addr().unwrap().to_string(),
+            "fec_encode": { "columns": l, "rows": d },
+        });
+        if dual {
+            config["redundancy"] = serde_json::json!({ "dest_addr": legs[1].local_addr().unwrap().to_string() });
+        }
+        let config: RtpOutputConfig = serde_json::from_value(config).unwrap();
+        let (tx, _rx) = broadcast::channel(8192);
+        let stats = Arc::new(OutputStatsAccumulator::new("fec-206".into(), "fec-206".into(), "rtp".into()));
+        let cancel = CancellationToken::new();
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let (_active_tx, active_rx) = tokio::sync::watch::channel(String::new());
+        let task = spawn_rtp_output(config, &tx, stats, cancel.clone(), None, events, active_rx);
+        // Every leg is read from before the first item goes in, both at
+        // once, and the items go in a few at a time, so no burst waits in a
+        // socket buffer: on a host with the stock rmem_max (a ~416 KiB
+        // buffer, about 180 of these datagrams) a burst sent ahead of its
+        // reader, or faster than a reader sharing its CPU gets to run,
+        // overflows it.
+        let leg_count = legs.len();
+        let (ready_tx, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
+        let readers = tokio::task::spawn_blocking(move || {
+            std::thread::scope(|scope| {
+                let readers: Vec<_> = legs
+                    .iter()
+                    .map(|s| {
+                        let ready = ready_tx.clone();
+                        scope.spawn(move || {
+                            let _ = ready.send(());
+                            drain_leg(s, expect_media)
+                        })
+                    })
+                    .collect();
+                readers.into_iter().map(|r| r.join().unwrap()).collect::<Vec<_>>()
+            })
+        });
+        for _ in 0..leg_count {
+            ready_rx.recv().await.expect("a leg reader started");
+        }
+        for (i, it) in items.into_iter().enumerate() {
+            tx.send(it).unwrap();
+            if i % 4 == 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        let captured = readers.await.unwrap();
+        cancel.cancel();
+        let _ = task.await;
+        captured
+    }
+
+    /// Replay a capture through a fresh decoder with the media datagram
+    /// `lose` left out. Asserts every packet it rebuilds carries exactly
+    /// the bytes sent under that number; returns their numbers.
+    fn replay(capture: &[Vec<u8>], l: u8, d: u8, lose: Option<u16>) -> Vec<u16> {
+        let sent: std::collections::HashMap<u16, &Vec<u8>> = capture
+            .iter()
+            .filter(|dg| !is_fec_packet(dg))
+            .map(|dg| (seq_of(dg), dg))
+            .collect();
+        let mut dec = FecDecoder::new(l, d);
+        let mut rebuilt = Vec::new();
+        for dg in capture {
+            let out = if is_fec_packet(dg) {
+                dec.process_fec(dg)
+            } else if Some(seq_of(dg)) == lose {
+                continue;
+            } else {
+                let mut out = dec.process_media(seq_of(dg), 0, &Bytes::copy_from_slice(dg));
+                out.remove(0);
+                out
+            };
+            for p in out {
+                let original = sent[&p.sequence_number];
+                assert_eq!(
+                    &p.data[RTP_HEADER_SIZE..],
+                    &original[RTP_HEADER_SIZE..],
+                    "seq {} rebuilt with other bytes than were sent",
+                    p.sequence_number,
+                );
+                rebuilt.push(p.sequence_number);
+            }
+        }
+        rebuilt
+    }
+
+    /// The checks every contiguous capture passes: contiguous numbering,
+    /// each FEC right after the datagram completing its group with the
+    /// group's true parity, the expected FEC count, and single losses
+    /// rebuilt byte for byte wherever a column or row FEC covers them.
+    fn check_contiguous(capture: &[Vec<u8>], l: u8, d: u8, matrices: usize) {
+        let (lu, du) = (l as u16, d as u16);
+        let media: Vec<&Vec<u8>> = capture.iter().filter(|dg| !is_fec_packet(dg)).collect();
+        assert_eq!(media.len(), matrices * lu as usize * du as usize);
+        let first = seq_of(media[0]);
+        for (i, dg) in media.iter().enumerate() {
+            assert_eq!(seq_of(dg), first.wrapping_add(i as u16), "wire numbering is contiguous");
+        }
+        let by_seq: std::collections::HashMap<u16, &Vec<u8>> = media.iter().map(|dg| (seq_of(dg), *dg)).collect();
+        let mut last_media = None;
+        let mut fec_count = 0;
+        for dg in capture {
+            if !is_fec_packet(dg) {
+                last_media = Some(seq_of(dg));
+                continue;
+            }
+            fec_count += 1;
+            let (base, is_column, index, parity) = fec_fields(dg);
+            assert_eq!(base.wrapping_sub(first) % (lu * du), 0, "SNBase starts a matrix");
+            let members: Vec<u16> = if is_column {
+                (0..du).map(|r| base.wrapping_add(r * lu + index as u16)).collect()
+            } else {
+                (0..lu).map(|c| base.wrapping_add(index as u16 * lu + c)).collect()
+            };
+            let completes = if is_column { *members.last().unwrap() } else { base.wrapping_add(lu * du - 1) };
+            assert_eq!(last_media, Some(completes), "FEC follows the datagram completing it");
+            let mut xor = vec![0u8; parity.len()];
+            for m in &members {
+                for (x, b) in xor.iter_mut().zip(&by_seq[m][RTP_HEADER_SIZE..]) {
+                    *x ^= b;
+                }
+            }
+            assert_eq!(parity, &xor[..], "parity of the datagrams as sent");
+        }
+        let rows_fec = if l > 1 { d.min(8) as usize } else { 0 };
+        assert_eq!(fec_count, matrices * (l.min(8) as usize + rows_fec));
+
+        assert!(replay(capture, l, d, None).is_empty(), "no loss, nothing rebuilt");
+        let m = first.wrapping_add(lu * du); // the second matrix
+        for (r, c) in [(0, 0), (du - 1, 1.min(lu - 1)), (du - 1, lu - 1), (2, lu - 1)] {
+            let lost = m.wrapping_add(r * lu + c);
+            let covered = c < 8 || (r < 8 && l > 1);
+            let expect = if covered { vec![lost] } else { vec![] };
+            assert_eq!(replay(capture, l, d, Some(lost)), expect, "{l}x{d} loss at row {r} column {c}");
+        }
+    }
+
+    /// Single leg, raw TS in items that are not datagram-sized (SRT's
+    /// 1456 bytes, and odd sizes): FEC protects the realigned datagrams.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_leg_raw_ts_fec_repairs_a_lost_datagram_byte_exact() {
+        for (l, d, matrices, sizes) in [
+            (4u8, 4u8, 3usize, &[1456usize][..]),
+            (4, 4, 3, &[1000, 1456, 777, 2048][..]),
+            (10, 10, 2, &[1456][..]),
+        ] {
+            let dgs = matrices * l as usize * d as usize;
+            let items = raw_ts_items(&ts_stream(dgs * TS_PACKETS_PER_DATAGRAM), sizes);
+            let legs = capture(l, d, false, items, dgs).await;
+            check_contiguous(&legs[0], l, d, matrices);
+        }
+    }
+
+    /// Single leg, RTP in (an upstream SSRC and numbers): re-wrapped with
+    /// this output's numbers, which the FEC follows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_leg_rtp_fec_repairs_a_lost_datagram_byte_exact() {
+        let ts = ts_stream(48 * TS_PACKETS_PER_DATAGRAM);
+        let items = ts
+            .chunks(TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE)
+            .enumerate()
+            .map(|(i, p)| upstream_rtp(30_000 + i as u16, p))
+            .collect();
+        let legs = capture(4, 4, false, items, 48).await;
+        assert!(legs[0].iter().filter(|dg| !is_fec_packet(dg)).all(|dg| dg[8..12] != [0xDE, 0xAD, 0xBE, 0xEF]));
+        check_contiguous(&legs[0], 4, 4, 3);
+    }
+
+    /// 2022-7, raw TS: both legs carry the same datagrams and FEC.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dual_leg_raw_ts_fec_repairs_a_lost_datagram_byte_exact() {
+        let items = raw_ts_items(&ts_stream(48 * TS_PACKETS_PER_DATAGRAM), &[1456]);
+        let legs = capture(4, 4, true, items, 48).await;
+        assert_eq!(legs[0], legs[1], "both legs byte-identical");
+        check_contiguous(&legs[0], 4, 4, 3);
+    }
+
+    /// 2022-7, RTP forwarded unchanged with an upstream gap and one short
+    /// datagram: groups holding a number never sent, or datagrams of two
+    /// sizes, get no FEC; every other loss is rebuilt byte for byte, and
+    /// nothing is ever made up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dual_leg_rtp_forward_fec_follows_upstream_numbers() {
+        let full = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
+        let ts = ts_stream(48 * TS_PACKETS_PER_DATAGRAM);
+        let seqs: Vec<u16> = (40_000u16..40_048).filter(|s| !(40_018..=40_020).contains(s)).collect();
+        let items: Vec<RtpPacket> = seqs
+            .iter()
+            .map(|&s| {
+                let i = (s - 40_000) as usize;
+                let len = if s == 40_034 { 3 * TS_PACKET_SIZE } else { full };
+                upstream_rtp(s, &ts[i * full..i * full + len])
+            })
+            .collect();
+        let legs = capture(4, 4, true, items, seqs.len()).await;
+        assert_eq!(legs[0], legs[1], "both legs byte-identical");
+        let cap = &legs[0];
+        let wire: Vec<u16> = cap.iter().filter(|dg| !is_fec_packet(dg)).map(|dg| seq_of(dg)).collect();
+        assert_eq!(wire, seqs, "upstream numbers forwarded unchanged");
+        assert!(replay(cap, 4, 4, None).is_empty());
+        // Column 1 of the gapped matrix, and a loss in the third matrix.
+        assert_eq!(replay(cap, 4, 4, Some(40_025)), vec![40_025]);
+        assert_eq!(replay(cap, 4, 4, Some(40_047)), vec![40_047]);
+        // Column 2 and row 1 both hold a number upstream never sent.
+        assert!(replay(cap, 4, 4, Some(40_022)).is_empty());
+        // The short datagram: its column and row are of mixed sizes.
+        assert!(replay(cap, 4, 4, Some(40_034)).is_empty());
+        // Same column as the short one, but its row is uniform.
+        assert_eq!(replay(cap, 4, 4, Some(40_046)), vec![40_046]);
+    }
+
+    /// L=1: column FEC only, so a receiver publishes each datagram once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_column_output_is_never_duplicated_by_a_receiver() {
+        let items = raw_ts_items(&ts_stream(12 * TS_PACKETS_PER_DATAGRAM), &[1316]);
+        let legs = capture(1, 4, false, items, 12).await;
+        check_contiguous(&legs[0], 1, 4, 3);
+        let mut dec = FecDecoder::new(1, 4);
+        let mut published = 0;
+        for dg in &legs[0] {
+            published += if is_fec_packet(dg) {
+                dec.process_fec(dg).len()
+            } else {
+                dec.process_media(seq_of(dg), 0, &Bytes::copy_from_slice(dg)).len()
+            };
+        }
+        assert_eq!(published, 12);
     }
 }

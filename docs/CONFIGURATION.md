@@ -973,6 +973,8 @@ SMPTE 2022-1 Forward Error Correction parameters.
 | `columns` | `u8` | 1-20  | L parameter (columns in FEC matrix)      |
 | `rows`    | `u8` | 4-20  | D parameter (rows in FEC matrix)         |
 
+The encoder protects the RTP datagrams as sent (their wire sequence numbers and payloads). Only columns and rows 0-7 carry FEC — the header names them in 3 bits — so prefer at most `8 x 8`; `columns: 1` sends column FEC only, and a column or row whose datagrams differ in size gets none. A single-leg `fec_decode` input publishes only the repairs that arrive ahead of what it has already published. Upgrade receivers before senders. Full rules: [configuration-guide.md](configuration-guide.md#smpte-2022-1-fec-configuration).
+
 ---
 
 ## Example Configurations
@@ -1073,7 +1075,7 @@ SMPTE 2022-1 Forward Error Correction parameters.
           "id": "rtp-fec",
           "name": "RTP with FEC",
           "dest_addr": "192.168.1.50:5004",
-          "fec_encode": { "columns": 10, "rows": 10 }
+          "fec_encode": { "columns": 8, "rows": 8 }
         }
       ]
     }
@@ -1100,7 +1102,7 @@ SMPTE 2022-1 Forward Error Correction parameters.
           "bind_addr": "239.1.1.2:5000",
           "interface_addr": "192.168.1.10"
         },
-        "fec_decode": { "columns": 10, "rows": 10 }
+        "fec_decode": { "columns": 8, "rows": 8 }
       },
       "outputs": [
         {
@@ -1113,7 +1115,7 @@ SMPTE 2022-1 Forward Error Correction parameters.
             "dest_addr": "239.2.1.2:5004",
             "interface_addr": "192.168.1.10"
           },
-          "fec_encode": { "columns": 10, "rows": 10 }
+          "fec_encode": { "columns": 8, "rows": 8 }
         }
       ]
     }

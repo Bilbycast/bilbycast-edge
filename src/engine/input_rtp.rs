@@ -266,6 +266,191 @@ impl TokenBucket {
     }
 }
 
+/// Whether RTP sequence number `seq` is ahead of `of`: by 1 to 0x7FFF,
+/// modulo 2^16.
+fn seq_is_ahead(seq: u16, of: u16) -> bool {
+    (1..0x8000).contains(&seq.wrapping_sub(of))
+}
+
+/// Keeps a single-leg RTP input's FEC repairs from going out behind packets
+/// it has already published (edge#206).
+///
+/// SMPTE 2022-1 column FEC follows the last row of its column, so most
+/// packets FEC rebuilds are rebuilt up to (D-1)*L datagrams after newer ones
+/// went out. Nothing between this input and the outputs reorders by sequence
+/// number, so publishing such a packet would hand every output a datagram
+/// out of order -- continuity errors, and a PCR stepping back -- which is
+/// worse than the loss it repairs. So a rebuilt packet is published only
+/// when it is ahead of every packet already published; one behind stays in
+/// the decoder's matrix (where it can still help rebuild others) and is
+/// neither published nor counted. A 2022-7 input is not gated: its merger
+/// takes the repairs and, with `path_differential_ms`, releases them in
+/// order.
+///
+/// It also remembers the last [`RECENT_REPAIRS`] repairs it let out, so the
+/// original of one, arriving late after the decoder has closed its matrix
+/// (where [`FecDecoder::holds_payload`] can no longer see it), is not
+/// published a second time. Like `holds_payload`, it matches on the bytes
+/// as well as the number: a datagram under a recently repaired number with
+/// other bytes (a sender that restarted a few numbers back) is new content,
+/// and is published like any other received packet.
+struct RepairOrder {
+    /// The newest sequence number published, as a modular maximum.
+    newest: Option<u16>,
+    /// The FEC matrix size (L*D). A received packet this far or further
+    /// behind `newest` is a stream that moved (a sender restarted on a new
+    /// sequence number), not a reorder: the decoder starts a new matrix on
+    /// it, and `newest` follows it there.
+    window: u16,
+    /// Packets published so far: the clock `repairs` are aged by.
+    published: u64,
+    /// The last repairs published.
+    repairs: [Option<PublishedRepair>; RECENT_REPAIRS],
+    /// Where the next repair is written in `repairs`.
+    next_repair: usize,
+}
+
+/// A repair [`RepairOrder`] let out.
+struct PublishedRepair {
+    seq: u16,
+    /// [`RepairOrder::published`] as it went out.
+    at: u64,
+    /// The datagram as published (a reference to it, not a copy), whose
+    /// payload a late original matches.
+    datagram: Bytes,
+}
+
+/// How many published repairs [`RepairOrder`] remembers. Only a repair
+/// ahead of everything published goes out -- in practice the last-row
+/// cells of each matrix -- so this covers several matrices' worth.
+const RECENT_REPAIRS: usize = 32;
+
+/// The bytes after an RTP datagram's 12-byte fixed header: what the FEC
+/// decoder files and rebuilds, and so what a late original is matched on.
+fn fec_payload(datagram: &[u8]) -> &[u8] {
+    datagram.get(12..).unwrap_or_default()
+}
+
+impl RepairOrder {
+    fn new(window: u16) -> Self {
+        Self {
+            newest: None,
+            window,
+            published: 0,
+            repairs: std::array::from_fn(|_| None),
+            next_repair: 0,
+        }
+    }
+
+    /// A received packet, which is published: moves `newest` forward, never
+    /// back, except onto a stream that moved.
+    fn received(&mut self, seq: u16) {
+        self.published += 1;
+        match self.newest {
+            Some(n) if !seq_is_ahead(seq, n) && n.wrapping_sub(seq) < self.window => {}
+            _ => self.newest = Some(seq),
+        }
+    }
+
+    /// Whether the packet FEC rebuilt as `datagram` under `seq` may be
+    /// published: only ahead of every packet already published. Moves
+    /// `newest` onto it, and remembers it, when it is.
+    fn recovered(&mut self, seq: u16, datagram: &Bytes) -> bool {
+        match self.newest {
+            Some(n) if !seq_is_ahead(seq, n) => false,
+            _ => {
+                self.newest = Some(seq);
+                self.published += 1;
+                self.repairs[self.next_repair] = Some(PublishedRepair {
+                    seq,
+                    at: self.published,
+                    datagram: datagram.clone(),
+                });
+                self.next_repair = (self.next_repair + 1) % RECENT_REPAIRS;
+                true
+            }
+        }
+    }
+
+    /// Whether a received `datagram` under `seq` is the late original of a
+    /// repair already published: behind `newest`, within the window (not a
+    /// stream that moved), published as a repair within the last two
+    /// windows' worth of packets (so not a number from a lap of the
+    /// sequence space ago), and carrying that repair's payload. Scans only
+    /// for a packet that arrives behind `newest`, and compares bytes only
+    /// on a number that matches.
+    fn already_repaired(&self, seq: u16, datagram: &[u8]) -> bool {
+        let Some(n) = self.newest else {
+            return false;
+        };
+        if seq_is_ahead(seq, n) || n.wrapping_sub(seq) >= self.window {
+            return false;
+        }
+        let horizon = 2 * self.window as u64;
+        let payload = fec_payload(datagram);
+        !payload.is_empty()
+            && self.repairs.iter().flatten().any(|r| {
+                r.seq == seq
+                    && self.published - r.at < horizon
+                    && fec_payload(&r.datagram) == payload
+            })
+    }
+}
+
+/// What a single-leg FEC input publishes of a received media datagram and
+/// of the packets FEC rebuilt alongside it, in that order. A datagram whose
+/// exact payload the decoder already holds under its sequence number -- a
+/// packet FEC rebuilt before it arrived, or a copy of one received -- is a
+/// duplicate of something already published or deliberately withheld, and
+/// is dropped; so is the late original of a repair published from a matrix
+/// the decoder has since closed (matched on its bytes too, so new content
+/// under that number is published). Returns the number of rebuilt packets
+/// published.
+fn publish_fec_media(
+    decoder: &mut FecDecoder,
+    order: &mut RepairOrder,
+    seq: u16,
+    ts: u32,
+    data: &Bytes,
+    mut publish: impl FnMut(RtpPacket),
+) -> u64 {
+    let duplicate = decoder.holds_payload(seq, data) || order.already_repaired(seq, data);
+    let mut packets = decoder.process_media(seq, ts, data).into_iter();
+    if let Some(received) = packets.next()
+        && !duplicate
+    {
+        order.received(seq);
+        publish(received);
+    }
+    publish_recovered(order, packets, publish)
+}
+
+/// What a single-leg FEC input publishes of the packets one FEC datagram
+/// rebuilt. Returns the number published.
+fn publish_fec_repair(
+    decoder: &mut FecDecoder,
+    order: &mut RepairOrder,
+    data: &[u8],
+    publish: impl FnMut(RtpPacket),
+) -> u64 {
+    publish_recovered(order, decoder.process_fec(data).into_iter(), publish)
+}
+
+fn publish_recovered(
+    order: &mut RepairOrder,
+    packets: impl Iterator<Item = RtpPacket>,
+    mut publish: impl FnMut(RtpPacket),
+) -> u64 {
+    let mut published = 0;
+    for pkt in packets {
+        if order.recovered(pkt.sequence_number, &pkt.data) {
+            published += 1;
+            publish(pkt);
+        }
+    }
+    published
+}
+
 /// Core receive loop for RTP input.
 ///
 /// Binds a UDP socket to `config.bind_addr` (with optional multicast join via
@@ -347,14 +532,18 @@ async fn rtp_input_loop(
         TokenBucket::new(rate)
     });
 
-    // Optional FEC decoder.
+    // Optional FEC decoder, with the gate that keeps its repairs in
+    // sequence order (`RepairOrder`).
     let mut fec_decoder = config.fec_decode.as_ref().map(|fec_config| {
         tracing::info!(
             "FEC decode enabled: L={} D={}",
             fec_config.columns,
             fec_config.rows
         );
-        FecDecoder::new(fec_config.columns, fec_config.rows)
+        (
+            FecDecoder::new(fec_config.columns, fec_config.rows),
+            RepairOrder::new(fec_config.columns as u16 * fec_config.rows as u16),
+        )
     });
 
     let mut buf = vec![0u8; MAX_RTP_PACKET_SIZE + 100]; // extra headroom
@@ -380,15 +569,15 @@ async fn rtp_input_loop(
 
                         // ── FEC repair packet (SMPTE 2022-1, bilbycast framing) ──
                         // Route to the decoder before the RTP-shape check so the
-                        // repair datagram isn't silently dropped. Emits any
-                        // reconstructed media packets directly to broadcast.
+                        // repair datagram isn't silently dropped. Publishes a
+                        // reconstructed media packet only when it is ahead of
+                        // everything already published (`RepairOrder`).
                         if is_fec_packet(data) {
-                            if let Some(ref mut decoder) = fec_decoder {
-                                let recovered = decoder.process_fec(data);
-                                for pkt in recovered {
-                                    stats.fec_recovered.fetch_add(1, Ordering::Relaxed);
+                            if let Some((ref mut decoder, ref mut order)) = fec_decoder {
+                                let recovered = publish_fec_repair(decoder, order, data, |pkt| {
                                     crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, pkt);
-                                }
+                                });
+                                stats.fec_recovered.fetch_add(recovered, Ordering::Relaxed);
                             }
                             continue;
                         }
@@ -440,10 +629,12 @@ async fn rtp_input_loop(
 
                         let bytes_data = Bytes::copy_from_slice(data);
 
-                        if let Some(ref mut decoder) = fec_decoder {
-                            let packets = decoder.process_media(seq, ts, &bytes_data);
-                            for pkt in packets {
+                        if let Some((ref mut decoder, ref mut order)) = fec_decoder {
+                            let recovered = publish_fec_media(decoder, order, seq, ts, &bytes_data, |pkt| {
                                 crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, pkt);
+                            });
+                            if recovered > 0 {
+                                stats.fec_recovered.fetch_add(recovered, Ordering::Relaxed);
                             }
                         } else {
                             let packet = RtpPacket {
@@ -923,5 +1114,192 @@ fn process_redundant_rtp_packet(
         for (chosen, p) in merger.ingest(packet, leg, now, stats) {
             publish_emitted_redundant_packet(chosen, p, publisher, stats, transcoder, post);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fec::encoder::FecEncoder;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn seq_is_ahead_is_modular() {
+        assert!(seq_is_ahead(101, 100));
+        assert!(!seq_is_ahead(100, 100));
+        assert!(!seq_is_ahead(99, 100));
+        assert!(seq_is_ahead(2, 0xFFFE), "across the wrap");
+        assert!(!seq_is_ahead(0xFFFE, 2), "behind, across the wrap");
+        assert!(seq_is_ahead(100u16.wrapping_add(0x7FFF), 100));
+        assert!(!seq_is_ahead(100u16.wrapping_add(0x8000), 100));
+    }
+
+    /// A received packet moves `newest` forward and never back -- a
+    /// reordered arrival must not re-admit late repairs -- except onto a
+    /// stream that moved a whole matrix or more behind.
+    #[test]
+    fn received_packets_move_newest_forward_or_onto_a_moved_stream() {
+        let mut order = RepairOrder::new(16);
+        order.received(0xFFF0);
+        order.received(3); // across the wrap
+        assert_eq!(order.newest, Some(3));
+        order.received(1); // reordered, two behind
+        assert_eq!(order.newest, Some(3));
+        assert!(!order.recovered(2, &datagram(2, 0)), "behind newest");
+        assert!(order.recovered(4, &datagram(4, 0)));
+        assert_eq!(order.newest, Some(4));
+        // A sender restarted 1000 numbers back: a new stream, not a reorder.
+        let moved = 4u16.wrapping_sub(1000);
+        order.received(moved);
+        assert_eq!(order.newest, Some(moved));
+        assert!(order.recovered(moved.wrapping_add(1), &datagram(moved.wrapping_add(1), 0)));
+    }
+
+    /// A 44-byte RTP datagram under `seq`; `content` picks its payload, so
+    /// one number can be sent with other bytes.
+    fn datagram(seq: u16, content: usize) -> Bytes {
+        let mut dg = vec![0x80, 33, (seq >> 8) as u8, seq as u8, 0, 0, 0, 1, 0, 0, 0, 7];
+        dg.extend((0..32).map(|i| (seq as usize * 31 + i * 5 + content) as u8));
+        Bytes::from(dg)
+    }
+
+    /// The datagrams and FEC an L x D output sends for `seqs`, in order.
+    fn sent(l: u8, d: u8, seqs: std::ops::Range<u16>) -> Vec<(Option<u16>, Bytes)> {
+        let mut enc = FecEncoder::new(l, d, Arc::new(AtomicU64::new(0)));
+        let mut wire = Vec::new();
+        for seq in seqs {
+            let dg = datagram(seq, 0);
+            let fec = enc.process(seq, &dg[12..]);
+            wire.push((Some(seq), dg));
+            wire.extend(fec.into_iter().map(|f| (None, f)));
+        }
+        wire
+    }
+
+    /// Run `wire` through the single-leg FEC path; returns what it published
+    /// (seq, payload) and the count it adds to `fec_recovered`.
+    fn single_leg(l: u8, d: u8, wire: &[(Option<u16>, Bytes)]) -> (Vec<(u16, Bytes)>, u64) {
+        let mut decoder = FecDecoder::new(l, d);
+        let mut order = RepairOrder::new(l as u16 * d as u16);
+        let mut published = Vec::new();
+        let mut recovered = 0;
+        for (seq, data) in wire {
+            let mut publish = |p: RtpPacket| published.push((p.sequence_number, p.data));
+            recovered += match seq {
+                Some(seq) => publish_fec_media(&mut decoder, &mut order, *seq, 0, data, &mut publish),
+                None => publish_fec_repair(&mut decoder, &mut order, data, &mut publish),
+            };
+        }
+        (published, recovered)
+    }
+
+    fn lose(wire: &[(Option<u16>, Bytes)], seq: u16) -> Vec<(Option<u16>, Bytes)> {
+        wire.iter().filter(|(s, _)| *s != Some(seq)).cloned().collect()
+    }
+
+    fn assert_in_order(published: &[(u16, Bytes)]) {
+        for w in published.windows(2) {
+            assert!(seq_is_ahead(w[1].0, w[0].0), "{} published after {}", w[1].0, w[0].0);
+        }
+    }
+
+    /// A loss in row 0 is rebuilt by its column FEC only after the column's
+    /// last row went out -- (D-1)*L packets late. It is withheld (and not
+    /// counted), so what the input publishes stays in sequence order.
+    #[test]
+    fn a_late_repair_is_withheld_and_not_counted() {
+        let wire = sent(4, 4, 1000..1032);
+        let (published, recovered) = single_leg(4, 4, &lose(&wire, 1017));
+        assert_in_order(&published);
+        assert!(published.iter().all(|(s, _)| *s != 1017));
+        assert_eq!(recovered, 0);
+        assert_eq!(published.len(), 31);
+    }
+
+    /// A loss in the last row is rebuilt by the column FEC that follows it,
+    /// before any newer packet: published, in order, and counted.
+    #[test]
+    fn a_last_row_repair_is_published_in_order() {
+        let wire = sent(4, 4, 1000..1032);
+        let (published, recovered) = single_leg(4, 4, &lose(&wire, 1029));
+        assert_in_order(&published);
+        assert_eq!(recovered, 1);
+        assert_eq!(published.len(), 32);
+        let original = &wire.iter().find(|(s, _)| *s == Some(1029)).unwrap().1;
+        let rebuilt = &published.iter().find(|(s, _)| *s == 1029).unwrap().1;
+        assert_eq!(&rebuilt[12..], &original[12..]);
+    }
+
+    /// A last-row datagram is delayed past the end of its matrix: its
+    /// column FEC rebuilds it in order, the decoder then closes the matrix,
+    /// and the original, arriving after that, is not published again.
+    #[test]
+    fn a_repaired_datagram_arriving_after_its_matrix_closed_is_published_once() {
+        let mut wire = sent(4, 4, 1000..1040);
+        let i = wire.iter().position(|(s, _)| *s == Some(1029)).unwrap();
+        let late = wire.remove(i);
+        let next = wire.iter().position(|(s, _)| *s == Some(1032)).unwrap();
+        wire.insert(next, late);
+        let (published, recovered) = single_leg(4, 4, &wire);
+        let seqs: Vec<u16> = published.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, (1000..1040).collect::<Vec<_>>());
+        assert_eq!(recovered, 1);
+    }
+
+    /// The repairs remembered age out: a packet published as a repair a lap
+    /// of the sequence space ago does not hide a reordered packet that
+    /// carries the same number now.
+    #[test]
+    fn a_repair_from_a_lap_ago_hides_nothing() {
+        let mut order = RepairOrder::new(16);
+        order.received(99);
+        assert!(order.recovered(100, &datagram(100, 0)));
+        order.received(101);
+        assert!(order.already_repaired(100, &datagram(100, 0)), "the late original of a fresh repair");
+        for k in 1..=0x1_0000u32 {
+            order.received(101u16.wrapping_add(k as u16));
+        }
+        assert_eq!(order.newest, Some(101));
+        assert!(!order.already_repaired(100, &datagram(100, 0)), "a reorder one lap on, not that repair");
+    }
+
+    /// A sender restarts a few numbers back just after a repair went out,
+    /// and sends the repaired number again with other bytes: new content,
+    /// published (behind `newest`, like every received packet), not taken
+    /// for the repair's late original.
+    #[test]
+    fn a_number_resent_with_other_bytes_after_its_repair_is_published() {
+        let mut wire = lose(&sent(4, 4, 1000..1032), 1029);
+        wire.extend((1026..1032).map(|s| (Some(s), datagram(s, 1))));
+        let (published, recovered) = single_leg(4, 4, &wire);
+        assert_eq!(recovered, 1, "1029 is rebuilt in order");
+        let seqs: Vec<u16> = published.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, (1000..1032).chain(1026..1032).collect::<Vec<_>>());
+        for (s, data) in &published[32..] {
+            assert_eq!(data, &datagram(*s, 1), "{s} carries the new content");
+        }
+        // The same bytes under that number are still the late original.
+        let mut order = RepairOrder::new(16);
+        order.received(1028);
+        assert!(order.recovered(1029, &datagram(1029, 0)));
+        order.received(1030);
+        assert!(order.already_repaired(1029, &datagram(1029, 0)));
+        assert!(!order.already_repaired(1029, &datagram(1029, 1)));
+        assert!(!order.already_repaired(1029, &datagram(1029, 0).slice(..12)), "header only");
+    }
+
+    /// The network swaps a last-row datagram and the column FEC right after
+    /// it: FEC rebuilds the datagram first, and the real one, arriving
+    /// next, is not published a second time.
+    #[test]
+    fn a_repair_that_beats_its_datagram_is_published_once() {
+        let mut wire = sent(4, 4, 1000..1016);
+        let i = wire.iter().position(|(s, _)| *s == Some(1013)).unwrap();
+        assert!(wire[i + 1].0.is_none(), "column 1's FEC follows 1013");
+        wire.swap(i, i + 1);
+        let (published, recovered) = single_leg(4, 4, &wire);
+        let seqs: Vec<u16> = published.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, (1000..1016).collect::<Vec<_>>());
+        assert_eq!(recovered, 1);
     }
 }
