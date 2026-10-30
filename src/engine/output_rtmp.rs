@@ -4179,9 +4179,11 @@ mod flv_timestamp_tests {
 
     /// An A/V source with a picture every 2 to 8 s, its AAC running on
     /// beside it, muxed at its own time or 1.1 s either side of the
-    /// pictures: each picture handed out when the next one's PES begins,
-    /// with the audio up to there already mapped, so the audio has run over
-    /// 3 s past the picture before it — the video taken for gone. Each
+    /// pictures: each picture handed out when the next one's PES begins, or
+    /// the one after it (an encoder writing each slide when the next is
+    /// due, as ffmpeg's do), with the audio up to there already mapped, so
+    /// the audio has run over 3 s past the picture before it — the video
+    /// taken for gone. Each
     /// picture still goes out at its own time, as a pause of the video's
     /// the audio ran through. Moving the video's line on to where the audio
     /// was put every other picture 2 s apart on an offset of its own, 2 s
@@ -4190,13 +4192,13 @@ mod flv_timestamp_tests {
     /// or beside the audio, an interval late.
     #[test]
     fn slow_pictures_beside_running_audio_keep_their_own_time() {
-        for interval in [180_000, 225_000, 450_000, 720_000] {
+        for (interval, held) in [180_000, 225_000, 450_000, 720_000].into_iter().flat_map(|i| [(i, 1), (i, 3)]) {
             for ahead in [0, 99_000, -99_000] {
-                let what = format!("a picture every {interval} ticks, audio {ahead} ahead");
+                let what = format!("a picture every {interval} ticks, {held} held, audio {ahead} ahead");
                 let mut tl = FlvTimeline::new("o");
                 let dts: Vec<u64> = (0..12).map(|k| T0 + k * interval).collect();
                 let audio = (0..11 * interval).step_by(1_920).map(|a| T0 + a);
-                for (_, picture, t) in hand_out(&dts, 1, audio, |_| ahead) {
+                for (_, picture, t) in hand_out(&dts, held, audio, |_| ahead) {
                     if picture {
                         let p = tl.video(t, None, true).unwrap();
                         assert_eq!((p.pts, p.dts), (LAP_90K + t, LAP_90K + t), "{what}: the picture at {t}");

@@ -477,8 +477,9 @@ last had to it, and its audio joins it there; it used to be continued
 one frame past its old picture, and the audio joining it was dropped as
 behind everything sent until the source had run as far again as the
 video had been away. A picture back on the clock it left, from 3 s
-behind where the audio puts it (10 s on a slide feed, whose pictures the
-demuxer hands out an interval late) to 1 s past, goes out at its own
+behind where the audio puts it (30 s on a slide feed, whose pictures the
+demuxer hands out an interval late, and an encoder writing each slide when
+the next is due muxes an interval or two late) to 1 s past, goes out at its own
 time, as a pause of the video's that the audio ran through — however many
 pictures the demuxer and any remuxer upstream held back. Further behind
 (a restarted encoder's clock) it is put beside the audio, and its audio

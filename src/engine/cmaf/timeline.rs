@@ -611,8 +611,10 @@ impl CmafTimeline {
             // A track the output took for gone coming back forwards on the
             // programme's offset where it says the track would be now
             // (`continue_at`) — up to its own window past there, and up to
-            // a cross window behind, or the lone gap behind on a slow
-            // picture source (each picture handed out an interval late) — is
+            // a cross window behind, or three lone gaps behind on a slow
+            // picture source (each picture handed out an interval late by
+            // the demuxer, and muxed an interval or two late by an encoder
+            // that writes a slide when the next is due) — is
             // back on the clock it left after a pause the other track ran
             // through: a gap. Measured from the track's own last timestamps
             // the other's run looks short when more than one was handed out
@@ -623,7 +625,7 @@ impl CmafTimeline {
             // as a gap, its audio could only open an offset of its own, A/V
             // apart for good. Further past, in doubt (a stray timestamp, a
             // hole in the other track meanwhile), it is continued there too.
-            let behind = if slow { lone_gap as i64 } else { CROSS_WINDOW_90K };
+            let behind = if slow { 3 * lone_gap as i64 } else { CROSS_WINDOW_90K };
             if own > OWN_WINDOW_90K
                 && on_programme
                 && continue_at.is_some_and(|c| (-behind..=OWN_WINDOW_90K).contains(&circ(ts, c)))
