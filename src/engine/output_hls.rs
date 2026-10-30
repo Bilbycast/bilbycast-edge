@@ -726,7 +726,8 @@ struct HlsEncoderCtx {
 
 /// How far (90 kHz) a decoded frame's PTS may sit from where the encoder's
 /// input is before the encoder's timeline is re-anchored on it: one 48 kHz
-/// frame plus rounding, as on CMAF (`SOURCE_PTS_SLACK_TICKS`).
+/// frame plus rounding, as on CMAF and RTMP
+/// (`audio_encode::SOURCE_PTS_SLACK_TICKS`).
 #[cfg(feature = "media-codecs")]
 const HLS_SOURCE_PTS_SLACK_90K: u64 = 2_000;
 

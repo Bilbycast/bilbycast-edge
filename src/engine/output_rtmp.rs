@@ -21,12 +21,15 @@ use crate::manager::events::{Event, EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index, sr_index_from_hz};
-use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
+use super::audio_encode::{
+    AudioCodec, AudioEncoder, AudioEncoderError, EncoderInputClock, EncoderParams, Placement,
+};
 use super::audio_silence::SilenceGenerator;
 use super::cmaf::codecs::{push_avcc_record, push_hvcc_record};
 use super::cmaf::fmp4::VideoCodec as CmafVideoCodec;
 use super::cmaf::nalu::{H265_NAL_VPS, h264_is_sei_recovery_point, h265_nal_type, to_length_prefixed};
 use super::cmaf::param_sets::{ParamSetCollector, ParamSets};
+use super::cmaf::timeline::{CmafTimeline, Track};
 use super::packet::RtpPacket;
 use super::rtmp::client::{RtmpClient, RtmpConnectError, RtmpFailureKind};
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
@@ -66,6 +69,13 @@ enum EncoderState {
         /// Silent-PCM generator + audio-drop watchdog. `Some` iff
         /// `audio_encode.silent_fallback = true`.
         silence: Option<SilenceGenerator>,
+        /// Where the encoder's input is on the connection's FLV timeline.
+        /// The encoder anchors once and counts samples from there, so this
+        /// is what re-anchors it where the source leaves it — a loop, a
+        /// switch, a gap — and lays silence to the picture (CMAF's rule,
+        /// shared). Without it the transcoded audio ran on across every seam
+        /// while the video followed the source (edge#211).
+        input: EncoderInputClock,
     },
     /// Decoder or encoder construction failed once. Drop audio for the
     /// rest of the output's lifetime; the failure event was already
@@ -122,14 +132,14 @@ struct VideoActive {
     src_pts_queue: std::collections::VecDeque<u64>,
     /// The source PTS of each decoded picture (see `FramePtsStamper`).
     stamper: crate::engine::video_encode_util::FramePtsStamper,
-    /// Last wire PTS emitted, for the strictly-increasing guard.
+    /// Last wire PTS emitted, on the connection's FLV timeline, for the
+    /// strictly-increasing guard ([`next_wire_pts_90k`]).
     ///
-    /// The encoder's `fps_num`/`fps_den` are deliberately no longer held here.
-    /// They still open the encoder (rate control, VBV, default GOP, SPS VUI)
-    /// but they no longer reach the FLV timestamp — that comes from the source
-    /// clock — and keeping a copy invited the next reader to use it again.
-    /// The one nominal frame step substituted when the source PTS is unusable
-    /// is read off the pipeline's rate as it is needed.
+    /// The encoder's `fps_num`/`fps_den` are deliberately not held here. They
+    /// still open the encoder (rate control, VBV, default GOP, SPS VUI) but
+    /// they do not reach the FLV timestamp — that comes from the source clock
+    /// through the timeline — and keeping a copy invited the next reader to
+    /// use it again.
     last_wire_pts_90k: Option<u64>,
     /// The encoder rate — pinned, or measured from the decoded frames before
     /// the encoder opens (it used to open at a flat 30/1).
@@ -357,7 +367,9 @@ async fn publish_loop(
     let mut demuxer = TsDemuxer::new(config.program_number);
     let mut passthrough = PassthroughVideo::default();
     let mut sent_audio_header = false;
-    let mut base_pts: Option<u64> = None;
+    // Every FLV timestamp, audio and video, on one continuous timeline per
+    // connection (edge#211).
+    let mut timeline = FlvTimeline::new(&config.id);
     // Lazy FFmpeg-backed audio decoder for non-AAC sources
     // (MP2 / AC-3 / E-AC-3). Opened on the first `OtherAudio` frame.
     // Mirrors the AAC decoder slot inside `EncoderState::Active` —
@@ -381,7 +393,10 @@ async fn publish_loop(
     };
     // Silence interval: ticks at the silence generator's chunk cadence
     // (~21 ms @ 48 kHz / 1024 samples). Only present when
-    // `silent_fallback` is active and the eager-build succeeded.
+    // `silent_fallback` is active and the eager-build succeeded. The tick is
+    // the watchdog, not the meter: each one lays silence up to where the
+    // picture says the audio would be (`lay_silence`), so a tick observed
+    // late costs nothing and the next makes it up.
     let mut silence_interval: Option<tokio::time::Interval> =
         if let EncoderState::Active { silence: Some(sg), .. } = &encoder_state {
             let mut iv = tokio::time::interval(sg.chunk_duration());
@@ -401,9 +416,9 @@ async fn publish_loop(
     let mut mpeg2_warned = false;
     let mut other_audio_warned = false;
     loop {
-        // Silence tick → inject one zero-filled chunk into the encoder
-        // if the watchdog says we should (no real audio within grace),
-        // then drain + write FLV audio tags.
+        // Silence tick → lay silence up to the picture if the watchdog
+        // says we should (no real audio within grace), then drain + write
+        // FLV audio tags.
         let silence_tick = async {
             match silence_interval.as_mut() {
                 Some(iv) => {
@@ -421,7 +436,7 @@ async fn publish_loop(
                     &mut encoder_state,
                     &mut sent_audio_header,
                     stats,
-                    base_pts,
+                    &mut timeline,
                 )
                 .await?;
                 client.flush().await?;
@@ -476,13 +491,11 @@ async fn publish_loop(
                     // this connection — the FLV frame type, the parameter-set
                     // table's random-access rule, the header re-send — agrees.
                     let is_keyframe = is_keyframe || h264_is_sei_recovery_point(&nalus);
-                    let (ts_ms, cts_ms) = flv_video_time(pts, dts, &mut base_pts);
+                    let time = timeline.video(pts, dts, pts_known);
                     if process_video_frame(
                         VideoFrameSource::H264 { nalus: &nalus, is_keyframe, pts_known },
-                        pts,
-                        ts_ms,
-                        cts_ms,
-                        &mut base_pts,
+                        time,
+                        &mut timeline,
                         recv_time_us,
                         &mut passthrough,
                         &mut video_state,
@@ -498,13 +511,11 @@ async fn publish_loop(
                     }
                 }
                 DemuxedFrame::H265 { nalus, pts, is_keyframe, pts_known, dts } => {
-                    let (ts_ms, cts_ms) = flv_video_time(pts, dts, &mut base_pts);
+                    let time = timeline.video(pts, dts, pts_known);
                     if process_video_frame(
                         VideoFrameSource::H265 { nalus: &nalus, is_keyframe, pts_known },
-                        pts,
-                        ts_ms,
-                        cts_ms,
-                        &mut base_pts,
+                        time,
+                        &mut timeline,
                         recv_time_us,
                         &mut passthrough,
                         &mut video_state,
@@ -519,7 +530,9 @@ async fn publish_loop(
                     }
                 }
                 DemuxedFrame::Aac { data, pts } => {
-                    let ts_ms = pts_to_ms(pts, &mut base_pts);
+                    // On the connection's timeline whether or not it is sent:
+                    // a frame dropped below still anchors the epoch, as before.
+                    let at = timeline.audio(pts);
 
                     // Lazy: build the encoder once we have the first
                     // ADTS frame (so we can read its profile / SR / ch).
@@ -537,31 +550,36 @@ async fn publish_loop(
                         );
                     }
 
-                    // Send the FLV AAC sequence header on first frame.
-                    // Always uses AOT=2 (AAC-LC) — even for HE-AAC output,
-                    // most RTMP servers (Twitch, YouTube, nginx-rtmp)
-                    // expect AOT=2 in the ASC and detect SBR / PS from
-                    // the bitstream itself. This matches what `ffmpeg
-                    // -c:a aac -profile:a aac_he -f flv` writes.
-                    if !sent_audio_header
-                        && let Some(cached) = demuxer.cached_aac_config()
-                        && let Some((asc_sr_idx, asc_ch_cfg)) =
-                            aac_sequence_header_format(&encoder_state, cached)
-                    {
-                            let header = build_aac_sequence_header(1, asc_sr_idx, asc_ch_cfg);
-                            client.send_audio(&header, ts_ms).await?;
-                            sent_audio_header = true;
-                            tracing::debug!("RTMP output '{}': sent AAC sequence header", config.id);
-                        }
-
-                    if !sent_audio_header {
-                        continue;
-                    }
+                    // The FLV AAC sequence header's format, for a frame
+                    // passed through. Always AOT=2 (AAC-LC) — even for
+                    // HE-AAC output, most RTMP servers (Twitch, YouTube,
+                    // nginx-rtmp) expect AOT=2 in the ASC and detect SBR /
+                    // PS from the bitstream itself. This matches what
+                    // `ffmpeg -c:a aac -profile:a aac_he -f flv` writes.
+                    let header_format = demuxer
+                        .cached_aac_config()
+                        .and_then(|cached| aac_sequence_header_format(&encoder_state, cached));
 
                     match &mut encoder_state {
                         EncoderState::Disabled | EncoderState::Transparent => {
-                            // Existing passthrough path: write the raw
-                            // ADTS-stripped AAC frame as an FLV audio tag.
+                            // Passthrough: the raw ADTS-stripped AAC frame as
+                            // an FLV audio tag, the sequence header ahead of
+                            // the first. A frame at or behind one already sent
+                            // (a loop's overlap) is dropped.
+                            if !sent_audio_header && header_format.is_none() {
+                                continue;
+                            }
+                            let Some(ts_ms) = timeline.audio_tag_ms(at) else {
+                                continue;
+                            };
+                            if !sent_audio_header
+                                && let Some((asc_sr_idx, asc_ch_cfg)) = header_format
+                            {
+                                let header = build_aac_sequence_header(1, asc_sr_idx, asc_ch_cfg);
+                                client.send_audio(&header, ts_ms).await?;
+                                sent_audio_header = true;
+                                tracing::debug!("RTMP output '{}': sent AAC sequence header", config.id);
+                            }
                             let tag = build_aac_raw_tag(&data);
                             let tag_len = tag.len();
                             client.send_audio(&tag, ts_ms).await?;
@@ -575,6 +593,7 @@ async fn publish_loop(
                             decode_stats,
                             stage,
                             silence,
+                            input,
                         } => {
                             // Silent-fallback mode: lazily build the decoder
                             // against the source's real AAC config on the
@@ -592,10 +611,12 @@ async fn publish_loop(
                                 }
                             // Reset the drop watchdog: real audio is
                             // flowing, suppress silence until the next
-                            // grace-window expiry.
+                            // grace-window expiry. And measure the picture's
+                            // lead over it, which silence stops short by.
                             if let Some(sg) = silence.as_mut() {
-                                sg.mark_real_audio(pts);
+                                sg.mark_real_audio(at);
                             }
+                            input.mark_real_audio(at, timeline.newest_picture());
                             let Some(dec) = decoder.as_mut() else {
                                 // Decoder build failed (or we're still in
                                 // silent-only mode with an unusable source
@@ -606,15 +627,16 @@ async fn publish_loop(
                             match dec.decode_frame(&data) {
                                 Ok(planar) => {
                                     decode_stats.inc_output();
-                                    match encoder.submit_through(stage, &planar, dec.sample_rate(), pts) {
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                "RTMP output '{}': transcode failed: {e}",
-                                                config.id
-                                            );
-                                        }
-                                    }
+                                    submit_source_audio(
+                                        encoder,
+                                        stage,
+                                        input,
+                                        silence.is_some(),
+                                        &planar,
+                                        dec.sample_rate(),
+                                        at,
+                                        &config.id,
+                                    );
                                 }
                                 Err(e) => {
                                     decode_stats.inc_error();
@@ -624,36 +646,19 @@ async fn publish_loop(
                                     );
                                 }
                             }
-                            // Drain any encoded frames the encoder has
-                            // ready and write them as FLV audio tags.
-                            let drained = encoder.drain();
-                            if !drained.is_empty() {
-                                tracing::debug!(
-                                    "RTMP output '{}': drained {} encoded frames",
-                                    config.id, drained.len()
-                                );
-                            }
-                            for frame in drained {
-                                let tag = build_aac_raw_tag(&frame.data);
-                                let tag_len = tag.len();
-                                // Use the encoder's per-frame PTS (90 kHz)
-                                // for the FLV tag so AAC frames drained as
-                                // a batch don't all share the source PES
-                                // ts_ms — keeps DTS strictly monotonic.
-                                // Share the connection's FLV epoch. This was
-                                // the raw absolute source PTS in ms, so on any
-                                // source whose PTS does not start near zero —
-                                // every feed from an upstream bilbycast edge,
-                                // whose rewriter anchors on the master clock —
-                                // audio tags landed up to ~26.5 h ahead of
-                                // 0-based video tags.
-                                let base = *base_pts.get_or_insert(frame.pts);
-                                let frame_ts_ms = rel_ms_monotonic(frame.pts, base);
-                                client.send_audio(&tag, frame_ts_ms).await?;
-                                stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
-                                stats.record_latency(recv_time_us);
-                            }
+                            // Write what the encoder has ready, each frame at
+                            // its own stamp, the sequence header (in the
+                            // encoder's format) ahead of the first.
+                            send_encoded_audio(
+                                client,
+                                encoder,
+                                &mut timeline,
+                                &mut sent_audio_header,
+                                demuxer.cached_aac_config().map(|c| c.1),
+                                stats,
+                                Some(recv_time_us),
+                            )
+                            .await?;
                         }
                         EncoderState::Failed | EncoderState::Lazy => {
                             // Failed: drop audio silently for the rest of
@@ -668,7 +673,9 @@ async fn publish_loop(
                 }
                 #[cfg(feature = "media-codecs")]
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
-                    let ts_ms = pts_to_ms(pts, &mut base_pts);
+                    // On the timeline before the Disabled check: a dropped
+                    // MP2 track still times the connection, as it did.
+                    let at = timeline.audio(pts);
 
                     // RTMP carries AAC: MP2 / AC-3 / E-AC-3 / AAC-LATM reach
                     // it only re-encoded (`audio_encode`). A source no
@@ -705,61 +712,51 @@ async fn publish_loop(
                         event_sender,
                     );
                     let EncoderState::Active {
-                        encoder, silence, stage, decode_stats, ..
+                        encoder, silence, stage, decode_stats, input, ..
                     } = &mut encoder_state
                     else {
                         continue;
                     };
                     if let Some(sg) = silence.as_mut() {
-                        sg.mark_real_audio(pts);
+                        sg.mark_real_audio(at);
                     }
+                    input.mark_real_audio(at, timeline.newest_picture());
 
-                    // Send the FLV AAC sequence header on first frame —
-                    // for OtherAudio sources we can't read ADTS config off
-                    // the demuxer, so derive the ASC straight from the
-                    // encoder's target params (which is what every RTMP
-                    // server actually expects to see).
-                    if !sent_audio_header {
-                        let p = encoder.params();
-                        if let Some(sr_idx) = sr_index_from_hz(p.target_sample_rate) {
-                            let header =
-                                build_aac_sequence_header(1, sr_idx, p.target_channels);
-                            client.send_audio(&header, ts_ms).await?;
-                            sent_audio_header = true;
-                        }
-                    }
-                    if !sent_audio_header {
-                        continue;
-                    }
-
+                    // To the encoder's format: MP2 at another rate was
+                    // encoded as if at the encoder's (and ran at the wrong
+                    // speed), 5.1 AC-3 refused. Each frame of the PES at its
+                    // own time — the PES's PTS stamps its first — or every
+                    // MP2 frame after the first (2 160 ticks, past the
+                    // placement's slack) would read as a departure.
+                    let fill_gaps = silence.is_some();
+                    let mut frame_at = at;
                     for frame in decoded {
                         decode_stats.inc_output();
-                        // To the encoder's format: MP2 at another rate
-                        // was encoded as if at the encoder's (and ran
-                        // at the wrong speed), 5.1 AC-3 refused.
-                        match encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts) {
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::debug!(
-                                    "RTMP output '{}': transcode failed: {e}",
-                                    config.id
-                                );
-                            }
-                        }
+                        submit_source_audio(
+                            encoder,
+                            stage,
+                            input,
+                            fill_gaps,
+                            &frame.planar,
+                            frame.sample_rate,
+                            frame_at,
+                            &config.id,
+                        );
+                        frame_at = frame_at.saturating_add(audio_ticks(frame.samples_per_channel, frame.sample_rate));
                     }
-                    let drained = encoder.drain();
-                    for frame in drained {
-                        let tag = build_aac_raw_tag(&frame.data);
-                        let tag_len = tag.len();
-                        // Share the connection's FLV epoch — see the AAC
-                        // path above.
-                        let base = *base_pts.get_or_insert(frame.pts);
-                        let frame_ts_ms = rel_ms_monotonic(frame.pts, base);
-                        client.send_audio(&tag, frame_ts_ms).await?;
-                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                        stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
-                        stats.record_latency(recv_time_us);
-                    }
+                    // An MP2 / AC-3 / E-AC-3 source has no ADTS config to
+                    // fall back on: the header is the encoder's target
+                    // format, which is what every RTMP server expects.
+                    send_encoded_audio(
+                        client,
+                        encoder,
+                        &mut timeline,
+                        &mut sent_audio_header,
+                        None,
+                        stats,
+                        Some(recv_time_us),
+                    )
+                    .await?;
                 }
                 #[cfg(not(feature = "media-codecs"))]
                 DemuxedFrame::OtherAudio { .. } => {
@@ -778,15 +775,13 @@ async fn publish_loop(
                         }
                         continue;
                     }
-                    // Re-encode only, which builds its own timeline: no
-                    // composition time to carry.
-                    let ts_ms = pts_to_ms(pts, &mut base_pts);
+                    // Re-encode only, which takes the picture's presentation
+                    // time: no DTS to read.
+                    let time = timeline.video(pts, None, pts_known);
                     process_video_frame(
                         VideoFrameSource::Mpeg2 { es: &es, is_keyframe, pts_known },
-                        pts,
-                        ts_ms,
-                        0,
-                        &mut base_pts,
+                        time,
+                        &mut timeline,
                         recv_time_us,
                         &mut passthrough,
                         &mut video_state,
@@ -801,7 +796,12 @@ async fn publish_loop(
                 // An input switch: passthrough starts its parameter-set
                 // table again, so the new source's sets replace the old
                 // one's in the sequence header (edge#211). The FLV timeline
-                // is not re-anchored here (edge#211 item 3).
+                // is deliberately not re-anchored: it judges the timestamps
+                // themselves, as CMAF's does. A switch on one clock is a gap
+                // or nothing, a switch to an unrelated clock a jump it
+                // absorbs; re-anchoring here would close real gaps, and put
+                // the old feed's last picture — handed out after this frame
+                // — on the new feed's clock.
                 DemuxedFrame::Discontinuity => passthrough.restart(),
                 DemuxedFrame::Scte35(_) => {}
             }
@@ -812,10 +812,367 @@ async fn publish_loop(
     }
 }
 
-/// Convert 90kHz PTS to milliseconds relative to the first frame.
-fn pts_to_ms(pts: u64, base_pts: &mut Option<u64>) -> u32 {
-    let base = *base_pts.get_or_insert(pts);
-    rel_ms_wrapping(pts, base)
+/// One lap of the 33-bit PTS clock.
+const LAP_90K: u64 = 1 << 33;
+const MASK_33: u64 = LAP_90K - 1;
+
+/// One FLV millisecond: how far a held picture goes on past the last.
+const FLV_MS_90K: u64 = 90;
+
+/// The longest pause kept on a track with nothing beside it (a video-only
+/// source, an audio-only one): a slide feed or VFR camera keeps its timing;
+/// a step past it is a jump and is continued one frame on.
+const FLV_LONE_GAP_90K: u64 = 10 * 90_000;
+
+/// The 64-bit value of the 33-bit `ts` that lies nearest `near`.
+fn unwrap_near(ts: u64, near: u64) -> u64 {
+    let ahead = ts.wrapping_sub(near) & MASK_33;
+    if ahead < LAP_90K / 2 { near.saturating_add(ahead) } else { near.saturating_sub(LAP_90K - ahead) }
+}
+
+/// One audio frame's length in 90 kHz ticks.
+#[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+fn audio_ticks(samples: usize, rate: u32) -> u64 {
+    samples as u64 * 90_000 / u64::from(rate.max(1))
+}
+
+/// A picture's place on the connection's FLV timeline ([`FlvTimeline::video`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PictureTime {
+    /// Presentation time, unwrapped, never held: what the re-encoder feeds
+    /// its decoder.
+    #[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+    pts: u64,
+    /// Decode time, unwrapped, at least a ms past the last picture's.
+    dts: u64,
+    /// The FLV tag timestamp (the decode time) and composition time.
+    ts_ms: u32,
+    cts_ms: u32,
+}
+
+/// One RTMP connection's FLV timeline: every tag timestamp, audio and video,
+/// passthrough and re-encoded, is placed on it (edge#211).
+///
+/// FLV wants one timeline that never steps back, and the source's need not
+/// be one. The connection's epoch used to be set once, from the first
+/// essence, and every tag stamped against it from the raw 33-bit PTS: a
+/// backward jump — a looped MPTS with no input `program_number`, so the PTS
+/// rewriter passes it through, or a switch on a `passthrough_clock` flow —
+/// stamped every later tag behind what had gone out, or 0; the 33-bit wrap,
+/// every 26.5 h, stamped every tag 0 until the PTS climbed back past the
+/// epoch; and a picture whose PES carried no PTS was stamped 0 in mid-stream.
+///
+/// Every timestamp now goes through a [`CmafTimeline`] — CMAF's, not a
+/// second copy of its rules — of the connection's own, which keeps the
+/// source's timestamps where they are continuous and continues a jump one
+/// frame on, sharing the offset between the tracks so the new feed keeps its
+/// own A/V relation; and the result is unwrapped to 64 bits, so the wrap is
+/// a lap and not a step. The video is mapped by its decode time, which is
+/// monotonic on a clean source, and presented at that plus its composition
+/// offset. A track with nothing beside it keeps a pause of up to
+/// [`FLV_LONE_GAP_90K`] (`CmafTimeline::with_lone_gap`).
+#[derive(Debug)]
+struct FlvTimeline {
+    source: CmafTimeline,
+    /// The last unwrapped value, either track's: what the next is unwrapped
+    /// against.
+    reference: Option<u64>,
+    /// FLV ms 0, unwrapped: the first essence's (a picture's decode time).
+    epoch: Option<u64>,
+    /// The last picture's time: a picture whose PES carried no PTS takes it,
+    /// and the next decode time goes at least a ms past it.
+    last_picture: Option<PictureTime>,
+    /// The newest presentation time any picture has had: where the picture
+    /// is, which silence is laid to.
+    newest_picture: Option<u64>,
+    /// The newest audio time mapped, sent or not.
+    newest_audio: Option<u64>,
+    /// The newest audio tag sent: one at or behind it is dropped.
+    last_audio: Option<u64>,
+    /// Jumps absorbed, and when one was last logged.
+    jumps: u64,
+    jump_logged: Option<std::time::Instant>,
+    output_id: String,
+}
+
+impl FlvTimeline {
+    fn new(output_id: &str) -> Self {
+        Self {
+            source: CmafTimeline::with_lone_gap(FLV_LONE_GAP_90K),
+            reference: None,
+            epoch: None,
+            last_picture: None,
+            newest_picture: None,
+            newest_audio: None,
+            last_audio: None,
+            jumps: 0,
+            jump_logged: None,
+            output_id: output_id.to_string(),
+        }
+    }
+
+    /// `src` (90 kHz, 33 bits) of `track` on the timeline, unwrapped. The
+    /// first value is put a lap up, so a value behind it does not underflow.
+    fn map(&mut self, track: Track, src: u64) -> u64 {
+        let m = self.source.map(track, src);
+        if let Some(jump) = m.jump {
+            self.jumps += 1;
+            let due = self.jump_logged.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
+            if due {
+                self.jump_logged = Some(std::time::Instant::now());
+                tracing::info!(
+                    output_id = self.output_id.as_str(),
+                    track = ?track,
+                    jump_s = jump as f64 / 90_000.0,
+                    jumps = self.jumps,
+                    "RTMP output: the source's timestamps jumped; the FLV timeline continues across it"
+                );
+            }
+        }
+        let at = self.reference.map_or(LAP_90K + m.ts, |r| unwrap_near(m.ts, r));
+        self.reference = Some(at);
+        at
+    }
+
+    /// One picture's time: `pts` and the PES's `dts` as the demuxer handed
+    /// them out. A picture whose PES carried no PTS (`pts_known` false — a
+    /// PAFF source remuxed one field to a PES) takes the previous picture's
+    /// time, decode and composition alike, since it belongs to its frame;
+    /// before any picture has had one there is none to take, and `None`.
+    ///
+    /// The decode time goes at least a ms past the last picture's: a jump
+    /// joining the other track's offset can step it back up to the
+    /// timeline's 1 s own window, and FLV's never does. The picture still
+    /// presents at its own time when that is later; on a clean source the
+    /// hold never engages, and the tag is what [`flv_video_time`] made of
+    /// the raw timestamps.
+    fn video(&mut self, pts: u64, dts: Option<u64>, pts_known: bool) -> Option<PictureTime> {
+        if !pts_known {
+            return self.last_picture;
+        }
+        let offset = dts.map_or(0, |d| super::cmaf::composition_offset_90k(pts, d));
+        let decoded = self.map(Track::Video, pts.wrapping_sub(offset) & MASK_33);
+        let presented = decoded.saturating_add(offset);
+        let dts = self.last_picture.map_or(decoded, |p| decoded.max(p.dts.saturating_add(FLV_MS_90K)));
+        let (ts_ms, cts_ms) = flv_video_time(presented.max(dts), Some(dts), &mut self.epoch);
+        self.newest_picture = Some(self.newest_picture.map_or(presented, |n| n.max(presented)));
+        let time = PictureTime { pts: presented, dts, ts_ms, cts_ms };
+        self.last_picture = Some(time);
+        Some(time)
+    }
+
+    /// One audio frame's time: mapped, anchoring the epoch when it is the
+    /// connection's first essence, whether or not the frame is sent.
+    fn audio(&mut self, pts: u64) -> u64 {
+        let at = self.map(Track::Audio, pts);
+        self.epoch.get_or_insert(at);
+        self.newest_audio = Some(self.newest_audio.map_or(at, |n| n.max(at)));
+        at
+    }
+
+    /// The FLV ms of `at`, a time on this timeline.
+    fn tag_ms(&mut self, at: u64) -> u32 {
+        rel_ms_monotonic(at, *self.epoch.get_or_insert(at))
+    }
+
+    /// The FLV ms of an audio tag at `at`, or `None` to drop it: at or behind
+    /// the last audio tag sent (a loop's or a switch's overlap, which would
+    /// step the audio track back), or before the epoch. Audio has no
+    /// composition time, so a frame before the epoch has no place on the
+    /// timeline: stamped 0, as every such frame was, the transcoded audio
+    /// of a connection whose first essence was a picture put ~640 ms of
+    /// MP2 / AC-3 at one instant. Every audio tag goes through here —
+    /// passthrough, transcoded and silent.
+    fn audio_tag_ms(&mut self, at: u64) -> Option<u32> {
+        if self.last_audio.is_some_and(|l| at <= l) || self.epoch.is_some_and(|e| at < e) {
+            return None;
+        }
+        self.last_audio = Some(at);
+        Some(self.tag_ms(at))
+    }
+
+    /// Whether an essence has anchored the epoch.
+    fn anchored(&self) -> bool {
+        self.epoch.is_some()
+    }
+
+    fn newest_picture(&self) -> Option<u64> {
+        self.newest_picture
+    }
+
+    fn newest_audio(&self) -> Option<u64> {
+        self.newest_audio
+    }
+}
+
+/// Submit one decoded source frame (`planar` at `rate`, from mapped time
+/// `at`) at its place on the encoder's input timeline: re-anchoring the
+/// encoder where the source left it, covering a gap with zeros under
+/// `silent_fallback` (`fill_gaps`), holding back a frame the input is
+/// already past — the rule CMAF's re-encoder applies
+/// ([`EncoderInputClock::place`]). The encoder used to anchor on its first
+/// frame and count samples for the life of the connection, so a loop
+/// whose audio and video lengths differ drifted A/V by the difference every
+/// lap, and a switch kept the old feed's A/V relation.
+#[allow(clippy::too_many_arguments)]
+fn submit_source_audio(
+    encoder: &mut AudioEncoder,
+    stage: &mut super::audio_transcode::EncoderStage,
+    input: &mut EncoderInputClock,
+    fill_gaps: bool,
+    planar: &[Vec<f32>],
+    rate: u32,
+    at: u64,
+    output_id: &str,
+) {
+    let n = planar.first().map_or(0, Vec::len) as u64;
+    if n == 0 {
+        return;
+    }
+    input.set_rate(rate);
+    match input.place(at, fill_gaps) {
+        Placement::Skip => return,
+        Placement::Submit { reanchor: true } => {
+            encoder.reanchor_pts();
+            input.anchor(at, rate);
+        }
+        Placement::FillThenSubmit { samples } => {
+            let zeros = vec![vec![0.0f32; samples as usize]; planar.len()];
+            match encoder.submit_through(stage, &zeros, rate, input.position().unwrap_or(at)) {
+                Ok(true) => input.took(samples),
+                _ => input.refused(),
+            }
+        }
+        Placement::Submit { reanchor: false } => {}
+    }
+    match encoder.submit_through(stage, planar, rate, input.position().unwrap_or(at)) {
+        Ok(true) => input.took(n),
+        Ok(false) => input.refused(),
+        Err(e) => {
+            tracing::debug!("RTMP output '{output_id}': transcode failed: {e}");
+            input.refused();
+        }
+    }
+}
+
+/// Lay silence while the watchdog says real audio is absent: up to the
+/// newest picture less the video's lead over the audio, as CMAF's
+/// `encode_silence_if_needed` does. The tick is only the watchdog, so a late
+/// tick costs nothing and a stalled picture stops the silence; with no
+/// picture, one chunk a tick from the encoder's input, else from the newest
+/// audio mapped. Never before an essence has anchored the FLV epoch.
+///
+/// The generator's own PTS starts at 0 and is not used: submitted at it, the
+/// first silent chunk anchored the encoder at 0 once a picture had anchored
+/// the epoch, and every silent tag went out at 0 for as long as the source
+/// PTS stood above 0 — on a video-only source always.
+fn lay_silence(
+    encoder: &mut AudioEncoder,
+    sg: &mut SilenceGenerator,
+    input: &mut EncoderInputClock,
+    timeline: &FlvTimeline,
+    output_id: &str,
+) {
+    if !timeline.anchored() || !sg.should_emit() {
+        return;
+    }
+    let rate = encoder.params().sample_rate;
+    let chunk = sg.chunk_samples() as u64;
+    let starting = |sg: &SilenceGenerator| {
+        if !sg.is_emitting() {
+            tracing::info!(
+                "RTMP output '{output_id}': source audio absent/stalled — starting silent-AAC injection"
+            );
+        }
+    };
+    match timeline.newest_picture() {
+        Some(video) => {
+            let target = input.silence_target(video);
+            if input.silence_start(target, rate) {
+                encoder.reanchor_pts();
+            }
+            while let Some(at) = input.next_silence(chunk, target) {
+                starting(sg);
+                let (planar, _) = sg.next_chunk();
+                if !encoder.submit_planar(planar, at) {
+                    input.refused();
+                    break;
+                }
+                input.took(chunk);
+                input.mark_silence();
+            }
+        }
+        None => {
+            let Some(start) = input.position().or(timeline.newest_audio()) else {
+                return;
+            };
+            if input.silence_start(start, rate) {
+                encoder.reanchor_pts();
+            }
+            let Some(at) = input.position() else {
+                return;
+            };
+            starting(sg);
+            let (planar, _) = sg.next_chunk();
+            if encoder.submit_planar(planar, at) {
+                input.took(chunk);
+                input.mark_silence();
+            } else {
+                input.refused();
+            }
+        }
+    }
+}
+
+/// Send what `encoder` has encoded, each frame at its own stamp on the
+/// connection's timeline ([`FlvTimeline::audio_tag_ms`], which drops a frame
+/// at or behind one already sent). The AAC sequence header — the encoder's
+/// target format, its rate's ADTS index, else `fallback_sr_index` — goes out
+/// with the first frame, at its timestamp: the encoder's first frame is
+/// stamped its codec delay before the source time that produced it, so a
+/// header sent at that source time stepped the audio track back.
+async fn send_encoded_audio(
+    client: &mut RtmpClient,
+    encoder: &mut AudioEncoder,
+    timeline: &mut FlvTimeline,
+    sent_audio_header: &mut bool,
+    fallback_sr_index: Option<u8>,
+    stats: &OutputStatsAccumulator,
+    recv_time_us: Option<u64>,
+) -> anyhow::Result<()> {
+    let header = (!*sent_audio_header)
+        .then(|| {
+            let p = encoder.params();
+            sr_index_from_hz(p.target_sample_rate)
+                .or(fallback_sr_index)
+                .map(|i| build_aac_sequence_header(1, i, p.target_channels))
+        })
+        .flatten();
+    // The encoder's stamps are already on the timeline: it was anchored on
+    // mapped times.
+    for frame in encoder.drain() {
+        if !*sent_audio_header && header.is_none() {
+            // No header to announce the format, so no frame, as before.
+            continue;
+        }
+        let Some(ts_ms) = timeline.audio_tag_ms(frame.pts) else {
+            continue;
+        };
+        if !*sent_audio_header && let Some(h) = &header {
+            client.send_audio(h, ts_ms).await?;
+            *sent_audio_header = true;
+            tracing::debug!("RTMP output '{}': sent AAC sequence header (re-encoded)", timeline.output_id);
+        }
+        let tag = build_aac_raw_tag(&frame.data);
+        let tag_len = tag.len();
+        client.send_audio(&tag, ts_ms).await?;
+        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+        stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+        if let Some(r) = recv_time_us {
+            stats.record_latency(r);
+        }
+    }
+    Ok(())
 }
 
 /// FLV timing of one passed-through H.264 / HEVC picture: `(tag timestamp,
@@ -828,12 +1185,13 @@ fn pts_to_ms(pts: u64, base_pts: &mut Option<u64>) -> u32 {
 /// with composition time 0, so the tag stream stepped back at every reordered
 /// picture.
 ///
-/// The decode time is the PTS less the composition offset that
+/// The inputs come from [`FlvTimeline::video`], already unwrapped. The decode
+/// time is the PTS less the composition offset that
 /// [`super::cmaf::composition_offset_90k`] reads off the PES's DTS, which is
 /// the judgement CMAF passthrough makes: a DTS after the PTS, or more than 2 s
 /// before it, counts as none. With no DTS (a stream without B-frames, every
-/// non-reference B-picture, a PES with no timestamp) the result is exactly
-/// [`pts_to_ms`] with composition time 0, byte for byte what went out before.
+/// non-reference B-picture) the result is exactly the PTS mapping, with
+/// composition time 0, byte for byte what went out before.
 ///
 /// - The first essence anchors the epoch. A picture anchors it on its decode
 ///   time, the earliest stamp any later picture carries; anchored on its PTS
@@ -844,71 +1202,46 @@ fn pts_to_ms(pts: u64, base_pts: &mut Option<u64>) -> u32 {
 /// - Behind an epoch audio anchored, a picture's decode time clamps to 0 and
 ///   its composition time carries the whole of its PTS: still presented on
 ///   time.
-/// - The decode time saturates at 0 rather than wrapping. A PTS just past the
-///   33-bit wrap, below its offset, would otherwise put the decode time (and,
-///   on a connection's first picture, the epoch) near 2^33, which
-///   [`rel_ms_wrapping`] reads as ~26.5 h ahead.
+/// - The decode time saturates at 0 rather than wrapping, a second line of
+///   defence behind the unwrapped timeline. The subtraction is in 64 bits, so
+///   a picture straddling the FLV clock's own 2^32 ms wrap keeps its
+///   composition time.
 fn flv_video_time(pts: u64, dts: Option<u64>, base_pts: &mut Option<u64>) -> (u32, u32) {
     let offset = dts.map_or(0, |d| super::cmaf::composition_offset_90k(pts, d));
     let dts = pts.saturating_sub(offset);
     let base = *base_pts.get_or_insert(dts);
-    let dts_ms = rel_ms_wrapping(dts, base);
-    let pts_ms = rel_ms_wrapping(pts, base);
-    (dts_ms, pts_ms.saturating_sub(dts_ms))
+    let dts_ms = dts.saturating_sub(base) / 90;
+    let pts_ms = pts.saturating_sub(base) / 90;
+    (dts_ms as u32, pts_ms.saturating_sub(dts_ms) as u32)
 }
 
-/// Largest 33-bit PTS distance still read as "forward". Only meaningful for a
-/// raw source PTS, which wraps at 2^33.
-const MAX_FORWARD_90K: u64 = 1 << 33;
-
-/// Raw (wrapping, 33-bit) source PTS → FLV milliseconds relative to the epoch.
-fn rel_ms_wrapping(pts: u64, base: u64) -> u32 {
-    let delta = pts.wrapping_sub(base);
-    if delta >= MAX_FORWARD_90K {
-        return 0;
-    }
-    (delta / 90) as u32
-}
-
-/// An already-monotonic 90 kHz timeline → FLV milliseconds relative to the
-/// epoch.
+/// A time on the connection's [`FlvTimeline`] (unwrapped, 64 bits) → FLV
+/// milliseconds relative to the epoch.
 ///
-/// `v` is non-decreasing by construction — either the wire-PTS guard below, or
-/// the audio encoder's once-anchored sample counter — so no wrap heuristic is
-/// wanted here. Applying one would cap the output at 2^33 ticks (~26.5 h) and
-/// then pin every later tag to 0. A value behind the epoch (the other essence
-/// anchored first) clamps to 0.
+/// No wrap heuristic is wanted here: the timeline has already unwrapped the
+/// source's 33-bit clock. Applying one would cap the output at 2^33 ticks
+/// (~26.5 h) and then pin every later tag to 0. A value behind the epoch (the
+/// other essence anchored first) clamps to 0. The `as u32` truncates modulo
+/// 2^32 ms (49.7 days), as FLV's own clock wraps.
 fn rel_ms_monotonic(v: u64, base: u64) -> u32 {
     (v.saturating_sub(base) / 90) as u32
 }
 
-/// Ticks beyond which a forward step is read as a source discontinuity rather
-/// than a real gap. Two seconds: past any legitimate inter-frame interval,
-/// well short of a splice or a clock re-anchor.
-const MAX_FORWARD_STEP_90K: u64 = 180_000;
-
 /// Wire PTS (90 kHz) for one encoded video frame.
 ///
 /// FLV carries DTS in the tag timestamp and RTMP servers drop a publisher whose
-/// DTS goes backwards, so the result is forced strictly increasing. It is also
-/// forced not to *leap*: the transcoded-audio timeline anchors once and then
-/// free-runs on a sample count, so it physically cannot follow a forward source
-/// jump. Letting video jump while audio cannot is the very A/V split this fix
-/// exists to close, so both directions substitute one nominal frame step. On a
-/// genuine ingest gap this compresses the video timeline by exactly the amount
-/// the audio timeline is already compressed — the two stay together, which is
-/// the property that matters.
-fn next_wire_pts_90k(
-    queue: &mut std::collections::VecDeque<u64>,
-    last: Option<u64>,
-    step_90k: u64,
-) -> u64 {
+/// DTS goes backwards, so the result is forced strictly increasing. Its input
+/// is on the connection's FLV timeline, where a forward step is a gap both
+/// tracks keep, a video pause the audio ran through, or a lone track's pause,
+/// so it is honoured: the transcoded audio follows the same timeline. A step
+/// back (an offset join inside the timeline's 1 s window) or a repeated stamp
+/// is held a millisecond on per frame until the source passes it, which takes
+/// ⌈Δ / (frame − 1 ms)⌉ frames. Substituting a whole frame (`last + step`), as
+/// this used to, kept the video a step ahead of the audio for good, and
+/// clamping a forward step to one split them at every gap.
+fn next_wire_pts_90k(queue: &mut std::collections::VecDeque<u64>, last: Option<u64>) -> u64 {
     let raw = queue.pop_front().unwrap_or(0);
-    match last {
-        None => raw,
-        Some(l) if raw > l && raw - l <= MAX_FORWARD_STEP_90K => raw,
-        Some(l) => l.wrapping_add(step_90k),
-    }
+    last.map_or(raw, |l| raw.max(l.saturating_add(FLV_MS_90K)))
 }
 
 /// Build an FLV video tag with length-prefixed NALUs, carrying the picture's
@@ -1363,12 +1696,13 @@ fn resolve_backend_chain_for_config(
 #[allow(clippy::too_many_arguments)]
 async fn process_video_frame(
     src: VideoFrameSource<'_>,
-    pts_90k: u64,
-    // The picture's FLV decode time and composition time (`flv_video_time`).
-    // Passthrough writes both; the re-encode builds its own timeline.
-    ts_ms: u32,
-    cts_ms: u32,
-    base_pts: &mut Option<u64>,
+    // The picture's time on the connection's FLV timeline
+    // (`FlvTimeline::video`): `None` for an access unit whose PES carried no
+    // PTS, before any picture that did. Passthrough writes its decode and
+    // composition times; the re-encode feeds its presentation time to the
+    // decoder and stamps what comes out on `timeline`.
+    time: Option<PictureTime>,
+    timeline: &mut FlvTimeline,
     recv_time_us: u64,
     passthrough: &mut PassthroughVideo,
     video_state: &mut VideoEncoderState,
@@ -1380,7 +1714,7 @@ async fn process_video_frame(
 ) -> anyhow::Result<bool> {
     match video_state {
         VideoEncoderState::Disabled => {
-            passthrough_video(&src, ts_ms, cts_ms, recv_time_us, passthrough, client, config, stats).await
+            passthrough_video(&src, time, recv_time_us, passthrough, client, config, stats).await
         }
         VideoEncoderState::Failed => {
             // Decoder/encoder already failed once — drop video silently
@@ -1409,11 +1743,11 @@ async fn process_video_frame(
                 return Ok(true);
             }
             // Fall through to Active on the very same frame.
-            encode_one_frame(&src, pts_90k, ts_ms, base_pts, recv_time_us, video_state, client, config, stats, flow_id, event_sender).await
+            encode_one_frame(&src, time, timeline, recv_time_us, video_state, client, config, stats, flow_id, event_sender).await
         }
         #[cfg(feature = "media-codecs")]
         VideoEncoderState::Active(_) => {
-            encode_one_frame(&src, pts_90k, ts_ms, base_pts, recv_time_us, video_state, client, config, stats, flow_id, event_sender).await
+            encode_one_frame(&src, time, timeline, recv_time_us, video_state, client, config, stats, flow_id, event_sender).await
         }
     }
 }
@@ -1425,8 +1759,8 @@ const HELD_PICTURES_WARN: u32 = 1_000;
 
 /// What passthrough has told the receiver about the source's video on this
 /// connection. A local of `publish_loop`, so each connection starts afresh.
-/// The per-connection state of the other edge#211 passthrough fixes belongs
-/// here too.
+/// The connection's timing is not here: every tag's time comes off its
+/// [`FlvTimeline`], which the re-encode shares.
 ///
 /// The sequence header used to be built from the demuxer's cache, which holds
 /// one set of each kind, the last seen, and is read after the whole datagram
@@ -1587,8 +1921,7 @@ fn sequence_header_tag(codec: CmafVideoCodec, sets: &ParamSets) -> Vec<u8> {
 #[allow(clippy::too_many_arguments)]
 async fn passthrough_video(
     src: &VideoFrameSource<'_>,
-    ts_ms: u32,
-    cts_ms: u32,
+    time: Option<PictureTime>,
     recv_time_us: u64,
     passthrough: &mut PassthroughVideo,
     client: &mut RtmpClient,
@@ -1623,6 +1956,13 @@ async fn passthrough_video(
     if codec == CmafVideoCodec::H265 && !nalus.iter().any(|n| h265_nal_type(n) < H265_NAL_VPS) {
         return Ok(true);
     }
+    // A picture whose PES carried no PTS, before any picture that did, has no
+    // time to go out at (edge#211: it went out at 0). Its parameter sets are
+    // in the table now; the picture is dropped, before a header is taken for
+    // it.
+    let Some(PictureTime { ts_ms, cts_ms, .. }) = time else {
+        return Ok(true);
+    };
     // The first sequence header goes out ahead of the first picture whose
     // parameter sets are in the table, not on the first keyframe: a source
     // that marks random access in neither way `is_keyframe` reads — an
@@ -1818,11 +2158,10 @@ fn open_video_active(
 #[allow(clippy::too_many_arguments)]
 async fn encode_one_frame(
     src: &VideoFrameSource<'_>,
-    pts_90k: u64,
-    _ts_ms: u32,
-    // Shared FLV epoch for this connection — anchored by whichever essence
-    // arrives first, so audio and video land on one timeline.
-    base_pts: &mut Option<u64>,
+    time: Option<PictureTime>,
+    // The connection's FLV timeline, shared with the audio: the source
+    // picture's time comes off it, and each encoded frame is stamped on it.
+    timeline: &mut FlvTimeline,
     recv_time_us: u64,
     video_state: &mut VideoEncoderState,
     client: &mut RtmpClient,
@@ -1844,7 +2183,15 @@ async fn encode_one_frame(
     let block_result = crate::timed_block_in_place!(
         "output_rtmp.video_encoder",
         crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-        { transcode_access_unit(active, &annex_b, pts_90k, src.pts_known(), &config.id) }
+        {
+            transcode_access_unit(
+                active,
+                &annex_b,
+                time.map_or(0, |t| t.pts),
+                src.pts_known() && time.is_some(),
+                &config.id,
+            )
+        }
     );
     // An explicit `scan: interlaced` the encoder could not open for: the
     // pipeline logged it; tell the manager too, once per open.
@@ -1883,33 +2230,22 @@ async fn encode_one_frame(
         _ => return Ok(true),
     };
 
-    // FLV timestamps come from the SOURCE clock, popped one per emitted frame
-    // from the FIFO the decode loop filled. The previous form derived them from
-    // the encoder's frame index and the *declared* rate, so video ran on the
-    // configured fps while transcoded audio ran on the source clock — the two
-    // diverged at the rate ratio, unbounded and with no resync.
+    // FLV timestamps come from the SOURCE clock, on the connection's
+    // timeline, popped one per emitted frame from the FIFO the decode loop
+    // filled. An older form derived them from the encoder's frame index and
+    // the *declared* rate, so video ran on the configured fps while
+    // transcoded audio ran on the source clock — the two diverged at the rate
+    // ratio, unbounded and with no resync.
     //
-    // Monotonicity, which the old form got for free, is preserved by
-    // `next_wire_pts_90k`: DTS is forced strictly increasing (RTMP servers drop
-    // a publisher whose DTS goes backwards) and forced not to leap, so a source
-    // discontinuity does not split video away from an audio timeline that
-    // cannot follow it.
-    // One frame period in 90 kHz ticks at the encoder's rate — only a
-    // substitute step for an unusable source PTS.
-    let step = {
-        let (num, den) = active.pipeline.fps();
-        (90_000 * u64::from(den.max(1)) / u64::from(num.max(1))).max(1)
-    };
+    // Monotonicity, which that form got for free, is kept by
+    // `next_wire_pts_90k`: DTS is forced strictly increasing (RTMP servers
+    // drop a publisher whose DTS goes backwards). A forward step is kept: the
+    // timeline has judged it, and the audio follows the same timeline.
     for (annex_b_encoded, keyframe, _enc_pts) in encoded {
-        let wire_pts = next_wire_pts_90k(
-            &mut active.src_pts_queue,
-            active.last_wire_pts_90k,
-            step,
-        );
+        let wire_pts = next_wire_pts_90k(&mut active.src_pts_queue, active.last_wire_pts_90k);
         active.last_wire_pts_90k = Some(wire_pts);
-        // Anchor the shared FLV epoch if this is the first essence to arrive.
-        let base = *base_pts.get_or_insert(wire_pts);
-        let frame_ts_ms = rel_ms_monotonic(wire_pts, base);
+        // Anchors the shared FLV epoch if this is the first essence to arrive.
+        let frame_ts_ms = timeline.tag_ms(wire_pts);
         // Send the sequence header once, then re-send on each subsequent
         // keyframe (mirrors the passthrough policy — some servers require
         // the ASC before they start demuxing).
@@ -1991,7 +2327,16 @@ fn transcode_access_unit(
         if !admitted {
             continue;
         }
-        let src_pts_for_frame = stamped.unwrap_or(pts_90k);
+        // On the connection's timeline: `pts_90k` is the picture's
+        // presentation time there (unwrapped), or the previous picture's for
+        // an access unit whose PES carried none, and the stamper's values —
+        // masked to 33 bits — are unwrapped against it.
+        let src_pts_for_frame = match stamped {
+            Some(s) => unwrap_near(s, pts_90k),
+            None if pts_known => pts_90k,
+            // No picture has carried a time yet: nothing to stamp it with.
+            None => continue,
+        };
         active.src_pts_queue.push_back(src_pts_for_frame);
 
         let was_open = active.pipeline.is_open();
@@ -2464,91 +2809,41 @@ fn build_encoder_for_format(
         decode_stats,
         stage,
         silence: None,
+        input: EncoderInputClock::default(),
     }
 }
 
-/// Silence-tick handler: if the drop watchdog says real audio is
-/// missing, inject one zero-filled chunk into the encoder, send the
-/// FLV AAC sequence header on the first emission, drain any encoded
-/// frames the encoder has queued, and write them out as FLV audio
-/// tags.
+/// Silence-tick handler: if the drop watchdog says real audio is missing,
+/// lay silence up to where the audio would be beside the picture
+/// ([`lay_silence`]), then send what the encoder has ready as FLV audio
+/// tags, the AAC sequence header ahead of the first.
 ///
 /// This is idempotent and cheap when no silence is needed: it
-/// short-circuits on `should_emit() == false`.
+/// short-circuits on `should_emit() == false`. Silence never *anchors* the
+/// connection's epoch, only reads it: until a real essence has, there is
+/// nothing for silence to be in sync with, so an output connecting before
+/// any essence arrives emits no audio tag until the first access unit — the
+/// right trade, since a video-only opening is universally tolerated and a
+/// split A/V timeline is not.
 async fn emit_silence_if_needed(
     config: &RtmpOutputConfig,
     client: &mut RtmpClient,
     encoder_state: &mut EncoderState,
     sent_audio_header: &mut bool,
     stats: &Arc<OutputStatsAccumulator>,
-    // Taken by value, deliberately: silence must never *anchor* the shared
-    // epoch, only read it.
-    base_pts: Option<u64>,
+    timeline: &mut FlvTimeline,
 ) -> anyhow::Result<()> {
     let EncoderState::Active {
         encoder,
         silence: Some(sg),
+        input,
         ..
     } = encoder_state
     else {
         return Ok(());
     };
-
-    // Wait for a real essence to anchor the epoch. Until one has, there is
-    // nothing for silence to be in sync with, and emitting is worse than
-    // waiting: the generator starts at 0 and the audio encoder latches its
-    // anchor from the first submission, so a chunk sent now would pin the
-    // whole audio timeline to 0 while video lands on the source clock. The
-    // cost is that an output connecting before any essence arrives emits no
-    // audio tag until the first access unit, where it used to emit silence
-    // from t≈0 — the right trade, since a video-only opening is universally
-    // tolerated and a split A/V timeline is not.
-    let Some(base) = base_pts else {
-        return Ok(());
-    };
-
-    if !sg.should_emit() {
-        return Ok(());
-    }
-
-    if !sg.is_emitting() {
-        tracing::info!(
-            "RTMP output '{}': source audio absent/stalled — starting silent-AAC injection",
-            config.id
-        );
-    }
-
-    let (planar, pts) = sg.next_chunk();
-    encoder.submit_planar(planar, pts);
-
-    if !*sent_audio_header {
-        let p = encoder.params();
-        if let Some(sr_idx) = sr_index_from_hz(p.target_sample_rate) {
-            let header = build_aac_sequence_header(1, sr_idx, p.target_channels);
-            client.send_audio(&header, 0).await?;
-            *sent_audio_header = true;
-            tracing::debug!(
-                "RTMP output '{}': sent AAC sequence header (silent-fallback)",
-                config.id
-            );
-        } else {
-            tracing::warn!(
-                "RTMP output '{}': silent-fallback target sample_rate {} has no ADTS index; deferring sequence header",
-                config.id, p.target_sample_rate
-            );
-        }
-    }
-
-    for frame in encoder.drain() {
-        let tag = build_aac_raw_tag(&frame.data);
-        let tag_len = tag.len();
-        let frame_ts_ms = rel_ms_monotonic(frame.pts, base);
-        client.send_audio(&tag, frame_ts_ms).await?;
-        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-        stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
-    }
-
-    Ok(())
+    lay_silence(encoder, sg, input, timeline, &config.id);
+    send_encoded_audio(client, encoder, timeline, sent_audio_header, None, stats, None).await
 }
 
 /// Eager encoder construction for `silent_fallback = true`.
@@ -2677,6 +2972,7 @@ fn build_encoder_state_eager_for_silent_fallback(
         decode_stats,
         stage,
         silence: Some(silence),
+        input: EncoderInputClock::default(),
     }
 }
 
@@ -3059,6 +3355,80 @@ mod rate_tests {
         assert!(pictures.windows(2).all(|p| p[1].0 > p[0].0), "{pictures:?}");
         assert_eq!(pictures[0].0, ((first_pts - first_dts) / 90) as u32, "{pictures:?}");
     }
+
+    /// The re-encoder is fed each picture's time on the connection's FLV
+    /// timeline, unwrapped, which runs on past 2^33 as the connection does:
+    /// the decoder echoes it, the stamper masks it to 33 bits, and the queue
+    /// unwraps it against the picture's own time again. Each queued time
+    /// steps +3 600 across 2^34 (a 33-bit wrap); taken masked, the wire
+    /// time would step back 26.5 h there.
+    #[test]
+    fn a_re_encode_across_the_33_bit_wrap_queues_unwrapped_times() {
+        let cfg: VideoEncodeConfig =
+            serde_json::from_value(serde_json::json!({"codec": "x264", "preset": "veryfast"})).unwrap();
+        let config: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k"
+        }))
+        .unwrap();
+        let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
+        let (events, _rx) = crate::manager::events::event_channel();
+        let aus = x264_test_source(40, 3_600);
+        let mut state = open_video_active(&cfg, video_codec::VideoCodec::H264, &aus[0].0, &config, &stats, &events);
+        const UP: u64 = 1 << 34;
+        for (k, (au, _)) in aus.iter().enumerate() {
+            let VideoEncoderState::Active(active) = &mut state else { panic!("not active") };
+            transcode_access_unit(active, au, UP - 72_000 + k as u64 * 3_600, true, "o").unwrap();
+        }
+        let VideoEncoderState::Active(active) = &state else { panic!("not active") };
+        let queued: Vec<u64> = active.src_pts_queue.iter().copied().collect();
+        assert!(queued.windows(2).all(|w| w[1] == w[0] + 3_600), "{queued:?}");
+        assert!(queued[0] < UP && *queued.last().unwrap() > UP, "across the wrap: {queued:?}");
+    }
+
+    /// A re-encoded loop whose audio (85 frames, 1 813 ms) is shorter than
+    /// its video (48 pictures, 1 920 ms), the audio meeting the loop first:
+    /// the audio goes on one frame on, and the video joins it 6 000 ticks
+    /// behind its last picture. The re-encode's wire time is held a ms on
+    /// for its first two pictures and then rejoins the source's: from the
+    /// third picture of the second lap every one is on its source time. The wire
+    /// time used to substitute a whole frame at a step back and run on from
+    /// there, a frame ahead of the audio for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_re_encode_rejoins_the_source_clock_after_a_loop_step_back() {
+        use super::flv_wire_tests::{Lap, programme_ts, publish, tag_cts};
+        use crate::engine::rtmp::ts_mux::TsMuxer;
+        const T0: u64 = 900_000;
+        let aus = x264_test_source(48, 3_600);
+        assert_eq!(aus[0].1, T0);
+        let pics: Vec<(u64, Option<u64>)> = aus.iter().map(|a| (a.1, None)).collect();
+        // Audio first: its first frame is muxed ahead of the second picture,
+        // and anchors the epoch.
+        let a0 = T0 + 1_800;
+        let audio: Vec<u64> = (0..85).map(|j| a0 + j * 1_920).collect();
+        let laps = [Lap::new(pics.clone(), audio.clone()), Lap::new(pics.clone(), audio.clone())];
+        let au = |_: bool, k: usize| aus[k].0.clone();
+        let tags = publish(
+            programme_ts(&mut TsMuxer::new(), &au, &laps, &[0]),
+            serde_json::json!({
+                "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+                "video_encode": { "codec": "x264", "preset": "veryfast", "fps_num": 25, "fps_den": 1 }
+            }),
+        )
+        .await;
+        let pictures: Vec<u32> =
+            tags.iter().filter(|t| t.video).filter_map(|t| Some(t.ts + tag_cts(&t.data)?)).collect();
+        assert_eq!(pictures.len(), 96, "every picture re-encoded");
+        assert!(pictures.windows(2).all(|p| p[1] > p[0]), "{pictures:?}");
+        let ms = |t: u64| (t.saturating_sub(a0) / 90) as u32;
+        let shift = 85 * 1_920;
+        for (k, &(pts, _)) in pics.iter().enumerate() {
+            assert_eq!(pictures[k], ms(pts), "lap 1, picture {k}");
+            if k >= 2 {
+                assert_eq!(pictures[48 + k], ms(pts + shift), "lap 2, picture {k}: on the source's time");
+            }
+        }
+        assert_eq!(pictures[48], ms(pics[47].0) + 1, "lap 2's first picture held a ms on");
+    }
 }
 
 #[cfg(test)]
@@ -3078,7 +3448,7 @@ mod flv_timestamp_tests {
         let mut last = None;
         let mut out = Vec::new();
         for _ in 0..5 {
-            let p = next_wire_pts_90k(&mut q, last, 3000 /* 30 fps step */);
+            let p = next_wire_pts_90k(&mut q, last);
             last = Some(p);
             out.push(p);
         }
@@ -3096,7 +3466,7 @@ mod flv_timestamp_tests {
         let mut last = None;
         let mut prev = 0u64;
         for i in 0..3 {
-            let p = next_wire_pts_90k(&mut q, last, STEP_25FPS);
+            let p = next_wire_pts_90k(&mut q, last);
             if i > 0 {
                 assert!(p > prev, "DTS must not stall or go backwards");
             }
@@ -3105,33 +3475,47 @@ mod flv_timestamp_tests {
         }
     }
 
-    #[test]
-    fn a_backwards_source_pts_substitutes_one_step() {
-        let mut q: VecDeque<u64> = VecDeque::from(vec![100_000, 50_000]);
-        let first = next_wire_pts_90k(&mut q, None, STEP_25FPS);
-        let second = next_wire_pts_90k(&mut q, Some(first), STEP_25FPS);
-        assert_eq!(second, first + STEP_25FPS, "never emit a backwards DTS");
+    /// `next_wire_pts_90k` over `src`, from a fresh connection.
+    fn wire_pts(src: &[u64]) -> Vec<u64> {
+        let mut q: VecDeque<u64> = src.iter().copied().collect();
+        let mut last = None;
+        (0..src.len())
+            .map(|_| {
+                let p = next_wire_pts_90k(&mut q, last);
+                last = Some(p);
+                p
+            })
+            .collect()
     }
 
-    /// The audio timeline anchors once and free-runs on a sample count, so it
-    /// cannot follow a forward source jump. Letting video jump while audio
-    /// cannot is exactly the A/V split this fix closes, so a leap is clamped
-    /// to one nominal step in both directions.
+    /// A source stamp behind the last one sent (an offset join inside the
+    /// timeline's 1 s own window), or repeating it, is held a millisecond on
+    /// per frame until the source passes it, and the source's own stamps
+    /// then go out as they are. Substituting a whole frame, as this did, kept
+    /// the video a frame ahead of the audio for good.
     #[test]
-    fn a_forward_source_leap_is_clamped_to_one_step() {
-        let mut q: VecDeque<u64> = VecDeque::from(vec![0, 90_000 * 60]);
-        let first = next_wire_pts_90k(&mut q, None, STEP_25FPS);
-        let second = next_wire_pts_90k(&mut q, Some(first), STEP_25FPS);
-        assert_eq!(second, first + STEP_25FPS, "a 60s leap must not split A/V");
+    fn a_backwards_source_pts_is_held_until_the_source_passes() {
+        assert_eq!(wire_pts(&[100_000, 50_000]), [100_000, 100_090], "never emit a backwards DTS");
+        const X: u64 = 900_000;
+        assert_eq!(wire_pts(&[X, X - 2_400, X + 1_200, X + 4_800]), [X, X + 90, X + 1_200, X + 4_800]);
+        assert_eq!(wire_pts(&[X, X, X + 3_600]), [X, X + 90, X + 3_600], "a repeated stamp");
+    }
+
+    /// A forward step is kept, however long. Its input is on the FLV
+    /// timeline, which has already judged it: a gap both tracks keep, a
+    /// video pause the audio ran through, or a lone track's pause — and the
+    /// transcoded audio now follows that timeline. Clamping it to one step,
+    /// as this did while the audio could not follow a jump, split the video
+    /// from the audio at every such gap.
+    #[test]
+    fn a_forward_step_on_the_flv_timeline_is_kept() {
+        assert_eq!(wire_pts(&[0, 90_000 * 60]), [0, 90_000 * 60]);
     }
 
     #[test]
     fn a_gap_within_tolerance_is_honoured() {
-        // A real one-second gap is under the 2s threshold and passes through.
-        let mut q: VecDeque<u64> = VecDeque::from(vec![0, 90_000]);
-        let first = next_wire_pts_90k(&mut q, None, STEP_25FPS);
-        let second = next_wire_pts_90k(&mut q, Some(first), STEP_25FPS);
-        assert_eq!(second, 90_000);
+        // A real one-second gap passes through.
+        assert_eq!(wire_pts(&[0, 90_000]), [0, 90_000]);
     }
 
     /// Audio and video share one epoch, so equal source instants produce equal
@@ -3159,14 +3543,6 @@ mod flv_timestamp_tests {
     #[test]
     fn a_value_behind_the_epoch_clamps_to_zero() {
         assert_eq!(rel_ms_monotonic(500, 90_000), 0);
-    }
-
-    /// The raw-source helper keeps its wrap heuristic — a 33-bit PTS really
-    /// does wrap, and a value that appears to be far in the future is a wrap.
-    #[test]
-    fn a_wrapped_raw_source_pts_clamps_to_zero() {
-        assert_eq!(rel_ms_wrapping(0, 90_000), 0, "one frame behind reads as a wrap");
-        assert_eq!(rel_ms_wrapping(180_000, 90_000), 1000);
     }
 
     // ── edge#205: decode time + composition time ──────────────────────────
@@ -3199,7 +3575,7 @@ mod flv_timestamp_tests {
     }
 
     /// The FLV ms a source instant maps to on an epoch at `base` — what
-    /// audio at that instant is stamped (`pts_to_ms`).
+    /// audio at that instant is stamped (`FlvTimeline::tag_ms`).
     fn ms(t: u64, base: u64) -> u32 {
         ((t - base) / 90) as u32
     }
@@ -3257,8 +3633,10 @@ mod flv_timestamp_tests {
 
     /// No DTS (a source without B-frames), or one equal to the PTS: the
     /// timestamp is the PTS mapping it always was and the composition time
-    /// 0 — byte for byte what went out before edge#205. So is a picture
-    /// whose PES carried no PTS at all (`pts` 0, no DTS).
+    /// 0 — byte for byte what went out before edge#205. A picture whose PES
+    /// carried no PTS no longer reaches `flv_video_time` (it takes its
+    /// predecessor's time, `FlvTimeline::video`); a PTS of 0 behind an epoch
+    /// clamps to 0.
     #[test]
     fn a_source_without_b_frames_is_tagged_exactly_as_before() {
         for with_dts in [false, true] {
@@ -3266,13 +3644,13 @@ mod flv_timestamp_tests {
             for k in 0..50u64 {
                 let pts = T0 + k * 3003;
                 let got = flv_video_time(pts, with_dts.then_some(pts), &mut base);
-                assert_eq!(got, (pts_to_ms(pts, &mut before), 0), "frame {k}");
+                assert_eq!(got, (rel_ms_monotonic(pts, *before.get_or_insert(pts)), 0), "frame {k}");
             }
             assert_eq!(base, before);
         }
         assert_eq!(flv_video_time(0, None, &mut None), (0, 0));
         let mut base = Some(T0);
-        assert_eq!(flv_video_time(0, None, &mut base), (rel_ms_wrapping(0, T0), 0));
+        assert_eq!(flv_video_time(0, None, &mut base), (0, 0));
         assert_eq!(base, Some(T0));
     }
 
@@ -3308,7 +3686,7 @@ mod flv_timestamp_tests {
         assert_eq!(got, [(0, 40), (0, 0), (0, 0), (40, 120), (80, 0), (120, 0)]);
         for (&(pts, _), (ts, cts)) in pics.iter().zip(&got) {
             if pts >= a0 {
-                assert_eq!(ts + cts, pts_to_ms(pts, &mut Some(a0)));
+                assert_eq!(ts + cts, rel_ms_monotonic(pts, a0));
             }
         }
         assert_eq!(base, Some(a0), "video does not move an epoch audio set");
@@ -3324,8 +3702,8 @@ mod flv_timestamp_tests {
         let (ts, cts) = flv_video_time(pts, Some(dts), &mut base);
         assert_eq!(base, Some(dts));
         assert_eq!((ts, cts), (0, 80));
-        assert_eq!(pts_to_ms(pts, &mut base), ts + cts, "audio at the same instant");
-        assert_eq!(pts_to_ms(pts + 1920, &mut base), 101);
+        assert_eq!(rel_ms_monotonic(pts, base.unwrap()), ts + cts, "audio at the same instant");
+        assert_eq!(rel_ms_monotonic(pts + 1920, base.unwrap()), 101);
     }
 
     /// The composition time is `pts_ms − dts_ms`, not the offset rounded on
@@ -3357,11 +3735,652 @@ mod flv_timestamp_tests {
         assert_eq!(flv_video_time(1_000, Some(WRAP - 2_000), &mut base), (0, 11));
         assert_eq!(base, Some(0));
         assert_eq!(flv_video_time(4_600, Some(1_600), &mut base), (17, 34));
-        assert_eq!(pts_to_ms(50_000, &mut base), 555, "audio after it is not pinned to 0");
+        assert_eq!(rel_ms_monotonic(50_000, base.unwrap()), 555, "audio after it is not pinned to 0");
 
         let mut base = Some(1_000);
         assert_eq!(flv_video_time(3_000, Some(WRAP - 500), &mut base), (0, 22));
         assert_eq!(flv_video_time(6_600, Some(3_100), &mut base), (23, 39));
+    }
+
+    /// FLV's own clock wraps at 2^32 ms (49.7 days). A picture decoding just
+    /// before that and presenting just after keeps its composition time: the
+    /// subtraction is done before the truncation, where it used to give 0.
+    #[test]
+    fn a_picture_straddling_the_u32_ms_wrap_keeps_its_composition_time() {
+        const E: u64 = 1 << 34;
+        let mut base = Some(E);
+        let (pts, dts) = (E + ((1 << 32) + 23) * 90, E + ((1 << 32) - 10) * 90);
+        assert_eq!(flv_video_time(pts, Some(dts), &mut base), (u32::MAX - 9, 33));
+    }
+
+    // ── edge#211: one FLV timeline per connection ─────────────────────────
+
+    const WRAP: u64 = 1 << 33;
+
+    /// `pics` (decode order) and `audio` stamps in arrival order — each
+    /// picture at its decode time, each audio frame at its stamp, a picture
+    /// first at a tie: `(is_video, index)`.
+    fn interleave(pics: &[(u64, Option<u64>)], audio: &[u64]) -> Vec<(bool, usize)> {
+        let mut ev: Vec<(u64, bool, usize)> = pics
+            .iter()
+            .enumerate()
+            .map(|(k, &(p, d))| (d.unwrap_or(p), true, k))
+            .chain(audio.iter().enumerate().map(|(j, &a)| (a, false, j)))
+            .collect();
+        ev.sort_by_key(|&(t, video, _)| (t, !video));
+        ev.into_iter().map(|(_, video, k)| (video, k)).collect()
+    }
+
+    /// An AAC frame's FLV ms through the timeline, `None` when dropped.
+    fn audio_ms(tl: &mut FlvTimeline, a: u64) -> Option<u32> {
+        let at = tl.audio(a);
+        tl.audio_tag_ms(at)
+    }
+
+    /// A clean source — B-frames, AAC beside them, whichever essence
+    /// anchors the epoch — goes out exactly as `flv_video_time` and the
+    /// shared epoch tagged it before the timeline: the timeline adds an
+    /// offset of 0 and a lap, and differences are all FLV reads.
+    #[test]
+    fn a_clean_source_is_tagged_exactly_as_before() {
+        let pics = ibbp(60, |k| T0 + k * STEP_25FPS);
+        for a0 in [T0 - 3_000, T0 + 1_000] {
+            let audio: Vec<u64> = (0..120).map(|j| a0 + j * 1_920).collect();
+            let mut tl = FlvTimeline::new("o");
+            let mut raw = None;
+            for (video, k) in interleave(&pics, &audio) {
+                if video {
+                    let (pts, dts) = pics[k];
+                    let t = tl.video(pts, dts, true).expect("a timed picture");
+                    assert_eq!((t.ts_ms, t.cts_ms), flv_video_time(pts, dts, &mut raw), "a0 {a0}: picture {k}");
+                } else {
+                    let a = audio[k];
+                    let e = *raw.get_or_insert(a);
+                    assert_eq!(audio_ms(&mut tl, a), Some(((a - e) / 90) as u32), "a0 {a0}: audio {k}");
+                }
+            }
+        }
+    }
+
+    /// edge#211 item 4: the source's 33-bit PTS wraps every 26.5 h, and every
+    /// tag after it went out at 0 until the PTS climbed back past the epoch.
+    /// The timeline unwraps it: audio counts on, B-frames stay in decode
+    /// order with their composition times, and a picture decoding just
+    /// behind an epoch audio set just past the wrap is still at 0.
+    #[test]
+    fn the_33_bit_wrap_keeps_counting() {
+        let mut tl = FlvTimeline::new("o");
+        let got: Vec<Option<u32>> = [WRAP - 90_000, 0, 90_000].iter().map(|&a| audio_ms(&mut tl, a)).collect();
+        assert_eq!(got, [Some(0), Some(1_000), Some(2_000)]);
+
+        let at = |k: u64| WRAP - 6 * STEP_25FPS + k * STEP_25FPS;
+        let pics = ibbp(24, at);
+        let mut tl = FlvTimeline::new("o");
+        let d0 = pics[0].1.unwrap();
+        let mut last = None;
+        for (k, &(pts, dts)) in pics.iter().enumerate() {
+            let t = tl.video(pts & MASK_33, dts.map(|d| d & MASK_33), true).unwrap();
+            let decode = dts.unwrap_or(pts);
+            assert_eq!(t.ts_ms, ((decode - d0) / 90) as u32, "picture {k}: its decode time");
+            assert_eq!(t.ts_ms + t.cts_ms, ((pts - d0) / 90) as u32, "picture {k}: presented at its PTS");
+            assert!(last.is_none_or(|l| t.ts_ms > l), "picture {k}");
+            last = Some(t.ts_ms);
+        }
+        assert!(pics.iter().any(|p| p.0 > WRAP) && pics.iter().any(|p| p.0 < WRAP), "across the wrap");
+
+        let mut tl = FlvTimeline::new("o");
+        assert_eq!(audio_ms(&mut tl, 1_000), Some(0));
+        let dts = (1_000 + WRAP - STEP_25FPS) & MASK_33;
+        let t = tl.video((dts + 3 * STEP_25FPS) & MASK_33, Some(dts), true).unwrap();
+        assert_eq!((t.ts_ms, t.cts_ms), (0, 80), "decoding before the epoch, presented on its audio's ms");
+    }
+
+    /// The picture straddling the wrap that `flv_video_time` alone could only
+    /// saturate (0, 11): on the unwrapped timeline its decode time is just
+    /// before the wrap, and its composition time whole.
+    #[test]
+    fn a_picture_straddling_the_33_bit_wrap_is_tagged_at_its_true_decode_time() {
+        let mut tl = FlvTimeline::new("o");
+        let t = tl.video(1_000, Some(WRAP - 2_000), true).unwrap();
+        assert_eq!((t.ts_ms, t.cts_ms), (0, 33));
+        let t = tl.video(4_600, Some(1_600), true).unwrap();
+        assert_eq!((t.ts_ms, t.cts_ms), (40, 33));
+        assert_eq!(audio_ms(&mut tl, 50_000), Some(577));
+    }
+
+    /// A 25 fps picture (no B-frames) every 3 600 ticks of programme time
+    /// and an AAC frame every 1 920, over `len` ticks, in arrival order (a
+    /// picture first at a tie): `(track, programme time)`.
+    fn programme(len: u64) -> Vec<(Track, u64)> {
+        let mut ev: Vec<(Track, u64)> = (0..len)
+            .step_by(STEP_25FPS as usize)
+            .map(|t| (Track::Video, t))
+            .chain((0..len).step_by(1_920).map(|t| (Track::Audio, t)))
+            .collect();
+        ev.sort_by_key(|&(track, t)| (t, track == Track::Audio));
+        ev
+    }
+
+    /// `programme(len)` through a fresh timeline with each stamp `src(t)`:
+    /// `(track, programme time, FLV ms)` — a dropped audio frame `None`.
+    fn tag_programme(len: u64, src: impl Fn(Track, u64) -> u64) -> Vec<(Track, u64, Option<u32>)> {
+        let mut tl = FlvTimeline::new("o");
+        programme(len)
+            .into_iter()
+            .map(|(track, t)| {
+                let ms = match track {
+                    Track::Video => tl.video(src(track, t), None, true).map(|p| p.ts_ms),
+                    Track::Audio => audio_ms(&mut tl, src(track, t)),
+                };
+                (track, t, ms)
+            })
+            .collect()
+    }
+
+    /// edge#211 item 3: both tracks jumping 90 s back (a looped MPTS with no
+    /// input `program_number`), the video first. Every tag after it used to
+    /// step back, or go out at 0. The video goes on one frame on and the
+    /// audio takes the same offset: the tags are what a source that never
+    /// jumped gets, A/V together.
+    #[test]
+    fn a_backward_jump_goes_on_one_frame_on_with_the_audio_beside_it() {
+        const B: u64 = 200 * 90_000;
+        let jump_at = 64 * STEP_25FPS;
+        let jumped = tag_programme(10 * 90_000, |_, t| B + t - if t >= jump_at { 90 * 90_000 } else { 0 });
+        let clean = tag_programme(10 * 90_000, |_, t| B + t);
+        assert_eq!(jumped, clean);
+        let video: Vec<u32> = jumped.iter().filter(|e| e.0 == Track::Video).filter_map(|e| e.2).collect();
+        assert_eq!(video[64], video[63] + 40, "the first picture after the jump, one frame on");
+        assert!(jumped.iter().all(|e| e.2.is_some()), "nothing dropped");
+    }
+
+    /// edge#211 item 5: a picture whose PES carried no PTS (a PAFF source
+    /// remuxed one field to a PES) was stamped 0 in mid-stream. It takes the
+    /// previous picture's time, decode and composition alike; before any
+    /// picture has had a time there is none to take.
+    #[test]
+    fn a_picture_without_a_pts_takes_the_previous_pictures_time() {
+        let mut tl = FlvTimeline::new("o");
+        assert_eq!(tl.video(0, None, false), None, "nothing to take yet");
+        assert!(!tl.anchored(), "and nothing anchored by it");
+        let pics = ibbp(6, |k| T0 + k * STEP_25FPS);
+        let mut prev = None;
+        for &(pts, dts) in &pics {
+            let t = tl.video(pts, dts, true);
+            assert!(t.is_some());
+            assert_eq!(tl.video(0, None, false), t, "the field after it");
+            if let (Some(p), Some(t)) = (prev, t) {
+                let p: PictureTime = p;
+                assert!(t.ts_ms > p.ts_ms, "the next timed picture unaffected");
+            }
+            prev = t;
+        }
+        assert_eq!(prev.map(|t| (t.ts_ms, t.cts_ms)), Some((200, 0)));
+    }
+
+    /// Both tracks stepping 0.5 s back, inside the timeline's 1 s own window
+    /// (a B-frame source's reordering, to the timeline): the decode time
+    /// goes a ms on per picture until the source passes it, each picture
+    /// presented at the later of its own time and that, then at the source's
+    /// times again; the audio behind what was sent is dropped.
+    #[test]
+    fn a_decode_time_behind_the_last_picture_is_held_a_millisecond_on() {
+        let back_at = 50 * STEP_25FPS;
+        let out = tag_programme(5 * 90_000, |_, t| T0 + t - if t >= back_at { 45_000 } else { 0 });
+        let video: Vec<u32> = out.iter().filter(|e| e.0 == Track::Video).map(|e| e.2.unwrap()).collect();
+        assert_eq!(video[49], 1_960);
+        // 12 pictures held, then the 13th past the hold at its source time.
+        for k in 50..62 {
+            assert_eq!(video[k], 1_960 + (k as u32 - 49), "picture {k} held a ms on");
+        }
+        for k in 62..video.len() {
+            assert_eq!(video[k], (k as u32) * 40 - 500, "picture {k} at its source time");
+        }
+        let audio: Vec<(u64, Option<u32>)> =
+            out.iter().filter(|e| e.0 == Track::Audio).map(|e| (e.1, e.2)).collect();
+        let last_before = audio.iter().rev().find(|a| a.0 < back_at).unwrap().0;
+        let mut dropped = 0;
+        for &(t, ms) in &audio {
+            let src = t - if t >= back_at { 45_000 } else { 0 };
+            if t >= back_at && src <= last_before {
+                assert_eq!(ms, None, "audio at {t}: behind what was sent");
+                dropped += 1;
+            } else {
+                assert_eq!(ms, Some((src / 90) as u32), "audio at {t}");
+            }
+        }
+        assert_eq!(dropped, 23, "0.5 s of audio, less the frame it ends inside");
+        // The presentation of a held picture: its decode ms, composition 0.
+        let mut tl = FlvTimeline::new("o");
+        tl.video(T0, None, true);
+        let held = tl.video(T0 - 45_000, None, true).unwrap();
+        assert_eq!((held.ts_ms, held.cts_ms), (1, 0));
+    }
+
+    /// An AAC frame at or behind the last one sent — a loop's or a switch's
+    /// overlap — is dropped rather than stepping the audio track back.
+    #[test]
+    fn audio_at_or_behind_what_was_sent_is_dropped() {
+        let mut tl = FlvTimeline::new("o");
+        assert_eq!(audio_ms(&mut tl, T0), Some(0));
+        assert_eq!(audio_ms(&mut tl, T0 + 1_920), Some(21));
+        assert_eq!(audio_ms(&mut tl, T0 + 1_920), None, "repeated");
+        assert_eq!(audio_ms(&mut tl, T0), None, "behind");
+        assert_eq!(audio_ms(&mut tl, T0 + 3_840), Some(42));
+    }
+
+    /// The addendum to edge#211's timeline: a frame of audio stamped before
+    /// the epoch has no place on the timeline and is dropped. Every such
+    /// frame used to go out at 0: a connection whose first essence was a
+    /// picture stacked ~640 ms of transcoded MP2 / AC-3 at one instant. And
+    /// the encoder's first frame, stamped its codec delay before the source
+    /// frame that anchored the epoch, is dropped rather than put at 0.
+    #[test]
+    fn audio_before_the_epoch_is_dropped_not_stacked_at_zero() {
+        let mut tl = FlvTimeline::new("o");
+        tl.video(T0, None, true);
+        let e = tl.epoch.unwrap();
+        let got: Vec<Option<u32>> =
+            [T0 - 3 * 1_920, T0 - 1_920, T0, T0 + 1_920].iter().map(|&a| audio_ms(&mut tl, a)).collect();
+        assert_eq!(got, [None, None, Some(0), Some(21)]);
+        assert_eq!(tl.epoch, Some(e), "audio does not move the epoch");
+
+        // fdk AAC-LC's 2 048-sample delay at 48 kHz is two frames: those two
+        // are dropped, and the third is the source frame's own time.
+        let mut tl = FlvTimeline::new("o");
+        let a = tl.audio(T0);
+        let first = a - 2_048 * 90_000 / 48_000;
+        let got: Vec<Option<u32>> = (0..4).map(|n| tl.audio_tag_ms(first + n * 1_920)).collect();
+        assert_eq!(got, [None, None, Some(0), Some(21)]);
+    }
+
+    /// FLV's clock wraps at 2^32 ms, as any long-running publisher's does,
+    /// and the guards compare the timeline's 64-bit values, so the wrap is
+    /// no step back to them.
+    #[test]
+    fn the_flv_clock_wraps_at_2_32_ms_without_tripping_the_guards() {
+        let mut tl = FlvTimeline::new("o");
+        let e = tl.audio(T0);
+        assert_eq!(tl.audio_tag_ms(e + ((1 << 32) - 10) * 90), Some(u32::MAX - 9));
+        assert_eq!(tl.audio_tag_ms(e + ((1 << 32) + 5) * 90), Some(5));
+    }
+
+    /// A video-only source (nothing else maps a timestamp) at 1 fps keeps its
+    /// pauses up to the lone gap — 3 s and 9 s — and continues a step past
+    /// it 3 003 ticks on: no step under 500 ms has been seen to continue by.
+    #[test]
+    fn a_video_only_source_keeps_pauses_up_to_the_lone_gap() {
+        let mut tl = FlvTimeline::new("o");
+        let mut ts = |t: u64| tl.video(T0 + t, None, true).unwrap().ts_ms;
+        for k in 0..5u64 {
+            assert_eq!(ts(k * 90_000), k as u32 * 1_000);
+        }
+        assert_eq!(ts(7 * 90_000), 7_000, "a 3 s pause kept");
+        assert_eq!(ts(16 * 90_000), 16_000, "a 9 s pause kept");
+        assert_eq!(ts(27 * 90_000), 16_033, "an 11 s step continued 3 003 ticks on");
+        assert_eq!(ts(28 * 90_000), 17_033, "and the source's timing after it");
+    }
+
+    /// A source stamping only its I pictures (every 12th): each picture
+    /// without a PTS takes the I picture's time, so each GOP goes out on one
+    /// timestamp. That is the rule edge#211 asked for; spreading a GOP needs
+    /// lookahead passthrough does not have.
+    #[test]
+    fn a_source_stamping_only_its_i_pictures_puts_each_gop_on_one_timestamp() {
+        let mut tl = FlvTimeline::new("o");
+        for g in 0..5u64 {
+            let gop: Vec<(u32, u32)> = (0..12)
+                .map(|k| {
+                    let t = tl.video(T0 + g * 12 * STEP_25FPS, None, k == 0).unwrap();
+                    (t.ts_ms, t.cts_ms)
+                })
+                .collect();
+            assert!(gop.iter().all(|&p| p == (g as u32 * 480, 0)), "GOP {g}: {gop:?}");
+        }
+    }
+
+    /// A feed on the wire, as `cmaf::timeline`'s tests have it: `frames`
+    /// IBBP pictures at 25 fps and the audio beside them in 1 920-tick
+    /// frames, stamped `base` plus the arrival time, the video `lead` ticks
+    /// ahead of the audio in the mux.
+    #[derive(Clone, Copy)]
+    struct Feed {
+        frames: u64,
+        base: i64,
+        lead: i64,
+    }
+
+    /// One essence of `feeds` as it arrives: a picture's `(pts, dts)` or an
+    /// AAC frame's stamp, each source value unmasked.
+    enum Essence {
+        Picture(u64, Option<u64>),
+        Audio(u64),
+    }
+
+    /// Every essence of `feeds`, one feed after another, in arrival order —
+    /// a picture at its decode time, the audio first at a tie when
+    /// `audio_first`.
+    fn wire(feeds: &[Feed], audio_first: bool) -> Vec<Essence> {
+        let mut ev: Vec<(i64, bool, Essence)> = Vec::new();
+        let mut t0 = 0i64;
+        for f in feeds {
+            let len = f.frames as i64 * STEP_25FPS as i64;
+            let at = |k: u64| (f.base + t0 + k as i64 * STEP_25FPS as i64 + f.lead) as u64;
+            for (k, (pts, dts)) in ibbp(f.frames, at).into_iter().enumerate() {
+                ev.push((t0 + k as i64 * STEP_25FPS as i64, true, Essence::Picture(pts, dts)));
+            }
+            for t in (0..len).step_by(1_920) {
+                ev.push((t0 + t, false, Essence::Audio((f.base + t0 + t) as u64)));
+            }
+            t0 += len;
+        }
+        ev.sort_by_key(|&(t, video, _)| (t, video == audio_first));
+        ev.into_iter().map(|(_, _, e)| e).collect()
+    }
+
+    /// `feeds` through a fresh timeline, checking FLV's contract on the way:
+    /// the video's tags never step back (a timed picture's strictly
+    /// forward), the audio sent strictly forward. Returns the last picture's
+    /// and the last audio's offsets from their source — equal when the last
+    /// feed's A/V relation is published as it came.
+    fn play(feeds: &[Feed], audio_first: bool) -> (u64, u64) {
+        let mut tl = FlvTimeline::new("o");
+        let (mut video, mut audio) = (None::<u32>, None::<u32>);
+        let mut offsets = (0, 0);
+        for e in wire(feeds, audio_first) {
+            match e {
+                Essence::Picture(pts, dts) => {
+                    let t = tl.video(pts & MASK_33, dts.map(|d| d & MASK_33), true).unwrap();
+                    assert!(video.is_none_or(|v| t.ts_ms > v), "the video steps back: {} after {video:?}", t.ts_ms);
+                    video = Some(t.ts_ms);
+                    offsets.0 = t.pts.wrapping_sub(pts);
+                }
+                Essence::Audio(a) => {
+                    let at = tl.audio(a & MASK_33);
+                    if let Some(ms) = tl.audio_tag_ms(at) {
+                        assert!(audio.is_none_or(|l| ms > l), "the audio steps back: {ms} after {audio:?}");
+                        audio = Some(ms);
+                    }
+                    offsets.1 = at.wrapping_sub(a);
+                }
+            }
+        }
+        offsets
+    }
+
+    /// The switches and jumps `cmaf::timeline` takes up, on an FLV timeline
+    /// carrying B-frames — the video mapped by decode time, so a composition
+    /// offset rides beside it — each in both arrival orders where the order
+    /// is the point: the tags never step back, and the new feed's A/V
+    /// relation is what goes out.
+    #[test]
+    fn feed_switches_with_b_frames_keep_tags_forward_and_take_the_new_relation() {
+        let scenarios: [(&str, [Feed; 2], bool); 4] = [
+            (
+                "a 2 s outage of both",
+                [Feed { frames: 150, base: 900_000, lead: 45_000 }, Feed { frames: 200, base: 1_080_000, lead: 45_000 }],
+                false,
+            ),
+            (
+                "a switch moving the video 1.1 s and the audio 0.5 s",
+                [Feed { frames: 150, base: 900_000, lead: -45_000 }, Feed { frames: 200, base: 945_000, lead: 9_000 }],
+                false,
+            ),
+            (
+                "a switch the audio meets first",
+                [Feed { frames: 150, base: 900_000, lead: 99_000 }, Feed { frames: 200, base: 5_000_000_000, lead: 0 }],
+                true,
+            ),
+            (
+                "both tracks jumping 2 s",
+                [Feed { frames: 100, base: 900_000, lead: 45_000 }, Feed { frames: 300, base: 1_080_000, lead: 45_000 }],
+                false,
+            ),
+        ];
+        for (what, feeds, audio_first) in scenarios {
+            let (v, a) = play(&feeds, audio_first);
+            assert_eq!(v, a, "{what}: the new feed's A/V relation");
+        }
+    }
+
+    /// An outage of both tracks past the timeline's 3 s cross window is a
+    /// jump nothing on the other track vouches for: both tracks go on one
+    /// step on, together, whichever meets it first — the FLV clock falls
+    /// behind the wall clock by the outage. A 2 s outage is kept as a gap.
+    #[test]
+    fn an_outage_of_both_tracks_longer_than_the_cross_window_is_closed_together() {
+        for audio_first in [false, true] {
+            let feeds = [Feed { frames: 150, base: 900_000, lead: 0 }, Feed { frames: 200, base: 1_350_000, lead: 0 }];
+            let (v, a) = play(&feeds, audio_first);
+            assert_eq!(v, a, "audio first {audio_first}: together");
+            // Closed one step on from the track that met it. The feeds are
+            // back to back on the wire: the video's next picture lands where
+            // it would have with no outage, and the audio's — 480 ticks
+            // after its last frame on the wire — a whole frame on.
+            let closed = if audio_first { 450_000 - 1_440 } else { 450_000 };
+            assert_eq!(LAP_90K - v, closed, "audio first {audio_first}: closed, one step on");
+        }
+        let feeds = [Feed { frames: 150, base: 900_000, lead: 45_000 }, Feed { frames: 200, base: 1_080_000, lead: 45_000 }];
+        assert_eq!(play(&feeds, false), (LAP_90K, LAP_90K), "a 2 s outage kept as a gap");
+    }
+
+    // ── edge#211: the transcoded audio on the timeline ────────────────────
+
+    /// One audio frame's length, whatever the codec, and no panic on a rate
+    /// of 0.
+    #[test]
+    fn audio_ticks_steps_by_the_frame() {
+        assert_eq!(audio_ticks(1_152, 48_000), 2_160, "MP2");
+        assert_eq!(audio_ticks(1_536, 48_000), 2_880, "AC-3");
+        assert_eq!(audio_ticks(1_024, 48_000), 1_920, "AAC");
+        assert_eq!(audio_ticks(1_024, 0), 92_160_000);
+    }
+
+    /// The eager encoder a `silent_fallback` output builds before any audio.
+    #[cfg(feature = "fdk-aac")]
+    fn silent_fallback_state() -> EncoderState {
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "silent_fallback": true }
+        }))
+        .unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
+        build_encoder_state_eager_for_silent_fallback(&cfg, &CancellationToken::new(), &stats, "f", &events)
+    }
+
+    /// The stamps of what `encoder` has encoded that the timeline sends
+    /// (`send_encoded_audio` without the client).
+    #[cfg(feature = "fdk-aac")]
+    fn sent(encoder: &mut AudioEncoder, tl: &mut FlvTimeline) -> Vec<u64> {
+        encoder.drain().into_iter().filter(|f| tl.audio_tag_ms(f.pts).is_some()).map(|f| f.pts).collect()
+    }
+
+    /// A video-only source (the case `silent_fallback` exists for) whose PTS
+    /// is far from 0. The silence used to be submitted at the generator's
+    /// own PTS, 0, and once the first picture had anchored the epoch every
+    /// silent tag went out at 0. It starts at the picture now — nothing laid
+    /// until the picture moves on — and is laid up to it, a second of
+    /// pictures bringing a second of silence however few ticks noticed.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn silence_on_a_video_only_source_starts_at_the_picture_not_at_zero() {
+        let mut st = silent_fallback_state();
+        let EncoderState::Active { encoder, silence: Some(sg), input, .. } = &mut st else {
+            panic!("silent fallback builds eagerly");
+        };
+        const P0: u64 = 4_000_000_000;
+        let mut tl = FlvTimeline::new("o");
+        for k in 0..25 {
+            tl.video(P0 + k * STEP_25FPS, None, true);
+        }
+        let p = tl.newest_picture().unwrap();
+        lay_silence(encoder, sg, input, &tl, "o");
+        assert!(encoder.drain().is_empty(), "nothing to lay yet");
+        assert_eq!(input.position(), Some(p), "the silence starts at the picture");
+        for k in 25..50 {
+            tl.video(P0 + k * STEP_25FPS, None, true);
+        }
+        lay_silence(encoder, sg, input, &tl, "o");
+        let frames = encoder.drain();
+        assert_eq!(frames.len(), 46, "46 chunks of 1 920 ticks fit in the second");
+        let delay = p - frames[0].pts;
+        assert!(delay > 0 && delay < 9_000, "the codec's delay: {delay}");
+        let first = tl.audio_tag_ms(frames[0].pts).unwrap();
+        assert_eq!(first, tl.tag_ms(p - delay));
+        assert!(first > 900, "the first silent tag at {first} ms, by the picture (it was 0)");
+        assert!(frames.windows(2).all(|w| w[1].pts - w[0].pts == 1_920));
+    }
+
+    /// A video-only source pausing 3 s (a pause the lone gap keeps): the
+    /// silence stands still with the picture and is laid across the pause
+    /// when the picture comes back — one contiguous track, ending within a
+    /// chunk of the picture less the codec's delay. Ticked by the clock it
+    /// ran on through a stall and fell behind at every tick observed late.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn silence_stays_with_a_video_only_source_across_a_pause() {
+        let mut st = silent_fallback_state();
+        let EncoderState::Active { encoder, silence: Some(sg), input, .. } = &mut st else {
+            panic!("silent fallback builds eagerly");
+        };
+        let mut tl = FlvTimeline::new("o");
+        let mut stamps = Vec::new();
+        let mut start = None;
+        for k in 0..100u64 {
+            let pause = if k >= 50 { 3 * 90_000 } else { 0 };
+            tl.video(T0 + k * STEP_25FPS + pause, None, true);
+            lay_silence(encoder, sg, input, &tl, "o");
+            start = start.or(input.position());
+            stamps.extend(encoder.drain().into_iter().map(|f| f.pts));
+            if k == 49 {
+                // The pause: the picture stands still, and so does the silence.
+                let before = input.position();
+                lay_silence(encoder, sg, input, &tl, "o");
+                assert_eq!(input.position(), before);
+            }
+        }
+        assert!(stamps.windows(2).all(|w| w[1] - w[0] == 1_920), "one contiguous track");
+        let delay = start.unwrap() - stamps[0];
+        let end = stamps.last().unwrap() + 1_920 + delay;
+        let newest = tl.newest_picture().unwrap();
+        assert!(end <= newest && newest - end < 1_920, "laid to the picture: {end} vs {newest}");
+        assert!(stamps.len() > 300, "{} frames for 7 s", stamps.len());
+    }
+
+    /// Real audio, then none past the watchdog's grace, then real audio
+    /// again: the silence continues the real audio exactly, real audio
+    /// returning where the silence ends continues it exactly, and audio
+    /// behind it is held back — the audio track never steps back.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn silence_and_real_audio_hand_over_without_stepping_back() {
+        let mut st = silent_fallback_state();
+        let EncoderState::Active { encoder, silence: Some(sg), input, stage, .. } = &mut st else {
+            panic!("silent fallback builds eagerly");
+        };
+        let pcm = vec![vec![0.1f32; 1_024]; 2];
+        let mut tl = FlvTimeline::new("o");
+        let mut stamps = Vec::new();
+        for (track, t) in programme(90_000) {
+            match track {
+                Track::Video => {
+                    tl.video(T0 + t, None, true);
+                }
+                Track::Audio => {
+                    let at = tl.audio(T0 + t);
+                    sg.mark_real_audio(at);
+                    input.mark_real_audio(at, tl.newest_picture());
+                    submit_source_audio(encoder, stage, input, true, &pcm, 48_000, at, "o");
+                    stamps.extend(sent(encoder, &mut tl));
+                }
+            }
+        }
+        let real = stamps.len();
+        assert!(real > 40);
+        // The audio stops; past the grace, a second more of pictures.
+        lay_silence(encoder, sg, input, &tl, "o");
+        assert!(encoder.drain().is_empty(), "inside the grace");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        for k in 0..25 {
+            tl.video(T0 + 90_000 + k * STEP_25FPS, None, true);
+            lay_silence(encoder, sg, input, &tl, "o");
+            stamps.extend(sent(encoder, &mut tl));
+        }
+        assert!(stamps.len() > real + 40, "a second of silence");
+        assert_eq!(stamps[real], stamps[real - 1] + 1_920, "the silence continues the real audio");
+        // Real audio back where the silence ends: continued.
+        let laid = stamps.len();
+        let back = input.position().unwrap() - LAP_90K;
+        for j in 0..3 {
+            let at = tl.audio(back + j * 1_920);
+            assert_eq!(at, input.position().unwrap(), "frame {j} where the input is");
+            sg.mark_real_audio(at);
+            input.mark_real_audio(at, tl.newest_picture());
+            submit_source_audio(encoder, stage, input, true, &pcm, 48_000, at, "o");
+            stamps.extend(sent(encoder, &mut tl));
+        }
+        assert_eq!(stamps.len(), laid + 3);
+        assert_eq!(stamps[laid], stamps[laid - 1] + 1_920, "the real audio continues the silence");
+        // Audio behind the input is held back until it catches up.
+        let position = input.position();
+        let behind = input.position().unwrap() - LAP_90K - 4 * 1_920;
+        for j in 0..2 {
+            let at = tl.audio(behind + j * 1_920);
+            submit_source_audio(encoder, stage, input, true, &pcm, 48_000, at, "o");
+        }
+        assert!(encoder.drain().is_empty(), "held back");
+        assert_eq!(input.position(), position);
+        assert!(stamps.windows(2).all(|w| w[1] > w[0]), "the audio never steps back");
+    }
+
+    /// MP2 packs several frames into a PES (four here, 8 640 ticks), each
+    /// stepped on from the PES's PTS by its own length: placed at the PES's
+    /// PTS, every frame after the first (2 160 ticks on, past the 2 000-tick
+    /// slack) would read as a departure. The encoder is anchored once and
+    /// never again, and its frames run on contiguous.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn transcoded_mp2_with_several_frames_per_pes_never_reanchors() {
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc" }
+        }))
+        .unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
+        let cancel = CancellationToken::new();
+        let mut state = EncoderState::Lazy;
+        let (mut dec, mut dec_codec) = (None, None);
+        let mut tl = FlvTimeline::new("o");
+        let mut stamps = Vec::new();
+        let mut first = None;
+        for k in 0..20u64 {
+            let pts = 900_000 + k * 8_640;
+            let at = tl.audio(pts);
+            first = first.or(Some(at));
+            let decoded = decode_other_audio_for_encode(
+                &mut state, &mut dec, &mut dec_codec, 0x03, &super::tests::mp2_pes(4), pts,
+                &cfg, &cancel, &stats, "f", &events,
+            );
+            let EncoderState::Active { encoder, stage, input, .. } = &mut state else {
+                panic!("the encoder is built on the first PES that decodes");
+            };
+            assert_eq!(encoder.params().sample_rate, 48_000);
+            let mut frame_at = at;
+            for f in decoded {
+                submit_source_audio(encoder, stage, input, false, &f.planar, f.sample_rate, frame_at, "o");
+                frame_at += audio_ticks(f.samples_per_channel, f.sample_rate);
+            }
+            if k == 0 {
+                assert_eq!(input.position(), Some(frame_at), "anchored on the first PES");
+            }
+            stamps.extend(encoder.drain().into_iter().map(|f| f.pts));
+        }
+        let EncoderState::Active { input, .. } = &state else { unreachable!() };
+        assert_eq!(input.position(), Some(first.unwrap() + 20 * 8_640), "never re-anchored");
+        assert!(stamps.len() > 70, "{} AAC frames", stamps.len());
+        assert!(stamps.windows(2).all(|w| w[1] - w[0] == 1_920), "contiguous");
     }
 }
 
@@ -3447,8 +4466,9 @@ pub(super) mod flv_wire_tests {
             .unwrap();
         }
         drop(tx);
-        // Returns once the channel is drained and closed.
-        publish_loop(&config, &mut client, &mut rx, &stats, &CancellationToken::new(), false, "f", &events)
+        // Returns once the channel is drained and closed. The input can
+        // carry TS audio (it only matters with `audio_encode`).
+        publish_loop(&config, &mut client, &mut rx, &stats, &CancellationToken::new(), true, "f", &events)
             .await
             .expect("publish_loop");
         client.close().await.unwrap();
@@ -4182,6 +5202,401 @@ pub(super) mod flv_wire_tests {
         }
         let got: Vec<(u32, Vec<u8>)> = tags.iter().filter(|t| t.video).map(|t| (t.ts, t.data.to_vec())).collect();
         assert_eq!(got, want);
+    }
+
+    // ── edge#211: one FLV timeline per connection, end to end ─────────────
+
+    /// One lap of the source, F = 25 fps: 48 IBBP pictures (1 920 ms).
+    const LAP_PICTURES: u64 = 48;
+
+    /// The ADTS frames of the 1 kHz test tone, whole (header included),
+    /// reused cyclically by the A/V fixtures.
+    pub(super) fn adts_frames() -> Vec<&'static [u8]> {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let mut out = Vec::new();
+        let mut off = 0;
+        while off + 7 <= ADTS.len() {
+            let len = (usize::from(ADTS[off + 3] & 0x03) << 11)
+                | (usize::from(ADTS[off + 4]) << 3)
+                | (usize::from(ADTS[off + 5]) >> 5);
+            out.push(&ADTS[off..off + len]);
+            off += len;
+        }
+        out
+    }
+
+    /// One stretch of a programme: pictures `(pts, dts)` in decode order and
+    /// an AAC frame at each of `audio`; `pmt_bump` bumps the PMT version
+    /// (a `Discontinuity`) ahead of it, and `audio_pid` moves the audio to
+    /// another PID there. `stray` is a picture `(index, ticks)` whose PES is
+    /// stamped that far ahead of its place, muxed where it belongs.
+    pub(super) struct Lap {
+        pub pics: Vec<(u64, Option<u64>)>,
+        pub audio: Vec<u64>,
+        pub pmt_bump: bool,
+        pub audio_pid: Option<u16>,
+        pub stray: Option<(usize, u64)>,
+    }
+
+    impl Lap {
+        pub(super) fn new(pics: Vec<(u64, Option<u64>)>, audio: Vec<u64>) -> Self {
+            Self { pics, audio, pmt_bump: false, audio_pid: None, stray: None }
+        }
+    }
+
+    /// `laps` muxed one after another as one programme: in each, an AAC
+    /// frame goes ahead of picture k iff it is stamped at or before k's
+    /// decode time, the rest after the lap's last picture; key pictures at
+    /// `keys` in each lap; a closing picture after the last lap, since the
+    /// demuxer hands a video PES out only at the next one on its PID. Lap L's
+    /// values go in plus L · 2^33, which the PES masks away: the muxer clamps
+    /// its audio PTS monotonic, and would otherwise not let a loop through.
+    pub(super) fn programme_ts(
+        mux: &mut TsMuxer,
+        au: &dyn Fn(bool, usize) -> Vec<u8>,
+        laps: &[Lap],
+        keys: &[usize],
+    ) -> Vec<Bytes> {
+        let frames = adts_frames();
+        mux.set_has_audio(true);
+        let mut out = Vec::new();
+        let (mut version, mut a, mut end) = (0u8, 0usize, 0u64);
+        for (l, lap) in laps.iter().enumerate() {
+            let up = l as u64 * WRAP;
+            if lap.pmt_bump {
+                version += 1;
+                mux.set_pmt_version(version);
+            }
+            if lap.audio_pid.is_some() {
+                mux.set_pids(None, None, lap.audio_pid, None);
+            }
+            let mut audio = lap.audio.iter().peekable();
+            for (k, &(pts, dts)) in lap.pics.iter().enumerate() {
+                let decode = dts.unwrap_or(pts);
+                while let Some(&&at) = audio.peek() {
+                    if at > decode {
+                        break;
+                    }
+                    out.extend(mux.mux_audio_pre_adts(frames[a % frames.len()], at + up));
+                    a += 1;
+                    audio.next();
+                }
+                let key = keys.contains(&k);
+                let ahead = lap.stray.filter(|s| s.0 == k).map_or(0, |s| s.1);
+                out.extend(mux.mux_video(&au(key, k), pts + up + ahead, decode + up + ahead, key));
+            }
+            for &at in audio {
+                out.extend(mux.mux_audio_pre_adts(frames[a % frames.len()], at + up));
+                a += 1;
+            }
+            end = lap.pics.iter().map(|p| p.0).max().unwrap() + F + up;
+        }
+        out.extend(mux.mux_video(&au(false, 0), end, end, false));
+        out
+    }
+
+    const WRAP: u64 = 1 << 33;
+
+    /// H.264 access units for [`programme_ts`].
+    fn h264(key: bool, k: usize) -> Vec<u8> {
+        h264_au(key, k as u8)
+    }
+
+    /// HEVC access units for [`programme_ts`].
+    fn h265(key: bool, k: usize) -> Vec<u8> {
+        h265_au(key, k as u8)
+    }
+
+    /// `ts` with the PTS (and DTS) of the PES starting on `pid` cleared from
+    /// its header — `PTS_DTS_flags` 0, the bytes left for
+    /// `PES_header_data_length` to skip — as a muxer that puts a field in a
+    /// PES of its own without a time writes it.
+    fn without_pts(mut ts: Vec<Bytes>, pid: u16) -> Vec<Bytes> {
+        let at = ts
+            .iter()
+            .position(|p| p[1] & 0x40 != 0 && (u16::from(p[1] & 0x1F) << 8 | u16::from(p[2])) == pid)
+            .expect("a PES start on the PID");
+        let mut p = ts[at].to_vec();
+        let payload = 4 + if p[3] & 0x20 != 0 { 1 + usize::from(p[4]) } else { 0 };
+        assert_eq!(&p[payload..payload + 3], &[0, 0, 1], "a PES header");
+        p[payload + 7] &= 0x3F;
+        ts[at] = Bytes::from(p);
+        ts
+    }
+
+    /// The video tags of `tags` that are pictures: `(timestamp, timestamp +
+    /// composition time)` — decode ms and presentation ms.
+    fn picture_times(tags: &[WireTag]) -> Vec<(u32, u32)> {
+        tags.iter().filter(|t| t.video).filter_map(|t| Some((t.ts, t.ts + tag_cts(&t.data)?))).collect()
+    }
+
+    /// The timestamps of the AAC frames of `tags` (not the sequence header).
+    fn audio_times(tags: &[WireTag]) -> Vec<u32> {
+        tags.iter().filter(|t| !t.video && t.data[1] == 1).map(|t| t.ts).collect()
+    }
+
+    /// FLV's contract on the timeline: the video's tags never step back, the
+    /// audio's strictly forward.
+    fn assert_monotonic(tags: &[WireTag], what: &str) {
+        let video: Vec<u32> = tags.iter().filter(|t| t.video).map(|t| t.ts).collect();
+        assert!(video.windows(2).all(|w| w[0] <= w[1]), "{what}: the video steps back: {video:?}");
+        let audio = audio_times(tags);
+        assert!(audio.windows(2).all(|w| w[0] < w[1]), "{what}: the audio steps back: {audio:?}");
+    }
+
+    /// The first essence the demuxer hands out, which anchors the epoch:
+    /// the first AAC frame when it is muxed ahead of the second picture —
+    /// the first picture is handed out only when the second's PES begins —
+    /// else the first picture's decode time.
+    fn epoch(pics: &[(u64, Option<u64>)], a0: u64) -> u64 {
+        let decode = |p: &(u64, Option<u64>)| p.1.unwrap_or(p.0);
+        if a0 <= decode(&pics[1]) { a0 } else { decode(&pics[0]) }
+    }
+
+    /// edge#211 item 3: a looped source the PTS rewriter passes through (an
+    /// MPTS input with no `program_number`). At each loop every tag stepped
+    /// back to the epoch or below it and went out at 0, and the receiver's
+    /// log filled with non-monotonic DTS. Each lap now continues the last,
+    /// both tracks on one offset — the lap's own A/V relation — whichever
+    /// meets the loop first and whatever the audio's length against the
+    /// video's (85, 90 or 95 frames to a 1 920 ms lap): the audio meeting it
+    /// first continues one frame on, and the video joins it (85 frames: 6
+    /// 000 ticks back, two pictures held a ms on); the video first
+    /// continues one picture on, and the audio joins it, its overlap dropped.
+    #[tokio::test]
+    async fn a_looped_source_keeps_both_tracks_monotonic_and_together() {
+        let pics = ibbp(LAP_PICTURES, |k| T0 + k * F);
+        let cases = [(false, T0 + F, 85u64), (false, T0 + F, 90), (false, T0 + F, 95)]
+            .into_iter()
+            .chain([(false, T0 + 3 * F, 85), (false, T0 + 3 * F, 90), (false, T0 + 3 * F, 95)])
+            .chain([(true, T0 + F, 85)]);
+        for (hevc, a0, m) in cases {
+            let audio_first = a0 == T0 + F;
+            let what = format!("hevc {hevc}, audio first {audio_first}, {m} audio frames a lap");
+            let audio: Vec<u64> = (0..m).map(|j| a0 + j * 1_920).collect();
+            let laps: Vec<Lap> = (0..3).map(|_| Lap::new(pics.clone(), audio.clone())).collect();
+            let au: &dyn Fn(bool, usize) -> Vec<u8> = if hevc { &h265 } else { &h264 };
+            let mut mux = TsMuxer::new();
+            if hevc {
+                mux.set_video_stream_type(0x24);
+            }
+            let tags = publish(programme_ts(&mut mux, au, &laps, &[0]), passthrough_output()).await;
+            assert_monotonic(&tags, &what);
+
+            let e = epoch(&pics, a0);
+            let ms = |t: u64| (t.saturating_sub(e) / 90) as u32;
+            let shift = |l: u64| if audio_first { l * m * 1_920 } else { l * LAP_PICTURES * F };
+            let (mut want_pics, mut last_decode) = (Vec::new(), None::<u64>);
+            let (mut want_audio, mut last_audio) = (Vec::new(), None::<u64>);
+            for l in 0..3 {
+                for &(pts, dts) in &pics {
+                    let decode = dts.unwrap_or(pts) + shift(l);
+                    let decode = last_decode.map_or(decode, |d| decode.max(d + 90));
+                    last_decode = Some(decode);
+                    want_pics.push((ms(decode), ms((pts + shift(l)).max(decode))));
+                }
+                for &a in &audio {
+                    let a = a + shift(l);
+                    if last_audio.is_none_or(|la| a > la) && a >= e {
+                        want_audio.push(ms(a));
+                        last_audio = Some(a);
+                    }
+                }
+            }
+            assert_eq!(picture_times(&tags), want_pics, "{what}: pictures");
+            assert_eq!(audio_times(&tags), want_audio, "{what}: audio");
+        }
+    }
+
+    /// edge#211 item 4, end to end: B-frames and AAC across the 33-bit wrap,
+    /// the values masked into the PES as any source's are. Every tag lands
+    /// at its unwrapped time; it used to go out at 0 for up to 26.5 h.
+    #[tokio::test]
+    async fn a_33_bit_wrap_mid_connection_keeps_counting() {
+        let start = WRAP - 3 * 90_000;
+        let pics = ibbp(150, |k| start + k * F);
+        let audio: Vec<u64> = (0..280).map(|j| start + 3 * F + j * 1_920).collect();
+        let lap = Lap::new(pics.clone(), audio.clone());
+        let tags = publish(programme_ts(&mut TsMuxer::new(), &h264, &[lap], &[0, 75]), passthrough_output()).await;
+        let d0 = pics[0].1.unwrap();
+        assert!(assert_wire_decode_order(&tags, &pics, d0, false) > 0);
+        let want: Vec<u32> = audio.iter().map(|&a| ((a - d0) / 90) as u32).collect();
+        assert_eq!(audio_times(&tags), want);
+        assert!(want.last().unwrap() > &5_000, "past the wrap");
+    }
+
+    /// An input switch is a PMT bump, and a `Discontinuity`, which the FLV
+    /// timeline does not need: (a) onto a feed 5 000 s on, whose audio runs
+    /// 5 frames behind its video where the first's ran one — the new feed
+    /// goes on one picture on, in its own A/V relation; (b) onto a feed on
+    /// the same clock — every tag at its source time, nothing re-anchored.
+    #[tokio::test]
+    async fn a_discontinuity_needs_no_re_anchor_with_or_without_a_jump() {
+        let feed = |base: u64, lead: u64, frames: u64, pmt_bump: bool| Lap {
+            pmt_bump,
+            ..Lap::new(ibbp(LAP_PICTURES, |k| base + k * F), (0..frames).map(|j| base + lead + j * 1_920).collect())
+        };
+        // (a) a jump: feed 2's picture 13 presents at the instant its audio
+        // frame 15 is stamped, and goes out on the same ms.
+        let far = T0 + 5_000 * 90_000;
+        let laps = [feed(T0, F, 85, false), feed(far, 5 * F, 85, true)];
+        let tags = publish(programme_ts(&mut TsMuxer::new(), &h264, &laps, &[0]), passthrough_output()).await;
+        assert_monotonic(&tags, "a jump");
+        assert_eq!(laps[1].pics[13].0, laps[1].audio[15], "the fixture's instant");
+        let pictures = picture_times(&tags);
+        assert_eq!(pictures.len(), 2 * LAP_PICTURES as usize);
+        // Strictly forward past the first, which decodes before the epoch
+        // the audio set and goes out at 0 with the second.
+        assert!(pictures[1..].windows(2).all(|w| w[0].0 < w[1].0), "every picture timed, strictly forward");
+        let audio = audio_times(&tags);
+        assert_eq!(audio.len(), 2 * 85, "no audio dropped");
+        assert_eq!(pictures[LAP_PICTURES as usize + 13].1, audio[85 + 15], "feed 2's A/V relation");
+        assert_eq!(
+            pictures[LAP_PICTURES as usize].0,
+            pictures[LAP_PICTURES as usize - 1].0 + 40,
+            "feed 2 one picture on",
+        );
+
+        // (b) no jump: the second feed continues the first's clock.
+        let laps = [feed(T0, F, 90, false), feed(T0 + LAP_PICTURES * F, F, 90, true)];
+        assert_eq!(laps[1].audio[0], laps[0].audio[89] + 1_920, "the fixture's audio is contiguous");
+        let tags = publish(programme_ts(&mut TsMuxer::new(), &h264, &laps, &[0]), passthrough_output()).await;
+        let pics: Vec<(u64, Option<u64>)> = laps.iter().flat_map(|l| l.pics.iter().copied()).collect();
+        let e = epoch(&pics, laps[0].audio[0]);
+        assert_wire_decode_order(&tags, &pics, e, false);
+        let want: Vec<u32> = laps.iter().flat_map(|l| l.audio.iter()).map(|&a| ((a - e) / 90) as u32).collect();
+        assert_eq!(audio_times(&tags), want, "every frame at its source time");
+    }
+
+    /// edge#211 item 5: a PAFF source remuxed with each second field in a PES
+    /// of its own and no PTS. The demuxer hands such a field over as PTS 0,
+    /// and passthrough stamped it 0 — a decode time stepping back to the
+    /// epoch every other picture. Each field now takes its first field's
+    /// time.
+    #[tokio::test]
+    async fn a_picture_whose_pes_carried_no_pts_takes_its_predecessors_time() {
+        let mut mux = TsMuxer::new();
+        let mut ts = Vec::new();
+        for f in 0..20u64 {
+            let at = T0 + f * F;
+            ts.extend(mux.mux_video(&h264_au(f == 0, (2 * f) as u8), at, at, f == 0));
+            let second = mux.mux_video(&h264_au(false, (2 * f + 1) as u8), at + F / 2, at + F / 2, false);
+            ts.extend(without_pts(second, 0x100));
+        }
+        ts.extend(mux.mux_video(&h264_au(false, 40), T0 + 20 * F, T0 + 20 * F, false));
+        let tags = publish(ts, passthrough_output()).await;
+        let pictures = picture_times(&tags);
+        assert_eq!(pictures.len(), 40);
+        for (f, pair) in pictures.chunks(2).enumerate() {
+            assert_eq!(pair[0], pair[1], "frame {f}: the second field on its first's time");
+            assert_eq!(pair[0], (f as u32 * 40, f as u32 * 40), "frame {f}");
+        }
+        assert!(pictures[2..].iter().all(|p| p.0 > 0), "nothing at 0 after the first frame");
+    }
+
+    /// One picture stamped 2 s ahead (PTS and DTS): placed one frame on —
+    /// where it belongs — and the pictures after it back on the programme's
+    /// clock, so every tag lands at its unshifted time. Taken as a gap it
+    /// would have put the video 2 s off the audio for good.
+    #[tokio::test]
+    async fn a_stray_picture_two_seconds_ahead_is_placed_one_frame_on() {
+        let pics = ibbp(100, |k| T0 + k * F);
+        let audio: Vec<u64> = (0..185).map(|j| T0 + F + j * 1_920).collect();
+        let lap = Lap { stray: Some((50, 180_000)), ..Lap::new(pics.clone(), audio.clone()) };
+        let tags = publish(programme_ts(&mut TsMuxer::new(), &h264, &[lap], &[0]), passthrough_output()).await;
+        let e = epoch(&pics, audio[0]);
+        assert_wire_decode_order(&tags, &pics, e, false);
+        // Strictly forward past the first, which decodes before the epoch
+        // the audio set and goes out at 0 with the second.
+        let pictures = picture_times(&tags);
+        assert!(pictures[1..].windows(2).all(|w| w[0].0 < w[1].0));
+        let want: Vec<u32> = audio.iter().map(|&a| ((a - e) / 90) as u32).collect();
+        assert_eq!(audio_times(&tags), want);
+    }
+
+    /// Transcoded audio beside passed-through video across loops of a
+    /// source whose audio (85 frames, 1 813 ms) is shorter than its video
+    /// (1 920 ms). The encoder anchored once and counted samples, so it ran
+    /// 107 ms further from the video every lap; it is now re-anchored at each
+    /// seam, where the video continues: the audio's first frame of lap L is
+    /// L × 1 920 ms after its first. The seam is the only place the audio
+    /// steps by more than a frame.
+    ///
+    /// The source's audio starting just past the video's second picture, the
+    /// encoder's first frame — stamped its codec delay before that — falls
+    /// before the epoch the first picture anchored: it is dropped, where it
+    /// used to go out at 0.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn transcoded_audio_stays_with_passed_through_video_across_loops() {
+        let pics = ibbp(LAP_PICTURES, |k| T0 + k * F);
+        let output = serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 96 }
+        });
+        // Video first both ways: 120 ms of audio lead, past the codec's
+        // 42.7 ms delay, and 41 ms, inside it.
+        for a0 in [T0 + 3 * F, T0 + F + 90] {
+            let audio: Vec<u64> = (0..85).map(|j| a0 + j * 1_920).collect();
+            assert_eq!(epoch(&pics, a0), T0, "video first");
+            let laps: Vec<Lap> = (0..4).map(|_| Lap::new(pics.clone(), audio.clone())).collect();
+            let tags = publish(programme_ts(&mut TsMuxer::new(), &h264, &laps, &[0]), output.clone()).await;
+            assert_monotonic(&tags, "transcoded");
+            let audio = audio_times(&tags);
+            assert!(audio.len() > 300, "{} AAC frames", audio.len());
+            assert!(!audio.contains(&0), "no audio stacked at 0: {:?}", &audio[..4]);
+            let seams: Vec<usize> = (1..audio.len()).filter(|&i| audio[i] - audio[i - 1] > 32).collect();
+            assert_eq!(seams.len(), 3, "a0 {a0}: one step a seam: {seams:?}");
+            if a0 == T0 + 3 * F {
+                assert!((70..120).contains(&audio[0]), "the first frame, its codec delay early: {}", audio[0]);
+                for (l, &i) in seams.iter().enumerate() {
+                    let lap = (l as i64 + 1) * 1_920;
+                    let got = i64::from(audio[i]) - i64::from(audio[0]);
+                    assert!((got - lap).abs() <= 1, "lap {}: {got} ms after the first, not {lap}", l + 1);
+                }
+            }
+            assert_eq!(picture_times(&tags).len(), 4 * LAP_PICTURES as usize);
+        }
+    }
+
+    /// A switch to a feed on another audio PID re-creates the demuxer's
+    /// audio framer, and the new feed's first audio PES carries no PTS: its
+    /// frame is handed out stamped 0. The timeline takes that for a jump and
+    /// continues the audio one frame on, and the next frame brings it back to
+    /// its source time: the tags go on forward, none at 0, and at most one
+    /// frame is lost.
+    #[tokio::test]
+    async fn an_audio_pes_without_a_pts_after_a_discontinuity_costs_at_most_one_frame() {
+        let pics = ibbp(2 * LAP_PICTURES, |k| T0 + k * F);
+        let audio: Vec<u64> = (0..180).map(|j| T0 + F + j * 1_920).collect();
+        let laps = [
+            Lap::new(pics[..48].to_vec(), audio[..90].to_vec()),
+            Lap {
+                pmt_bump: true,
+                audio_pid: Some(0x0102),
+                ..Lap::new(pics[48..].to_vec(), audio[90..].to_vec())
+            },
+        ];
+        let ts = without_pts(programme_ts(&mut TsMuxer::new(), &h264, &laps, &[0]), 0x0102);
+        let tags = publish(ts, passthrough_output()).await;
+        assert_monotonic(&tags, "a PTS-less audio PES");
+        let got = audio_times(&tags);
+        assert!(got.len() + 1 >= audio.len(), "{} of {} frames", got.len(), audio.len());
+        assert!(got[1..].iter().all(|&t| t > 0), "none at 0 after the start");
+        assert_wire_decode_order(&tags, &pics, epoch(&pics, audio[0]), false);
+    }
+
+    /// The lone gap end to end: a video-only source pausing 3 s keeps the
+    /// pause, as passthrough always did, where a timeline closing every
+    /// pause past a second would have run its clock behind the source's.
+    #[tokio::test]
+    async fn a_video_only_source_pausing_three_seconds_keeps_the_pause() {
+        let pics: Vec<(u64, Option<u64>)> =
+            (0..50).map(|k| (T0 + k * F + if k >= 25 { 3 * 90_000 } else { 0 }, None)).collect();
+        let tags = publish(video_ts(&mut TsMuxer::new(), false, &pics, &[0, 25]), passthrough_output()).await;
+        assert_wire_decode_order(&tags, &pics, T0, false);
+        let pictures = picture_times(&tags);
+        assert_eq!(pictures[25].0 - pictures[24].0, 3_040, "the pause kept");
     }
 }
 

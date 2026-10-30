@@ -44,7 +44,7 @@ mod segmenter;
 // encoding rather than duplicating them, so it exists only when `replay` does.
 #[cfg(feature = "replay")]
 mod thumbnails;
-mod timeline;
+pub(crate) mod timeline;
 mod upload;
 
 use std::collections::{HashMap, VecDeque};

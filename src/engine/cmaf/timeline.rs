@@ -60,6 +60,10 @@
 //! first track's (audio stamped 60 s back, met by an output started inside
 //! the excursion) takes the offset that does, as its siblings did.
 //!
+//! An RTMP connection keeps a timeline of its own, shared with nothing
+//! ([`CmafTimeline::with_lone_gap`]), on which a track with no other beside
+//! it keeps a pause of up to 10 s as a gap rather than closing it.
+//!
 //! **The cross window is directed.** A track may step back within
 //! [`OWN_WINDOW_90K`] of its newest timestamp and keep its offset: that is a
 //! B-frame source's presentation order (the video is mapped by PTS, in
@@ -331,6 +335,10 @@ pub struct CmafTimeline {
     /// it met first, or an excursion of its own.
     programme: Option<u64>,
     offsets: SharedOffsets,
+    /// The longest forward step (90 kHz) a track with no other beside it
+    /// keeps as a gap (see [`CmafTimeline::with_lone_gap`]); 0 on a CMAF
+    /// output, which closes it.
+    lone_gap_90k: u64,
 }
 
 impl Default for CmafTimeline {
@@ -341,6 +349,7 @@ impl Default for CmafTimeline {
             audio: Line::default(),
             programme: None,
             offsets: Arc::default(),
+            lone_gap_90k: 0,
         }
     }
 }
@@ -359,13 +368,20 @@ impl CmafTimeline {
                 o
             }
         };
-        Self { video: Line::default(), audio: Line::default(), programme: None, offsets }
+        Self { video: Line::default(), audio: Line::default(), programme: None, offsets, lone_gap_90k: 0 }
+    }
+
+    /// A timeline of its own, shared with nothing, that keeps a forward step of up to
+    /// `lone_gap_90k` as a gap on a track with no other beside it (an RTMP connection's).
+    pub fn with_lone_gap(lone_gap_90k: u64) -> Self {
+        Self { lone_gap_90k, ..Self::default() }
     }
 
     /// Map a source timestamp (90 kHz) of `track` onto the output timeline.
     pub fn map(&mut self, track: Track, src: u64) -> Mapped {
         let src = src & MASK_33;
         let programme = self.programme;
+        let lone_gap = self.lone_gap_90k;
         let (me, other) = match track {
             Track::Video => (&mut self.video, &mut self.audio),
             Track::Audio => (&mut self.audio, &mut self.video),
@@ -515,6 +531,15 @@ impl CmafTimeline {
             let ts = (src + own_offset) & MASK_33;
             let own = circ(ts, newest);
             if in_own(own) {
+                break 'choose Some((own_offset, ts));
+            }
+            // A track with no other beside it — the output has only this one,
+            // or the other has gone quiet — keeps a forward step up to
+            // `lone_gap` as a gap: nothing there tells a pause from a jump,
+            // and closing every pause past a second (a slide feed, a VFR
+            // camera) ran the track's clock behind the source's. 0 (CMAF)
+            // closes it, as before.
+            if own > 0 && (other_newest.is_none() || other_quiet) && own as u64 <= lone_gap {
                 break 'choose Some((own_offset, ts));
             }
             // The other track may have met this jump first: onto its offset
@@ -1693,5 +1718,58 @@ mod tests {
             assert_eq!(a.map(Track::Video, v).ts, c.map(Track::Video, v).ts, "{k}: one video timeline");
             assert_eq!(a.map(Track::Audio, au).ts, c.map(Track::Audio, au).ts, "{k}: one audio timeline");
         }
+    }
+
+    /// A track with nothing beside it — the output's only track, or one whose
+    /// other track has gone quiet — keeps a forward step of up to the lone
+    /// gap it is given as a gap (an RTMP connection's slide feed or VFR
+    /// camera) and continues a step past it one step on. A CMAF output is
+    /// given none and closes every step past its own window, as before.
+    #[test]
+    fn a_lone_track_keeps_a_gap_only_when_asked() {
+        for (track, step) in [(Track::Video, 3_600u64), (Track::Audio, 1_920)] {
+            // 50 timestamps a step apart from 900 000; the last of them.
+            let run = |tl: &mut CmafTimeline| -> u64 {
+                let mut t = 900_000;
+                for _ in 0..50 {
+                    assert_eq!(tl.map(track, t), Mapped { ts: t, jump: None }, "{track:?}");
+                    t += step;
+                }
+                t - step
+            };
+            let mut cmaf = CmafTimeline::default();
+            let last = run(&mut cmaf);
+            let m = cmaf.map(track, last + 3 * 90_000);
+            assert_eq!(m.ts, last + step, "{track:?}: CMAF continues the 3 s step one step on");
+            assert!(m.jump.is_some());
+
+            let mut rtmp = CmafTimeline::with_lone_gap(10 * 90_000);
+            let last = run(&mut rtmp);
+            let paused = last + 3 * 90_000;
+            assert_eq!(rtmp.map(track, paused), Mapped { ts: paused, jump: None }, "{track:?}: the pause kept");
+            // Past the lone gap: one step on — the smallest step recorded,
+            // since the pause (over 500 ms) recorded none.
+            let m = rtmp.map(track, paused + 11 * 90_000);
+            assert_eq!(m.ts, paused + step, "{track:?}: an 11 s step continued");
+            assert!(m.jump.is_some());
+        }
+        // The audio gone quiet for more than a cross window of video: the
+        // video is alone, and keeps a 3 s pause under the lone gap.
+        let mut rtmp = CmafTimeline::with_lone_gap(10 * 90_000);
+        let mut cmaf = CmafTimeline::default();
+        let mut v = 900_000u64;
+        for k in 0..150u64 {
+            for tl in [&mut rtmp, &mut cmaf] {
+                tl.map(Track::Video, v);
+                if k < 50 {
+                    tl.map(Track::Audio, v - 9_000);
+                }
+            }
+            v += 3_600;
+        }
+        let last = v - 3_600;
+        let paused = last + 3 * 90_000;
+        assert_eq!(rtmp.map(Track::Video, paused), Mapped { ts: paused, jump: None }, "the pause kept");
+        assert_eq!(cmaf.map(Track::Video, paused).ts, last + 3_600, "CMAF closes it");
     }
 }

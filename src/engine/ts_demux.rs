@@ -65,8 +65,11 @@ pub enum DemuxedFrame {
     /// its monotonic counter). Consumers that own decoder state (the local-
     /// display output) should flush their decoders and reset PTS / clock
     /// anchors so the new stream starts cleanly without waiting for the next
-    /// natural IDR to time out a stale reference-frame queue. Re-muxing
-    /// consumers (RTMP / WebRTC TS demuxers) can ignore this variant; their
+    /// natural IDR to time out a stale reference-frame queue. The RTMP
+    /// output restarts its passthrough parameter-set table on it, and its FLV
+    /// timeline (`output_rtmp::FlvTimeline`) deliberately ignores it, judging
+    /// the timestamps themselves — the old source's last picture comes out
+    /// after this frame. The WebRTC TS demuxer can ignore this variant; its
     /// downstream encoder pipelines re-anchor on the next IDR independently.
     /// Emitted at most once per discontinuity event, at the head of the
     /// `demux()` return Vec.

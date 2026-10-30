@@ -1301,6 +1301,210 @@ impl AudioEncoder {
     }
 }
 
+// ── The encoder's input on the media timeline ───────────────────────────────
+
+/// How far a submit's PTS may sit from where the encoder's input is before
+/// the encoder's output timeline is re-anchored on it, or the submit held
+/// back ([`EncoderInputClock::place`]).
+///
+/// The in-process encoder free-runs from one anchor (see
+/// [`AudioEncoder::reanchor_pts`]), so a splice, a lost PES, a wrap the
+/// timeline did not absorb, or silence inserted between two contiguous real
+/// frames would otherwise leave the audio on a timeline the picture is no
+/// longer on — for good. Compared against where the input *is* rather than
+/// against the previous submit, so a source that packs half a second of
+/// audio into one PES is not a jump, and a 200 ms silence burst between two
+/// contiguous frames is. One 48 kHz frame plus the rounding a PES-to-frame
+/// PTS carries; anything a seam lets through here is an offset the picture
+/// never shares, so it has to sit inside the ±40 ms the A/V gate allows.
+pub(crate) const SOURCE_PTS_SLACK_TICKS: u64 = 2_000;
+
+/// How much silence one fill may emit before it is treated as a jump in the
+/// picture rather than a gap to cover: a splice or a wrap on the video moves
+/// the target by hours, and nobody wants hours of silence encoded to reach it.
+pub(crate) const SILENCE_FILL_CAP_TICKS: u64 = 4 * 90_000;
+
+/// Where an [`AudioEncoder`]'s input is on the media timeline: the time it
+/// was (re-)anchored at and how many input samples, real and silent, it has
+/// taken since at `rate` — a running count divided once, so a 44.1 kHz
+/// rounding does not drift it. The encoder free-runs from one anchor
+/// ([`AudioEncoder::reanchor_pts`]) and ignores every later PTS, so this is
+/// the only way to know when the source and the encoder have parted company.
+///
+/// One rule for every output that re-encodes audio beside a picture — CMAF's
+/// `AudioReencoder` and the RTMP output — so the two cannot drift apart: the
+/// caller keeps the encoder and applies what this says (re-anchoring it,
+/// filling a gap, holding a frame back), and tells it what the encoder took.
+#[derive(Debug, Default)]
+pub(crate) struct EncoderInputClock {
+    anchor: Option<u64>,
+    since: u64,
+    rate: u32,
+    /// A submit the clock was told of was refused: the position no longer
+    /// says where the encoder's input is, so the next placement re-anchors.
+    stale: bool,
+    /// How far the newest video PTS runs ahead of the newest audio PTS, the
+    /// largest seen over the current run of real audio. A hardware encoder
+    /// sends video ahead of its DTS by its VBV delay and audio close to its
+    /// PTS, so filling silence to the picture's position would run it past
+    /// where the audio is, and every return of real audio would then step
+    /// backwards. Silence is filled to the picture less this.
+    video_lead_90k: u64,
+    /// True while silence is being laid down, so the first real frame after
+    /// it resets the lead measurement.
+    in_silence: bool,
+}
+
+/// Where a real submit lands relative to the encoder's input
+/// ([`EncoderInputClock::place`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// Submit at [`EncoderInputClock::position`]; with `reanchor`, call
+    /// [`AudioEncoder::reanchor_pts`] and [`EncoderInputClock::anchor`]
+    /// (`pts`, rate) first.
+    Submit { reanchor: bool },
+    /// A forward gap the silent fallback covers: submit `samples` zeros at
+    /// the position, then the frame at the position after them.
+    FillThenSubmit { samples: u64 },
+    /// Behind the input by no more than the fill cap: drop it.
+    Skip,
+}
+
+impl EncoderInputClock {
+    /// Where on the media timeline the encoder's next input sample belongs,
+    /// once it has been anchored.
+    pub(crate) fn position(&self) -> Option<u64> {
+        let anchor = self.anchor?;
+        Some(anchor.saturating_add(self.since.saturating_mul(90_000) / u64::from(self.rate.max(1))))
+    }
+
+    /// The input rate the position counts at.
+    pub(crate) fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// Start the input timeline afresh at `pts`, at `rate` — with the
+    /// encoder re-anchored beside it.
+    pub(crate) fn anchor(&mut self, pts: u64, rate: u32) {
+        self.anchor = Some(pts);
+        self.since = 0;
+        self.rate = rate;
+        self.stale = false;
+    }
+
+    /// Count on at `rate` from where the input is: an encoder rebuilt for
+    /// another input rate. The position is a property of what has been
+    /// handed on, not of the encoder, so it carries over, and the new
+    /// encoder is anchored there by the next submit.
+    pub(crate) fn rebase(&mut self, rate: u32) {
+        self.anchor = self.position();
+        self.since = 0;
+        self.rate = rate;
+    }
+
+    /// [`Self::rebase`] onto `rate` when it is not the rate counted at.
+    pub(crate) fn set_rate(&mut self, rate: u32) {
+        if rate != self.rate {
+            self.rebase(rate);
+        }
+    }
+
+    /// The encoder accepted `samples` more input samples.
+    pub(crate) fn took(&mut self, samples: u64) {
+        self.since = self.since.saturating_add(samples);
+    }
+
+    /// The encoder refused a submit: counted, the position would run ahead
+    /// of what the encoder holds and every later frame be skipped as
+    /// behind it, so the next placement re-anchors instead.
+    pub(crate) fn refused(&mut self) {
+        self.stale = true;
+    }
+
+    /// What to do with a real submit at `pts`, given where the input is (see
+    /// [`SOURCE_PTS_SLACK_TICKS`]). `fill_gaps` (a silent fallback is
+    /// running) covers a forward gap up to [`SILENCE_FILL_CAP_TICKS`] with
+    /// zeros rather than re-anchoring and stretching the last sample over it.
+    pub(crate) fn place(&self, pts: u64, fill_gaps: bool) -> Placement {
+        let Some(at) = self.position().filter(|_| !self.stale) else {
+            return Placement::Submit { reanchor: true };
+        };
+        if pts > at.saturating_add(SOURCE_PTS_SLACK_TICKS) {
+            // A gap: the source moved on without the encoder. The silent
+            // fallback covers one the fill stops a chunk short of —
+            // continued with zeros; anything else re-anchors.
+            let gap = pts - at;
+            if fill_gaps && gap <= SILENCE_FILL_CAP_TICKS {
+                Placement::FillThenSubmit { samples: gap * u64::from(self.rate.max(1)) / 90_000 }
+            } else {
+                Placement::Submit { reanchor: true }
+            }
+        } else if pts.saturating_add(SOURCE_PTS_SLACK_TICKS) < at {
+            // The source is behind the encoder's input: silence overshot the
+            // audio's return, or a seam repeated audio already encoded.
+            // Going backwards would stamp this frame before what was already
+            // handed on — a zero-duration sample, a tag stepping back. Hold
+            // the source back until it catches up; what is lost is the
+            // overlap, once. Behind by more than any fill, it is a jump.
+            if at - pts > SILENCE_FILL_CAP_TICKS {
+                Placement::Submit { reanchor: true }
+            } else {
+                Placement::Skip
+            }
+        } else {
+            Placement::Submit { reanchor: false }
+        }
+    }
+
+    /// Where silence laid beside the picture at `video` should stop: where
+    /// the audio would be, the picture less its measured lead.
+    pub(crate) fn silence_target(&self, video: u64) -> u64 {
+        video.saturating_sub(self.video_lead_90k)
+    }
+
+    /// Ready the input to lay silence up to `target` at the encoder's
+    /// `rate`: anchored at `target` when it has no position, a refused
+    /// submit left it stale, or the target moved further than any gap a
+    /// fill covers (a splice or a wrap on the picture, which the silence
+    /// follows rather than chases). Returns whether it anchored, so the
+    /// caller re-anchors the encoder too.
+    pub(crate) fn silence_start(&mut self, target: u64, rate: u32) -> bool {
+        self.set_rate(rate);
+        let anchor = match self.position().filter(|_| !self.stale) {
+            None => true,
+            Some(at) => target.saturating_sub(at) > SILENCE_FILL_CAP_TICKS,
+        };
+        if anchor {
+            self.anchor(target, rate);
+        }
+        anchor
+    }
+
+    /// The position the next chunk of `samples` silent samples goes in at,
+    /// while it still ends at or before `target`.
+    pub(crate) fn next_silence(&self, samples: u64, target: u64) -> Option<u64> {
+        let ticks = samples.saturating_mul(90_000) / u64::from(self.rate.max(1));
+        self.position().filter(|at| at.saturating_add(ticks) <= target)
+    }
+
+    /// Silence is being laid down.
+    pub(crate) fn mark_silence(&mut self) {
+        self.in_silence = true;
+    }
+
+    /// A real source frame at `pts`, the newest picture at `video`: the
+    /// picture's lead over the audio, measured afresh on the first real frame
+    /// after silence, for the next fill to stop short by.
+    pub(crate) fn mark_real_audio(&mut self, pts: u64, video: Option<u64>) {
+        if std::mem::take(&mut self.in_silence) {
+            self.video_lead_90k = 0;
+        }
+        if let Some(video) = video {
+            self.video_lead_90k = self.video_lead_90k.max(video.saturating_sub(pts));
+        }
+    }
+}
+
 // ── Internal: ffmpeg command line ───────────────────────────────────────────
 
 /// Build the ffmpeg argv for the requested codec. All commands include
@@ -2349,6 +2553,154 @@ async fn stderr_drainer_task(
         }
     }
     let _ = done_tx.send(());
+}
+
+#[cfg(test)]
+mod input_clock_tests {
+    use super::*;
+
+    const T: u64 = 900_000;
+
+    fn anchored(rate: u32) -> EncoderInputClock {
+        let mut c = EncoderInputClock::default();
+        assert_eq!(c.place(T, false), Placement::Submit { reanchor: true }, "nothing to place against");
+        c.anchor(T, rate);
+        c
+    }
+
+    /// Frames handed over at their own PTS, one after another, stay on the
+    /// encoder's input timeline — at 44.1 kHz too, where a frame is no whole
+    /// number of ticks.
+    #[test]
+    fn contiguous_input_never_reanchors() {
+        for rate in [48_000u32, 44_100] {
+            let mut c = anchored(rate);
+            for k in 0..2_000u64 {
+                let pts = T + k * 1_024 * 90_000 / u64::from(rate);
+                assert_eq!(c.place(pts, false), Placement::Submit { reanchor: false }, "{rate}: frame {k}");
+                assert_eq!(c.place(pts, true), Placement::Submit { reanchor: false }, "{rate}: frame {k}");
+                c.took(1_024);
+            }
+        }
+    }
+
+    /// A frame further ahead of the input than the slack is a gap: covered
+    /// with zeros under the silent fallback when no longer than the fill
+    /// cap, else re-anchored on. Within the slack it is the next frame.
+    #[test]
+    fn a_gap_past_the_slack_reanchors_or_is_filled_under_silent_fallback() {
+        let c = anchored(48_000);
+        assert_eq!(c.place(T + 9_000, false), Placement::Submit { reanchor: true });
+        assert_eq!(c.place(T + 9_000, true), Placement::FillThenSubmit { samples: 4_800 });
+        for fill in [false, true] {
+            assert_eq!(c.place(T + 5 * 90_000, fill), Placement::Submit { reanchor: true }, "5 s ahead");
+            assert_eq!(c.place(T + 1_920, fill), Placement::Submit { reanchor: false }, "a frame ahead");
+        }
+    }
+
+    /// A frame behind the input — silence that overshot the audio's return,
+    /// a seam repeating audio already encoded — is held back until the source
+    /// catches up; behind by more than the fill cap it is a jump.
+    #[test]
+    fn input_behind_is_skipped_until_it_catches_up_and_reanchors_past_the_cap() {
+        let mut c = anchored(48_000);
+        c.took(48_000 * 10);
+        let at = c.position().unwrap();
+        assert_eq!(at, T + 10 * 90_000);
+        for fill in [false, true] {
+            assert_eq!(c.place(at - 9_000, fill), Placement::Skip, "100 ms behind");
+            assert_eq!(c.place(at - 5 * 90_000, fill), Placement::Submit { reanchor: true }, "5 s behind");
+            assert_eq!(c.place(at - 1_920, fill), Placement::Submit { reanchor: false }, "a frame behind");
+        }
+    }
+
+    /// An encoder rebuilt for a source at another rate counts on from where
+    /// the input was: 48 kHz silence, then 44.1 kHz frames, the position
+    /// continuous across the change and running at the new rate.
+    #[test]
+    fn a_rate_change_carries_the_position_over() {
+        let mut c = anchored(48_000);
+        for _ in 0..10 {
+            c.took(1_024);
+        }
+        let before = c.position().unwrap();
+        assert_eq!(before, T + 19_200);
+        c.set_rate(48_000);
+        assert_eq!(c.position(), Some(before), "the same rate changes nothing");
+        c.set_rate(44_100);
+        assert_eq!((c.position(), c.rate()), (Some(before), 44_100));
+        for n in 1..=100u64 {
+            c.took(1_024);
+            let want = before + n * 1_024 * 90_000 / 44_100;
+            assert!(c.position().unwrap().abs_diff(want) <= 1, "frame {n}: {:?} vs {want}", c.position());
+            assert_eq!(c.place(want, false), Placement::Submit { reanchor: false });
+        }
+    }
+
+    /// A submit the encoder refused was never taken: the next placement
+    /// re-anchors, where counting it ran the input ahead of the encoder and
+    /// every later frame read as behind it.
+    #[test]
+    fn a_refused_submit_reanchors_the_next_placement() {
+        let mut c = anchored(48_000);
+        c.took(1_024);
+        assert_eq!(c.place(T + 1_920, false), Placement::Submit { reanchor: false });
+        c.refused();
+        assert_eq!(c.place(T + 1_920, false), Placement::Submit { reanchor: true });
+        assert_eq!(c.place(T + 1_920, true), Placement::Submit { reanchor: true });
+        c.anchor(T + 1_920, 48_000);
+        assert_eq!(c.place(T + 1_920, false), Placement::Submit { reanchor: false }, "anchored afresh");
+        // A silence start re-anchors a stale input too.
+        c.refused();
+        assert!(c.silence_start(T + 1_920, 48_000));
+        assert_eq!(c.place(T + 1_920, false), Placement::Submit { reanchor: false });
+    }
+
+    /// Silence starts at its target, with nothing laid until the target moves
+    /// on; it is then laid in whole chunks up to the target, never past it,
+    /// and a target moving further than any fill re-anchors it there.
+    #[test]
+    fn silence_starts_at_the_target_and_follows_a_jump_past_the_cap() {
+        let mut c = EncoderInputClock::default();
+        assert!(c.silence_start(T, 48_000), "no position: anchored at the target");
+        assert_eq!((c.position(), c.rate()), (Some(T), 48_000));
+        assert_eq!(c.next_silence(1_024, T), None, "nothing to lay yet");
+        let target = T + 90_000;
+        assert!(!c.silence_start(target, 48_000), "a second on: laid, not re-anchored");
+        let mut laid = Vec::new();
+        while let Some(at) = c.next_silence(1_024, target) {
+            laid.push(at);
+            c.took(1_024);
+            c.mark_silence();
+        }
+        assert_eq!(laid.len(), 46, "46 chunks of 1 920 ticks fit in a second");
+        assert!(laid.windows(2).all(|w| w[1] - w[0] == 1_920));
+        assert_eq!(laid[0], T);
+        assert!(c.position().unwrap() <= target && target - c.position().unwrap() < 1_920);
+        // The picture jumps an hour: the silence follows it.
+        let jumped = target + 3_600 * 90_000;
+        assert!(c.silence_start(jumped, 48_000));
+        assert_eq!(c.position(), Some(jumped));
+        // Within the cap it is a gap, filled.
+        assert!(!c.silence_start(jumped + 3 * 90_000, 48_000));
+    }
+
+    /// The picture's lead over the audio is the largest seen over a run of
+    /// real audio, and measured afresh on the first real frame after
+    /// silence: silence stops short of the picture by it.
+    #[test]
+    fn the_lead_is_measured_afresh_after_silence() {
+        let mut c = EncoderInputClock::default();
+        assert_eq!(c.silence_target(T), T, "no lead measured");
+        c.mark_real_audio(T, Some(T + 27_000));
+        c.mark_real_audio(T + 1_920, Some(T + 1_920 + 9_000));
+        c.mark_real_audio(T + 3_840, None);
+        assert_eq!(c.silence_target(T + 90_000), T + 90_000 - 27_000, "the largest lead of the run");
+        c.mark_silence();
+        c.mark_real_audio(T + 90_000, Some(T + 90_000 + 9_000));
+        assert_eq!(c.silence_target(T + 180_000), T + 180_000 - 9_000, "a new run, measured afresh");
+        assert_eq!(c.silence_target(1_000), 0, "never below zero");
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

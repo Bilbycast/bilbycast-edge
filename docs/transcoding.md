@@ -413,9 +413,13 @@ the audio timeline pins to 0 while video runs on the source clock. So
 an RTMP output that connects *before* any essence arrives opens
 video-only rather than emitting silence from t≈0, which is what it used
 to do. For the headline case here (a genuinely video-only source) video
-anchors the epoch on its first access unit and the silent track resumes
-immediately after, so the exposed window is publish-to-first-essence
-only.
+anchors the epoch on its first access unit and the silent track starts
+at that picture's time, less the encoder's delay, as soon as the next
+picture arrives — so the exposed window is publish-to-first-essence
+only. Until edge#211 it started at 0 instead: once a picture had
+anchored the epoch, the first silent chunk anchored the encoder at 0,
+and every silent tag went out at 0 for as long as the source's PTS
+stood above it.
 
 Required whenever:
 
@@ -429,24 +433,35 @@ Required whenever:
 - Packaging **low-latency CMAF / CMAF-LL** — the segmenter expects
   monotonic audio timestamps per segment; gaps cause player stalls.
 
-On CMAF the silence is **measured against the picture, not ticked by
-the clock**. The 500 ms grace is the trigger; once it has elapsed, each
-tick lays down as much silence as it takes to bring the audio up to
-where the audio would be — the newest video PTS less the picture's lead
-over the audio, measured over the preceding run of real audio (a
-hardware encoder sends video ahead of its DTS by its VBV delay) — and no
-further. So a delivery stall inserts nothing (neither track moves), a
-tick the output loop observed late is made up on the next, and real
-audio returning lands where the silence ends. Real and silent frames are
-stamped from one encoder timeline: the re-encoder tracks where the
-encoder's input is on the source's timeline and re-anchors the encoder
-when a real frame is more than a frame past it (a splice, a lost PES, a
-gap), holds a frame back that is behind it (silence overshot the return
-by the part of the lead the estimate missed), and otherwise continues.
-The eager silent-fallback encoder is built at the declared rate and
-rebuilt, with a resampler, on the first real frame whose rate or channel
-count differs — a 44.1 kHz source through a 48 kHz encoder used to run
-8.8 % slow.
+On CMAF and RTMP the silence is **measured against the picture, not
+ticked by the clock** — one rule, shared by both outputs
+(`audio_encode::EncoderInputClock`). The 500 ms grace is the trigger;
+once it has elapsed, each tick lays down as much silence as it takes to
+bring the audio up to where the audio would be — the newest video PTS
+less the picture's lead over the audio, measured over the preceding run
+of real audio (a hardware encoder sends video ahead of its DTS by its
+VBV delay) — and no further. So a delivery stall inserts nothing
+(neither track moves), a tick the output loop observed late is made up
+on the next, and real audio returning lands where the silence ends. Real
+and silent frames are stamped from one encoder timeline: the re-encoder
+tracks where the encoder's input is on the source's timeline and
+re-anchors the encoder when a real frame is more than a frame past it (a
+splice, a lost PES, a gap), holds a frame back that is behind it
+(silence overshot the return by the part of the lead the estimate
+missed), and otherwise continues. The eager silent-fallback encoder is
+built at the declared rate and rebuilt, with a resampler, on the first
+real frame whose rate or channel count differs — a 44.1 kHz source
+through a 48 kHz encoder used to run 8.8 % slow. On RTMP (since
+edge#211) the measure is the connection's FLV timeline, the encoder's
+channel / rate stage converts the source instead of a rebuild, and a
+connection with no picture to measure against (an audio-only source
+whose audio has stopped) gets one chunk a tick from where the encoder's
+input is; RTMP's silence used to be one chunk a tick, wall-clock, and
+every tick observed late was lost for good. The same placement
+re-anchors RTMP's transcoded audio at a loop, a switch or a gap whether
+or not `silent_fallback` is set: the encoder used to anchor on its first
+frame and count samples for the life of the connection, so a loop whose
+audio and video lengths differ drifted A/V by the difference every lap.
 
 Wired for RTMP, WebRTC (both WHIP client and WHEP server paths), and
 CMAF (HLS + DASH output) in this release. HLS (standalone HLS output,
