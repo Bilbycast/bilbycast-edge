@@ -193,7 +193,7 @@ broadcast IRDs) do not lose lock during a switch:
   Input A (active)  ──▶  per-input broadcast  ──▶  Forwarder A ──┐
                                                                    │
                                                    ┌───────────┐  │
-                                                   │ TS Contin- │◀─┘  (shared, Arc<Mutex>)
+                                                   │ TS Contin- │◀─┘  (owned by ts_fixer_task)
                                                    │ uity Fixer │◀─┐
                                                    └─────┬─────┘  │
                                                          │        │
@@ -208,12 +208,16 @@ broadcast IRDs) do not lose lock during a switch:
 
 **What it does on switch:**
 
-1. **CC state reset** — Output-side continuity counter tracking is cleared on
-   switch. The new input's original CC values pass through, creating a natural
-   CC jump on all PIDs. Receivers detect this as "packet loss," flush their PES
-   buffers, and resync on the next PES start (PUSI=1). This is more reliable
-   than trying to maintain CC continuity — it gives receivers a clean break
-   signal that works regardless of codec or stream structure.
+1. **CC passes through** — the new input's CCs give one jump per PID; loss on
+   the new input still shows. The new input's original CC values pass through,
+   creating a natural CC jump on all PIDs. Receivers detect this as "packet
+   loss," flush their PES buffers, and resync on the next PES start (PUSI=1).
+   This is more reliable than trying to maintain CC continuity — it gives
+   receivers a clean break signal that works regardless of codec or stream
+   structure. The fixer never rewrites a CC, before or after a switch, so every
+   later gap downstream (and in the flow's TR 101 290 `cc_errors`) is real
+   loss. Until edge#214 it renumbered every payload CC after the first switch
+   or source PCR jump, for the rest of the flow, which erased that loss.
 
 2. **Per-input PSI caching** — Each input has its own PAT/PMT cache (not
    shared). Passive inputs observe PSI tables while running warm. On switch,
@@ -278,10 +282,12 @@ one to two frames regardless of whether the target input is passthrough or
 ingress-transcoded. The pre-fix behaviour (switching *to* an ingress-
 transcoded input used to stall for up to one full GOP) is gone.
 
-**Zero-cost when not switching:** Before the first switch occurs, the fixer
-passes packets through unchanged — a single `bool` check per packet, no
-allocations, no copies. CC state is tracked passively so it is accurate if a
-switch occurs later.
+**Zero-cost when not switching:** every packet passes through unchanged
+except the PCR that takes a pending DI (a switch's, or a source
+discontinuity's on that PCR's PID) — no allocations, no copies, beyond the
+PSI the fixer observes for its switch cache. Only a datagram carrying that
+PCR is copied, with the one DI bit set and every other byte, and the
+datagram's metadata, as it arrived.
 
 **Downstream safety:** The fixer operates strictly at the TS packet level
 (188-byte boundaries). RTP headers are preserved unchanged. No output, FEC

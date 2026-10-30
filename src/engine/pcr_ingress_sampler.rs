@@ -163,7 +163,9 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
 /// `FixerCommand::SignalSourceDiscontinuity` naming the PCR PID that
 /// jumped to the per-flow `TsContinuityFixer`, which stamps the MPEG-TS
 /// adaptation-field `discontinuity_indicator` on that PID's next PCR.
-/// Receivers see DI=1 and flush STC. A PTS / DTS jump alone raises its
+/// Receivers see DI=1 and flush STC. It arms DI and nothing else: CC
+/// passes through as the source sent it (it used to switch the fixer into
+/// renumbering every CC for the rest of the flow, edge#214). A PTS / DTS jump alone raises its
 /// event and counter but no DI: DI on a PCR packet announces a new
 /// system time base, and a PES timestamp that jumps while the PCR runs on
 /// is not one (the Spain capture's teletext PIDs step back ~650 ms at 73 s
