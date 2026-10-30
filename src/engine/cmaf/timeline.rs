@@ -198,6 +198,9 @@ struct Line {
     /// in doubt, while it has not come past there again: if the video then
     /// cannot follow, the return was a switch both met (see `map`).
     back_from: Option<u64>,
+    /// Where the next timestamp opens an offset if no rule places it, for
+    /// that timestamp only (see [`CmafTimeline::continue_at`]).
+    continue_at: Option<u64>,
 }
 
 /// A step of one track forward past its own window, on the programme's
@@ -381,23 +384,25 @@ impl CmafTimeline {
         Self { lone_gap_90k, ..Self::default() }
     }
 
-    /// Move `track`'s newest timestamp on to `ts` (90 kHz) when it is
-    /// behind it, so the track's next timestamp is judged from there: for
-    /// an output that knows where a track it took for gone would be now —
-    /// an RTMP connection whose picture comes back after the audio ran on
-    /// alone (`output_rtmp::FlvTimeline::video`). Judged from its old
-    /// picture, a return the rules continue went one step past that, as
-    /// far behind the other track as it had been away. CMAF's outputs, which
-    /// share their offsets across the flow, never call it.
-    pub fn resume_from(&mut self, track: Track, ts: u64) {
+    /// Continue `track`'s next timestamp at `ts` (90 kHz) when it is a jump
+    /// no rule places and `ts` is ahead of the track's newest, rather than
+    /// one step past that: for an output that knows where a track it took
+    /// for gone would be now — an RTMP connection whose picture comes back
+    /// on another clock after the audio ran on alone
+    /// (`output_rtmp::FlvTimeline::video`). Continued from its old picture,
+    /// such a return went as far behind the other track as it had been
+    /// away. A timestamp the rules place — the old picture handed out late,
+    /// a pause the other track ran through — is placed as ever: moving the
+    /// track's newest on to `ts` instead put the picture before a pause of
+    /// over 1.5 s on an offset of its own, 2 s late. For the next timestamp
+    /// only. CMAF's outputs, which share their offsets across the flow,
+    /// never call it.
+    pub fn continue_at(&mut self, track: Track, ts: u64) {
         let line = match track {
             Track::Video => &mut self.video,
             Track::Audio => &mut self.audio,
         };
-        let ts = ts & MASK_33;
-        if line.newest.is_some_and(|n| circ(ts, n) > 0) {
-            line.newest = Some(ts);
-        }
+        line.continue_at = Some(ts & MASK_33);
     }
 
     /// Map a source timestamp (90 kHz) of `track` onto the output timeline.
@@ -409,6 +414,7 @@ impl CmafTimeline {
             Track::Video => (&mut self.video, &mut self.audio),
             Track::Audio => (&mut self.audio, &mut self.video),
         };
+        let continue_at = me.continue_at.take();
         let leapt = me.last_src.is_some_and(|prev| circ(src, prev) > MAX_STEP_90K as i64);
         let other_leapt = other.leaps > me.other_leaps_prev;
         me.note_step(src);
@@ -630,7 +636,12 @@ impl CmafTimeline {
                             Track::Video => 3_003,
                             Track::Audio => 1_920,
                         };
-                        let ts = (newest + me.step(default_step)) & MASK_33;
+                        // Not for a picture placed in doubt either: the
+                        // next picture is judged by where it landed.
+                        let ts = match continue_at.filter(|&c| !placing_in_doubt && circ(c, newest) > 0) {
+                            Some(c) => c,
+                            None => (newest + me.step(default_step)) & MASK_33,
+                        };
                         let off = ts.wrapping_sub(src) & MASK_33;
                         offsets.list.retain(|o| *o != off);
                         offsets.list.push(off);

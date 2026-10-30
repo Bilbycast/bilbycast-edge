@@ -471,11 +471,13 @@ goes on the timeline as audio: audio returning on the same clock lands
 where it ends, the stretch the grace and any late tick held it back
 zero-filled (up to 4 s; past that the encoder re-anchors forward on the
 returning audio), and audio returning on another clock is continued one
-frame past it. A picture coming back to such a connection ahead of its
-audio is put where the audio is, in the relation it last had to it, and
-its audio joins it there; it used to be continued one frame past its old
-picture, and the audio joining it was dropped as behind everything sent
-until the source had run as far again as the video had been away.
+frame past it. A picture coming back to such a connection on another
+clock, ahead of its audio, is put where the audio is, in the relation it
+last had to it, and its audio joins it there; it used to be continued
+one frame past its old picture, and the audio joining it was dropped as
+behind everything sent until the source had run as far again as the
+video had been away. A picture back on the clock it left goes out at its
+own time, as a pause of the video's that the audio ran through.
 RTMP's silence used to be one chunk a tick, wall-clock, and every tick
 observed late was lost for good.
 

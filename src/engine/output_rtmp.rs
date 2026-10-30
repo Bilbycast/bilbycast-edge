@@ -958,18 +958,19 @@ impl FlvTimeline {
     /// hold never engages, and the tag is what [`flv_video_time`] made of
     /// the raw timestamps.
     ///
-    /// A picture coming back after the video was taken for gone — the audio
-    /// ran on past it alone (a switch to an audio-only backup, a video PID
-    /// that stopped), and silence may have followed — is judged from where
-    /// the audio is now, in the relation the picture last had to it
-    /// ([`CmafTimeline::resume_from`]): on the same clock it lands at its
-    /// own time, on another it opens an offset there, and its audio joins it
-    /// beside the audio already sent. Judged from its old picture, a picture
-    /// coming back ahead of its audio went one frame past that, as far behind
-    /// the audio as the video had been away; its audio joined it there, and
-    /// was dropped as behind what had been sent until the source had run
-    /// that far again. Audio coming back first was placed beside the
-    /// silence, as it still is.
+    /// A picture coming back on another clock after the video was taken for
+    /// gone — the audio ran on past it alone (a switch to an audio-only
+    /// backup, a video PID that stopped), and silence may have followed —
+    /// opens an offset where the audio is now, in the relation the picture
+    /// last had to it ([`CmafTimeline::continue_at`]), and its audio joins
+    /// it beside the audio already sent. Continued from its old picture, a
+    /// picture coming back ahead of its audio went one frame past that, as
+    /// far behind the audio as the video had been away; its audio joined it
+    /// there, and was dropped as behind what had been sent until the source
+    /// had run that far again. Audio coming back first was placed beside
+    /// the silence, as it still is; and a picture the timeline places — on
+    /// the clock it left, or the old picture the demuxer hands out beside
+    /// the first after a stall — at its own time.
     fn video(&mut self, pts: u64, dts: Option<u64>, pts_known: bool) -> Option<PictureTime> {
         if !pts_known {
             return self.last_picture;
@@ -977,7 +978,7 @@ impl FlvTimeline {
         if self.live_picture().is_none()
             && let Some(audio) = self.newest_audio
         {
-            self.source.resume_from(Track::Video, audio.saturating_add(self.picture_lead) & MASK_33);
+            self.source.continue_at(Track::Video, audio.saturating_add(self.picture_lead) & MASK_33);
         }
         let offset = dts.map_or(0, |d| super::cmaf::composition_offset_90k(pts, d));
         let decoded = self.map(Track::Video, pts.wrapping_sub(offset) & MASK_33);
@@ -4154,6 +4155,83 @@ mod flv_timestamp_tests {
         assert_eq!(ts(16 * 90_000), 16_000, "a 9 s pause kept");
         assert_eq!(ts(27 * 90_000), 16_033, "an 11 s step continued 3 003 ticks on");
         assert_eq!(ts(28 * 90_000), 17_033, "and the source's timing after it");
+    }
+
+    /// `(handed out at, picture, decode time)` in hand-out order, a picture
+    /// first at a tie, as the demuxer hands them out: a picture when the
+    /// next picture's PES begins (at its decode time), an AAC frame on
+    /// arrival, `ahead(pts)` before its own time.
+    fn hand_out(dts: &[u64], audio: impl Iterator<Item = u64>, ahead: impl Fn(u64) -> i64) -> Vec<(i64, bool, u64)> {
+        let mut ev: Vec<(i64, bool, u64)> = dts.windows(2).map(|w| (w[1] as i64, true, w[0])).collect();
+        ev.extend(audio.map(|a| (a as i64 - ahead(a), false, a)));
+        ev.sort_by_key(|&(at, picture, _)| (at, !picture));
+        ev
+    }
+
+    /// An A/V source with a picture every 2 s or 2.5 s, its AAC running on
+    /// beside it: each picture handed out when the next one's PES begins,
+    /// with the audio up to there already mapped, so the audio has run over
+    /// 3 s past the picture before it — the video taken for gone. Each
+    /// picture still goes out at its own time, as a pause of the video's
+    /// the audio ran through. Moving the video's line on to where the audio
+    /// was put every other picture on an offset of its own, 2 s late, a
+    /// millisecond before the next.
+    #[test]
+    fn slow_pictures_beside_running_audio_keep_their_own_time() {
+        for interval in [180_000, 225_000] {
+            let mut tl = FlvTimeline::new("o");
+            let dts: Vec<u64> = (0..12).map(|k| T0 + k * interval).collect();
+            for (_, picture, t) in hand_out(&dts, (0..11 * interval).step_by(1_920).map(|a| T0 + a), |_| 0) {
+                if picture {
+                    let p = tl.video(t, None, true).unwrap();
+                    assert_eq!((p.pts, p.dts), (LAP_90K + t, LAP_90K + t), "{interval}: the picture at {t}");
+                } else {
+                    assert_eq!(tl.audio(t), LAP_90K + t, "{interval}: the audio at {t}");
+                }
+            }
+            assert_eq!(tl.jumps, 0, "{interval}: the source never jumped");
+        }
+    }
+
+    /// A 25 fps source decoding 80 ms before it presents whose video PID
+    /// stops for 4 s or 12 s on its own clock while its AAC runs on, muxed
+    /// at its own time, 300 ms or 1.1 s ahead of the pictures, or 1.1 s
+    /// behind them before the stall and at its own time after it. The
+    /// demuxer hands the last picture before the stall out only beside the
+    /// first after it; both, and every picture after, go out at their own
+    /// time. Moving the video's line on to where the audio was took that
+    /// old picture for a jump: an offset of its own, presented after
+    /// returning pictures squashed a millisecond apart behind it — and with
+    /// the audio over a second off the pictures, the video late for good.
+    #[test]
+    fn a_video_stall_beside_running_audio_keeps_every_picture_at_its_own_time() {
+        const STALL: u64 = T0 + 100 * STEP_25FPS;
+        for stall in [4 * 90_000, 12 * 90_000] {
+            for (what, ahead) in [
+                ("own time", (|_| 0) as fn(u64) -> i64),
+                ("300 ms ahead", |_| 27_000),
+                ("1.1 s ahead", |_| 99_000),
+                ("1.1 s behind, then own time", |a| if a < STALL { -99_000 } else { 0 }),
+            ] {
+                let what = format!("{} s stall, audio {what}", stall / 90_000);
+                let mut tl = FlvTimeline::new("o");
+                let dts: Vec<u64> = (0..300)
+                    .map(|k| T0 + k * STEP_25FPS)
+                    .filter(|&d| !(STALL..STALL + stall).contains(&d))
+                    .collect();
+                let audio = (0..300 * STEP_25FPS).step_by(1_920).map(|a| T0 + a);
+                for (_, picture, t) in hand_out(&dts, audio, ahead) {
+                    if picture {
+                        let p = tl.video(t + 7_200, Some(t), true).unwrap();
+                        let want = (LAP_90K + t + 7_200, LAP_90K + t);
+                        assert_eq!((p.pts, p.dts), want, "{what}: the picture decoding at {t}");
+                    } else {
+                        assert_eq!(tl.audio(t), LAP_90K + t, "{what}: the audio at {t}");
+                    }
+                }
+                assert_eq!(tl.jumps, 0, "{what}: the source never jumped");
+            }
+        }
     }
 
     /// A source stamping only its I pictures (every 12th): each picture
