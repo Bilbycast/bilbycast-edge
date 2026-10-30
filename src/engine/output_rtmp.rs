@@ -25,7 +25,7 @@ use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderPa
 use super::audio_silence::SilenceGenerator;
 use super::cmaf::codecs::{push_avcc_record, push_hvcc_record};
 use super::cmaf::fmp4::VideoCodec as CmafVideoCodec;
-use super::cmaf::nalu::{H265_NAL_VPS, h265_nal_type, to_length_prefixed};
+use super::cmaf::nalu::{H265_NAL_VPS, h264_is_sei_recovery_point, h265_nal_type, to_length_prefixed};
 use super::cmaf::param_sets::{ParamSetCollector, ParamSets};
 use super::packet::RtpPacket;
 use super::rtmp::client::{RtmpClient, RtmpConnectError, RtmpFailureKind};
@@ -469,6 +469,13 @@ async fn publish_loop(
                 // demuxer started surfacing it, and the tags went out in
                 // presentation order (edge#205).
                 DemuxedFrame::H264 { nalus, pts, is_keyframe, pts_known, dts } => {
+                    // A receiver can start decoding at an IDR — the demuxer's
+                    // flag — or, on an IDR-less open-GOP source, at an intra
+                    // picture a recovery-point SEI marks (edge#211). Judged
+                    // once per access unit, here, so every use of the flag on
+                    // this connection — the FLV frame type, the parameter-set
+                    // table's random-access rule, the header re-send — agrees.
+                    let is_keyframe = is_keyframe || h264_is_sei_recovery_point(&nalus);
                     let (ts_ms, cts_ms) = flv_video_time(pts, dts, &mut base_pts);
                     if process_video_frame(
                         VideoFrameSource::H264 { nalus: &nalus, is_keyframe, pts_known },
@@ -1120,6 +1127,8 @@ fn nalus_to_annex_b(nalus: &[Vec<u8>]) -> Vec<u8> {
 
 /// Borrowed view of the source NAL units for one access unit.
 enum VideoFrameSource<'a> {
+    /// `is_keyframe`: the demuxer's IDR flag, widened in `publish_loop` to an
+    /// intra picture with a recovery-point SEI (edge#211).
     H264 { nalus: &'a [Vec<u8>], is_keyframe: bool, pts_known: bool },
     H265 { nalus: &'a [Vec<u8>], is_keyframe: bool, pts_known: bool },
     /// An MPEG-2 video access unit (the ES as the PES carried it): RTMP
@@ -1130,6 +1139,11 @@ enum VideoFrameSource<'a> {
 }
 
 impl<'a> VideoFrameSource<'a> {
+    /// Whether a receiver can start decoding at this access unit: what the FLV
+    /// frame type says and where passthrough re-sends the sequence header. For
+    /// H.264 that includes recovery points (see `publish_loop`); read once per
+    /// access unit, by `passthrough_video`. The re-encode takes keys from its
+    /// encoder.
     fn is_keyframe(&self) -> bool {
         match self {
             VideoFrameSource::H264 { is_keyframe, .. }
@@ -1582,7 +1596,8 @@ async fn passthrough_video(
     stats: &Arc<OutputStatsAccumulator>,
 ) -> anyhow::Result<bool> {
     // One flag drives the FLV frame type, the table's random-access rule and
-    // the key-picture re-send.
+    // the key-picture re-send: the demuxer's, which for H.264 `publish_loop`
+    // has widened to recovery points.
     let is_keyframe = src.is_keyframe();
     let (codec, nalus) = match src {
         // Not carried without `video_encode` (the loop says so once).
@@ -1608,17 +1623,24 @@ async fn passthrough_video(
     if codec == CmafVideoCodec::H265 && !nalus.iter().any(|n| h265_nal_type(n) < H265_NAL_VPS) {
         return Ok(true);
     }
-    // The first header does not wait for a key picture. Real-world broadcast
-    // streams often use open-GOP / recovery-point SEI signalling instead of a
-    // true IDR (NAL type 5), so waiting for `is_keyframe` would never fire and
-    // video would never start. Receivers gracefully handle the first picture
-    // being non-IDR — they treat it as "wait for the next IDR" — but the
-    // sequence header is what they need to initialise the decoder. A picture
-    // nothing describes yet is dropped.
+    // The first sequence header goes out ahead of the first picture whose
+    // parameter sets are in the table, not on the first keyframe: a source
+    // that marks random access in neither way `is_keyframe` reads — an
+    // intra-refresh encoder, or an open GOP whose recovery-point SEIs were
+    // stripped upstream — would otherwise never start video. A receiver given
+    // a non-key first picture waits for the next key; the header is what it
+    // needs to open its decoder. A picture nothing describes yet is dropped.
     let Some((header, copies)) = passthrough.take_headers(codec, is_keyframe) else {
         passthrough.hold(codec, &config.id);
         return Ok(true);
     };
+    // The header is re-sent at each random-access point — an IDR or IRAP, or
+    // an H.264 intra picture a recovery-point SEI marks (edge#211) — where a
+    // receiver joins, cuts or opens a GOP-cache entry. On an open GOP the
+    // leading pictures after it still reference the previous GOP; a receiver
+    // that re-opened its decoder on every header would lose them, but ffmpeg
+    // keeps an identical SPS (its decoded output is unchanged by the re-send),
+    // and HEVC CRA has had the same re-send all along.
     for _ in 0..copies {
         client.send_video(header, ts_ms).await?;
     }
@@ -3985,6 +4007,181 @@ pub(super) mod flv_wire_tests {
                 0xDA, 0x01, 0x00, 0x04, 0x68, 0xCE, 0x3C, 0x80,
             ],
         );
+    }
+
+    // ── edge#211: H.264 recovery points ──────────────────────────────────
+
+    /// The SEIs of broadcast-spts-h264-1080p25-ac3.ts: buffering_period,
+    /// recovery_point and pic_timing at a random-access point; pic_timing
+    /// alone elsewhere.
+    const H264_SEI_RP: [u8; 11] = [0x06, 0x00, 0x01, 0xC0, 0x06, 0x01, 0x84, 0x01, 0x01, 0x32, 0x80];
+    const H264_SEI_PT: [u8; 5] = [0x06, 0x01, 0x01, 0x32, 0x80];
+
+    /// What an H.264 test picture is.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Pic {
+        /// [`h264_au`]'s key picture: SPS, PPS, IDR.
+        Idr,
+        /// An open-GOP random-access point as the DVB sources send it: SPS,
+        /// PPS, a recovery-point SEI, a non-IDR I picture.
+        RecoveryPoint,
+        /// The same with a P field after it in the same PES.
+        RecoveryPointFieldPair,
+        /// A non-IDR I picture with SPS / PPS and no recovery point.
+        Intra,
+        /// [`h264_au`]'s P picture.
+        Inter,
+        /// A P picture repeating SPS and PPS.
+        InterWithSets,
+        /// A recovery-point SEI on a P picture: gradual decoding refresh.
+        GdrP,
+    }
+
+    impl Pic {
+        /// Whether a muxer marks it random access (RAI, PSI ahead of it), as
+        /// the capture's did.
+        fn keyed(self) -> bool {
+            matches!(self, Pic::Idr | Pic::RecoveryPoint | Pic::RecoveryPointFieldPair)
+        }
+    }
+
+    /// Picture `k` of kind `p`, Annex B.
+    fn h264_pic(p: Pic, k: u8) -> Vec<u8> {
+        let i_slice = [0x41, 0x88, 0x84, k + 1]; // slice_type 7
+        let p_field = [0x41, 0x9A, 0x22, k + 2]; // slice_type 5
+        match p {
+            Pic::Idr => h264_au(true, k),
+            Pic::Inter => h264_au(false, k),
+            Pic::RecoveryPoint => annex_b(&[&H264_AUD, &H264_SPS, &H264_PPS0, &H264_SEI_RP, &i_slice]),
+            Pic::RecoveryPointFieldPair => annex_b(&[
+                &H264_AUD,
+                &H264_SPS,
+                &H264_PPS0,
+                &H264_SEI_RP,
+                &i_slice,
+                &H264_AUD,
+                &H264_SEI_PT,
+                &p_field,
+            ]),
+            Pic::Intra => annex_b(&[&H264_AUD, &H264_SPS, &H264_PPS0, &H264_SEI_PT, &i_slice]),
+            Pic::InterWithSets => annex_b(&[&H264_AUD, &H264_SPS, &H264_PPS0, &h264_slice(k)]),
+            Pic::GdrP => annex_b(&[&H264_AUD, &H264_SEI_RP, &h264_slice(k)]),
+        }
+    }
+
+    /// [`video_ts`] for H.264 pictures of the kinds `kind(k)` gives, the
+    /// muxer marking the keyed ones random access; `kind(0)` must be one, so
+    /// PSI precedes the first picture. It ends with a closing `Inter`
+    /// picture, since the demuxer releases a PES only at the next one.
+    fn h264_pics_ts(mux: &mut TsMuxer, pics: &[(u64, Option<u64>)], kind: impl Fn(usize) -> Pic) -> Vec<Bytes> {
+        assert!(kind(0).keyed(), "PSI ahead of the first picture");
+        let keys: Vec<usize> = (0..pics.len()).filter(|&k| kind(k).keyed()).collect();
+        let au = |_: bool, k: usize| h264_pic(if k < pics.len() { kind(k) } else { Pic::Inter }, k as u8);
+        video_ts_with(mux, false, pics, &keys, &au)
+    }
+
+    /// Byte 0 of each picture's tag: 0x17 keyed, 0x27 not.
+    fn picture_frame_types(tags: &[WireTag]) -> Vec<u8> {
+        tags.iter().filter(|t| t.video && tag_cts(&t.data).is_some()).map(|t| t.data[0]).collect()
+    }
+
+    /// The index, among the video tags, of each sequence header.
+    fn header_positions(tags: &[WireTag]) -> Vec<usize> {
+        let video: Vec<&WireTag> = tags.iter().filter(|t| t.video).collect();
+        (0..video.len()).filter(|&i| tag_cts(&video[i].data).is_none()).collect()
+    }
+
+    const KEYS_AT_0_AND_6: [u8; 12] = [0x17, 0x27, 0x27, 0x27, 0x27, 0x27, 0x17, 0x27, 0x27, 0x27, 0x27, 0x27];
+
+    /// edge#211, the reported failure: an IDR-less open-GOP source marks
+    /// random access with an intra picture behind a recovery-point SEI. Every
+    /// tag went out an inter frame and the sequence header was sent once. Such
+    /// a picture is now keyed and the header re-sent ahead of it, as at an IDR
+    /// — on a source with no IDR at all, one mixing IDRs among its recovery
+    /// points, and one whose recovery point is an I / P field pair in one PES.
+    /// Pictures 7 and 8 are picture 6's open-GOP leading pictures; the
+    /// edge#205 timing is unchanged.
+    #[tokio::test]
+    async fn an_h264_recovery_point_is_keyed_like_an_idr() {
+        let pics = ibbp(12, |k| T0 + k * F);
+        let base = pics[0].1.unwrap_or(pics[0].0);
+        for (case, first, sixth) in [
+            ("no IDR", Pic::RecoveryPoint, Pic::RecoveryPoint),
+            ("an IDR first", Pic::Idr, Pic::RecoveryPoint),
+            ("a field pair", Pic::RecoveryPoint, Pic::RecoveryPointFieldPair),
+        ] {
+            let kind = |k: usize| match k {
+                0 => first,
+                6 => sixth,
+                _ => Pic::Inter,
+            };
+            let tags = publish(h264_pics_ts(&mut TsMuxer::new(), &pics, kind), passthrough_output()).await;
+            assert_wire_decode_order(&tags, &pics, base, false);
+            assert_eq!(picture_frame_types(&tags), KEYS_AT_0_AND_6, "{case}");
+            assert_eq!(header_positions(&tags), [0, 1, 8], "{case}: a header, then a re-send on each key");
+            let headers = headers(&tags);
+            assert!(headers.iter().all(|h| h.data == headers[0].data), "{case}: one header, re-sent");
+        }
+    }
+
+    /// What the rule leaves out: an access unit carrying SPS / PPS, an intra
+    /// picture with no recovery point, and a recovery point on a P picture
+    /// (gradual decoding refresh) are not keyed and re-send no header. If GDR
+    /// keying is adopted later, picture 6's expectation changes deliberately.
+    #[tokio::test]
+    async fn parameter_sets_an_intra_picture_or_a_gdr_point_alone_do_not_make_a_keyframe() {
+        let pics = ibbp(12, |k| T0 + k * F);
+        let kind = |k: usize| match k {
+            0 => Pic::RecoveryPoint,
+            3 | 9 => Pic::Intra,
+            6 => Pic::GdrP,
+            _ => Pic::InterWithSets,
+        };
+        let tags = publish(h264_pics_ts(&mut TsMuxer::new(), &pics, kind), passthrough_output()).await;
+        let mut want = [0x27; 12];
+        want[0] = 0x17;
+        assert_eq!(picture_frame_types(&tags), want);
+        assert_eq!(header_positions(&tags), [0, 1]);
+        assert_wire_decode_order(&tags, &pics, pics[0].1.unwrap_or(pics[0].0), false);
+    }
+
+    /// A source with no recovery points — IDRs, an intra picture without the
+    /// SEI, a P picture repeating its sets — goes out as it did before: the
+    /// keyframe flag is the demuxer's IDR flag. Pinned literally and against
+    /// a recomputation of every video tag (the first header taken from the
+    /// wire, so the test does not depend on the avcC bytes); the byte-identity
+    /// evidence for clean sources is the edge#205 wire tests passing
+    /// unchanged.
+    #[tokio::test]
+    async fn an_idr_source_reaches_flv_byte_for_byte_as_before() {
+        let pics = ibbp(12, |k| T0 + k * F);
+        let kind = |k: usize| match k {
+            0 | 6 => Pic::Idr,
+            3 => Pic::Intra,
+            9 => Pic::InterWithSets,
+            _ => Pic::Inter,
+        };
+        let tags = publish(h264_pics_ts(&mut TsMuxer::new(), &pics, kind), passthrough_output()).await;
+        assert_eq!(picture_frame_types(&tags), KEYS_AT_0_AND_6);
+        assert_eq!(header_positions(&tags), [0, 1, 8]);
+
+        let header = headers(&tags)[0].data.to_vec();
+        let mut base = None;
+        let mut want = Vec::new();
+        for (k, &(pts, dts)) in pics.iter().enumerate() {
+            let (ts, cts) = flv_video_time(pts, dts, &mut base);
+            let nalus = crate::engine::ts_demux::split_annex_b_nalus(&h264_pic(kind(k), k as u8));
+            let idr = kind(k) == Pic::Idr;
+            if k == 0 {
+                want.push((ts, header.clone()));
+            }
+            if idr {
+                want.push((ts, header.clone()));
+            }
+            want.push((ts, build_avc_nalu_tag(&nalus, idr, cts)));
+        }
+        let got: Vec<(u32, Vec<u8>)> = tags.iter().filter(|t| t.video).map(|t| (t.ts, t.data.to_vec())).collect();
+        assert_eq!(got, want);
     }
 }
 

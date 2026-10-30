@@ -203,8 +203,9 @@ pub fn parse_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
 /// SPS to the resolution fields.
 ///
 /// Also reused by the HEVC SPS parser in `fmp4.rs` for the track's
-/// dimensions, by the `hvcC` header reader below, and by `param_sets` to read
-/// each parameter set's id.
+/// dimensions, by the `hvcC` header reader below, by `param_sets` to read
+/// each parameter set's id, and by `nalu` to read slice headers and SEI
+/// messages.
 pub(super) struct BitReader<'a> {
     data: &'a [u8],
     /// Index of the next raw (pre-EPB-stripping) byte in `data`.
@@ -276,6 +277,20 @@ impl<'a> BitReader<'a> {
     pub(super) fn skip_bits(&mut self, n: u32) -> Option<()> {
         for _ in 0..n {
             let _ = self.bit()?;
+        }
+        Some(())
+    }
+
+    /// Skip `n` whole RBSP bytes — emulation-prevention bytes not counted, as
+    /// an SEI's payloadSize does not count them — a byte at a time where
+    /// `skip_bits` goes a bit at a time. `None` off a byte boundary or when
+    /// the data ends first.
+    pub(super) fn skip_bytes(&mut self, n: usize) -> Option<()> {
+        if self.bit_pos != 0 {
+            return None;
+        }
+        for _ in 0..n {
+            self.read_raw_byte()?;
         }
         Some(())
     }
@@ -1582,5 +1597,21 @@ mod tests {
         // not guaranteed to decode to a specific resolution. Just check that
         // parsing doesn't panic and returns Some(_).
         let _ = parse_sps_resolution(&baseline_sps);
+    }
+
+    /// `skip_bytes` counts RBSP bytes: the 03 of `00 00 03` is not one of
+    /// them. It refuses to start off a byte boundary, and to run off the end.
+    #[test]
+    fn skip_bytes_counts_rbsp_bytes() {
+        let data = [0x00, 0x00, 0x03, 0x01, 0xAB];
+        let mut r = BitReader::new(&data);
+        assert_eq!(r.skip_bytes(3), Some(()));
+        assert_eq!(r.read_bits(8), Some(0xAB));
+        assert_eq!(r.skip_bytes(0), Some(()), "nothing left to skip");
+        assert_eq!(r.skip_bytes(1), None, "past the end");
+
+        let mut r = BitReader::new(&data[3..]);
+        r.bit().unwrap();
+        assert_eq!(r.skip_bytes(1), None, "off a byte boundary");
     }
 }

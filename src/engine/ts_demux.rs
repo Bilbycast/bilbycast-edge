@@ -111,7 +111,8 @@ pub enum DemuxedFrame {
         /// Presentation timestamp in 90 kHz clock ticks — 0 when the PES
         /// carried none (see `pts_known`).
         pts: u64,
-        /// Whether this is a keyframe (IDR_W_RADL, IDR_N_LP, or CRA_NUT).
+        /// Whether this is a keyframe: any IRAP — BLA (16-18), IDR_W_RADL,
+        /// IDR_N_LP, or CRA_NUT.
         is_keyframe: bool,
         /// Whether the PES carried a PTS (see `H264::pts_known`).
         pts_known: bool,

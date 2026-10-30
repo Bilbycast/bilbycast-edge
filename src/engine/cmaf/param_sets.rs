@@ -168,8 +168,10 @@ pub struct ParamSetCollector {
 }
 
 impl ParamSetCollector {
-    /// Take in one access unit. `is_rap` is the demuxer's keyframe flag: an
-    /// IDR for H.264, any IRAP for HEVC.
+    /// Take in one access unit. `is_rap` is the access unit's random-access
+    /// flag: the demuxer's keyframe flag (an IDR for H.264, any IRAP for
+    /// HEVC), which on RTMP passthrough also includes H.264 recovery points
+    /// (`nalu::h264_is_sei_recovery_point`, edge#211).
     ///
     /// On an access unit that carries no parameter set — almost all of them —
     /// this is one length check and one header byte per NAL.
