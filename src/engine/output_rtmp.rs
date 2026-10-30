@@ -23,7 +23,7 @@ use crate::stats::collector::OutputStatsAccumulator;
 use super::audio_au::adts_access_unit;
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 use super::audio_encode::{
-    AudioCodec, AudioEncoder, AudioEncoderError, EncoderInputClock, EncoderParams, Placement,
+    AudioCodec, AudioEncoder, AudioEncoderError, EncodedFrame, EncoderInputClock, EncoderParams, Placement,
 };
 use super::audio_silence::SilenceGenerator;
 use super::cmaf::codecs::{push_avcc_record, push_hvcc_record};
@@ -1276,24 +1276,7 @@ async fn send_encoded_audio(
     // The encoder's stamps are already on the timeline: it was anchored on
     // mapped times.
     for frame in encoder.drain() {
-        // fdk may hand back an empty frame while it primes: nothing to send.
-        if frame.data.is_empty() {
-            continue;
-        }
-        let Some((au, (profile, sr_idx, ch_cfg))) = adts_access_unit(&frame.data) else {
-            // Every encoder here writes one ADTS frame a frame; one that is
-            // not has no access unit FLV can carry. A property of the
-            // build's encoder, so said once.
-            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::warn!(
-                    "RTMP output '{}': an encoded AAC frame is not one whole ADTS frame, dropped",
-                    timeline.output_id
-                );
-            }
-            continue;
-        };
-        let Some(ts_ms) = timeline.audio_tag_ms(frame.pts) else {
+        let Some((ts_ms, au, (profile, sr_idx, ch_cfg))) = encoded_aac_tag(&frame, timeline) else {
             continue;
         };
         if !*sent_audio_header {
@@ -1311,6 +1294,34 @@ async fn send_encoded_audio(
         }
     }
     Ok(())
+}
+
+/// What [`send_encoded_audio`] sends of one encoded frame: its FLV ms on the
+/// connection's timeline, the raw access unit its ADTS frame carries
+/// ([`adts_access_unit`]) and the `(profile, sampling-frequency index,
+/// channel configuration)` that ADTS header names — or `None` to send
+/// nothing. A frame FLV cannot carry is turned away before the timeline sees
+/// it: past [`FlvTimeline::audio_tag_ms`] it would take the place of the frame
+/// after it, which would then go as at or behind one already sent.
+fn encoded_aac_tag<'a>(frame: &'a EncodedFrame, timeline: &mut FlvTimeline) -> Option<(u32, &'a [u8], (u8, u8, u8))> {
+    // fdk may hand back an empty frame while it primes: nothing to send.
+    if frame.data.is_empty() {
+        return None;
+    }
+    let Some((au, asc)) = adts_access_unit(&frame.data) else {
+        // Every encoder here writes one ADTS frame a frame; one that is not
+        // has no access unit FLV can carry. A property of the build's
+        // encoder, so said once.
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "RTMP output '{}': an encoded AAC frame is not one whole ADTS frame, dropped",
+                timeline.output_id
+            );
+        }
+        return None;
+    };
+    Some((timeline.audio_tag_ms(frame.pts)?, au, asc))
 }
 
 /// FLV timing of one passed-through H.264 / HEVC picture: `(tag timestamp,
@@ -4554,10 +4565,38 @@ mod flv_timestamp_tests {
     }
 
     /// The stamps of what `encoder` has encoded that the timeline sends
-    /// (`send_encoded_audio` without the client).
+    /// (`send_encoded_audio` without the client: its [`encoded_aac_tag`]).
     #[cfg(feature = "fdk-aac")]
     fn sent(encoder: &mut AudioEncoder, tl: &mut FlvTimeline) -> Vec<u64> {
-        encoder.drain().into_iter().filter(|f| tl.audio_tag_ms(f.pts).is_some()).map(|f| f.pts).collect()
+        encoder.drain().into_iter().filter(|f| encoded_aac_tag(f, tl).is_some()).map(|f| f.pts).collect()
+    }
+
+    /// edge#210: what an encoder hands back that FLV cannot carry — an empty
+    /// frame (fdk priming), a bare ADTS header, a raw access unit with no
+    /// header — sends nothing and takes no place on the timeline, so the
+    /// whole frame at the same time still goes, stamped as on a timeline that
+    /// never saw them. Turned away after `audio_tag_ms`, the first of them
+    /// took that place and the frame was dropped as at or behind it.
+    #[test]
+    fn a_frame_flv_cannot_carry_takes_no_place_on_the_timeline() {
+        let whole = super::flv_wire_tests::adts_frames()[0];
+        const P0: u64 = 900_000;
+        // The encoder stamps on the timeline: a frame 1 920 ticks past the
+        // picture as the timeline placed it.
+        let mut tl = FlvTimeline::new("o");
+        let at = tl.video(P0, None, true).expect("a picture").pts + 1_920;
+        let frame = |data: &[u8]| EncodedFrame { data: bytes::Bytes::copy_from_slice(data), pts: at };
+        for junk in [&[][..], &whole[..7], &whole[7..]] {
+            assert!(encoded_aac_tag(&frame(junk), &mut tl).is_none(), "{} bytes sent", junk.len());
+        }
+        let mut clean = FlvTimeline::new("o");
+        clean.video(P0, None, true);
+        let want = clean.audio_tag_ms(at).expect("a frame after the picture goes");
+        assert!(want > 0);
+        let real = frame(whole);
+        let (ts_ms, au, asc) = encoded_aac_tag(&real, &mut tl).expect("the whole frame goes");
+        assert_eq!((ts_ms, au, asc), (want, &whole[7..], (1, 3, 2)), "at its time, less its header");
+        assert!(encoded_aac_tag(&real, &mut tl).is_none(), "a second at that time is at or behind it");
     }
 
     /// A video-only source (the case `silent_fallback` exists for) whose PTS
@@ -6480,6 +6519,50 @@ pub(super) mod flv_wire_tests {
         }
     }
 
+    /// An HE-AAC v2 source re-encoded to AAC-LC: the header names what the
+    /// re-encode carries, 48 kHz stereo LC, not the source's 24 kHz mono
+    /// core (its cached ADTS config, which passthrough announces). One
+    /// source frame (2 048 samples, 3 840 ticks) a PES; `bitrate_kbps` keeps
+    /// it off the same-codec fast path.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn an_he_aac_source_re_encoded_to_aac_lc_announces_lc_not_its_core() {
+        let adts = crate::engine::ts_test_fixtures::he_aac_adts(true);
+        let mut frames = Vec::new();
+        let mut off = 0;
+        while off + 7 <= adts.len() {
+            let len = (usize::from(adts[off + 3] & 0x03) << 11)
+                | (usize::from(adts[off + 4]) << 3)
+                | (usize::from(adts[off + 5]) >> 5);
+            frames.push(&adts[off..off + len]);
+            off += len;
+        }
+        assert!(frames.len() >= 20, "{} HE-AAC frames", frames.len());
+        let pics = ibbp(LAP_PICTURES, |k| T0 + k * F);
+        let mut mux = TsMuxer::new();
+        mux.set_has_audio(true);
+        let mut ts = Vec::new();
+        let mut next = frames.iter().enumerate().map(|(j, f)| (T0 + 3 * F + j as u64 * 3_840, *f)).peekable();
+        for (k, &(pts, dts)) in pics.iter().enumerate() {
+            let decode = dts.unwrap_or(pts);
+            while let Some((at, f)) = next.next_if(|&(at, _)| at <= decode) {
+                ts.extend(mux.mux_audio_pre_adts(f, at));
+            }
+            ts.extend(mux.mux_video(&h264(k == 0, k), pts, decode, k == 0));
+        }
+        for (at, f) in next {
+            ts.extend(mux.mux_audio_pre_adts(f, at));
+        }
+        let end = pics.iter().map(|p| p.0).max().unwrap() + F;
+        ts.extend(mux.mux_video(&h264(false, 0), end, end, false));
+        let output = serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 128 }
+        });
+        let n = assert_raw_aac(&publish(ts, output).await, (2, 3, 2), 1_024);
+        assert!(n >= 30, "{n} AAC frames");
+    }
+
     /// The same for an MP2 source, the `OtherAudio` arm's re-encode: four
     /// MP2 frames a PES, 8 640 ticks apart.
     #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
@@ -6670,9 +6753,10 @@ pub(crate) mod tests {
     /// No FLV AAC sequence header goes out while the re-encoder waits for a
     /// frame that decodes: it would announce the ADTS header's format —
     /// for HE-AAC the 24 kHz / mono core — not the 48 kHz stereo the
-    /// re-encode then carries. Passthrough announces the source's; a
-    /// re-encode, none here: its header comes from its encoder's first
-    /// frame.
+    /// re-encode then carries. Passthrough announces the source's. A
+    /// re-encode's header comes from its encoder's first frame, which
+    /// `flv_wire_tests::an_he_aac_source_re_encoded_to_aac_lc_announces_lc_not_its_core`
+    /// pins.
     #[cfg(feature = "fdk-aac")]
     #[test]
     fn the_aac_sequence_header_waits_for_the_resolved_format() {
@@ -6688,15 +6772,12 @@ pub(crate) mod tests {
             &crate::engine::ts_test_fixtures::he_aac_adts(true),
         );
         let mut demux = TsDemuxer::new(None);
-        let first = first_aac_frame(&mut demux, &ts);
+        demux.demux(&ts);
         let (events, _rx) = crate::manager::events::event_channel();
         let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
         let lazy = build_encoder_state(&cfg, &demux, Some(&[]), true, &CancellationToken::new(), &stats, "f", &events);
         assert!(matches!(lazy, EncoderState::Lazy), "a frame that does not decode leaves it waiting");
         assert_eq!(aac_sequence_header_format(&lazy, he_aac_v2), None);
-        let active = build_encoder_state(&cfg, &demux, Some(&first), true, &CancellationToken::new(), &stats, "f", &events);
-        assert!(matches!(active, EncoderState::Active { .. }), "a frame that decodes builds the re-encoder");
-        assert_eq!(aac_sequence_header_format(&active, he_aac_v2), None, "the encoder's first frame says");
     }
 
     /// A silent-fallback encoder, built before any source audio, is sized
