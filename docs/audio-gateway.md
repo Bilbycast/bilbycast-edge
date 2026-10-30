@@ -882,7 +882,7 @@ affected codecs fall back to an ffmpeg subprocess. Outputs without
 
 | Output | Allowed `codec` | Default | Notes |
 |---|---|---|---|
-| `rtmp` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | FLV only carries AAC. With the default `fdk-aac` feature, all AAC profiles are encoded in-process. Without it, HE-AAC v2 requires an ffmpeg build with `libfdk_aac`. |
+| `rtmp` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | FLV only carries AAC. With the default `fdk-aac` feature, all AAC profiles are encoded in-process. Without it, HE-AAC v2 requires an ffmpeg build with `libfdk_aac`. Each tag carries the raw access unit, the encoder's ADTS header removed, and the sequence header names the format that header does — for HE-AAC its core (24 kHz, v2's mono), SBR / PS signalled implicitly (edge#210: the header went inside every tag, and the HE-AAC sequence header named the output rate). |
 | `hls` | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | HLS-TS supports MP2 (stream type 0x04) and AC-3 (private_stream_1) so long as the consumer's player does. |
 | `webrtc` | `opus` | `opus` | WebRTC realistically only does Opus. Validation also rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). |
 | `srt`, `udp`, `rtp`, `rist` (TS) | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | `opus` is rejected — MPEG-TS has no standard Opus mapping. Incompatible with `transport_mode: "audio_302m"`, SMPTE 2022-7 redundancy, and SMPTE 2022-1 / SRT FEC (validation rejects at load time). |

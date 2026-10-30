@@ -152,6 +152,25 @@ fn adts_header(buf: &[u8]) -> Head {
     })
 }
 
+/// One whole ADTS frame of one raw data block, as every AAC encoder here
+/// writes it (fdk-aac `TransportType::Adts`, the subprocess `-f adts`): the
+/// raw access unit it carries — the header (7 bytes, 9 with its CRC) taken
+/// off as the demuxer takes a passed-through frame's — and the `(profile,
+/// sample_rate_index, channel_config)` the header names. `None` for anything
+/// else (a frame cut short or run on into the next, several raw data
+/// blocks), which a raw-AAC container (FLV AACPacketType 1) cannot carry as
+/// one access unit.
+pub(crate) fn adts_access_unit(frame: &[u8]) -> Option<(&[u8], (u8, u8, u8))> {
+    let Head::Valid(h) = adts_header(frame) else {
+        return None;
+    };
+    if h.len != frame.len() || h.samples != 1024 {
+        return None;
+    }
+    let header_len = if frame[1] & 0x01 != 0 { 7 } else { 9 };
+    Some((&frame[header_len..], ((h.key >> 8) as u8, (h.key >> 4) as u8 & 0x0F, h.key as u8 & 0x07)))
+}
+
 /// LOAS AudioSyncStream (ISO/IEC 14496-3 §1.7.3): 11-bit sync `0x2B7`,
 /// 13-bit length of the AudioMuxElement that follows.
 fn loas_header(buf: &[u8]) -> Head {
@@ -805,6 +824,69 @@ mod tests {
         assert!(matches!(parse_header(AuFormat::Ac3, &dep), Head::Valid(h) if h.len == 768 && h.samples == 0));
         let loas = [0x56, 0xE0 | 0x01, 0x00];
         assert!(matches!(parse_header(AuFormat::Loas, &loas), Head::Valid(h) if h.len == 3 + 256));
+    }
+
+    /// `frame` with its ADTS frame_length set to `len`.
+    fn with_frame_length(mut frame: Vec<u8>, len: usize) -> Vec<u8> {
+        frame[3] = (frame[3] & 0xFC) | ((len >> 11) as u8 & 0x03);
+        frame[4] = (len >> 3) as u8;
+        frame[5] = (frame[5] & 0x1F) | ((len as u8) << 5);
+        frame
+    }
+
+    /// An encoder's ADTS frame gives FLV its raw access unit and the
+    /// sequence header its format — one whole frame of one raw data block,
+    /// nothing else (edge#210).
+    #[test]
+    fn adts_access_unit_takes_one_whole_frame_and_reads_its_header() {
+        const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let first = match adts_header(ADTS) {
+            Head::Valid(h) => ADTS[..h.len].to_vec(),
+            other => panic!("the fixture opens on an ADTS frame: {other:?}"),
+        };
+        assert_eq!(first[1] & 0x01, 1, "no CRC");
+        let (au, cfg) = adts_access_unit(&first).expect("one whole frame");
+        assert_eq!(au, &first[7..]);
+        assert_eq!(cfg, (1, 3, 2), "AAC-LC, 48 kHz, stereo");
+
+        // With its CRC: protection_absent 0, two bytes after the header.
+        let mut crc = first[..7].to_vec();
+        crc[1] &= 0xFE;
+        crc.extend_from_slice(&[0xAB, 0xCD]);
+        crc.extend_from_slice(&first[7..]);
+        let crc = with_frame_length(crc, first.len() + 2);
+        let (au, cfg) = adts_access_unit(&crc).expect("one whole frame with its CRC");
+        assert_eq!(au, &first[7..], "the body after the 9-byte header");
+        assert_eq!(cfg, (1, 3, 2));
+
+        // Not one whole frame: two run together, one cut short, one run on.
+        assert_eq!(adts_access_unit(&[first.clone(), first.clone()].concat()), None, "two frames");
+        assert_eq!(adts_access_unit(&first[..first.len() - 1]), None, "cut short");
+        assert_eq!(adts_access_unit(&[&first[..], &[0][..]].concat()), None, "one byte on");
+
+        // Not ADTS, several raw data blocks, a reserved rate, no body.
+        let mut no_sync = first.clone();
+        no_sync[0] = 0xFE;
+        assert_eq!(adts_access_unit(&no_sync), None, "no sync");
+        let mut blocks = first.clone();
+        blocks[6] = (blocks[6] & 0xFC) | 0x01;
+        assert_eq!(adts_access_unit(&blocks), None, "two raw data blocks");
+        let mut reserved = first.clone();
+        reserved[2] = (reserved[2] & 0xC3) | (13 << 2);
+        assert_eq!(adts_access_unit(&reserved), None, "sampling-frequency index 13");
+        assert_eq!(adts_access_unit(&with_frame_length(first[..7].to_vec(), 7)), None, "a header alone");
+
+        // An HE-AAC v2 encoder's header names its core: LC, 24 kHz, mono.
+        #[cfg(feature = "fdk-aac")]
+        {
+            let he = crate::engine::ts_test_fixtures::he_aac_adts(true);
+            let Head::Valid(h) = adts_header(&he) else {
+                panic!("the HE-AAC fixture opens on an ADTS frame");
+            };
+            let (au, cfg) = adts_access_unit(&he[..h.len]).expect("one whole HE-AAC frame");
+            assert_eq!(au.len(), h.len - 7);
+            assert_eq!(cfg, (1, 6, 1));
+        }
     }
 
     /// The real Sky Sports Arena pattern: PES k's last AU (412 bytes) has
