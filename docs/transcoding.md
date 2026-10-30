@@ -476,8 +476,11 @@ clock, ahead of its audio, is put where the audio is, in the relation it
 last had to it, and its audio joins it there; it used to be continued
 one frame past its old picture, and the audio joining it was dropped as
 behind everything sent until the source had run as far again as the
-video had been away. A picture back on the clock it left goes out at its
-own time, as a pause of the video's that the audio ran through.
+video had been away. A picture back on the clock it left, from 10 s
+behind where the audio puts it to 3 s past, goes out at its own time, as
+a pause of the video's that the audio ran through — however many pictures
+the demuxer and any remuxer upstream held back, and on a slide feed with
+pictures up to about 8 s apart.
 RTMP's silence used to be one chunk a tick, wall-clock, and every tick
 observed late was lost for good.
 

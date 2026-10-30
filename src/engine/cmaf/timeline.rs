@@ -384,19 +384,20 @@ impl CmafTimeline {
         Self { lone_gap_90k, ..Self::default() }
     }
 
-    /// Continue `track`'s next timestamp at `ts` (90 kHz) when it is a jump
-    /// no rule places and `ts` is ahead of the track's newest, rather than
-    /// one step past that: for an output that knows where a track it took
-    /// for gone would be now — an RTMP connection whose picture comes back
-    /// on another clock after the audio ran on alone
-    /// (`output_rtmp::FlvTimeline::video`). Continued from its old picture,
-    /// such a return went as far behind the other track as it had been
-    /// away. A timestamp the rules place — the old picture handed out late,
-    /// a pause the other track ran through — is placed as ever: moving the
-    /// track's newest on to `ts` instead put the picture before a pause of
-    /// over 1.5 s on an offset of its own, 2 s late. For the next timestamp
-    /// only. CMAF's outputs, which share their offsets across the flow,
-    /// never call it.
+    /// `ts` (90 kHz) is where `track`, taken for gone, would be now: for an
+    /// output that knows — an RTMP connection whose picture comes back
+    /// after the audio ran on alone (`output_rtmp::FlvTimeline::video`).
+    /// The track's next timestamp landing forwards near there, on the
+    /// programme's offset, is a pause the other track ran through, kept as
+    /// a gap; one that is a jump no rule places is continued at `ts` when
+    /// that is ahead of the track's newest, rather than one step past it —
+    /// continued from its old picture, a return on another clock went as
+    /// far behind the other track as it had been away. A timestamp the
+    /// rules place otherwise — the old picture handed out late — is placed
+    /// as ever: moving the track's newest on to `ts` instead put the
+    /// picture before a pause of over 1.5 s on an offset of its own, 2 s
+    /// late. For the next timestamp only. CMAF's outputs, which share their
+    /// offsets across the flow, never call it.
     pub fn continue_at(&mut self, track: Track, ts: u64) {
         let line = match track {
             Track::Video => &mut self.video,
@@ -597,6 +598,24 @@ impl CmafTimeline {
                 && let Some(ts) = fits(o)
             {
                 break 'choose Some((o, ts));
+            }
+            // A track the output took for gone coming back forwards on the
+            // programme's offset where it says the track would be now
+            // (`continue_at`) — up to the lone gap behind there (a slow
+            // picture handed out an interval late), up to a cross window past
+            // (a hole in the other track meanwhile) — is back on the clock it
+            // left after a pause the other track ran through: a gap. Measured
+            // from the track's own last timestamps the other's run looks
+            // short when more than one was handed out late (every remuxer
+            // upstream holds a picture back), and the return was placed in
+            // doubt, one step past them, as far behind the audio as it had
+            // been away.
+            if own > OWN_WINDOW_90K
+                && on_programme
+                && continue_at
+                    .is_some_and(|c| (-(lone_gap as i64)..=CROSS_WINDOW_90K).contains(&circ(ts, c)))
+            {
+                break 'choose Some((own_offset, ts));
             }
             // Forwards past its own window on the programme's offset: a pause
             // of this track that the other ran through, or a jump the other

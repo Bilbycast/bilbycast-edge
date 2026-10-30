@@ -4158,38 +4158,51 @@ mod flv_timestamp_tests {
     }
 
     /// `(handed out at, picture, decode time)` in hand-out order, a picture
-    /// first at a tie, as the demuxer hands them out: a picture when the
-    /// next picture's PES begins (at its decode time), an AAC frame on
+    /// first at a tie, as the demuxer hands them out: a picture when the PES
+    /// `held` pictures on begins (at its decode time) — 1 for the demuxer's
+    /// own hold, one more for every remuxer upstream — an AAC frame on
     /// arrival, `ahead(pts)` before its own time.
-    fn hand_out(dts: &[u64], audio: impl Iterator<Item = u64>, ahead: impl Fn(u64) -> i64) -> Vec<(i64, bool, u64)> {
-        let mut ev: Vec<(i64, bool, u64)> = dts.windows(2).map(|w| (w[1] as i64, true, w[0])).collect();
+    fn hand_out(
+        dts: &[u64],
+        held: usize,
+        audio: impl Iterator<Item = u64>,
+        ahead: impl Fn(u64) -> i64,
+    ) -> Vec<(i64, bool, u64)> {
+        let mut ev: Vec<(i64, bool, u64)> = dts.windows(held + 1).map(|w| (w[held] as i64, true, w[0])).collect();
         ev.extend(audio.map(|a| (a as i64 - ahead(a), false, a)));
         ev.sort_by_key(|&(at, picture, _)| (at, !picture));
         ev
     }
 
-    /// An A/V source with a picture every 2 s or 2.5 s, its AAC running on
-    /// beside it: each picture handed out when the next one's PES begins,
+    /// An A/V source with a picture every 2 to 8 s, its AAC running on
+    /// beside it, muxed at its own time or 1.1 s either side of the
+    /// pictures: each picture handed out when the next one's PES begins,
     /// with the audio up to there already mapped, so the audio has run over
     /// 3 s past the picture before it — the video taken for gone. Each
     /// picture still goes out at its own time, as a pause of the video's
     /// the audio ran through. Moving the video's line on to where the audio
-    /// was put every other picture on an offset of its own, 2 s late, a
-    /// millisecond before the next.
+    /// was put every other picture 2 s apart on an offset of its own, 2 s
+    /// late, a millisecond before the next; and pictures handed out over
+    /// 3 s from the audio were continued one step past the last picture,
+    /// or beside the audio, an interval late.
     #[test]
     fn slow_pictures_beside_running_audio_keep_their_own_time() {
-        for interval in [180_000, 225_000] {
-            let mut tl = FlvTimeline::new("o");
-            let dts: Vec<u64> = (0..12).map(|k| T0 + k * interval).collect();
-            for (_, picture, t) in hand_out(&dts, (0..11 * interval).step_by(1_920).map(|a| T0 + a), |_| 0) {
-                if picture {
-                    let p = tl.video(t, None, true).unwrap();
-                    assert_eq!((p.pts, p.dts), (LAP_90K + t, LAP_90K + t), "{interval}: the picture at {t}");
-                } else {
-                    assert_eq!(tl.audio(t), LAP_90K + t, "{interval}: the audio at {t}");
+        for interval in [180_000, 225_000, 450_000, 720_000] {
+            for ahead in [0, 99_000, -99_000] {
+                let what = format!("a picture every {interval} ticks, audio {ahead} ahead");
+                let mut tl = FlvTimeline::new("o");
+                let dts: Vec<u64> = (0..12).map(|k| T0 + k * interval).collect();
+                let audio = (0..11 * interval).step_by(1_920).map(|a| T0 + a);
+                for (_, picture, t) in hand_out(&dts, 1, audio, |_| ahead) {
+                    if picture {
+                        let p = tl.video(t, None, true).unwrap();
+                        assert_eq!((p.pts, p.dts), (LAP_90K + t, LAP_90K + t), "{what}: the picture at {t}");
+                    } else {
+                        assert_eq!(tl.audio(t), LAP_90K + t, "{what}: the audio at {t}");
+                    }
                 }
+                assert_eq!(tl.jumps, 0, "{what}: the source never jumped");
             }
-            assert_eq!(tl.jumps, 0, "{interval}: the source never jumped");
         }
     }
 
@@ -4198,39 +4211,84 @@ mod flv_timestamp_tests {
     /// at its own time, 300 ms or 1.1 s ahead of the pictures, or 1.1 s
     /// behind them before the stall and at its own time after it. The
     /// demuxer hands the last picture before the stall out only beside the
-    /// first after it; both, and every picture after, go out at their own
-    /// time. Moving the video's line on to where the audio was took that
-    /// old picture for a jump: an offset of its own, presented after
-    /// returning pictures squashed a millisecond apart behind it — and with
-    /// the audio over a second off the pictures, the video late for good.
+    /// first after it, and a remuxer upstream with the same hold one more;
+    /// they, and every picture after, go out at their own time. Moving the
+    /// video's line on to where the audio was took the old picture for a
+    /// jump: an offset of its own, presented after returning pictures
+    /// squashed a millisecond apart behind it — and with the audio over a
+    /// second off the pictures, the video late for good. With two held back
+    /// the audio's run, measured from the pictures before, looked a few
+    /// frames long, and the first picture back was put one frame past the
+    /// old ones, 4 s early.
     #[test]
     fn a_video_stall_beside_running_audio_keeps_every_picture_at_its_own_time() {
         const STALL: u64 = T0 + 100 * STEP_25FPS;
-        for stall in [4 * 90_000, 12 * 90_000] {
-            for (what, ahead) in [
-                ("own time", (|_| 0) as fn(u64) -> i64),
-                ("300 ms ahead", |_| 27_000),
-                ("1.1 s ahead", |_| 99_000),
-                ("1.1 s behind, then own time", |a| if a < STALL { -99_000 } else { 0 }),
-            ] {
-                let what = format!("{} s stall, audio {what}", stall / 90_000);
-                let mut tl = FlvTimeline::new("o");
-                let dts: Vec<u64> = (0..300)
-                    .map(|k| T0 + k * STEP_25FPS)
-                    .filter(|&d| !(STALL..STALL + stall).contains(&d))
-                    .collect();
-                let audio = (0..300 * STEP_25FPS).step_by(1_920).map(|a| T0 + a);
-                for (_, picture, t) in hand_out(&dts, audio, ahead) {
-                    if picture {
-                        let p = tl.video(t + 7_200, Some(t), true).unwrap();
-                        let want = (LAP_90K + t + 7_200, LAP_90K + t);
-                        assert_eq!((p.pts, p.dts), want, "{what}: the picture decoding at {t}");
+        for held in [1, 2] {
+            for stall in [4 * 90_000, 12 * 90_000] {
+                for (what, ahead) in [
+                    ("own time", (|_| 0) as fn(u64) -> i64),
+                    ("300 ms ahead", |_| 27_000),
+                    ("1.1 s ahead", |_| 99_000),
+                    ("1.1 s behind, then own time", |a| if a < STALL { -99_000 } else { 0 }),
+                ] {
+                    let what = format!("{} s stall, {held} held, audio {what}", stall / 90_000);
+                    let mut tl = FlvTimeline::new("o");
+                    let dts: Vec<u64> = (0..300)
+                        .map(|k| T0 + k * STEP_25FPS)
+                        .filter(|&d| !(STALL..STALL + stall).contains(&d))
+                        .collect();
+                    let audio = (0..300 * STEP_25FPS).step_by(1_920).map(|a| T0 + a);
+                    for (_, picture, t) in hand_out(&dts, held, audio, ahead) {
+                        if picture {
+                            let p = tl.video(t + 7_200, Some(t), true).unwrap();
+                            let want = (LAP_90K + t + 7_200, LAP_90K + t);
+                            assert_eq!((p.pts, p.dts), want, "{what}: the picture decoding at {t}");
+                        } else {
+                            assert_eq!(tl.audio(t), LAP_90K + t, "{what}: the audio at {t}");
+                        }
+                    }
+                    assert_eq!(tl.jumps, 0, "{what}: the source never jumped");
+                }
+            }
+        }
+    }
+
+    /// A source whose video stops while its audio runs on 5 s on the same
+    /// clock — one input whose video PID stopped, or an audio-only backup
+    /// the ingress rewriter put on the main's clock — and then its audio
+    /// stops too, for 1.1 s to 2.9 s with no silence laid, before the whole
+    /// source comes back on that clock picture first. The picture goes out
+    /// at its own time, and every frame of its audio is sent. The picture
+    /// used to be placed in doubt one step past its old one, 6 s behind the
+    /// audio; its audio joined it there and was dropped as behind what had
+    /// been sent.
+    #[test]
+    fn a_picture_back_after_a_hole_in_the_audio_goes_out_at_its_own_time() {
+        for hole in [99_000, 135_000, 180_000, 261_000] {
+            let mut tl = FlvTimeline::new("o");
+            let play = |tl: &mut FlvTimeline, from: u64| {
+                for (track, t) in programme(90_000) {
+                    let t = from + t;
+                    if track == Track::Video {
+                        let p = tl.video(t, None, true).unwrap();
+                        assert_eq!(p.dts, LAP_90K + t, "{hole}: the picture at {t}");
                     } else {
-                        assert_eq!(tl.audio(t), LAP_90K + t, "{what}: the audio at {t}");
+                        let at = tl.audio(t);
+                        assert_eq!(at, LAP_90K + t, "{hole}: the audio at {t}");
+                        assert!(tl.audio_tag_ms(at).is_some(), "{hole}: the audio at {t} sent");
                     }
                 }
-                assert_eq!(tl.jumps, 0, "{what}: the source never jumped");
+            };
+            play(&mut tl, T0);
+            let mut a = T0 + 90_000;
+            while a < T0 + 6 * 90_000 {
+                let at = tl.audio(a);
+                assert_eq!(at, LAP_90K + a, "{hole}: the audio alone at {a}");
+                assert!(tl.audio_tag_ms(at).is_some());
+                a += 1_920;
             }
+            play(&mut tl, a + hole);
+            assert_eq!(tl.jumps, 0, "{hole}: the source never jumped");
         }
     }
 
