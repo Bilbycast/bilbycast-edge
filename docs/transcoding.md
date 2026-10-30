@@ -458,7 +458,7 @@ built at the declared rate and rebuilt, with a resampler, on the first
 real frame whose rate or channel count differs — a 44.1 kHz source
 through a 48 kHz encoder used to run 8.8 % slow. On RTMP (since
 edge#211) the measure is the connection's FLV timeline, the encoder's
-channel / rate stage converts the source instead of a rebuild, and two
+channel / rate stage converts the source instead of a rebuild, and three
 things differ from CMAF. A tick lays at most a second of silence, off
 the connection's async task, so a longer stretch is caught up over the
 next few ticks rather than encoded at once; and the fill reaches as far
@@ -471,12 +471,37 @@ goes on the timeline as audio: audio returning on the same clock lands
 where it ends, the stretch the grace and any late tick held it back
 zero-filled (up to 4 s; past that the encoder re-anchors forward on the
 returning audio), and audio returning on another clock is continued one
-frame past it. RTMP's silence used to be one chunk a tick, wall-clock,
-and every tick observed late was lost for good. The same placement
-re-anchors RTMP's transcoded audio at a loop, a switch or a gap whether
-or not `silent_fallback` is set: the encoder used to anchor on its first
-frame and count samples for the life of the connection, so a loop whose
-audio and video lengths differ drifted A/V by the difference every lap.
+frame past it. A picture coming back to such a connection ahead of its
+audio is put where the audio is, in the relation it last had to it, and
+its audio joins it there; it used to be continued one frame past its old
+picture, and the audio joining it was dropped as behind everything sent
+until the source had run as far again as the video had been away.
+RTMP's silence used to be one chunk a tick, wall-clock, and every tick
+observed late was lost for good.
+
+The demuxer hands an MP2 / AC-3 / E-AC-3 PES out only when the next one
+begins, so the last PES before an outage reaches the output beside the
+first after it, its place long since laid with silence. RTMP holds back a
+real frame behind the encoder's input however far behind it is — the
+third difference: CMAF re-anchors on one more than 4 s behind, but FLV's
+audio cannot step back — and does not take it for the picture's lead over
+the audio. Beside a picture that PES is such a frame. Re-anchored on, it
+left the encoder's input short of the returning audio by that lead — a
+hole in the audio tags at every outage of more than about 4 s beside a
+picture (0.4 s on an ffmpeg-muxed MP2 source); taken for the lead, it
+held the next outage's silence as far short of the picture as the outage
+before had been long. With no picture, where the silence is on the
+timeline, that PES cannot be told from audio whose timestamps close the
+outage (the input's PTS rewriter bridges an audio-only feed's gap the
+wall clock did not see), so it is continued one frame past the silence
+and sent like that audio; audio returning after it on its own clock goes
+back there, at its own time. It used to stay on that PES's offset: after
+a 3 s outage every frame from then on went out 2.5 s late, and a 6 s
+outage left a 6 s hole as well. The same placement re-anchors RTMP's
+transcoded audio at a loop, a switch or a gap whether or not
+`silent_fallback` is set: the encoder used to anchor on its first frame
+and count samples for the life of the connection, so a loop whose audio
+and video lengths differ drifted A/V by the difference every lap.
 
 Wired for RTMP, WebRTC (both WHIP client and WHEP server paths), and
 CMAF (HLS + DASH output) in this release. HLS (standalone HLS output,

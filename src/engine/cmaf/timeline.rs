@@ -62,7 +62,8 @@
 //!
 //! An RTMP connection keeps a timeline of its own, shared with nothing
 //! ([`CmafTimeline::with_lone_gap`]), on which a track with no other beside
-//! it keeps a pause of up to 10 s as a gap rather than closing it.
+//! it keeps a pause of up to 10 s as a gap rather than closing it — unless
+//! an offset already in use puts the step within the track's own window.
 //!
 //! **The cross window is directed.** A track may step back within
 //! [`OWN_WINDOW_90K`] of its newest timestamp and keep its offset: that is a
@@ -380,6 +381,25 @@ impl CmafTimeline {
         Self { lone_gap_90k, ..Self::default() }
     }
 
+    /// Move `track`'s newest timestamp on to `ts` (90 kHz) when it is
+    /// behind it, so the track's next timestamp is judged from there: for
+    /// an output that knows where a track it took for gone would be now —
+    /// an RTMP connection whose picture comes back after the audio ran on
+    /// alone (`output_rtmp::FlvTimeline::video`). Judged from its old
+    /// picture, a return the rules continue went one step past that, as
+    /// far behind the other track as it had been away. CMAF's outputs, which
+    /// share their offsets across the flow, never call it.
+    pub fn resume_from(&mut self, track: Track, ts: u64) {
+        let line = match track {
+            Track::Video => &mut self.video,
+            Track::Audio => &mut self.audio,
+        };
+        let ts = ts & MASK_33;
+        if line.newest.is_some_and(|n| circ(ts, n) > 0) {
+            line.newest = Some(ts);
+        }
+    }
+
     /// Map a source timestamp (90 kHz) of `track` onto the output timeline.
     pub fn map(&mut self, track: Track, src: u64) -> Mapped {
         let src = src & MASK_33;
@@ -541,9 +561,25 @@ impl CmafTimeline {
             // `lone_gap` as a gap: nothing there tells a pause from a jump,
             // and closing every pause past a second (a slide feed, a VFR
             // camera) ran the track's clock behind the source's. 0 (CMAF)
-            // closes it, as before.
+            // closes it, as before. An offset already in use that puts the
+            // timestamp within its own window is the source back on a clock
+            // it left, and is taken before the gap: an RTMP audio-only
+            // source's last PES before an outage, which the demuxer hands
+            // out beside the first after it, is continued past the silence
+            // laid meanwhile on an offset of its own, and the return, kept
+            // there as a gap, went out as late as the silence had run.
             if own > 0 && (other_newest.is_none() || other_quiet) && own as u64 <= lone_gap {
-                break 'choose Some((own_offset, ts));
+                let back = lock(&self.offsets)
+                    .list
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|o| *o != own_offset)
+                    .find_map(|off| {
+                        let ts = (src + off) & MASK_33;
+                        in_own(circ(ts, newest)).then_some((off, ts))
+                    });
+                break 'choose back.or(Some((own_offset, ts)));
             }
             // The other track may have met this jump first: onto its offset
             // before any step of this track's own past its window. With the

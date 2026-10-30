@@ -613,10 +613,7 @@ async fn publish_loop(
                             // flowing, suppress silence until the next
                             // grace-window expiry. And measure the picture's
                             // lead over it, which silence stops short by.
-                            if let Some(sg) = silence.as_mut() {
-                                sg.mark_real_audio(at);
-                            }
-                            input.mark_real_audio(at, timeline.newest_picture());
+                            note_real_audio(silence.as_mut(), input, at, timeline.newest_picture());
                             let Some(dec) = decoder.as_mut() else {
                                 // Decoder build failed (or we're still in
                                 // silent-only mode with an unusable source
@@ -717,10 +714,7 @@ async fn publish_loop(
                     else {
                         continue;
                     };
-                    if let Some(sg) = silence.as_mut() {
-                        sg.mark_real_audio(at);
-                    }
-                    input.mark_real_audio(at, timeline.newest_picture());
+                    note_real_audio(silence.as_mut(), input, at, timeline.newest_picture());
 
                     // To the encoder's format: MP2 at another rate was
                     // encoded as if at the encoder's (and ran at the wrong
@@ -891,6 +885,11 @@ struct FlvTimeline {
     /// The newest presentation time any picture has had: where the picture
     /// is, which silence is laid to.
     newest_picture: Option<u64>,
+    /// How far the last picture's decode time ran ahead of the newest audio
+    /// while the video was live ([`Self::live_picture`]), none counted when
+    /// it ran behind: where a picture coming back after the video was taken
+    /// for gone is put, beside the audio ([`Self::video`]).
+    picture_lead: u64,
     /// The newest audio time mapped, sent or not, silence on a connection
     /// with no picture included ([`Self::silent_audio`]).
     newest_audio: Option<u64>,
@@ -913,6 +912,7 @@ impl FlvTimeline {
             epoch: None,
             last_picture: None,
             newest_picture: None,
+            picture_lead: 0,
             newest_audio: None,
             last_real_audio: None,
             last_audio: None,
@@ -957,9 +957,27 @@ impl FlvTimeline {
     /// presents at its own time when that is later; on a clean source the
     /// hold never engages, and the tag is what [`flv_video_time`] made of
     /// the raw timestamps.
+    ///
+    /// A picture coming back after the video was taken for gone — the audio
+    /// ran on past it alone (a switch to an audio-only backup, a video PID
+    /// that stopped), and silence may have followed — is judged from where
+    /// the audio is now, in the relation the picture last had to it
+    /// ([`CmafTimeline::resume_from`]): on the same clock it lands at its
+    /// own time, on another it opens an offset there, and its audio joins it
+    /// beside the audio already sent. Judged from its old picture, a picture
+    /// coming back ahead of its audio went one frame past that, as far behind
+    /// the audio as the video had been away; its audio joined it there, and
+    /// was dropped as behind what had been sent until the source had run
+    /// that far again. Audio coming back first was placed beside the
+    /// silence, as it still is.
     fn video(&mut self, pts: u64, dts: Option<u64>, pts_known: bool) -> Option<PictureTime> {
         if !pts_known {
             return self.last_picture;
+        }
+        if self.live_picture().is_none()
+            && let Some(audio) = self.newest_audio
+        {
+            self.source.resume_from(Track::Video, audio.saturating_add(self.picture_lead) & MASK_33);
         }
         let offset = dts.map_or(0, |d| super::cmaf::composition_offset_90k(pts, d));
         let decoded = self.map(Track::Video, pts.wrapping_sub(offset) & MASK_33);
@@ -967,6 +985,11 @@ impl FlvTimeline {
         let dts = self.last_picture.map_or(decoded, |p| decoded.max(p.dts.saturating_add(FLV_MS_90K)));
         let (ts_ms, cts_ms) = flv_video_time(presented.max(dts), Some(dts), &mut self.epoch);
         self.newest_picture = Some(self.newest_picture.map_or(presented, |n| n.max(presented)));
+        if self.live_picture().is_some()
+            && let Some(audio) = self.newest_audio
+        {
+            self.picture_lead = decoded.saturating_sub(audio);
+        }
         let time = PictureTime { pts: presented, dts, ts_ms, cts_ms };
         self.last_picture = Some(time);
         Some(time)
@@ -986,7 +1009,8 @@ impl FlvTimeline {
     /// track as the source's clock would have stamped it, run on from the
     /// last real frame. The timeline then judges the audio's return against
     /// where the silence ends: on the same clock it lands there, on another
-    /// it is continued one frame past it. Left off the track, a return the
+    /// it is continued one frame past it, and a picture coming back ahead of
+    /// it is put beside it ([`Self::video`]). Left off the track, a return the
     /// timeline continues (past the lone gap, or onto another clock) would
     /// go one frame past the last *real* frame, behind the silence by as long
     /// as it had run, and every frame of it be held back or dropped as
@@ -1051,12 +1075,39 @@ impl FlvTimeline {
     }
 }
 
+/// Real audio at mapped time `at` reached the output: the silence watchdog
+/// is told, so no silence is laid while it flows, and the picture's lead
+/// over it measured for silence to stop short by — unless the encoder's
+/// input is already past it, a frame [`submit_source_audio`] holds back.
+/// The last MP2 / AC-3 PES before an outage, handed out beside the first
+/// after it, sat the outage's length behind the picture: taken for the
+/// lead, it held the next outage's silence that far short of the picture,
+/// an unfilled hole as long again.
+fn note_real_audio(
+    silence: Option<&mut SilenceGenerator>,
+    input: &mut EncoderInputClock,
+    at: u64,
+    picture: Option<u64>,
+) {
+    if let Some(sg) = silence {
+        sg.mark_real_audio(at);
+    }
+    if !input.passed(at) {
+        input.mark_real_audio(at, picture);
+    }
+}
+
 /// Submit one decoded source frame (`planar` at `rate`, from mapped time
 /// `at`) at its place on the encoder's input timeline: re-anchoring the
 /// encoder where the source left it, covering a gap with zeros under
 /// `silent_fallback` (`fill_gaps`), holding back a frame the input is
 /// already past — the rule CMAF's re-encoder applies
-/// ([`EncoderInputClock::place`]). The encoder used to anchor on its first
+/// ([`EncoderInputClock::place`]), but for a frame behind the input by
+/// more than the fill cap, which is held back too rather than re-anchored
+/// on ([`EncoderInputClock::place_forward_only`]): FLV's audio never steps
+/// back. Beside a picture that is the last MP2 / AC-3 PES before an
+/// outage, which the demuxer hands out only beside the first after it, its
+/// place long since laid with silence. The encoder used to anchor on its first
 /// frame and count samples for the life of the connection, so a loop
 /// whose audio and video lengths differ drifted A/V by the difference every
 /// lap, and a switch kept the old feed's A/V relation.
@@ -1076,7 +1127,7 @@ fn submit_source_audio(
         return;
     }
     input.set_rate(rate);
-    match input.place(at, fill_gaps) {
+    match input.place_forward_only(at, fill_gaps) {
         Placement::Skip => return,
         Placement::Submit { reanchor: true } => {
             encoder.reanchor_pts();
@@ -1122,6 +1173,18 @@ fn submit_source_audio(
 /// input, else from the newest audio mapped, and put on the timeline's audio
 /// track ([`FlvTimeline::silent_audio`]) so the audio returning is placed
 /// after it. Never before an essence has anchored the FLV epoch.
+///
+/// Silence laid beside a picture stays off the audio track: the picture
+/// already says where the audio is. Audio coming back behind it — the last
+/// MP2 / AC-3 PES before an outage, which the demuxer hands out only beside
+/// the first after it — is mapped at its own time and held back however
+/// far behind ([`submit_source_audio`]). Behind the silence on the track,
+/// with no picture, that PES cannot be told from audio whose timestamps
+/// close the outage (the input's PTS rewriter bridges an audio-only feed's
+/// gap the wall clock did not see), which must not be held back: it is
+/// continued one frame past the silence and sent, and audio returning after
+/// it on its own clock goes back there, at its own time (a lone track's
+/// gap, `CmafTimeline::map`).
 ///
 /// The generator's own PTS starts at 0 and is not used: submitted at it, the
 /// first silent chunk anchored the encoder at 0 once a picture had anchored
@@ -4417,8 +4480,7 @@ mod flv_timestamp_tests {
         let pcm = vec![vec![0.1f32; 1_024]; 2];
         for j in 0..n {
             let at = tl.audio((from + j * 1_920) & MASK_33);
-            sg.mark_real_audio(at);
-            input.mark_real_audio(at, tl.newest_picture());
+            note_real_audio(Some(sg), input, at, tl.newest_picture());
             submit_source_audio(encoder, stage, input, true, &pcm, 48_000, at, "o");
         }
     }
@@ -4526,6 +4588,246 @@ mod flv_timestamp_tests {
         assert!(sent.len() >= 48, "{} silent frames on 50 ticks", sent.len());
         stamps.extend(sent);
         assert!(stamps.windows(2).all(|w| w[1] - w[0] == 1_920), "the silence continues the audio");
+    }
+
+    /// After its video had gone the audio ran on alone — a switch to an
+    /// audio-only backup on another clock — and then stopped, and silence
+    /// was laid a chunk a tick. The main feed comes back, on its own clock
+    /// run on in real time or on a third, picture first or audio first:
+    /// either way its audio is sent whole, continuing the silence, in the
+    /// source's own A/V relation. A picture returning first used to be
+    /// continued one frame past its old picture, as far behind the audio as
+    /// it had been away, and its audio joined it there: behind everything
+    /// sent, every frame of it dropped until the source had run that far
+    /// again — 8.5 s of the main feed's audio here.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn a_picture_returning_after_the_video_had_gone_is_put_beside_the_audio() {
+        const B: u64 = 5_000_000_000;
+        // The main's second, the backup's 5 s, the grace and the silence
+        // after it: where the main's clock is when it comes back.
+        let away = 90_000 + 235 * 1_920 + 45_000 + 140 * 1_920;
+        for (clock, picture_first) in
+            [(T0 + away, true), (T0 + away, false), (7_000_000_000, true), (7_000_000_000, false)]
+        {
+            let what = format!("back at {clock}, picture first {picture_first}");
+            let mut st = silent_fallback_state();
+            let mut tl = FlvTimeline::new("o");
+            for (track, t) in programme(90_000) {
+                match track {
+                    Track::Video => {
+                        tl.video(T0 + t, None, true);
+                    }
+                    Track::Audio => feed_real(&mut st, &mut tl, T0 + t, 1),
+                }
+            }
+            // The video stops, and the audio goes on 5 s on the backup's clock.
+            feed_real(&mut st, &mut tl, B, 235);
+            let (_, mut stamps) = drain_sent(&mut st, &mut tl);
+            assert!(tl.live_picture().is_none(), "the video taken for gone");
+            // The audio stops: past the grace, 3 s of silence.
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            tick_silence(&mut st, &mut tl, 140);
+            stamps.extend(drain_sent(&mut st, &mut tl).1);
+            // A second of the main feed, a tick after each essence.
+            let mut back = programme(90_000);
+            if !picture_first {
+                back.sort_by_key(|&(track, t)| (t, track == Track::Video));
+            }
+            let (mut drained, mut sent) = (Vec::new(), Vec::new());
+            for (track, t) in back {
+                match track {
+                    Track::Video => {
+                        tl.video(clock + t, None, true);
+                    }
+                    Track::Audio => feed_real(&mut st, &mut tl, clock + t, 1),
+                }
+                tick_silence(&mut st, &mut tl, 1);
+                let (d, s) = drain_sent(&mut st, &mut tl);
+                drained.extend(d);
+                sent.extend(s);
+            }
+            let dropped: Vec<u64> = drained.iter().copied().filter(|p| !sent.contains(p)).collect();
+            assert!(dropped.is_empty(), "{what}: dropped after the return: {dropped:?}");
+            assert!(sent.len() > 40, "{what}: {} frames after the return", sent.len());
+            stamps.extend(sent);
+            assert!(stamps.windows(2).all(|w| w[1] - w[0] == 1_920), "{what}: one contiguous track");
+            // The last frame at 88 320, the last picture at 86 400.
+            let (a, v) = (tl.newest_audio().unwrap(), tl.newest_picture().unwrap());
+            assert_eq!(a as i64 - v as i64, 1_920, "{what}: the source's A/V relation");
+        }
+    }
+
+    /// One PES of `frames` MP2 frames from source time `pts`, placed as the
+    /// publish loop's `OtherAudio` arm places it under `silent_fallback`:
+    /// the PES on the timeline, the watchdog and the lead told, each frame
+    /// of it 2 160 ticks on from the one before. Returns where it was mapped.
+    #[cfg(feature = "fdk-aac")]
+    fn feed_pes(st: &mut EncoderState, tl: &mut FlvTimeline, pts: u64, frames: u64) -> u64 {
+        let EncoderState::Active { encoder, silence: Some(sg), input, stage, .. } = st else {
+            panic!("silent fallback builds eagerly");
+        };
+        let pcm = vec![vec![0.1f32; 1_152]; 2];
+        let at = tl.audio(pts & MASK_33);
+        note_real_audio(Some(sg), input, at, tl.newest_picture());
+        for j in 0..frames {
+            submit_source_audio(encoder, stage, input, true, &pcm, 48_000, at + j * 2_160, "o");
+        }
+        at
+    }
+
+    /// A source whose audio stops for 5 s while its pictures run on, under
+    /// `silent_fallback` — the live case: H.264 decoding 80 ms before it
+    /// presents, MP2 in PES of four frames, its audio PID dropped. The
+    /// demuxer hands a picture out when the next picture's PES begins, and
+    /// an MP2 PES's frames when the next audio PES begins, so the last PES
+    /// before the outage comes out only beside the first after it, 5 s
+    /// late, its place long since laid with silence. It is dropped, and the
+    /// audio returning continues the silence, the stretch up to it
+    /// zero-filled: one contiguous track, the return at its own time. That
+    /// PES used to re-anchor the encoder 4.8 s back, every frame of it then
+    /// dropped as behind what had been sent, and the return re-anchored it
+    /// forward with nothing filled: no audio tag between the silence's end
+    /// and the return, the picture's lead over the audio (0.4 s live). A
+    /// second outage is laid as the first: that PES, 5 s behind the picture,
+    /// was also taken for the picture's lead over the audio, and held the
+    /// next outage's silence 5 s short of the picture — a 5 s hole. With the
+    /// audio muxed at its own time, and 300 ms ahead of the pictures, so that
+    /// it comes back ahead of the newest one.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn a_pes_handed_out_after_an_outage_beside_the_picture_leaves_no_hole() {
+        const PES: u64 = 4 * 2_160;
+        // Two outages: the second laid as the first.
+        let out = |p: u64| [(3, 8), (11, 16)].iter().any(|&(a, b)| (T0 + a * 90_000..T0 + b * 90_000).contains(&p));
+        for audio_ahead in [0, 27_000] {
+            let mut st = silent_fallback_state();
+            let mut tl = FlvTimeline::new("o");
+            // (handed out at, a picture, its decode time / the PES's PTS):
+            // a picture's PES arrives at its decode time, an audio PES
+            // `audio_ahead` before its PTS.
+            let mut ev: Vec<(u64, bool, u64)> =
+                (0..500).map(|k| T0 + k * STEP_25FPS).map(|dts| (dts + STEP_25FPS, true, dts)).collect();
+            let pes: Vec<u64> = (0..230).map(|j| T0 + j * PES).filter(|&p| !out(p)).collect();
+            ev.extend(pes.windows(2).map(|w| (w[1] - audio_ahead, false, w[0])));
+            ev.sort_by_key(|&(at, picture, _)| (at, !picture));
+            let (mut stamps, mut drained, mut sent, mut moved) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut last_real, mut slept, mut first_back, mut last_back) = (None, None, None, None);
+            let mut outages = 0;
+            for (w, picture, t) in ev {
+                if picture {
+                    tl.video(t + 2 * STEP_25FPS, Some(t), true);
+                } else {
+                    let at = feed_pes(&mut st, &mut tl, t, 4);
+                    if at != LAP_90K + t {
+                        moved.push(t);
+                    }
+                    last_real = Some(w);
+                    if t >= T0 + 8 * 90_000 {
+                        first_back = first_back.or(Some((t, at)));
+                        last_back = Some(at);
+                    }
+                }
+                // Into an outage, past the watchdog's grace.
+                if last_real.is_some_and(|r| w > r + 45_000) && slept != last_real {
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    slept = last_real;
+                    outages += 1;
+                }
+                tick_silence(&mut st, &mut tl, 1);
+                let (d, s) = drain_sent(&mut st, &mut tl);
+                if slept.is_some() {
+                    drained.extend(d);
+                    sent.extend(s.iter().copied());
+                }
+                stamps.extend(s);
+            }
+            let what = format!("audio {audio_ahead} ticks ahead");
+            assert_eq!(outages, 2, "{what}: two outages");
+            // The late PES included: continued past the silence, it would go
+            // out 5 s from its place.
+            assert!(moved.is_empty(), "{what}: PES moved off the source's clock: {moved:?}");
+            assert_eq!(tl.jumps, 0, "{what}: the source never jumped");
+            let dropped: Vec<u64> = drained.iter().copied().filter(|p| !sent.contains(p)).collect();
+            assert!(dropped.is_empty(), "{what}: encoded from the outage on and dropped: {dropped:?}");
+            let holes: Vec<i64> =
+                stamps.windows(2).map(|w| w[1] as i64 - w[0] as i64).filter(|&d| d != 1_920).collect();
+            assert!(holes.is_empty(), "{what}: steps other than a frame in the audio tags: {holes:?}");
+            let (src, at) = first_back.unwrap();
+            assert_eq!(at, LAP_90K + src, "{what}: the return on the source's clock");
+            // Submitted where the timeline put it, within the placement's slack.
+            let EncoderState::Active { input, .. } = &st else { unreachable!() };
+            let off = input.position().unwrap() as i64 - (last_back.unwrap() + PES) as i64;
+            let slack = crate::engine::audio_encode::SOURCE_PTS_SLACK_TICKS;
+            assert!(off.unsigned_abs() <= slack, "{what}: the return {off} ticks off its own time");
+            assert_eq!(tl.newest_picture(), Some(LAP_90K + T0 + 501 * STEP_25FPS), "{what}: the pictures too");
+        }
+    }
+
+    /// An audio-only MP2 source under `silent_fallback`, its silence on the
+    /// timeline's audio track a chunk a tick, and the last PES before an
+    /// outage handed out only beside the first after it, its place long
+    /// gone: that PES is continued one frame past the silence, and the audio
+    /// returning after it lands at its own time on its own clock, the
+    /// stretch up to it filled — one contiguous track. That PES's offset
+    /// used to take the return with it as a lone track's gap: after a 3 s
+    /// outage every frame from then on went out 2.5 s late; after 6 s, past
+    /// the fill's reach, with a 6 s hole as well. A source whose timestamps
+    /// close the outage (the input's PTS rewriter bridges an audio-only
+    /// feed's gap the wall clock did not see) runs on past the silence, none
+    /// of it held back.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn audio_returning_after_an_outage_with_no_picture_lands_at_its_own_time() {
+        const PES: u64 = 4 * 2_160;
+        for (outage, closed) in [(3u64, false), (6, false), (11, false), (6, true)] {
+            let what = format!("a {outage} s outage, closed {closed}");
+            let mut st = silent_fallback_state();
+            let mut tl = FlvTimeline::new("o");
+            let gone = T0 + 2 * 90_000;
+            let back = if closed { gone } else { gone + outage * 90_000 };
+            let pes: Vec<u64> = (0..250)
+                .map(|j| T0 + j * PES)
+                .filter(|&p| p < gone || p >= back)
+                .take_while(|&p| p < back + 90_000)
+                .collect();
+            let (mut stamps, mut drained, mut sent, mut moved) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut silence_end, mut after) = (None, 0);
+            // Each PES handed out when the next begins.
+            for w in pes.windows(2) {
+                if silence_end.is_none() && w[1] >= back {
+                    // The outage: the grace, then a chunk a tick.
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    tick_silence(&mut st, &mut tl, ((outage * 90_000 - 45_000) / 1_920) as usize);
+                    let EncoderState::Active { input, .. } = &st else { unreachable!() };
+                    silence_end = input.position();
+                }
+                let at = feed_pes(&mut st, &mut tl, w[0], 4);
+                if !closed && w[0] >= back && at != LAP_90K + w[0] {
+                    moved.push(w[0]);
+                }
+                let (d, s) = drain_sent(&mut st, &mut tl);
+                if silence_end.is_some() {
+                    after += 1;
+                    drained.extend(d);
+                    sent.extend(s.iter().copied());
+                }
+                stamps.extend(s);
+            }
+            let dropped: Vec<u64> = drained.iter().copied().filter(|p| !sent.contains(p)).collect();
+            assert!(dropped.is_empty(), "{what}: encoded from the outage on and dropped: {dropped:?}");
+            let holes: Vec<i64> =
+                stamps.windows(2).map(|w| w[1] as i64 - w[0] as i64).filter(|&d| d != 1_920).collect();
+            assert!(holes.is_empty(), "{what}: steps other than a frame in the audio tags: {holes:?}");
+            assert!(moved.is_empty(), "{what}: returning PES off the source's clock: {moved:?}");
+            // Where the input ends: the source's own time, or with the
+            // outage closed every PES after the silence, none held back.
+            let EncoderState::Active { input, .. } = &st else { unreachable!() };
+            let end = if closed { silence_end.unwrap() + after * PES } else { LAP_90K + pes[pes.len() - 2] + PES };
+            let off = input.position().unwrap() as i64 - end as i64;
+            let slack = crate::engine::audio_encode::SOURCE_PTS_SLACK_TICKS;
+            assert!(off.unsigned_abs() <= slack, "{what}: the input {off} ticks off where it belongs");
+        }
     }
 
     /// A video-only source with a picture every 5 s (a slide feed, a

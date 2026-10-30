@@ -1456,6 +1456,25 @@ impl EncoderInputClock {
         }
     }
 
+    /// [`Self::place`] for an output whose audio track can never step back
+    /// (an RTMP connection's FLV timeline): a frame behind the input is held
+    /// back however far behind it is, where [`Self::place`] re-anchors on
+    /// one more than the fill cap behind. Re-anchored there, the encoder
+    /// stamped every frame behind what had been sent — all of it dropped —
+    /// and left the input behind the silence already laid, so the audio's
+    /// return was a step past the fill cap, re-anchored on with nothing
+    /// filled: a hole. Held back, the frames cost the same and the input
+    /// stays where the silence ends. A stale input re-anchors as before.
+    pub(crate) fn place_forward_only(&self, pts: u64, fill_gaps: bool) -> Placement {
+        if self.passed(pts) { Placement::Skip } else { self.place(pts, fill_gaps) }
+    }
+
+    /// Whether the input is already past a real frame at `pts` (by more than
+    /// the slack), which [`Self::place_forward_only`] holds back.
+    pub(crate) fn passed(&self, pts: u64) -> bool {
+        !self.stale && self.position().is_some_and(|at| pts.saturating_add(SOURCE_PTS_SLACK_TICKS) < at)
+    }
+
     /// Where silence laid beside the picture at `video` should stop: where
     /// the audio would be, the picture less its measured lead.
     pub(crate) fn silence_target(&self, video: u64) -> u64 {
