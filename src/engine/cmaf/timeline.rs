@@ -165,7 +165,8 @@ struct Line {
     newest: Option<u64>,
     /// The previous source timestamp, for the step measurement.
     last_src: Option<u64>,
-    /// Recent positive steps between source timestamps.
+    /// The last step between source timestamps, and recent positive ones.
+    last_step: Option<i64>,
     steps: [u64; STEP_HISTORY],
     n_steps: usize,
     /// The furthest output timestamp the track has reached, and how far
@@ -247,6 +248,7 @@ impl Line {
     fn note_step(&mut self, src: u64) {
         if let Some(prev) = self.last_src {
             let d = circ(src, prev);
+            self.last_step = Some(d);
             if d > 0 && d as u64 <= MAX_STEP_90K {
                 self.steps[self.n_steps % STEP_HISTORY] = d as u64;
                 self.n_steps += 1;
@@ -389,8 +391,9 @@ impl CmafTimeline {
     /// after the audio ran on alone (`output_rtmp::FlvTimeline::video`).
     /// The track's next timestamp landing forwards near there, on the
     /// programme's offset, is a pause the other track ran through, kept as
-    /// a gap; one that is a jump no rule places is continued at `ts` when
-    /// that is ahead of the track's newest, rather than one step past it —
+    /// a gap; one that is a jump no rule places, or a step placed in doubt,
+    /// is continued at `ts` when that is ahead of the track's newest,
+    /// rather than one step past it —
     /// continued from its old picture, a return on another clock went as
     /// far behind the other track as it had been away. A timestamp the
     /// rules place otherwise — the old picture handed out late — is placed
@@ -416,6 +419,10 @@ impl CmafTimeline {
             Track::Audio => (&mut self.audio, &mut self.video),
         };
         let continue_at = me.continue_at.take();
+        // Whether the track's last step was longer than any frame's (or it
+        // has had none): a slow picture source, whose pictures the demuxer
+        // hands out an interval late.
+        let slow = me.last_step.is_none_or(|d| d > MAX_STEP_90K as i64);
         let leapt = me.last_src.is_some_and(|prev| circ(src, prev) > MAX_STEP_90K as i64);
         let other_leapt = other.leaps > me.other_leaps_prev;
         me.note_step(src);
@@ -601,19 +608,23 @@ impl CmafTimeline {
             }
             // A track the output took for gone coming back forwards on the
             // programme's offset where it says the track would be now
-            // (`continue_at`) — up to the lone gap behind there (a slow
-            // picture handed out an interval late), up to a cross window past
-            // (a hole in the other track meanwhile) — is back on the clock it
-            // left after a pause the other track ran through: a gap. Measured
-            // from the track's own last timestamps the other's run looks
-            // short when more than one was handed out late (every remuxer
-            // upstream holds a picture back), and the return was placed in
-            // doubt, one step past them, as far behind the audio as it had
-            // been away.
+            // (`continue_at`) — up to its own window past there, and up to
+            // a cross window behind, or the lone gap behind on a slow
+            // picture source (each picture handed out an interval late) — is
+            // back on the clock it left after a pause the other track ran
+            // through: a gap. Measured from the track's own last timestamps
+            // the other's run looks short when more than one was handed out
+            // late (every remuxer upstream holds a picture back), and the
+            // return was placed in doubt, one step past them, as far behind
+            // the audio as it had been away. Further behind, a feed whose
+            // clock restarted behind the audio's is continued beside it: kept
+            // as a gap, its audio could only open an offset of its own, A/V
+            // apart for good. Further past, in doubt (a stray timestamp, a
+            // hole in the other track meanwhile), it is continued there too.
+            let behind = if slow { lone_gap as i64 } else { CROSS_WINDOW_90K };
             if own > OWN_WINDOW_90K
                 && on_programme
-                && continue_at
-                    .is_some_and(|c| (-(lone_gap as i64)..=CROSS_WINDOW_90K).contains(&circ(ts, c)))
+                && continue_at.is_some_and(|c| (-behind..=OWN_WINDOW_90K).contains(&circ(ts, c)))
             {
                 break 'choose Some((own_offset, ts));
             }
@@ -655,9 +666,10 @@ impl CmafTimeline {
                             Track::Video => 3_003,
                             Track::Audio => 1_920,
                         };
-                        // Not for a picture placed in doubt either: the
-                        // next picture is judged by where it landed.
-                        let ts = match continue_at.filter(|&c| !placing_in_doubt && circ(c, newest) > 0) {
+                        // A picture placed in doubt too: the next is judged
+                        // by where it would have landed on the programme's
+                        // offset, and goes on there with the gap or back.
+                        let ts = match continue_at.filter(|&c| circ(c, newest) > 0) {
                             Some(c) => c,
                             None => (newest + me.step(default_step)) & MASK_33,
                         };

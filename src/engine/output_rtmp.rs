@@ -4257,29 +4257,31 @@ mod flv_timestamp_tests {
     /// clock — one input whose video PID stopped, or an audio-only backup
     /// the ingress rewriter put on the main's clock — and then its audio
     /// stops too, for 1.1 s to 2.9 s with no silence laid, before the whole
-    /// source comes back on that clock picture first. The picture goes out
-    /// at its own time, and every frame of its audio is sent. The picture
-    /// used to be placed in doubt one step past its old one, 6 s behind the
-    /// audio; its audio joined it there and was dropped as behind what had
-    /// been sent.
+    /// source comes back on that clock picture first. Every frame of its
+    /// audio is sent at its own time; its first picture goes out where the
+    /// audio stopped (in doubt: as far as the timeline can tell, a stray
+    /// timestamp), and the rest at their own time. The picture used to be
+    /// placed one step past its old one, 6 s behind the audio; its audio
+    /// joined it there and was dropped as behind what had been sent.
     #[test]
-    fn a_picture_back_after_a_hole_in_the_audio_goes_out_at_its_own_time() {
+    fn a_picture_back_after_a_hole_in_the_audio_keeps_its_audio() {
         for hole in [99_000, 135_000, 180_000, 261_000] {
             let mut tl = FlvTimeline::new("o");
-            let play = |tl: &mut FlvTimeline, from: u64| {
+            let play = |tl: &mut FlvTimeline, from: u64, first: Option<u64>| {
                 for (track, t) in programme(90_000) {
-                    let t = from + t;
+                    let src = from + t;
                     if track == Track::Video {
-                        let p = tl.video(t, None, true).unwrap();
-                        assert_eq!(p.dts, LAP_90K + t, "{hole}: the picture at {t}");
+                        let p = tl.video(src, None, true).unwrap();
+                        let want = first.filter(|_| t == 0).unwrap_or(src);
+                        assert_eq!(p.dts, LAP_90K + want, "{hole}: the picture at {src}");
                     } else {
-                        let at = tl.audio(t);
-                        assert_eq!(at, LAP_90K + t, "{hole}: the audio at {t}");
-                        assert!(tl.audio_tag_ms(at).is_some(), "{hole}: the audio at {t} sent");
+                        let at = tl.audio(src);
+                        assert_eq!(at, LAP_90K + src, "{hole}: the audio at {src}");
+                        assert!(tl.audio_tag_ms(at).is_some(), "{hole}: the audio at {src} sent");
                     }
                 }
             };
-            play(&mut tl, T0);
+            play(&mut tl, T0, None);
             let mut a = T0 + 90_000;
             while a < T0 + 6 * 90_000 {
                 let at = tl.audio(a);
@@ -4287,8 +4289,76 @@ mod flv_timestamp_tests {
                 assert!(tl.audio_tag_ms(at).is_some());
                 a += 1_920;
             }
-            play(&mut tl, a + hole);
-            assert_eq!(tl.jumps, 0, "{hole}: the source never jumped");
+            play(&mut tl, a + hole, Some(a));
+        }
+    }
+
+    /// The same, but the source comes back with its clock 4 s to 9.5 s
+    /// behind where it was — the main's encoder restarted, the ingress
+    /// rewriter bridging the step it did not see — while an audio-only
+    /// backup ran 12 s on in its place on that clock. The picture goes
+    /// beside the audio, its audio joins it, and every frame is sent in the
+    /// source's A/V relation. Kept as a gap at its own time, behind the
+    /// audio, the picture left its audio to open an offset of its own beside
+    /// the audio sent: the video 4 s or more behind its audio for good.
+    #[test]
+    fn a_picture_back_on_a_clock_behind_the_audio_goes_beside_it() {
+        for behind in [360_000, 540_000, 855_000] {
+            let mut tl = FlvTimeline::new("o");
+            for (track, t) in programme(90_000) {
+                if track == Track::Video {
+                    tl.video(T0 + t, None, true);
+                } else {
+                    tl.audio(T0 + t);
+                }
+            }
+            let mut a = T0 + 90_000;
+            while a < T0 + 13 * 90_000 {
+                let at = tl.audio(a);
+                assert!(tl.audio_tag_ms(at).is_some());
+                a += 1_920;
+            }
+            for (track, t) in programme(90_000) {
+                let src = a - behind + t;
+                if track == Track::Video {
+                    tl.video(src, None, true);
+                } else {
+                    let at = tl.audio(src);
+                    assert!(tl.audio_tag_ms(at).is_some(), "{behind}: the audio at {src} sent");
+                }
+            }
+            // The last frame at 88 320, the last picture at 86 400.
+            let (a, v) = (tl.newest_audio().unwrap(), tl.newest_picture().unwrap());
+            assert_eq!(a as i64 - v as i64, 1_920, "{behind}: the source's A/V relation");
+        }
+    }
+
+    /// A 25 fps source whose video PID stops for 4 s while its AAC runs on,
+    /// the first picture back stamped 1.5 s to 2.9 s ahead of its time. The
+    /// pictures after it go out at their own time. Kept as a gap, the stray
+    /// left every picture after it on an offset of its own, as late.
+    #[test]
+    fn a_stray_picture_after_a_video_stall_does_not_hold_the_video_late() {
+        const STALL: u64 = T0 + 100 * STEP_25FPS;
+        for stray in [135_000, 180_000, 261_000] {
+            let mut tl = FlvTimeline::new("o");
+            let dts: Vec<u64> = (0..300)
+                .map(|k| T0 + k * STEP_25FPS)
+                .filter(|&d| !(STALL..STALL + 4 * 90_000).contains(&d))
+                .collect();
+            let audio = (0..300 * STEP_25FPS).step_by(1_920).map(|a| T0 + a);
+            for (_, picture, t) in hand_out(&dts, 1, audio, |_| 0) {
+                if !picture {
+                    assert_eq!(tl.audio(t), LAP_90K + t, "{stray}: the audio at {t}");
+                } else if t == STALL + 4 * 90_000 {
+                    tl.video(t + stray, None, true);
+                } else if t > STALL + 4 * 90_000 {
+                    let p = tl.video(t, None, true).unwrap();
+                    assert_eq!(p.dts, LAP_90K + t, "{stray}: the picture at {t}");
+                } else {
+                    tl.video(t, None, true);
+                }
+            }
         }
     }
 
