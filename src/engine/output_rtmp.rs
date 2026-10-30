@@ -824,6 +824,12 @@ const FLV_MS_90K: u64 = 90;
 /// a step past it is a jump and is continued one frame on.
 const FLV_LONE_GAP_90K: u64 = 10 * 90_000;
 
+/// The most silence one tick lays beside a picture (46 AAC frames at
+/// 48 kHz). A pause the timeline keeps (up to [`FLV_LONE_GAP_90K`]) is
+/// caught up over the next ticks, at about 46 times real time, rather than
+/// encoded in one go: 470 frames at the lone gap.
+const SILENCE_PER_TICK_90K: u64 = 90_000;
+
 /// The 64-bit value of the 33-bit `ts` that lies nearest `near`.
 fn unwrap_near(ts: u64, near: u64) -> u64 {
     let ahead = ts.wrapping_sub(near) & MASK_33;
@@ -885,8 +891,12 @@ struct FlvTimeline {
     /// The newest presentation time any picture has had: where the picture
     /// is, which silence is laid to.
     newest_picture: Option<u64>,
-    /// The newest audio time mapped, sent or not.
+    /// The newest audio time mapped, sent or not, silence on a connection
+    /// with no picture included ([`Self::silent_audio`]).
     newest_audio: Option<u64>,
+    /// The last real audio frame's source time (33 bits) and where it was
+    /// mapped: what silence with no picture beside it is measured from.
+    last_real_audio: Option<(u64, u64)>,
     /// The newest audio tag sent: one at or behind it is dropped.
     last_audio: Option<u64>,
     /// Jumps absorbed, and when one was last logged.
@@ -904,6 +914,7 @@ impl FlvTimeline {
             last_picture: None,
             newest_picture: None,
             newest_audio: None,
+            last_real_audio: None,
             last_audio: None,
             jumps: 0,
             jump_logged: None,
@@ -967,7 +978,30 @@ impl FlvTimeline {
         let at = self.map(Track::Audio, pts);
         self.epoch.get_or_insert(at);
         self.newest_audio = Some(self.newest_audio.map_or(at, |n| n.max(at)));
+        self.last_real_audio = Some((pts & MASK_33, at));
         at
+    }
+
+    /// Silence laid at `at` with no picture to lay it to, put on the audio
+    /// track as the source's clock would have stamped it, run on from the
+    /// last real frame. The timeline then judges the audio's return against
+    /// where the silence ends: on the same clock it lands there, on another
+    /// it is continued one frame past it. Left off the track, a return the
+    /// timeline continues (past the lone gap, or onto another clock) would
+    /// go one frame past the last *real* frame, behind the silence by as long
+    /// as it had run, and every frame of it be held back or dropped as
+    /// behind what had been sent. Silence behind what is mapped already is
+    /// left off: the timeline is not stepped back for it. Never anchors the
+    /// epoch.
+    fn silent_audio(&mut self, at: u64) {
+        let Some((src, real_at)) = self.last_real_audio else {
+            return;
+        };
+        if self.newest_audio.is_some_and(|n| at <= n) {
+            return;
+        }
+        let mapped = self.map(Track::Audio, src.wrapping_add(at.wrapping_sub(real_at)) & MASK_33);
+        self.newest_audio = Some(self.newest_audio.map_or(mapped, |n| n.max(mapped)));
     }
 
     /// The FLV ms of `at`, a time on this timeline.
@@ -998,6 +1032,18 @@ impl FlvTimeline {
 
     fn newest_picture(&self) -> Option<u64> {
         self.newest_picture
+    }
+
+    /// The newest picture, unless the audio has run on past it by the
+    /// timeline's cross window, which then takes the video for quiet: the
+    /// video has gone (a switch to an audio-only backup, a video PID that
+    /// stops) while the audio carried on. Silence laid to such a picture
+    /// would stop short of where the audio already is, and none be laid at
+    /// all. A source stopping whole leaves its audio near its picture, and
+    /// that picture still stops the silence.
+    fn live_picture(&self) -> Option<u64> {
+        let window = super::cmaf::timeline::CROSS_WINDOW_90K as u64;
+        self.newest_picture.filter(|&v| self.newest_audio.is_none_or(|a| a <= v.saturating_add(window)))
     }
 
     fn newest_audio(&self) -> Option<u64> {
@@ -1037,8 +1083,15 @@ fn submit_source_audio(
             input.anchor(at, rate);
         }
         Placement::FillThenSubmit { samples } => {
+            // Up to the fill cap (4 s, ~190 AAC frames) encoded at once: off
+            // the async task, as CMAF's encoding is.
             let zeros = vec![vec![0.0f32; samples as usize]; planar.len()];
-            match encoder.submit_through(stage, &zeros, rate, input.position().unwrap_or(at)) {
+            let filled = crate::timed_block_in_place!(
+                "output_rtmp.audio_gap_fill",
+                crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                { encoder.submit_through(stage, &zeros, rate, input.position().unwrap_or(at)) }
+            );
+            match filled {
                 Ok(true) => input.took(samples),
                 _ => input.refused(),
             }
@@ -1058,9 +1111,17 @@ fn submit_source_audio(
 /// Lay silence while the watchdog says real audio is absent: up to the
 /// newest picture less the video's lead over the audio, as CMAF's
 /// `encode_silence_if_needed` does. The tick is only the watchdog, so a late
-/// tick costs nothing and a stalled picture stops the silence; with no
-/// picture, one chunk a tick from the encoder's input, else from the newest
-/// audio mapped. Never before an essence has anchored the FLV epoch.
+/// tick costs nothing and a stalled picture stops the silence; at most
+/// [`SILENCE_PER_TICK_90K`] a tick, so a long pause is caught up over a few.
+/// The fill reaches as far as the timeline keeps a lone track's pause
+/// ([`FLV_LONE_GAP_90K`]), not CMAF's 4 s: a kept step past the fill's
+/// reach would re-anchor the silence at the picture with nothing laid, and
+/// a video-only source with a picture every 5 s would send no audio at
+/// all. With no picture, or one the audio has run on past
+/// ([`FlvTimeline::live_picture`]), one chunk a tick from the encoder's
+/// input, else from the newest audio mapped, and put on the timeline's audio
+/// track ([`FlvTimeline::silent_audio`]) so the audio returning is placed
+/// after it. Never before an essence has anchored the FLV epoch.
 ///
 /// The generator's own PTS starts at 0 and is not used: submitted at it, the
 /// first silent chunk anchored the encoder at 0 once a picture had anchored
@@ -1070,7 +1131,7 @@ fn lay_silence(
     encoder: &mut AudioEncoder,
     sg: &mut SilenceGenerator,
     input: &mut EncoderInputClock,
-    timeline: &FlvTimeline,
+    timeline: &mut FlvTimeline,
     output_id: &str,
 ) {
     if !timeline.anchored() || !sg.should_emit() {
@@ -1085,13 +1146,14 @@ fn lay_silence(
             );
         }
     };
-    match timeline.newest_picture() {
+    match timeline.live_picture() {
         Some(video) => {
             let target = input.silence_target(video);
-            if input.silence_start(target, rate) {
+            if input.silence_start_within(target, rate, FLV_LONE_GAP_90K) {
                 encoder.reanchor_pts();
             }
-            while let Some(at) = input.next_silence(chunk, target) {
+            let end = input.position().map_or(target, |at| target.min(at.saturating_add(SILENCE_PER_TICK_90K)));
+            while let Some(at) = input.next_silence(chunk, end) {
                 starting(sg);
                 let (planar, _) = sg.next_chunk();
                 if !encoder.submit_planar(planar, at) {
@@ -1117,6 +1179,7 @@ fn lay_silence(
             if encoder.submit_planar(planar, at) {
                 input.took(chunk);
                 input.mark_silence();
+                timeline.silent_audio(at);
             } else {
                 input.refused();
             }
@@ -2842,7 +2905,16 @@ async fn emit_silence_if_needed(
     else {
         return Ok(());
     };
-    lay_silence(encoder, sg, input, timeline, &config.id);
+    // Up to a second of AAC encoded at once, off the async task as CMAF's
+    // silence is; skipped while real audio is flowing, so that the hand-off
+    // is paid only on the ticks that may lay something.
+    if sg.should_emit() {
+        crate::timed_block_in_place!(
+            "output_rtmp.audio_silence_encode",
+            crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+            { lay_silence(encoder, sg, input, timeline, &config.id) }
+        );
+    }
     send_encoded_audio(client, encoder, timeline, sent_audio_header, None, stats, None).await
 }
 
@@ -4215,13 +4287,13 @@ mod flv_timestamp_tests {
             tl.video(P0 + k * STEP_25FPS, None, true);
         }
         let p = tl.newest_picture().unwrap();
-        lay_silence(encoder, sg, input, &tl, "o");
+        lay_silence(encoder, sg, input, &mut tl, "o");
         assert!(encoder.drain().is_empty(), "nothing to lay yet");
         assert_eq!(input.position(), Some(p), "the silence starts at the picture");
         for k in 25..50 {
             tl.video(P0 + k * STEP_25FPS, None, true);
         }
-        lay_silence(encoder, sg, input, &tl, "o");
+        lay_silence(encoder, sg, input, &mut tl, "o");
         let frames = encoder.drain();
         assert_eq!(frames.len(), 46, "46 chunks of 1 920 ticks fit in the second");
         let delay = p - frames[0].pts;
@@ -4250,13 +4322,13 @@ mod flv_timestamp_tests {
         for k in 0..100u64 {
             let pause = if k >= 50 { 3 * 90_000 } else { 0 };
             tl.video(T0 + k * STEP_25FPS + pause, None, true);
-            lay_silence(encoder, sg, input, &tl, "o");
+            lay_silence(encoder, sg, input, &mut tl, "o");
             start = start.or(input.position());
             stamps.extend(encoder.drain().into_iter().map(|f| f.pts));
             if k == 49 {
                 // The pause: the picture stands still, and so does the silence.
                 let before = input.position();
-                lay_silence(encoder, sg, input, &tl, "o");
+                lay_silence(encoder, sg, input, &mut tl, "o");
                 assert_eq!(input.position(), before);
             }
         }
@@ -4299,12 +4371,12 @@ mod flv_timestamp_tests {
         let real = stamps.len();
         assert!(real > 40);
         // The audio stops; past the grace, a second more of pictures.
-        lay_silence(encoder, sg, input, &tl, "o");
+        lay_silence(encoder, sg, input, &mut tl, "o");
         assert!(encoder.drain().is_empty(), "inside the grace");
         std::thread::sleep(std::time::Duration::from_millis(600));
         for k in 0..25 {
             tl.video(T0 + 90_000 + k * STEP_25FPS, None, true);
-            lay_silence(encoder, sg, input, &tl, "o");
+            lay_silence(encoder, sg, input, &mut tl, "o");
             stamps.extend(sent(encoder, &mut tl));
         }
         assert!(stamps.len() > real + 40, "a second of silence");
@@ -4332,6 +4404,187 @@ mod flv_timestamp_tests {
         assert!(encoder.drain().is_empty(), "held back");
         assert_eq!(input.position(), position);
         assert!(stamps.windows(2).all(|w| w[1] > w[0]), "the audio never steps back");
+    }
+
+    /// `n` real AAC frames from source time `from`, placed as the publish
+    /// loop's AAC arm places them under `silent_fallback`: on the timeline,
+    /// the watchdog and the lead told, onto the encoder's input.
+    #[cfg(feature = "fdk-aac")]
+    fn feed_real(st: &mut EncoderState, tl: &mut FlvTimeline, from: u64, n: u64) {
+        let EncoderState::Active { encoder, silence: Some(sg), input, stage, .. } = st else {
+            panic!("silent fallback builds eagerly");
+        };
+        let pcm = vec![vec![0.1f32; 1_024]; 2];
+        for j in 0..n {
+            let at = tl.audio((from + j * 1_920) & MASK_33);
+            sg.mark_real_audio(at);
+            input.mark_real_audio(at, tl.newest_picture());
+            submit_source_audio(encoder, stage, input, true, &pcm, 48_000, at, "o");
+        }
+    }
+
+    /// `ticks` silence ticks, `lay_silence` on each.
+    #[cfg(feature = "fdk-aac")]
+    fn tick_silence(st: &mut EncoderState, tl: &mut FlvTimeline, ticks: usize) {
+        let EncoderState::Active { encoder, silence: Some(sg), input, .. } = st else {
+            panic!("silent fallback builds eagerly");
+        };
+        for _ in 0..ticks {
+            lay_silence(encoder, sg, input, tl, "o");
+        }
+    }
+
+    /// The stamps of what the encoder has encoded, and of those the timeline
+    /// sends.
+    #[cfg(feature = "fdk-aac")]
+    fn drain_sent(st: &mut EncoderState, tl: &mut FlvTimeline) -> (Vec<u64>, Vec<u64>) {
+        let EncoderState::Active { encoder, .. } = st else {
+            panic!("silent fallback builds eagerly");
+        };
+        let drained: Vec<u64> = encoder.drain().into_iter().map(|f| f.pts).collect();
+        let sent = drained.iter().copied().filter(|&p| tl.audio_tag_ms(p).is_some()).collect();
+        (drained, sent)
+    }
+
+    /// An audio-only source under `silent_fallback` — no picture to lay the
+    /// silence to, so it goes in a chunk a tick from the encoder's input —
+    /// whose audio stops for 11 s and comes back on the same clock, then
+    /// for 3 s and comes back on another (a backup, a publisher reconnecting
+    /// at a reset PTS). The returning audio continues the silence, zero-filled
+    /// up to it on the same clock and one frame on across the jump, and
+    /// nothing after either return is dropped. Were the silence left off the
+    /// timeline, it would continue the return one frame past the last *real*
+    /// frame, behind the silence by as long as it ran: every frame held back
+    /// or dropped, and no audio sent for as long again.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn audio_returning_to_an_audio_only_source_continues_its_silence() {
+        let mut st = silent_fallback_state();
+        let mut tl = FlvTimeline::new("o");
+        feed_real(&mut st, &mut tl, T0, 50);
+        let (_, mut stamps) = drain_sent(&mut st, &mut tl);
+        // 11 s without audio: the grace, then a chunk on each tick of the rest.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        tick_silence(&mut st, &mut tl, 492);
+        let (drained, sent) = drain_sent(&mut st, &mut tl);
+        assert_eq!(sent, drained, "the silence sent whole");
+        assert!(sent.len() > 480, "{} silent frames", sent.len());
+        stamps.extend(sent);
+        // Back on the same clock, 11 s on: past the lone gap from the last
+        // real frame, inside the timeline's window from the silence's end.
+        feed_real(&mut st, &mut tl, T0 + 50 * 1_920 + 11 * 90_000, 50);
+        let (drained, sent) = drain_sent(&mut st, &mut tl);
+        assert_eq!(sent, drained, "nothing after the return dropped");
+        assert!(sent.len() > 70, "the fill to the return, and the return: {}", sent.len());
+        stamps.extend(sent);
+        // 3 s without audio, back on an unrelated clock.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        tick_silence(&mut st, &mut tl, 117);
+        let (drained, sent) = drain_sent(&mut st, &mut tl);
+        assert_eq!(sent, drained, "the silence sent whole");
+        stamps.extend(sent);
+        feed_real(&mut st, &mut tl, 5_000_000_000, 50);
+        let (drained, sent) = drain_sent(&mut st, &mut tl);
+        assert_eq!(sent, drained, "nothing after the jump dropped");
+        assert!(sent.len() >= 49, "{} frames after the jump", sent.len());
+        stamps.extend(sent);
+        assert!(stamps.windows(2).all(|w| w[1] - w[0] == 1_920), "one contiguous track");
+    }
+
+    /// The video stops while the audio runs on (a switch to an audio-only
+    /// backup, a video PID that stops), and then the audio stops too: the
+    /// silence follows the audio a chunk a tick, as on a source that never
+    /// had a picture. Laid to the newest picture, which the audio has long
+    /// passed, none would be laid at all. A source stopping whole — both
+    /// tracks together — still lays none past its stalled picture.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn silence_follows_the_audio_once_the_video_has_gone() {
+        let mut st = silent_fallback_state();
+        let mut tl = FlvTimeline::new("o");
+        for (track, t) in programme(90_000) {
+            match track {
+                Track::Video => {
+                    tl.video(T0 + t, None, true);
+                }
+                Track::Audio => feed_real(&mut st, &mut tl, T0 + t, 1),
+            }
+        }
+        let (_, mut stamps) = drain_sent(&mut st, &mut tl);
+        // Both tracks stop: nothing past the stalled picture.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        tick_silence(&mut st, &mut tl, 25);
+        assert!(drain_sent(&mut st, &mut tl).0.is_empty(), "a stalled picture stops the silence");
+        // The audio comes back alone, where it stopped, and runs 5 s on.
+        feed_real(&mut st, &mut tl, T0 + 47 * 1_920, 235);
+        stamps.extend(drain_sent(&mut st, &mut tl).1);
+        // And stops: past the grace, a chunk a tick.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        tick_silence(&mut st, &mut tl, 50);
+        let (drained, sent) = drain_sent(&mut st, &mut tl);
+        assert_eq!(sent, drained);
+        assert!(sent.len() >= 48, "{} silent frames on 50 ticks", sent.len());
+        stamps.extend(sent);
+        assert!(stamps.windows(2).all(|w| w[1] - w[0] == 1_920), "the silence continues the audio");
+    }
+
+    /// A video-only source with a picture every 5 s (a slide feed, a
+    /// timelapse camera): the FLV timeline keeps each step (a lone track's
+    /// gap, up to 10 s), and the silence fills it to the picture. Filled no
+    /// further than the 4 s a CMAF fill covers, each picture would re-anchor
+    /// the silence at itself with nothing laid, and the connection never
+    /// send an audio tag, the sequence header included.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn silence_fills_a_video_only_source_whose_pictures_are_seconds_apart() {
+        let mut st = silent_fallback_state();
+        let mut tl = FlvTimeline::new("o");
+        let (mut drained, mut sent) = (Vec::new(), Vec::new());
+        let mut start = None;
+        for k in 0..6u64 {
+            tl.video(T0 + k * 5 * 90_000, None, true);
+            tick_silence(&mut st, &mut tl, 10);
+            let EncoderState::Active { input, .. } = &st else { unreachable!() };
+            start = start.or(input.position());
+            let (d, s) = drain_sent(&mut st, &mut tl);
+            drained.extend(d);
+            sent.extend(s);
+        }
+        assert!(sent.len() > 1_100, "{} silent frames for 25 s", sent.len());
+        assert!(drained.windows(2).all(|w| w[1] - w[0] == 1_920), "one contiguous track");
+        let delay = start.unwrap() - drained[0];
+        let end = drained.last().unwrap() + 1_920 + delay;
+        let newest = tl.newest_picture().unwrap();
+        assert!(end <= newest && newest - end < 1_920, "laid to the picture: {end} vs {newest}");
+    }
+
+    /// One tick lays at most a second of silence: a pause the timeline keeps
+    /// (3 s here; up to 10 s on a video-only source) is caught up over the
+    /// next few ticks, each a bounded piece of work, rather than encoded at
+    /// once — 140 AAC frames on one tick here, 470 at the lone gap.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn one_tick_lays_at_most_a_second_of_silence() {
+        let mut st = silent_fallback_state();
+        let mut tl = FlvTimeline::new("o");
+        for k in 0..25 {
+            tl.video(T0 + k * STEP_25FPS, None, true);
+        }
+        tick_silence(&mut st, &mut tl, 1);
+        tl.video(T0 + 24 * STEP_25FPS + 3 * 90_000, None, true);
+        let mut per_tick = Vec::new();
+        let mut stamps = Vec::new();
+        for _ in 0..5 {
+            tick_silence(&mut st, &mut tl, 1);
+            let (drained, _) = drain_sent(&mut st, &mut tl);
+            per_tick.push(drained.len());
+            stamps.extend(drained);
+        }
+        assert!(per_tick.iter().all(|&n| n <= 47), "frames encoded per tick: {per_tick:?}");
+        assert!(stamps.windows(2).all(|w| w[1] - w[0] == 1_920), "one contiguous track");
+        let EncoderState::Active { input, .. } = &st else { unreachable!() };
+        let (at, newest) = (input.position().unwrap(), tl.newest_picture().unwrap());
+        assert!(at <= newest && newest - at < 1_920, "caught up: {at} vs {newest}");
     }
 
     /// MP2 packs several frames into a PES (four here, 8 640 ticks), each

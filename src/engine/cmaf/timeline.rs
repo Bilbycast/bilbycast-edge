@@ -127,8 +127,11 @@ const OWN_WINDOW_90K: i64 = 90_000;
 /// How far (90 kHz) a timestamp may sit from the *other* track's newest and
 /// still be on the programme's clock: 3 s, past the video lead of a hardware
 /// encoder (the witness source runs ~1.1 s) with room to spare, and three
-/// orders of magnitude inside any clip loop or clock change.
-const CROSS_WINDOW_90K: i64 = 3 * 90_000;
+/// orders of magnitude inside any clip loop or clock change. A track that has
+/// come this far since the other's last timestamp has the other gone quiet;
+/// the RTMP output's silence takes a picture the audio has run this far past
+/// for one that has gone (`output_rtmp::FlvTimeline::live_picture`).
+pub(crate) const CROSS_WINDOW_90K: i64 = 3 * 90_000;
 
 /// Offsets remembered, newest last. A source coming back from an excursion
 /// finds the offset it had; more than a handful of live timelines at once

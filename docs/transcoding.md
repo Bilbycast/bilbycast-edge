@@ -413,13 +413,18 @@ the audio timeline pins to 0 while video runs on the source clock. So
 an RTMP output that connects *before* any essence arrives opens
 video-only rather than emitting silence from t≈0, which is what it used
 to do. For the headline case here (a genuinely video-only source) video
-anchors the epoch on its first access unit and the silent track starts
-at that picture's time, less the encoder's delay, as soon as the next
-picture arrives — so the exposed window is publish-to-first-essence
-only. Until edge#211 it started at 0 instead: once a picture had
-anchored the epoch, the first silent chunk anchored the encoder at 0,
-and every silent tag went out at 0 for as long as the source's PTS
-stood above it.
+anchors the epoch on its first access unit, and the first silence tick
+after it (ticks run every ~21 ms) starts the silent track at the newest
+picture's time — the first picture's, unless another arrived within the
+tick — less the encoder's delay, laid as the pictures move on; so the
+exposed window is publish-to-first-essence only. A silent frame that
+delay puts before the epoch is dropped, as any audio before the epoch
+is: where the epoch is that picture's own time (a source without
+B-frames, whose decode time is its presentation time) the track's first
+tag lands within a frame after it. Until edge#211 it started at 0
+instead: once a picture had anchored the epoch, the first silent chunk
+anchored the encoder at 0, and every silent tag went out at 0 for as
+long as the source's PTS stood above it.
 
 Required whenever:
 
@@ -453,11 +458,21 @@ built at the declared rate and rebuilt, with a resampler, on the first
 real frame whose rate or channel count differs — a 44.1 kHz source
 through a 48 kHz encoder used to run 8.8 % slow. On RTMP (since
 edge#211) the measure is the connection's FLV timeline, the encoder's
-channel / rate stage converts the source instead of a rebuild, and a
-connection with no picture to measure against (an audio-only source
-whose audio has stopped) gets one chunk a tick from where the encoder's
-input is; RTMP's silence used to be one chunk a tick, wall-clock, and
-every tick observed late was lost for good. The same placement
+channel / rate stage converts the source instead of a rebuild, and two
+things differ from CMAF. A tick lays at most a second of silence, off
+the connection's async task, so a longer stretch is caught up over the
+next few ticks rather than encoded at once; and the fill reaches as far
+as the timeline keeps a pause — 10 s on a video-only source, where
+CMAF's fill stops at 4 s. A connection with no picture to measure
+against — an audio-only source whose audio has stopped, or a source
+whose video stopped while its audio ran on more than 3 s past it — gets
+one chunk a tick from where the encoder's input is, and that silence
+goes on the timeline as audio: audio returning on the same clock lands
+where it ends, the stretch the grace and any late tick held it back
+zero-filled (up to 4 s; past that the encoder re-anchors forward on the
+returning audio), and audio returning on another clock is continued one
+frame past it. RTMP's silence used to be one chunk a tick, wall-clock,
+and every tick observed late was lost for good. The same placement
 re-anchors RTMP's transcoded audio at a loop, a switch or a gap whether
 or not `silent_fallback` is set: the encoder used to anchor on its first
 frame and count samples for the life of the connection, so a loop whose

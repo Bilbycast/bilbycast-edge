@@ -1469,10 +1469,21 @@ impl EncoderInputClock {
     /// follows rather than chases). Returns whether it anchored, so the
     /// caller re-anchors the encoder too.
     pub(crate) fn silence_start(&mut self, target: u64, rate: u32) -> bool {
+        self.silence_start_within(target, rate, SILENCE_FILL_CAP_TICKS)
+    }
+
+    /// [`Self::silence_start`] with the fill's reach `cap` the caller's: the
+    /// furthest the target may run ahead of the input and still be filled.
+    /// CMAF's timeline closes a forward step past a second, so its fill cap
+    /// is [`SILENCE_FILL_CAP_TICKS`]; an RTMP connection's keeps a lone
+    /// track's pause up to 10 s, and capped at 4 s the silence beside a
+    /// source with a picture every 5 s would re-anchor at each picture and
+    /// lay nothing at all.
+    pub(crate) fn silence_start_within(&mut self, target: u64, rate: u32, cap: u64) -> bool {
         self.set_rate(rate);
         let anchor = match self.position().filter(|_| !self.stale) {
             None => true,
-            Some(at) => target.saturating_sub(at) > SILENCE_FILL_CAP_TICKS,
+            Some(at) => target.saturating_sub(at) > cap,
         };
         if anchor {
             self.anchor(target, rate);
