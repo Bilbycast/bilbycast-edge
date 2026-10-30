@@ -1645,7 +1645,8 @@ fn write_progressive_audio_trak(
 mod tests {
     use super::*;
 
-    /// A single-set track writes the init it always wrote, byte for byte.
+    /// A single-set track writes the init it always wrote, byte for byte —
+    /// except the `hvcC` header edge#211 corrects.
     ///
     /// Load-bearing: a restart compares this run's init with the one the
     /// origin holds (`restored_init_differs`), and an init that differs opens
@@ -1655,6 +1656,13 @@ mod tests {
     /// tracks carried more than one parameter set of a kind (edge#204), from
     /// real parameter sets: the sky-witness capture's H.264 SPS / PPS and the
     /// 770_H capture's HEVC VPS / SPS / PPS0.
+    ///
+    /// The H.264 inits are unchanged. The HEVC ones differ in the 22 bytes of
+    /// the `hvcC` header alone, which used to be read off the raw SPS at fixed
+    /// offsets (Main 10 came out as profile byte 0x01, level 0, 8-bit) and is
+    /// now read from its RBSP: with the old 22 bytes put back each hashes as
+    /// main's did, so nothing else moved. That one change opens one new init
+    /// generation per HEVC output at the upgrade.
     ///
     /// Both ways a passthrough track can be built are held to it: the
     /// single-set constructors, and the production path — the access unit
@@ -1738,30 +1746,42 @@ mod tests {
                 "ac971fbd6ca05e73fd8182db53978a36795f327de98152bef183259e33f58e18",
             );
         }
+        // 770_H's hvcC header as it was written, and as it is now.
+        let old_header = hx("01010220000003006000000300f000fcfdf8f800000f");
+        let new_header = hx("0102200000006000000000007bf000fcfdfafa00000f");
         for (path, t) in ["from_h265", "collected"].iter().zip(&h265) {
             assert_eq!((t.width, t.height), (1920, 544), "{path}");
-            let check = |name: &str, bytes: Vec<u8>, want: &str| {
-                assert_eq!(sha(&bytes), want, "{path}: {name} differs from main's");
+            let check = |name: &str, bytes: Vec<u8>, main: &str, now: &str| {
+                let at = bytes.windows(4).position(|w| w == b"hvcC").expect("hvcC") + 4;
+                assert_eq!(bytes[at..at + 22], new_header[..], "{path}: {name}: the hvcC header");
+                let mut was = bytes.clone();
+                was[at..at + 22].copy_from_slice(&old_header);
+                assert_eq!(sha(&was), main, "{path}: {name} differs from main's past the hvcC header");
+                assert_eq!(sha(&bytes), now, "{path}: {name}");
             };
             check(
                 "video",
                 build_init_segment(t, None),
                 "8b261b53e9d94f787c98f1ba9df106ce404c378e6da968018d5fa4612aff72b8",
+                "4623e881dffe87c2c844f04b85d679a268ded9a30c1fe9bfafdd04197704084e",
             );
             check(
                 "video + AAC",
                 build_init_segment(t, Some(&aac)),
                 "2e755484998164e7c13a7b12f590a27f850874906451ed00bfdbeacf3b0d9ef7",
+                "8ea6816fdb5732c7d1a2b0b29df94fc77c17fedd6afed268a9b6ddcba4ba84e8",
             );
             check(
                 "cbcs video",
                 build_encrypted_init_segment(t, None, &cbcs),
                 "d950c58004de290d91decb56f7f20f11ff8f00e10b8f6ca87d915018c01aadb4",
+                "31380df53cddf2199e366467bdd86f3e990df3818e404bf6b65e423cf02ae6b5",
             );
             check(
                 "progressive",
                 build_progressive_mp4(t, &samples, None, &[]),
                 "a8531d26f85ced6020d7ff1182ffca3f639492370990ef9545539c9e5cb09537",
+                "b7d0f2b67bd1cbe213638ab3c2925e05f3ab1484a533ffd4f7b20e50b7d3efe1",
             );
         }
 

@@ -673,16 +673,40 @@ is a record a strict decoder may refuse whole. So is one over 65 535 bytes,
 which a configuration record's 16-bit length cannot describe (a real one is a
 few hundred bytes at most).
 
-The configuration record's profile / level header bytes, the track's
-dimensions and the DASH `@codecs` string are read from the **lowest-id
-SPS**. That is the only SPS on almost every source; see [Known
-limitations](#known-limitations) for a source with several.
+The `avcC` profile / compatibility / level bytes, the track's dimensions and
+the DASH `@codecs` string are read from the **lowest-id SPS**. That is the
+only SPS on almost every source; see [Known limitations](#known-limitations)
+for a source with several.
 
-A single-set source writes the init it always wrote, byte for byte (a test pins the SHA-256 of each init against the
-builder before this change), so an upgrade opens no new generation on a
-running stream. A multi-set source's init differs, so its first run on the
-new edge opens one, with `#EXT-X-DISCONTINUITY` at the join; the rows
-restored from before it keep the init they name, which never decoded.
+The **`hvcC` header** describes every set the record carries, as ISO/IEC
+14496-15 asks and FFmpeg's `hvcc_parse_vps` does: the highest tier and the
+highest level within it, the highest profile, the AND of the compatibility
+and constraint flags, the largest chroma format, bit depths and temporal
+sub-layer count, nested only if every SPS is — each read from the SPS's (and
+VPS's) RBSP, emulation-prevention bytes removed. For one SPS the header is
+FFmpeg's. Until edge#211 it was read off the raw SPS at fixed offsets, one
+byte early and ahead of the emulation-prevention bytes, with 4:2:0 at 8 bits
+written whatever the source: 770_H's Main 10, level 4.1 went out as profile
+byte 0x01, compatibility 0x02200000, level 0. FFmpeg skips those bytes; a
+player that reads them was told wrong. The same record builder writes the
+RTMP output's `SequenceStart` (with no array marked complete, since RTMP
+keeps the sets in-band) and the replay MP4 export's `hvcC`.
+
+A single-set H.264 source writes the init it always wrote, byte for byte (a
+test pins the SHA-256 of each init against the builder before this change),
+so an upgrade opens no new generation on a running stream. A multi-set
+source's init differs, so its first run on the new edge opens one, with
+`#EXT-X-DISCONTINUITY` at the join; the rows restored from before it keep
+the init they name, which never decoded.
+
+Every **HEVC** output — passthrough or `video_encode` — writes a different
+init at its first start after the edge#211 upgrade: the 22 bytes of the
+`hvcC` header and nothing else (the same test puts the old bytes back and
+gets the old hash). So it opens one new init generation there: a running
+DVR stream sees one `#EXT-X-DISCONTINUITY`, rows on each side naming their
+own init with a per-row `#EXT-X-MAP`, and a DVR clip whose window straddles
+it is cut exactly from the recording, or refused on the whole-segment
+fallback, which cannot span two inits.
 
 What it does not cover:
 
@@ -1692,8 +1716,9 @@ should set up a URL-rewriting reverse proxy in front of their ingest.
 
 - **Unit tests** (`cargo test cmaf::`): 156 tests covering `BoxWriter`
   round-trips, `avcC` / `hvcC` / `esds` shape (every parameter set, one entry
-  per id, and a single-set init pinned byte for byte to the builder before
-  edge#204), the parameter-set table and its id parsers (`param_sets`, and
+  per id, the `hvcC` header read from the RBSP, and a single-set init pinned
+  byte for byte to the builder before edge#204 — HEVC's but for that
+  header), the parameter-set table and its id parsers (`param_sets`, and
   `param_set_tests`, which drives the 770_H case and source switches through
   the segmenter), SPS resolution parsing,
   m3u8 and MPD golden files, media-segment `data_offset` patching,
@@ -1812,14 +1837,16 @@ backward decode steps to none.
   own PPS rather than the demuxer's look-ahead. Following both needs in-band
   parameter sets (`avc3` / `hev1` sample entries), which iOS Safari refuses
   for HEVC (see [HEVC `hvc1` vs `hev1`](#hevc-hvc1-vs-hev1)).
-- **A source with several SPS is described by its lowest-id one.** The
-  `avcC` / `hvcC` profile, tier, level and compatibility bytes and the DASH
-  `@codecs` string are read from the lowest-id SPS. For `avcC` that is what
-  FFmpeg does; for `hvcC`, ISO/IEC 14496-15 asks for the highest level and
-  tier and the AND of the compatibility flags across every SPS, so an HEVC
-  source whose SPS differ in level is under-declared there. Every SPS is in
-  the record, and the decoder configures itself from the one each picture
-  names.
+- **A source with several SPS: `avcC` and `@codecs` read the lowest-id
+  one.** The `avcC` profile, compatibility and level bytes and the DASH
+  `@codecs` string are read from the lowest-id SPS — for `avcC`, what FFmpeg
+  does. The `hvcC` header describes every SPS and VPS as ISO/IEC 14496-15
+  asks (see [Every parameter set, by id](#every-parameter-set-by-id)). The
+  HEVC `@codecs` string is still read from the raw SPS bytes at the offsets
+  the `hvcC` header used before edge#211, so the two can disagree: 770_H's
+  MPD says `hvc1.1.2200000.L0` where its `hvcC` says Main 10, level 123.
+  Every SPS is in the record, and the decoder configures itself from the one
+  each picture names.
 - **The RTSP input carries no DTS.** It muxes each camera frame with DTS =
   PTS (RTP carries presentation times only), so a camera that codes B-frames
   arrives with its pictures' decode order lost and a passthrough CMAF output

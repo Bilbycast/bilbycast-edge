@@ -1,14 +1,21 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! CMAF codec-metadata box writers: `avcC` (H.264 config), `esds` (AAC
-//! descriptor chain). HEVC `hvcC` is a Phase 2 follow-up.
+//! CMAF codec-metadata box writers: `avcC` (H.264 config), `hvcC` (HEVC
+//! config), `esds` (AAC descriptor chain), `dac3` / `dec3`.
+//!
+//! The two decoder configuration records themselves are built by
+//! [`push_avcc_record`] and [`push_hvcc_record`], which RTMP shares: its FLV
+//! AVC sequence header and Enhanced-RTMP `SequenceStart` carry the same
+//! records, passthrough and re-encode alike, so the `hvcC` header is read from
+//! the SPS RBSP in one place (edge#211).
 //!
 //! Also includes a minimal H.264 SPS parser for extracting resolution
 //! (width x height) to populate `tkhd` / `mvhd` / `visual_sample_entry`
 //! dimension fields.
 
 use super::box_writer::BoxWriter;
+use super::nalu::{H265_NAL_PPS, H265_NAL_SPS, H265_NAL_VPS};
 use super::param_sets::ParamSet;
 
 // ────────────────────────────────────────────────────────────────────────
@@ -16,7 +23,17 @@ use super::param_sets::ParamSet;
 // ────────────────────────────────────────────────────────────────────────
 
 /// Write an `avcC` (AVC Decoder Configuration Record) box inside the
-/// parent (typically an `avc1` sample entry).
+/// parent (typically an `avc1` sample entry): the record
+/// [`push_avcc_record`] builds.
+pub fn write_avcc(parent: &mut BoxWriter<'_>, sps_list: &[ParamSet], pps_list: &[ParamSet]) {
+    let mut record = Vec::new();
+    push_avcc_record(&mut record, sps_list, pps_list);
+    let mut b = parent.child(*b"avcC");
+    b.bytes(&record);
+}
+
+/// Append an AVC Decoder Configuration Record to `out` — the body of a CMAF
+/// `avcC` box and of an FLV AVC sequence header.
 ///
 /// Layout (ISO/IEC 14496-15 §5.3.3.1.2):
 /// - `configurationVersion (u8)` — always 1.
@@ -40,38 +57,38 @@ use super::param_sets::ParamSet;
 /// (For profiles 100/110/122/244/44 the spec adds three more bytes —
 /// `chroma_format_idc`, `bit_depth_luma_minus8`, `bit_depth_chroma_minus8` —
 /// but most browsers tolerate the short form for those profiles and we
-/// defer that extension to when we need 10-bit HDR.)
-pub fn write_avcc(parent: &mut BoxWriter<'_>, sps_list: &[ParamSet], pps_list: &[ParamSet]) {
-    let mut b = parent.child(*b"avcC");
+/// defer that extension to when we need 10-bit HDR. RTMP goes without it
+/// too: ffmpeg's avcC parser, nginx-rtmp, flv.js and the edge's own RTMP
+/// input all skip whatever follows the PPS, the SPS carries the same fields,
+/// and adding it would change the header of every clean High-profile source.
+/// Should a receiver ever need it, it belongs here behind a flag, since CMAF
+/// and RTMP share this record.)
+pub(crate) fn push_avcc_record(out: &mut Vec<u8>, sps_list: &[ParamSet], pps_list: &[ParamSet]) {
     let sps: &[u8] = sps_list.first().map_or(&[], |s| &s.nal);
     if sps.len() < 4 {
         // Can't derive profile/level; emit a zeroed config. This should
         // never happen because validation requires a source SPS.
-        b.u8(1);
-        b.u8(0);
-        b.u8(0);
-        b.u8(0);
-        b.u8(0xFF); // lengthSizeMinusOne = 3
-        b.u8(0xE0); // numOfSequenceParameterSets = 0
-        b.u8(0); // numOfPictureParameterSets = 0
+        // configurationVersion 1, profile / compat / level 0,
+        // lengthSizeMinusOne 3, no SPS, no PPS.
+        out.extend_from_slice(&[1, 0, 0, 0, 0xFF, 0xE0, 0]);
         return;
     }
-    b.u8(1); // configurationVersion
-    b.u8(sps[1]); // profile
-    b.u8(sps[2]); // compat
-    b.u8(sps[3]); // level
-    b.u8(0xFF); // reserved(6)='111111'b | lengthSizeMinusOne=3
+    out.push(1); // configurationVersion
+    out.push(sps[1]); // profile
+    out.push(sps[2]); // compat
+    out.push(sps[3]); // level
+    out.push(0xFF); // reserved(6)='111111'b | lengthSizeMinusOne=3
     let sps_list = &sps_list[..sps_list.len().min(31)];
     let pps_list = &pps_list[..pps_list.len().min(255)];
-    b.u8(0xE0 | sps_list.len() as u8); // reserved(3)='111'b | numOfSequenceParameterSets
+    out.push(0xE0 | sps_list.len() as u8); // reserved(3)='111'b | numOfSequenceParameterSets
     for s in sps_list {
-        b.u16(s.nal.len() as u16);
-        b.bytes(&s.nal);
+        out.extend_from_slice(&(s.nal.len() as u16).to_be_bytes());
+        out.extend_from_slice(&s.nal);
     }
-    b.u8(pps_list.len() as u8); // numOfPictureParameterSets
+    out.push(pps_list.len() as u8); // numOfPictureParameterSets
     for p in pps_list {
-        b.u16(p.nal.len() as u16);
-        b.bytes(&p.nal);
+        out.extend_from_slice(&(p.nal.len() as u16).to_be_bytes());
+        out.extend_from_slice(&p.nal);
     }
 }
 
@@ -185,8 +202,9 @@ pub fn parse_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
 /// byte stripping. Not a full RBSP parser — just enough to walk an H.264
 /// SPS to the resolution fields.
 ///
-/// Also reused by the HEVC SPS parser in `fmp4.rs` for `hvcC` creation, and
-/// by `param_sets` to read each parameter set's id.
+/// Also reused by the HEVC SPS parser in `fmp4.rs` for the track's
+/// dimensions, by the `hvcC` header reader below, and by `param_sets` to read
+/// each parameter set's id.
 pub(super) struct BitReader<'a> {
     data: &'a [u8],
     /// Index of the next raw (pre-EPB-stripping) byte in `data`.
@@ -315,116 +333,279 @@ impl<'a> BitReader<'a> {
 // ────────────────────────────────────────────────────────────────────────
 
 /// Write an `hvcC` (HEVC Decoder Configuration Record) box inside the
-/// parent (typically an `hvc1` or `hev1` sample entry).
-///
-/// Layout (ISO/IEC 14496-15 §8.3.3.1.2). We emit `hvc1`-flavoured:
-/// parameter sets live in the init only (not in-band), which matches
-/// what Safari prefers. The resulting record works for Shaka, hls.js,
-/// ExoPlayer, and most CDN ingests.
-///
-/// Because parsing the full HEVC profile/tier/level bitstream requires
-/// a substantial amount of bit-reader logic, we take a pragmatic
-/// shortcut for Phase 2: we extract the load-bearing bytes directly
-/// from the SPS (profile_tier_level starts at SPS byte 2 after the NAL
-/// header) and leave the remaining fields at conservative defaults.
-/// Players derive the actual profile/level from the decoded SPS inside
-/// the array of VPS/SPS/PPS that hvcC embeds, so the cover-page bytes
-/// only need to be *consistent* with the embedded SPS, not verbatim.
-///
-/// Each array carries every parameter set given, in id order — a slice
-/// may name any PPS, and `array_completeness` = 1 below promises an `hvc1`
-/// decoder that every one it needs is here. The header bytes come from the
-/// first SPS (the lowest id) alone; ISO/IEC 14496-15 asks for the highest
-/// level and tier, and the AND of the compatibility flags, across every SPS,
-/// which a source with more than one SPS of different levels does not get
-/// (docs/cmaf.md, Known limitations). With one of each the record is the
-/// single-entry one this writer always wrote.
+/// parent (typically an `hvc1` sample entry): the record
+/// [`push_hvcc_record`] builds, every array marked complete. An `hvc1` sample
+/// carries no parameter set of its own (`nalu::filter_frame_nalus_h265`), so
+/// the promise holds: every one a slice can name is in the arrays.
 pub fn write_hvcc(
     parent: &mut BoxWriter<'_>,
     vps_list: &[ParamSet],
     sps_list: &[ParamSet],
     pps_list: &[ParamSet],
 ) {
+    let mut record = Vec::new();
+    push_hvcc_record(&mut record, vps_list, sps_list, pps_list, true);
     let mut b = parent.child(*b"hvcC");
-    let sps: &[u8] = sps_list.first().map_or(&[], |s| &s.nal);
-    // configurationVersion(8) = 1
-    b.u8(1);
-
-    // Extract profile_tier_level fields from SPS when possible.
-    // HEVC SPS layout (ITU-T H.265 §7.3.2.2.1):
-    //   NAL header (2 bytes)
-    //   sps_video_parameter_set_id(4) | sps_max_sub_layers_minus1(3) | sps_temporal_id_nesting_flag(1)
-    //   profile_tier_level(12 bytes common).
-    // Index 2 is the first byte of profile_tier_level.
-    let (profile_space_tier_profile, profile_compat, constraint, level) =
-        if sps.len() >= 15 {
-            // Byte 2: general_profile_space(2) | general_tier_flag(1) | general_profile_idc(5)
-            let ptl = sps[2];
-            // Bytes 3..7 = general_profile_compatibility_flag (32 bits)
-            let compat = u32::from_be_bytes([sps[3], sps[4], sps[5], sps[6]]);
-            // Bytes 7..13 = constraint_indicator_flags (48 bits).  We
-            // pack the lower 48 of a u64.
-            let c0 = sps[7] as u64;
-            let c1 = sps[8] as u64;
-            let c2 = sps[9] as u64;
-            let c3 = sps[10] as u64;
-            let c4 = sps[11] as u64;
-            let c5 = sps[12] as u64;
-            let constraint: u64 =
-                (c0 << 40) | (c1 << 32) | (c2 << 24) | (c3 << 16) | (c4 << 8) | c5;
-            // Byte 13 = general_level_idc
-            let level = sps[13];
-            (ptl, compat, constraint, level)
-        } else {
-            // Defaults: Main profile, Main tier, level 4.1 (common 1080p30).
-            (0x01, 0x6000_0000, 0u64, 0x7B)
-        };
-
-    // general_profile_space(2) | general_tier_flag(1) | general_profile_idc(5)
-    b.u8(profile_space_tier_profile);
-    // general_profile_compatibility_flags(32)
-    b.u32(profile_compat);
-    // general_constraint_indicator_flags(48)
-    b.u8(((constraint >> 40) & 0xFF) as u8);
-    b.u8(((constraint >> 32) & 0xFF) as u8);
-    b.u8(((constraint >> 24) & 0xFF) as u8);
-    b.u8(((constraint >> 16) & 0xFF) as u8);
-    b.u8(((constraint >> 8) & 0xFF) as u8);
-    b.u8((constraint & 0xFF) as u8);
-    // general_level_idc(8)
-    b.u8(level);
-
-    // reserved(4)=1111 | min_spatial_segmentation_idc(12). Zero is valid.
-    b.u16(0xF000);
-    // reserved(6)=111111 | parallelismType(2). Zero = unknown.
-    b.u8(0xFC);
-    // reserved(6)=111111 | chromaFormat(2). 0x01 = 4:2:0, 0x02 = 4:2:2.
-    // Most broadcast uses 4:2:0.
-    b.u8(0xFD);
-    // reserved(5)=11111 | bitDepthLumaMinus8(3). 8-bit default.
-    b.u8(0xF8);
-    // reserved(5)=11111 | bitDepthChromaMinus8(3). 8-bit default.
-    b.u8(0xF8);
-    // avgFrameRate(16) — 0 = unknown.
-    b.u16(0);
-    // constantFrameRate(2) | numTemporalLayers(3) | temporalIdNested(1) | lengthSizeMinusOne(2)
-    //   = 0b00 | 0b001 | 0b1 | 0b11 = 0x0F
-    b.u8(0x0F);
-
-    // numOfArrays(8) — three arrays: VPS, SPS, PPS.
-    b.u8(3);
-    write_hvcc_array(&mut b, 32, vps_list); // VPS
-    write_hvcc_array(&mut b, 33, sps_list); // SPS
-    write_hvcc_array(&mut b, 34, pps_list); // PPS
+    b.bytes(&record);
 }
 
-fn write_hvcc_array(b: &mut BoxWriter<'_>, nal_unit_type: u8, nalus: &[ParamSet]) {
-    // array_completeness(1)=1 | reserved(1)=0 | NAL_unit_type(6)
-    b.u8(0x80 | (nal_unit_type & 0x3F));
-    b.u16(nalus.len() as u16);
-    for nalu in nalus {
-        b.u16(nalu.nal.len() as u16);
-        b.bytes(&nalu.nal);
+/// The general part of an H.265 `profile_tier_level` (§7.3.3): what an
+/// `hvcC` header carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct GeneralPtl {
+    /// `general_profile_space`, two bits.
+    pub(super) profile_space: u8,
+    pub(super) tier: bool,
+    /// `general_profile_idc`, five bits.
+    pub(super) profile_idc: u8,
+    pub(super) compatibility: u32,
+    /// The 48 constraint-indicator bits, right-aligned.
+    pub(super) constraint: u64,
+    pub(super) level_idc: u8,
+}
+
+/// H.265 §7.3.3 `profile_tier_level(1, max_sub_layers_minus1)`: the general
+/// fields read, the sub-layer fields skipped. The sub-layer fields are present
+/// only where their flags say so — skipping them unconditionally lands the
+/// reader in the wrong place on any stream with temporal sub-layers whose
+/// flags are not all set.
+///
+/// The reader strips emulation-prevention bytes, which a real PTL holds: the
+/// 770_H capture's has three. Read off the raw NAL bytes instead, as the
+/// `hvcC` writers used to, its Main 10 level 4.1 came out as profile byte
+/// 0x01 and level 0.
+pub(super) fn read_profile_tier_level(
+    r: &mut BitReader<'_>,
+    max_sub_layers_minus1: u32,
+) -> Option<GeneralPtl> {
+    let profile_space = r.read_bits(2)? as u8;
+    let tier = r.bit()?;
+    let profile_idc = r.read_bits(5)? as u8;
+    let compatibility = r.read_bits(32)?;
+    // general_progressive_source_flag .. general_inbld_flag / the reserved
+    // bit: 48 bits. Widened before the shift — `read_bits` returns a u32,
+    // and shifting one by 32 overflows.
+    let constraint = (u64::from(r.read_bits(16)?) << 32) | u64::from(r.read_bits(32)?);
+    let level_idc = r.read_bits(8)? as u8;
+    let n = max_sub_layers_minus1.min(7) as usize;
+    let mut present = [(false, false); 7];
+    for p in present.iter_mut().take(n) {
+        *p = (r.bit()?, r.bit()?);
+    }
+    if n > 0 {
+        // reserved_zero_2bits for each sub-layer slot from n up to 8.
+        r.skip_bits(2 * (8 - n as u32))?;
+    }
+    for &(profile_present, level_present) in present.iter().take(n) {
+        if profile_present {
+            // sub_layer_profile_space .. the 44 constraint/reserved bits.
+            r.skip_bits(88)?;
+        }
+        if level_present {
+            r.skip_bits(8)?; // sub_layer_level_idc
+        }
+    }
+    Some(GeneralPtl { profile_space, tier, profile_idc, compatibility, constraint, level_idc })
+}
+
+/// The fields of an `hvcC` header that come from the parameter sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HvccHeader {
+    ptl: GeneralPtl,
+    chroma_format_idc: u8,
+    bit_depth_luma_minus8: u8,
+    bit_depth_chroma_minus8: u8,
+    /// `numTemporalLayers`, 1..=7.
+    temporal_layers: u8,
+    temporal_id_nested: bool,
+}
+
+/// The header written when no SPS parses: Main, Main tier, level 4.1, 4:2:0,
+/// 8-bit, one temporal layer. Byte for byte what the `hvcC` writer wrote for
+/// an SPS too short for its PTL before it read the RBSP.
+const HVCC_HEADER_FALLBACK: HvccHeader = HvccHeader {
+    ptl: GeneralPtl {
+        profile_space: 0,
+        tier: false,
+        profile_idc: 1,
+        compatibility: 0x6000_0000,
+        constraint: 0,
+        level_idc: 0x7B,
+    },
+    chroma_format_idc: 1,
+    bit_depth_luma_minus8: 0,
+    bit_depth_chroma_minus8: 0,
+    temporal_layers: 1,
+    temporal_id_nested: true,
+};
+
+/// H.265 §7.3.2.2.1, read from the RBSP as far as the bit depths. `None` for
+/// an SPS cut short, or one whose sub-layer count, chroma format or bit
+/// depth is out of range — the last is a three-bit field in the record.
+fn sps_hvcc_fields(sps: &[u8]) -> Option<HvccHeader> {
+    let mut r = BitReader::new(sps.get(2..)?);
+    r.skip_bits(4)?; // sps_video_parameter_set_id
+    let max_sub_layers_minus1 = r.read_bits(3)?;
+    if max_sub_layers_minus1 > 6 {
+        return None;
+    }
+    let temporal_id_nested = r.bit()?;
+    let ptl = read_profile_tier_level(&mut r, max_sub_layers_minus1)?;
+    r.ue()?; // sps_seq_parameter_set_id
+    let chroma_format_idc = r.ue()?;
+    if chroma_format_idc > 3 {
+        return None;
+    }
+    if chroma_format_idc == 3 {
+        r.skip_bits(1)?; // separate_colour_plane_flag
+    }
+    r.ue()?; // pic_width_in_luma_samples
+    r.ue()?; // pic_height_in_luma_samples
+    if r.bit()? {
+        // conf_win_{left,right,top,bottom}_offset
+        for _ in 0..4 {
+            r.ue()?;
+        }
+    }
+    let bit_depth_luma_minus8 = r.ue()?;
+    let bit_depth_chroma_minus8 = r.ue()?;
+    if bit_depth_luma_minus8 > 7 || bit_depth_chroma_minus8 > 7 {
+        return None;
+    }
+    Some(HvccHeader {
+        ptl,
+        chroma_format_idc: chroma_format_idc as u8,
+        bit_depth_luma_minus8: bit_depth_luma_minus8 as u8,
+        bit_depth_chroma_minus8: bit_depth_chroma_minus8 as u8,
+        temporal_layers: max_sub_layers_minus1 as u8 + 1,
+        temporal_id_nested,
+    })
+}
+
+/// H.265 §7.3.2.1: a VPS's general PTL and its temporal sub-layer count.
+fn vps_ptl(vps: &[u8]) -> Option<(GeneralPtl, u8)> {
+    let mut r = BitReader::new(vps.get(2..)?);
+    // vps_video_parameter_set_id(4), vps_base_layer_internal_flag,
+    // vps_base_layer_available_flag, vps_max_layers_minus1(6).
+    r.skip_bits(12)?;
+    let max_sub_layers_minus1 = r.read_bits(3)?;
+    if max_sub_layers_minus1 > 6 {
+        return None;
+    }
+    r.skip_bits(17)?; // vps_temporal_id_nesting_flag, vps_reserved_0xffff_16bits
+    let ptl = read_profile_tier_level(&mut r, max_sub_layers_minus1)?;
+    Some((ptl, max_sub_layers_minus1 as u8 + 1))
+}
+
+/// Two PTLs as one `hvcC` header describes them (ISO/IEC 14496-15, the
+/// record's semantics): the highest tier, and the highest level within it; the
+/// highest profile; compatibility and constraint flags each set only where
+/// both set them. The profile space is `a`'s.
+fn merge_ptl(a: GeneralPtl, b: GeneralPtl) -> GeneralPtl {
+    let (tier, level_idc) = match b.tier.cmp(&a.tier) {
+        std::cmp::Ordering::Greater => (b.tier, b.level_idc),
+        std::cmp::Ordering::Equal => (a.tier, a.level_idc.max(b.level_idc)),
+        std::cmp::Ordering::Less => (a.tier, a.level_idc),
+    };
+    GeneralPtl {
+        profile_space: a.profile_space,
+        tier,
+        profile_idc: a.profile_idc.max(b.profile_idc),
+        compatibility: a.compatibility & b.compatibility,
+        constraint: a.constraint & b.constraint,
+        level_idc,
+    }
+}
+
+/// Two SPSs as one header: their PTLs merged, the larger chroma format, bit
+/// depths and sub-layer count, and nested only if both are.
+fn merge_sps(a: HvccHeader, b: HvccHeader) -> HvccHeader {
+    HvccHeader {
+        ptl: merge_ptl(a.ptl, b.ptl),
+        chroma_format_idc: a.chroma_format_idc.max(b.chroma_format_idc),
+        bit_depth_luma_minus8: a.bit_depth_luma_minus8.max(b.bit_depth_luma_minus8),
+        bit_depth_chroma_minus8: a.bit_depth_chroma_minus8.max(b.bit_depth_chroma_minus8),
+        temporal_layers: a.temporal_layers.max(b.temporal_layers),
+        temporal_id_nested: a.temporal_id_nested && b.temporal_id_nested,
+    }
+}
+
+/// The `hvcC` header for a record carrying these sets: every SPS that parses,
+/// merged in id order, then each VPS's PTL and sub-layer count folded in, as
+/// FFmpeg's `hvcc_parse_vps` does — the record describes all of its parameter
+/// sets. A set that does not parse is left out, and a VPS counts only beside
+/// a parsed SPS; with none, [`HVCC_HEADER_FALLBACK`].
+///
+/// Two deliberate departures from FFmpeg, which only a source with more than
+/// one SPS meets: a lower-tier PTL does not raise the level (FFmpeg's does),
+/// and the chroma format and bit depths are the largest, nesting the AND and
+/// the profile space the first, where FFmpeg takes the last. For one SPS the
+/// header is FFmpeg's.
+fn hvcc_header(vps_list: &[ParamSet], sps_list: &[ParamSet]) -> HvccHeader {
+    let Some(mut h) = sps_list.iter().filter_map(|s| sps_hvcc_fields(&s.nal)).reduce(merge_sps) else {
+        return HVCC_HEADER_FALLBACK;
+    };
+    for (ptl, layers) in vps_list.iter().filter_map(|v| vps_ptl(&v.nal)) {
+        h.ptl = merge_ptl(h.ptl, ptl);
+        h.temporal_layers = h.temporal_layers.max(layers);
+    }
+    h
+}
+
+/// Append an HEVC Decoder Configuration Record (ISO/IEC 14496-15 §8.3.3.1.2)
+/// to `out` — the body of a CMAF `hvcC` box and of an Enhanced-RTMP
+/// `SequenceStart`.
+///
+/// The header comes from [`hvcc_header`]: profile space, tier, profile,
+/// compatibility and constraint flags and level across every SPS (and VPS),
+/// read from the RBSP; chroma format and bit depths from the SPS; the
+/// temporal sub-layer count and nesting. `min_spatial_segmentation_idc`,
+/// `parallelismType` and the frame rate are written as 0, unknown — they come
+/// from the VUI and PPS, which this does not read, and FFmpeg writes the same
+/// for a source that signals none. It used to take the header bytes off the
+/// raw SPS at fixed offsets, one byte early and ahead of the emulation-
+/// prevention bytes, and to write 4:2:0 at 8 bits whatever the source was.
+///
+/// Each array carries every parameter set given, in id order — a slice may
+/// name any PPS. `array_completeness` says whether that is all of them: CMAF's
+/// `hvc1` samples carry none in-band, so it writes `true`; RTMP keeps them
+/// in-band, so it writes `false`, as FFmpeg's FLV muxer does. With one of
+/// each the arrays are the single-entry ones this writer always wrote.
+pub(crate) fn push_hvcc_record(
+    out: &mut Vec<u8>,
+    vps_list: &[ParamSet],
+    sps_list: &[ParamSet],
+    pps_list: &[ParamSet],
+    array_completeness: bool,
+) {
+    let h = hvcc_header(vps_list, sps_list);
+    out.push(1); // configurationVersion
+    // general_profile_space(2) | general_tier_flag(1) | general_profile_idc(5)
+    out.push((h.ptl.profile_space << 6) | (u8::from(h.ptl.tier) << 5) | h.ptl.profile_idc);
+    out.extend_from_slice(&h.ptl.compatibility.to_be_bytes());
+    // general_constraint_indicator_flags(48)
+    out.extend_from_slice(&h.ptl.constraint.to_be_bytes()[2..]);
+    out.push(h.ptl.level_idc);
+    // reserved(4)=1111 | min_spatial_segmentation_idc(12)=0,
+    // reserved(6)=111111 | parallelismType(2)=0.
+    out.extend_from_slice(&[0xF0, 0x00, 0xFC]);
+    out.push(0xFC | h.chroma_format_idc); // reserved(6) | chromaFormat(2)
+    out.push(0xF8 | h.bit_depth_luma_minus8); // reserved(5) | bitDepthLumaMinus8(3)
+    out.push(0xF8 | h.bit_depth_chroma_minus8); // reserved(5) | bitDepthChromaMinus8(3)
+    out.extend_from_slice(&[0x00, 0x00]); // avgFrameRate(16) = unknown
+    // constantFrameRate(2)=0 | numTemporalLayers(3) | temporalIdNested(1) |
+    // lengthSizeMinusOne(2)=3
+    out.push((h.temporal_layers << 3) | (u8::from(h.temporal_id_nested) << 2) | 0x03);
+    out.push(3); // numOfArrays: VPS, SPS, PPS
+    let completeness = if array_completeness { 0x80 } else { 0 };
+    for (nal_type, list) in [(H265_NAL_VPS, vps_list), (H265_NAL_SPS, sps_list), (H265_NAL_PPS, pps_list)] {
+        // array_completeness(1) | reserved(1)=0 | NAL_unit_type(6)
+        out.push(completeness | nal_type);
+        out.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        for nal in list {
+            out.extend_from_slice(&(nal.nal.len() as u16).to_be_bytes());
+            out.extend_from_slice(&nal.nal);
+        }
     }
 }
 
@@ -1031,6 +1212,180 @@ mod tests {
             at = next;
         }
         assert_eq!(at, body.len());
+    }
+
+    use super::super::param_sets::tests::{
+        HevcSpsSpec, h770, hevc_sps, hevc_sps_full, hevc_vps_full, hx, x265_sps,
+    };
+
+    /// The h770 header as FFmpeg's FLV muxer writes it for program 4010, up to
+    /// numOfArrays: Main 10, compatibility 0x20000000, progressive, level 4.1,
+    /// 4:2:0, 10-bit, one temporal layer.
+    const H770_HEADER: &str = "0102200000006000000000007bf000fcfdfafa00000f03";
+
+    fn one(nal: &[u8]) -> Vec<ParamSet> {
+        vec![ParamSet { id: 0, nal: nal.to_vec() }]
+    }
+
+    /// The 22 header bytes of the record for these sets, before numOfArrays.
+    fn header(vps: &[ParamSet], sps: &[ParamSet]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_hvcc_record(&mut out, vps, sps, &[], true);
+        out.truncate(22);
+        out
+    }
+
+    /// edge#211: the `hvcC` header is read from the SPS RBSP. The raw-offset
+    /// reads it replaced took profile_tier_level from the byte before it and
+    /// ahead of the emulation-prevention bytes, giving 770_H profile byte
+    /// 0x01, compatibility 0x02200000 and level 0, and wrote 8-bit 4:2:0 for
+    /// a 10-bit source.
+    #[test]
+    fn hvcc_header_comes_from_the_sps_rbsp() {
+        let (vps, sps, pps) = h770();
+        let pps_list = sets(&pps);
+        for completeness in [true, false] {
+            let mut out = Vec::new();
+            push_hvcc_record(&mut out, &one(&vps), &one(&sps), &pps_list, completeness);
+            assert_eq!(out[..23], hx(H770_HEADER)[..], "completeness {completeness}");
+            let flag = if completeness { 0x80 } else { 0 };
+            let mut at = 23;
+            for (nal_type, want) in [(32u8, vec![vps.clone()]), (33, vec![sps.clone()]), (34, pps.to_vec())] {
+                assert_eq!(out[at], flag | nal_type, "completeness {completeness}, type {nal_type}");
+                let n = u16::from_be_bytes([out[at + 1], out[at + 2]]) as usize;
+                let (got, next) = read_nals(&out, at + 3, n);
+                assert_eq!(got, want);
+                at = next;
+            }
+            assert_eq!(at, out.len());
+        }
+    }
+
+    /// numTemporalLayers and temporalIdNested come from the SPS: libx265
+    /// with two and three sub-layers above the base, not nested, RExt 4:4:4.
+    #[test]
+    fn hvcc_header_counts_temporal_layers() {
+        let [tl3, tl4] = x265_sps();
+        assert_eq!(header(&[], &one(&tl3)), hx("0104080000009e08000000003cf000fcfff8f800001b"));
+        assert_eq!(header(&[], &one(&tl4)), hx("0104080000009e08000000003cf000fcfff8f8000023"));
+    }
+
+    /// Across more than one SPS the header describes them all (ISO/IEC
+    /// 14496-15): the highest tier and the highest level within it, the
+    /// highest profile, the AND of the compatibility and constraint flags,
+    /// the largest chroma format, bit depths and sub-layer count, nested only
+    /// if every SPS is. The order the ids hold them in does not matter.
+    #[test]
+    fn hvcc_header_combines_every_sps_as_14496_15_asks() {
+        let s0 = HevcSpsSpec { level: 153, ..Default::default() };
+        let s1 = HevcSpsSpec {
+            id: 1,
+            tier: true,
+            profile: 2,
+            compat: 0x2000_0000,
+            constraint: 0xB000_0000_0000,
+            level: 120,
+            sub_layers: &[(false, false), (false, false)],
+            nested: false,
+            chroma: 2,
+            bit_depths: (2, 2),
+            ..Default::default()
+        };
+        let pair = |a: HevcSpsSpec, b: HevcSpsSpec| {
+            header(&[], &[
+                ParamSet { id: 0, nal: hevc_sps_full(HevcSpsSpec { id: 0, ..a }) },
+                ParamSet { id: 1, nal: hevc_sps_full(HevcSpsSpec { id: 1, ..b }) },
+            ])
+        };
+        let want = hx("01222000000090000000000078f000fcfefafa00001b");
+        assert_eq!(pair(s0, s1), want, "the higher tier's level, not the higher level");
+        assert_eq!(pair(s1, s0), want, "whichever id holds which");
+        assert_eq!(
+            header(&[], &one(&hevc_sps_full(s0))),
+            hx("01016000000090000000000099f000fcfdf8f800000f"),
+        );
+    }
+
+    /// Each VPS's general PTL and sub-layer count are folded in, as FFmpeg's
+    /// `hvcc_parse_vps` does: the record describes all of its parameter sets.
+    /// Nesting stays the SPS's.
+    #[test]
+    fn hvcc_header_folds_in_the_vps_ptl() {
+        let s0 = hevc_sps_full(HevcSpsSpec { level: 153, ..Default::default() });
+        let vps = hevc_vps_full(HevcSpsSpec {
+            compat: 0x4000_0000,
+            level: 156,
+            sub_layers: &[(false, false); 3],
+            ..Default::default()
+        });
+        assert_eq!(header(&one(&vps), &one(&s0)), hx("0101400000009000000000009cf000fcfdf8f8000027"));
+        let (vps, sps, _) = h770();
+        assert_eq!(header(&one(&vps), &one(&sps)), hx(H770_HEADER)[..22]);
+    }
+
+    /// With no SPS that parses, the header is the one this writer always
+    /// wrote for an SPS too short for its PTL — so a track built from one
+    /// keeps its init. An SPS that does not parse is left out of the merge.
+    #[test]
+    fn an_hvcc_with_no_parseable_sps_keeps_the_old_defaults() {
+        let fallback = hx("0101600000000000000000007bf000fcfdf8f800000f");
+        assert_eq!(header(&[], &[]), fallback);
+        // A PTL but no chroma format, picture size or bit depths after it.
+        assert_eq!(header(&[], &one(&hevc_sps(0, 1))), fallback);
+        let (_, sps, _) = h770();
+        let both = vec![ParamSet { id: 0, nal: hevc_sps(0, 1) }, ParamSet { id: 1, nal: sps }];
+        assert_eq!(header(&[], &both), hx(H770_HEADER)[..22]);
+    }
+
+    /// These come off the wire: no prefix of a real SPS or VPS, and no field
+    /// out of range, panics or yields anything but the fallback or the full
+    /// header.
+    #[test]
+    fn a_truncated_or_out_of_range_parameter_set_never_panics() {
+        let fallback = hx("0101600000000000000000007bf000fcfdf8f800000f");
+        let full = hx(H770_HEADER)[..22].to_vec();
+        let (vps, sps, _) = h770();
+        for len in 0..=sps.len() {
+            let got = header(&[], &one(&sps[..len]));
+            assert!(got == fallback || got == full, "SPS prefix {len}: {got:02x?}");
+        }
+        for len in 0..=vps.len() {
+            assert_eq!(header(&one(&vps[..len]), &one(&sps)), full, "VPS prefix {len}");
+            assert_eq!(header(&one(&vps[..len]), &[]), fallback, "VPS prefix {len}, no SPS");
+        }
+        for spec in [
+            HevcSpsSpec { chroma: 4, ..Default::default() },
+            HevcSpsSpec { sub_layers: &[(true, true); 7], ..Default::default() },
+            HevcSpsSpec { bit_depths: (8, 0), ..Default::default() },
+        ] {
+            assert_eq!(header(&[], &one(&hevc_sps_full(spec))), fallback);
+        }
+    }
+
+    /// The boxes are the shared records, boxed: what CMAF writes and what
+    /// RTMP sends are one builder's output.
+    #[test]
+    fn write_avcc_and_write_hvcc_box_the_shared_records() {
+        let sps = vec![vec![0x67, 0x64, 0x00, 0x28, 0xAC, 0xD9]];
+        let pps = vec![vec![0x68, 0xEE, 0x3C, 0x80], vec![0x68, 0x5B, 0x8F, 0x20]];
+        let mut buf = Vec::new();
+        {
+            let mut parent = BoxWriter::open(&mut buf, *b"avc1");
+            write_avcc(&mut parent, &sets(&sps), &sets(&pps));
+        }
+        let mut record = Vec::new();
+        push_avcc_record(&mut record, &sets(&sps), &sets(&pps));
+        assert_eq!(box_body(&buf, *b"avcC"), &record[..]);
+
+        let (vps, sps, pps) = h770();
+        let mut buf = Vec::new();
+        {
+            let mut parent = BoxWriter::open(&mut buf, *b"hvc1");
+            write_hvcc(&mut parent, &one(&vps), &one(&sps), &sets(&pps));
+        }
+        let mut record = Vec::new();
+        push_hvcc_record(&mut record, &one(&vps), &one(&sps), &sets(&pps), true);
+        assert_eq!(box_body(&buf, *b"hvcC"), &record[..]);
     }
 
     #[test]

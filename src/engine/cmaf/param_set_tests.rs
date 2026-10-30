@@ -14,7 +14,7 @@
 //! against holds it.
 
 use super::codecs::BitReader;
-use super::param_sets::tests::{Bits, h264_pps, h264_sps, hevc_pps, hevc_sps, hevc_vps, hx};
+use super::param_sets::tests::{Bits, h264_pps, h264_sps, h770, hevc_pps, hevc_sps, hevc_vps};
 use super::param_sets::ParamSets;
 use super::*;
 
@@ -205,26 +205,6 @@ fn length_prefixed(data: &[u8]) -> Vec<Vec<u8>> {
         at += 4 + len;
     }
     out
-}
-
-fn h770() -> (Vec<u8>, Vec<u8>, [Vec<u8>; 3]) {
-    let vps = hx("40010c01ffff02200000030060000003000003007b0c190240");
-    let sps = hx(concat!(
-        "42010102200000030060000003000003007ba003c080221f6d8d0c199246f843fff91421ff",
-        "fc8a10fffffffffffffffe45087fffffffffffffff22843fffffffffffffffc8a10fffffff",
-        "fffffffff22843fffffffffffffffe10ffffffffffffffff5780a1010101eff00000030010",
-        "000003032080",
-    ));
-    let pps = [
-        hx("4401c02524f87640"),
-        hx("44015009693e1d90"),
-        hx(concat!(
-            "44017009693e1f061838fff22830c1c7ff914187fc1c7ffffffffffffc8a0c3fe0e3ffffff",
-            "ffffffe45061ff838fffffffffffff914187fe0e3ffffffffffffe45061ff838fffffffffffff",
-            "c187fe0e3fffffffffffff9",
-        )),
-    ];
-    (vps, sps, pps)
 }
 
 /// The reported capture, as it is: every IRAP carries VPS0, SPS0, PPS0, PPS1,

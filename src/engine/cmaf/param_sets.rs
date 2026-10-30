@@ -31,6 +31,10 @@
 //! point that re-sends them; and a source that sends the same sets at every
 //! random-access point holds one stable table.
 //!
+//! RTMP passthrough feeds the same table, one access unit at a time, for the
+//! `avcC` / `hvcC` its FLV sequence header carries
+//! (`output_rtmp::PassthroughVideo`, edge#211).
+//!
 //! A parameter set is stored under the id it names. One that names none — cut
 //! short (a PES truncated by loss can end on a one-byte NAL), an id out of the
 //! codec's range, or an HEVC set for a layer other than the base layer — is
@@ -43,7 +47,7 @@
 //! Every read of source bytes here is bounds-checked: these NALs come off the
 //! wire, and a panic would take the output's task down with it.
 
-use super::codecs::BitReader;
+use super::codecs::{BitReader, read_profile_tier_level};
 use super::fmp4::VideoCodec;
 use super::nalu::{
     H264_NAL_PPS, H264_NAL_SPS, H265_NAL_PPS, H265_NAL_SPS, H265_NAL_VPS, h264_nal_type,
@@ -130,6 +134,17 @@ impl ParamSets {
             })
         }
         covers(&self.vps, &other.vps) && covers(&self.sps, &other.sps) && covers(&self.pps, &other.pps)
+    }
+
+    /// Whether every set in `other` has an entry here under its id, whatever
+    /// its bytes. No allocation — RTMP passthrough asks it of every access
+    /// unit, renewing its sequence header between key pictures only for a new
+    /// id.
+    pub fn has_every_id(&self, other: &ParamSets) -> bool {
+        fn has(have: &[ParamSet], want: &[ParamSet]) -> bool {
+            want.iter().all(|w| have.binary_search_by_key(&w.id, |e| e.id).is_ok())
+        }
+        has(&self.vps, &other.vps) && has(&self.sps, &other.sps) && has(&self.pps, &other.pps)
     }
 
     fn list_mut(&mut self, kind: Kind) -> &mut Vec<ParamSet> {
@@ -299,7 +314,7 @@ fn hevc_sps_id(nal: &[u8]) -> Option<u32> {
     r.skip_bits(4)?; // sps_video_parameter_set_id
     let max_sub_layers_minus1 = r.read_bits(3)?;
     r.skip_bits(1)?; // sps_temporal_id_nesting_flag
-    skip_profile_tier_level(&mut r, max_sub_layers_minus1)?;
+    read_profile_tier_level(&mut r, max_sub_layers_minus1)?;
     r.ue().filter(|id| *id <= 15)
 }
 
@@ -308,45 +323,12 @@ fn hevc_pps_id(nal: &[u8]) -> Option<u32> {
     BitReader::new(nal.get(2..)?).ue().filter(|id| *id <= 63)
 }
 
-/// H.265 §7.3.3 `profile_tier_level(1, max_sub_layers_minus1)`. The
-/// sub-layer fields are present only where their flags say so — skipping them
-/// unconditionally lands the reader in the wrong place on any stream with
-/// temporal sub-layers whose flags are not all set.
-fn skip_profile_tier_level(
-    r: &mut BitReader<'_>,
-    max_sub_layers_minus1: u32,
-) -> Option<()> {
-    // general_profile_space(2) general_tier_flag(1) general_profile_idc(5)
-    // general_profile_compatibility_flag[32] the four source/constraint flags,
-    // 43 reserved/constraint bits, one more, general_level_idc(8): 96 bits.
-    r.skip_bits(96)?;
-    let n = max_sub_layers_minus1.min(7) as usize;
-    let mut present = [(false, false); 7];
-    for p in present.iter_mut().take(n) {
-        *p = (r.bit()?, r.bit()?);
-    }
-    if n > 0 {
-        // reserved_zero_2bits for each sub-layer slot from n up to 8.
-        r.skip_bits(2 * (8 - n as u32))?;
-    }
-    for &(profile_present, level_present) in present.iter().take(n) {
-        if profile_present {
-            // sub_layer_profile_space .. the 44 constraint/reserved bits.
-            r.skip_bits(88)?;
-        }
-        if level_present {
-            r.skip_bits(8)?; // sub_layer_level_idc
-        }
-    }
-    Some(())
-}
-
-
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::engine::cmaf::codecs::GeneralPtl;
 
-    pub(in crate::engine::cmaf) fn hx(s: &str) -> Vec<u8> {
+    pub(crate) fn hx(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 
@@ -396,7 +378,7 @@ pub(super) mod tests {
     pub(in crate::engine::cmaf) fn h264_sps(id: u32, tag: u8) -> Vec<u8> {
         Bits::new(&[0x67, 0x64, 0x00, 0x28]).ue(id).put(u64::from(tag), 8).done()
     }
-    pub(in crate::engine::cmaf) fn h264_pps(id: u32, tag: u8) -> Vec<u8> {
+    pub(crate) fn h264_pps(id: u32, tag: u8) -> Vec<u8> {
         Bits::new(&[0x68]).ue(id).put(u64::from(tag), 8).done()
     }
     pub(in crate::engine::cmaf) fn hevc_vps(id: u32, tag: u8) -> Vec<u8> {
@@ -436,8 +418,158 @@ pub(super) mod tests {
     pub(in crate::engine::cmaf) fn hevc_sps(id: u32, tag: u8) -> Vec<u8> {
         hevc_sps_with(id, tag, &[])
     }
-    pub(in crate::engine::cmaf) fn hevc_pps(id: u32, tag: u8) -> Vec<u8> {
+    pub(crate) fn hevc_pps(id: u32, tag: u8) -> Vec<u8> {
         Bits::new(&[0x44, 0x01]).ue(id).put(u64::from(tag), 8).done()
+    }
+
+    /// `nal` with an emulation-prevention byte inserted wherever its payload
+    /// (past the `header_len`-byte NAL header) holds two zero bytes followed
+    /// by one of 0..=3 — a legal NAL, which survives an Annex B mux and makes
+    /// the reader strip what it would strip from a real one.
+    pub(crate) fn escaped(nal: Vec<u8>, header_len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(nal.len() + 4);
+        let mut zeros = 0;
+        for (i, &b) in nal.iter().enumerate() {
+            if zeros >= 2 && b <= 3 {
+                out.push(0x03);
+                zeros = 0;
+            }
+            out.push(b);
+            zeros = if i >= header_len && b == 0 { zeros + 1 } else { 0 };
+        }
+        out
+    }
+
+    /// What an HEVC SPS built by [`hevc_sps_full`] (or a VPS by
+    /// [`hevc_vps_full`]) says: the fields an `hvcC` header is read from.
+    #[derive(Clone, Copy)]
+    pub(crate) struct HevcSpsSpec {
+        pub id: u32,
+        pub space: u8,
+        pub tier: bool,
+        pub profile: u8,
+        pub compat: u32,
+        pub constraint: u64,
+        pub level: u8,
+        /// `(sub_layer_profile_present_flag, sub_layer_level_present_flag)`
+        /// per temporal sub-layer above the base.
+        pub sub_layers: &'static [(bool, bool)],
+        pub nested: bool,
+        pub chroma: u32,
+        /// `(bit_depth_luma_minus8, bit_depth_chroma_minus8)`.
+        pub bit_depths: (u32, u32),
+    }
+
+    /// Main, Main tier, progressive + frame-only, level 4.0, no sub-layers,
+    /// 4:2:0, 8-bit — the general PTL [`hevc_sps_with`] writes.
+    impl Default for HevcSpsSpec {
+        fn default() -> Self {
+            Self {
+                id: 0,
+                space: 0,
+                tier: false,
+                profile: 1,
+                compat: 0x6000_0000,
+                constraint: 0x9000_0000_0000,
+                level: 120,
+                sub_layers: &[],
+                nested: true,
+                chroma: 1,
+                bit_depths: (0, 0),
+            }
+        }
+    }
+
+    /// §7.3.3, the general part from `s` and the sub-layer part its flags ask
+    /// for.
+    fn put_ptl(b: &mut Bits, s: &HevcSpsSpec) {
+        b.put(u64::from(s.space), 2)
+            .put(u64::from(s.tier), 1)
+            .put(u64::from(s.profile), 5)
+            .put(u64::from(s.compat), 32)
+            .put(s.constraint, 48)
+            .put(u64::from(s.level), 8);
+        for &(p, l) in s.sub_layers {
+            b.put(u64::from(p), 1).put(u64::from(l), 1);
+        }
+        if !s.sub_layers.is_empty() {
+            for _ in s.sub_layers.len()..8 {
+                b.put(0, 2);
+            }
+        }
+        for &(p, l) in s.sub_layers {
+            if p {
+                b.put(0x0A5_A5A5_A5A5, 44).put(0x0A5_A5A5_A5A5, 44);
+            }
+            if l {
+                b.put(0x5D, 8);
+            }
+        }
+    }
+
+    /// An HEVC SPS written in full as far as the bit depths (§7.3.2.2.1): VPS
+    /// id 0, the PTL, the id, the chroma format, a 64x64 picture with no
+    /// conformance window, the bit depths. Escaped, so a PTL with zero bytes
+    /// in it carries the emulation-prevention bytes a real one does.
+    pub(crate) fn hevc_sps_full(s: HevcSpsSpec) -> Vec<u8> {
+        let mut b = Bits::new(&[0x42, 0x01]);
+        b.put(0, 4).put(s.sub_layers.len() as u64, 3).put(u64::from(s.nested), 1);
+        put_ptl(&mut b, &s);
+        b.ue(s.id).ue(s.chroma);
+        if s.chroma == 3 {
+            b.put(0, 1); // separate_colour_plane_flag
+        }
+        b.ue(64).ue(64).put(0, 1).ue(s.bit_depths.0).ue(s.bit_depths.1);
+        escaped(b.done(), 2)
+    }
+
+    /// An HEVC VPS (§7.3.2.1) with id 0, the base layer internal and
+    /// available, one layer, and `s`'s sub-layer count and PTL.
+    pub(crate) fn hevc_vps_full(s: HevcSpsSpec) -> Vec<u8> {
+        let mut b = Bits::new(&[0x40, 0x01]);
+        b.put(0, 4).put(1, 1).put(1, 1).put(0, 6);
+        b.put(s.sub_layers.len() as u64, 3).put(1, 1).put(0xFFFF, 16);
+        put_ptl(&mut b, &s);
+        escaped(b.done(), 2)
+    }
+
+    /// Program 4010 of `broadcast-mpts-hevc-1080p-hd-russia-dttv.ts` (the
+    /// 770_H capture): Main 10, level 4.1, 1920x544 coded. Every IRAP carries
+    /// VPS0, SPS0 and PPS0-2, and its slices name PPS0 and PPS1. Real bytes,
+    /// emulation-prevention bytes in the PTL included.
+    pub(crate) fn h770() -> (Vec<u8>, Vec<u8>, [Vec<u8>; 3]) {
+        let vps = hx("40010c01ffff02200000030060000003000003007b0c190240");
+        let sps = hx(concat!(
+            "42010102200000030060000003000003007ba003c080221f6d8d0c199246f843fff91421ff",
+            "fc8a10fffffffffffffffe45087fffffffffffffff22843fffffffffffffffc8a10fffffff",
+            "fffffffff22843fffffffffffffffe10ffffffffffffffff5780a1010101eff00000030010",
+            "000003032080",
+        ));
+        let pps = [
+            hx("4401c02524f87640"),
+            hx("44015009693e1d90"),
+            hx(concat!(
+                "44017009693e1f061838fff22830c1c7ff914187fc1c7ffffffffffffc8a0c3fe0e3ffffff",
+                "ffffffe45061ff838fffffffffffff914187fe0e3ffffffffffffe45061ff838fffffffffffff",
+                "c187fe0e3fffffffffffff9",
+            )),
+        ];
+        (vps, sps, pps)
+    }
+
+    /// libx265 SPSs with two and three temporal sub-layers above the base
+    /// (RExt 4:4:4, 320x240, level 2).
+    pub(crate) fn x265_sps() -> [Vec<u8>; 2] {
+        [
+            hx(concat!(
+                "4201040408000003009e0800000300003c000090014101e2cb2b29594acb24995e02dc0808",
+                "00100000030010000003019080",
+            )),
+            hx(concat!(
+                "4201060408000003009e0800000300003c000090014101e2cb2b125624ac4988264932bc05",
+                "b81010002000000300200000030321",
+            )),
+        ]
     }
 
     const H264_IDR: [u8; 4] = [0x65, 0x88, 0x84, 0x21];
@@ -531,41 +663,47 @@ pub(super) mod tests {
     /// 320x240), and the 770_H capture's (Main 10, emulation-prevention
     /// bytes in its PTL, 1920x544). The reader carries on past the id to the
     /// picture size, so a skip that is off by any number of bits fails here
-    /// even where the id it happened to read was right.
+    /// even where the id it happened to read was right — and the general PTL
+    /// it reads on the way is what the encoder wrote, which on 770_H the
+    /// raw-byte reads it replaced got wrong (profile byte 0x01, level 0).
     #[test]
     fn real_hevc_sps_parse_to_their_picture_size() {
-        fn read(nal: &[u8]) -> (u32, u32, u32, u32) {
+        fn read(nal: &[u8]) -> (GeneralPtl, (u32, u32, u32, u32)) {
             let mut r = BitReader::new(&nal[2..]);
             r.skip_bits(4).unwrap();
             let msl = r.read_bits(3).unwrap();
             r.skip_bits(1).unwrap();
-            skip_profile_tier_level(&mut r, msl).unwrap();
+            let ptl = read_profile_tier_level(&mut r, msl).unwrap();
             let id = r.ue().unwrap();
             let chroma = r.ue().unwrap();
             if chroma == 3 {
                 r.skip_bits(1).unwrap();
             }
-            (id, chroma, r.ue().unwrap(), r.ue().unwrap())
+            (ptl, (id, chroma, r.ue().unwrap(), r.ue().unwrap()))
         }
-        let x265_tl3 = hx(concat!(
-            "4201040408000003009e0800000300003c000090014101e2cb2b29594acb24995e02dc0808",
-            "00100000030010000003019080",
-        ));
-        let x265_tl4 = hx(concat!(
-            "4201060408000003009e0800000300003c000090014101e2cb2b125624ac4988264932bc05",
-            "b81010002000000300200000030321",
-        ));
-        let h770 = hx(concat!(
-            "42010102200000030060000003000003007ba003c080221f6d8d0c199246f843fff91421ff",
-            "fc8a10fffffffffffffffe45087fffffffffffffff22843fffffffffffffffc8a10fffffff",
-            "fffffffff22843fffffffffffffffe10ffffffffffffffff5780a1010101eff00000030010",
-            "000003032080",
-        ));
+        let [x265_tl3, x265_tl4] = x265_sps();
+        let (_, h770, _) = h770();
         assert_eq!((x265_tl3[2] >> 1) & 7, 2, "fixture: two sub-layers above the base");
         assert_eq!((x265_tl4[2] >> 1) & 7, 3);
-        assert_eq!(read(&x265_tl3), (0, 3, 320, 240));
-        assert_eq!(read(&x265_tl4), (0, 3, 320, 240));
-        assert_eq!(read(&h770), (0, 1, 1920, 544));
+        let x265_ptl = GeneralPtl {
+            profile_space: 0,
+            tier: false,
+            profile_idc: 4,
+            compatibility: 0x0800_0000,
+            constraint: 0x9E08_0000_0000,
+            level_idc: 60,
+        };
+        assert_eq!(read(&x265_tl3), (x265_ptl, (0, 3, 320, 240)));
+        assert_eq!(read(&x265_tl4), (x265_ptl, (0, 3, 320, 240)));
+        let h770_ptl = GeneralPtl {
+            profile_space: 0,
+            tier: false,
+            profile_idc: 2,
+            compatibility: 0x2000_0000,
+            constraint: 0x6000_0000_0000,
+            level_idc: 123,
+        };
+        assert_eq!(read(&h770), (h770_ptl, (0, 1, 1920, 544)));
         for nal in [&x265_tl3, &x265_tl4, &h770] {
             assert_eq!(classify(VideoCodec::H265, nal), Some((Kind::Sps, 0)));
         }
@@ -844,6 +982,26 @@ pub(super) mod tests {
         let mut other_sps = set(&[(0, 1)]);
         other_sps.sps[0].nal = h264_sps(0, 2);
         assert!(!track.contains_all(&other_sps));
+    }
+
+    /// `has_every_id` asks only whether each id is there: the bytes under it
+    /// may differ.
+    #[test]
+    fn has_every_id_ignores_bytes() {
+        let set = |pps: &[(u32, u8)]| ParamSets {
+            vps: Vec::new(),
+            sps: vec![ParamSet { id: 0, nal: h264_sps(0, 1) }],
+            pps: pps.iter().map(|&(id, tag)| ParamSet { id, nal: h264_pps(id, tag) }).collect(),
+        };
+        let track = set(&[(0, 1), (1, 1)]);
+        let mut other_bytes = set(&[(0, 2), (1, 3)]);
+        other_bytes.sps[0].nal = h264_sps(0, 9);
+        assert!(track.has_every_id(&other_bytes), "the same ids, other bytes");
+        assert!(!track.has_every_id(&set(&[(0, 1), (1, 1), (2, 1)])), "one more id");
+        assert!(track.has_every_id(&ParamSets::default()), "nothing asked for");
+        let mut other_sps = set(&[(0, 1)]);
+        other_sps.sps[0].id = 1;
+        assert!(!track.has_every_id(&other_sps), "an SPS id the track lacks");
     }
 
     /// `single` keeps one entry of each kind whatever the bytes — the

@@ -23,6 +23,10 @@ use crate::stats::collector::OutputStatsAccumulator;
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index, sr_index_from_hz};
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
 use super::audio_silence::SilenceGenerator;
+use super::cmaf::codecs::{push_avcc_record, push_hvcc_record};
+use super::cmaf::fmp4::VideoCodec as CmafVideoCodec;
+use super::cmaf::nalu::{H265_NAL_VPS, h265_nal_type, to_length_prefixed};
+use super::cmaf::param_sets::{ParamSetCollector, ParamSets};
 use super::packet::RtpPacket;
 use super::rtmp::client::{RtmpClient, RtmpConnectError, RtmpFailureKind};
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
@@ -351,7 +355,7 @@ async fn publish_loop(
     event_sender: &EventSender,
 ) -> anyhow::Result<()> {
     let mut demuxer = TsDemuxer::new(config.program_number);
-    let mut sent_video_header = false;
+    let mut passthrough = PassthroughVideo::default();
     let mut sent_audio_header = false;
     let mut base_pts: Option<u64> = None;
     // Lazy FFmpeg-backed audio decoder for non-AAC sources
@@ -473,8 +477,7 @@ async fn publish_loop(
                         cts_ms,
                         &mut base_pts,
                         recv_time_us,
-                        &demuxer,
-                        &mut sent_video_header,
+                        &mut passthrough,
                         &mut video_state,
                         client,
                         config,
@@ -496,8 +499,7 @@ async fn publish_loop(
                         cts_ms,
                         &mut base_pts,
                         recv_time_us,
-                        &demuxer,
-                        &mut sent_video_header,
+                        &mut passthrough,
                         &mut video_state,
                         client,
                         config,
@@ -779,8 +781,7 @@ async fn publish_loop(
                         0,
                         &mut base_pts,
                         recv_time_us,
-                        &demuxer,
-                        &mut sent_video_header,
+                        &mut passthrough,
                         &mut video_state,
                         client,
                         config,
@@ -790,11 +791,12 @@ async fn publish_loop(
                     )
                     .await?;
                 }
-                // Stream discontinuity is metadata for stateful consumers
-                // that own decoder state. RTMP is a forwarding output —
-                // the FLV writer re-anchors on the next IDR / AAC config
-                // change naturally.
-                DemuxedFrame::Discontinuity | DemuxedFrame::Scte35(_) => {}
+                // An input switch: passthrough starts its parameter-set
+                // table again, so the new source's sets replace the old
+                // one's in the sequence header (edge#211). The FLV timeline
+                // is not re-anchored here (edge#211 item 3).
+                DemuxedFrame::Discontinuity => passthrough.restart(),
+                DemuxedFrame::Scte35(_) => {}
             }
         }
 
@@ -902,37 +904,6 @@ fn next_wire_pts_90k(
     }
 }
 
-/// Build an AVC sequence header FLV video tag (AVCDecoderConfigurationRecord).
-fn build_avc_sequence_header(sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(16 + sps.len() + pps.len());
-
-    // FLV video tag header
-    buf.put_u8(0x17); // keyframe (1) + AVC (7)
-    buf.put_u8(0x00); // AVC sequence header
-    buf.put_u8(0x00); // composition time
-    buf.put_u8(0x00);
-    buf.put_u8(0x00);
-
-    // AVCDecoderConfigurationRecord
-    buf.put_u8(1); // configurationVersion
-    buf.put_u8(if sps.len() > 1 { sps[1] } else { 66 }); // AVCProfileIndication
-    buf.put_u8(if sps.len() > 2 { sps[2] } else { 0 });   // profile_compatibility
-    buf.put_u8(if sps.len() > 3 { sps[3] } else { 30 });  // AVCLevelIndication
-    buf.put_u8(0xFF); // lengthSizeMinusOne = 3 (4-byte NALU lengths) | reserved 0xFC
-    buf.put_u8(0xE1); // numOfSequenceParameterSets = 1 | reserved 0xE0
-
-    // SPS
-    buf.put_u16(sps.len() as u16);
-    buf.put_slice(sps);
-
-    // PPS
-    buf.put_u8(1); // numOfPictureParameterSets
-    buf.put_u16(pps.len() as u16);
-    buf.put_slice(pps);
-
-    buf.to_vec()
-}
-
 /// Build an FLV video tag with length-prefixed NALUs, carrying the picture's
 /// composition time (ms after its decode time, the tag timestamp — see
 /// [`flv_video_time`]).
@@ -959,7 +930,8 @@ fn build_avc_nalu_tag(nalus: &[Vec<u8>], is_keyframe: bool, cts_ms: u32) -> Vec<
 /// FourCC identifier for HEVC in the Enhanced RTMP v2 extended VideoTagHeader.
 const FOURCC_HVC1: [u8; 4] = *b"hvc1";
 
-/// Build an Enhanced RTMP v2 SequenceStart tag payload for HEVC.
+/// Build an Enhanced RTMP v2 SequenceStart tag payload for HEVC from the
+/// re-encoder's extradata.
 ///
 /// Layout: `0x90 "hvc1" <HEVCDecoderConfigurationRecord>`
 /// - first byte: `IsExHeader(1) | FrameType(1=key) | PacketType(0=SequenceStart)`.
@@ -972,33 +944,30 @@ fn build_hevc_sequence_header_from_hvcc(extradata: &[u8]) -> Vec<u8> {
     // MP4/Matroska muxers run `hevc_mp4toannexb` on the way out — we mux
     // into FLV ourselves, so we have to assemble the hvcC here. Detect a
     // pre-built hvcC by `configurationVersion == 0x01` as the first byte;
-    // otherwise split the Annex-B and rebuild.
-    let hvcc = if !extradata.is_empty() && extradata[0] == 0x01 {
-        extradata.to_vec()
-    } else {
-        match build_hvcc_from_annex_b(extradata) {
-            Some(blob) => blob,
-            None => {
-                tracing::warn!(
-                    "RTMP video_encode: HEVC extradata had no VPS/SPS/PPS NALs ({} bytes)",
-                    extradata.len()
-                );
-                return Vec::new();
-            }
+    // otherwise split the Annex-B and build the record passthrough sends,
+    // its header read from the SPS RBSP (edge#211).
+    if !extradata.is_empty() && extradata[0] == 0x01 {
+        let mut buf = BytesMut::with_capacity(5 + extradata.len());
+        buf.put_u8(0x80 | (1 << 4)); // Ex | keyframe | PacketType=SequenceStart
+        buf.put_slice(&FOURCC_HVC1);
+        buf.put_slice(extradata);
+        return buf.to_vec();
+    }
+    match hevc_annex_b_param_sets(extradata) {
+        Some(sets) => sequence_header_tag(CmafVideoCodec::H265, &sets),
+        None => {
+            tracing::warn!(
+                "RTMP video_encode: HEVC extradata had no VPS/SPS/PPS NALs ({} bytes)",
+                extradata.len()
+            );
+            Vec::new()
         }
-    };
-    let mut buf = BytesMut::with_capacity(5 + hvcc.len());
-    buf.put_u8(0x80 | (1 << 4)); // Ex | keyframe | PacketType=SequenceStart
-    buf.put_slice(&FOURCC_HVC1);
-    buf.put_slice(&hvcc);
-    buf.to_vec()
+    }
 }
 
-/// Assemble a HEVCDecoderConfigurationRecord (per ISO/IEC 14496-15 §8.3.3.1.2)
-/// from an Annex-B VPS/SPS/PPS bytestream as emitted by libx265. We pull
-/// profile_space / tier / profile_idc / level_idc straight from the SPS
-/// (which mirrors them from the VPS), and use safe defaults for the rest.
-fn build_hvcc_from_annex_b(extradata: &[u8]) -> Option<Vec<u8>> {
+/// The first VPS, SPS and PPS of an Annex-B bytestream as emitted by
+/// libx265, or `None` unless all three are there.
+fn hevc_annex_b_param_sets(extradata: &[u8]) -> Option<ParamSets> {
     let nalus = super::ts_demux::split_annex_b_nalus(extradata);
     let mut vps: Option<&[u8]> = None;
     let mut sps: Option<&[u8]> = None;
@@ -1013,45 +982,7 @@ fn build_hvcc_from_annex_b(extradata: &[u8]) -> Option<Vec<u8>> {
             _ => {}
         }
     }
-    let (vps, sps, pps) = match (vps, sps, pps) {
-        (Some(v), Some(s), Some(p)) => (v, s, p),
-        _ => return None,
-    };
-    // Pull profile/tier/level from the SPS profile_tier_level() structure,
-    // which immediately follows the 4-bit sps_video_parameter_set_id +
-    // 3-bit sps_max_sub_layers_minus1 + 1-bit sps_temporal_id_nesting_flag
-    // = first byte after the 2-byte NAL header.
-    if sps.len() < 2 + 12 { return None; }
-    let ptl = &sps[2..];
-    let profile_space_tier_profile = ptl[0];
-    let profile_compat: [u8; 4] = [ptl[1], ptl[2], ptl[3], ptl[4]];
-    let constraint: [u8; 6] = [ptl[5], ptl[6], ptl[7], ptl[8], ptl[9], ptl[10]];
-    let level_idc = ptl[11];
-
-    let mut out = Vec::with_capacity(64 + vps.len() + sps.len() + pps.len());
-    out.push(0x01); // configurationVersion
-    out.push(profile_space_tier_profile);
-    out.extend_from_slice(&profile_compat);
-    out.extend_from_slice(&constraint);
-    out.push(level_idc);
-    out.extend_from_slice(&[0xF0, 0x00]); // reserved | min_spatial_segmentation_idc=0
-    out.push(0xFC); // reserved | parallelismType=0
-    out.push(0xFD); // reserved | chroma_format_idc=1 (4:2:0)
-    out.push(0xF8); // reserved | bitDepthLumaMinus8=0
-    out.push(0xF8); // reserved | bitDepthChromaMinus8=0
-    out.extend_from_slice(&[0x00, 0x00]); // avgFrameRate=0
-    // constantFrameRate(2)=0 | numTemporalLayers(3)=1 | temporalIdNested(1)=1 | lengthSizeMinusOne(2)=3
-    out.push((1 << 3) | (1 << 2) | 0x03);
-    out.push(3); // numOfArrays = VPS, SPS, PPS
-
-    for (nal_type, nal) in [(32u8, vps), (33, sps), (34, pps)] {
-        out.push(0x80 | nal_type); // array_completeness=1 | reserved | NAL_unit_type
-        out.extend_from_slice(&[0x00, 0x01]); // numNalus = 1
-        let len = nal.len() as u16;
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(nal);
-    }
-    Some(out)
+    Some(ParamSets::single(CmafVideoCodec::H265, vps?.to_vec(), sps?.to_vec(), pps?.to_vec()))
 }
 
 /// Build an Enhanced RTMP v2 coded-frames tag payload for HEVC.
@@ -1116,9 +1047,9 @@ fn build_avc_nalu_tag_raw(avcc_nalus: &[u8], is_keyframe: bool) -> Vec<u8> {
 /// AVCDecoderConfigurationRecord. The MP4/FLV muxer normally converts via
 /// the `h264_mp4toannexb` BSF, but we mux into FLV ourselves so we have to
 /// do the conversion here. We split on Annex-B, pick the SPS (type 7) and
-/// the first PPS (type 8), and build a proper DCR via
-/// `build_avc_sequence_header`. As a fallback, when extradata already
-/// looks like a DCR (first byte = `0x01`), we wrap it directly.
+/// the first PPS (type 8), and build the record passthrough sends
+/// ([`sequence_header_tag`]). As a fallback, when extradata already looks
+/// like a DCR (first byte = `0x01`), we wrap it directly.
 fn build_avc_sequence_header_from_avcc(extradata: &[u8]) -> Vec<u8> {
     if !extradata.is_empty() && extradata[0] == 0x01 {
         let mut buf = BytesMut::with_capacity(5 + extradata.len());
@@ -1143,7 +1074,10 @@ fn build_avc_sequence_header_from_avcc(extradata: &[u8]) -> Vec<u8> {
         }
     }
     match (sps, pps) {
-        (Some(sps), Some(pps)) => build_avc_sequence_header(sps, pps),
+        (Some(sps), Some(pps)) => sequence_header_tag(
+            CmafVideoCodec::H264,
+            &ParamSets::single(CmafVideoCodec::H264, Vec::new(), sps.to_vec(), pps.to_vec()),
+        ),
         _ => {
             tracing::warn!(
                 "RTMP video_encode: encoder extradata had no SPS/PPS NALs ({} bytes)",
@@ -1422,8 +1356,7 @@ async fn process_video_frame(
     cts_ms: u32,
     base_pts: &mut Option<u64>,
     recv_time_us: u64,
-    demuxer: &TsDemuxer,
-    sent_video_header: &mut bool,
+    passthrough: &mut PassthroughVideo,
     video_state: &mut VideoEncoderState,
     client: &mut RtmpClient,
     config: &RtmpOutputConfig,
@@ -1433,7 +1366,7 @@ async fn process_video_frame(
 ) -> anyhow::Result<bool> {
     match video_state {
         VideoEncoderState::Disabled => {
-            passthrough_video(&src, ts_ms, cts_ms, recv_time_us, demuxer, sent_video_header, client, config, stats).await
+            passthrough_video(&src, ts_ms, cts_ms, recv_time_us, passthrough, client, config, stats).await
         }
         VideoEncoderState::Failed => {
             // Decoder/encoder already failed once — drop video silently
@@ -1462,13 +1395,167 @@ async fn process_video_frame(
                 return Ok(true);
             }
             // Fall through to Active on the very same frame.
-            encode_one_frame(&src, pts_90k, ts_ms, base_pts, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
+            encode_one_frame(&src, pts_90k, ts_ms, base_pts, recv_time_us, video_state, client, config, stats, flow_id, event_sender).await
         }
         #[cfg(feature = "media-codecs")]
         VideoEncoderState::Active(_) => {
-            encode_one_frame(&src, pts_90k, ts_ms, base_pts, recv_time_us, sent_video_header, video_state, client, config, stats, flow_id, event_sender).await
+            encode_one_frame(&src, pts_90k, ts_ms, base_pts, recv_time_us, video_state, client, config, stats, flow_id, event_sender).await
         }
     }
+}
+
+/// Pictures held for want of a sequence header before the output says why,
+/// once per connection: 20 s at 50 fps, 40 s at 25 — past any GOP a
+/// broadcast source keeps.
+const HELD_PICTURES_WARN: u32 = 1_000;
+
+/// What passthrough has told the receiver about the source's video on this
+/// connection. A local of `publish_loop`, so each connection starts afresh.
+/// The per-connection state of the other edge#211 passthrough fixes belongs
+/// here too.
+///
+/// The sequence header used to be built from the demuxer's cache, which holds
+/// one set of each kind, the last seen, and is read after the whole datagram
+/// has been demuxed: an HEVC source whose IRAPs carry PPS0-2 while its slices
+/// name PPS0 and PPS1 got a header holding PPS2 alone, its coded frames were
+/// stripped of their parameter sets, and no picture decoded at the receiver
+/// (edge#211, the RTMP counterpart of edge#204).
+#[derive(Default)]
+struct PassthroughVideo {
+    /// Every parameter set the source has sent, by id, fed one access unit at
+    /// a time in decode order.
+    collector: ParamSetCollector,
+    /// The header last built.
+    header: Option<SequenceHeader>,
+    /// Rebuilt and not yet sent: it goes out ahead of the next picture sent.
+    pending: bool,
+    /// A header has gone out on this connection.
+    any_sent: bool,
+    /// A discontinuity restarted the table: the next complete one replaces the
+    /// header.
+    rebuild: bool,
+    /// Pictures dropped because nothing describes their codec yet.
+    held: u32,
+}
+
+/// One built sequence header: the codec and sets it describes, and the FLV
+/// tag that carries them.
+struct SequenceHeader {
+    codec: CmafVideoCodec,
+    sets: ParamSets,
+    tag: Vec<u8>,
+}
+
+impl PassthroughVideo {
+    /// Take in one access unit, in decode order, before anything is sent for
+    /// it. True when the header was rebuilt: nothing described `codec`, the
+    /// table restarted at a discontinuity, the table names an id the header
+    /// lacks, or — on a key picture only — a set's bytes changed. Between key
+    /// pictures a changed set reaches the decoder in-band; renewing on it
+    /// would put a header ahead of every picture of a source that re-sends a
+    /// varying PPS (CMAF's rule, edge#204).
+    fn observe(&mut self, codec: CmafVideoCodec, nalus: &[Vec<u8>], is_keyframe: bool) -> bool {
+        self.collector.observe(codec, nalus, is_keyframe);
+        let Some(table) = self.collector.complete_sets(codec) else {
+            return false;
+        };
+        let stale = match self.header.as_ref().filter(|h| h.codec == codec) {
+            None => true,
+            Some(_) if self.rebuild => true,
+            Some(h) if is_keyframe => !h.sets.contains_all(table),
+            Some(h) => !h.sets.has_every_id(table),
+        };
+        if stale {
+            self.header = Some(SequenceHeader {
+                codec,
+                tag: sequence_header_tag(codec, table),
+                sets: table.clone(),
+            });
+            self.pending = true;
+            self.rebuild = false;
+        }
+        stale
+    }
+
+    /// A stream discontinuity: start the table again. The header stays, so
+    /// pictures keep flowing under it until the new source's sets are
+    /// complete; the header is then replaced even if it already holds them,
+    /// dropping the old source's extra ids.
+    fn restart(&mut self) {
+        self.collector = ParamSetCollector::default();
+        self.rebuild = true;
+    }
+
+    /// The header to send ahead of a picture that is about to go out, and how
+    /// many copies: two on the connection's first key picture (a header, then
+    /// the key-picture re-send, as always), one on any other key picture
+    /// (carrying a renewal if one is pending) or ahead of the first picture
+    /// after a renewal, else none. `None` while nothing describes `codec`.
+    /// Call it only for a picture that will be sent, so a renewal is never
+    /// spent on a dropped one.
+    fn take_headers(&mut self, codec: CmafVideoCodec, is_keyframe: bool) -> Option<(&[u8], usize)> {
+        let header = self.header.as_ref().filter(|h| h.codec == codec)?;
+        let copies =
+            usize::from(self.pending && (!is_keyframe || !self.any_sent)) + usize::from(is_keyframe);
+        self.pending = false;
+        self.any_sent |= copies > 0;
+        Some((&header.tag, copies))
+    }
+
+    /// Count a picture dropped for want of a header, and at
+    /// [`HELD_PICTURES_WARN`] say once which kinds of parameter set the source
+    /// has not sent.
+    fn hold(&mut self, codec: CmafVideoCodec, output_id: &str) {
+        self.held = self.held.saturating_add(1);
+        if self.held != HELD_PICTURES_WARN {
+            return;
+        }
+        let none = ParamSets::default();
+        let have = self.collector.sets(codec).unwrap_or(&none);
+        let missing: Vec<&str> = [
+            ("VPS", codec == CmafVideoCodec::H265 && have.vps.is_empty()),
+            ("SPS", have.sps.is_empty()),
+            ("PPS", have.pps.is_empty()),
+        ]
+        .into_iter()
+        .filter_map(|(kind, absent)| absent.then_some(kind))
+        .collect();
+        tracing::warn!(
+            "RTMP output '{output_id}': {HELD_PICTURES_WARN} {} pictures held back with no sequence \
+             header to describe them; the source has sent no usable {}",
+            codec_label(codec),
+            missing.join(" / "),
+        );
+    }
+}
+
+/// How a log line names `codec`.
+fn codec_label(codec: CmafVideoCodec) -> &'static str {
+    match codec {
+        CmafVideoCodec::H264 => "AVC",
+        CmafVideoCodec::H265 => "HEVC",
+    }
+}
+
+/// The FLV sequence header for `codec` carrying every one of `sets`: classic
+/// AVC, or Enhanced-RTMP `SequenceStart` whose `hvcC` says sets may also
+/// arrive in-band (they do).
+fn sequence_header_tag(codec: CmafVideoCodec, sets: &ParamSets) -> Vec<u8> {
+    let entries: usize = sets.vps.iter().chain(&sets.sps).chain(&sets.pps).map(|s| 3 + s.nal.len()).sum();
+    let mut tag = Vec::with_capacity(64 + entries);
+    match codec {
+        CmafVideoCodec::H264 => {
+            // keyframe (1) + AVC (7), AVC sequence header, composition time 0.
+            tag.extend_from_slice(&[0x17, 0x00, 0x00, 0x00, 0x00]);
+            push_avcc_record(&mut tag, &sets.sps, &sets.pps);
+        }
+        CmafVideoCodec::H265 => {
+            tag.push(0x80 | (1 << 4)); // Ex | keyframe | PacketType=SequenceStart
+            tag.extend_from_slice(&FOURCC_HVC1);
+            push_hvcc_record(&mut tag, &sets.vps, &sets.sps, &sets.pps, false);
+        }
+    }
+    tag
 }
 
 /// H.264 (classic FLV) or H.265 (Enhanced RTMP) passthrough — no re-encode.
@@ -1476,180 +1563,75 @@ async fn process_video_frame(
 /// Each picture goes out at its decode time `ts_ms` with its composition time
 /// `cts_ms` ([`flv_video_time`]). A sequence header sent ahead of a picture
 /// takes the picture's decode time and composition time 0, as FLV requires.
+///
+/// The sequence header carries every parameter set the source has sent, by
+/// id ([`PassthroughVideo`]), and both codecs keep their parameter sets
+/// in-band: the coded frames go out with every NAL the access unit carried,
+/// and the HEVC `hvcC` says so (`array_completeness` 0), as FFmpeg's FLV
+/// muxer writes it. HEVC used to go out with its parameter sets stripped and
+/// a header holding the last one of each kind (edge#211).
 #[allow(clippy::too_many_arguments)]
 async fn passthrough_video(
     src: &VideoFrameSource<'_>,
     ts_ms: u32,
     cts_ms: u32,
     recv_time_us: u64,
-    demuxer: &TsDemuxer,
-    sent_video_header: &mut bool,
+    passthrough: &mut PassthroughVideo,
     client: &mut RtmpClient,
     config: &RtmpOutputConfig,
     stats: &Arc<OutputStatsAccumulator>,
 ) -> anyhow::Result<bool> {
+    // One flag drives the FLV frame type, the table's random-access rule and
+    // the key-picture re-send.
     let is_keyframe = src.is_keyframe();
-
-    match src {
+    let (codec, nalus) = match src {
         // Not carried without `video_encode` (the loop says so once).
-        VideoFrameSource::Mpeg2 { .. } => {}
-        VideoFrameSource::H264 { nalus, .. } => {
-            // Send sequence header on the first frame where SPS/PPS are
-            // cached. Real-world broadcast streams often use open-GOP /
-            // recovery-point SEI signalling instead of true IDR (NAL
-            // type 5), so waiting for `is_keyframe` would never fire
-            // and video would never start. Receivers gracefully handle
-            // the first NALU tag being non-IDR — they treat it as
-            // "wait for next IDR" but the sequence header is what
-            // they actually need to initialise the decoder.
-            if !*sent_video_header
-                && let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
-                    let header = build_avc_sequence_header(sps, pps);
-                    client.send_video(&header, ts_ms).await?;
-                    *sent_video_header = true;
-                    tracing::debug!("RTMP output '{}': sent AVC sequence header", config.id);
-                }
-            if !*sent_video_header {
-                return Ok(true);
-            }
-            // Re-send sequence header on each keyframe (some servers need this)
-            if is_keyframe
-                && let (Some(sps), Some(pps)) = (demuxer.cached_sps(), demuxer.cached_pps()) {
-                    let header = build_avc_sequence_header(sps, pps);
-                    client.send_video(&header, ts_ms).await?;
-                }
-            let tag = build_avc_nalu_tag(nalus, is_keyframe, cts_ms);
-            let tag_len = tag.len();
-            client.send_video(&tag, ts_ms).await?;
-            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-            stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
-            stats.record_latency(recv_time_us);
-        }
-        VideoFrameSource::H265 { nalus, .. } => {
-            // HEVC passthrough over Enhanced RTMP. Build hvcC from cached
-            // VPS / SPS / PPS on the first frame where they're available.
-            // Same rationale as the H.264 path: open-GOP broadcast streams
-            // may not surface a true IDR (`is_keyframe`) for many seconds.
-            if !*sent_video_header
-                && let Some(hvcc) = build_hvcc_from_cached(demuxer) {
-                    let header = build_hevc_sequence_header_from_hvcc(&hvcc);
-                    client.send_video(&header, ts_ms).await?;
-                    *sent_video_header = true;
-                    tracing::debug!("RTMP output '{}': sent HEVC sequence header", config.id);
-                }
-            if !*sent_video_header {
-                return Ok(true);
-            }
-            if is_keyframe
-                && let Some(hvcc) = build_hvcc_from_cached(demuxer) {
-                    let header = build_hevc_sequence_header_from_hvcc(&hvcc);
-                    client.send_video(&header, ts_ms).await?;
-                }
-            // Filter out VPS/SPS/PPS from the coded-frames payload — they
-            // travel out-of-band via the sequence header.
-            let avcc = annex_b_to_avcc_filtered_h265(nalus);
-            if avcc.is_empty() {
-                return Ok(true);
-            }
-            let tag = build_hevc_coded_frames_tag(&avcc, is_keyframe, cts_ms);
-            let tag_len = tag.len();
-            client.send_video(&tag, ts_ms).await?;
-            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-            stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
-            stats.record_latency(recv_time_us);
-        }
+        VideoFrameSource::Mpeg2 { .. } => return Ok(true),
+        VideoFrameSource::H264 { nalus, .. } => (CmafVideoCodec::H264, *nalus),
+        VideoFrameSource::H265 { nalus, .. } => (CmafVideoCodec::H265, *nalus),
+    };
+    if passthrough.observe(codec, nalus, is_keyframe)
+        && let Some(h) = &passthrough.header
+    {
+        tracing::debug!(
+            "RTMP output '{}': built {} sequence header ({} VPS / {} SPS / {} PPS)",
+            config.id,
+            codec_label(codec),
+            h.sets.vps.len(),
+            h.sets.sps.len(),
+            h.sets.pps.len(),
+        );
     }
+    // An HEVC access unit with no picture in it (parameter sets, an AUD, SEI)
+    // is not a CodedFrames tag. Its sets are in the table, and a renewal they
+    // caused waits for the next picture.
+    if codec == CmafVideoCodec::H265 && !nalus.iter().any(|n| h265_nal_type(n) < H265_NAL_VPS) {
+        return Ok(true);
+    }
+    // The first header does not wait for a key picture. Real-world broadcast
+    // streams often use open-GOP / recovery-point SEI signalling instead of a
+    // true IDR (NAL type 5), so waiting for `is_keyframe` would never fire and
+    // video would never start. Receivers gracefully handle the first picture
+    // being non-IDR — they treat it as "wait for the next IDR" — but the
+    // sequence header is what they need to initialise the decoder. A picture
+    // nothing describes yet is dropped.
+    let Some((header, copies)) = passthrough.take_headers(codec, is_keyframe) else {
+        passthrough.hold(codec, &config.id);
+        return Ok(true);
+    };
+    for _ in 0..copies {
+        client.send_video(header, ts_ms).await?;
+    }
+    let tag = match codec {
+        CmafVideoCodec::H264 => build_avc_nalu_tag(nalus, is_keyframe, cts_ms),
+        CmafVideoCodec::H265 => build_hevc_coded_frames_tag(&to_length_prefixed(nalus), is_keyframe, cts_ms),
+    };
+    let tag_len = tag.len();
+    client.send_video(&tag, ts_ms).await?;
+    stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+    stats.bytes_sent.fetch_add(tag_len as u64, Ordering::Relaxed);
+    stats.record_latency(recv_time_us);
     Ok(true)
-}
-
-/// Assemble an `HEVCDecoderConfigurationRecord` (hvcC) from the cached
-/// VPS / SPS / PPS emitted by the TS demuxer. Returns `None` if any of the
-/// three parameter sets is missing yet.
-fn build_hvcc_from_cached(demuxer: &TsDemuxer) -> Option<Vec<u8>> {
-    let vps = demuxer.cached_h265_vps()?;
-    let sps = demuxer.cached_h265_sps()?;
-    let pps = demuxer.cached_h265_pps()?;
-    Some(build_hvcc(vps, sps, pps))
-}
-
-/// Build a minimal `HEVCDecoderConfigurationRecord` (ISO/IEC 14496-15 §8.3.2).
-///
-/// We do not have the full SPS/VPS/PPS parser needed to populate every
-/// profile field, so the record's profile_tier_level bits are left at zero
-/// — receivers that only care about parsing the payload (e.g. ffmpeg,
-/// OBS Studio, Wowza with E-RTMP) accept this. Strict conformance checkers
-/// may reject it; such profiles should use video_encode to let the encoder
-/// emit its own hvcC.
-fn build_hvcc(vps: &[u8], sps: &[u8], pps: &[u8]) -> Vec<u8> {
-    let mut buf = BytesMut::new();
-    // configurationVersion
-    buf.put_u8(1);
-    // general_profile_space (2) | general_tier_flag (1) | general_profile_idc (5)
-    buf.put_u8(0);
-    // general_profile_compatibility_flags (32 bits)
-    buf.put_u32(0);
-    // general_constraint_indicator_flags (48 bits)
-    buf.put_u8(0);
-    buf.put_u8(0);
-    buf.put_u8(0);
-    buf.put_u8(0);
-    buf.put_u8(0);
-    buf.put_u8(0);
-    // general_level_idc
-    buf.put_u8(0);
-    // min_spatial_segmentation_idc (12 bits) + reserved (4 bits)
-    buf.put_u8(0xF0);
-    buf.put_u8(0x00);
-    // parallelismType (2 bits) + reserved (6 bits)
-    buf.put_u8(0xFC);
-    // chromaFormat (2 bits) + reserved (6 bits) — 0x01 = 4:2:0
-    buf.put_u8(0xFC | 0x01);
-    // bitDepthLumaMinus8 (3 bits) + reserved (5 bits)
-    buf.put_u8(0xF8);
-    // bitDepthChromaMinus8 (3 bits) + reserved (5 bits)
-    buf.put_u8(0xF8);
-    // avgFrameRate (16 bits)
-    buf.put_u16(0);
-    // constantFrameRate (2) | numTemporalLayers (3) | temporalIdNested (1) | lengthSizeMinusOne (2) = 0x0F
-    buf.put_u8(0x0F);
-    // numOfArrays
-    buf.put_u8(3);
-    // Array[0]: VPS (NAL type 32)
-    push_hvcc_nal_array(&mut buf, 32, &[vps]);
-    // Array[1]: SPS (NAL type 33)
-    push_hvcc_nal_array(&mut buf, 33, &[sps]);
-    // Array[2]: PPS (NAL type 34)
-    push_hvcc_nal_array(&mut buf, 34, &[pps]);
-    buf.to_vec()
-}
-
-fn push_hvcc_nal_array(buf: &mut BytesMut, nal_type: u8, nals: &[&[u8]]) {
-    // array_completeness (1) | reserved (1) | nal_unit_type (6)
-    buf.put_u8(0x80 | (nal_type & 0x3F));
-    // numNalus
-    buf.put_u16(nals.len() as u16);
-    for n in nals {
-        buf.put_u16(n.len() as u16);
-        buf.put_slice(n);
-    }
-}
-
-/// Convert a list of HEVC NALUs to AVCC framing, filtering out VPS / SPS /
-/// PPS (which ride in the hvcC sequence header, not the coded-frames body).
-fn annex_b_to_avcc_filtered_h265(nalus: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for n in nalus {
-        if n.is_empty() {
-            continue;
-        }
-        let nal_type = (n[0] >> 1) & 0x3F;
-        if matches!(nal_type, 32..=34) {
-            continue;
-        }
-        out.extend_from_slice(&(n.len() as u32).to_be_bytes());
-        out.extend_from_slice(n);
-    }
-    out
 }
 
 #[cfg(feature = "media-codecs")]
@@ -1820,7 +1802,6 @@ async fn encode_one_frame(
     // arrives first, so audio and video land on one timeline.
     base_pts: &mut Option<u64>,
     recv_time_us: u64,
-    sent_video_header: &mut bool,
     video_state: &mut VideoEncoderState,
     client: &mut RtmpClient,
     config: &RtmpOutputConfig,
@@ -1914,7 +1895,6 @@ async fn encode_one_frame(
             if !active.sequence_header_sent {
                 client.send_video(hdr, frame_ts_ms).await?;
                 active.sequence_header_sent = true;
-                *sent_video_header = true;
                 tracing::debug!(
                     "RTMP output '{}': sent transcoded video sequence header",
                     config.id
@@ -3371,6 +3351,7 @@ mod flv_timestamp_tests {
 pub(super) mod flv_wire_tests {
     use super::flv_timestamp_tests::{b_pyramid, ibbp};
     use super::*;
+    use crate::engine::cmaf::param_sets::tests::{h264_pps, h770, hevc_pps, hx};
     use crate::engine::rtmp::server::{RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
     use crate::engine::rtmp::ts_mux::TsMuxer;
     use bytes::Bytes;
@@ -3507,30 +3488,106 @@ pub(super) mod flv_wire_tests {
     /// picture, a non-IDR slice otherwise. The bytes are only ever passed
     /// through, never decoded.
     fn h264_au(key: bool, k: u8) -> Vec<u8> {
-        let mut au = vec![0, 0, 0, 1, 0x09, 0xF0];
         if key {
-            au.extend_from_slice(&[0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1E, 0xDA]);
-            au.extend_from_slice(&[0, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80]);
-            au.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x88, 0x84, k + 1]);
+            annex_b(&[&H264_AUD, &H264_SPS, &H264_PPS0, &h264_idr(k)])
         } else {
-            au.extend_from_slice(&[0, 0, 0, 1, 0x41, 0x9A, 0x22, k + 1]);
+            annex_b(&[&H264_AUD, &h264_slice(k)])
+        }
+    }
+
+    /// The HEVC counterpart: AUD, then VPS + SPS + PPS + IDR_W_RADL, or a
+    /// TRAIL_R slice. The parameter sets are 770_H's VPS, SPS and PPS0: real
+    /// ones, which the sequence header is built from.
+    fn h265_au(key: bool, k: u8) -> Vec<u8> {
+        let (vps, sps, pps) = h770();
+        if key {
+            annex_b(&[&HEVC_AUD, &vps, &sps, &pps[0], &hevc_idr(k)])
+        } else {
+            annex_b(&[&HEVC_AUD, &hevc_trail(k)])
+        }
+    }
+
+    const H264_AUD: [u8; 2] = [0x09, 0xF0];
+    const H264_SPS: [u8; 5] = [0x67, 0x42, 0xC0, 0x1E, 0xDA];
+    const H264_PPS0: [u8; 4] = [0x68, 0xCE, 0x3C, 0x80];
+    const HEVC_AUD: [u8; 3] = [0x46, 0x01, 0x50];
+
+    fn h264_idr(k: u8) -> [u8; 4] {
+        [0x65, 0x88, 0x84, k + 1]
+    }
+    fn h264_slice(k: u8) -> [u8; 4] {
+        [0x41, 0x9A, 0x22, k + 1]
+    }
+    fn hevc_idr(k: u8) -> [u8; 4] {
+        [0x26, 0x01, 0xAF, k + 1]
+    }
+    fn hevc_trail(k: u8) -> [u8; 4] {
+        [0x02, 0x01, 0xD0, k + 1]
+    }
+
+    /// NAL units as an Annex B access unit, four-byte start codes.
+    pub(super) fn annex_b(nals: &[&[u8]]) -> Vec<u8> {
+        let mut au = Vec::new();
+        for n in nals {
+            au.extend_from_slice(&[0, 0, 0, 1]);
+            au.extend_from_slice(n);
         }
         au
     }
 
-    /// The HEVC counterpart: AUD, then VPS + SPS + PPS + IDR_W_RADL, or a
-    /// TRAIL_R slice.
-    fn h265_au(key: bool, k: u8) -> Vec<u8> {
-        let mut au = vec![0, 0, 0, 1, 0x46, 0x01, 0x50];
-        if key {
-            au.extend_from_slice(&[0, 0, 0, 1, 0x40, 0x01, 0x0C, 0x01]);
-            au.extend_from_slice(&[0, 0, 0, 1, 0x42, 0x01, 0x01, 0x01]);
-            au.extend_from_slice(&[0, 0, 0, 1, 0x44, 0x01, 0xC1, 0x72]);
-            au.extend_from_slice(&[0, 0, 0, 1, 0x26, 0x01, 0xAF, k + 1]);
+    /// The parameter sets a sequence header tag carries, read back from its
+    /// `avcC` / `hvcC`: `(VPS, SPS, PPS)`, each in the record's order.
+    pub(super) fn header_sets(tag: &[u8]) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let record = &tag[5..];
+        let mut at;
+        let read = |at: &mut usize| {
+            let len = u16::from_be_bytes([record[*at], record[*at + 1]]) as usize;
+            let nal = record[*at + 2..*at + 2 + len].to_vec();
+            *at += 2 + len;
+            nal
+        };
+        let (mut vps, mut sps, mut pps) = (Vec::new(), Vec::new(), Vec::new());
+        if tag[0] & 0x80 == 0 {
+            assert_eq!(&tag[..2], &[0x17, 0x00], "an AVC sequence header");
+            at = 6;
+            for _ in 0..record[5] & 0x1F {
+                sps.push(read(&mut at));
+            }
+            let n = record[at];
+            at += 1;
+            for _ in 0..n {
+                pps.push(read(&mut at));
+            }
         } else {
-            au.extend_from_slice(&[0, 0, 0, 1, 0x02, 0x01, 0xD0, k + 1]);
+            assert_eq!(tag[0], 0x90, "an Enhanced-RTMP SequenceStart");
+            at = 23;
+            for _ in 0..record[22] {
+                let nal_type = record[at] & 0x3F;
+                let n = u16::from_be_bytes([record[at + 1], record[at + 2]]);
+                at += 3;
+                for _ in 0..n {
+                    let nal = read(&mut at);
+                    match nal_type {
+                        32 => vps.push(nal),
+                        33 => sps.push(nal),
+                        _ => pps.push(nal),
+                    }
+                }
+            }
         }
-        au
+        assert_eq!(at, record.len(), "nothing after the arrays");
+        (vps, sps, pps)
+    }
+
+    /// The same TS published three ways: one item per packet, seven packets
+    /// to an item as the inputs publish (`packet::bundle_ts_packets`), and
+    /// the whole stream as one item — one `demux` call, so an output that
+    /// read parameter sets per datagram rather than per access unit sees the
+    /// last of them ahead of the first picture.
+    fn as_published(ts: Vec<Bytes>) -> [(&'static str, Vec<Bytes>); 3] {
+        let whole = Bytes::from(ts.iter().flat_map(|p| p.iter().copied()).collect::<Vec<u8>>());
+        let bundled = crate::engine::packet::bundle_ts_packets(ts.clone());
+        [("per packet", ts), ("seven to an item", bundled), ("one item", vec![whole])]
     }
 
     /// `pics` (`(pts, dts)` in decode order; key pictures at the indices in
@@ -3539,10 +3596,21 @@ pub(super) mod flv_wire_tests {
     /// closing picture, since the demuxer hands a video PES out only at the
     /// next one on its PID.
     fn video_ts(mux: &mut TsMuxer, hevc: bool, pics: &[(u64, Option<u64>)], keys: &[usize]) -> Vec<Bytes> {
+        let au = |key: bool, k: usize| if hevc { h265_au(key, k as u8) } else { h264_au(key, k as u8) };
+        video_ts_with(mux, hevc, pics, keys, &au)
+    }
+
+    /// [`video_ts`] with the access units `au(key, k)` builds (Annex B).
+    fn video_ts_with(
+        mux: &mut TsMuxer,
+        hevc: bool,
+        pics: &[(u64, Option<u64>)],
+        keys: &[usize],
+        au: &dyn Fn(bool, usize) -> Vec<u8>,
+    ) -> Vec<Bytes> {
         if hevc {
             mux.set_video_stream_type(0x24);
         }
-        let au = |key: bool, k: usize| if hevc { h265_au(key, k as u8) } else { h264_au(key, k as u8) };
         let mut out = Vec::new();
         for (k, &(pts, dts)) in pics.iter().enumerate() {
             let key = keys.contains(&k);
@@ -3615,8 +3683,10 @@ pub(super) mod flv_wire_tests {
         }
     }
 
-    /// A source without B-frames goes out exactly as it did: each picture at
-    /// its PTS, composition time 0, HEVC as `CodedFramesX`.
+    /// A source without B-frames goes out on the timeline it always had: each
+    /// picture at its PTS, composition time 0, HEVC as `CodedFramesX`. (HEVC
+    /// tags now keep their in-band parameter sets, under a corrected `hvcC`:
+    /// edge#211.)
     #[tokio::test]
     async fn a_source_without_b_frames_reaches_flv_unchanged() {
         let pics: Vec<(u64, Option<u64>)> = (0..10).map(|k| (T0 + k * 3_003, None)).collect();
@@ -3684,11 +3754,245 @@ pub(super) mod flv_wire_tests {
             .collect();
         assert_eq!(out, flv);
     }
+
+    /// Every video tag that is a sequence header, in order.
+    fn headers(tags: &[WireTag]) -> Vec<&WireTag> {
+        tags.iter().filter(|t| t.video && tag_cts(&t.data).is_none()).collect()
+    }
+
+    /// The index, among the video tags, of each picture's tag.
+    fn picture_positions(video: &[&WireTag]) -> Vec<usize> {
+        (0..video.len()).filter(|&i| tag_cts(&video[i].data).is_some()).collect()
+    }
+
+    /// edge#211, the reported failure: an HEVC source whose IRAPs carry PPS0,
+    /// PPS1 and PPS2 while its slices name PPS0 and PPS1 (770_H). The sequence
+    /// header carried the last PPS alone and the coded frames none, so no
+    /// picture decoded at the receiver ("PPS id out of range"). The header now
+    /// carries all three under FFmpeg's header bytes, and every key picture
+    /// keeps its parameter sets in-band — however the TS was published.
+    #[tokio::test]
+    async fn a_multi_pps_hevc_source_reaches_flv_with_every_pps() {
+        let (vps, sps, pps) = h770();
+        let pics: Vec<(u64, Option<u64>)> = (0..12).map(|k| (T0 + k * F, None)).collect();
+        let nals = |key: bool, k: usize| -> Vec<Vec<u8>> {
+            let k = k as u8;
+            if key {
+                let mut au = vec![HEVC_AUD.to_vec(), vps.clone(), sps.clone()];
+                au.extend(pps.iter().cloned());
+                au.push(hevc_idr(k).to_vec());
+                au
+            } else {
+                vec![HEVC_AUD.to_vec(), hevc_trail(k).to_vec()]
+            }
+        };
+        let au = |key: bool, k: usize| annex_b(&nals(key, k).iter().map(Vec::as_slice).collect::<Vec<_>>());
+        let ts = video_ts_with(&mut TsMuxer::new(), true, &pics, &[0, 6], &au);
+        for (shape, items) in as_published(ts) {
+            let tags = publish(items, passthrough_output()).await;
+            let video: Vec<&WireTag> = tags.iter().filter(|t| t.video).collect();
+            let first = &video[0].data;
+            assert_eq!(first[0], 0x90, "{shape}: the first video tag is a SequenceStart");
+            assert_eq!(
+                first[5..28],
+                hx("0102200000006000000000007bf000fcfdfafa00000f03")[..],
+                "{shape}: FFmpeg's hvcC header for 770_H",
+            );
+            assert_eq!(header_sets(first), (vec![vps.clone()], vec![sps.clone()], pps.to_vec()), "{shape}");
+            let headers = headers(&tags);
+            assert_eq!(headers.len(), 3, "{shape}");
+            assert!(headers.iter().all(|h| h.data == *first), "{shape}: one header, re-sent");
+            let keys: Vec<&WireTag> = video.iter().copied().filter(|t| t.data[0] == 0x93).collect();
+            assert_eq!(keys.len(), 2, "{shape}");
+            for (tag, k) in keys.iter().zip([0, 6]) {
+                assert_eq!(
+                    tag.data[5..],
+                    to_length_prefixed(&nals(true, k))[..],
+                    "{shape}: key picture {k} keeps every NAL it carried",
+                );
+            }
+            assert_wire_decode_order(&tags, &pics, T0, true);
+        }
+    }
+
+    /// The same for H.264: the `avcC` carries every PPS, in id order, and the
+    /// NALU tags carry their parameter sets in-band as they always did.
+    #[tokio::test]
+    async fn a_multi_pps_h264_source_reaches_flv_with_every_pps() {
+        let (pps1, pps2) = (h264_pps(1, 1), h264_pps(2, 1));
+        let pics: Vec<(u64, Option<u64>)> = (0..8).map(|k| (T0 + k * F, None)).collect();
+        let keys = [0, 4];
+        let nals = |key: bool, k: usize| -> Vec<Vec<u8>> {
+            let k = k as u8;
+            if key {
+                vec![
+                    H264_AUD.to_vec(),
+                    H264_SPS.to_vec(),
+                    H264_PPS0.to_vec(),
+                    pps1.clone(),
+                    pps2.clone(),
+                    h264_idr(k).to_vec(),
+                ]
+            } else {
+                vec![H264_AUD.to_vec(), h264_slice(k).to_vec()]
+            }
+        };
+        let au = |key: bool, k: usize| annex_b(&nals(key, k).iter().map(Vec::as_slice).collect::<Vec<_>>());
+        let tags = publish(video_ts_with(&mut TsMuxer::new(), false, &pics, &keys, &au), passthrough_output()).await;
+        let mut want = vec![0x17, 0, 0, 0, 0, 0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x05];
+        want.extend_from_slice(&H264_SPS);
+        want.push(3);
+        for p in [&H264_PPS0[..], &pps1, &pps2] {
+            want.extend_from_slice(&(p.len() as u16).to_be_bytes());
+            want.extend_from_slice(p);
+        }
+        let headers = headers(&tags);
+        assert_eq!(headers.len(), 3);
+        assert!(headers.iter().all(|h| h.data[..] == want[..]), "{:02x?}", &headers[0].data[..]);
+        let video: Vec<&WireTag> = tags.iter().filter(|t| t.video).collect();
+        let pictures = picture_positions(&video);
+        assert_eq!(pictures.len(), pics.len());
+        for (k, &at) in pictures.iter().enumerate() {
+            let key = keys.contains(&k);
+            assert_eq!(video[at].data[0], if key { 0x17 } else { 0x27 }, "picture {k}");
+            assert_eq!(video[at].data[5..], to_length_prefixed(&nals(key, k))[..], "picture {k}");
+        }
+        assert_wire_decode_order(&tags, &pics, T0, false);
+    }
+
+    /// A parameter set under a new id between key pictures renews the header
+    /// at once — immediately ahead of the picture that brought it, at that
+    /// picture's decode time — since the next picture may name it. The table
+    /// is fed one access unit at a time: built from what a whole datagram
+    /// held, the one-item feed's first header would already carry PPS3.
+    #[tokio::test]
+    async fn a_parameter_set_arriving_mid_gop_renews_the_header_before_its_picture() {
+        let pics: Vec<(u64, Option<u64>)> = (0..6).map(|k| (T0 + k * F, None)).collect();
+        for hevc in [false, true] {
+            let (pps0, pps3) =
+                if hevc { (h770().2[0].clone(), hevc_pps(3, 1)) } else { (H264_PPS0.to_vec(), h264_pps(3, 1)) };
+            let au = |key: bool, k: usize| match (hevc, k) {
+                (true, 3) => annex_b(&[&HEVC_AUD, &pps3, &hevc_trail(3)]),
+                (false, 3) => annex_b(&[&H264_AUD, &pps3, &h264_slice(3)]),
+                (true, _) => h265_au(key, k as u8),
+                (false, _) => h264_au(key, k as u8),
+            };
+            let ts = video_ts_with(&mut TsMuxer::new(), hevc, &pics, &[0], &au);
+            for (shape, items) in as_published(ts) {
+                let tags = publish(items, passthrough_output()).await;
+                let headers = headers(&tags);
+                assert_eq!(headers.len(), 3, "hevc {hevc}, {shape}");
+                assert_eq!(header_sets(&headers[0].data).2, vec![pps0.clone()], "hevc {hevc}, {shape}: the first");
+                let video: Vec<&WireTag> = tags.iter().filter(|t| t.video).collect();
+                let pictures = picture_positions(&video);
+                let between = &video[pictures[2] + 1..pictures[3]];
+                assert_eq!(between.len(), 1, "hevc {hevc}, {shape}: one header between pictures 2 and 3");
+                assert_eq!(between[0].ts, video[pictures[3]].ts, "hevc {hevc}, {shape}: at picture 3's decode time");
+                assert_eq!(
+                    header_sets(&between[0].data).2,
+                    vec![pps0.clone(), pps3.clone()],
+                    "hevc {hevc}, {shape}: renewed with PPS3",
+                );
+                assert_wire_decode_order(&tags, &pics, T0, hevc);
+            }
+        }
+    }
+
+    /// A PPS re-sent under its id with other bytes between key pictures goes
+    /// to the decoder in-band and leaves the header alone; the next key
+    /// picture renews the header with it. Renewing on every change would put a
+    /// header ahead of every picture of a source that alternates its PPS.
+    #[tokio::test]
+    async fn a_pps_resent_with_new_bytes_mid_gop_waits_for_the_key_picture() {
+        let pics: Vec<(u64, Option<u64>)> = (0..10).map(|k| (T0 + k * F, None)).collect();
+        let (vps, sps, _) = h770();
+        for hevc in [false, true] {
+            let pps = |k: usize| {
+                let tag = 1 + (k % 2) as u8;
+                if hevc { hevc_pps(0, tag) } else { h264_pps(0, tag) }
+            };
+            let au = |key: bool, k: usize| {
+                let (n, p) = (k as u8, pps(k));
+                match (hevc, key) {
+                    (true, true) => annex_b(&[&HEVC_AUD, &vps, &sps, &p, &hevc_idr(n)]),
+                    (true, false) => annex_b(&[&HEVC_AUD, &p, &hevc_trail(n)]),
+                    (false, true) => annex_b(&[&H264_AUD, &H264_SPS, &p, &h264_idr(n)]),
+                    (false, false) => annex_b(&[&H264_AUD, &p, &h264_slice(n)]),
+                }
+            };
+            let tags = publish(video_ts_with(&mut TsMuxer::new(), hevc, &pics, &[0, 5], &au), passthrough_output()).await;
+            let headers = headers(&tags);
+            assert_eq!(headers.len(), 3, "hevc {hevc}");
+            assert_eq!(headers[0].data, headers[1].data, "hevc {hevc}: a header, then its key-picture re-send");
+            assert_eq!(header_sets(&headers[0].data).2, vec![pps(0)], "hevc {hevc}");
+            assert_eq!(header_sets(&headers[2].data).2, vec![pps(5)], "hevc {hevc}: renewed at the key picture");
+            let ms = |k: usize| ((pics[k].0 - T0) / 90) as u32;
+            assert_eq!([headers[0].ts, headers[1].ts, headers[2].ts], [ms(0), ms(0), ms(5)], "hevc {hevc}");
+            assert_wire_decode_order(&tags, &pics, T0, hevc);
+        }
+    }
+
+    /// An HEVC access unit carrying no picture — parameter sets, with or
+    /// without an AUD — sends no tag of its own (a CodedFrames tag carries a
+    /// picture), and the renewal its new PPS causes goes out immediately
+    /// ahead of the next picture, at that picture's decode time.
+    #[tokio::test]
+    async fn an_hevc_access_unit_without_a_picture_sends_no_tag() {
+        let (vps, sps, pps) = h770();
+        let pps3 = hevc_pps(3, 1);
+        let pics: Vec<(u64, Option<u64>)> = (0..5).map(|k| (T0 + k * F, None)).collect();
+        for with_aud in [true, false] {
+            let mut sets: Vec<&[u8]> = vec![&vps[..], &sps[..], &pps3[..]];
+            if with_aud {
+                sets.insert(0, &HEVC_AUD[..]);
+            }
+            let mut mux = TsMuxer::new();
+            mux.set_video_stream_type(0x24);
+            let mut ts = Vec::new();
+            for (k, &(pts, _)) in pics.iter().enumerate() {
+                if k == 2 {
+                    let at = T0 + F + F / 2;
+                    ts.extend(mux.mux_video(&annex_b(&sets), at, at, false));
+                }
+                ts.extend(mux.mux_video(&h265_au(k == 0, k as u8), pts, pts, k == 0));
+            }
+            let end = T0 + 5 * F;
+            ts.extend(mux.mux_video(&h265_au(false, 5), end, end, false));
+            let tags = publish(ts, passthrough_output()).await;
+            let video: Vec<&WireTag> = tags.iter().filter(|t| t.video).collect();
+            assert_eq!(headers(&tags).len(), 3, "aud {with_aud}");
+            assert_eq!(video.len(), pics.len() + 3, "aud {with_aud}: no tag for the access unit");
+            let pictures = picture_positions(&video);
+            assert_eq!(pictures[2] - pictures[1], 2, "aud {with_aud}: one header between pictures 1 and 2");
+            let renewal = video[pictures[2] - 1];
+            assert_eq!(renewal.ts, video[pictures[2]].ts, "aud {with_aud}: at picture 2's decode time");
+            assert_eq!(header_sets(&renewal.data).2, vec![pps[0].clone(), pps3.clone()], "aud {with_aud}");
+            assert_wire_decode_order(&tags, &pics, T0, true);
+        }
+    }
+
+    /// Non-regression: a clean single-set H.264 source sends the sequence
+    /// header it always sent, byte for byte.
+    #[tokio::test]
+    async fn a_clean_h264_source_keeps_its_sequence_header_bytes() {
+        let pics: Vec<(u64, Option<u64>)> = (0..4).map(|k| (T0 + k * F, None)).collect();
+        let tags = publish(video_ts(&mut TsMuxer::new(), false, &pics, &[0]), passthrough_output()).await;
+        let first = tags.iter().find(|t| t.video).unwrap();
+        assert_eq!(
+            first.data[..],
+            [
+                0x17, 0, 0, 0, 0, 0x01, 0x42, 0xC0, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x42, 0xC0, 0x1E,
+                0xDA, 0x01, 0x00, 0x04, 0x68, 0xCE, 0x3C, 0x80,
+            ],
+        );
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::flv_wire_tests::{annex_b, header_sets};
     use super::*;
+    use crate::engine::cmaf::param_sets::tests::{HevcSpsSpec, h264_pps, h770, hevc_pps, hevc_sps_full, hx};
 
     /// **B1.** `audio_encode.sample_rate` / `channels` without a
     /// `transcode` block go through the shared channel / rate stage: the
@@ -4023,6 +4327,156 @@ pub(crate) mod tests {
             build_avc_nalu_tag(&nalus, true, 0),
             vec![0x17, 0x01, 0, 0, 0, 0, 0, 0, 3, 0x41, 0x9A, 0x22],
         );
+    }
+
+    const HEVC_IDR: [u8; 4] = [0x26, 0x01, 0xAF, 0x21];
+    const HEVC_TRAIL: [u8; 4] = [0x02, 0x01, 0xD0, 0x21];
+    /// FFmpeg's FLV muxer's `hvcC` header for 770_H, and numOfArrays.
+    const H770_HEADER: &str = "0102200000006000000000007bf000fcfdfafa00000f03";
+    const H264: CmafVideoCodec = CmafVideoCodec::H264;
+    const H265: CmafVideoCodec = CmafVideoCodec::H265;
+
+    fn au(nals: &[&[u8]]) -> Vec<Vec<u8>> {
+        nals.iter().map(|n| n.to_vec()).collect()
+    }
+
+    /// The headers ahead of a picture about to go out: the tag, and how many
+    /// copies.
+    fn take(pv: &mut PassthroughVideo, codec: CmafVideoCodec, key: bool) -> Option<(Vec<u8>, usize)> {
+        pv.take_headers(codec, key).map(|(tag, n)| (tag.to_vec(), n))
+    }
+
+    /// edge#211: no header until the table holds a VPS, an SPS and a PPS;
+    /// then one carrying every PPS the key picture brought, under FFmpeg's
+    /// header bytes and with no array marked complete, sent twice ahead of
+    /// the connection's first key picture as it always was.
+    #[test]
+    fn the_sequence_header_waits_for_a_complete_table() {
+        let (vps, sps, pps) = h770();
+        let mut pv = PassthroughVideo::default();
+        assert!(!pv.observe(H265, &au(&[&pps[0], &HEVC_TRAIL]), false));
+        assert_eq!(take(&mut pv, H265, false), None);
+        assert!(pv.observe(H265, &au(&[&vps, &sps, &pps[0], &pps[1], &pps[2], &HEVC_IDR]), true));
+        let mut want = vec![0x90];
+        want.extend_from_slice(b"hvc1");
+        want.extend(hx(H770_HEADER));
+        for (nal_type, list) in [(0x20u8, vec![vps.clone()]), (0x21, vec![sps.clone()]), (0x22, pps.to_vec())] {
+            want.push(nal_type);
+            want.extend((list.len() as u16).to_be_bytes());
+            for nal in &list {
+                want.extend((nal.len() as u16).to_be_bytes());
+                want.extend_from_slice(nal);
+            }
+        }
+        assert_eq!(take(&mut pv, H265, true), Some((want, 2)));
+    }
+
+    /// Between key pictures only a new id renews the header — changed bytes
+    /// under a known id reach the decoder in-band — and at a key picture
+    /// changed bytes do too. A renewal makes the header the table, and on a
+    /// key picture rides its one re-send rather than adding a second.
+    #[test]
+    fn a_header_is_renewed_by_id_between_key_pictures_and_by_bytes_at_them() {
+        let (vps, sps, pps) = h770();
+        let key = au(&[&vps, &sps, &pps[0], &pps[1], &pps[2], &HEVC_IDR]);
+        let mut pv = PassthroughVideo::default();
+        assert!(pv.observe(H265, &key, true));
+        let (tag, _) = take(&mut pv, H265, true).unwrap();
+        // (a) The same key picture again: one re-send of the same header.
+        assert!(!pv.observe(H265, &key, true));
+        assert_eq!(take(&mut pv, H265, true), Some((tag.clone(), 1)));
+        // (b) PPS0 re-sent as it was: nothing.
+        assert!(!pv.observe(H265, &au(&[&pps[0], &HEVC_TRAIL]), false));
+        assert_eq!(take(&mut pv, H265, false), Some((tag.clone(), 0)));
+        // (c) PPS0 with other bytes between key pictures: in-band only.
+        assert!(!pv.observe(H265, &au(&[&hevc_pps(0, 9), &HEVC_TRAIL]), false));
+        assert_eq!(header_sets(&pv.header.as_ref().unwrap().tag).2, pps.to_vec());
+        // (d) A key picture leaving PPS2 out, PPS0 and PPS1 as the header has
+        // them: not a change, and the header keeps all three.
+        assert!(!pv.observe(H265, &au(&[&pps[0], &pps[1], &HEVC_IDR]), true));
+        assert_eq!(take(&mut pv, H265, true), Some((tag.clone(), 1)));
+        assert_eq!(header_sets(&tag).2.len(), 3);
+        // (e) A new id between key pictures renews at once, and the header
+        // becomes the table: PPS2, which the key picture left out, goes.
+        assert!(pv.observe(H265, &au(&[&hevc_pps(3, 1), &HEVC_TRAIL]), false));
+        let (renewed, n) = take(&mut pv, H265, false).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(header_sets(&renewed).2, vec![pps[0].clone(), pps[1].clone(), hevc_pps(3, 1)]);
+        // (f) A key picture with a changed SPS: renewed, one copy, not two.
+        let sps150 = hevc_sps_full(HevcSpsSpec { level: 150, ..Default::default() });
+        assert!(pv.observe(H265, &au(&[&vps, &sps150, &pps[0], &HEVC_IDR]), true));
+        let (changed, n) = take(&mut pv, H265, true).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(header_sets(&changed), (vec![vps.clone()], vec![sps150], vec![pps[0].clone()]));
+    }
+
+    /// A change of codec starts again: no header describes the new codec's
+    /// pictures until its table is complete, and the old codec's header goes.
+    #[test]
+    fn a_codec_change_starts_the_header_again() {
+        let mut pv = PassthroughVideo::default();
+        let h264_key = au(&[&[0x67, 0x42, 0xC0, 0x1E, 0xDA], &[0x68, 0xCE, 0x3C, 0x80], &[0x65, 0x88, 0x84, 0x21]]);
+        assert!(pv.observe(H264, &h264_key, true));
+        assert_eq!(take(&mut pv, H264, true).map(|(_, n)| n), Some(2));
+        let (vps, sps, pps) = h770();
+        assert!(!pv.observe(H265, &au(&[&pps[0], &HEVC_TRAIL]), false));
+        assert_eq!(take(&mut pv, H265, false), None, "nothing describes HEVC yet");
+        assert!(pv.observe(H265, &au(&[&vps, &sps, &pps[0], &HEVC_IDR]), true));
+        let (tag, n) = take(&mut pv, H265, true).unwrap();
+        assert_eq!((tag[0], n), (0x90, 1));
+        assert_eq!(take(&mut pv, H264, true), None, "nor H.264 any longer");
+    }
+
+    /// At a discontinuity the table starts again. Pictures keep going out
+    /// under the old header until the new source's table is complete, which
+    /// then replaces it even though the old one holds every set it has —
+    /// dropping the old source's extra ids.
+    #[test]
+    fn a_discontinuity_rebuilds_the_header_from_the_new_source() {
+        let sps = [0x67, 0x42, 0xC0, 0x1E, 0xDA];
+        let pps0 = [0x68, 0xCE, 0x3C, 0x80];
+        let idr = [0x65, 0x88, 0x84, 0x21];
+        let mut pv = PassthroughVideo::default();
+        assert!(pv.observe(H264, &au(&[&sps, &pps0, &h264_pps(1, 1), &h264_pps(2, 1), &idr]), true));
+        let (old, _) = take(&mut pv, H264, true).unwrap();
+        assert_eq!(header_sets(&old).2.len(), 3);
+        pv.restart();
+        assert!(!pv.observe(H264, &au(&[&[0x41, 0x9A, 0x22, 0x21]]), false));
+        assert_eq!(take(&mut pv, H264, false), Some((old, 0)), "the old header meanwhile");
+        assert!(pv.observe(H264, &au(&[&sps, &pps0, &idr]), true), "replaced, though it held these");
+        let (new, n) = take(&mut pv, H264, true).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(header_sets(&new).2, vec![pps0.to_vec()]);
+    }
+
+    /// edge#211: the re-encoder's `hvcC` header is read from its SPS RBSP as
+    /// passthrough's is — it took the raw bytes one early — and says its sets
+    /// may arrive in-band too.
+    #[test]
+    fn the_re_encoders_hvcc_reads_its_sps_rbsp() {
+        let (vps, sps, pps) = h770();
+        let tag = build_hevc_sequence_header_from_hvcc(&annex_b(&[&vps, &sps, &pps[0]]));
+        assert_eq!(&tag[..5], &[0x90, b'h', b'v', b'c', b'1']);
+        assert_eq!(tag[5..28], hx(H770_HEADER)[..]);
+        let mut at = 28;
+        for (nal_type, nal) in [(0x20u8, &vps), (0x21, &sps), (0x22, &pps[0])] {
+            assert_eq!(&tag[at..at + 3], &[nal_type, 0, 1], "one entry, not marked complete");
+            at += 3 + 2 + nal.len();
+        }
+        assert_eq!(header_sets(&tag), (vec![vps.clone()], vec![sps.clone()], vec![pps[0].clone()]));
+    }
+
+    /// Non-regression: the re-encoder's AVC sequence header from x264's
+    /// Annex-B extradata is the record it always sent.
+    #[test]
+    fn the_re_encoders_avcc_is_unchanged() {
+        let sps = hx("6764000d32cd94141fb011000003000100000300320f142996");
+        let pps = hx("6831abe3cb22c0");
+        let mut want = vec![0x17, 0, 0, 0, 0, 0x01, 0x64, 0x00, 0x0D, 0xFF, 0xE1, 0x00, 0x19];
+        want.extend_from_slice(&sps);
+        want.extend_from_slice(&[0x01, 0x00, 0x07]);
+        want.extend_from_slice(&pps);
+        assert_eq!(build_avc_sequence_header_from_avcc(&annex_b(&[&sps, &pps])), want);
     }
 
     /// Total reconnect attempts in 60 s of wall clock should be ≤ 7
