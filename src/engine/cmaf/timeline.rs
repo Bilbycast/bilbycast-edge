@@ -165,8 +165,9 @@ struct Line {
     newest: Option<u64>,
     /// The previous source timestamp, for the step measurement.
     last_src: Option<u64>,
-    /// The last step between source timestamps, and recent positive ones.
-    last_step: Option<i64>,
+    /// The last two steps between source timestamps, the newest first, and
+    /// recent positive ones.
+    last_steps: [Option<i64>; 2],
     steps: [u64; STEP_HISTORY],
     n_steps: usize,
     /// The furthest output timestamp the track has reached, and how far
@@ -248,7 +249,7 @@ impl Line {
     fn note_step(&mut self, src: u64) {
         if let Some(prev) = self.last_src {
             let d = circ(src, prev);
-            self.last_step = Some(d);
+            self.last_steps = [Some(d), self.last_steps[0]];
             if d > 0 && d as u64 <= MAX_STEP_90K {
                 self.steps[self.n_steps % STEP_HISTORY] = d as u64;
                 self.n_steps += 1;
@@ -419,10 +420,11 @@ impl CmafTimeline {
             Track::Audio => (&mut self.audio, &mut self.video),
         };
         let continue_at = me.continue_at.take();
-        // Whether the track's last step was longer than any frame's (or it
-        // has had none): a slow picture source, whose pictures the demuxer
-        // hands out an interval late.
-        let slow = me.last_step.is_none_or(|d| d > MAX_STEP_90K as i64);
+        // Whether the track's last two steps were longer than any frame's
+        // (or it has had none): a slow picture source, whose pictures the
+        // demuxer hands out an interval late. One long step is a few lost
+        // pictures, before an outage as often as not.
+        let slow = me.last_steps.iter().all(|s| s.is_none_or(|d| d > MAX_STEP_90K as i64));
         let leapt = me.last_src.is_some_and(|prev| circ(src, prev) > MAX_STEP_90K as i64);
         let other_leapt = other.leaps > me.other_leaps_prev;
         me.note_step(src);
