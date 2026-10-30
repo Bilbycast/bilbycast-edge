@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -535,34 +537,15 @@ pub async fn connect_srt_output(
 ///
 /// `connect_srt_with_retry` retries **forever** (30 s cap) and only logs, so
 /// without an observer a caller-mode output that cannot reach its peer is
-/// completely silent after its first event — for the whole outage. Mirrors
-/// [`connect_srt_redundancy_leg_observed`], which is the existing precedent.
+/// completely silent after its first event — for the whole outage. The
+/// 2022-7 input's caller legs take the same kind of observer through
+/// [`acquire_redundant_leg`].
 pub async fn connect_srt_output_observed(
     config: &SrtOutputConfig,
     cancel: &CancellationToken,
     on_attempt_failed: &mut (dyn FnMut(u32, &anyhow::Error) + Send),
 ) -> Result<Arc<SrtSocket>> {
     let p = SrtConnectionParams::from(config);
-    connect_srt_with_retry_observed(&p, cancel, on_attempt_failed).await
-}
-
-/// Convenience wrapper: connect the SMPTE 2022-7 redundancy leg (leg 2)
-/// using the parameters in [`SrtRedundancyConfig`], with automatic retry.
-pub async fn connect_srt_redundancy_leg(
-    redundancy: &SrtRedundancyConfig,
-    cancel: &CancellationToken,
-) -> Result<Arc<SrtSocket>> {
-    connect_srt_redundancy_leg_observed(redundancy, cancel, &mut |_, _| {}).await
-}
-
-/// Like [`connect_srt_redundancy_leg`], with the per-attempt failure
-/// observer (see [`connect_srt_with_retry_observed`]).
-pub async fn connect_srt_redundancy_leg_observed(
-    redundancy: &SrtRedundancyConfig,
-    cancel: &CancellationToken,
-    on_attempt_failed: &mut (dyn FnMut(u32, &anyhow::Error) + Send),
-) -> Result<Arc<SrtSocket>> {
-    let p = SrtConnectionParams::from(redundancy);
     connect_srt_with_retry_observed(&p, cancel, on_attempt_failed).await
 }
 
@@ -644,6 +627,111 @@ pub async fn bind_srt_listener_for_input(config: &SrtInputConfig) -> Result<SrtL
 pub async fn bind_srt_listener_for_redundancy(config: &SrtRedundancyConfig) -> Result<SrtListener> {
     let p = SrtConnectionParams::from(config);
     bind_srt_listener(&p).await
+}
+
+// ---------------------------------------------------------------------------
+// SMPTE 2022-7 leg acquisition
+// ---------------------------------------------------------------------------
+
+/// How long a lost 2022-7 leg waits before it is accepted or dialled again.
+/// A caller leg then backs off as every caller does, up to 30 s between
+/// attempts.
+pub const LEG_REACQUIRE_DELAY: Duration = Duration::from_secs(1);
+
+/// What one acquisition of a 2022-7 leg ended with.
+pub enum LegAcquired {
+    /// The leg's socket, and its listener handed back for the next re-arm
+    /// (`None` on a caller or rendezvous leg).
+    Connected(Arc<SrtSocket>, Option<SrtListener>),
+    /// `cancel` fired. Never returned otherwise.
+    Cancelled,
+    /// The listener can never accept again: its accept channel has closed,
+    /// which the wrapper does only once the listener itself is closed. It has
+    /// been dropped, so the leg is not to be re-armed.
+    Failed(anyhow::Error),
+}
+
+/// One acquisition of a 2022-7 leg in flight. Allocated once per arm, never
+/// per packet, and polled by `&mut` across `select!` iterations, so an accept
+/// or a connect is never abandoned half-way except at teardown.
+pub type LegAcquire<'a> = Pin<Box<dyn Future<Output = LegAcquired> + Send + 'a>>;
+
+/// Accept or dial one leg of a SMPTE 2022-7 pair, on its own.
+///
+/// The 2022-7 input and output each keep one of these in flight per leg that
+/// is not attached, so neither leg waits on the other: either leg alone
+/// carries, and a lost leg is re-armed while the other carries on.
+///
+/// - `listener`: the leg's bound listener (`Some` for a listener leg). It is
+///   handed back in [`LegAcquired::Connected`] for the next re-arm. An accept
+///   error that is not a cancel is permanent — the wrapper's accept fails
+///   only once the listener's accept channel has closed — so it is returned
+///   as [`LegAcquired::Failed`] rather than retried.
+/// - a caller or rendezvous leg retries forever with back-off
+///   ([`connect_srt_with_retry_observed`]), reporting each failed attempt to
+///   `on_attempt_failed`.
+/// - `delay`: waited first, cancel-aware: zero on the first arm,
+///   [`LEG_REACQUIRE_DELAY`] after a loss.
+/// - `slow`: called once if the leg has not connected that long after the
+///   delay; the acquisition carries on regardless.
+pub fn acquire_redundant_leg<'a>(
+    params: SrtConnectionParams<'a>,
+    listener: Option<SrtListener>,
+    delay: Duration,
+    cancel: &'a CancellationToken,
+    mut on_attempt_failed: impl FnMut(u32, &anyhow::Error) + Send + 'a,
+    slow: Option<(Duration, Box<dyn FnOnce() + Send + 'a>)>,
+) -> LegAcquire<'a> {
+    Box::pin(async move {
+        if !delay.is_zero() {
+            tokio::select! {
+                _ = cancel.cancelled() => return LegAcquired::Cancelled,
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+        let acquire = async move {
+            if let Some(mut listener) = listener {
+                return match accept_srt_connection(&mut listener, cancel).await {
+                    Ok(socket) => LegAcquired::Connected(socket, Some(listener)),
+                    Err(_) if cancel.is_cancelled() => LegAcquired::Cancelled,
+                    // Dropping the listener closes it.
+                    Err(e) => LegAcquired::Failed(e),
+                };
+            }
+            loop {
+                match connect_srt_with_retry_observed(&params, cancel, &mut on_attempt_failed)
+                    .await
+                {
+                    Ok(socket) => return LegAcquired::Connected(socket, None),
+                    Err(_) if cancel.is_cancelled() => return LegAcquired::Cancelled,
+                    Err(e) => {
+                        // Unreachable today: the retry loop errs only on a
+                        // cancel. Keep the leg trying rather than leave it
+                        // dead with no event.
+                        tracing::warn!(
+                            "SRT 2022-7 leg connect ended without a socket: {e}; retrying in {:?}",
+                            LEG_REACQUIRE_DELAY
+                        );
+                        tokio::select! {
+                            _ = cancel.cancelled() => return LegAcquired::Cancelled,
+                            _ = tokio::time::sleep(LEG_REACQUIRE_DELAY) => {}
+                        }
+                    }
+                }
+            }
+        };
+        let mut acquire = std::pin::pin!(acquire);
+        let Some((after, warn)) = slow else {
+            return acquire.await;
+        };
+        tokio::select! {
+            acquired = &mut acquire => acquired,
+            _ = tokio::time::sleep(after) => {
+                warn();
+                acquire.await
+            }
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1621,5 +1709,131 @@ mod tests {
         // `apply_stream_id_access_control`), but an empty expected value must
         // not silently match every caller if one ever reaches here.
         assert!(!stream_id_matches("", "anything"));
+    }
+
+    // ── SMPTE 2022-7 leg acquisition (edge#182) ──────────────────────
+
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn input_config(value: serde_json::Value) -> SrtInputConfig {
+        serde_json::from_value(value).expect("SRT config fixture")
+    }
+
+    /// A listener whose accept channel has closed can never accept again, so
+    /// its leg is reported failed once rather than retried every second for
+    /// ever. It is never an attempt failure either: the observer is for
+    /// caller legs.
+    #[tokio::test]
+    async fn acquire_redundant_leg_fails_a_closed_listener_once() {
+        let config = input_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{}", free_port()),
+            "latency_ms": 200
+        }));
+        let listener = super::bind_srt_listener_for_input(&config).await.expect("binds");
+        listener.close().await.expect("closes");
+        let cancel = CancellationToken::new();
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let acquired = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::acquire_redundant_leg(
+                SrtConnectionParams::from(&config),
+                Some(listener),
+                Duration::ZERO,
+                &cancel,
+                |_, _| {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("a closed listener is not waited on");
+        assert!(
+            matches!(acquired, super::LegAcquired::Failed(_)),
+            "a closed listener fails its leg"
+        );
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    /// A leg slow to connect says so once and keeps waiting, and a caller
+    /// arriving afterwards is still accepted, with the listener handed back
+    /// for the leg's next re-arm.
+    #[tokio::test]
+    async fn acquire_redundant_leg_warns_once_when_slow_and_keeps_trying() {
+        let port = free_port();
+        let config = input_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }));
+        let listener = super::bind_srt_listener_for_input(&config).await.expect("binds");
+        let cancel = CancellationToken::new();
+        let warned = std::sync::atomic::AtomicU32::new(0);
+        let mut acquire = super::acquire_redundant_leg(
+            SrtConnectionParams::from(&config),
+            Some(listener),
+            Duration::ZERO,
+            &cancel,
+            |_, _| {},
+            Some((
+                Duration::from_millis(200),
+                Box::new(|| {
+                    warned.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }),
+            )),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), &mut acquire).await.is_err(),
+            "no caller yet, so the leg is still waiting"
+        );
+        assert_eq!(warned.load(std::sync::atomic::Ordering::Relaxed), 1, "warned exactly once");
+
+        let caller = input_config(serde_json::json!({
+            "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }));
+        let (acquired, peer) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(10), acquire),
+            tokio::time::timeout(Duration::from_secs(10), super::connect_srt_input(&caller, &cancel)),
+        );
+        let _peer = peer.expect("the caller connects in time").expect("the caller connects");
+        match acquired.expect("the leg is accepted in time") {
+            super::LegAcquired::Connected(_, listener) => {
+                assert!(listener.is_some(), "the listener is handed back for the next re-arm")
+            }
+            _ => panic!("a caller arriving late is still accepted"),
+        }
+        assert_eq!(warned.load(std::sync::atomic::Ordering::Relaxed), 1, "and warned no more");
+    }
+
+    /// A caller leg whose peer is absent keeps retrying, reporting each
+    /// failed attempt, and ends only on a cancel, as `Cancelled`.
+    #[tokio::test]
+    async fn acquire_redundant_leg_is_cancelled_only_by_cancel() {
+        let config = input_config(serde_json::json!({
+            "mode": "caller", "remote_addr": format!("127.0.0.1:{}", free_port()),
+            "latency_ms": 200, "connect_timeout_secs": 1
+        }));
+        let cancel = CancellationToken::new();
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let mut acquire = super::acquire_redundant_leg(
+            SrtConnectionParams::from(&config),
+            None,
+            Duration::ZERO,
+            &cancel,
+            |_, _| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            },
+            None,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1500), &mut acquire).await.is_err(),
+            "an absent peer is retried, never given up on"
+        );
+        assert!(attempts.load(std::sync::atomic::Ordering::Relaxed) >= 1, "each failure is reported");
+        cancel.cancel();
+        let acquired = tokio::time::timeout(Duration::from_secs(5), acquire)
+            .await
+            .expect("a cancel ends the acquisition");
+        assert!(matches!(acquired, super::LegAcquired::Cancelled));
     }
 }
