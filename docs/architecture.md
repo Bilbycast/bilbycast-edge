@@ -249,9 +249,12 @@ broadcast IRDs) do not lose lock during a switch:
    JPEG 2000, uncompressed video, SMPTE ST 2110-30/-31/-40, AAC, HE-AAC,
    Opus, MP2, AC-3, LPCM, SMPTE 302M, or any future format. Inputs do not
    need to share the same codec, resolution, frame rate, sample rate, channel
-   count, or stream structure. For non-TS transports (e.g., raw ST 2110 RTP),
-   the fixer is transparent — the switch mechanism (watch channel) works
-   identically.
+   count, or stream structure. For non-TS transports (e.g., raw ST 2110 RTP,
+   `rtp_audio`, MXL audio) the switch mechanism (watch channel) works
+   identically, and the fixer leaves the payload unchanged except for one
+   bit: while a DI is pending (on any PID after a switch, on that PID after
+   a source discontinuity), a 188-byte stride that happens to start 0x47 and
+   parse as a PCR has its discontinuity-indicator bit set.
 
 5. **Force IDR on the newly-active ingress re-encoder** — When the incoming
    input has an `video_encode` stage (ingress transcoding), the forwarder

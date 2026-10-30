@@ -10,8 +10,8 @@
 //! 1. **Outside a pending DI**: zero overhead — packets pass through
 //!    unchanged (PSI observed for the switch cache).
 //! 2. **On switch**: lets the new input's CCs through (one CC jump per
-//!    PID) and injects the new input's
-//!    cached PAT/PMTs for fast receiver re-acquisition, with their
+//!    PID) and injects the new input's cached PAT/PMTs for fast receiver
+//!    re-acquisition, with their
 //!    `version_number` rewritten from a per-fixer **monotonic counter**
 //!    that advances on every switch (see [`TsContinuityFixer::on_switch`]
 //!    for the motivation — the alternative `cached_version + 1` stamping
@@ -43,6 +43,11 @@
 //! the CC jump (PES buffer flush) and pick up the new stream at the next
 //! PES start. This keeps the fixer codec-agnostic and works unchanged for
 //! H.264, HEVC, JPEG XS, SMPTE 2110 uncompressed, or any future format.
+//! A non-TS payload (ST 2110-30/-31/-40, `rtp_audio`, MXL audio) goes
+//! through it too and is left unchanged, except that while a DI is pending
+//! (on any PID after a switch, on that PID after a source discontinuity) a
+//! 188-byte stride that happens to start 0x47 and parse as a PCR takes the
+//! DI bit.
 //!
 //! The fixer is owned by the per-flow fixer task (`flow::ts_fixer_task`),
 //! which every per-input forwarder of the flow feeds over a channel.
@@ -166,16 +171,15 @@ pub struct TsContinuityFixer {
     /// a media packet (its CC goes out as the source sent it). While it,
     /// or an entry of `pending_di_pids`, is armed, `process_packet` reads
     /// each packet's PCR; otherwise it reads nothing but PSI. Tells the
-    /// receiver "the next PCR
-    /// is a fresh STC anchor, throw away your old timestamp tracking" —
-    /// without it, professional and prosumer decoders (VLC, ffplay,
-    /// Appear-style hardware) treat the post-switch PCR jump (which
-    /// happens whenever inputs A and B have different epochs — the
-    /// common case for live-camera switching, test-pattern ↔ media-
-    /// player, or any per-input transcoder pipeline) as a clock fault
-    /// and lock up. Set on every switch (including dead-input switches)
-    /// so the next real packet picks it up regardless of which input
-    /// finally produces data first.
+    /// receiver "the next PCR is a fresh STC anchor, throw away your old
+    /// timestamp tracking" — without it, professional and prosumer
+    /// decoders (VLC, ffplay, Appear-style hardware) treat the post-switch
+    /// PCR jump (which happens whenever inputs A and B have different
+    /// epochs — the common case for live-camera switching, test-pattern ↔
+    /// media-player, or any per-input transcoder pipeline) as a clock
+    /// fault and lock up. Set on every switch (including dead-input
+    /// switches) so the next real packet picks it up regardless of which
+    /// input finally produces data first.
     pending_di_on_pcr: bool,
     /// PCR PIDs whose next PCR must carry DI — a source discontinuity the
     /// watcher saw on that PID's own clock. On an MPTS each program has its
@@ -972,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_switches_reset_cc_each_time() {
+    fn multiple_switches_pass_each_inputs_cc_through() {
         let mut fixer = TsContinuityFixer::new();
 
         // Input A: PID 0x100, CC=0..4

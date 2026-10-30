@@ -741,9 +741,12 @@ mod tests {
         }
     }
 
-    /// The discard keeps repairing: a receiver that starts at media seq 5
-    /// of the first matrix (4x4) and loses seq 13 still rebuilds it, from
-    /// the parities sent after it started.
+    /// A receiver that starts at media seq 5 of the first matrix (4x4) and
+    /// loses seq 13 still rebuilds it, from the parities sent after it
+    /// started. No FEC precedes its first media packet here (the first
+    /// parity follows seq 12), so this pins only that the first matrix's
+    /// later parities are kept, not repair after a discard: that is
+    /// `a_receiver_started_at_a_parity_repairs_the_next_matrix`.
     #[test]
     fn a_receiver_started_mid_matrix_still_repairs_its_last_row() {
         let base = 9_000u16;
@@ -755,6 +758,35 @@ mod tests {
             .expect("seq 5 was sent");
         let got = receive_from(4, 4, &wire, start, &[base + 13], |_| false);
         assert!(got.contains(&(base + 13)), "{got:?}");
+    }
+
+    /// The discard keeps repairing: a receiver whose first datagram is a
+    /// parity (any of the first matrix's column or row FEC, so the decoder
+    /// discards it and every parity up to the next media packet) still
+    /// rebuilds a packet lost in the next matrix's last row from that
+    /// matrix's column FEC.
+    #[test]
+    fn a_receiver_started_at_a_parity_repairs_the_next_matrix() {
+        for (l, d) in [(4u8, 4u8), (5, 5)] {
+            let base = 11_000u16;
+            let m = l as u16 * d as u16;
+            let seqs: Vec<u16> = (0..3 * m).map(|i| base + i).collect();
+            let wire = send(l, d, &seqs, |_| 20);
+            let next_matrix = wire
+                .iter()
+                .position(|w| matches!(w, Wire::Media(s, _) if *s == base + m))
+                .expect("the second matrix was sent");
+            // The second matrix's last row, column 1.
+            let lost = base + m + (d as u16 - 1) * l as u16 + 1;
+            let starts: Vec<usize> = (0..next_matrix)
+                .filter(|&i| matches!(wire[i], Wire::Fec(_)))
+                .collect();
+            assert_eq!(starts.len(), l as usize + d as usize, "{l}x{d}: every column and row FEC");
+            for start in starts {
+                let got = receive_from(l, d, &wire, start, &[lost], |_| false);
+                assert!(got.contains(&lost), "{l}x{d} from wire[{start}]: {got:?}");
+            }
+        }
     }
 
     /// Sequence numbers with an upstream gap of 3 inside the second

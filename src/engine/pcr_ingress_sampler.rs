@@ -165,13 +165,13 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
 /// adaptation-field `discontinuity_indicator` on that PID's next PCR.
 /// Receivers see DI=1 and flush STC. It arms DI and nothing else: CC
 /// passes through as the source sent it (it used to switch the fixer into
-/// renumbering every CC for the rest of the flow, edge#214). A PTS / DTS jump alone raises its
-/// event and counter but no DI: DI on a PCR packet announces a new
-/// system time base, and a PES timestamp that jumps while the PCR runs on
-/// is not one (the Spain capture's teletext PIDs step back ~650 ms at 73 s
-/// with a continuous PCR, and put DI on an unrelated PCR every loop). A
-/// loop or a restart that steps the time base steps the PCR too, which is
-/// what carries the DI. This is the receiver-side fix for the
+/// renumbering every CC for the rest of the flow, edge#214). A PTS / DTS
+/// jump alone raises its event and counter but no DI: DI on a PCR packet
+/// announces a new system time base, and a PES timestamp that jumps while
+/// the PCR runs on is not one (the Spain capture's teletext PIDs step back
+/// ~650 ms at 73 s with a continuous PCR, and put DI on an unrelated PCR
+/// every loop). A loop or a restart that steps the time base steps the PCR
+/// too, which is what carries the DI. This is the receiver-side fix for the
 /// upstream-file-loop case (ffmpeg `-stream_loop -1 -c copy`) — the
 /// edge can't undo the jump in the bytes, but it can tell the
 /// receiver "fresh anchor, forget your old STC tracking" so

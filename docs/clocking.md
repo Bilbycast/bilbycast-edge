@@ -752,11 +752,15 @@ treats such a DI as no epoch (above). The watch arms that DI and nothing
 else: CC is untouched. Until edge#214 its first signal also switched the
 fixer into renumbering every CC for the rest of the flow, so after the
 first outage or loop no later loss showed on the outputs or in
-`cc_errors`, and the fixer forwarded its DI-stamped datagram without
-`sender_timestamp_us`, feeding that datagram's PCR to an SRT flow's
-sender-timestamp PLL (`master_clock.rate_source` then read `pcr` for the
-rest of the flow). The DI-stamped datagram now keeps every field it arrived
-with (`a_di_stamped_datagram_keeps_its_upstream_metadata`).
+`cc_errors`. Every datagram the fixer rewrote, which from then on was every
+one, also went out without `sender_timestamp_us`, so the PLL of an SRT input
+with `passthrough_clock: true` and no `program_number`, `pid_overrides`,
+`pid_map` or ingress transcode ran on PCR for the rest of the flow
+(`master_clock.rate_source` read `pcr`). On any other SRT input one of those
+stages, or the muxer-mode rewriter that `passthrough_clock: true` turns off,
+already drops that field at ingress, so its PLL runs on PCR either way. Now the fixer rewrites only a datagram that takes a DI,
+and that datagram keeps every field it arrived with
+(`a_di_stamped_datagram_keeps_its_upstream_metadata`).
 
 The **PLL sampler** on the same broadcast (`sample_packet`) had the same
 fault: it fed every PID's PCR to the source-PCR PLL, which on an MPTS read
