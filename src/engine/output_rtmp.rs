@@ -576,6 +576,44 @@ async fn publish_loop(
                         );
                     }
 
+                    // The same-codec fast path holds for the source it was
+                    // decided on, by its first frame. A source whose AAC
+                    // configuration then changes (a switch to another feed)
+                    // has it decided again, the same way: an HE-AAC feed
+                    // after an AAC-LC one is re-encoded to the AAC-LC the
+                    // config asks for, where it went on being passed through
+                    // as HE-AAC under a new header naming its core. A new
+                    // source's frame that cannot be judged yet (it does not
+                    // decode, or its layout has not arrived) is not passed
+                    // through meanwhile. Once re-encoding it stays so: an
+                    // AAC-LC source re-encodes to AAC-LC fine.
+                    if matches!(encoder_state, EncoderState::Transparent)
+                        && audio_header.is_some()
+                        && demuxer.cached_aac_specific_config() != audio_header
+                    {
+                        match build_encoder_state(
+                            config,
+                            &demuxer,
+                            Some(&data),
+                            compressed_audio_input,
+                            cancel,
+                            stats,
+                            flow_id,
+                            event_sender,
+                        ) {
+                            EncoderState::Transparent => {}
+                            EncoderState::Lazy => continue,
+                            next => {
+                                tracing::info!(
+                                    "RTMP output '{}': the source's AAC configuration changed and it \
+                                     cannot be passed through as the configured aac_lc; re-encoding it",
+                                    config.id
+                                );
+                                encoder_state = next;
+                            }
+                        }
+                    }
+
                     // A PCE-signalled source (channel_configuration 0)
                     // whose layout no frame has carried yet is held back,
                     // passed through or re-encoded alike: neither a header
@@ -2700,7 +2738,9 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) {
 }
 
 /// Resolve the audio_encode block and demuxer-cached AAC config into an
-/// [`EncoderState`]. Called once on the first AAC frame.
+/// [`EncoderState`]. Called on the first AAC frame, and again while
+/// passing through when the source's configuration changes (the fast path
+/// is the first frame's judgement, and holds only for that source).
 ///
 /// - If the requested codec is `aac_lc` and the operator did not override
 ///   bitrate / SR / channels and the input is itself AAC-LC — decoding to
@@ -6809,6 +6849,44 @@ pub(super) mod flv_wire_tests {
     }
 
     use crate::engine::ts_test_fixtures::split_adts;
+
+    /// An AAC-LC feed passed through by the same-codec fast path (`aac_lc`,
+    /// no overrides), then a switch to an HE-AAC v2 one: the fast path is
+    /// decided again on the new configuration and the HE-AAC is re-encoded
+    /// to the AAC-LC the config asks for, so every sequence header on the
+    /// connection names 48 kHz stereo AAC-LC and the audio goes on after the
+    /// switch. The fast path was decided by the connection's first frame
+    /// alone: the HE-AAC went out passed through, under a second header
+    /// naming its 24 kHz mono core.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn a_switch_to_an_he_aac_feed_leaves_the_same_codec_fast_path() {
+        let lc = adts_frames();
+        let he = crate::engine::ts_test_fixtures::he_aac_adts(true);
+        let he = split_adts(&he);
+        let mut timed: Vec<(u64, &[u8])> = (0..20).map(|j| (3 * F + j as u64 * 1_920, lc[j % lc.len()])).collect();
+        let switch = 3 * F + 20 * 1_920;
+        timed.extend((0..20).map(|j| (switch + j as u64 * 3_840, he[j % he.len()])));
+        let output = serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc" }
+        });
+        let tags = publish(programme_timed(&timed), output).await;
+        let audio: Vec<&WireTag> = tags.iter().filter(|t| !t.video).collect();
+        let headers: Vec<(u8, u8, u8)> = audio
+            .iter()
+            .filter(|t| t.data[..2] == [0xAF, 0x00])
+            .map(|t| (t.data[2] >> 3, (t.data[2] & 0x07) << 1 | t.data[3] >> 7, t.data[3] >> 3 & 0x0F))
+            .collect();
+        assert!(!headers.is_empty());
+        assert!(headers.iter().all(|&h| h == (2, 3, 2)), "every header names 48 kHz stereo AAC-LC: {headers:?}");
+        let first_ms = audio.iter().find(|t| t.data[..2] == [0xAF, 0x01]).map(|t| t.ts).unwrap();
+        let after = audio
+            .iter()
+            .filter(|t| t.data[..2] == [0xAF, 0x01] && u64::from(t.ts - first_ms) * 90 > 20 * 1_920 + 3_840)
+            .count();
+        assert!(after >= 10, "the audio goes on after the switch: {after} frames");
+    }
 
     /// A programme of [`LAP_PICTURES`] H.264 pictures with `frames` (whole
     /// ADTS frames), one a PES, `step` ticks apart from three pictures in,
