@@ -1624,7 +1624,14 @@ async fn run(
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
 
-    let mut demuxer = TsDemuxer::new(config.program_number);
+    // The audio track `audio_encode.source_audio_pid` names, when it is one
+    // this output can publish; the first such track otherwise, or the first
+    // audio track when there is none. `audio_watch` reports a missed pin and
+    // a track it cannot publish.
+    let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
+    let can_publish = crate::engine::transcode_engage::aac_output_can_publish;
+    let mut demuxer = TsDemuxer::with_audio_pid(config.program_number, pinned_audio, can_publish);
+    let mut audio_watch = crate::engine::transcode_engage::AudioTrackWatch::new(pinned_audio, can_publish);
     let mut state = CmafState::new();
     // One media timeline for every CMAF output of the flow: they share
     // the flow's wall-clock epoch (`FlowClock`), so a jump one absorbs
@@ -1863,6 +1870,20 @@ async fn run(
                         };
 
                         let frames = demuxer.demux(ts_bytes);
+                        if let Some((pid, stream_type)) =
+                            audio_watch.poll(demuxer.audio_track(), event_sender, &config.id)
+                        {
+                            crate::engine::transcode_engage::emit_audio_codec_unpublishable(
+                                event_sender,
+                                category::CMAF,
+                                "CMAF",
+                                &config.id,
+                                flow_id,
+                                pid,
+                                stream_type,
+                                CMAF_AUDIO_CARRIES,
+                            );
+                        }
                         for frame in frames {
                             handle_frame(
                                 frame,
@@ -2091,6 +2112,14 @@ async fn handle_frame(
         DemuxedFrame::Scte35(_) => {}
     }
 }
+
+/// What CMAF publishes, for `audio_codec_unpublishable`
+/// (`transcode_engage::aac_output_can_publish`). An AC-4 or Opus-in-TS track
+/// used to publish no audio without a word.
+#[cfg(feature = "media-codecs")]
+const CMAF_AUDIO_CARRIES: &str = "AAC, and MP2 / AC-3 / E-AC-3 / AAC-LATM through `audio_encode`";
+#[cfg(not(feature = "media-codecs"))]
+const CMAF_AUDIO_CARRIES: &str = "AAC only: this build has no decoder to re-encode anything else";
 
 /// Tell the operator, once per output, that the source's `source_codec`
 /// reaches this CMAF output only through `needs` (CMAF carries H.264 /

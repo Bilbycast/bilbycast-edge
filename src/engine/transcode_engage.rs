@@ -348,6 +348,204 @@ pub fn emit_pinned_pid_absent(
     }
 }
 
+/// `audio_encode.source_audio_pid` on an output that picks its audio track
+/// itself — RTMP, CMAF and WebRTC through `TsDemuxer::with_audio_pid` (inside
+/// an [`AudioTrackWatch`]), HLS in its remux — rather than through a
+/// `TsAudioReplacer`: the replacers' `(pinned, actual)` dedupe, as a value
+/// the output keeps for its lifetime. Those outputs used to ignore the pin
+/// and publish the track they picked.
+#[derive(Debug)]
+pub struct AudioPinWatch {
+    pin: Option<u16>,
+    /// The `(pinned, actual)` pair last warned about; cleared once the
+    /// output is on the pin again, so a later drop-out warns again.
+    warned: Option<(u16, u16)>,
+}
+
+impl AudioPinWatch {
+    pub fn new(pin: Option<u16>) -> Self {
+        Self { pin, warned: None }
+    }
+
+    /// The pinned PID, `None` when nothing is pinned.
+    #[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+    pub fn pin(&self) -> Option<u16> {
+        self.pin
+    }
+
+    /// The output is on audio `track` (`(pid, stream_type)`, `None` while it
+    /// has none). Returns `(pinned, actual, actual_stream_type)` the first
+    /// time it is off the pin on a given actual PID — the moment to raise
+    /// [`emit_pinned_audio_pid_absent`]. Cheap enough to call per datagram.
+    pub fn check(&mut self, track: Option<(u16, u8)>) -> Option<(u16, u16, u8)> {
+        let (pin, (actual, stream_type)) = (self.pin?, track?);
+        if pin == actual {
+            self.warned = None;
+            return None;
+        }
+        if self.warned == Some((pin, actual)) {
+            return None;
+        }
+        self.warned = Some((pin, actual));
+        Some((pin, actual, stream_type))
+    }
+}
+
+/// The `audio_source_pid_not_found` Warning for an output that picks its
+/// own audio track ([`AudioPinWatch`]): the code, category, scope and
+/// details [`emit_pinned_pid_absent`] raises for a replacer, with a message
+/// naming what the output fell back to — `fallback`, e.g. "the program's
+/// first audio stream it can publish".
+pub fn emit_pinned_audio_pid_absent(
+    sender: &EventSender,
+    output_id: &str,
+    pinned: u16,
+    actual: u16,
+    actual_stream_type: u8,
+    fallback: &str,
+) {
+    let message = format!(
+        "Output '{output_id}': audio_encode.source_audio_pid 0x{pinned:04X} is not in the PMT \
+         (or is not an audio stream this output can publish) — using {fallback}, PID \
+         0x{actual:04X} (stream_type 0x{actual_stream_type:02X}), instead."
+    );
+    tracing::warn!(
+        error_code = "audio_source_pid_not_found",
+        pinned_pid = format!("0x{pinned:04X}"),
+        actual_pid = format!("0x{actual:04X}"),
+        actual_stream_type = format!("0x{actual_stream_type:02X}"),
+        "{message}"
+    );
+    sender.emit_output_with_details(
+        EventSeverity::Warning,
+        category::FLOW,
+        message,
+        output_id,
+        serde_json::json!({
+            "error_code": "audio_source_pid_not_found",
+            "pinned_pid": pinned,
+            "actual_pid": actual,
+            "actual_stream_type": actual_stream_type,
+        }),
+    );
+}
+
+/// Whether an output that publishes AAC — RTMP, CMAF — can publish audio
+/// its demuxer routes as `stream_type` (`TsDemuxer::audio_track`): AAC in
+/// ADTS (0x0F) as it is, and — through `audio_encode`, on a build with
+/// `media-codecs` — what libavcodec decodes into the AAC encoder: MP2, AC-3,
+/// E-AC-3, AAC-LATM (without the block `codec_needs_encode` says so). Never
+/// Opus, whose frames reach no decoder on these outputs, nor AC-4, which
+/// nothing here decodes.
+pub fn aac_output_can_publish(stream_type: u8) -> bool {
+    #[cfg(feature = "media-codecs")]
+    if crate::engine::audio_decode::ff_codec_for_stream_type(stream_type)
+        .is_some_and(|codec| codec != video_codec::AudioDecoderCodec::Opus)
+    {
+        return true;
+    }
+    stream_type == 0x0F
+}
+
+/// What an output that picks its audio track through
+/// `TsDemuxer::with_audio_pid` — RTMP, CMAF, WebRTC — owes the operator about
+/// that track: `audio_source_pid_not_found` for a pin it could not take
+/// ([`AudioPinWatch`]), and `audio_codec_unpublishable` for a track in a
+/// codec it cannot publish (`can_publish`, the predicate its demuxer was
+/// built with), each once per episode. Kept for the output's lifetime, so a
+/// reconnect or a new viewer repeats neither. Those outputs used to publish
+/// such a track as no audio at all, without a word.
+#[derive(Debug)]
+pub struct AudioTrackWatch {
+    pin: AudioPinWatch,
+    can_publish: fn(u8) -> bool,
+    /// The `(pid, stream_type)` last reported unpublishable. Cleared once
+    /// the output is on audio it can publish, so each episode on an
+    /// unpublishable track is reported once.
+    unpublishable: Option<(u16, u8)>,
+}
+
+impl AudioTrackWatch {
+    pub fn new(pin: Option<u16>, can_publish: fn(u8) -> bool) -> Self {
+        Self { pin: AudioPinWatch::new(pin), can_publish, unpublishable: None }
+    }
+
+    /// The output is on audio `track` (`TsDemuxer::audio_track`, `None`
+    /// while it has none). Raises `audio_source_pid_not_found` on `sender`
+    /// the moment the output is off its pin, and returns `(pid, stream_type)`
+    /// when an `audio_codec_unpublishable` is owed — the output raises that
+    /// one itself ([`emit_audio_codec_unpublishable`]), saying what it can
+    /// carry. Cheap enough to call after every `demux`.
+    pub fn poll(
+        &mut self,
+        track: Option<(u16, u8)>,
+        sender: &EventSender,
+        output_id: &str,
+    ) -> Option<(u16, u8)> {
+        if let Some((pinned, actual, stream_type)) = self.pin.check(track) {
+            // Off the pin, the demuxer is on the first track the output can
+            // publish, or — when there is none — on the first of all.
+            let fallback = if (self.can_publish)(stream_type) {
+                "the program's first audio stream it can publish"
+            } else {
+                "the program's first audio stream (it can publish none of them)"
+            };
+            emit_pinned_audio_pid_absent(sender, output_id, pinned, actual, stream_type, fallback);
+        }
+        let (pid, stream_type) = track?;
+        if (self.can_publish)(stream_type) {
+            self.unpublishable = None;
+            return None;
+        }
+        if self.unpublishable == Some((pid, stream_type)) {
+            return None;
+        }
+        self.unpublishable = Some((pid, stream_type));
+        Some((pid, stream_type))
+    }
+}
+
+/// The `audio_codec_unpublishable` Warning [`AudioTrackWatch::poll`] owes:
+/// the audio track output `output_id` is on, PID `pid`, is in a codec it can
+/// neither carry nor re-encode, so the source's audio is not published. A
+/// program whose first audio track is AC-4 used to go out that way without a
+/// word. `kind` names the output ("RTMP"), `category` is its event category
+/// and `carries` what it can publish. Output-scoped, with the flow in
+/// `details`, like `codec_needs_encode`.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_audio_codec_unpublishable(
+    sender: &EventSender,
+    category: &str,
+    kind: &str,
+    output_id: &str,
+    flow_id: &str,
+    pid: u16,
+    stream_type: u8,
+    carries: &str,
+) {
+    let codec = crate::engine::ts_demux::audio_codec_name(stream_type);
+    let message = format!(
+        "{kind} output '{output_id}': its audio track, PID 0x{pid:04X}, is {codec} (stream_type \
+         0x{stream_type:02X}), which {kind} cannot carry or re-encode here ({carries}); the \
+         source's audio is not published. If the program carries an audio track it can \
+         publish, pin it with `audio_encode.source_audio_pid`"
+    );
+    tracing::warn!(error_code = "audio_codec_unpublishable", "{message}");
+    sender.emit_output_with_details(
+        EventSeverity::Warning,
+        category,
+        message,
+        output_id,
+        serde_json::json!({
+            "error_code": "audio_codec_unpublishable",
+            "audio_pid": pid,
+            "stream_type": stream_type,
+            "source_codec": codec,
+            "flow_id": flow_id,
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +697,136 @@ mod tests {
             w.on_reset();
         }
         assert!(matches!(w.note_locked(0x101, 0x0F), Some(EngageEvent::Found { .. })));
+    }
+
+    /// An output off its pinned audio PID is told once per distinct actual
+    /// PID — the replacers' `(pinned, actual)` rule — however often it is
+    /// polled, and again after it has been back on the pin.
+    #[test]
+    fn a_missed_audio_pin_is_reported_once_per_pair_and_rearmed_on_the_pin() {
+        let mut w = AudioPinWatch::new(Some(0x305));
+        assert_eq!(w.check(None), None, "no track yet: nothing to judge");
+        assert_eq!(w.check(Some((0x301, 0x81))), Some((0x305, 0x301, 0x81)));
+        assert_eq!(w.check(Some((0x301, 0x81))), None, "once per pair");
+        assert_eq!(w.check(Some((0x302, 0x0F))), Some((0x305, 0x302, 0x0F)), "a new actual PID");
+        assert_eq!(w.check(Some((0x305, 0x03))), None, "on the pin");
+        assert_eq!(w.check(Some((0x302, 0x0F))), Some((0x305, 0x302, 0x0F)), "re-armed");
+
+        let mut unpinned = AudioPinWatch::new(None);
+        assert_eq!(unpinned.check(Some((0x301, 0x81))), None, "nothing pinned, nothing to say");
+    }
+
+    /// What RTMP and CMAF can publish: AAC as it is; MP2 / AC-3 / E-AC-3 /
+    /// AAC-LATM through `audio_encode` where libavcodec is compiled in;
+    /// never Opus or AC-4.
+    #[test]
+    fn aac_outputs_publish_aac_and_what_their_decoders_read_never_opus_or_ac4() {
+        assert!(aac_output_can_publish(0x0F));
+        for st in [0x03, 0x04, 0x80, 0x81, 0xC1, 0x87, 0xC2, 0x11] {
+            assert_eq!(aac_output_can_publish(st), cfg!(feature = "media-codecs"), "stream_type {st:#04x}");
+        }
+        assert!(!aac_output_can_publish(0x06), "Opus");
+        assert!(!aac_output_can_publish(crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4));
+    }
+
+    /// The `error_code` of every event raised so far.
+    fn raised(rx: &mut tokio::sync::mpsc::Receiver<crate::manager::events::Event>) -> Vec<String> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|ev| ev.details.unwrap()["error_code"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// An output on a track it cannot publish is owed one
+    /// `audio_codec_unpublishable` per episode: not again while it stays
+    /// there, however often polled, and again after it has been on audio it
+    /// can publish. No track yet is nothing to judge.
+    #[test]
+    fn an_unpublishable_audio_track_is_owed_once_per_episode() {
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        let ac4 = crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4;
+        let mut w = AudioTrackWatch::new(None, aac_output_can_publish);
+        assert_eq!(w.poll(None, &tx, "o"), None);
+        assert_eq!(w.poll(Some((0x300, ac4)), &tx, "o"), Some((0x300, ac4)));
+        for _ in 0..3 {
+            assert_eq!(w.poll(Some((0x300, ac4)), &tx, "o"), None, "once per episode");
+        }
+        assert_eq!(w.poll(Some((0x302, 0x06)), &tx, "o"), Some((0x302, 0x06)), "another track: Opus");
+        assert_eq!(w.poll(Some((0x301, 0x0F)), &tx, "o"), None, "AAC publishes");
+        assert_eq!(w.poll(Some((0x300, ac4)), &tx, "o"), Some((0x300, ac4)), "a new episode");
+        assert!(raised(&mut rx).is_empty(), "the output raises that one itself");
+    }
+
+    /// A missed pin raises `audio_source_pid_not_found` from the watch, once
+    /// per pair, its message naming what the demuxer fell back to: the first
+    /// track the output can publish, or — when the program has none — the
+    /// first of all, which is also owed `audio_codec_unpublishable`.
+    #[test]
+    fn a_missed_pin_names_the_fallback_the_demuxer_took() {
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        let ac4 = crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4;
+        let mut w = AudioTrackWatch::new(Some(0x305), aac_output_can_publish);
+        assert_eq!(w.poll(Some((0x301, 0x0F)), &tx, "o"), None);
+        assert_eq!(w.poll(Some((0x301, 0x0F)), &tx, "o"), None);
+        let ev = rx.try_recv().expect("one Warning");
+        assert!(rx.try_recv().is_err(), "once per pair");
+        assert!(ev.message.contains("first audio stream it can publish, PID 0x0301"), "{}", ev.message);
+        assert_eq!(ev.details.unwrap()["error_code"], "audio_source_pid_not_found");
+
+        assert_eq!(w.poll(Some((0x300, ac4)), &tx, "o"), Some((0x300, ac4)));
+        let ev = rx.try_recv().expect("a new pair");
+        assert!(ev.message.contains("it can publish none of them"), "{}", ev.message);
+
+        assert_eq!(w.poll(Some((0x305, 0x0F)), &tx, "o"), None, "on the pin");
+        assert!(raised(&mut rx).is_empty());
+    }
+
+    /// `audio_codec_unpublishable` names the output, PID and codec, scoped to
+    /// the output with the flow in `details`.
+    #[test]
+    fn audio_codec_unpublishable_names_the_pid_and_codec() {
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        emit_audio_codec_unpublishable(&tx, category::CMAF, "CMAF", "c1", "f", 0x300, 0xAC, "AAC only");
+        let ev = rx.try_recv().expect("one Warning");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::CMAF);
+        assert_eq!(ev.output_id.as_deref(), Some("c1"));
+        assert!(
+            ev.message.starts_with("CMAF output 'c1': its audio track, PID 0x0300, is AC-4 (stream_type 0xAC)"),
+            "{}",
+            ev.message
+        );
+        assert_eq!(
+            ev.details.unwrap(),
+            serde_json::json!({
+                "error_code": "audio_codec_unpublishable",
+                "audio_pid": 0x300,
+                "stream_type": 0xAC,
+                "source_codec": "AC-4",
+                "flow_id": "f",
+            })
+        );
+    }
+
+    /// The output's Warning carries the replacer's code, category, severity,
+    /// scope and details.
+    #[test]
+    fn a_missed_audio_pin_on_an_output_is_the_replacers_warning() {
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        emit_pinned_audio_pid_absent(&tx, "rtmp-1", 0x305, 0x300, 0xAC, "the program's first audio stream");
+        let ev = rx.try_recv().expect("one Warning");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::FLOW);
+        assert_eq!(ev.output_id.as_deref(), Some("rtmp-1"));
+        assert!(ev.message.contains("0x0305") && ev.message.contains("PID 0x0300"), "{}", ev.message);
+        assert_eq!(
+            ev.details.unwrap(),
+            serde_json::json!({
+                "error_code": "audio_source_pid_not_found",
+                "pinned_pid": 0x305,
+                "actual_pid": 0x300,
+                "actual_stream_type": 0xAC,
+            })
+        );
     }
 }
 

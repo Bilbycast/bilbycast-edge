@@ -663,6 +663,7 @@ fn resolve_audio_encode(
                 output_id: output_id.to_string(),
                 events: ctx.events.cloned(),
             },
+            enc.source_audio_pid,
         ));
         Ok(resolved)
     }
@@ -777,11 +778,14 @@ struct HlsAudioChain {
     source_dialnorm: Option<i8>,
     /// Continuity counter of the audio PID across segments.
     audio_cc: u8,
+    /// `audio_encode.source_audio_pid`, and whether its absence from the
+    /// PMT has been reported (`audio_source_pid_not_found`).
+    pin: crate::engine::transcode_engage::AudioPinWatch,
 }
 
 #[cfg(feature = "media-codecs")]
 impl HlsAudioChain {
-    fn new(enc: &ResolvedAudioEncode, ctx: HlsEncoderCtx) -> Self {
+    fn new(enc: &ResolvedAudioEncode, ctx: HlsEncoderCtx, source_audio_pid: Option<u16>) -> Self {
         Self {
             codec: enc.codec,
             bitrate_kbps: enc.bitrate_kbps,
@@ -800,6 +804,7 @@ impl HlsAudioChain {
             encoder_dialnorm: None,
             source_dialnorm: None,
             audio_cc: 0,
+            pin: crate::engine::transcode_engage::AudioPinWatch::new(source_audio_pid),
         }
     }
 
@@ -854,7 +859,7 @@ impl HlsAudioChain {
             if let Some((pn, shared)) = program
                 && let Some(i) = pmt_index(&sections, pn, shared)
                 && let Some(view) = parse_pmt(&sections[i])
-                && let Some((apid, ast)) = pmt_audio_pid(&view)
+                && let Some((apid, ast)) = pmt_audio_pid(&view, self.pin.pin())
             {
                 audio_pid = Some(apid);
                 audio_stream_type = ast;
@@ -871,6 +876,18 @@ impl HlsAudioChain {
     let audio_pid = audio_pid.ok_or("no audio PID found in segment")?;
     let pmt_pid = pmt_pid.ok_or("no PMT PID found in segment")?;
     let (program_number, pmt_pid_shared) = program.ok_or("no program in the PAT")?;
+    if let Some((pinned, actual, stream_type)) = self.pin.check(Some((audio_pid, audio_stream_type)))
+        && let Some(events) = self.ctx.events.as_ref()
+    {
+        crate::engine::transcode_engage::emit_pinned_audio_pid_absent(
+            events,
+            &self.ctx.output_id,
+            pinned,
+            actual,
+            stream_type,
+            "the last audio stream in the PMT it can decode",
+        );
+    }
     let codec = self.codec;
     if matches!(codec, AudioCodec::Opus) {
         return Err("Opus not supported on HLS".into());
@@ -1241,11 +1258,12 @@ impl HlsAudioChain {
     }
 }
 
-/// The audio ES of a parsed PMT this remux re-encodes — the last one it can
-/// decode, as it always picked — and the stream type it decodes as: an AAC
-/// ADTS / LATM, MPEG audio, ATSC AC-3 / E-AC-3 stream type, or a private
-/// (0x06) ES whose descriptors name AC-3, E-AC-3, LATM or Opus (decoded as
-/// 0x81 / 0x87 / 0x11 / 0x06).
+/// The audio ES of a parsed PMT this remux re-encodes — the one on `pin`
+/// (`audio_encode.source_audio_pid`) when it is one it can decode, else the
+/// last one it can decode, as it always picked — and the stream type it
+/// decodes as: an AAC ADTS / LATM, MPEG audio, ATSC AC-3 / E-AC-3 stream
+/// type, or a private (0x06) ES whose descriptors name AC-3, E-AC-3, LATM or
+/// Opus (decoded as 0x81 / 0x87 / 0x11 / 0x06). The pin used to be ignored.
 ///
 /// It used to require an H.264 / HEVC video ES beside it, which the remux
 /// never uses: an MPEG-2 video source (VH1) failed every segment with "no
@@ -1253,7 +1271,7 @@ impl HlsAudioChain {
 /// 0x06 ES for audio, so a later teletext or subtitle PID was re-encoded in
 /// place of the programme's sound.
 #[cfg(feature = "media-codecs")]
-fn pmt_audio_pid(view: &super::ts_pmt_edit::PmtView<'_>) -> Option<(u16, u8)> {
+fn pmt_audio_pid(view: &super::ts_pmt_edit::PmtView<'_>, pin: Option<u16>) -> Option<(u16, u8)> {
     use super::ts_parse::{descriptor_audio_kind, PrivateEsAudioKind};
     let mut audio: Option<(u16, u8)> = None;
     for es in &view.es {
@@ -1269,6 +1287,9 @@ fn pmt_audio_pid(view: &super::ts_pmt_edit::PmtView<'_>) -> Option<(u16, u8)> {
             _ => None,
         };
         if let Some(st) = decode_as {
+            if pin == Some(es.pid) {
+                return Some((es.pid, st));
+            }
             audio = Some((es.pid, st));
         }
     }
@@ -1665,6 +1686,7 @@ mod pmt_remux_tests {
                 output_id: "hls".into(),
                 events: None,
             },
+            None,
         )
     }
 
@@ -2170,6 +2192,70 @@ mod pmt_remux_tests {
             }
         }
         assert_eq!(pcrs, src, "every source PCR, in order");
+    }
+
+    /// `audio_encode.source_audio_pid` picks the ES the remux re-encodes
+    /// when it is one it can decode; otherwise — absent, or a codec it
+    /// cannot decode (AC-4) — it re-encodes the last decodable one, as
+    /// it always did. The pin used to be ignored.
+    #[test]
+    fn the_audio_pin_picks_the_remuxed_es_when_it_can_decode_it() {
+        let pmt = pmt_section(
+            1,
+            0,
+            0x100,
+            &[],
+            &[
+                (0x1B, 0x100, &[]),
+                (0x0F, 0x101, &[]),
+                (0x81, 0x102, &[]),
+                (0x06, 0x103, &[0xAC, 0x03, 0x00, 0x00, 0x00]),
+            ],
+        );
+        let view = parse_pmt(&pmt).unwrap();
+        assert_eq!(pmt_audio_pid(&view, None), Some((0x102, 0x81)), "unpinned: the last decodable");
+        assert_eq!(pmt_audio_pid(&view, Some(0x101)), Some((0x101, 0x0F)), "the pin");
+        assert_eq!(pmt_audio_pid(&view, Some(0x103)), Some((0x102, 0x81)), "AC-4 cannot be decoded");
+        assert_eq!(pmt_audio_pid(&view, Some(0x1FF)), Some((0x102, 0x81)), "absent");
+    }
+
+    /// A pin the segments' PMT does not carry raises the replacers'
+    /// `audio_source_pid_not_found` on the output, once for the chain —
+    /// not once per segment.
+    #[test]
+    fn a_missing_audio_pin_is_reported_once_across_segments() {
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+        let mut seg = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        seg.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let (events, mut rx) = crate::manager::events::event_channel();
+        let resolved = ResolvedAudioEncode {
+            codec: AudioCodec::AacLc,
+            bitrate_kbps: 128,
+            sample_rate: None,
+            channels: None,
+            transcode: None,
+            chain: None,
+        };
+        let mut chain = HlsAudioChain::new(
+            &resolved,
+            HlsEncoderCtx {
+                cancel: CancellationToken::new(),
+                stats: Arc::new(OutputStatsAccumulator::new("hls".into(), "hls".into(), "hls".into())),
+                flow_id: "f".into(),
+                output_id: "hls".into(),
+                events: Some(events),
+            },
+            Some(0x105),
+        );
+        for _ in 0..3 {
+            let _ = chain.remux(&seg);
+        }
+        let ev = rx.try_recv().expect("one Warning");
+        assert!(rx.try_recv().is_err(), "once, not per segment");
+        assert_eq!(ev.output_id.as_deref(), Some("hls"));
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "audio_source_pid_not_found");
+        assert_eq!((d["pinned_pid"].as_u64(), d["actual_pid"].as_u64()), (Some(0x105), Some(0x101)));
     }
 
 }

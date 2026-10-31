@@ -547,6 +547,58 @@ fn audio_needs_encode_label(
     }
 }
 
+/// Whether a WebRTC output can publish audio its demuxer routes as
+/// `stream_type` (`TsDemuxer::audio_track`): Opus-in-TS (0x06) as it is, or
+/// re-encoded through `audio_encode`; AAC (0x0F) through `audio_encode`; and
+/// on a build with `media-codecs` MP2 / AC-3 / E-AC-3 / AAC-LATM through it
+/// too (without the block `codec_needs_encode` says so). Never AC-4, which
+/// nothing here decodes.
+#[cfg(feature = "webrtc")]
+fn webrtc_can_publish_audio(stream_type: u8) -> bool {
+    #[cfg(feature = "media-codecs")]
+    if crate::engine::audio_decode::ff_codec_for_stream_type(stream_type).is_some() {
+        return true;
+    }
+    matches!(stream_type, 0x06 | 0x0F)
+}
+
+/// What WebRTC publishes, for `audio_codec_unpublishable`
+/// (`webrtc_can_publish_audio`).
+#[cfg(all(feature = "webrtc", feature = "media-codecs"))]
+const WEBRTC_AUDIO_CARRIES: &str = "Opus, and AAC / MP2 / AC-3 / E-AC-3 / AAC-LATM through `audio_encode`";
+#[cfg(all(feature = "webrtc", not(feature = "media-codecs")))]
+const WEBRTC_AUDIO_CARRIES: &str = "Opus, and AAC through `audio_encode`: this build has no decoder for anything else";
+
+/// Raise what the audio track a WebRTC output's demuxer is on (`track`)
+/// calls for, once for the output rather than once per viewer or WHIP
+/// connection: `audio_source_pid_not_found` for a missed pin, and
+/// `audio_codec_unpublishable` for a codec it cannot publish — unless it
+/// sends no audio at all (`video_only`). An AC-4 track used to publish no
+/// audio without a word.
+#[cfg(feature = "webrtc")]
+fn poll_audio_track(
+    watch: &mut super::transcode_engage::AudioTrackWatch,
+    track: Option<(u16, u8)>,
+    config: &WebrtcOutputConfig,
+    flow_id: &str,
+    events: &EventSender,
+) {
+    if let Some((pid, stream_type)) = watch.poll(track, events, &config.id)
+        && !config.video_only
+    {
+        super::transcode_engage::emit_audio_codec_unpublishable(
+            events,
+            category::WEBRTC,
+            "WebRTC",
+            &config.id,
+            flow_id,
+            pid,
+            stream_type,
+            WEBRTC_AUDIO_CARRIES,
+        );
+    }
+}
+
 /// Tell the operator, once per session, that the source's Opus is a
 /// multistream layout (`channel_config_code`, from its PMT) — more than two
 /// channels, or dual mono — which an RTP Opus track does not carry, so its
@@ -1168,7 +1220,17 @@ async fn whep_server_loop(
     // The source's PSI, read off the packets this loop already consumes: a
     // viewer that accepts no H.264 is sent audio alone only if there is Opus
     // to send it, and without an `audio_encode` that is an Opus source's own.
-    let mut source = super::webrtc::ts_demux::TsDemuxer::new(config.program_number);
+    // With one, its `source_audio_pid` pins the track every viewer's demuxer
+    // takes; this one, following the same PMT, says once for the output —
+    // not once per viewer — when it cannot take the pin, and when the track
+    // it is on is one it cannot publish.
+    let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
+    let mut source = super::webrtc::ts_demux::TsDemuxer::with_audio_pid(
+        config.program_number,
+        pinned_audio,
+        webrtc_can_publish_audio,
+    );
+    let mut audio_watch = super::transcode_engage::AudioTrackWatch::new(pinned_audio, webrtc_can_publish_audio);
 
     loop {
         // Wait for a viewer to connect via WHEP
@@ -1183,6 +1245,7 @@ async fn whep_server_loop(
                 match result {
                     Ok(packet) => {
                         source.observe_psi(super::ts_parse::strip_rtp_header(&packet));
+                        poll_audio_track(&mut audio_watch, source.audio_track(), &config, flow_id, events);
                         continue;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1529,8 +1592,15 @@ async fn whep_viewer_loop(
 
     // Send loop: demux TS → packetize H.264 → send via str0m.
     // Also processes incoming RTCP/STUN via drive_udp_io() to keep
-    // the session alive (same pattern as whip_client_loop).
-    let mut demuxer = TsDemuxer::new(program_number);
+    // the session alive (same pattern as whip_client_loop). The audio is
+    // the track `audio_encode.source_audio_pid` pins, when it is one this
+    // output can publish — the server loop's demuxer picks the same track
+    // and reports what the operator needs to know about it.
+    let mut demuxer = TsDemuxer::with_audio_pid(
+        program_number,
+        audio_encode.as_ref().and_then(|a| a.source_audio_pid),
+        webrtc_can_publish_audio,
+    );
     // The 48 kHz RTP timeline of an Opus source passed through.
     let mut opus_timeline = super::webrtc::opus_passthrough::OpusTimeline::default();
     // A viewer that leaves without a DELETE — `pc.close()`, a closed tab, a
@@ -1774,6 +1844,15 @@ async fn whep_viewer_loop(
                                 super::webrtc::ts_demux::DemuxedFrame::OtherAudio {
                                     stream_type, data, pts,
                                 } => {
+                                    // A track no decoder here can read (AC-4)
+                                    // is no audio: dropped (the server loop
+                                    // raises `audio_codec_unpublishable`) and
+                                    // never taken for real audio, which held
+                                    // `silent_fallback`'s silence off, so
+                                    // nothing went out at all.
+                                    if !webrtc_can_publish_audio(stream_type) {
+                                        continue;
+                                    }
                                     let decoded = decode_other_audio_for_encode(
                                         &mut encoder_state,
                                         &mut ff_audio_decoder,
@@ -1957,6 +2036,11 @@ async fn whip_client_loop(
     // WHIP output is the client side — full ICE (not ICE-Lite).
     let session_config = SessionConfig { bind_addr, public_ip, ice_lite: false };
     let mut backoff_secs = 1u64;
+    // What the audio track calls for — a pin it cannot take, a codec it
+    // cannot publish — said once for the output rather than once per
+    // connection.
+    let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
+    let mut audio_watch = super::transcode_engage::AudioTrackWatch::new(pinned_audio, webrtc_can_publish_audio);
 
     'outer: loop {
         // Create session
@@ -2175,7 +2259,7 @@ async fn whip_client_loop(
         // keepalives) so str0m can maintain the connection. Without this
         // the remote peer never receives RTCP feedback, timers expire,
         // and the session silently dies.
-        let mut demuxer = TsDemuxer::new(config.program_number);
+        let mut demuxer = TsDemuxer::with_audio_pid(config.program_number, pinned_audio, webrtc_can_publish_audio);
         // The 48 kHz RTP timeline of an Opus source passed through.
         let mut opus_timeline = super::webrtc::opus_passthrough::OpusTimeline::default();
         // As on the WHEP viewer loop: the session is driven when no packet
@@ -2248,6 +2332,7 @@ async fn whip_client_loop(
                             if payload.is_empty() { continue; }
 
                             let frames = demuxer.demux(payload);
+                            poll_audio_track(&mut audio_watch, demuxer.audio_track(), &config, flow_id, events);
                             for frame in frames {
                                 // Nothing is written while ICE is down, as
                                 // on the WHEP viewer loop (`write_media`
@@ -2427,6 +2512,16 @@ async fn whip_client_loop(
                                     super::webrtc::ts_demux::DemuxedFrame::OtherAudio {
                                         stream_type, data, pts,
                                     } => {
+                                        // A track no decoder here can read
+                                        // (AC-4) is no audio: dropped
+                                        // (`poll_audio_track` raises
+                                        // `audio_codec_unpublishable`) and
+                                        // never taken for real audio, which
+                                        // held `silent_fallback`'s silence
+                                        // off, so nothing went out at all.
+                                        if !webrtc_can_publish_audio(stream_type) {
+                                            continue;
+                                        }
                                         let decoded = decode_other_audio_for_encode(
                                             &mut encoder_state,
                                             &mut ff_audio_decoder,
@@ -3506,6 +3601,77 @@ mod needs_encode_tests {
             encoded += encoder.drain().len();
         }
         assert!(encoded >= 15, "{encoded} Opus frames re-encoded from 21 packets");
+    }
+
+    /// What WebRTC can publish: Opus, AAC, and MP2 / AC-3 / E-AC-3 /
+    /// AAC-LATM through `audio_encode`; never AC-4. The OtherAudio arms drop
+    /// what this refuses before `silent_fallback` hears it as real audio.
+    #[test]
+    fn webrtc_publishes_opus_aac_and_what_its_decoders_read_never_ac4() {
+        for st in [0x06, 0x0F, 0x03, 0x04, 0x80, 0x81, 0xC1, 0x87, 0xC2, 0x11] {
+            assert!(webrtc_can_publish_audio(st), "stream_type {st:#04x}");
+        }
+        assert!(!webrtc_can_publish_audio(crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4));
+    }
+
+    fn webrtc_config(extra: serde_json::Value) -> WebrtcOutputConfig {
+        let mut v = serde_json::json!({ "id": "w1", "name": "w1" });
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The output's audio track in a codec WebRTC cannot publish (AC-4) is
+    /// reported as `audio_codec_unpublishable` under the `webrtc` category —
+    /// it used to publish no audio without a word — but not on a
+    /// `video_only` output, which sends no audio whatever the codec.
+    #[test]
+    fn an_unpublishable_audio_track_is_reported_unless_video_only() {
+        let ac4 = crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4;
+        let (events, mut rx) = crate::manager::events::event_channel();
+        let config = webrtc_config(serde_json::json!({}));
+        let mut watch = crate::engine::transcode_engage::AudioTrackWatch::new(None, webrtc_can_publish_audio);
+        poll_audio_track(&mut watch, Some((0x301, 0x06)), &config, "f", &events);
+        assert!(rx.try_recv().is_err(), "Opus publishes");
+        poll_audio_track(&mut watch, Some((0x300, ac4)), &config, "f", &events);
+        poll_audio_track(&mut watch, Some((0x300, ac4)), &config, "f", &events);
+        let ev = rx.try_recv().expect("one Warning");
+        assert!(rx.try_recv().is_err(), "once per episode");
+        assert_eq!(ev.category, category::WEBRTC);
+        assert_eq!(ev.output_id.as_deref(), Some("w1"));
+        assert!(ev.message.starts_with("WebRTC output 'w1': its audio track, PID 0x0300, is AC-4"), "{}", ev.message);
+        let d = ev.details.unwrap();
+        assert_eq!(d["error_code"], "audio_codec_unpublishable");
+        assert_eq!(d["flow_id"], "f");
+
+        let config = webrtc_config(serde_json::json!({ "video_only": true }));
+        let mut watch = crate::engine::transcode_engage::AudioTrackWatch::new(None, webrtc_can_publish_audio);
+        poll_audio_track(&mut watch, Some((0x300, ac4)), &config, "f", &events);
+        assert!(rx.try_recv().is_err(), "video_only sends no audio");
+    }
+
+    /// Every WebRTC demuxer — the WHEP server loop's, each viewer's, the
+    /// WHIP connection's — takes a pin only onto a track WebRTC can publish:
+    /// a pinned AC-4 falls back to the AC-3 it can re-encode, with
+    /// `audio_source_pid_not_found`.
+    #[test]
+    fn a_pinned_ac4_track_is_not_taken() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let ac4: &[u8] = &[0xAC, 0x03, 0x00, 0x00, 0x00];
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x81, 0x300, &[]), (0x06, 0x301, ac4)]);
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let mut demux = TsDemuxer::with_audio_pid(None, Some(0x301), webrtc_can_publish_audio);
+        demux.observe_psi(&ts);
+        assert_eq!(demux.audio_track(), Some((0x300, 0x81)));
+
+        let (events, mut rx) = crate::manager::events::event_channel();
+        let config = webrtc_config(serde_json::json!({ "audio_encode": { "codec": "opus", "source_audio_pid": 0x301 } }));
+        let mut watch = crate::engine::transcode_engage::AudioTrackWatch::new(Some(0x301), webrtc_can_publish_audio);
+        poll_audio_track(&mut watch, demux.audio_track(), &config, "f", &events);
+        let d = rx.try_recv().expect("one Warning").details.unwrap();
+        assert_eq!(d["error_code"], "audio_source_pid_not_found");
+        assert_eq!((d["pinned_pid"].as_u64(), d["actual_pid"].as_u64()), (Some(0x301), Some(0x300)));
+        assert!(rx.try_recv().is_err());
     }
 }
 
