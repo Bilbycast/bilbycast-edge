@@ -344,24 +344,42 @@ impl LegHolds {
 /// holds a receiver on each of its legs', which must see the input's next
 /// start. One small entry per input id the node ever ran or a slot named.
 #[derive(Debug, Default)]
-pub struct LegHoldRegistry(dashmap::DashMap<String, watch::Sender<Duration>>);
+pub struct LegHoldRegistry(dashmap::DashMap<String, LegHold>);
+
+/// One input's entry in a [`LegHoldRegistry`].
+#[derive(Debug)]
+struct LegHold {
+    hold: watch::Sender<Duration>,
+    /// Whether the input has started and published its hold: until then a
+    /// plan's seed from the node config moves it.
+    started: bool,
+}
 
 impl LegHoldRegistry {
     /// Input `input_id` started holding each packet `hold`.
     pub fn publish(&self, input_id: &str, hold: Duration) {
-        self.0
+        let mut entry = self
+            .0
             .entry(input_id.to_string())
-            .or_insert_with(|| watch::channel(hold).0)
-            .send_if_modified(|held| std::mem::replace(held, hold) != hold);
+            .or_insert_with(|| LegHold { hold: watch::channel(hold).0, started: true });
+        entry.started = true;
+        entry.hold.send_if_modified(|held| std::mem::replace(held, hold) != hold);
     }
 
-    /// Follow `input_id`'s hold: `seed` until the input first starts, if it
-    /// has not.
+    /// Follow `input_id`'s hold: `seed`, the hold the node config names now,
+    /// until the input first starts. Each plan built before then seeds it
+    /// afresh, so an edit to an input that has never run reaches every
+    /// merger following it at the next plan; the first seed used to stand
+    /// until the input started.
     pub fn watch(&self, input_id: &str, seed: Duration) -> watch::Receiver<Duration> {
-        self.0
+        let entry = self
+            .0
             .entry(input_id.to_string())
-            .or_insert_with(|| watch::channel(seed).0)
-            .subscribe()
+            .or_insert_with(|| LegHold { hold: watch::channel(seed).0, started: false });
+        if !entry.started {
+            entry.hold.send_if_modified(|held| std::mem::replace(held, seed) != seed);
+        }
+        entry.hold.subscribe()
     }
 }
 
@@ -1997,6 +2015,31 @@ mod tests {
         assert!(
             tokio::time::timeout(Duration::from_millis(50), running.changed()).await.is_err()
         );
+    }
+
+    /// A leg whose input has never run follows the node config's hold as
+    /// each plan seeds it: an edit before the input starts reaches the
+    /// merger already following it at the next plan build. Once the input
+    /// has started, a seed no longer moves it. The first seed used to stand
+    /// until the input started: a leg input edited from 2 s of de-jitter to
+    /// none kept its merger's stale time at 3 s.
+    #[tokio::test]
+    async fn a_leg_that_has_not_run_follows_each_plans_seed() {
+        let registry = LegHoldRegistry::default();
+        let mut first = registry.watch("in-x", Duration::from_secs(2));
+        assert_eq!(*first.borrow_and_update(), Duration::from_secs(2));
+        let rebuilt = registry.watch("in-x", Duration::ZERO);
+        assert_eq!(*rebuilt.borrow(), Duration::ZERO, "the plan rebuilt after the edit");
+        assert!(first.has_changed().expect("open"), "the merger already following it");
+        assert_eq!(*first.borrow_and_update(), Duration::ZERO);
+        registry.watch("in-x", Duration::ZERO);
+        assert!(!first.has_changed().expect("open"), "the same seed is no change");
+
+        registry.publish("in-x", Duration::from_millis(60));
+        assert_eq!(*first.borrow_and_update(), Duration::from_millis(60));
+        let later = registry.watch("in-x", Duration::from_secs(2));
+        assert_eq!(*later.borrow(), Duration::from_millis(60), "started: the seed is not taken");
+        assert!(!first.has_changed().expect("open"));
     }
 
     /// A merger's key is told by its whole shape: a run's scope, a slot uid

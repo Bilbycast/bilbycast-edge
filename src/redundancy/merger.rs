@@ -2803,8 +2803,13 @@ mod buffered_tests {
     }
 
     /// A restart (an SRT pair that lost both legs) forgets both legs' SSRCs:
-    /// a sender back on a new SSRC on both legs is no mismatch, while legs
-    /// that disagree after it still are, and the count carries on.
+    /// a sender back on a new SSRC on both legs is no mismatch; legs that
+    /// disagree after it are timed from when both have delivered since,
+    /// never against a leg's SSRC from before it; and the count carries on.
+    /// Leg 2 back first on one SSRC and leg 1 half a second later on
+    /// another: with leg 1's old SSRC kept, the disagreement ran from leg
+    /// 2's first packet and was counted 1.05 s after it (the 50 ms hold and
+    /// a second), half a second before the legs had disagreed that long.
     #[test]
     fn a_restart_forgets_the_legs_ssrcs_and_keeps_the_count() {
         let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
@@ -2815,6 +2820,30 @@ mod buffered_tests {
         m.observe_ssrc(ActiveLeg::Leg2, 0xfeedface, back);
         deliver_ssrcs(&mut m, back, Duration::from_secs(2), (0xfeedface, 0xfeedface));
         assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0, "one sender, a new SSRC");
+
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
+        deliver_ssrcs(&mut m, t0, Duration::from_millis(500), (0xdeadbeef, 0xdeadbeef));
+        m.restart();
+        let at = |ms: u64| back + Duration::from_millis(ms);
+        for ms in (0..=1_200).step_by(20) {
+            m.observe_ssrc(ActiveLeg::Leg2, 0xfeedface, at(ms));
+            if ms >= 500 {
+                m.observe_ssrc(ActiveLeg::Leg1, 0x0bad_cafe, at(ms + 1));
+            }
+        }
+        assert_eq!(
+            m.stats.ssrc_mismatch.load(Ordering::Relaxed),
+            0,
+            "timed from leg 1's first packet since the restart, not its SSRC from before"
+        );
+        deliver_ssrcs(&mut m, at(1_220), Duration::from_millis(400), (0x0bad_cafe, 0xfeedface));
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 1, "and counted once they have");
+
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
+        deliver_ssrcs(&mut m, t0, Duration::from_millis(500), (0xdeadbeef, 0xdeadbeef));
+        m.restart();
+        m.observe_ssrc(ActiveLeg::Leg2, 0xfeedface, back);
+        deliver_ssrcs(&mut m, back, Duration::from_secs(2), (0xfeedface, 0xfeedface));
 
         let split = back + Duration::from_millis(2_020);
         deliver_ssrcs(&mut m, split, Duration::from_secs(2), (0xfeedface, 0x0bad_cafe));

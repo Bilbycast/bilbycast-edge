@@ -4018,7 +4018,10 @@ mod tests {
     /// disagreed for a second past the hold, and raises the RTP input's
     /// Warning once for it; legs back on one new SSRC after both were lost
     /// count nothing more. An SRT pair used to check no SSRC, so its
-    /// `ssrc_mismatch` read 0 whatever the legs carried.
+    /// `ssrc_mismatch` read 0 whatever the legs carried. (The legs here
+    /// alternate packet by packet, so this pins no more of the restart than
+    /// that; that it forgets the legs' SSRCs is pinned on the merger,
+    /// `a_restart_forgets_the_legs_ssrcs_and_keeps_the_count`.)
     #[test]
     fn a_buffered_pair_reports_legs_carrying_different_ssrcs() {
         let mut bench = PairBench::new(serde_json::json!({ "path_differential_ms": 20 }));
