@@ -605,9 +605,6 @@ async fn srt_output_listener_loop(
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
         build_transcode_chain_for_srt(config, events, &stats);
-    let mut null_padder = config
-        .cbr_pad_to_kbps
-        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         transcode_chain.as_ref(),
@@ -753,7 +750,7 @@ async fn srt_output_listener_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), None, poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let forward = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone(), keepalive_gate);
+        let forward = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, input_format, compressed_audio_input, frame_rate_rx.clone(), keepalive_gate);
         tokio::pin!(forward);
         // `None`: the caller left the forward loop's first sends
         // unacknowledged — the probe's stale verdict, on an output the
@@ -832,9 +829,6 @@ async fn srt_output_caller_loop(
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
         build_transcode_chain_for_srt(config, events, &stats);
-    let mut null_padder = config
-        .cbr_pad_to_kbps
-        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         transcode_chain.as_ref(),
@@ -930,7 +924,7 @@ async fn srt_output_caller_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), None, poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone(), KeepaliveGate::default()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, input_format, compressed_audio_input, frame_rate_rx.clone(), KeepaliveGate::default()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -1236,11 +1230,11 @@ fn forwards_unchanged(
         && transcode_chain.is_none()
 }
 
-/// Start a connection's stream on the stages a single-connection SRT output
-/// keeps from one connection to the next. Nothing reaches them while no
-/// receiver is connected, so the flow's stream has a gap of a second or
-/// more across a reconnection, and the new receiver's stream must start
-/// from the flow as it is now:
+/// Start a connection's stream for a single-connection SRT output, whose
+/// stages outlive the connection. Nothing reaches them while no receiver is
+/// connected, so the flow's stream has a gap of a second or more across a
+/// reconnection, and the new receiver's stream must start from the flow as
+/// it is now:
 ///
 /// - the transcode chain restarts its stream
 ///   ([`TranscodeChain::restart_stream`](crate::engine::transcode_chain::TranscodeChain::restart_stream)).
@@ -1249,9 +1243,10 @@ fn forwards_unchanged(
 ///   indicator, and the audio it held from before the gap restamped for
 ///   after it: a receiving edge bridged that PCR jump, and the audio PTS on
 ///   its output stepped by about a second (bench, 2026-10-31);
-/// - the CBR padder starts afresh: its budget runs on the wall clock, so
-///   carried across, it owed the gap's worth of NULL packets and sent them
-///   in bursts of up to 350 packets with the new connection's first chunks.
+/// - the connection gets a CBR padder of its own, returned here: the
+///   padder's budget runs on the wall clock, so one carried across owed the
+///   gap's worth of NULL packets and sent them in bursts of up to 350
+///   packets with the new connection's first chunks.
 ///
 /// The program filter and the PID rewrites keep what they learnt of the
 /// PSI, so a new connection is filtered from its first packet; nothing in
@@ -1259,14 +1254,13 @@ fn forwards_unchanged(
 fn start_connection_stream(
     config: &SrtOutputConfig,
     transcode_chain: &mut Option<crate::engine::transcode_chain::TranscodeChain>,
-    null_padder: &mut Option<crate::engine::ts_null_padder::TsNullPadder>,
-) {
+) -> Option<crate::engine::ts_null_padder::TsNullPadder> {
     if let Some(chain) = transcode_chain.as_mut() {
         chain.restart_stream();
     }
-    *null_padder = config
+    config
         .cbr_pad_to_kbps
-        .map(crate::engine::ts_null_padder::TsNullPadder::new);
+        .map(crate::engine::ts_null_padder::TsNullPadder::new)
 }
 
 /// Inner packet forwarding loop shared by listener and caller output modes
@@ -1279,8 +1273,8 @@ fn start_connection_stream(
 ///
 /// The stages are owned by the caller and outlive the connection: the
 /// program filter's PAT/PMT state survives reconnects, while the transcode
-/// chain and the CBR padder start each connection's stream afresh
-/// ([`start_connection_stream`]).
+/// chain starts each connection's stream afresh and the CBR padder is the
+/// connection's own ([`start_connection_stream`]).
 #[allow(clippy::too_many_arguments)]
 async fn srt_output_forward_loop(
     config: &SrtOutputConfig,
@@ -1292,7 +1286,6 @@ async fn srt_output_forward_loop(
     pid_remapper: &mut Option<TsPidRemapper>,
     pid_overrides_rewriter: &mut Option<TsPidOverridesRewriter>,
     transcode_chain: &mut Option<crate::engine::transcode_chain::TranscodeChain>,
-    null_padder: &mut Option<crate::engine::ts_null_padder::TsNullPadder>,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
@@ -1301,7 +1294,7 @@ async fn srt_output_forward_loop(
     // or what a listener output's liveness probe learnt on this one.
     mut keepalive_gate: KeepaliveGate,
 ) -> anyhow::Result<bool> {
-    start_connection_stream(config, transcode_chain, null_padder);
+    let mut null_padder = start_connection_stream(config, transcode_chain);
     let (send_tx, mut send_rx) = send_queue();
     let send_sink = sink.clone();
     let send_stats = stats.clone();
@@ -1598,32 +1591,14 @@ async fn srt_output_forward_loop(
                                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                             // Drain whatever the codec thread has produced
-                            // since last poll — all of it, as one payload.
-                            // If nothing's ready yet, skip this iteration —
-                            // encoded output will come on a later one. It
-                            // took one chunk per chunk submitted, so every
-                            // chunk the thread produced while the loop ran
-                            // ahead of it (a bursty source, a slow encode)
-                            // stayed queued for good: latency on the output
-                            // for as long as it ran, and TS of the last
-                            // connection handed to the next.
-                            let Some(chain) = transcode_chain.as_mut() else {
+                            // since last poll — all of it, as one payload
+                            // (`TranscodeChain::try_recv_ready`). If
+                            // nothing's ready yet, skip this iteration —
+                            // encoded output will come on a later one.
+                            let Some(transcoded) =
+                                transcode_chain.as_mut().and_then(|c| c.try_recv_ready())
+                            else {
                                 continue;
-                            };
-                            let Some(first) = chain.try_recv() else {
-                                continue;
-                            };
-                            let transcoded = match chain.try_recv() {
-                                None => first,
-                                Some(second) => {
-                                    let mut joined = Vec::with_capacity(first.len() + second.len());
-                                    joined.extend_from_slice(&first);
-                                    joined.extend_from_slice(&second);
-                                    while let Some(more) = chain.try_recv() {
-                                        joined.extend_from_slice(&more);
-                                    }
-                                    Bytes::from(joined)
-                                }
                             };
                             // Apply CBR null padding to the transcoded
                             // bytes, then forward.
@@ -2665,9 +2640,6 @@ async fn srt_output_bonded_loop(
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
         build_transcode_chain_for_srt(config, events, &stats);
-    let mut null_padder = config
-        .cbr_pad_to_kbps
-        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         transcode_chain.as_ref(),
@@ -2736,7 +2708,6 @@ async fn srt_output_bonded_loop(
                     config, &mut rx, &stats, &cancel, &sink,
                     &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter,
                     &mut transcode_chain,
-                    &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                     KeepaliveGate::default(),
                 )
@@ -2834,7 +2805,6 @@ async fn srt_output_bonded_loop(
                     config, &mut rx, &stats, &cancel, &sink,
                     &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter,
                     &mut transcode_chain,
-                    &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                     KeepaliveGate::default(),
                 )
@@ -4750,15 +4720,15 @@ mod tests {
     fn a_connection_owes_no_padding_for_the_gap_before_it() {
         let config = listener_output(9, serde_json::json!({ "cbr_pad_to_kbps": 8_000 }));
         let mut chain = None;
-        let mut padder = config.cbr_pad_to_kbps.map(crate::engine::ts_null_padder::TsNullPadder::new);
+        let mut padder = start_connection_stream(&config, &mut chain).expect("a padder");
         let chunk = PairHarness::media();
         let mut out = Vec::new();
-        padder.as_mut().unwrap().process(&chunk, &mut out);
+        padder.process(&chunk, &mut out);
         // The gap: no receiver, nothing through the padder.
         std::thread::sleep(Duration::from_millis(60));
-        start_connection_stream(&config, &mut chain, &mut padder);
+        let mut padder = start_connection_stream(&config, &mut chain).expect("a padder");
         out.clear();
-        padder.as_mut().unwrap().process(&chunk, &mut out);
+        padder.process(&chunk, &mut out);
         assert_eq!(out.len(), chunk.len(), "no NULL packets owed for the gap");
     }
 

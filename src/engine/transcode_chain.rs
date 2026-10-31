@@ -349,6 +349,26 @@ impl TranscodeChain {
         }
     }
 
+    /// Everything the codec thread has ready, as one chunk; `None` when
+    /// nothing is. What an output that hands the chain's output on once per
+    /// chunk it submits takes each time round: taking one chunk per chunk
+    /// submitted, every chunk the thread produced while the output ran
+    /// ahead of it (a bursty source, a slow encode) stayed queued for good,
+    /// latency on the output for as long as it ran.
+    pub fn try_recv_ready(&mut self) -> Option<Bytes> {
+        let first = self.try_recv()?;
+        let Some(second) = self.try_recv() else {
+            return Some(first);
+        };
+        let mut joined = Vec::with_capacity(first.len() + second.len());
+        joined.extend_from_slice(&first);
+        joined.extend_from_slice(&second);
+        while let Some(more) = self.try_recv() {
+            joined.extend_from_slice(&more);
+        }
+        Some(Bytes::from(joined))
+    }
+
     /// The output this chain feeds has started a new stream to a new
     /// receiver — an SRT output's next connection. Nothing submitted
     /// before this call reaches the new stream: input still queued is
@@ -1039,6 +1059,90 @@ mod tests {
             &programme_events(&wire),
             first_new - 27_000_000,
         );
+    }
+
+    /// The `version_number` of every PMT section starting in `ts`.
+    #[cfg(feature = "media-codecs")]
+    fn pmt_versions(ts: &[u8]) -> Vec<u8> {
+        use crate::engine::ts_parse::{ts_has_payload, ts_payload_offset, ts_pusi, TS_PACKET_SIZE};
+        ts.chunks_exact(TS_PACKET_SIZE)
+            .filter(|p| ts_pusi(p) && ts_has_payload(p))
+            .filter_map(|p| {
+                let sec = ts_payload_offset(p) + 1 + *p.get(ts_payload_offset(p))? as usize;
+                let version = *p.get(sec + 5)?;
+                (p.get(sec) == Some(&0x02)).then_some((version >> 1) & 0x1F)
+            })
+            .collect()
+    }
+
+    /// The first chunk of a new stream resets the replacers as an input
+    /// switch does, which re-stamps the output PMT with a new version: the
+    /// old stream's partial access unit, held audio and PTS anchor do not
+    /// run on across the gap into the new one.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_new_stream_resets_the_replacers() {
+        use crate::engine::ts_test_fixtures::Mp2Programme;
+        let stats = Arc::new(crate::stats::collector::OutputStatsAccumulator::new(
+            "out".into(),
+            "out".into(),
+            "srt".into(),
+        ));
+        let mut chain = build_for_output("out", Some(&mp2_config()), None, None, &stats, None, None)
+            .unwrap()
+            .expect("an audio chain");
+        let mut source = Mp2Programme::new(6);
+        let mut first = Vec::new();
+        for k in 0..50 {
+            submit(&chain, source.chunk(k).unwrap());
+            while let Some(o) = chain.try_recv() {
+                first.extend_from_slice(&o);
+            }
+        }
+        first.extend(drain_until_quiet(&mut chain));
+        let before: std::collections::BTreeSet<u8> = pmt_versions(&first).into_iter().collect();
+        assert_eq!(before.len(), 1, "one PMT version on the first stream: {before:?}");
+
+        chain.restart_stream();
+        let mut second = Vec::new();
+        for k in 80..130 {
+            submit(&chain, source.chunk(k).unwrap());
+            while let Some(o) = chain.try_recv() {
+                second.extend_from_slice(&o);
+            }
+        }
+        second.extend(drain_until_quiet(&mut chain));
+        let after = pmt_versions(&second);
+        assert!(!after.is_empty(), "the new stream carries its PMT");
+        assert!(
+            after.iter().all(|v| !before.contains(v)),
+            "the new stream's PMT is re-stamped: {before:?} then {after:?}"
+        );
+    }
+
+    /// `try_recv_ready` hands on everything the codec thread has ready, in
+    /// order, as one chunk.
+    #[test]
+    fn try_recv_ready_takes_everything_ready_at_once() {
+        let mut chain = make_audio_only_chain();
+        // Null packets pass the pre-PMT gate unchanged: one output chunk per
+        // chunk submitted.
+        let null = |cc: u8| {
+            let mut p = [0xFFu8; 188];
+            p[..4].copy_from_slice(&[0x47, 0x1F, 0xFF, 0x10 | (cc & 0x0F)]);
+            p
+        };
+        for cc in 0..5u8 {
+            chain.try_submit(Bytes::copy_from_slice(&null(cc))).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while chain.output_rx.len() < 5 {
+            assert!(std::time::Instant::now() < deadline, "the codec thread passes all five");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let want: Vec<u8> = (0..5u8).flat_map(null).collect();
+        assert_eq!(chain.try_recv_ready().as_deref(), Some(&want[..]), "all five, in order, at once");
+        assert!(chain.try_recv_ready().is_none(), "nothing left");
     }
 
     /// Construct + immediately drop. Verifies the codec thread sees

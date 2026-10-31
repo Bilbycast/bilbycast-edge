@@ -978,6 +978,11 @@ bits on; band-limited MP2 / AAC sources are not.
   programme rather than on TS the last one never got followed by a PCR jump
   over the reconnection gap. See
   [configuration-guide.md](configuration-guide.md#srt-output) (Reconnections).
+  The SRT and RIST outputs take everything the chain has ready each time
+  round (`TranscodeChain::try_recv_ready`), as UDP and RTP always did:
+  taking one chunk per chunk submitted, a chunk the chain finished after the
+  output had moved on stayed queued for as long as the output ran, adding to
+  its latency.
 - Decoder: `bilbycast-fdk-aac-rs::AacDecoder::open_adts` (Fraunhofer FDK
   AAC, opened with no added delay) for ADTS; libavcodec for LATM / MP2 /
   AC-3 / E-AC-3.
