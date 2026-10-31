@@ -82,11 +82,17 @@
 //! ahead of it, then move it forward again and go out a second time. A
 //! caller whose legs lag by configuration sets the stale time a second past
 //! that lag ([`stale_after_lag_us`]): an SRT pair its legs' latency
-//! difference, a PID-bus Hitless slot the difference between its legs'
-//! receive holds ([`crate::engine::ts_es_hitless::leg_receive_hold`]), a
-//! buffered merger its path differential, which budgets its legs' networks,
-//! plus the slot's difference. What the legs' networks add past that is
-//! left to the second.
+//! difference as negotiated (none while one leg's socket is down, since it
+//! can then bring nothing of the old stream), a PID-bus Hitless slot the
+//! difference between its legs' receive holds as their inputs run
+//! ([`crate::engine::ts_es_hitless::leg_receive_hold`]), a buffered merger
+//! its path differential, which budgets its legs' networks, plus the slot's
+//! difference — each re-set on a running merger when the lag changes
+//! ([`HitlessMerger::set_stale_after_us`]). What the legs' networks add past
+//! that is left to the second. The price is a moved stream's blackout with
+//! one leg up: nothing is followed until the stale time has passed, the lag
+//! and a second, since a lagging leg that has fallen silent may still hold
+//! old-stream packets in its input's buffer.
 //!
 //! ## Why a gap-fill window
 //!
@@ -262,6 +268,20 @@ impl HitlessMerger {
     pub fn with_stale_after_us(mut self, stale_after_us: u64) -> Self {
         self.stale_after_us = stale_after_us;
         self
+    }
+
+    /// The stale time ([`Self::with_stale_after_us`]), in microseconds.
+    #[cfg(test)]
+    pub fn stale_after_us(&self) -> u64 {
+        self.stale_after_us
+    }
+
+    /// Change the stale time of a running merger
+    /// ([`Self::with_stale_after_us`]): its legs' configured lag changed.
+    /// It is read only when a packet arrives too far behind the window, so
+    /// the next such packet is judged by it.
+    pub fn set_stale_after_us(&mut self, stale_after_us: u64) {
+        self.stale_after_us = stale_after_us;
     }
 
     /// Seqs that left the gap-fill window without either leg delivering
@@ -639,6 +659,11 @@ impl HitlessRunMerger {
         self
     }
 
+    /// Change its seqs' stale time ([`HitlessMerger::set_stale_after_us`]).
+    pub fn set_stale_after_us(&mut self, stale_after_us: u64) {
+        self.seqs.set_stale_after_us(stale_after_us);
+    }
+
     /// Merge packet `index` of seq `seq`'s run, from `leg`, arriving at
     /// `now_us` (as for [`HitlessMerger::try_merge`]). Returns `Some(leg)`
     /// to forward it, or `None` to drop it: a duplicate, a packet ahead of
@@ -678,6 +703,9 @@ pub trait SeqDedup {
     /// Re-anchors so far ([`HitlessMerger::resets`]): the buffered merger
     /// re-projects a seq that re-anchored the window from behind it.
     fn resets(&self) -> u64;
+
+    /// Change the stale time ([`HitlessMerger::set_stale_after_us`]).
+    fn set_stale_after_us(&mut self, stale_after_us: u64);
 }
 
 /// What a 2022-7 merger counts of the seqs it never forwarded, for a caller
@@ -722,6 +750,10 @@ impl SeqDedup for HitlessMerger {
     fn resets(&self) -> u64 {
         HitlessMerger::resets(self)
     }
+
+    fn set_stale_after_us(&mut self, stale_after_us: u64) {
+        HitlessMerger::set_stale_after_us(self, stale_after_us);
+    }
 }
 
 /// The dedup of a [`BufferedHitlessMerger::with_runs`]: runs of packets per
@@ -754,6 +786,10 @@ impl SeqDedup for HeldRuns {
 
     fn resets(&self) -> u64 {
         self.0.resets()
+    }
+
+    fn set_stale_after_us(&mut self, stale_after_us: u64) {
+        self.0.set_stale_after_us(stale_after_us);
     }
 }
 
@@ -1939,6 +1975,12 @@ impl<T: Clone> BufferedHitlessMerger<T> {
         )
     }
 
+    /// Its dedup's stale time, in microseconds.
+    #[cfg(test)]
+    pub fn stale_after_us(&self) -> u64 {
+        self.dedup.stale_after_us()
+    }
+
     /// Ingest a packet. Returns the (leg, payload) pairs that are now
     /// ready to forward, in seq order.
     pub fn ingest(
@@ -2098,6 +2140,15 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
             self.anchor_virtual = virt;
         }
         virt
+    }
+
+    /// One leg now reaches the merger up to `leg_lag` behind the other by
+    /// configuration (as for [`Self::with_leg_lag`] / [`Self::with_runs`]):
+    /// its dedup's stale time becomes a second past that and the hold
+    /// together, from the next packet on.
+    pub fn set_leg_lag(&mut self, leg_lag: Duration) {
+        self.dedup
+            .set_stale_after_us(stale_after_lag_us(self.max_path_diff.saturating_add(leg_lag)));
     }
 
     /// Set the SSRC observed for one leg. Called by the input layer
@@ -2975,6 +3026,17 @@ mod buffered_tests {
         );
         assert_eq!(m.dedup.stale_after_us, 2_580_000);
         let m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(200));
+        assert_eq!(m.dedup.stale_after_us, 1_200_000);
+    }
+
+    /// A leg lag set on a running merger re-sizes its stale time as building
+    /// it with that lag does: a second past the lag and the hold.
+    #[test]
+    fn a_leg_lag_set_later_resizes_the_stale_time() {
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(200));
+        m.set_leg_lag(Duration::from_millis(1_380));
+        assert_eq!(m.dedup.stale_after_us, 2_580_000);
+        m.set_leg_lag(Duration::ZERO);
         assert_eq!(m.dedup.stale_after_us, 1_200_000);
     }
 

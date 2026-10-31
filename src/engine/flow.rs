@@ -697,7 +697,7 @@ impl FlowRuntime {
             Some(a) => Some(build_assembly_plan(
                 a,
                 &config,
-                &config.leg_holds,
+                &config.leg_holds.clone().running_on(flow_manager.leg_holds()),
                 &hitless_scope,
                 &event_sender,
             )?),
@@ -1895,6 +1895,10 @@ impl FlowRuntime {
         // `build_assembly_plan` emits Critical events on every failure
         // path (`pid_bus_spts_*`, `pid_bus_audio_encode_codec_*`, etc.)
         // so the manager UI has its field-level signals.
+        let leg_holds = match self.flow_manager_weak.upgrade() {
+            Some(flow_manager) => leg_holds.running_on(flow_manager.leg_holds()),
+            None => leg_holds,
+        };
         let mut build = build_assembly_plan(
             &new_assembly,
             &self.config,
@@ -4175,6 +4179,11 @@ pub(crate) fn spawn_input_runtime(
     let psi_catalog = ctx
         .flow_manager
         .register_input_publisher(&input_id, per_input_tx.clone());
+    // The hold it starts with, read now as the input reads its own
+    // configuration now, for any seq-aware Hitless slot it is a leg of.
+    ctx.flow_manager
+        .leg_holds()
+        .publish(&input_id, crate::engine::ts_es_hitless::leg_receive_hold(&input_def.config));
     let force_idr = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let per_input_counters = ctx.flow_stats.register_input_counters_with_psi_catalog(
@@ -5541,7 +5550,8 @@ fn patch_essence_pid(slot: &mut AssemblySlot, leg_idx: Option<usize>, pid: u16) 
 }
 
 /// `leg_holds` are the receive holds of `assembly`'s Hitless legs, taken
-/// from the node config
+/// from the node config and, attached by the flow, the node's record of the
+/// holds its inputs run with
 /// ([`crate::engine::ts_es_hitless::LegHolds`]). `hitless_scope` is the flow
 /// run's scope for its Hitless slots' bus keys
 /// ([`crate::engine::ts_es_hitless::hitless_scope`]).
@@ -5801,12 +5811,12 @@ fn build_assembly_plan(
                         crate::config::models::HitlessMode::SeqAware
                     );
                     // How far the legs lag each other by configuration, for
-                    // the seq-aware merger's stale time: each leg's hold from
-                    // the node config, whichever flow owns its input.
+                    // the seq-aware merger's stale time: each leg's hold as
+                    // its input runs, whichever flow owns it, kept up to date.
                     let leg_lag = if seq_aware {
-                        leg_holds.get(&primary_pair.0).abs_diff(leg_holds.get(&backup_pair.0))
+                        leg_holds.lag(&primary_pair.0, &backup_pair.0)
                     } else {
-                        std::time::Duration::ZERO
+                        crate::engine::ts_es_hitless::LegLag::fixed(std::time::Duration::ZERO)
                     };
                     let legs = crate::engine::ts_assembler::HitlessLegs {
                         primary: primary_pair.0.clone(),
@@ -8278,7 +8288,7 @@ mod assembly_plan_tests {
             let build =
                 build_assembly_plan(assembly, &resolved, &resolved.leg_holds, "f1:0", &events)
                     .expect("plan");
-            build.pending_hitless[0].leg_lag
+            build.pending_hitless[0].leg_lag.current()
         };
         let ms = std::time::Duration::from_millis;
         for hosted in [false, true] {
@@ -8327,7 +8337,7 @@ mod assembly_plan_tests {
             seq_aware: false,
             reorder_window: crate::redundancy::merger::REORDER_WINDOW,
             path_differential_ms: None,
-            leg_lag: Duration::ZERO,
+            leg_lag: crate::engine::ts_es_hitless::LegLag::fixed(Duration::ZERO),
             forwarding_primary: Default::default(),
             seq_fallback: Default::default(),
         };

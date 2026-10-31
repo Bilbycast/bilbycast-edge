@@ -124,6 +124,10 @@ pub struct FlowManager {
     /// duplicate-demuxer / duplicate-bus-publish bug when two flows
     /// both reference the same input on the node.
     demuxers: DashMap<String, Arc<DemuxerSlot>>,
+    /// The receive hold each input on the node last started with, which
+    /// seq-aware Hitless mergers follow for their legs' lag, whichever flow
+    /// owns the legs' inputs.
+    leg_holds: Arc<crate::engine::ts_es_hitless::LegHoldRegistry>,
 }
 
 /// One node-wide publisher entry for a running input. Held by every
@@ -262,7 +266,14 @@ impl FlowManager {
             node_es_bus: Arc::new(NodeEsBus::new()),
             input_publishers: DashMap::new(),
             demuxers: DashMap::new(),
+            leg_holds: Default::default(),
         }
+    }
+
+    /// The node's record of the receive hold each input started with
+    /// ([`crate::engine::ts_es_hitless::LegHoldRegistry`]).
+    pub fn leg_holds(&self) -> Arc<crate::engine::ts_es_hitless::LegHoldRegistry> {
+        self.leg_holds.clone()
     }
 
     /// Accessor for the WebRTC session registry (if wired). Used by
@@ -2299,6 +2310,124 @@ mod tests {
         });
         let outcome = checks.await;
         let _ = fm.destroy_flow("f1").await;
+        if let Err(failed) = outcome {
+            std::panic::resume_unwind(failed.into_panic());
+        }
+    }
+
+    /// A seq-aware merger's legs lag by the holds their inputs run with. A
+    /// plan swap that leaves the slot alone keeps its merger on those, whatever
+    /// the config now says the inputs would hold: here the config was edited
+    /// under a running host input, as a node de-jitter default pushed since
+    /// it started is, and the swap used to read 300 ms for that leg, call the
+    /// slot changed and restart its merger on air with a 1.7 s lag. And a
+    /// host flow started again on an edit re-sizes the slot's running merger
+    /// with no swap at all, where it used to wait for the slot's flow's next
+    /// start or swap.
+    #[tokio::test]
+    async fn a_seq_aware_merger_follows_the_holds_its_legs_run_with() {
+        use std::time::Duration;
+        let fm = make_fm();
+        let assembly = |marker: bool| -> crate::config::models::FlowAssembly {
+            let pid = |input_id: &str, pid: u16| {
+                serde_json::json!({ "type": "pid", "input_id": input_id, "source_pid": pid })
+            };
+            let mut streams = vec![
+                serde_json::json!({ "source": pid("in-c", 256), "out_pid": 256, "stream_type": 27 }),
+                serde_json::json!({
+                    "source": {
+                        "type": "hitless", "mode": "seq_aware",
+                        "primary": pid("rtp-p", 257), "backup": pid("rtp-b", 257)
+                    },
+                    "out_pid": 257, "stream_type": 15
+                }),
+            ];
+            if marker {
+                streams.push(
+                    serde_json::json!({ "source": pid("in-c", 258), "out_pid": 258, "stream_type": 15 }),
+                );
+            }
+            serde_json::from_value(serde_json::json!({
+                "kind": "spts",
+                "pcr_source": { "input_id": "in-c", "pid": 256 },
+                "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": streams }]
+            }))
+            .expect("assembly fixture")
+        };
+        let flow = |id: &str, input_id: &str, assembly: Option<_>| {
+            serde_json::from_value::<crate::config::models::FlowConfig>(serde_json::json!({
+                "id": id, "name": id, "input_ids": [input_id], "output_ids": [],
+                "assembly": assembly
+            }))
+            .expect("flow fixture")
+        };
+        let rtp = |id: &str, port: u16, dejitter_ms: u32| {
+            input(serde_json::json!({
+                "id": id, "name": id, "type": "rtp", "passthrough_clock": true,
+                "bind_addr": format!("127.0.0.1:{port}"), "ingress_dejitter_ms": dejitter_ms
+            }))
+        };
+        let mut cfg = crate::config::models::AppConfig {
+            inputs: vec![
+                input(serde_json::json!({
+                    "id": "in-c", "name": "in-c", "type": "udp", "bind_addr": "127.0.0.1:41942"
+                })),
+                rtp("rtp-p", 41943, 100),
+                rtp("rtp-b", 41944, 2000),
+            ],
+            flows: vec![
+                flow("f1", "in-c", Some(assembly(false))),
+                flow("host-p", "rtp-p", None),
+                flow("host-b", "rtp-b", None),
+            ],
+            ..Default::default()
+        };
+        for host in [1, 2] {
+            fm.create_flow(cfg.resolve_flow(&cfg.flows[host]).expect("resolve"))
+                .await
+                .expect("host flow");
+        }
+        let runtime = fm
+            .create_flow(cfg.resolve_flow(&cfg.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+        // A failed assertion must not leave the flows running: their input
+        // threads would hold the test runtime's shutdown forever.
+        let checks = tokio::spawn({
+            let (fm, runtime) = (fm.clone(), runtime.clone());
+            async move {
+                let lag = || async {
+                    runtime.begin_assembly_swap().await.leg_lag("slot_0_1").expect("the slot")
+                };
+                assert_eq!(lag().await, Duration::from_millis(1_900), "as the hosts run");
+
+                // The config now says rtp-p would hold 300 ms; it runs on 100.
+                cfg.inputs[1] = rtp("rtp-p", 41943, 300);
+                let wanted = assembly(true);
+                let leg_holds = crate::engine::ts_es_hitless::LegHolds::of(&wanted, &cfg);
+                let mut swap = runtime.begin_assembly_swap().await;
+                let on_air = swap.replace(wanted, leg_holds, None).await.expect("swap");
+                assert!(matches!(on_air, crate::engine::flow::SwapOutcome::OnAir));
+                assert_eq!(
+                    swap.leg_lag("slot_0_1"),
+                    Some(Duration::from_millis(1_900)),
+                    "the kept merger, on what runs"
+                );
+                drop(swap);
+
+                // host-p is started again on its edit, now 600 ms.
+                fm.destroy_flow("host-p").await.expect("stop host-p");
+                cfg.inputs[1] = rtp("rtp-p", 41943, 600);
+                fm.create_flow(cfg.resolve_flow(&cfg.flows[1]).expect("resolve"))
+                    .await
+                    .expect("host-p again");
+                assert_eq!(lag().await, Duration::from_millis(1_400), "no swap needed");
+            }
+        });
+        let outcome = checks.await;
+        for flow in ["f1", "host-p", "host-b"] {
+            let _ = fm.destroy_flow(flow).await;
+        }
         if let Err(failed) = outcome {
             std::panic::resume_unwind(failed.into_panic());
         }

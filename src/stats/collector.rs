@@ -3704,7 +3704,9 @@ pub enum SrtInputSocket {
 /// A loss that leaves neither leg connected restarts the merger, which then
 /// counts the seqs still unfilled in its window as lost — nothing will fill
 /// them now — and the receive loop settles what waits for polls
-/// ([`SrtInputStats::settle_pair_loss`]).
+/// ([`SrtInputStats::settle_pair_loss`]). A merger that goes with its input
+/// (a stop, a removal, an edit applied in place) counts nothing of its
+/// window: its legs were up, and the gaps there were still being filled.
 ///
 /// [`HitlessMerger`]: crate::redundancy::merger::HitlessMerger
 /// [`BufferedHitlessMerger`]: crate::redundancy::merger::BufferedHitlessMerger

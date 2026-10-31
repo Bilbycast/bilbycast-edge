@@ -34,10 +34,11 @@
 //! Both seq-aware mergers' stale time (see "Re-anchoring" in
 //! [`crate::redundancy::merger`]) is a second past how far one leg lags the
 //! other by configuration — the difference of their [`leg_receive_hold`]s,
-//! each read from the node config whichever flow owns its input
-//! ([`LegHolds`]) — or, buffered, past the hold when that is longer, so a
-//! leg that only lags is never taken for a moved stream while it is still a
-//! window behind.
+//! each as its input last started with it whichever flow owns that input
+//! ([`LegHoldRegistry`], seeded from the node config for one that has not
+//! run, [`LegHolds`]) and followed as the inputs start again ([`LegLag`]) —
+//! plus the hold, buffered, so a leg that only lags is never taken for a
+//! moved stream while it is still a window behind.
 //!
 //! A leg whose packets reach the bus with no sequence number — any input but
 //! RTP and RIST, or one whose ingress transcode or post-process stage
@@ -66,7 +67,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
 
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 use tokio_util::sync::CancellationToken;
@@ -262,8 +263,19 @@ pub fn leg_receive_hold(input: &crate::config::models::InputConfig) -> Duration 
 /// for a flow's start by [`crate::config::models::AppConfig::resolve_flow`],
 /// for a plan swap by the swap's caller
 /// ([`crate::engine::flow::AssemblySwap::replace`]).
+///
+/// These are the holds the config names, which a running input need not
+/// have: an RTP input keeps the node de-jitter default it started with, and
+/// an edit reaches a running input only when its flow applies it. So the
+/// flow building a plan hands it the node's [`LegHoldRegistry`]
+/// ([`Self::running_on`]), and a leg whose input has run takes its hold from
+/// there, kept up to date ([`Self::lag`]); these values only seed a leg whose
+/// input has not.
 #[derive(Debug, Clone, Default)]
-pub struct LegHolds(HashMap<String, Duration>);
+pub struct LegHolds {
+    holds: HashMap<String, Duration>,
+    running: Option<Arc<LegHoldRegistry>>,
+}
 
 impl LegHolds {
     pub fn of(
@@ -285,14 +297,133 @@ impl LegHolds {
                 }
             }
         }
-        Self(holds)
+        Self { holds, running: None }
     }
 
-    /// `input_id`'s hold: none for an input the node does not define.
+    /// Take each leg's hold, where its input has run, from `registry`: the
+    /// node's record of the holds its inputs run with.
+    pub fn running_on(mut self, registry: Arc<LegHoldRegistry>) -> Self {
+        self.running = Some(registry);
+        self
+    }
+
+    /// `input_id`'s hold by the config: none for an input the node does not
+    /// define.
     pub fn get(&self, input_id: &str) -> Duration {
-        self.0.get(input_id).copied().unwrap_or_default()
+        self.holds.get(input_id).copied().unwrap_or_default()
+    }
+
+    /// How far apart the legs on inputs `primary` and `backup` reach a
+    /// merger: from the registry, following each input as it is started
+    /// again, when one is attached; else from the config, fixed.
+    pub fn lag(&self, primary: &str, backup: &str) -> LegLag {
+        let hold = |input_id: &str| match &self.running {
+            Some(registry) => registry.watch(input_id, self.get(input_id)),
+            None => watch::channel(self.get(input_id)).1,
+        };
+        LegLag::new([hold(primary), hold(backup)])
     }
 }
+
+/// The receive hold ([`leg_receive_hold`]) each input on the node last
+/// started with, by input id: what a seq-aware Hitless slot's legs actually
+/// lag by, whichever flow owns their inputs. One per [`crate::engine::manager::FlowManager`].
+///
+/// An input publishes its hold each time it is spawned
+/// ([`Self::publish`]) — a flow start, a hot-add, an edit applied in place —
+/// read then, as the input itself reads its configuration then; a merger
+/// follows its legs' entries ([`LegLag`]), so an edit to a leg's input on a
+/// host flow reaches the slot's running merger, and a node de-jitter default
+/// pushed since an input started never stands in for the one it runs with.
+/// Until 2026-10-31 a merger's lag was read from the config when its slot's
+/// flow started or swapped its plan: a hosted leg's edit waited for the next
+/// of those, and a plan swap after a tuning push read a hold no running
+/// input had, called the slot changed and restarted its merger on air.
+///
+/// Entries are never removed, like the [`NodeEsBus`]'s input keys: a merger
+/// holds a receiver on each of its legs', which must see the input's next
+/// start. One small entry per input id the node ever ran or a slot named.
+#[derive(Debug, Default)]
+pub struct LegHoldRegistry(dashmap::DashMap<String, watch::Sender<Duration>>);
+
+impl LegHoldRegistry {
+    /// Input `input_id` started holding each packet `hold`.
+    pub fn publish(&self, input_id: &str, hold: Duration) {
+        self.0
+            .entry(input_id.to_string())
+            .or_insert_with(|| watch::channel(hold).0)
+            .send_if_modified(|held| std::mem::replace(held, hold) != hold);
+    }
+
+    /// Follow `input_id`'s hold: `seed` until the input first starts, if it
+    /// has not.
+    pub fn watch(&self, input_id: &str, seed: Duration) -> watch::Receiver<Duration> {
+        self.0
+            .entry(input_id.to_string())
+            .or_insert_with(|| watch::channel(seed).0)
+            .subscribe()
+    }
+}
+
+/// How far one leg of a seq-aware Hitless slot reaches its merger behind the
+/// other by configuration — the difference of the legs' receive holds — as
+/// [`LegHolds::lag`] follows them: the merger sizes its stale time to it and
+/// re-sizes it when either changes ([`Self::changed`]).
+///
+/// Runtime state, not plan: any two compare equal, so a plan swap that keeps
+/// a slot's legs and settings keeps its merger, which follows its legs'
+/// holds itself.
+#[derive(Debug, Clone)]
+pub struct LegLag {
+    holds: [watch::Receiver<Duration>; 2],
+    /// Per leg, whether its hold can still change.
+    open: [bool; 2],
+}
+
+impl LegLag {
+    fn new(holds: [watch::Receiver<Duration>; 2]) -> Self {
+        Self { holds, open: [true; 2] }
+    }
+
+    /// A lag of `lag` that never changes: a primary-preference slot's (zero),
+    /// or a test's.
+    pub fn fixed(lag: Duration) -> Self {
+        Self::new([watch::channel(lag).1, watch::channel(Duration::ZERO).1])
+    }
+
+    /// The lag now.
+    pub fn current(&self) -> Duration {
+        self.holds[0].borrow().abs_diff(*self.holds[1].borrow())
+    }
+
+    /// Wait until either leg's hold changes. Cancel-safe; pends for good once
+    /// neither can.
+    pub async fn changed(&mut self) {
+        let [primary, backup] = &mut self.holds;
+        let [primary_open, backup_open] = &mut self.open;
+        loop {
+            tokio::select! {
+                res = primary.changed(), if *primary_open => match res {
+                    Ok(()) => return,
+                    Err(_) => *primary_open = false,
+                },
+                res = backup.changed(), if *backup_open => match res {
+                    Ok(()) => return,
+                    Err(_) => *backup_open = false,
+                },
+                else => std::future::pending::<()>().await,
+            }
+        }
+    }
+}
+
+impl PartialEq for LegLag {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LegLag {}
 
 /// The mergers running behind one assembled flow's Hitless slots, by slot
 /// uid. A slot's merger is the only publisher onto the slot's bus key, so
@@ -489,7 +620,7 @@ impl HitlessMergers {
                 slot.seq_aware,
                 slot.reorder_window,
                 slot.path_differential_ms,
-                slot.leg_lag,
+                slot.leg_lag.clone(),
                 slot.forwarding_primary.clone(),
                 slot.seq_fallback.clone(),
                 cancel.clone(),
@@ -515,10 +646,10 @@ impl HitlessMergers {
         self.outputs.clone()
     }
 
-    /// How far apart the merger behind slot `uid` was told its legs are.
+    /// How far apart the merger behind slot `uid` is told its legs are now.
     #[cfg(test)]
     pub fn leg_lag(&self, uid: &str) -> Option<Duration> {
-        self.running.get(uid).map(|running| running.slot.leg_lag)
+        self.running.get(uid).map(|running| running.slot.leg_lag.current())
     }
 }
 
@@ -541,7 +672,8 @@ impl HitlessMergers {
 /// the hold together, buffered — rather than the second of
 /// [`crate::redundancy::merger::DEFAULT_STALE_AFTER_US`], so a lagging leg
 /// is never taken for a moved stream while it is still a window behind (see
-/// "Re-anchoring" in [`crate::redundancy::merger`]).
+/// "Re-anchoring" in [`crate::redundancy::merger`]). The merger re-sizes it
+/// whenever `leg_lag` changes, as a leg's input is started again.
 ///
 /// The merger publishes onto `output`, the slot's [`hitless_bus_key`], and
 /// names it in its logs.
@@ -568,7 +700,7 @@ pub fn spawn_hitless_es_merger_full(
     seq_aware: bool,
     reorder_window: u16,
     path_differential_ms: Option<u32>,
-    leg_lag: Duration,
+    mut leg_lag: LegLag,
     forwarding_primary: ForwardingPrimary,
     seq_fallback: SeqFallback,
     cancel: CancellationToken,
@@ -600,7 +732,7 @@ pub fn spawn_hitless_es_merger_full(
                         &out_tx,
                         Duration::from_millis(ms as u64),
                         reorder_window,
-                        leg_lag,
+                        &mut leg_lag,
                         &cancel,
                     )
                     .await
@@ -608,9 +740,17 @@ pub fn spawn_hitless_es_merger_full(
                 None => {
                     use crate::redundancy::merger::{stale_after_lag_us, HitlessRunMerger};
                     let merger = HitlessRunMerger::with_window(reorder_window)
-                        .with_stale_after_us(stale_after_lag_us(leg_lag));
-                    run_seq_aware(&uid, &mut primary_rx, &mut backup_rx, &out_tx, merger, &cancel)
-                        .await
+                        .with_stale_after_us(stale_after_lag_us(leg_lag.current()));
+                    run_seq_aware(
+                        &uid,
+                        &mut primary_rx,
+                        &mut backup_rx,
+                        &out_tx,
+                        merger,
+                        &mut leg_lag,
+                        &cancel,
+                    )
+                    .await
                 }
             };
             // `None`: cancelled, or a leg's channel closed.
@@ -653,12 +793,12 @@ async fn run_buffered(
     out_tx: &broadcast::Sender<EsPacketAlias>,
     max_path_diff: Duration,
     reorder_window: u16,
-    leg_lag: Duration,
+    leg_lag: &mut LegLag,
     cancel: &CancellationToken,
 ) -> Option<Unsequenced> {
     use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HeldRuns};
     let mut merger: BufferedHitlessMerger<EsPacketAlias, HeldRuns> =
-        BufferedHitlessMerger::with_runs(max_path_diff, reorder_window, leg_lag);
+        BufferedHitlessMerger::with_runs(max_path_diff, reorder_window, leg_lag.current());
     // Far-future placeholder used when the buffer is empty so the
     // tokio::select! `sleep_until` arm doesn't fire spuriously.
     let far_future = std::time::Instant::now() + Duration::from_secs(86_400);
@@ -711,6 +851,7 @@ async fn run_buffered(
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             },
+            _ = leg_lag.changed() => merger.set_leg_lag(leg_lag.current()),
         }
     }
 }
@@ -779,6 +920,7 @@ async fn run_seq_aware(
     backup_rx: &mut broadcast::Receiver<EsPacketAlias>,
     out_tx: &broadcast::Sender<EsPacketAlias>,
     mut merger: crate::redundancy::merger::HitlessRunMerger,
+    leg_lag: &mut LegLag,
     cancel: &CancellationToken,
 ) -> Option<Unsequenced> {
     use crate::redundancy::merger::ActiveLeg;
@@ -818,6 +960,10 @@ async fn run_seq_aware(
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             },
+            _ = leg_lag.changed() => {
+                use crate::redundancy::merger::stale_after_lag_us;
+                merger.set_stale_after_us(stale_after_lag_us(leg_lag.current()));
+            }
         }
     }
 }
@@ -974,7 +1120,7 @@ mod tests {
             /* seq_aware */ false,
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
-            /* leg_lag */ Duration::ZERO,
+            /* leg_lag */ LegLag::fixed(Duration::ZERO),
             forwarding.clone(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -1018,7 +1164,7 @@ mod tests {
             /* seq_aware */ false,
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
-            /* leg_lag */ Duration::ZERO,
+            /* leg_lag */ LegLag::fixed(Duration::ZERO),
             forwarding.clone(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -1060,7 +1206,7 @@ mod tests {
             /* seq_aware */ false,
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
-            /* leg_lag */ Duration::ZERO,
+            /* leg_lag */ LegLag::fixed(Duration::ZERO),
             forwarding.clone(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -1121,7 +1267,7 @@ mod tests {
                     /* seq_aware */ true,
                     reorder_window,
                     path_differential_ms,
-                    /* leg_lag */ Duration::ZERO,
+                    /* leg_lag */ LegLag::fixed(Duration::ZERO),
                     ForwardingPrimary::default(),
                     SeqFallback::default(),
                     cancel.clone(), None
@@ -1201,7 +1347,7 @@ mod tests {
                 /* seq_aware */ true,
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
-                /* leg_lag */ Duration::ZERO,
+                /* leg_lag */ LegLag::fixed(Duration::ZERO),
                 ForwardingPrimary::default(),
                 SeqFallback::default(),
                 cancel.clone(), None
@@ -1260,7 +1406,7 @@ mod tests {
                 /* seq_aware */ true,
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
-                /* leg_lag */ Duration::from_secs(2),
+                /* leg_lag */ LegLag::fixed(Duration::from_secs(2)),
                 ForwardingPrimary::default(),
                 SeqFallback::default(),
                 cancel.clone(),
@@ -1316,7 +1462,7 @@ mod tests {
             /* seq_aware */ true,
             crate::redundancy::merger::REORDER_WINDOW,
             /* path_differential_ms */ None,
-            /* leg_lag */ Duration::ZERO,
+            /* leg_lag */ LegLag::fixed(Duration::ZERO),
             ForwardingPrimary::default(),
             SeqFallback::default(),
             cancel.clone(),
@@ -1384,7 +1530,7 @@ mod tests {
                     /* seq_aware */ true,
                     crate::redundancy::merger::REORDER_WINDOW,
                     path_differential_ms,
-                    /* leg_lag */ Duration::ZERO,
+                    /* leg_lag */ LegLag::fixed(Duration::ZERO),
                     forwarding.clone(),
                     fallback.clone(),
                     cancel.clone(),
@@ -1457,7 +1603,7 @@ mod tests {
                 /* seq_aware */ true,
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
-                /* leg_lag */ Duration::ZERO,
+                /* leg_lag */ LegLag::fixed(Duration::ZERO),
                 ForwardingPrimary::default(),
                 SeqFallback::default(),
                 cancel.clone(),
@@ -1562,7 +1708,7 @@ mod tests {
             /* seq_aware */ true,
             crate::redundancy::merger::REORDER_WINDOW,
             path_differential_ms,
-            /* leg_lag */ Duration::ZERO,
+            /* leg_lag */ LegLag::fixed(Duration::ZERO),
             ForwardingPrimary::default(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -1661,7 +1807,7 @@ mod tests {
                 /* seq_aware */ true,
                 crate::redundancy::merger::REORDER_WINDOW,
                 path_differential_ms,
-                /* leg_lag */ Duration::ZERO,
+                /* leg_lag */ LegLag::fixed(Duration::ZERO),
                 ForwardingPrimary::default(),
                 SeqFallback::default(),
                 cancel.clone(), None
@@ -1718,7 +1864,7 @@ mod tests {
             /* seq_aware */ true,
             4096,
             /* path_differential_ms */ None,
-            /* leg_lag */ Duration::ZERO,
+            /* leg_lag */ LegLag::fixed(Duration::ZERO),
             ForwardingPrimary::default(),
             SeqFallback::default(),
             cancel.clone(), None
@@ -1762,6 +1908,97 @@ mod tests {
         cancel.cancel();
     }
 
+    /// A seq-aware merger follows its legs' holds as their inputs start: a
+    /// leg's input started again with a 2 s hold makes a moved stream wait
+    /// out a 3 s stale time, and back at none, the second it was. A
+    /// far-behind primary datagram 1.3 s after the last forwarded is held
+    /// back, then taken. The lag used to be fixed when the merger started.
+    #[tokio::test]
+    async fn a_seq_aware_merger_follows_its_legs_holds() {
+        use crate::engine::ts_es_bus::TsEsDemuxer;
+        // The merger's clock, which reads 0 throughout until started.
+        crate::util::time::init_epoch();
+        let bus = Arc::new(NodeEsBus::new());
+        let cancel = CancellationToken::new();
+        let registry = Arc::new(LegHoldRegistry::default());
+        let leg_lag = LegHolds::default().running_on(registry.clone()).lag("in-a", "in-b");
+        assert_eq!(leg_lag.current(), Duration::ZERO);
+        let _handle = spawn_hitless_es_merger_full(
+            hitless_bus_key("f1", "slot_0_0"),
+            ("in-a".to_string(), 0x100),
+            ("in-b".to_string(), 0x100),
+            bus.clone(),
+            Duration::from_millis(50),
+            /* seq_aware */ true,
+            crate::redundancy::merger::REORDER_WINDOW,
+            /* path_differential_ms */ None,
+            leg_lag,
+            ForwardingPrimary::default(),
+            SeqFallback::default(),
+            cancel.clone(),
+            None,
+        );
+        let mut out_rx = bus.subscribe(&hitless_bus_key("f1", "slot_0_0").0, 0);
+        let mut demux_a = TsEsDemuxer::new("in-a", bus.clone());
+        let mut forwarded = Vec::new();
+        let mut drain = async |forwarded: &mut Vec<(u16, u8)>| {
+            while let Ok(res) =
+                tokio::time::timeout(Duration::from_millis(100), out_rx.recv()).await
+            {
+                forwarded.push(tag(&res.expect("the test keeps up with the merger")));
+            }
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for seq in 10_000..10_010 {
+            demux_a.process(&datagram(0x100, seq));
+        }
+        drain(&mut forwarded).await;
+        assert_eq!(forwarded, every_packet(10_000..10_010));
+        forwarded.clear();
+
+        // The backup's input starts with a 2 s hold.
+        registry.publish("in-b", Duration::from_secs(2));
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        demux_a.process(&datagram(0x100, 5_010));
+        drain(&mut forwarded).await;
+        assert!(forwarded.is_empty(), "within the 3 s stale time: {forwarded:?}");
+
+        // And again with none.
+        registry.publish("in-b", Duration::ZERO);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        demux_a.process(&datagram(0x100, 5_011));
+        drain(&mut forwarded).await;
+        assert_eq!(forwarded, every_packet(5_011..5_012), "past the 1 s stale time");
+        cancel.cancel();
+    }
+
+    /// The registry hands a leg its input's hold as last started, `seed`
+    /// until the input starts, and a merger's lag follows either leg.
+    #[tokio::test]
+    async fn leg_holds_follow_the_inputs_as_they_start() {
+        let registry = Arc::new(LegHoldRegistry::default());
+        registry.publish("in-a", Duration::from_millis(100));
+        let config = crate::config::models::AppConfig::default();
+        let assembly: crate::config::models::FlowAssembly = serde_json::from_value(serde_json::json!({
+            "kind": "spts", "programs": []
+        }))
+        .expect("assembly fixture");
+        let holds = LegHolds::of(&assembly, &config);
+        let fixed = holds.lag("in-a", "in-b");
+        let mut running = holds.running_on(registry.clone()).lag("in-a", "in-b");
+        assert_eq!(fixed.current(), Duration::ZERO, "no config, no registry");
+        assert_eq!(running.current(), Duration::from_millis(100));
+        registry.publish("in-b", Duration::from_millis(700));
+        tokio::time::timeout(Duration::from_secs(1), running.changed()).await.expect("a change");
+        assert_eq!(running.current(), Duration::from_millis(600));
+        assert_eq!(fixed, running, "runtime state, not plan");
+        // The same hold again is no change.
+        registry.publish("in-b", Duration::from_millis(700));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), running.changed()).await.is_err()
+        );
+    }
+
     /// A merger's key is told by its whole shape: a run's scope, a slot uid
     /// and PID 0. An input id that only starts with the prefix is not one —
     /// judged on the prefix, `hitless:cam1` was refused a channel before its
@@ -1797,7 +2034,7 @@ mod tests {
             seq_aware: false,
             reorder_window: crate::redundancy::merger::REORDER_WINDOW,
             path_differential_ms: None,
-            leg_lag: Duration::ZERO,
+            leg_lag: LegLag::fixed(Duration::ZERO),
             forwarding_primary: ForwardingPrimary::default(),
             seq_fallback: SeqFallback::default(),
         }
