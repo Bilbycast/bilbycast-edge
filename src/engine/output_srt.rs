@@ -5492,48 +5492,11 @@ mod tests {
         assert!(from_forward_loop > 0, "the forward loop sends the keepalives on");
     }
 
-    /// A connection's stream starts the CBR padder afresh: carried over from
-    /// the last connection, its wall-clock budget owed the reconnection
-    /// gap's worth of NULL packets and sent them in bursts with the new
-    /// connection's first chunks.
-    #[test]
-    fn a_connection_owes_no_padding_for_the_gap_before_it() {
-        let config = listener_output(9, serde_json::json!({ "cbr_pad_to_kbps": 8_000 }));
-        let mut chain = None;
-        let mut padder = start_connection_stream(&config, &mut chain).expect("a padder");
-        let chunk = PairHarness::media();
-        let mut out = Vec::new();
-        padder.process(&chunk, &mut out);
-        // The gap: no receiver, nothing through the padder.
-        std::thread::sleep(Duration::from_millis(60));
-        let mut padder = start_connection_stream(&config, &mut chain).expect("a padder");
-        out.clear();
-        padder.process(&chunk, &mut out);
-        assert_eq!(out.len(), chunk.len(), "no NULL packets owed for the gap");
-    }
-
-    /// The bench's N3, on loopback: a listener output re-encoding a live
-    /// programme's audio, its caller re-joining. The second caller's stream
-    /// starts on the programme as it is when it joins and is one a receiver
-    /// can follow from its first byte. The output kept its transcode chain
-    /// from one connection to the next and took one chunk from it per chunk
-    /// it gave it: the second caller first got TS the first one never did,
-    /// then the PCR jumped over the reconnection gap with no DI, and a
-    /// receiving edge stepped its audio PTS by about a second.
+    /// A live programme published onto the flow, as `Mp2Programme` chunks
+    /// 40 ms apart, until `cancel`.
     #[cfg(feature = "media-codecs")]
-    #[tokio::test]
-    async fn a_transcoding_listener_output_starts_a_rejoining_caller_on_the_live_programme() {
-        use crate::engine::ts_test_fixtures::{
-            assert_one_followable_stream, programme_events, Mp2Programme, ProgrammeEvent,
-        };
-        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let cancel = CancellationToken::new();
-        let _stop = cancel.clone().drop_guard();
-        let (tx, _events_rx) = spawn_output_alone(
-            listener_output(port, serde_json::json!({ "audio_encode": { "codec": "aac_lc" } })),
-            &cancel,
-        );
-        // The programme, live: chunk k published 40 ms * k after the start.
+    fn pump_live_programme(tx: &broadcast::Sender<RtpPacket>, cancel: &CancellationToken) {
+        use crate::engine::ts_test_fixtures::Mp2Programme;
         let (pump_tx, stop) = (tx.clone(), cancel.clone());
         tokio::spawn(async move {
             let mut source = Mp2Programme::new(20);
@@ -5553,14 +5516,93 @@ mod tests {
                 }
             }
         });
-        async fn read_for(peer: &SrtSocket, how_long: Duration) -> Vec<u8> {
-            let mut ts = Vec::new();
-            let until = Instant::now() + how_long;
-            while let Ok(Ok(datagram)) = tokio::time::timeout_at(until, peer.recv()).await {
-                ts.extend_from_slice(&datagram.data);
-            }
-            ts
+    }
+
+    /// Everything `peer` receives for `how_long`, as one TS.
+    #[cfg(feature = "media-codecs")]
+    async fn read_for(peer: &SrtSocket, how_long: Duration) -> Vec<u8> {
+        let mut ts = Vec::new();
+        let until = Instant::now() + how_long;
+        while let Ok(Ok(datagram)) = tokio::time::timeout_at(until, peer.recv()).await {
+            ts.extend_from_slice(&datagram.data);
         }
+        ts
+    }
+
+    /// A transcoding listener output padded to CBR owes a re-joining caller
+    /// nothing for the reconnection gap: each connection's padder is its
+    /// own, its wall-clock budget starting with the connection. Carried
+    /// across, the padder owed the gap's worth of NULL packets — about 800
+    /// at 1 Mbit/s over a gap of 1.2 s — and sent them in bursts of up to
+    /// 350 with the new connection's first chunks. Judged on the
+    /// programme's own clock: the NULL packets the new connection carries up
+    /// to 300 ms of PCR past its first, which at 1 Mbit/s less the
+    /// programme's own rate are some 150.
+    #[cfg(feature = "media-codecs")]
+    #[tokio::test]
+    async fn a_padded_listener_output_owes_a_rejoining_caller_nothing_for_the_gap() {
+        use crate::engine::ts_parse::{extract_pcr, ts_pid};
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (tx, _events_rx) = spawn_output_alone(
+            listener_output(
+                port,
+                serde_json::json!({ "audio_encode": { "codec": "aac_lc" }, "cbr_pad_to_kbps": 1_000 }),
+            ),
+            &cancel,
+        );
+        pump_live_programme(&tx, &cancel);
+
+        let first = caller_of(port, &cancel).await;
+        let first_ts = read_for(&first, Duration::from_millis(1_000)).await;
+        assert!(
+            first_ts.chunks(TS_PACKET_SIZE).any(|p| ts_pid(p) == 0x1FFF),
+            "the first connection is padded"
+        );
+        first.close().await.unwrap();
+
+        // The output re-accepts a second after it sees the first caller go.
+        let second = caller_of(port, &cancel).await;
+        let second_ts = read_for(&second, Duration::from_millis(2_000)).await;
+        let mut first_pcr = None;
+        let mut nulls = 0;
+        for p in second_ts.chunks(TS_PACKET_SIZE) {
+            if let Some(pcr) = extract_pcr(p) {
+                let start = *first_pcr.get_or_insert(pcr);
+                if pcr >= start + 300 * 27_000 {
+                    break;
+                }
+            }
+            nulls += usize::from(ts_pid(p) == 0x1FFF);
+        }
+        assert!(first_pcr.is_some(), "the second connection carries the programme");
+        assert!(nulls < 300, "{nulls} NULL packets in the second connection's first 300 ms");
+    }
+
+    /// The bench's N3, on loopback: a listener output re-encoding a live
+    /// programme's audio, its caller re-joining. The second caller's stream
+    /// starts on the programme as it is when it joins and is one a receiver
+    /// can follow from its first byte. The output kept its transcode chain
+    /// from one connection to the next and took one chunk from it per chunk
+    /// it gave it: the second caller first got TS the first one never did,
+    /// then the PCR jumped over the reconnection gap with no DI, and a
+    /// receiving edge stepped its audio PTS by about a second.
+    #[cfg(feature = "media-codecs")]
+    #[tokio::test]
+    async fn a_transcoding_listener_output_starts_a_rejoining_caller_on_the_live_programme() {
+        use crate::engine::ts_test_fixtures::{
+            assert_one_followable_stream, programme_events, ProgrammeEvent,
+        };
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (tx, _events_rx) = spawn_output_alone(
+            listener_output(port, serde_json::json!({ "audio_encode": { "codec": "aac_lc" } })),
+            &cancel,
+        );
+        // The programme, live: chunk k published 40 ms * k after the start.
+        pump_live_programme(&tx, &cancel);
 
         let first = caller_of(port, &cancel).await;
         let first_events = programme_events(&read_for(&first, Duration::from_millis(1_500)).await);
