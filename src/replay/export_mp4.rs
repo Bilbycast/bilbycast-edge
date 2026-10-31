@@ -406,7 +406,7 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
                 params.observe(CmafVideoCodec::H265, &nalus, is_keyframe);
                 video_pts.push((pts, nalus, is_keyframe));
             }
-            DemuxedFrame::Aac { data, pts } => {
+            DemuxedFrame::Aac { data, pts, .. } => {
                 aac_pts.push((pts, data));
             }
             DemuxedFrame::OtherAudio { stream_type, data, pts } => {

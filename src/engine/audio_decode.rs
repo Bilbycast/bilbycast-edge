@@ -20,7 +20,7 @@
 //! ## Layering
 //!
 //! ```text
-//! DemuxedFrame::Aac { data, pts }
+//! DemuxedFrame::Aac { data, pts, config }
 //!         │
 //!         ▼
 //! ┌──────────────────────┐

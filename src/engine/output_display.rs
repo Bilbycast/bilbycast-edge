@@ -1381,7 +1381,7 @@ fn demux_decode_loop(
                         },
                     );
                 }
-                DemuxedFrame::Aac { data, pts } => {
+                DemuxedFrame::Aac { data, pts, .. } => {
                     counters.set_audio_codec_label(
                         crate::stats::collector::DisplayCodecLabel::Aac,
                     );

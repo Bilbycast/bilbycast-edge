@@ -351,7 +351,7 @@ async fn run_sdi_output(
                             // AAC-LC); MP2/AC-3/E-AC-3 cover DVB/ATSC flows.
                             // Opus (display-gated variant) and AC-4 (no decoder)
                             // are not handled — those flows play out video-only.
-                            DemuxedFrame::Aac { data, pts } if want_audio => {
+                            DemuxedFrame::Aac { data, pts, .. } if want_audio => {
                                 match demuxer.cached_aac_config() {
                                     Some(config) => PlayoutAu::Audio(AudioAu {
                                         pts,

@@ -923,7 +923,15 @@ unchanged. An HE-AAC source carries the AAC-LC profile in its ADTS header
 too (SBR / PS are signalled implicitly), so the source is told by what its
 first frame decodes to — twice its header's rate, or stereo from a mono
 core — and an HE-AAC one is re-encoded to the AAC-LC the block asks for.
-Before edge#210 it was passed through as HE-AAC. This is the right behaviour for "I want to confirm the
+Before edge#210 it was passed through as HE-AAC. The judgement is made
+again whenever the source's AAC configuration changes while it is passed
+through (a switch to another feed): a switch to an HE-AAC feed leaves the
+fast path for the re-encode, where it went on passing the HE-AAC through
+under a new sequence header naming its core. Once re-encoding, the output
+stays so. The encoder's first frames after such a switch are its priming,
+behind what was passed through, and are not sent, so the first re-encoded
+frame decodes after a frame of the passed-through stream: up to a frame
+(about 21 ms) of it may be garbled at the switch. This is the right behaviour for "I want to confirm the
 config schema accepts audio_encode but I don't actually need to
 re-encode anything." Any field override (`bitrate_kbps`, `sample_rate`,
 `channels`) forces the full decode/encode chain.

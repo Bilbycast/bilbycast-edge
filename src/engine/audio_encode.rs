@@ -120,6 +120,21 @@ impl AudioCodec {
         }
     }
 
+    /// The most channels this codec's encoder opens at, when that is fewer
+    /// than a decoder here can hand out (eight, from a 7.1 AAC or E-AC-3
+    /// source): AC-3 5.1, MP2 and Opus stereo. With no channel count
+    /// configured, a wider source is converted down to it by the channel
+    /// stage's standard downmix (`audio_transcode::override_conversion`);
+    /// opened at the source's eight, the encoder refused and the audio was
+    /// lost. `None` for AAC, whose encoder takes 7.1.
+    pub fn channel_cap(self) -> Option<u8> {
+        match self {
+            Self::Ac3 => Some(6),
+            Self::Mp2 | Self::Opus => Some(2),
+            Self::AacLc | Self::HeAacV1 | Self::HeAacV2 => None,
+        }
+    }
+
     /// Wire identifier as it appears in tracing / event payloads.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -768,7 +783,9 @@ impl std::fmt::Debug for AudioEncoder {
 /// cannot hold: fdk writes it masked, as 4 (4.0), and no
 /// program_config_element (it writes one only for channel configuration 0),
 /// so every 7.1 AAC target — the TS replacer, HLS, CMAF, RTMP — told its
-/// receivers 4.0 over five channel elements. The frame is rewritten to
+/// receivers 4.0 over five channel elements. Every fdk encode goes through
+/// it: [`encode_fdk_frames`] here, and the TS audio replacer's own frame
+/// loop, which owns its encoder. The frame is rewritten to
 /// channel configuration 0 with the PCE fdk itself writes for that mode
 /// where it writes one (`aac_config::pce_7_1_back`: centre, front pair,
 /// surround pair, rear pair, LFE — the element tags its raw_data_block
@@ -776,7 +793,7 @@ impl std::fmt::Debug for AudioEncoder {
 /// decoder joining mid-stream needs it at once. Nine bytes a frame. A frame
 /// of another shape (a CRC) is left as it was.
 #[cfg(feature = "fdk-aac")]
-fn with_7_1_layout(frame: Vec<u8>) -> Vec<u8> {
+pub(crate) fn with_7_1_layout(frame: Vec<u8>) -> Vec<u8> {
     if frame.len() < 7 {
         return frame;
     }

@@ -1979,9 +1979,11 @@ async fn handle_frame(
             is_keyframe,
             pts_known,
         },
-        DemuxedFrame::Aac { data, pts } => {
-            DemuxedFrame::Aac { pts: state.map_timestamp(timeline::Track::Audio, pts, &config.id), data }
-        }
+        DemuxedFrame::Aac { data, pts, config: aac } => DemuxedFrame::Aac {
+            pts: state.map_timestamp(timeline::Track::Audio, pts, &config.id),
+            data,
+            config: aac,
+        },
         DemuxedFrame::OtherAudio { stream_type, data, pts } => DemuxedFrame::OtherAudio {
             pts: state.map_timestamp(timeline::Track::Audio, pts, &config.id),
             stream_type,
@@ -2045,8 +2047,8 @@ async fn handle_frame(
             )
             .await;
         }
-        DemuxedFrame::Aac { data, pts } => {
-            handle_audio_frame(state, demuxer, config, &data, pts, event_sender, flow_id);
+        DemuxedFrame::Aac { data, pts, config: source } => {
+            handle_audio_frame(state, demuxer, config, &data, pts, source, event_sender, flow_id);
         }
         DemuxedFrame::Opus { .. } => {}
         DemuxedFrame::OtherAudio { stream_type, data, pts } => {
@@ -2825,12 +2827,17 @@ fn buffer_audio_frames<I: IntoIterator<Item = (Vec<u8>, u64)>>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_audio_frame(
     state: &mut CmafState,
     demuxer: &TsDemuxer,
     config: &CmafOutputConfig,
     data: &[u8],
     pts: u64,
+    // The frame's own configuration (`DemuxedFrame::Aac::config`), not the
+    // demuxer's after the chunk: the frames of the old configuration in the
+    // chunk of a change were taken for the new one's.
+    source: Option<crate::engine::aac_config::AacConfig>,
     event_sender: &EventSender,
     flow_id: &str,
 ) {
@@ -2872,7 +2879,7 @@ fn handle_audio_frame(
     // channel count (or rate) while every frame carried another, which a
     // browser's decoder refuses as a mid-stream change.
     if state.audio_seg.is_none() && state.audio_reencoder.is_none() {
-        let Some(source) = demuxer.cached_aac_specific_config() else {
+        let Some(source) = source.clone() else {
             return;
         };
         let track = AudioTrack::for_aac(&source, bitrate);
@@ -2886,7 +2893,7 @@ fn handle_audio_frame(
             config.id, sample_rate, channels,
         );
     }
-    note_passthrough_aac_change(state, demuxer, config, event_sender, flow_id);
+    note_passthrough_aac_change(state, source.as_ref(), config, event_sender, flow_id);
 
     // Phase 3: audio_encode hook — pump the source AAC frame through
     // the AudioReencoder and substitute the re-encoded frame(s).
@@ -2898,7 +2905,7 @@ fn handle_audio_frame(
         // Propagate the source's configuration from the demuxer so lazy
         // decoder construction inside AudioReencoder can succeed — a
         // PCE-signalled source's with its program_config_element.
-        if let Some(source) = demuxer.cached_aac_specific_config() {
+        if let Some(source) = source {
             reenc.set_source_config(source);
         }
         let out = match crate::timed_block_in_place!(
@@ -2955,7 +2962,7 @@ fn handle_audio_frame(
 /// It used to change silently.
 fn note_passthrough_aac_change(
     state: &mut CmafState,
-    demuxer: &TsDemuxer,
+    source: Option<&crate::engine::aac_config::AacConfig>,
     config: &CmafOutputConfig,
     event_sender: &EventSender,
     flow_id: &str,
@@ -2963,7 +2970,7 @@ fn note_passthrough_aac_change(
     let Some(track_cfg) = state.passthrough_aac.as_ref() else {
         return;
     };
-    let Some(now) = demuxer.cached_aac_specific_config() else {
+    let Some(now) = source.cloned() else {
         return;
     };
     if &now == track_cfg {

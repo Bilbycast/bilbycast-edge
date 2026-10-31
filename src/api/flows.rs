@@ -726,7 +726,9 @@ pub async fn get_config(
 /// that have `enabled: true` in the new config. This is an atomic swap of the entire
 /// configuration. A Hitless slot an earlier release accepted and validation now
 /// refuses is repaired first, as at load
-/// ([`crate::config::validation::repair_hitless_slots`]), and reported.
+/// ([`crate::config::validation::repair_hitless_slots`]), and reported; so is
+/// an AAC channel count the encoder has no mode for
+/// ([`crate::config::validation::repair_aac_channel_counts`]).
 ///
 /// # Infrastructure secrets
 ///
@@ -802,9 +804,11 @@ pub async fn replace_config(
     // for its nulls: see "Infrastructure secrets" above.
     let mut new_config =
         AppConfig::deserialize(&body).map_err(|e| ApiError::BadRequest(format!("not a valid config: {e}")))?;
-    // A whole config repairs the Hitless slots earlier releases accepted
-    // rather than being refused for them, as at load.
+    // A whole config repairs the Hitless slots and AAC channel counts
+    // earlier releases accepted rather than being refused for them, as at
+    // load.
     let repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
+    let aac_repairs = crate::config::validation::repair_aac_channel_counts(&mut new_config);
 
     // Held from here to the swap: see "Infrastructure secrets" above.
     let mut config = state.config.write().await;
@@ -814,6 +818,7 @@ pub async fn replace_config(
     validate_config(&new_config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
     validate_changed_tunnels(&config.tunnels, &new_config.tunnels)?;
     repairs.report(state.flow_manager.event_sender());
+    aac_repairs.report(state.flow_manager.event_sender());
 
     // Stop all running flows
     state.flow_manager.stop_all().await;
@@ -882,9 +887,10 @@ fn validate_changed_tunnels(
 /// currently running flows, replaces the in-memory config with the disk version,
 /// and starts all flows that have `enabled: true`. This is useful after manual
 /// edits to the config file or after deploying a new config via external tooling.
-/// Its Hitless slots are repaired as at load
-/// ([`crate::config::validation::repair_hitless_slots`]), the repair written back
-/// to the file and reported.
+/// Its Hitless slots and AAC channel counts are repaired as at load
+/// ([`crate::config::validation::repair_hitless_slots`],
+/// [`crate::config::validation::repair_aac_channel_counts`]), the repair written
+/// back to the file and reported.
 ///
 /// # Errors
 ///
@@ -902,8 +908,9 @@ pub async fn reload_config(
 
     // Repaired, and the repair written back, as at load.
     let repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
+    let aac_repairs = crate::config::validation::repair_aac_channel_counts(&mut new_config);
     validate_config(&new_config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if !repairs.is_empty()
+    if !(repairs.is_empty() && aac_repairs.is_empty())
         && let Err(e) = save_config_split_async(
             state.config_path.clone(),
             state.secrets_path.clone(),
@@ -918,6 +925,7 @@ pub async fn reload_config(
         );
     }
     repairs.report(state.flow_manager.event_sender());
+    aac_repairs.report(state.flow_manager.event_sender());
 
     // Stop all running flows
     state.flow_manager.stop_all().await;

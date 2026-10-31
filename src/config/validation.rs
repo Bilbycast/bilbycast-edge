@@ -4872,6 +4872,190 @@ pub fn repair_hitless_reorder_windows(
     repaired
 }
 
+/// One AAC channel count [`repair_aac_channel_counts`] replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairedAacChannels {
+    /// `"input"` or `"output"`.
+    pub kind: &'static str,
+    pub id: String,
+    /// `"audio_encode.channels"` or `"transcode.channels"`.
+    pub field: &'static str,
+    pub codec: String,
+    pub was: u8,
+    pub now: u8,
+}
+
+impl RepairedAacChannels {
+    fn message(&self) -> String {
+        format!(
+            "{} '{}': {} {} has no {} encoder mode, so its audio was dropped; set to {} (AAC \
+             encodes 1-6 or 8 channels, he_aac_v2 2). Set another count if that is not the one wanted.",
+            self.kind, self.id, self.field, self.was, self.codec, self.now
+        )
+    }
+}
+
+/// What [`repair_aac_channel_counts`] changed in a whole config.
+#[derive(Debug, Default)]
+pub struct AacChannelRepairs(pub Vec<RepairedAacChannels>);
+
+impl AacChannelRepairs {
+    /// Whether nothing was repaired.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Say what was repaired: a warning log line each and a Warning
+    /// `config` event scoped to the input or output, for the operator who
+    /// reads the Events page rather than the journal.
+    pub fn report(&self, events: &crate::manager::events::EventSender) {
+        use crate::manager::events::{EventSeverity, category};
+        for r in &self.0 {
+            let message = r.message();
+            tracing::warn!("{message}");
+            let details = serde_json::json!({
+                "error_code": "aac_channels_repaired",
+                "field": r.field,
+                "codec": r.codec,
+                "was": r.was,
+                "now": r.now,
+            });
+            if r.kind == "input" {
+                events.emit_input_with_details(EventSeverity::Warning, category::CONFIG, message, &r.id, details);
+            } else {
+                events.emit_output_with_details(EventSeverity::Warning, category::CONFIG, message, &r.id, details);
+            }
+        }
+    }
+}
+
+/// The channel count an AAC encoder of `codec` takes in place of
+/// `channels`, which it has no mode for ([`aac_layout_refusal`]): HE-AAC v2
+/// stereo, else 6 for 7 (the nearest below, which every receiver takes) and
+/// 8 for 9-16. `None` when the encoder takes `channels`, or for a count
+/// (0, past 16) earlier releases refused anyway.
+fn aac_layout_repair(codec: &str, channels: u8) -> Option<u8> {
+    aac_layout_refusal(codec, channels)?;
+    match (codec, channels) {
+        (_, 0) | (_, 17..) => None,
+        ("he_aac_v2", _) => Some(2),
+        (_, 7) => Some(6),
+        _ => Some(8),
+    }
+}
+
+/// Repair, in one input's or output's JSON, the AAC channel counts this
+/// release refuses and earlier ones accepted: `audio_encode.channels: 7`
+/// with `aac_lc` (the only count `audio_encode`'s own checks let through
+/// that the AAC encoder has no mode for), and a `transcode` block's
+/// `channels` beside an AAC `audio_encode` ([`aac_layout_refusal`]: 7 or
+/// 9-16 with `aac_lc` / `he_aac_v1`, anything but 2 with `he_aac_v2`). Every
+/// object of the entity that carries an `audio_encode` is looked at, with
+/// the `transcode` beside it. Returns `(field, codec, was, now)` for each.
+fn repair_aac_channels_in(value: &mut serde_json::Value, found: &mut Vec<(&'static str, String, u8, u8)>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let codec = map
+                .get("audio_encode")
+                .and_then(|a| a.get("codec"))
+                .and_then(|c| c.as_str())
+                .map(str::to_owned);
+            if let Some(codec) = codec {
+                let channels = |v: Option<&serde_json::Value>| {
+                    v.and_then(|b| b.get("channels")).and_then(|c| c.as_u64()).and_then(|c| u8::try_from(c).ok())
+                };
+                if codec == "aac_lc"
+                    && let Some(was) = channels(map.get("audio_encode"))
+                    && let Some(now) = aac_layout_repair(&codec, was)
+                    && let Some(serde_json::Value::Object(ae)) = map.get_mut("audio_encode")
+                {
+                    ae.insert("channels".into(), now.into());
+                    found.push(("audio_encode.channels", codec.clone(), was, now));
+                }
+                if let Some(was) = channels(map.get("transcode"))
+                    && let Some(now) = aac_layout_repair(&codec, was)
+                    && let Some(serde_json::Value::Object(tj)) = map.get_mut("transcode")
+                {
+                    tj.insert("channels".into(), now.into());
+                    found.push(("transcode.channels", codec, was, now));
+                }
+            }
+            for v in map.values_mut() {
+                repair_aac_channels_in(v, found);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                repair_aac_channels_in(v, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Repair the AAC channel counts [`aac_layout_refusal`] began refusing in a
+/// whole config, and say what changed.
+///
+/// Such a count used to pass validation, and the output (or the input's
+/// transcode) then carried no audio: the AAC encoder has no 6.1 mode, none
+/// past eight channels, and HE-AAC v2 takes stereo alone. Refused at load,
+/// it turned the upgrade into a node that exits at boot — every flow down,
+/// and no manager WebSocket to repair it over (an automated upgrade's boot
+/// watchdog rolls back; a manual one leaves the node dead). Like
+/// [`repair_hitless_slots`], every route that takes a whole config runs it
+/// before validating — the load, `POST /api/v1/config/reload`,
+/// `PUT /api/v1/config` and the WS `update_config`, the first two writing
+/// the repair back to `config.json` — and the count is set to one the
+/// encoder has ([`aac_layout_repair`]: 7 to 6, 9-16 to 8, HE-AAC v2 to 2),
+/// so the audio flows from then on. The edits that name an input or an
+/// output still refuse such a count: it is the operator's to fix there.
+///
+/// Each entity is repaired through its JSON, the form it is persisted in,
+/// and only an entity with something to repair is read back from it.
+pub fn repair_aac_channel_counts(config: &mut crate::config::models::AppConfig) -> AacChannelRepairs {
+    let mut repaired = Vec::new();
+    let mut note = |kind: &'static str, id: &str, found: Vec<(&'static str, String, u8, u8)>| {
+        for (field, codec, was, now) in found {
+            repaired.push(RepairedAacChannels { kind, id: id.to_owned(), field, codec, was, now });
+        }
+    };
+    for input in &mut config.inputs {
+        let Ok(mut v) = serde_json::to_value(&input.config) else {
+            continue;
+        };
+        let mut found = Vec::new();
+        repair_aac_channels_in(&mut v, &mut found);
+        if found.is_empty() {
+            continue;
+        }
+        match serde_json::from_value(v) {
+            Ok(c) => {
+                input.config = c;
+                note("input", &input.id, found);
+            }
+            Err(e) => tracing::warn!("input '{}': could not repair its AAC channel count: {e}", input.id),
+        }
+    }
+    for output in &mut config.outputs {
+        let Ok(mut v) = serde_json::to_value(&*output) else {
+            continue;
+        };
+        let mut found = Vec::new();
+        repair_aac_channels_in(&mut v, &mut found);
+        if found.is_empty() {
+            continue;
+        }
+        match serde_json::from_value(v) {
+            Ok(c) => {
+                *output = c;
+                note("output", output.id(), found);
+            }
+            Err(e) => tracing::warn!("output '{}': could not repair its AAC channel count: {e}", output.id()),
+        }
+    }
+    AacChannelRepairs(repaired)
+}
+
 /// The Cargo feature a codec name needs, when this build lacks it.
 ///
 /// Extracted alongside [`validate_encoder_codec_name`] so the mosaic gets the
@@ -11191,6 +11375,89 @@ mod tests {
         assert_eq!(details["repaired_to"], "primary_preference");
         assert_eq!((details["leg"].as_str(), details["input_id"].as_str()), (Some("backup"), Some("in-b")));
         assert!(repair_hitless_slots(&mut config).is_empty(), "nothing left to repair");
+    }
+
+    /// An AAC channel count the encoder has no mode for — `audio_encode`'s
+    /// 7 with `aac_lc`, a `transcode` block's 7 or 9-16 beside AAC, or other
+    /// than 2 beside HE-AAC v2 — passed validation before this release,
+    /// whose refusal of it at load took the whole node down at boot (every
+    /// flow off, no manager link to fix it over). Every route that takes a
+    /// whole config repairs it instead, on inputs and outputs alike, to a
+    /// count the encoder has (7 to 6, 9-16 to 8, HE-AAC v2 to 2), and reports
+    /// each as a Warning `config` event naming the entity; counts the
+    /// encoder takes are left alone, and a repaired config validates.
+    #[test]
+    fn a_whole_config_has_its_aac_channel_counts_repaired_and_reported() {
+        use serde_json::json;
+        let mut config = AppConfig {
+            inputs: vec![
+                serde_json::from_value(json!({
+                    "id": "in-srt", "name": "in-srt", "type": "srt", "mode": "listener",
+                    "local_addr": "127.0.0.1:9000",
+                    "audio_encode": { "codec": "he_aac_v1" }, "transcode": { "channels": 7 }
+                }))
+                .unwrap(),
+                serde_json::from_value(json!({
+                    "id": "in-ok", "name": "in-ok", "type": "udp", "bind_addr": "127.0.0.1:41880",
+                    "audio_encode": { "codec": "aac_lc", "channels": 8 }, "transcode": { "channels": 6 }
+                }))
+                .unwrap(),
+            ],
+            outputs: vec![
+                serde_json::from_value(json!({
+                    "type": "udp", "id": "o-seven", "name": "o", "dest_addr": "239.0.0.1:5000",
+                    "audio_encode": { "codec": "aac_lc", "channels": 7 }
+                }))
+                .unwrap(),
+                serde_json::from_value(json!({
+                    "type": "udp", "id": "o-nine", "name": "o", "dest_addr": "239.0.0.1:5002",
+                    "audio_encode": { "codec": "aac_lc" }, "transcode": { "channels": 9 }
+                }))
+                .unwrap(),
+                serde_json::from_value(json!({
+                    "type": "rtmp", "id": "o-ps", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+                    "audio_encode": { "codec": "he_aac_v2" }, "transcode": { "channels": 1 }
+                }))
+                .unwrap(),
+                serde_json::from_value(json!({
+                    "type": "udp", "id": "o-ac3", "name": "o", "dest_addr": "239.0.0.1:5004",
+                    "audio_encode": { "codec": "ac3" }, "transcode": { "channels": 7 }
+                }))
+                .unwrap(),
+            ],
+            ..Default::default()
+        };
+        assert!(validate_config(&config).is_err(), "refused as it stands");
+        let untouched = (config.inputs[1].clone(), config.outputs[3].clone());
+        let repairs = repair_aac_channel_counts(&mut config);
+        validate_config(&config).expect("a repaired config validates");
+        let got: Vec<_> =
+            repairs.0.iter().map(|r| (r.kind, r.id.as_str(), r.field, r.codec.as_str(), r.was, r.now)).collect();
+        assert_eq!(
+            got,
+            [
+                ("input", "in-srt", "transcode.channels", "he_aac_v1", 7, 6),
+                ("output", "o-seven", "audio_encode.channels", "aac_lc", 7, 6),
+                ("output", "o-nine", "transcode.channels", "aac_lc", 9, 8),
+                ("output", "o-ps", "transcode.channels", "he_aac_v2", 1, 2),
+            ]
+        );
+        assert_eq!((config.inputs[1].clone(), config.outputs[3].clone()), untouched, "counts the encoder takes");
+        let json = serde_json::to_value(&config.outputs[0]).unwrap();
+        assert_eq!(json["audio_encode"]["channels"], 6);
+        assert_eq!(json["dest_addr"], "239.0.0.1:5000", "the rest of the output as it was");
+
+        let (sender, mut events) = crate::manager::events::event_channel();
+        repairs.report(&sender);
+        let reported: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(reported.len(), 4, "one event per repair");
+        assert_eq!(reported[0].input_id.as_deref(), Some("in-srt"));
+        assert_eq!(reported[1].output_id.as_deref(), Some("o-seven"));
+        for e in &reported {
+            assert_eq!((e.severity, e.category.as_str()), (crate::manager::events::EventSeverity::Warning, "config"));
+            assert_eq!(e.details.as_ref().unwrap()["error_code"], "aac_channels_repaired");
+        }
+        assert!(repair_aac_channel_counts(&mut config).is_empty(), "nothing left to repair");
     }
 
     /// An input id that takes the Hitless mergers' key prefix is refused a

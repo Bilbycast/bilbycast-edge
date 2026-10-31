@@ -191,6 +191,15 @@ pub enum DemuxedFrame {
         /// it is the first AU that commences in that PES, else where the
         /// samples before it end.
         pts: u64,
+        /// The stream's configuration as of this frame: its own ADTS
+        /// header's, with the PCE the stream last carried for channel
+        /// configuration 0 — what [`TsDemuxer::cached_aac_specific_config`]
+        /// said when it was cut, `None` while such a stream's layout is
+        /// pending. Read from the demuxer after a whole chunk was demuxed,
+        /// the cache had already moved to the newest frame's, so the frames
+        /// of the old configuration in the chunk of a change (a feed switch)
+        /// were sent, or decoded, under the new one.
+        config: Option<crate::engine::aac_config::AacConfig>,
     },
     /// Non-AAC compressed audio frame (MP2 / AC-3 / E-AC-3 / AC-4) —
     /// payload is the elementary stream the FFmpeg audio decoder consumes
@@ -400,6 +409,20 @@ fn pes_assembler_cap(stream_type: u8) -> usize {
         // MPEG-1/2 video, MPEG-4 part 2, H.264, HEVC, VVC, AVS2/AVS3, VC-1.
         0x01 | 0x02 | 0x10 | 0x1B | 0x24 | 0x33 | 0x42 | 0xD1 | 0xEA => PES_ASSEMBLER_CAP_VIDEO,
         _ => PES_ASSEMBLER_CAP_OTHER,
+    }
+}
+
+/// The configuration an ADTS header `(profile, sampling_frequency_index,
+/// channel_configuration)` names, with `pce` for channel configuration 0 —
+/// `None` for that without one, which no decoder opens.
+fn aac_config_of(
+    (profile, sr_idx, ch_cfg): (u8, u8, u8),
+    pce: Option<&crate::engine::aac_config::ProgramConfig>,
+) -> Option<crate::engine::aac_config::AacConfig> {
+    use crate::engine::aac_config::AacConfig;
+    match pce {
+        Some(pce) if ch_cfg == 0 => Some(AacConfig::with_pce(profile, sr_idx, pce.clone())),
+        _ => AacConfig::new(profile, sr_idx, ch_cfg),
     }
 }
 
@@ -719,12 +742,7 @@ impl TsDemuxer {
     /// until a frame has opened with its PCE: a header without it is one no
     /// decoder opens.
     pub fn cached_aac_specific_config(&self) -> Option<crate::engine::aac_config::AacConfig> {
-        use crate::engine::aac_config::AacConfig;
-        let (profile, sr_idx, ch_cfg) = self.cached_aac_config?;
-        match &self.cached_aac_pce {
-            Some(pce) if ch_cfg == 0 => Some(AacConfig::with_pce(profile, sr_idx, pce.clone())),
-            _ => AacConfig::new(profile, sr_idx, ch_cfg),
-        }
+        aac_config_of(self.cached_aac_config?, self.cached_aac_pce.as_ref())
     }
 
     /// The Opus `channel_config_code` the PMT signals for the selected
@@ -1235,7 +1253,16 @@ impl TsDemuxer {
                 // `cached_aac_config` is intentionally kept across codec
                 // changes — every ADTS header refreshes it, and the export
                 // path needs the AAC config to remain available for the
-                // frames it captured before the switch.
+                // frames it captured before the switch. The layout a PCE
+                // gave the old track is not: a header alone does not clear
+                // it (only a change of profile, rate or channel
+                // configuration does), so a new track signalling its layout
+                // the same way — channel configuration 0 at the old track's
+                // profile and rate — ran on the old track's PCE until its
+                // own first one, a stale sequence header on RTMP passthrough
+                // and a decoder of the wrong layout on a re-encode, where the
+                // wait for it (`aac_layout_pending`) should hold them back.
+                self.cached_aac_pce = None;
             }
         } else if let Some(old) = self.audio_pid.take() {
             // The program no longer carries audio this demuxer surfaces: let
@@ -1247,13 +1274,18 @@ impl TsDemuxer {
             // video, whose assembler took its place in the map above.
             // `cached_aac_config` is kept for the export path, as on a codec
             // change: no `Aac` frame leaves before its own ADTS header has
-            // refreshed it, so a returning track never runs on the old one.
+            // refreshed it. Its PCE goes, as on a track change: a returning
+            // track's header can equal the old one's (channel
+            // configuration 0, same profile and rate) and leave it in place,
+            // so the new track ran on the old track's layout until its own
+            // first PCE.
             tracing::info!(
                 "TS demux: audio PID 0x{:04X} is gone from the PMT; no audio track selected",
                 old
             );
             self.audio_au = None;
             self.opus_channel_config = None;
+            self.cached_aac_pce = None;
             if Some(old) != self.video_pid {
                 self.pes_assemblers.remove(&old);
             }
@@ -1327,7 +1359,8 @@ impl TsDemuxer {
                 {
                     self.cached_aac_pce = Some(pce);
                 }
-                out.push(DemuxedFrame::Aac { data: raw.to_vec(), pts });
+                let config = aac_config_of(cfg, self.cached_aac_pce.as_ref());
+                out.push(DemuxedFrame::Aac { data: raw.to_vec(), pts, config });
             } else {
                 if au.pes_start {
                     out.extend(a.take_group());
@@ -2441,7 +2474,7 @@ mod tests {
         ts.chunks(TS_PACKET_SIZE)
             .flat_map(|p| demux.demux(p))
             .filter_map(|f| match f {
-                DemuxedFrame::Aac { data, pts } => Some((pts, data)),
+                DemuxedFrame::Aac { data, pts, .. } => Some((pts, data)),
                 _ => None,
             })
             .collect()
@@ -2648,6 +2681,75 @@ mod tests {
         }
     }
 
+    /// A PCE-signalled track that leaves the PMT, or is replaced by one on
+    /// another PID, takes its layout with it: the next track, signalled the
+    /// same way at the same profile and rate, waits for a PCE of its own —
+    /// `aac_layout_pending`, and no configuration to build a header or a
+    /// decoder from — however alike its headers are. The old track's PCE
+    /// survived both (it was cleared only when the header's profile, rate
+    /// or channel configuration changed), so RTMP passthrough sent a
+    /// sequence header with the old layout and a re-encode decoded the new
+    /// track with it until the new track's first PCE.
+    #[test]
+    fn a_new_pce_signalled_track_waits_for_its_own_layout() {
+        use crate::engine::ts_test_fixtures::{pce_signalled_adts, pes_packets, sine_aac_lc_frames};
+        const P0: u64 = 900_000;
+        let sine = sine_aac_lc_frames();
+        let with_pce = pce_signalled_adts(&sine[..3], 0, 1);
+        let without = pce_signalled_adts(&sine[..3], 3, 1);
+        let state = |demux: &TsDemuxer| (demux.aac_layout_pending(), demux.cached_aac_specific_config().is_some());
+        for moved in [false, true] {
+            let mut demux = TsDemuxer::new(None);
+            let mut cc = 0;
+            let mut ts = build_pat(0x100).to_vec();
+            ts.extend(pmt_packets(0, &[(0x1B, 0x200), (0x0F, 0x300)]));
+            ts.extend(audio_pes_packets(&with_pce, P0, &mut cc));
+            assert_eq!(aac_frames(&mut demux, &ts).len(), 3);
+            assert_eq!(state(&demux), (None, true), "moved {moved}: the first track's layout");
+            let (pid, back) = if moved {
+                // Straight onto another PID.
+                (0x301, pmt_packets(1, &[(0x1B, 0x200), (0x0F, 0x301)]))
+            } else {
+                // Gone from the PMT, then back.
+                assert!(aac_frames(&mut demux, &pmt_packets(1, &[(0x1B, 0x200)])).is_empty());
+                (0x300, pmt_packets(2, &[(0x1B, 0x200), (0x0F, 0x300)]))
+            };
+            let mut back = back;
+            let mut cc2 = 0;
+            back.extend(pes_packets(pid, 0xC0, &without, P0 + 6 * 1920, &mut cc2));
+            assert_eq!(aac_frames(&mut demux, &back).len(), 3, "moved {moved}");
+            assert_eq!(demux.cached_aac_config(), Some((1, 3, 0)), "moved {moved}: the same header");
+            assert_eq!(state(&demux), (Some(3), false), "moved {moved}: the new track's layout is not known yet");
+        }
+    }
+
+    /// Each `Aac` frame carries the configuration its own header names,
+    /// however many frames one `demux` call hands out: across a switch from
+    /// 48 kHz to 44.1 kHz in one chunk, the frames before it say 48 kHz,
+    /// though the demuxer's cache already says 44.1 when the call returns —
+    /// which is what a consumer reading the cache after the chunk took for
+    /// all of them.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn each_aac_frame_carries_its_own_configuration() {
+        use crate::engine::ts_test_fixtures::{aac_program_ts_timed, rate_switch_frames};
+        let (frames, first) = rate_switch_frames(10);
+        let refs: Vec<(u64, &[u8])> = frames.iter().map(|(pts, f)| (*pts, f.as_slice())).collect();
+        let mut demux = TsDemuxer::new(None);
+        let out = demux.demux(&aac_program_ts_timed(&refs));
+        let rates: Vec<u8> = out
+            .iter()
+            .filter_map(|f| match f {
+                DemuxedFrame::Aac { config, .. } => Some(config.as_ref().expect("a configuration").sr_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rates.len(), frames.len());
+        assert!(rates[..first].iter().all(|&r| r == 3), "48 kHz before the switch: {rates:?}");
+        assert!(rates[first..].iter().all(|&r| r == 4), "44.1 kHz after it: {rates:?}");
+        assert_eq!(demux.cached_aac_config().map(|c| c.1), Some(4), "the cache is the newest frame's");
+    }
+
     #[test]
     fn an_adts_frame_straddling_two_pes_is_demuxed_with_the_rest() {
         const P0: u64 = 900_000;
@@ -2667,7 +2769,7 @@ mod tests {
             .chunks(TS_PACKET_SIZE)
             .flat_map(|p| demux.demux(p))
             .filter_map(|f| match f {
-                DemuxedFrame::Aac { data, pts } => Some((data, pts)),
+                DemuxedFrame::Aac { data, pts, .. } => Some((data, pts)),
                 _ => None,
             })
             .collect();

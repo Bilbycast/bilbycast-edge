@@ -1816,7 +1816,7 @@ async fn whep_viewer_loop(
                                         output_id,
                                     ).await;
                                 }
-                                super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts } => {
+                                super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts, config: source } => {
                                     if matches!(encoder_state, WebrtcEncoderState::Lazy) {
                                         encoder_state = build_webrtc_encoder_state(
                                             audio_encode.as_ref(),
@@ -1849,7 +1849,11 @@ async fn whep_viewer_loop(
                                         Some(audio_pt),
                                     ) = (&mut encoder_state, audio_mid, audio_pt)
                                     {
-                                        if let Some(source) = demuxer.cached_aac_specific_config()
+                                        // The frame's own configuration, not the
+                                        // demuxer's after the chunk: a frame of the
+                                        // old one in the chunk of a change went to a
+                                        // decoder built for the new.
+                                        if let Some(source) = source
                                             && decoder.as_ref().is_none_or(|d| d.config() != &source)
                                         {
                                             *decoder = None;
@@ -2515,7 +2519,7 @@ async fn whip_client_loop(
                                             &config.id,
                                         ).await;
                                     }
-                                    super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts } => {
+                                    super::webrtc::ts_demux::DemuxedFrame::Aac { data, pts, config: source } => {
                                         if matches!(encoder_state, WebrtcEncoderState::Lazy) {
                                             encoder_state = build_webrtc_encoder_state(
                                                 audio_encode.as_ref(),
@@ -2548,7 +2552,9 @@ async fn whip_client_loop(
                                             Some(audio_pt),
                                         ) = (&mut encoder_state, audio_mid, audio_pt)
                                         {
-                                            if let Some(source) = demuxer.cached_aac_specific_config()
+                                            // The frame's own configuration (see the
+                                            // viewer loop).
+                                            if let Some(source) = source
                                                 && decoder.as_ref().is_none_or(|d| d.config() != &source)
                                             {
                                                 *decoder = None;
@@ -3873,7 +3879,7 @@ mod needs_encode_tests {
         assert_eq!(label(&other(0x81), true, true), None);
         assert_eq!(label(&other(0x81), false, false), None);
         // AAC whose profile the demuxer has not read: not claimed.
-        let aac = DemuxedFrame::Aac { data: Vec::new(), pts: 0 };
+        let aac = DemuxedFrame::Aac { data: Vec::new(), pts: 0, config: None };
         assert_eq!(label(&aac, false, true), None);
         // Opus passes through: nothing for `audio_encode` to do.
         let opus = DemuxedFrame::Opus { data: Vec::new(), pts: 0, pts_known: true };

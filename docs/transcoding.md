@@ -537,10 +537,22 @@ real frame whose rate or channel count differs — a 44.1 kHz source
 through a 48 kHz encoder used to run 8.8 % slow. A rebuild for another
 source rate (an eager encoder meeting its first source, or a source
 changing rate mid-stream) first runs the retired encoder out on its own
-timeline, as a re-anchor does, and the new encoder's priming frames
-that would overlap that run-out are not sent; the retired encoder was
-dropped with the end of the audio before the change in it, a hole the
-new encoder's priming filled. On RTMP (since
+timeline, as a re-anchor does; the retired encoder was dropped with the
+end of the audio before the change in it, a hole the new encoder's
+priming filled. The new encoder's priming frames overlap that run-out
+and are not sent, but for the last: the MDCT overlap-add partner of its
+first frame carrying the new audio, which decodes garbled after any other
+frame, and decodes to silence after the run-out. It goes out one step
+(12 ticks) before that frame. When that frame starts no later than the
+run-out's last frame (the retired encoder held fewer samples than the new
+resampler's delay, ~34 at 44.1 to 48 kHz), that last frame is dropped,
+with the few samples of the old audio it carries (`encode::Splice`). The
+first version dropped every new frame at or before the run-out's last
+stamp, the partner included, so the new audio's first ~21 ms decoded
+garbled, or, in that case, were dropped. A player that plays every
+decoded frame back to back, ignoring the sample durations, hears that
+partner as up to a frame of silence at the change (with the run-out's
+own zero tail, which it already heard). On RTMP (since
 edge#211) the measure is the connection's FLV timeline, the encoder's
 channel / rate stage converts the source instead of a rebuild, and three
 things differ from CMAF. A tick lays at most a second of silence, off
@@ -682,19 +694,39 @@ has for them (ISO/IEC 14496-3 §4.4.1.1). Shared code:
   replacer, HLS, CMAF and RTMP — told its receivers 4.0 over five channel
   elements. Each 7.1 frame now says channel configuration 0 and opens with
   the PCE fdk itself writes for that mode (centre, front pair, surround pair,
-  rear pair, LFE: `pce_7_1_back`), nine bytes a frame; CMAF and RTMP carry
+  rear pair, LFE: `pce_7_1_back`), nine bytes a frame
+  (`audio_encode::with_7_1_layout`, applied in the shared `AudioEncoder` and
+  in the TS audio replacer's own frame loop, which owns its encoder and
+  missed it until the release that brought 7.1 sources in at eight
+  channels); CMAF and RTMP carry
   that PCE in the AudioSpecificConfig, as their sample entry and sequence
   header need. ffmpeg decodes it as 7.1 with each input channel (WAV order:
   FL FR FC LFE BL BR SL SR) on its own output channel. `audio_encode.channels`
   (or a `transcode` block's) of 7 is refused for AAC: fdk-aac has no 6.1
-  mode, and the count used to pass validation and fail at the first frame.
-- **7.1 sources.** The edge's AAC decoders (the re-encoding outputs', the TS
-  audio replacer's, the display's, the meters') hand out every channel a 7.1
-  stream carries. fdk-aac mixes anything wider than six channels down to 5.1
-  by default, which no decoder here changed, so a 7.1 AAC source decoded as
-  six channels while `AacDecoder::channels()` said eight until the first
-  frame. The channel stage converts the eight to what each output carries,
-  as it does for E-AC-3 7.1.
+  mode, and the count used to pass validation and fail at the first frame
+  (a `transcode` block's 9-16, or other than 2 beside `he_aac_v2`, too).
+  That refusal is for the edits that name an input or output; a whole
+  config already holding such a count — the load, the reload,
+  `PUT /api/v1/config`, a manager `update_config` — is repaired to 6
+  (from 7), 8 (from 9-16) or 2 (HE-AAC v2) and a Warning `config` event
+  (`aac_channels_repaired`) names it, since refusing it at load would stop
+  the node (`config::validation::repair_aac_channel_counts`).
+- **7.1 sources.** The edge's AAC decoders (the re-encoding outputs' — RTMP,
+  CMAF, WebRTC and HLS — the TS audio replacer's, the display's, the
+  meters') hand out every channel a 7.1 stream carries. fdk-aac mixes
+  anything wider than six channels down to 5.1 by default, which no decoder
+  here changed, so a 7.1 AAC source decoded as six channels while
+  `AacDecoder::channels()` said eight until the first frame. The channel
+  stage converts the eight to what each output carries, as it does for
+  E-AC-3 7.1: to `channels` or the `transcode` block's when set; with
+  neither, an AAC target keeps 7.1 (and says so, above), while a target
+  whose codec takes fewer channels is mixed down to its most
+  (`AudioCodec::channel_cap`, `audio_transcode::capped_channels`): AC-3 to
+  5.1, the second surround pair folded into the first at −3 dB, MP2 to
+  stereo by BS.775 (TS outputs and HLS; WebRTC's Opus already mixed down to
+  stereo). Opened at eight, those encoders refused, and the audio was
+  dropped — which a 7.1 AAC source would otherwise have newly hit, having
+  arrived as 5.1 before.
 - **PCE-signalled sources** (channel configuration 0 — ISDB-T 1seg, e.g.
   NHK's HE-AAC at a 24 kHz core with two single channel elements). The
   layout is in a PCE that only some frames open with (on NHK about one in
@@ -886,7 +918,10 @@ the sample:
     decoder, the stage and the encoder still hold when that PES arrives
     (AAC-LC's delay line alone is 2048 samples) is audio from before the
     step and keeps the old stamps. Up to 0.116.0 the step went on the next
-    frame out, presenting that audio late by the whole step;
+    frame out, presenting that audio late by the whole step. (Those frames
+    leave only when the audio after the step arrives; where the file's
+    audio paused before it with the PCR running on, they are behind the
+    program clock and are dropped — see below the re-anchor);
   - an **overlap**, by the same rules: that much audio dropped from the
     head of what follows (the count of placed content may go below the
     anchor: a PES stamped 150 ms behind one AU after an anchor drops
@@ -897,7 +932,22 @@ the sample:
     silence, which is not counted in `silence_inserted_samples` (until
     0.116.0 it went out just ahead of the new PTS, on the new timeline;
     after a step back of over 1 s the PCR stage drops it as the previous
-    epoch's). A source
+    epoch's). **Held audio the program clock has passed is dropped.** That
+    run-out, and the frames a relabel step leaves on the old timeline, go
+    out only when the audio after the seam arrives. When the source's audio
+    paused while its PCR ran on (a pause of more than 500 ms within the
+    clock fill's 2 s warm-up, one longer than the fill's 500 ms cap after
+    it, a `media_player` file whose audio ends before its picture), that is
+    about the pause behind the PCR. Sent, such a frame reached the chain's
+    PCR stage that late and raised `D` by as much for the life of the flow,
+    with a PCR discontinuity and a `transcode_pcr_late` Warning (a 2 s
+    pause after the warm-up: `D` 80 ms to about 1.45 s). A held frame more
+    than 20 ms further behind the program's last PCR than any other frame
+    the replacer has sent is now dropped instead (`ClockFill::keep_frame`;
+    `D` already covers the others, being never less than a frame's lateness
+    plus 40 ms), with an info log line naming the seam and the count. The
+    cost is the last up to ~65 ms of audio before such a pause, which on
+    its old timeline could only be late. A source
     that resets its clock back (an encoder restart, an ffmpeg
     `-stream_loop` wrap) takes its PCR and its video back with it, and the
     transcode chain's PCR stage drops re-encoded PES left on the old
@@ -1222,7 +1272,15 @@ CMAF): the stage between the decoder and the encoder is
     centre (the dialogue) dropped — on CMAF a regression from its own
     average-to-mono, since CMAF shares this rule; 3.0 / 5.0 → stereo
     dropped the centre the same way;
+  - **7.1 → 5.1**: the fronts, centre and LFE as they are, the first
+    surround pair at unity with the second folded into it at −3 dB, left
+    into left (it kept the first six channels and dropped the second pair);
   - otherwise the channels in order with silence for any missing.
+
+  With no channel count at all, a source wider than the target codec takes
+  is converted to its most, by the same rule: AC-3 5.1, MP2 stereo (TS
+  outputs and HLS; `AudioCodec::channel_cap`). AAC takes 7.1, so an AAC
+  target keeps an eight-channel source's layout.
 
   They used to be bare encoder parameters: the TS replacer and
   HLS opened the encoder at the new rate and fed
