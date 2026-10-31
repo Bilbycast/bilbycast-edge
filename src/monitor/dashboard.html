@@ -812,9 +812,9 @@ function renderBufferedHitless(s) {
     <div class="sub-card" style="margin-top:6px">
       <div class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">Buffered hitless</div>
       <div class="row">
-        <span><b>Buffer</b> ${s.buffer_ms||0} ms</span>
-        <span><b>Forwarded</b> ${fmtNum(s.packets_forwarded||0)}</span>
-        <span><b>Dup dropped</b> ${fmtNum(s.packets_dropped_duplicate||0)}</span>
+        <span><b>Buffer</b> ${s.max_path_diff_ms||0} ms</span>
+        <span><b>Forwarded</b> ${fmtNum(s.packets_emitted||0)}</span>
+        <span><b>Dup dropped</b> ${fmtNum(s.dups_dropped||0)}</span>
       </div>
     </div>`;
 }

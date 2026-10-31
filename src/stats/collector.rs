@@ -4205,7 +4205,7 @@ impl SrtInputStats {
 
 /// An input's buffered 2022-7 merger stats, published on its flow's stats
 /// under the input's id while this is held, and withdrawn when it drops: a
-/// receive loop holds it for as long as it runs, so an input stopped,
+/// receive loop holds it while its merger runs, so an input stopped,
 /// removed or swapped in place for one without the merger takes its card
 /// with it. A successor published under the same id first keeps its own.
 pub struct BufferedHitlessPublication {
@@ -4269,13 +4269,13 @@ pub struct FlowStatsAccumulator {
     /// start" alongside the recent-events panel.
     pub source_discontinuities: AtomicU64,
     /// The stats of each input's buffered SMPTE 2022-7 merger, keyed by
-    /// `input_id`: an RTP or SRT 2022-7 input with `path_differential_ms`
-    /// publishes its merger's for as long as its receive loop runs
-    /// ([`BufferedHitlessPublication`]). The snapshot reads the **active**
-    /// input's through an `active_key` lookup, as it does
-    /// `ingress_dejitter_stats`: one flow-wide slot showed a passive input's
-    /// merger under whichever input was active, and kept a removed input's
-    /// last values for the life of the flow.
+    /// `input_id`: an RTP 2022-7 input with `path_differential_ms` publishes
+    /// its merger's for as long as its receive loop runs, an SRT one while
+    /// its legs carry RTP ([`BufferedHitlessPublication`]). The snapshot
+    /// reads an input's that is on air ([`Self::on_air_buffered_hitless`]):
+    /// one flow-wide slot showed a passive input's merger under whichever
+    /// input was active, and kept a removed input's last values for the life
+    /// of the flow.
     pub buffered_hitless_stats:
         DashMap<String, Arc<crate::redundancy::merger::BufferedHitlessStats>>,
     /// Ingress de-jitter telemetry, keyed by `input_id` (one entry per
@@ -5015,6 +5015,25 @@ impl FlowStatsAccumulator {
         self.srt_input_stats.remove(input_id);
     }
 
+    /// The buffered 2022-7 merger the input snapshot shows: the active
+    /// input's (`active_key`), or on an assembled flow, which plays from
+    /// several inputs at once and leaves the active input unused, that of the
+    /// first input in id order that it plays from ([`OnAirInputs`]). Never
+    /// the merger of an input off air.
+    fn on_air_buffered_hitless(
+        &self,
+        active_key: &str,
+    ) -> Option<crate::stats::models::BufferedHitlessSnapshot> {
+        if self.on_air.assembled.load().is_none() {
+            return self.buffered_hitless_stats.get(active_key).map(|h| h.snapshot());
+        }
+        self.buffered_hitless_stats
+            .iter()
+            .filter(|e| self.on_air.contains(e.key()))
+            .min_by(|a, b| a.key().cmp(b.key()))
+            .map(|e| e.value().snapshot())
+    }
+
     /// Latency and RTT of the SRT input that dropped the most while on air,
     /// for the `srt_recv_dropped` reason's hint: the link the flow's drops
     /// came from, whether or not it is still on air.
@@ -5659,10 +5678,7 @@ impl FlowStatsAccumulator {
                         .map(bond_handle_to_leg_stats),
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
                     source_discontinuities: self.source_discontinuities.load(Ordering::Relaxed),
-                    buffered_hitless: self
-                        .buffered_hitless_stats
-                        .get(active_key)
-                        .map(|h| h.snapshot()),
+                    buffered_hitless: self.on_air_buffered_hitless(active_key),
                     ingress_dejitter_shed: self
                         .ingress_dejitter_stats
                         .get(active_key)
@@ -7184,6 +7200,31 @@ mod buffered_hitless_publication_tests {
 
         drop(published);
         assert!(flow.snapshot().input.buffered_hitless.is_none(), "gone with its loop");
+    }
+
+    /// A PID-bus assembled flow leaves its active input unused and plays from
+    /// its slots' inputs at once: the snapshot shows the merger of an input
+    /// it plays from, never one it does not, and none once it plays from no
+    /// input with one.
+    #[test]
+    fn an_assembled_flow_shows_the_merger_of_an_input_it_plays_from() {
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "rtp".into()));
+        let _off = BufferedHitlessPublication::new(&flow, "a-spare", merger(100).stats_handle());
+        let _on = BufferedHitlessPublication::new(&flow, "b-slot", merger(300).stats_handle());
+        flow.on_air.set_assembled(AssembledOnAir {
+            inputs: BTreeSet::from(["b-slot".to_string(), "c-audio".to_string()]),
+            hitless: Vec::new(),
+        });
+        let snap = flow.snapshot().input.buffered_hitless.expect("the slot input's merger");
+        assert_eq!(snap.max_path_diff_ms, 300);
+
+        // The flow's active input does not decide what an assembly plays.
+        flow.set_active_input_id("a-spare");
+        flow.on_air.set_assembled(AssembledOnAir {
+            inputs: BTreeSet::from(["c-audio".to_string()]),
+            hitless: Vec::new(),
+        });
+        assert!(flow.snapshot().input.buffered_hitless.is_none(), "a-spare is not played from");
     }
 
     /// An input swapped in place publishes before the old loop has wound
