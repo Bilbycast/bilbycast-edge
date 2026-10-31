@@ -2621,9 +2621,13 @@ pub struct BufferedHitlessSnapshot {
     /// out as a hole (counted in `gap_lost` too), or a copy of a packet the
     /// hold dropped — real loss, from a hold shorter than the legs' skew or
     /// a latency spike past it. Also a copy further back than the merger
-    /// remembers releases (see `max_observed_path_diff_us`), whose twin it
-    /// can no longer find. Until 2026-10-31 it counted `late_duplicates`
-    /// as well.
+    /// remembers releases (2048 seqs, or its window when longer; see
+    /// `max_observed_path_diff_us`), whose twin it can no longer find —
+    /// usually a harmless duplicate of a packet the other leg delivered long
+    /// before, so on a pair whose later leg lags that far (about 0.85 s at
+    /// 2400 packets a second) every one of its copies counts here though
+    /// nothing is lost: `gap_lost` is what the output missed. Until
+    /// 2026-10-31 it counted `late_duplicates` as well.
     pub late_dropped: u64,
     /// Copies that arrived after the hold had already released their twin:
     /// harmless — nothing is lost — but the later leg reaches the merger

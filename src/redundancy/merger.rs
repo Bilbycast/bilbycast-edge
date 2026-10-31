@@ -1900,7 +1900,10 @@ pub struct BufferedHitlessStats {
     /// hold never released: a gap fill too late for its seq, which went out
     /// as a hole, or a copy of a packet the hold dropped — loss either way.
     /// Also a copy too far behind for the merger to remember whether its
-    /// twin went out ([`BufferedHitlessMerger::released`]).
+    /// twin went out ([`BufferedHitlessMerger::released`], [`RELEASED_SEQS`]
+    /// or the window), which is usually a harmless duplicate: on a pair
+    /// whose later leg lags that far, every one of its copies counts here
+    /// though the output loses nothing. `gap_lost` is the output's loss.
     pub late_dropped: AtomicU64,
     /// Copies that came after the hold had released their twin: harmless,
     /// nothing is lost, but the leg reaches the merger later than the hold
