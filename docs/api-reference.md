@@ -442,7 +442,7 @@ Create a new flow. The flow is validated, persisted to the config file, and (if 
 
 **Request body:**
 
-A `FlowConfig` JSON object. The flow references **already-existing** top-level inputs and outputs by ID via `input_ids` / `output_ids` — create those first with `POST /api/v1/inputs` and `POST /api/v1/outputs`. Dangling references are rejected at create time. An enabled flow naming an input another enabled flow already holds is refused 400 ("input '…' is already assigned to another flow ('…')", as a whole config is), on this route and on `PUT /api/v1/flows/{flow_id}`, before anything starts or is saved; until 2026-10-31 both saved it, and the next load refused the config.
+A `FlowConfig` JSON object. The flow references **already-existing** top-level inputs and outputs by ID via `input_ids` / `output_ids` — create those first with `POST /api/v1/inputs` and `POST /api/v1/outputs`. Dangling references are rejected at create time. An enabled flow naming an input another enabled or running flow already holds is refused 400 ("input '…' is already assigned to another flow ('…')", as a whole config is), on this route and on `PUT /api/v1/flows/{flow_id}`, before anything starts or is saved; until 2026-10-31 both saved it, and the next load refused the config. A flow running while saved disabled (one `POST /api/v1/flows/{flow_id}/start` or the WS `create_flow` started) holds its inputs too.
 
 ```json
 {
@@ -571,7 +571,7 @@ curl -X DELETE http://localhost:8080/api/v1/flows/old-flow \
 
 ### POST /api/v1/flows/{flow_id}/start
 
-Start a stopped flow. Reads the flow configuration and starts it in the engine.
+Start a stopped flow. Reads the flow configuration and starts it in the engine, whatever its `enabled` says (the flow stays saved as it was). It is judged as running, so it is refused while another enabled or running flow holds one of its inputs; until 2026-10-31 nothing was checked and a second runtime of the input started.
 
 **Auth:** Requires `admin` role.
 
@@ -594,6 +594,7 @@ Start a stopped flow. Reads the flow configuration and starts it in the engine.
 
 | Status | Condition |
 |--------|-----------|
+| 400 | Another enabled or running flow holds one of its inputs ("input '…' is already assigned to another flow ('…')") |
 | 404 | Flow not found in configuration |
 | 409 | Flow is already running |
 | 500 | Engine failed to start the flow |

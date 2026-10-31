@@ -4548,49 +4548,58 @@ pub(crate) fn validate_flow_hitless_legs(
 
 /// Refuse to hot-add input `input_id` to flow `flow_id` (`add_input`) while
 /// another flow holds it: the assignment uniqueness [`validate_config`]
-/// enforces, judged the same way — only between enabled flows, since a
-/// disabled flow spawns no input — and with its message. Unrefused, the
-/// input was saved in both flows' `input_ids`, and the config failed
-/// validation at the next load.
+/// enforces, with its message, judged between the flows that run an input —
+/// enabled ones, and any `running` says is running — since a flow that does
+/// neither spawns none. Unrefused, the input was saved in both flows'
+/// `input_ids`, and the config failed validation at the next load.
 pub(crate) fn validate_add_input_assignment(
     flow_id: &str,
     input_id: &str,
     config: &crate::config::models::AppConfig,
+    running: impl Fn(&str) -> bool,
 ) -> Result<()> {
-    let enabled = config.flows.iter().find(|f| f.id == flow_id).is_none_or(|f| f.enabled);
-    if enabled {
-        refuse_input_held_elsewhere(flow_id, input_id, config)?;
+    let runs = running(flow_id)
+        || config.flows.iter().find(|f| f.id == flow_id).is_none_or(|f| f.enabled);
+    if runs {
+        refuse_input_held_elsewhere(flow_id, input_id, config, &running)?;
     }
     Ok(())
 }
 
 /// [`validate_add_input_assignment`] for every input of `flow`, created or
-/// replacing the flow of its id (a targeted `create_flow` / `update_flow`,
-/// REST or WS, or a WS `start_flow` that enables it): an enabled flow may
-/// not take an input another enabled flow holds. Those routes validated the
-/// flow alone, so each could save one input in two enabled flows — a config
-/// the next load refused.
+/// replacing the flow of its id (a targeted `create_flow` / `update_flow`, or
+/// a `start_flow`, REST or WS): a flow that will run (`runs`) may not take an
+/// input another flow runs. Those routes validated the flow alone, so each
+/// could save one input in two enabled flows — a config the next load
+/// refused. A route that starts the flow whatever its `enabled` says (the WS
+/// `create_flow`, a REST `start_flow`) judges it as running, and a flow such
+/// a route started holds its inputs though it is saved disabled: until
+/// 2026-10-31 the rule exempted disabled flows on both sides, and either
+/// route could start a second runtime of an input another flow ran.
 pub(crate) fn validate_flow_input_assignment(
     flow: &FlowConfig,
+    runs: bool,
     config: &crate::config::models::AppConfig,
+    running: impl Fn(&str) -> bool,
 ) -> Result<()> {
-    if flow.enabled {
+    if runs {
         for input_id in &flow.input_ids {
-            refuse_input_held_elsewhere(&flow.id, input_id, config)?;
+            refuse_input_held_elsewhere(&flow.id, input_id, config, &running)?;
         }
     }
     Ok(())
 }
 
-/// Refuse `input_id` to enabled flow `flow_id` when another enabled flow
-/// holds it, in [`validate_config`]'s words.
+/// Refuse `input_id` to flow `flow_id` when another flow that runs an input —
+/// enabled, or `running` — holds it, in [`validate_config`]'s words.
 fn refuse_input_held_elsewhere(
     flow_id: &str,
     input_id: &str,
     config: &crate::config::models::AppConfig,
+    running: &dyn Fn(&str) -> bool,
 ) -> Result<()> {
     let holder = config.flows.iter().find(|f| {
-        f.id != flow_id && f.enabled && f.input_ids.iter().any(|id| id == input_id)
+        f.id != flow_id && (f.enabled || running(&f.id)) && f.input_ids.iter().any(|id| id == input_id)
     });
     if let Some(holder) = holder {
         bail!(

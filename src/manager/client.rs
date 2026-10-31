@@ -2712,8 +2712,12 @@ async fn execute_command(
                         "hitless_seq_aware_leg_unsequenced",
                     )
                 })?;
-                crate::config::validation::validate_flow_input_assignment(&flow, &cfg)
-                    .map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
+                // Judged as running: this route starts every flow it
+                // creates, whatever its `enabled` says.
+                crate::config::validation::validate_flow_input_assignment(&flow, true, &cfg, |id| {
+                    flow_manager.is_running(id)
+                })
+                .map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
             }
             tracing::info!("Manager command: create flow '{}'", flow.id);
             let resolved = {
@@ -2779,8 +2783,13 @@ async fn execute_command(
                 // Judged as the flow it replaces, which the inputs it keeps
                 // are held by.
                 let replacing = FlowConfig { id: flow_id.to_string(), ..new_flow.clone() };
-                crate::config::validation::validate_flow_input_assignment(&replacing, &cfg)
-                    .map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
+                crate::config::validation::validate_flow_input_assignment(
+                    &replacing,
+                    replacing.enabled,
+                    &cfg,
+                    |id| flow_manager.is_running(id),
+                )
+                .map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
             }
             tracing::info!("Manager command: update flow '{flow_id}' (diff-based)");
 
@@ -3218,9 +3227,10 @@ async fn execute_command(
             {
                 let cfg = app_config.read().await;
                 if let Some(flow) = cfg.flows.iter().find(|f| f.id == flow_id) {
-                    let enabled = FlowConfig { enabled: true, ..flow.clone() };
-                    crate::config::validation::validate_flow_input_assignment(&enabled, &cfg)
-                        .map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
+                    crate::config::validation::validate_flow_input_assignment(flow, true, &cfg, |id| {
+                        flow_manager.is_running(id)
+                    })
+                    .map_err(|e| CommandError::from_validation("Invalid flow config", e))?;
                 }
             }
             tracing::info!("Manager command: {action_type} flow '{flow_id}'");
@@ -3423,8 +3433,10 @@ async fn execute_command(
                         )
                     })?;
                 }
-                crate::config::validation::validate_add_input_assignment(&flow_id, &input.id, cfg)
-                    .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
+                crate::config::validation::validate_add_input_assignment(&flow_id, &input.id, cfg, |id| {
+                    flow_manager.is_running(id)
+                })
+                .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
                 validate_port_conflicts_with_input(cfg, &input)
                     .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
                 crate::config::validation::validate_add_input_hitless_legs(&flow_id, &input, cfg)
@@ -8464,11 +8476,15 @@ mod reserved_input_id_tests {
         let _ = fm.destroy_flow("f").await;
     }
 
-    /// `create_flow`, `update_flow` and `start_flow` refuse an enabled flow
-    /// an input another enabled flow holds, before anything starts or is
-    /// saved, as `add_input` and a whole config do. They validated the flow
-    /// alone and could save one input in two enabled flows, a config the next
-    /// load refused. Disabled, a flow may name it.
+    /// `create_flow`, `update_flow` and `start_flow` refuse a flow that will
+    /// run an input another flow runs, before anything starts or is saved, as
+    /// `add_input` and a whole config do. They validated the flow alone and
+    /// could save one input in two enabled flows, a config the next load
+    /// refused. `create_flow` starts every flow it creates, so a disabled one
+    /// is judged as running, and a flow it started holds its inputs though
+    /// it is saved disabled: the rule used to exempt disabled flows on both
+    /// sides, and a disabled `create_flow` started a second runtime of an
+    /// input an enabled flow ran.
     #[tokio::test]
     async fn targeted_flow_routes_refuse_an_input_another_flow_holds() {
         let (event_sender, _events) = crate::manager::events::event_channel();
@@ -8550,10 +8566,24 @@ mod reserved_input_id_tests {
         assert!(fm.get_runtime("parked").is_none(), "nothing started");
         assert_eq!(serde_json::to_value(saved().await.flows).expect("flows"), before, "nothing saved");
 
-        // Disabled, a flow may name it.
-        run("create_flow", serde_json::json!({ "flow": flow("f", false, &["a"]) }))
+        // Disabled, it is started all the same: refused too.
+        let err = run("create_flow", serde_json::json!({ "flow": flow("f", false, &["a"]) }))
+            .await
+            .expect_err("g holds a, and f would run");
+        refused(err);
+        assert!(fm.get_runtime("f").is_none(), "no second runtime of a");
+
+        // A disabled flow naming an input only parked flows name is created,
+        // and runs, and holds it from then on.
+        run("create_flow", serde_json::json!({ "flow": flow("f", false, &["b"]) }))
             .await
             .unwrap_or_else(|e| panic!("a disabled flow: {}", e.message));
+        assert!(fm.is_running("f"));
+        let err = run("start_flow", serde_json::json!({ "flow_id": "h" }))
+            .await
+            .expect_err("f runs b");
+        assert!(err.message.contains("already assigned to another flow ('f')"), "{}", err.message);
+        assert!(fm.get_runtime("h").is_none(), "nothing started");
         crate::config::validation::validate_config(&*cfg.read().await).expect("the saved config loads");
         for id in ["f", "g", "h", "parked"] {
             let _ = fm.destroy_flow(id).await;
