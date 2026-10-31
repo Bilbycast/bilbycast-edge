@@ -292,9 +292,10 @@ broadcast IRDs) do not lose lock during a switch:
    switch between two RTP inputs and is never interleaved with an input's.
    Outputs that pass framing through (SRT) therefore carry one framing
    while the flow's inputs do; outputs that strip (UDP, RIST, bonded) never
-   cared, and outputs that re-wrap (RTP, single-leg and 2022-7) re-wrap each
-   datagram as it comes, so a raw-TS input of seven-packet items reaches
-   them as uniform datagrams. A flow whose inputs share a framing converts
+   cared, and outputs that re-wrap (RTP, single-leg and 2022-7) re-cut the
+   TS into seven-packet datagrams of their own (`output_rtp::TsRealigner`),
+   so a Take's PSI or a slate's loop-splice remainder goes out inside a full
+   datagram rather than short. A flow whose inputs share a framing converts
    nothing. The framing settles again when an input's removal leaves no
    input of the flow in it (`FlowFraming::forget`), so an RTP input
    replaced in place by a raw-TS one goes out raw TS. An SRT output still
