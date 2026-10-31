@@ -1088,7 +1088,7 @@ async fn srt_input_redundant_loop(
                         lose_input_leg(&ctx, 1, &mut sock1, &mut poller1, &sock2).await;
                         acquire1 = Some(arm_input_leg(&ctx, 1, listener1.take(), LEG_REACQUIRE_DELAY, false));
                         if sock2.is_none() {
-                            both_input_legs_lost(events, flow_id, &mut pair);
+                            both_input_legs_lost(events, flow_id, &mut pair, srt);
                         }
                     }
                 }
@@ -1112,7 +1112,7 @@ async fn srt_input_redundant_loop(
                         lose_input_leg(&ctx, 2, &mut sock2, &mut poller2, &sock1).await;
                         acquire2 = Some(arm_input_leg(&ctx, 2, listener2.take(), LEG_REACQUIRE_DELAY, false));
                         if sock1.is_none() {
-                            both_input_legs_lost(events, flow_id, &mut pair);
+                            both_input_legs_lost(events, flow_id, &mut pair, srt);
                         }
                     }
                 }
@@ -1210,6 +1210,14 @@ impl RedundantPair {
         self.prev_active_leg = ActiveLeg::None;
         self.format = SrtPayloadFormat::Unknown;
         (self.raw_ts_seq_leg1, self.raw_ts_seq_leg2, self.raw_ts_timestamp) = (0, 0, 0);
+    }
+
+    /// Hand `srt`'s pair what the merger has counted since the last hand-off.
+    fn hand_off(&mut self, srt: &SrtInputStats) {
+        match &self.merger {
+            PairMerger::Bare(merger) => srt.pair.hand_off(merger, &mut self.merger_handoff),
+            PairMerger::Buffered(merger) => srt.pair.hand_off(&**merger, &mut self.merger_handoff),
+        }
     }
 }
 
@@ -1471,11 +1479,22 @@ async fn lose_input_leg(
 
 /// A loss has left neither leg connected: raise the Critical and start the
 /// pair afresh ([`RedundantPair::restart`]). Both legs are being
-/// re-acquired.
-fn both_input_legs_lost(events: &EventSender, flow_id: &str, pair: &mut RedundantPair) {
+/// re-acquired. What the merger then counts of the stream it forgets — the
+/// seqs its window still waited for — and whatever of the pair's loss waits
+/// for the legs' polls are counted now ([`SrtInputStats::settle_pair_loss`]):
+/// no poll may come again, and until 2026-10-31 a source that never returned
+/// left that loss unpublished.
+fn both_input_legs_lost(
+    events: &EventSender,
+    flow_id: &str,
+    pair: &mut RedundantPair,
+    srt: &SrtInputStats,
+) {
     tracing::warn!("SRT input (redundant) both legs lost, re-acquiring each");
     events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
     pair.restart();
+    pair.hand_off(srt);
+    srt.settle_pair_loss();
 }
 
 /// Leg `leg`'s listener can never accept again (see
@@ -3375,18 +3394,18 @@ mod tests {
         assert!(card(&bench).is_none(), "raw TS");
 
         let (events, _events_rx) = crate::manager::events::event_channel();
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         for seq in 0..10u16 {
             bench.deliver(ActiveLeg::Leg1, seq);
         }
         assert_eq!(card(&bench).expect("RTP").leg1_packets_received, 10);
 
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         assert!(card(&bench).is_none(), "both legs lost");
         bench.deliver_raw_ts(ActiveLeg::Leg2);
         assert!(card(&bench).is_none(), "back with raw TS");
 
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         bench.deliver(ActiveLeg::Leg2, 500);
         let held = card(&bench).expect("back with RTP");
         assert_eq!((held.leg1_packets_received, held.leg2_packets_received), (10, 1));
@@ -3404,7 +3423,7 @@ mod tests {
             bench.deliver(ActiveLeg::Leg2, seq);
         }
         let (events, _events_rx) = crate::manager::events::event_channel();
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         bench.deliver_raw_ts(ActiveLeg::Leg2);
         let published: Vec<(u16, bool)> = std::iter::from_fn(|| bench.rx.try_recv().ok())
             .map(|packet| (packet.sequence_number, packet.is_raw_ts))
@@ -3431,7 +3450,7 @@ mod tests {
             bench.deliver(ActiveLeg::Leg2, seq);
         }
         let (events, mut events_rx) = crate::manager::events::event_channel();
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         let critical = events_rx.try_recv().expect("the Critical");
         assert_eq!(critical.message, "Both redundant legs lost");
         assert_eq!(critical.severity, EventSeverity::Critical);

@@ -49,7 +49,7 @@ Emitted unconditionally at the top of every scrape.
 | `bilbycast_edge_flow_input_packets_total` | counter | `flow_id` | Packets received on the active input. |
 | `bilbycast_edge_flow_input_bytes_total` | counter | `flow_id` | Bytes received on the active input. |
 | `bilbycast_edge_flow_input_bitrate_bps` | gauge | `flow_id` | Input bitrate estimate (bits/sec). |
-| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Packets that never reached the flow since it started, each counted once: sequence gaps, plus the too-late drops SRT inputs made while on air (libsrt `pktRcvDropTotal`, summed across reconnects; on an assembled flow, each of its own inputs the assembler plays from — a Switch slot's current leg, the leg a Hitless slot's merger is forwarding — while a slot sourced from another flow's input counts on the flow that owns it). On a SMPTE 2022-7 redundant SRT input the input's loss is what the pair lost, not its legs' drops. With RTP that is the packets neither leg delivered, split by cause: the share the delivering legs' libsrt drop counters explain is SRT's (the `srt_recv_dropped` reason), the rest was missing from both legs upstream of SRT and counts as a sequence gap (the `packet_loss` reasons). A jump of a whole 1024-number merger window or more re-anchors the merger: the old window's unfilled numbers count as above, and the numbers it skipped count only as far as the legs' drops around the jump confirm them — so a burst both legs dropped counts, and a source restarting on a new ISN, which made libsrt drop nothing, does not. With raw TS it is the drops of the leg its failover forwards. Each once-a-second stats poll counts its drops against the flow only while its input is on air, so a warm standby's drops stay out of it and a Take or a Hitless failover neither adds the new input's history nor removes the old input's: the counter never decreases. |
+| `bilbycast_edge_flow_input_packets_lost` | counter | `flow_id` | Packets that never reached the flow since it started, each counted once: sequence gaps, plus the too-late drops SRT inputs made while on air (libsrt `pktRcvDropTotal`, summed across reconnects; on an assembled flow, each of its own inputs the assembler plays from — a Switch slot's current leg, the leg a Hitless slot's merger is forwarding — while a slot sourced from another flow's input counts on the flow that owns it). On a SMPTE 2022-7 redundant SRT input the input's loss is what the pair lost, not its legs' drops. With RTP that is the packets neither leg delivered, split by cause: the share the delivering legs' libsrt drop counters explain is SRT's (the `srt_recv_dropped` reason), the rest was missing from both legs upstream of SRT and counts as a sequence gap (the `packet_loss` reasons). A jump of a whole 1024-number merger window or more re-anchors the merger: the old window's unfilled numbers count as above, and the numbers it skipped count only as far as the legs' drops around the jump confirm them — so a burst both legs dropped counts, and a source restarting on a new ISN, which made libsrt drop nothing, does not. When both legs are lost, the numbers the merger's window still waited for count as lost, and what waits for the legs' polls is counted at once. With raw TS it is the drops of the leg its failover forwards. Each once-a-second stats poll counts its drops against the flow only while its input is on air, so a warm standby's drops stay out of it and a Take or a Hitless failover neither adds the new input's history nor removes the old input's: the counter never decreases. |
 | `bilbycast_edge_flow_input_fec_recovered_total` | counter | `flow_id` | Packets rebuilt by 2022-1 FEC. A single-leg RTP input counts only what it publishes: a rebuilt packet ahead of every packet it has already published (a late one is withheld and not counted). A 2022-7 RTP input counts every packet an FEC datagram on either leg rebuilds, whether or not the other leg delivered it, and not those rebuilt as a media packet arrives. |
 | `bilbycast_edge_flow_output_packets_total` | counter | `flow_id,output_id` | Packets emitted per output. |
 | `bilbycast_edge_flow_output_bytes_total` | counter | `flow_id,output_id` | Bytes emitted per output. |
@@ -231,6 +231,27 @@ bilbycast_edge_bond_path_throughput_bps
 
 **Source:** `src/stats/models.rs::NetworkLegsStats` / `LegCounters`,
 populated in `src/stats/collector.rs`.
+
+## Buffered SMPTE 2022-7 merger (`InputStats.buffered_hitless`)
+
+> **Not exposed through Prometheus.** The block rides the WS `stats` message
+> and `GET /api/v1/stats[/{flow_id}]` on the active input of an RTP or SRT
+> 2022-7 input with `redundancy.path_differential_ms` set. Every field and
+> when it is present: [api-reference.md](api-reference.md) (`buffered_hitless`).
+
+The fields that say whether the hold fits the legs' skew:
+
+| Field | Meaning |
+|---|---|
+| `max_path_diff_ms` | The hold: every packet waits this long from its first copy. |
+| `current_path_diff_us` / `max_observed_path_diff_us` | How long after a packet's first copy the other leg's came: the latest, and the largest. Measured whether the second copy found the first still held or already released, as far back as 2048 sequence numbers (or the merger's window when longer). A maximum above `max_path_diff_ms` is a hold shorter than the skew. Until 2026-10-31 only copies that met within the hold were measured, so it never read above the hold. |
+| `dups_dropped` | Copies that met their twin within the hold: the 2022-7 happy path. |
+| `late_duplicates` | Copies that came after their twin had been released: no loss, but the later leg reaches the merger past the hold, so it cannot fill the earlier leg's gaps. |
+| `late_dropped` | Packets that came after the hold had passed them and were never released: a gap fill too late (its sequence number is in `gap_lost` too), or a copy too far back for the merger to remember. Real loss. Until 2026-10-31 it counted the late duplicates as well. |
+| `gap_lost` | Sequence numbers the hold released past with neither leg's copy. |
+
+**Source:** `src/redundancy/merger.rs::BufferedHitlessStats`, snapshot
+`src/stats/models.rs::BufferedHitlessSnapshot`.
 
 ## TR-101290 analyzer
 

@@ -2568,13 +2568,19 @@ pub struct BufferedHitlessSnapshot {
     /// emission latency).
     pub max_path_diff_ms: u32,
     /// Currently-observed path differential between the two legs in
-    /// microseconds (last sample). Useful as a live debug widget.
+    /// microseconds (last sample): how long after a packet's first copy the
+    /// other leg's came. Useful as a live debug widget.
     pub current_path_diff_us: u64,
-    /// Largest path differential observed since flow start, between two
-    /// copies of a packet that met within the hold — so it never reads
-    /// above `max_path_diff_ms`. A reading near the hold says the hold is
-    /// too small to measure the skew, not that it fits: raise
-    /// `path_differential_ms` until this settles well below it.
+    /// Largest path differential observed since flow start: the time
+    /// between a packet's two copies, whether the second found the first
+    /// still held or already released — as far back as the merger
+    /// remembers its releases, 2048 seqs or its gap-fill window when
+    /// longer. A reading above `max_path_diff_ms` says the hold is shorter
+    /// than the skew: the later leg's copies come after the release
+    /// (`late_duplicates`), and a gap the earlier leg leaves is not filled
+    /// (`late_dropped`). Until 2026-10-31 only copies that met within the
+    /// hold were measured, so it never read above the hold however far
+    /// apart the legs were.
     pub max_observed_path_diff_us: u64,
     /// Total packets emitted by the merger.
     pub packets_emitted: u64,
@@ -2585,14 +2591,25 @@ pub struct BufferedHitlessSnapshot {
     pub packets_via_leg1_only: u64,
     /// Packets emitted where only leg 2 delivered. Loss on leg 1.
     pub packets_via_leg2_only: u64,
-    /// Duplicate packets the merger correctly dropped.
+    /// Duplicate packets the merger correctly dropped: copies that came
+    /// while their twin was still held.
     pub dups_dropped: u64,
     /// Sequence-number gaps where neither leg ever delivered.
     pub gap_lost: u64,
-    /// Packets that arrived after their hold window had expired (the
-    /// path differential was misconfigured or the leg latency
-    /// momentarily spiked beyond `max_path_diff`).
+    /// Packets that arrived after the hold had released past them and that
+    /// the hold never released: a gap fill too late for its seq, which went
+    /// out as a hole (counted in `gap_lost` too), or a copy of a packet the
+    /// hold dropped — real loss, from a hold shorter than the legs' skew or
+    /// a latency spike past it. Also a copy further back than the merger
+    /// remembers releases (see `max_observed_path_diff_us`), whose twin it
+    /// can no longer find. Until 2026-10-31 it counted `late_duplicates`
+    /// as well.
     pub late_dropped: u64,
+    /// Copies that arrived after the hold had already released their twin:
+    /// harmless — nothing is lost — but the later leg reaches the merger
+    /// past the hold, so a gap the earlier leg leaves will not be filled.
+    /// Not in `dups_dropped`, which counts copies that met within the hold.
+    pub late_duplicates: u64,
     /// Packets dropped because the buffer reached its overflow cap.
     /// Sustained non-zero values indicate a misconfigured
     /// `path_differential_ms` (set too high).
