@@ -537,10 +537,22 @@ real frame whose rate or channel count differs — a 44.1 kHz source
 through a 48 kHz encoder used to run 8.8 % slow. A rebuild for another
 source rate (an eager encoder meeting its first source, or a source
 changing rate mid-stream) first runs the retired encoder out on its own
-timeline, as a re-anchor does, and the new encoder's priming frames
-that would overlap that run-out are not sent; the retired encoder was
-dropped with the end of the audio before the change in it, a hole the
-new encoder's priming filled. On RTMP (since
+timeline, as a re-anchor does; the retired encoder was dropped with the
+end of the audio before the change in it, a hole the new encoder's
+priming filled. The new encoder's priming frames overlap that run-out
+and are not sent, but for the last: the MDCT overlap-add partner of its
+first frame carrying the new audio, which decodes garbled after any other
+frame, and decodes to silence after the run-out. It goes out one step
+(12 ticks) before that frame. When that frame starts no later than the
+run-out's last frame (the retired encoder held fewer samples than the new
+resampler's delay, ~34 at 44.1 to 48 kHz), that last frame is dropped,
+with the few samples of the old audio it carries (`encode::Splice`). The
+first version dropped every new frame at or before the run-out's last
+stamp, the partner included, so the new audio's first ~21 ms decoded
+garbled, or, in that case, were dropped. A player that plays every
+decoded frame back to back, ignoring the sample durations, hears that
+partner as up to a frame of silence at the change (with the run-out's
+own zero tail, which it already heard). On RTMP (since
 edge#211) the measure is the connection's FLV timeline, the encoder's
 channel / rate stage converts the source instead of a rebuild, and three
 things differ from CMAF. A tick lays at most a second of silence, off
