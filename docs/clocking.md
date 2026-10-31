@@ -419,9 +419,11 @@ before it, so the packet still follows on). With the DI the standard lets
 the CC start anew there, and nothing reads as a duplicate. Only the first
 packet per PID is marked, so a flow's first start sends one marked packet
 per PID too, and later CCs pass through as before (a PES gate drop still
-lowers them). The flow's TR 101 290 analyzer counts CC on payload packets
-only, as before. Inputs with `passthrough_clock: true`, which run no
-rewriter, are not marked. Pinned by
+lowers them). The flow's TR 101 290 analyzer counts no CC_error on a break
+a DI signals (see `cc_errors` in `metrics.md`). Inputs with
+`passthrough_clock: true`, which run no rewriter, are not marked, and
+neither is a PID-bus assembled flow whose assembler runs without a pacer:
+their restart keeps the 1-in-16 chance. Pinned by
 `a_restarted_rewriters_first_packets_never_read_as_duplicates`.
 
 The hold is bounded. Once it has held 2 s of PES time on a PID (forward

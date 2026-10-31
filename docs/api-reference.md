@@ -1112,7 +1112,7 @@ Every counter below is a `u64`. The bare counters are **lifetime totals** since 
 | `pat_count` / `pmt_count` | — | PAT / PMT sections received |
 | `sync_loss_count` | P1 | Sync-loss events |
 | `sync_byte_errors` | P1 | Packets whose sync byte was not `0x47` |
-| `cc_errors` | P1 | Continuity-counter discontinuities |
+| `cc_errors` | P1 | Continuity-counter discontinuities (not a break `discontinuity_indicator` signals, nor a duplicate) |
 | `pat_errors` / `pmt_errors` | P1 | PAT / PMT not seen within the required interval |
 | `pid_errors` | P1 | PMT-referenced ES PIDs that went missing |
 | `tei_errors` | P2 | Packets with the Transport Error Indicator set |

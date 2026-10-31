@@ -325,18 +325,30 @@ fn process_ts_packet(
     let pid = ts_pid(pkt);
 
     // ── 3. Continuity counter check ──
-    // Skip null packets and adaptation-only packets (no payload)
-    if pid != NULL_PID && ts_has_payload(pkt) {
-        let cc = ts_cc(pkt);
-        if let Some(&prev_cc) = state.cc_tracker.get(&pid) {
-            let expected = (prev_cc + 1) & 0x0F;
-            // Allow duplicate (same CC) per spec, but flag other mismatches
-            if cc != expected && cc != prev_cc {
-                stats.cc_errors.fetch_add(1, Ordering::Relaxed);
-                stats.window_cc_errors.fetch_add(1, Ordering::Relaxed);
+    // Null packets carry no continuity. A packet with
+    // `discontinuity_indicator` set may break it (ISO/IEC 13818-1
+    // §2.4.3.4), which TR 101 290's CC_error does not count: a payload
+    // packet's CC is then taken as it is, and an adaptation-field-only
+    // packet announcing the break carries the CC the next payload packet
+    // follows on from (it repeats the CC before it). Such a break used to
+    // be counted, a restarted flow's or input's first packet on a PID
+    // among them. Other adaptation-field-only packets are not checked.
+    if pid != NULL_PID {
+        let di = ts_discontinuity_indicator(pkt);
+        if ts_has_payload(pkt) {
+            let cc = ts_cc(pkt);
+            if let Some(&prev_cc) = state.cc_tracker.get(&pid) {
+                let expected = (prev_cc + 1) & 0x0F;
+                // Allow duplicate (same CC) per spec, but flag other mismatches
+                if cc != expected && cc != prev_cc && !di {
+                    stats.cc_errors.fetch_add(1, Ordering::Relaxed);
+                    stats.window_cc_errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
+            state.cc_tracker.insert(pid, cc);
+        } else if di {
+            state.cc_tracker.insert(pid, ts_cc(pkt));
         }
-        state.cc_tracker.insert(pid, cc);
     }
 
     // ── 4. PAT handling (PID 0x0000) ──
@@ -1128,6 +1140,41 @@ mod tests {
         let pkt5 = make_ts_packet(0x100, 5, true);
         process_ts_packet(&pkt5, now, &stats, &mut state);
         assert_eq!(stats.cc_errors.load(Ordering::Relaxed), 1);
+    }
+
+    /// A CC break signalled by `discontinuity_indicator` is no CC_error —
+    /// on the payload packet that breaks, or on an adaptation-field-only
+    /// packet just ahead of it carrying the CC it follows on from (what a
+    /// restarted rewriter sends) — and the check goes on from there. An
+    /// unsignalled break is still counted.
+    #[test]
+    fn a_cc_break_signalled_by_di_is_no_error() {
+        let stats = Arc::new(Tr101290Accumulator::new());
+        let now = Instant::now();
+        let mut state = stats.state.lock().unwrap();
+        let di = |mut p: Vec<u8>| {
+            // A 2-byte adaptation field (flags: DI) ahead of the payload.
+            p[3] |= 0x20;
+            p[4] = 1;
+            p[5] = 0x80;
+            p
+        };
+        for cc in [0, 1] {
+            process_ts_packet(&make_ts_packet(0x100, cc, true), now, &stats, &mut state);
+        }
+        process_ts_packet(&di(make_ts_packet(0x100, 9, true)), now, &stats, &mut state);
+        process_ts_packet(&make_ts_packet(0x100, 10, true), now, &stats, &mut state);
+        assert_eq!(stats.cc_errors.load(Ordering::Relaxed), 0, "the payload packet's DI");
+        // An adaptation-field-only carrier with CC 4, then the payload
+        // packet with CC 5.
+        let mut carrier = [0xFFu8; TS_PACKET_SIZE];
+        carrier[..6].copy_from_slice(&[TS_SYNC_BYTE, 0x01, 0x00, 0x20 | 4, 183, 0x80]);
+        process_ts_packet(&carrier, now, &stats, &mut state);
+        process_ts_packet(&make_ts_packet(0x100, 5, true), now, &stats, &mut state);
+        process_ts_packet(&make_ts_packet(0x100, 6, true), now, &stats, &mut state);
+        assert_eq!(stats.cc_errors.load(Ordering::Relaxed), 0, "the carrier's DI");
+        process_ts_packet(&make_ts_packet(0x100, 12, true), now, &stats, &mut state);
+        assert_eq!(stats.cc_errors.load(Ordering::Relaxed), 1, "an unsignalled break counts");
     }
 
     #[test]
