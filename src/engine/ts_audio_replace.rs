@@ -1901,6 +1901,7 @@ impl TsAudioReplacer {
                     "ts_audio_replace: source PTS stepped by more than 500 ms; \
                      re-anchoring audio output PTS"
                 );
+                self.run_out(output);
                 self.anchor_at(pts);
             }
             TimelineAction::Gap(off) => {
@@ -2319,6 +2320,32 @@ impl TsAudioReplacer {
             return;
         }
         self.stats.silence_inserted_samples.fetch_add(n, Ordering::Relaxed);
+        self.send_silence(n, output);
+    }
+
+    /// Before a re-anchor, push what the pipeline still holds of the old
+    /// timeline out on it: the held tail, the stage's queue and delay line,
+    /// the encoder's accumulator and delay line (AAC-LC 2048 samples) — with
+    /// silence enough to clear them all, plus a frame. The anchor then puts
+    /// only that silence's remainder ahead of the new PTS. It used to put
+    /// the old audio there: the last ~50 ms before a step of more than
+    /// 500 ms went out on the new timeline, late (or early) by the step.
+    /// After a step back of over 1 s the transcode chain's PCR stage drops
+    /// these frames as the previous epoch's, rather than presenting them on
+    /// the new one. The silence is no gap in the source, so it is not
+    /// counted in `silence_inserted_samples`.
+    fn run_out(&mut self, output: &mut Vec<u8>) {
+        if !self.codecs_ready || self.timeline.rate == 0 {
+            return;
+        }
+        let held_90k = self.pending_out_90k() + self.latency.applied_90k + self.out_frame_90k().max(0) as u64;
+        let n = (u128::from(held_90k) * u128::from(self.timeline.rate)).div_ceil(90_000) as u64;
+        self.send_silence(n, output);
+    }
+
+    /// `n` samples of silence at the source rate: the held tail faded out
+    /// ahead of it, the audio after it faded in.
+    fn send_silence(&mut self, n: u64, output: &mut Vec<u8>) {
         let channels = self.tail.len();
         let mut tail = std::mem::replace(&mut self.tail, vec![Vec::new(); channels]);
         let len = tail.first().map_or(0, |c| c.len());
@@ -5376,6 +5403,39 @@ mod tests {
             assert!(e.abs() <= 3.0, "{target}: the audio after the step is {e} samples off");
             let steps: Vec<i64> = audio_pes(&out).windows(2).map(|w| pts_diff(w[1].0, w[0].0)).collect();
             assert!(steps.iter().all(|&d| d > 0), "{target}: the stamps never step back");
+        }
+    }
+
+    /// **AT-3.** At a re-anchor (a step of more than 500 ms) the audio the
+    /// pipeline still holds from before the step — the encoder's delay line
+    /// and accumulator, the stage's queue — goes out on the old timeline,
+    /// and the audio after it on its own PTS: with and without 48 -> 44.1
+    /// kHz rate conversion, for AAC-LC and MP2. The anchor used to put it
+    /// just ahead of the new PTS, presented a second late here.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_reanchor_keeps_the_audio_before_the_step_on_its_timeline() {
+        use e2e::*;
+        // The step comes at the PES of source AU 40, whose content starts at
+        // 40 * 1024 - 2048: a burst ending 200 samples before that is the
+        // old timeline's tail, and one 250 ms later is the new one's.
+        let before = 40 * 1024 - 2048 - 480 - 200;
+        let after = 40 * 1024 + 12_000;
+        let mut pcm = content(before, 48_000 * 2);
+        pcm[after..after + 480].copy_from_slice(&burst(RATE));
+        let mut aus = encode_source(Src::Aac, &pcm);
+        for au in aus.iter_mut().skip(40) {
+            au.1 += 90_000;
+        }
+        let ts = mux(0x0F, &pack(&aus, 1));
+        for (target, sr, out_rate) in [("aac_lc", None, 48_000), ("mp2", None, 48_000), ("aac_lc", Some(44_100), 44_100)] {
+            let mut r = replacer(target, sr, None);
+            let out = run(&mut r, &ts);
+            assert_eq!(r.stats_handle().silence_inserted_samples.load(Ordering::Relaxed), 0);
+            let e = err_samples(target, &out, src_time(before), out_rate);
+            assert!(e.abs() <= 4.0, "{target} {out_rate}: the audio before the step is {e} samples off");
+            let e = err_samples(target, &out, src_time(after) + 90_000.0, out_rate);
+            assert!(e.abs() <= 4.0, "{target} {out_rate}: the audio after the step is {e} samples off");
         }
     }
 

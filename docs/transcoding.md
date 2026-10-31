@@ -769,9 +769,13 @@ the sample:
     head of what follows (the count of placed content may go below the
     anchor: a PES stamped 150 ms behind one AU after an anchor drops
     exactly 150 ms);
-  - a step over 500 ms, **either way**: re-anchor at the new PTS (the
-    content still in the pipeline goes out just ahead of it, on the new
-    timeline). A source
+  - a step over 500 ms, **either way**: re-anchor at the new PTS, after
+    running out what the pipeline still holds (the held tail, the stage,
+    the encoder's accumulator and delay line) on the old timeline with
+    silence, which is not counted in `silence_inserted_samples` (until
+    0.116.0 it went out just ahead of the new PTS, on the new timeline;
+    after a step back of over 1 s the PCR stage drops it as the previous
+    epoch's). A source
     that resets its clock back (an encoder restart, an ffmpeg
     `-stream_loop` wrap) takes its PCR and its video back with it, and the
     transcode chain's PCR stage drops re-encoded PES left on the old
