@@ -1040,24 +1040,50 @@ pass with the master-clock work in.
   as PES PTS/DTS: on every learned PCR_PID it recomputes the value with
   `rewrite_pcr_value`, patches the six adaptation-field bytes in place
   (`write_pcr_field_in_packet`), sets DI=1 whenever it re-anchors, and
-  injects synthetic PCR_RR carrier packets where PCR-bearing datagrams
-  were lost upstream: whenever the gap to the next source PCR exceeds
-  40 ms and is more than 1.5 times the median of the source's last 16 PCR
-  intervals (nothing is padded before it has shown four), `ceil(gap / 40
-  ms) - 1` of them, their values evenly spaced so no interval exceeds
-  40 ms, sent immediately ahead of that source PCR, and none across a DI'd
-  discontinuity — see "PCR discontinuity bridging" above. A gap of the
-  source's own cadence is never padded, however long: one PCR a frame at
-  24 fps (41.7 ms) or a steady 100 ms goes out as it came, its PCR_RR the
-  source's. `wire_emit` paces a datagram by its first PCR, so a synthetic
-  sitting ahead of a source PCR sends that PCR early by the synthetic's
-  lead, which padding a steady cadence did on every PCR — while
-  `pcr_trust`, which reads only a datagram's first PCR, saw nothing. (Up to
-  0.116.0 it injected `floor(gap / 40 ms) - 1` at 40 ms steps whatever the
-  cadence, so any gap not a whole multiple of 40 ms kept one interval of
-  40–80 ms — two lost datagrams of a 15 ms-PCR source left 45 ms, with no
-  padding at all, edge#214 — and a steady cadence of 80 ms or more was
-  padded on every PCR.) Source PCR bytes reach the wire
+  keeps PCR_RR (40 ms) inline (`PcrFill`). Between two real PCRs it counts
+  the packets it passes and takes the stream's rate from the PCR PID's own
+  recent intervals (ticks per packet over the last four), as a
+  remultiplexer does. Where the next real PCR would come more than 40 ms
+  after the last PCR sent, because the source's own cadence is longer or
+  because PCR-bearing datagrams were lost upstream, it puts an
+  adaptation-field-only PCR packet in at the position it has reached,
+  valued `last PCR + packets since × ticks per packet` and carrying the
+  PID's last payload CC. On a regular cadence it adds the fewest that
+  leave no interval over 30 ms, the first as early as that allows
+  (41.7 ms: one, 11.7 ms in; 80 ms: two, 20 and 50 ms in; a cadence within
+  40 ms: none), each held under the source's next PCR that could still
+  come. On an irregular cadence it adds one every 30 ms, and only while
+  the packet rate is steady. None before the rate is known (two real
+  PCRs), none across a DI, a re-anchor or an input transcode's own PCR
+  step (the history starts again), none more than 500 ms past the last
+  real PCR — see "PCR discontinuity bridging" above. Each synthetic sits
+  where its value says, so `wire_emit`, which paces a datagram by its
+  first PCR, sends it on time. On a CBR source a synthetic is exact to the
+  packet; after packets lost upstream it reads early by their duration
+  (two 7-packet datagrams at 4 Mbit/s: 5.3 ms), never late. On a VBR
+  source the packet count is a poor clock. A synthetic reads off its
+  position by the rate's swing since those four intervals (a rate swinging
+  ±10 % over 4 s: within 2–4 ms), and by more where frame sizes differ
+  threefold (the transport bench's 24 fps ffmpeg sources, measured on the
+  output: p50 3 ms and p99 13 ms off at one PCR a frame, every interval
+  filled; p50 3 ms and p99 27 ms at one PCR every two frames, where 3
+  intervals in 100 s stayed over 40 ms, up to 60 ms). A PCR is
+  presumed lost only far past where it was due, so a gap a lost PCR leaves
+  on a VBR source goes unfilled; and a VBR cadence whose shortest interval
+  is within 40 ms but which mostly runs longer (ffmpeg's default VBR mux
+  adds a PCR at each keyframe 40 ms into its 80 ms cadence, the audio
+  bench's `av-gap.ts`) is not filled, since the next PCR might come at
+  40 ms. No real PCR came at or before a synthetic on any bench source,
+  measured or simulated. Up to 0.116.0 it
+  filled a gap only once the next real PCR arrived, putting
+  `floor(gap / 40 ms) - 1` synthetics immediately ahead of it at 40 ms
+  steps from the last one, so each read up to a whole gap behind its
+  position and `wire_emit` sent that real PCR early by the first
+  synthetic's lead (on the transport bench, filling lost-PCR gaps that way
+  took PCR_AC p99 from 5.9 ms to 27.5 ms); and any gap not a whole
+  multiple of 40 ms kept an interval of 40–80 ms (a 41.7 ms cadence got
+  none; two lost datagrams of a 15 ms-PCR source left 45 ms with none,
+  edge#214). Source PCR bytes reach the wire
   untouched under per-input `passthrough_clock: true` or on a `bonded`
   input, where the rewriter is not in the path at all; opting out to keep
   them therefore also opts out of PES PTS/DTS regeneration. That is the
