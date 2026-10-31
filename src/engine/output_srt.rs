@@ -2031,10 +2031,13 @@ struct RedundantOutputCtx<'a> {
     /// Warnings and the connect observers, which run inside the
     /// acquisitions.
     leg_up: &'a [AtomicBool; 2],
-    /// Leg 1's consecutive failed connect attempts: the output's own
-    /// `connect_failures`, which the stats read (`connect_failed` past the
-    /// threshold), stored 0 whenever leg 1 attaches.
+    /// The output's own `connect_failures`, which the stats read
+    /// (`connect_failed` past the threshold): leg 1's count while leg 2 is
+    /// not attached, and 0 while it is ([`Self::publish_connect_failures`]).
     connect_failures: &'a AtomicU32,
+    /// Leg 1's consecutive failed connect attempts, stored 0 whenever leg 1
+    /// attaches.
+    leg1_attempts: &'a AtomicU32,
     /// Leg 2's, for its observer alone: nothing reads the count.
     leg2_attempts: &'a AtomicU32,
 }
@@ -2050,6 +2053,20 @@ impl<'a> RedundantOutputCtx<'a> {
 
     fn up(&self, leg: u8) -> &'a AtomicBool {
         &self.leg_up[if leg == 1 { 0 } else { 1 }]
+    }
+
+    /// Put leg 1's count of failed attempts on the output's own while leg 2
+    /// is not attached, and 0 while it is: an output leg 2 carries is in
+    /// service, and the stats put `connect_failed` ahead of `idle`, so with
+    /// leg 1's count there it read CONNECT FAILED whenever its flow had
+    /// nothing to send. Called on every change to either.
+    fn publish_connect_failures(&self) {
+        let count = if self.up(2).load(Ordering::Relaxed) {
+            0
+        } else {
+            self.leg1_attempts.load(Ordering::Relaxed)
+        };
+        self.connect_failures.store(count, Ordering::Relaxed);
     }
 }
 
@@ -2100,7 +2117,9 @@ fn arm_output_leg<'a>(
 /// Leg `leg`'s per-attempt connect observer, called after each failed
 /// attempt of a caller or rendezvous leg (a listener leg has none). It
 /// stores the acquisition's count of consecutive failures — leg 1's on the
-/// output's `connect_failures`, leg 2's on a scratch counter — and raises
+/// output's `connect_failures` while leg 2 is not attached
+/// ([`RedundantOutputCtx::publish_connect_failures`]), leg 2's on a scratch
+/// counter — and raises
 /// `srt_output_peer_unreachable` naming the leg when [`peer_unreachable_due`],
 /// as the single-leg caller output does: a Warning while the other leg is
 /// attached, since the output is then on air, and a Critical otherwise.
@@ -2117,10 +2136,13 @@ fn output_leg_connect_observer<'a>(
 ) -> impl FnMut(u32, &anyhow::Error) + Send + 'a {
     let params = ctx.params(leg);
     let (mode, remote_addr) = (*params.mode, params.remote_addr.unwrap_or(""));
-    let counter = if leg == 1 { ctx.connect_failures } else { ctx.leg2_attempts };
+    let counter = if leg == 1 { ctx.leg1_attempts } else { ctx.leg2_attempts };
     let other_up = ctx.up(if leg == 1 { 2 } else { 1 });
     move |attempt: u32, err: &anyhow::Error| {
         counter.store(attempt, Ordering::Relaxed);
+        if leg == 1 {
+            ctx.publish_connect_failures();
+        }
         if !peer_unreachable_due(attempt) {
             return;
         }
@@ -2181,8 +2203,9 @@ fn attach_output_leg(
     let output_id = &ctx.config.id;
     ctx.up(leg).store(true, Ordering::Relaxed);
     if leg == 1 {
-        ctx.connect_failures.store(0, Ordering::Relaxed);
+        ctx.leg1_attempts.store(0, Ordering::Relaxed);
     }
+    ctx.publish_connect_failures();
     let poller = ctx.cancel.child_token();
     let cache = if leg == 1 {
         stats.srt_stats_cache.clone()
@@ -2264,6 +2287,7 @@ async fn detach_output_leg(
     poller: &mut Option<CancellationToken>,
 ) {
     ctx.up(leg).store(false, Ordering::Relaxed);
+    ctx.publish_connect_failures();
     if let Some(poller) = poller.take() {
         poller.cancel();
     }
@@ -2444,7 +2468,7 @@ async fn srt_output_redundant_loop(
     // a lock.
     let leg1_lost = Arc::new(AtomicBool::new(true));
     let leg_up = [AtomicBool::new(false), AtomicBool::new(false)];
-    let leg2_attempts = AtomicU32::new(0);
+    let (leg1_attempts, leg2_attempts) = (AtomicU32::new(0), AtomicU32::new(0));
     // Cancelled at teardown whether or not `cancel` was, so a pending
     // acquisition can be let finish (see the end of this function).
     let legs_cancel = cancel.child_token();
@@ -2455,6 +2479,7 @@ async fn srt_output_redundant_loop(
         events,
         leg_up: &leg_up,
         connect_failures: &stats.connect_failures,
+        leg1_attempts: &leg1_attempts,
         leg2_attempts: &leg2_attempts,
     };
 
@@ -4302,11 +4327,15 @@ mod tests {
 
     /// A 2022-7 output's caller legs report their failed attempts as the
     /// single-leg caller output does: leg 1's count is the output's
-    /// `connect_failures`, leg 2's is not, and `srt_output_peer_unreachable`
-    /// names the leg at the fifth attempt and every twentieth after it — a
-    /// Warning while the other leg carries, a Critical while it does not. The
-    /// legs used to pass no observer, so neither said anything past the 15 s
-    /// Warning of its first acquisition.
+    /// `connect_failures` while leg 2 is not attached (and 0 while it is,
+    /// the output then in service), leg 2's never is, and
+    /// `srt_output_peer_unreachable` names the leg at the fifth attempt and
+    /// every twentieth after it — a Warning while the other leg carries, a
+    /// Critical while it does not. The legs used to pass no observer, so
+    /// neither said anything past the 15 s Warning of its first
+    /// acquisition; then leg 1's count stood on the output's while leg 2
+    /// carried it, which read CONNECT FAILED whenever the flow had nothing
+    /// to send.
     #[test]
     fn a_2022_7_output_caller_leg_reports_its_unreachable_peer() {
         let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
@@ -4318,7 +4347,8 @@ mod tests {
         let (events, mut events_rx) = crate::manager::events::event_channel();
         let cancel = CancellationToken::new();
         let leg_up = [AtomicBool::new(false), AtomicBool::new(true)];
-        let (connect_failures, leg2_attempts) = (AtomicU32::new(0), AtomicU32::new(0));
+        let (connect_failures, leg1_attempts, leg2_attempts) =
+            (AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0));
         let ctx = RedundantOutputCtx {
             config: &config,
             redundancy: &redundancy,
@@ -4326,6 +4356,7 @@ mod tests {
             events: &events,
             leg_up: &leg_up,
             connect_failures: &connect_failures,
+            leg1_attempts: &leg1_attempts,
             leg2_attempts: &leg2_attempts,
         };
         let failed = anyhow::anyhow!("connection setup failure: connection timed out");
@@ -4335,7 +4366,15 @@ mod tests {
         for attempt in 1..=20 {
             leg1(attempt, &failed);
         }
+        assert_eq!(leg1_attempts.load(Ordering::Relaxed), 20);
+        assert_eq!(connect_failures.load(Ordering::Relaxed), 0, "leg 2 carries the output");
+        // Leg 2 lost: leg 1's count is the output's at once.
+        leg_up[1].store(false, Ordering::Relaxed);
+        ctx.publish_connect_failures();
         assert_eq!(connect_failures.load(Ordering::Relaxed), 20, "the output's own count");
+        leg_up[1].store(true, Ordering::Relaxed);
+        ctx.publish_connect_failures();
+        assert_eq!(connect_failures.load(Ordering::Relaxed), 0, "leg 2 back");
         let raised: Vec<_> = std::iter::from_fn(|| events_rx.try_recv().ok()).collect();
         assert_eq!(raised.len(), 2, "at the 5th and 20th attempts");
         for (event, attempts) in raised.iter().zip([5, 20]) {
