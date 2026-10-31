@@ -485,8 +485,14 @@ impl WebrtcSession {
     /// session must then be dropped, as on any other error.
     pub fn apply_answer(&mut self, answer_sdp: &str, pending: str0m::change::SdpPendingOffer) -> Result<()> {
         isolate_negotiation("SDP answer", || {
-            let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp)
-                .map_err(|e| anyhow::anyhow!("SDP answer parse error: {}", e))?;
+            // The parser's own error stays in the log, as for an offer: it is
+            // several lines of parser internals and names a heap address of
+            // this process (`PointerOffset(0x…)`), and a WHEP input raises
+            // what this returns as an event the manager stores and shows.
+            let answer = str0m::change::SdpAnswer::from_sdp_string(answer_sdp).map_err(|e| {
+                tracing::warn!("WebRTC: the answer is not valid SDP: {e}");
+                anyhow::anyhow!("SDP answer parse error: the answer is not valid SDP")
+            })?;
 
             self.rtc.sdp_api().accept_answer(pending, answer)
                 .map_err(|e| anyhow::anyhow!("SDP answer accept error: {}", e))?;

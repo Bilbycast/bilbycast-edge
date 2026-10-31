@@ -245,9 +245,12 @@ unpinned, whatever the pin said:
   that carries the pin moves the output back onto it. A PMT update that
   drops every audio stream leaves the output on none: it stops demuxing
   the old PID and holds nothing of it, and a later PMT bringing audio back
-  is selected afresh by the same rule. Until 2026-10 the shared demuxer
-  stayed on the dropped PID, so the output went on reporting and expecting
-  that track and demuxing whatever still came on the PID.
+  is selected afresh by the same rule. Only a PMT section whose CRC_32
+  checks counts, as in the TS transcode stages: one damaged in transit, or
+  completed from the wrong bytes after a lost packet, changes nothing. Until
+  2026-10 the shared demuxer stayed on the dropped PID, so the output went
+  on reporting and expecting that track and demuxing whatever still came on
+  the PID.
 - **HLS** (`audio_encode` remux): unpinned, the **last** audio stream it
   can decode, as before. A pin is taken when it is one it can decode;
   otherwise (absent, or AC-4 / DTS) the output falls back to that last
@@ -1192,9 +1195,12 @@ bits on; band-limited MP2 / AAC sources are not.
   to the egress pipeline. An SRT output restarts the chain's stream at each
   connection (`TranscodeChain::restart_stream`): input and output of the
   last connection still in the chain are dropped, and both replacers reset
-  as on an input switch, so a re-joining receiver starts on the live
-  programme rather than on TS the last one never got followed by a PCR jump
-  over the reconnection gap. See
+  as on an input switch, the video replacer closing its encoder as well
+  (`TsVideoReplacer::restart_stream`: an input switch keeps it open, and
+  kept open the pictures it held would come out on the new connection, each
+  taking one of its PTS, its video that many frames behind its audio), so a
+  re-joining receiver starts on the live programme rather than on TS the
+  last one never got followed by a PCR jump over the reconnection gap. See
   [configuration-guide.md](configuration-guide.md#srt-output) (Reconnections).
   The SRT and RIST outputs take everything the chain has ready each time
   round (`TranscodeChain::try_recv_ready`), as UDP and RTP always did:

@@ -222,10 +222,12 @@ pub struct MasterClockStats {
     pub lipsync_offset_90k: i64,
     /// What the operator (or auto-policy) configured, when it differs
     /// from `kind`: `auto` (the UI renders "Auto → PTP"), `sender_timestamp`
-    /// and `contribution` (both run the source-PCR PLL), or the kind a
-    /// fallback left (so the UI can render "PCR PLL → Wallclock
-    /// (fallback)"). `None` for an explicit kind that runs as itself.
-    /// Additive on the wire.
+    /// and `contribution` (both run the source-PCR PLL, and the name holds
+    /// across a fallback: "fallback from sender_timestamp"), or
+    /// `source_pcr_pll` while an explicit pin's fallback runs (so the UI
+    /// can render "PCR PLL → Wallclock (fallback)"). `None` for an explicit
+    /// kind that runs as itself. Not a fallback signal by itself:
+    /// `fallback_active` is. Additive on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_kind: Option<String>,
     /// `true` when a fallback has activated. Driven by the PLL
@@ -238,26 +240,29 @@ pub struct MasterClockStats {
     /// Set only when `fallback_active`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
-    /// ID of the input currently feeding the clock. For
-    /// `source_pcr_pll` this is the active input whose PCR samples the
-    /// PLL is tracking; the field refreshes on operator-driven input
-    /// switches without re-creating the master. `None` for clock kinds
-    /// that don't take their rate from a single ingress stream (`ptp`,
-    /// bare `wallclock`). Lets the manager UI render "PLL locked on
-    /// <input_id>" / "wallclock fallback after failing on <input_id>".
-    /// Additive — older managers ignore it.
+    /// On an assembled (PID-bus) flow that designates an
+    /// `assembly.pcr_source`, that input while the clock is the source-PCR
+    /// PLL (its fallback rungs included), and `None` on any other kind. On
+    /// every other flow, the flow's active input whatever the clock kind —
+    /// the input the PLL tracks while `kind` is `source_pcr_pll`, refreshed
+    /// on operator-driven input switches, but on `ptp`, `wallclock` and
+    /// `passthrough` only the input on air. Lets the manager UI render
+    /// "PLL locked on <input_id>" / "wallclock fallback after failing on
+    /// <input_id>". Additive — older managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_input_id: Option<String>,
-    /// What last fed the source-PCR PLL a rate sample, while the PLL is the
-    /// clock in use: `"sender_timestamp"` (the SRT / RIST sender's
-    /// per-packet timestamp, libsrt's `srctime`), `"pcr"` (an MPEG-TS PCR
-    /// read from the bytes) or `"none"` (no sample yet). Absent on every
-    /// other kind and rung (`ptp`, `wallclock`, `passthrough`, a fallback
-    /// rung). Lets the manager tell a `sender_timestamp` flow that really
-    /// runs on the sender's clock from one that fell back to PCR — the
-    /// muxer-mode clock rewriter drops the sender timestamp at ingress, so
-    /// on default settings it reads `"pcr"`. Additive — older managers
-    /// ignore it.
+    /// What last fed the source-PCR PLL a rate sample: `"sender_timestamp"`
+    /// (the SRT / RIST sender's per-packet timestamp, libsrt's `srctime`),
+    /// `"pcr"` (an MPEG-TS PCR read from the bytes) or `"none"` (no sample
+    /// yet). Present while the PLL is the flow's clock and no fallback has
+    /// fired — locked, or acquiring lock while the output holds on wallclock
+    /// (`kind` `source_pcr_pll`, `locked` false; on an assembled flow
+    /// `fallback_active` is then true too). Absent on every other kind
+    /// (`ptp`, `wallclock`, `passthrough`) and on a fallback rung. Lets the
+    /// manager tell a `sender_timestamp` flow that really runs on the
+    /// sender's clock from one that fell back to PCR — the muxer-mode clock
+    /// rewriter drops the sender timestamp at ingress, so on default
+    /// settings it reads `"pcr"`. Additive — older managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_source: Option<String>,
 }
@@ -2616,9 +2621,13 @@ pub struct BufferedHitlessSnapshot {
     /// out as a hole (counted in `gap_lost` too), or a copy of a packet the
     /// hold dropped — real loss, from a hold shorter than the legs' skew or
     /// a latency spike past it. Also a copy further back than the merger
-    /// remembers releases (see `max_observed_path_diff_us`), whose twin it
-    /// can no longer find. Until 2026-10-31 it counted `late_duplicates`
-    /// as well.
+    /// remembers releases (2048 seqs, or its window when longer; see
+    /// `max_observed_path_diff_us`), whose twin it can no longer find —
+    /// usually a harmless duplicate of a packet the other leg delivered long
+    /// before, so on a pair whose later leg lags that far (about 0.85 s at
+    /// 2400 packets a second) every one of its copies counts here though
+    /// nothing is lost: `gap_lost` is what the output missed. Until
+    /// 2026-10-31 it counted `late_duplicates` as well.
     pub late_dropped: u64,
     /// Copies that arrived after the hold had already released their twin:
     /// harmless — nothing is lost — but the later leg reaches the merger

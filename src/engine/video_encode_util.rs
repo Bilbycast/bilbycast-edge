@@ -1830,6 +1830,22 @@ impl ScaledVideoEncoder {
         }
     }
 
+    /// Close the encoder, and with it every frame it still holds (a
+    /// lookahead, frame threads, an async hardware pipeline): nothing it was
+    /// given comes out. The next [`Self::encode`] opens it afresh, at the
+    /// rate it opened at, on that frame's size and scan, so its first frame
+    /// is an IDR. libavcodec has no way to empty an encoder and go on: a
+    /// drain ([`Self::flush`]) ends its stream.
+    pub fn close(&mut self) {
+        self.encoder = None;
+        self.scaler = None;
+        self.sar_signalled = None;
+        self.sar_pending = None;
+        self.sar_fixed = false;
+        self.field_order = None;
+        self.field_split = false;
+    }
+
     /// Drain any buffered frames from the encoder at end-of-stream.
     /// No-op if the encoder was never opened.
     pub fn flush(&mut self) -> Result<Vec<video_codec::EncodedVideoFrame>, String> {

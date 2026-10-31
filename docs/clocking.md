@@ -965,11 +965,14 @@ The 1 Hz background task in `FlowRuntime::start` mirrors the master's
 `telemetry()` snapshot into the stats accumulator. Manager UI renders
 the kind label, lock chip, rate offset, p99 jitter, and the trim knob.
 
-`rate_source` names what last fed the source-PCR PLL a rate sample, while
-the PLL is the clock in use: `sender_timestamp` (the SRT sender's
-per-packet `srctime`), `pcr` (a PCR read from the bytes) or `none` (no
-sample yet). It is absent on every other kind and on a fallback rung
-(`ptp`, `wallclock`, `passthrough`). A flow configured for
+`rate_source` names what last fed the source-PCR PLL a rate sample:
+`sender_timestamp` (the SRT sender's per-packet `srctime`), `pcr` (a PCR
+read from the bytes) or `none` (no sample yet). It is present while the PLL
+is the flow's clock and no fallback has fired — locked, or still acquiring
+lock while the output holds on wallclock (`kind` `source_pcr_pll`,
+`locked: false`; on an assembled flow `fallback_active` is then `true` as
+well) — and absent on every other kind (`ptp`, `wallclock`, `passthrough`)
+and once a fallback has moved the flow to the PTP or wallclock rung. A flow configured for
 `sender_timestamp` that reads `pcr` is running on PCR because its packets
 reach the PLL without the sender timestamp (see the `sender_timestamp` kind
 above). The telemetry computed it from the start, but the copy into

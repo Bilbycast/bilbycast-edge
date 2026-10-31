@@ -910,13 +910,20 @@ impl TsDemuxer {
         // and other programs' PMTs. The program's PMT is chosen exactly as
         // the transcode stages choose it (`ts_pmt_edit::pmt_index`): an
         // exact program_number match wins; on a PID the PAT gives to no
-        // other program the first PMT is accepted too.
+        // other program the first PMT is accepted too. Only a section whose
+        // CRC_32 checks is acted on, as in the transcode stages: the
+        // assembler checks no continuity, so a multi-packet PMT that lost a
+        // middle packet completes from the next one's bytes, and parsed, a
+        // section whose ES loop no longer listed the video or the audio let
+        // go of it — the in-flight access unit lost, the parameter sets
+        // forgotten when the next good PMT brought it back.
         if Some(pid) == self.selected_pmt_pid {
             if let Some(payload) = Self::psi_payload(pkt) {
                 let sections: Vec<Vec<u8>> = self
                     .pmt_section
                     .feed(ts_pusi(pkt), payload)
                     .filter(|s| s.first() == Some(&0x02))
+                    .filter(|s| mpeg2_crc32(s) == 0)
                     .map(|s| s.to_vec())
                     .collect();
                 let chosen = match self.selected_program {
@@ -2327,7 +2334,8 @@ mod tests {
             0x00,
         ];
         section.extend_from_slice(&es_loop);
-        section.extend_from_slice(&[0, 0, 0, 0]); // CRC (not validated)
+        let crc = mpeg2_crc32(&section);
+        section.extend_from_slice(&crc.to_be_bytes());
         assert!(
             section.len() > 184,
             "test PMT must exceed one TS packet to exercise reassembly"
@@ -2600,6 +2608,37 @@ mod tests {
         let (video, cues) = counts(&demux.demux(&ts));
         assert!(video >= 1 && cues == 1, "{video} pictures, {cues} cues");
         assert_eq!(demux.video_pid(), Some(0x200));
+    }
+
+    /// A PMT section damaged in transit — its CRC_32 does not check — is not
+    /// acted on, as the transcode stages act on none: here the damage leaves
+    /// its ES loop without the video. Parsed, it let go of the video (and the
+    /// access unit in flight), and the next good PMT brought it back as a new
+    /// track with its parameter sets forgotten. Lost packets do it too: the
+    /// assembler checks no continuity, so a PMT spanning packets that loses
+    /// one completes from whatever comes next.
+    #[test]
+    fn a_damaged_pmt_is_not_acted_on() {
+        let both = [(0x1B, 0x200), (0x0F, 0x300)];
+        let mut demux = TsDemuxer::new(None);
+        let mut ts = build_pat(0x100).to_vec();
+        ts.extend(pmt_packets(0, &both));
+        let _ = demux.demux(&ts);
+        assert_eq!(demux.video_pid(), Some(0x200));
+
+        // Version 1, the video's stream_type damaged: the ES loop starts 12
+        // bytes into the section, which starts after the pointer_field.
+        let mut damaged = pmt_packets(1, &both);
+        assert_eq!(damaged[5 + 12], 0x1B);
+        damaged[5 + 12] = 0x99;
+        let _ = demux.demux(&damaged);
+        assert_eq!(demux.video_pid(), Some(0x200), "the video stays selected");
+        assert!(demux.pes_assemblers.contains_key(&0x200), "with its assembler");
+        assert_eq!(demux.audio_track(), Some((0x300, 0x0F)));
+
+        // An intact PMT that drops the video still lets go of it.
+        let _ = demux.demux(&pmt_packets(2, &[(0x0F, 0x300)]));
+        assert_eq!(demux.video_pid(), None);
     }
 
     // ── Audio AUs across PES boundaries ──
