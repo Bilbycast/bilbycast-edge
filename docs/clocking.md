@@ -748,8 +748,16 @@ about −16 500 s and was flagged. Pinned by
 `interleaved_program_clocks_are_not_discontinuities`,
 `a_pcr_jump_signal_lands_on_its_own_pid` and `only_a_pcr_jump_arms_a_di`. The watch still stamps its DI
 one PCR after the jump it saw (it observes the fixer's output); the remux
-treats such a DI as no epoch (above). The watch arms that DI and nothing
-else: CC is untouched. Until edge#214 its first signal also switched the
+treats such a DI as no epoch (above). It arms none when the jumped PCR
+carries DI already — the muxer-mode rewriter's on a jump it saw, the
+fixer's on a switch's first PCR, or the source's own — so one new time base
+takes one DI. Until 2026-10 it armed one regardless, and a second DI landed
+one PCR late after every source jump in muxer mode and every Take between
+`passthrough_clock` or bonded inputs on different epochs, against gate
+10's one event per DI (`a_jump_already_carrying_a_di_arms_no_second`). The
+watch runs only on a flow with an input that carries TS, and the fixer
+ignores a report made while an input that does not is on air. The watch
+arms that DI and nothing else: CC is untouched. Until edge#214 its first signal also switched the
 fixer into renumbering every CC for the rest of the flow, so after the
 first outage or loop no later loss showed on the outputs or in
 `cc_errors`. Every datagram the fixer rewrote, which from then on was every

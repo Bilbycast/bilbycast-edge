@@ -43,16 +43,21 @@
 //! the CC jump (PES buffer flush) and pick up the new stream at the next
 //! PES start. This keeps the fixer codec-agnostic and works unchanged for
 //! H.264, HEVC, JPEG XS, SMPTE 2110 uncompressed, or any future format.
-//! A non-TS payload (ST 2110-30/-31/-40, `rtp_audio`, MXL audio) goes
-//! through it too and is left unchanged, except that while a DI is pending
-//! (on any PID after a switch, on that PID after a source discontinuity) a
-//! 188-byte stride that happens to start 0x47 and parse as a PCR takes the
-//! DI bit.
+//! A non-TS payload (ST 2110-30/-31/-40, `rtp_audio`, MXL audio without
+//! `audio_encode`) never reaches it: the fixer task forwards such an
+//! input's datagrams as they came (`flow::FixerCommand::OpaquePacket`).
+//! Read in 188-byte strides, PCM or ANC bytes that happened to start 0x47
+//! and parse as a PCR used to take a pending DI bit, and a cached "PAT" of
+//! such noise could be injected at the next switch.
 //!
 //! The fixer is owned by the per-flow fixer task (`flow::ts_fixer_task`),
 //! which every per-input forwarder of the flow feeds over a channel.
 //! Packets of the active input go through [`process_packet`]; those of
-//! passive inputs go to [`observe_passive`] to pre-warm the PSI cache.
+//! passive inputs go to [`observe_passive`] to pre-warm the PSI cache. The
+//! task also keeps the flow's broadcast in one TS framing — RTP-wrapped or
+//! raw — whichever inputs it switches between ([`FlowFraming`]), and sends
+//! a switch's PSI in the framing of the datagram it precedes
+//! ([`frame_switch_psi`]).
 //! Dead-input periods — when the operator has switched to an input whose
 //! source isn't currently transmitting — are handled at the forwarder
 //! level (see `spawn_input_forwarder` in `flow.rs`), which emits 250 ms-
@@ -494,6 +499,190 @@ impl TsContinuityFixer {
         match out {
             Some(buf) => ProcessResult::Rewritten(Bytes::from(buf)),
             None => ProcessResult::Unchanged,
+        }
+    }
+}
+
+/// TS packets in an RTP datagram the edge builds itself: a switch's PSI on
+/// an RTP-framed input ([`frame_switch_psi`]), and a raw-TS input's
+/// datagrams on an RTP-framed flow ([`FlowFraming`]). Six, not the seven of
+/// a raw-TS datagram: the 12-byte RTP header and seven packets come to 1328
+/// bytes, past the 1316-byte live message an SRT output sends each item in,
+/// which would split the datagram and leave its tail without a header.
+const EDGE_RTP_TS_PACKETS: usize = 6;
+
+/// One RTP datagram of `ts` under the header fields given, as the flow
+/// broadcast carries it, received with `template` and carrying
+/// `sender_timestamp_us`. A sender timestamp is the sampler's per-datagram
+/// clock sample, so only one datagram may carry each.
+fn edge_rtp_datagram(
+    ts: &[u8],
+    payload_type: u8,
+    seq: u16,
+    timestamp: u32,
+    ssrc: u32,
+    template: &RtpPacket,
+    sender_timestamp_us: Option<i64>,
+) -> RtpPacket {
+    let mut data = Vec::with_capacity(RTP_HEADER_MIN_SIZE + ts.len());
+    data.extend_from_slice(&[0x80, payload_type & 0x7F]);
+    data.extend_from_slice(&seq.to_be_bytes());
+    data.extend_from_slice(&timestamp.to_be_bytes());
+    data.extend_from_slice(&ssrc.to_be_bytes());
+    data.extend_from_slice(ts);
+    RtpPacket {
+        data: Bytes::from(data),
+        sequence_number: seq,
+        rtp_timestamp: timestamp,
+        recv_time_us: template.recv_time_us,
+        is_raw_ts: false,
+        upstream_seq: None,
+        upstream_leg_id: None,
+        sender_timestamp_us,
+    }
+}
+
+/// Frame the PSI a switch injects ([`TsContinuityFixer::on_switch`], one
+/// raw-TS item per packet) like `first`, the newly active input's first
+/// datagram, which goes out right after it.
+///
+/// Raw TS when `first` is raw TS. When it is RTP, the PSI goes out as RTP
+/// too — datagrams of up to [`EDGE_RTP_TS_PACKETS`] packets under `first`'s
+/// SSRC, payload type and timestamp, numbered up to the one before
+/// `first`'s, so a receiver sees them as the input's own stream running
+/// into its first datagram. Those numbers are the input's datagrams just
+/// before it, which never reached this flow's outputs while the input was
+/// passive. Injected as raw TS, the PSI was the first datagram of the new
+/// input on an RTP-framed flow, and an SRT output passes framing through:
+/// a receiver that (re)connected then and settles its framing on the first
+/// datagram it gets settled raw TS, and dropped every RTP datagram after.
+///
+/// An RTP `first` too short to hold a header injects nothing: raw PSI ahead
+/// of RTP is the mix this exists to prevent, and the receiver takes the
+/// PSI from the stream itself within a repetition interval.
+pub fn frame_switch_psi(injected: Vec<RtpPacket>, first: &RtpPacket) -> Vec<RtpPacket> {
+    if first.is_raw_ts || injected.is_empty() {
+        return injected;
+    }
+    let header = &first.data;
+    if header.len() < RTP_HEADER_MIN_SIZE || header[0] >> 6 != 2 {
+        return Vec::new();
+    }
+    let payload_type = header[1] & 0x7F;
+    let seq = u16::from_be_bytes([header[2], header[3]]);
+    let timestamp = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    let ssrc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+    let ts: Vec<u8> = injected.iter().flat_map(|p| p.data.iter().copied()).collect();
+    let chunks: Vec<&[u8]> = ts.chunks(EDGE_RTP_TS_PACKETS * TS_PACKET_SIZE).collect();
+    let n = chunks.len() as u16;
+    chunks
+        .into_iter()
+        .zip(0u16..)
+        .map(|(chunk, i)| {
+            edge_rtp_datagram(chunk, payload_type, seq.wrapping_sub(n - i), timestamp, ssrc, first, None)
+        })
+        .collect()
+}
+
+/// The PSI a switch injects ([`TsContinuityFixer::on_switch`], one item per
+/// packet) as raw-TS items of up to seven packets, under `first`'s
+/// timestamp and receive time: for a flow whose framing `first`, the
+/// datagram it goes out ahead of, is not in, where [`FlowFraming::conform`]
+/// puts the PSI in the flow's framing with `first` — wrapped six packets to
+/// a datagram rather than one, or passed.
+pub fn bundle_switch_psi(injected: Vec<RtpPacket>, first: &RtpPacket) -> Vec<RtpPacket> {
+    super::packet::bundle_ts_packets(injected.into_iter().map(|p| p.data).collect())
+        .into_iter()
+        .map(|data| RtpPacket {
+            data,
+            sequence_number: 0,
+            rtp_timestamp: first.rtp_timestamp,
+            recv_time_us: first.recv_time_us,
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        })
+        .collect()
+}
+
+/// The one TS framing a flow's broadcast carries: the framing of the first
+/// media datagram its fixer task forwards — RTP-wrapped or raw TS.
+///
+/// A multi-input flow may switch between an RTP-framed input and a raw-TS
+/// one, and an output that passes framing through (SRT) would then carry
+/// both on one connection; a receiver that settles its framing on the first
+/// datagram it gets drops every datagram in the other. So a datagram in the
+/// other framing is converted here, once, for every output: an RTP
+/// datagram on a raw-TS flow loses its RTP header, and a raw-TS datagram on
+/// an RTP-framed flow is wrapped in the flow's own RTP header — its own
+/// SSRC and sequence numbers, [`EDGE_RTP_TS_PACKETS`] packets to a
+/// datagram. That SSRC changes at the Take like any switch between two RTP
+/// inputs; it is never interleaved with an input's. A flow whose inputs
+/// all share one framing never converts anything.
+///
+/// The idle keepalive (`flow::null_ts_packet`) is not conformed: it is raw
+/// TS on every flow, which an SRT output holds back from an RTP-framed
+/// stream (`output_srt::KeepaliveGate`) and an RTP output wraps itself.
+pub struct FlowFraming {
+    /// Whether the flow carries raw TS; `None` before its first media
+    /// datagram.
+    raw_ts: Option<bool>,
+    /// The flow's own RTP header, for raw-TS datagrams on an RTP-framed
+    /// flow.
+    wrap: super::output_rtp::RtpWrapState,
+}
+
+impl FlowFraming {
+    pub fn new() -> Self {
+        Self { raw_ts: None, wrap: super::output_rtp::RtpWrapState::new() }
+    }
+
+    /// Take `pkt`'s framing for the flow's if it has none yet: an active
+    /// input's datagram, before it — and anything a switch injects ahead
+    /// of it — is conformed. NULL packets alone settle nothing: a raw-TS
+    /// datagram of them says nothing of how the input frames its media.
+    pub fn observe(&mut self, pkt: &RtpPacket) {
+        if self.raw_ts.is_none() && !(pkt.is_raw_ts && is_null_ts_only(&pkt.data)) {
+            self.raw_ts = Some(pkt.is_raw_ts);
+        }
+    }
+
+    /// Whether `pkt` goes out in the framing it came in.
+    pub fn passes(&self, pkt: &RtpPacket) -> bool {
+        self.raw_ts.is_none_or(|raw| raw == pkt.is_raw_ts)
+    }
+
+    /// Hand `pkt` to `emit` in the flow's framing: as it came when it is
+    /// already in it (the only case on a flow whose inputs share one),
+    /// otherwise stripped of its RTP header or wrapped in the flow's.
+    pub fn conform(&mut self, pkt: RtpPacket, mut emit: impl FnMut(RtpPacket)) {
+        match self.raw_ts {
+            Some(true) if !pkt.is_raw_ts => {
+                let start = pkt.data.len() - strip_rtp_header(&pkt).len();
+                if start < pkt.data.len() {
+                    emit(RtpPacket { data: pkt.data.slice(start..), is_raw_ts: true, ..pkt });
+                }
+            }
+            Some(false) if pkt.is_raw_ts => {
+                let mut sender_timestamp_us = pkt.sender_timestamp_us;
+                for chunk in pkt.data.chunks(EDGE_RTP_TS_PACKETS * TS_PACKET_SIZE) {
+                    let header = self.wrap.build_header(pkt.rtp_timestamp);
+                    let seq = u16::from_be_bytes([header[2], header[3]]);
+                    let timestamp = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+                    let ssrc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+                    emit(edge_rtp_datagram(
+                        chunk,
+                        header[1],
+                        seq,
+                        timestamp,
+                        ssrc,
+                        &pkt,
+                        sender_timestamp_us.take(),
+                    ));
+                }
+            }
+            _ => emit(pkt),
         }
     }
 }
@@ -1634,5 +1823,115 @@ mod tests {
             assert!(matches!(fixer.process_packet("a", &pcr), ProcessResult::Unchanged));
         }
         assert_eq!(fixer.pending_di_pids, vec![0x300], "still pending for its own PID");
+    }
+
+    /// An RTP datagram under `ssrc` numbered `seq` carrying `ts`, with a CSRC
+    /// word in its header so a 12-byte strip would be wrong.
+    fn rtp_with_csrc(ssrc: u32, seq: u16, ts: &[u8]) -> RtpPacket {
+        let mut data = vec![0x81, 0x80 | 33];
+        data.extend_from_slice(&seq.to_be_bytes());
+        data.extend_from_slice(&3_000u32.to_be_bytes());
+        data.extend_from_slice(&ssrc.to_be_bytes());
+        data.extend_from_slice(&[0xC5; 4]);
+        data.extend_from_slice(ts);
+        RtpPacket { data: Bytes::from(data), is_raw_ts: false, sequence_number: seq, ..make_rtp_packet(&[]) }
+    }
+
+    fn header_fields(p: &RtpPacket) -> (u8, u8, u16, u32, u32) {
+        let d = &p.data;
+        (
+            d[0],
+            d[1],
+            u16::from_be_bytes([d[2], d[3]]),
+            u32::from_be_bytes([d[4], d[5], d[6], d[7]]),
+            u32::from_be_bytes([d[8], d[9], d[10], d[11]]),
+        )
+    }
+
+    /// A switch's PSI ahead of an RTP datagram goes out as RTP datagrams of
+    /// up to six packets in that datagram's stream — its SSRC, payload type
+    /// and timestamp, numbered up to the one before it — with no marker,
+    /// CSRC or extension of its own. Ahead of raw TS it is left as it was,
+    /// and ahead of an RTP datagram too short to hold a header nothing is
+    /// injected rather than raw TS.
+    #[test]
+    fn switch_psi_takes_the_framing_of_the_datagram_it_precedes() {
+        let raw_psi: Vec<RtpPacket> =
+            (0..8u8).map(|cc| make_rtp_packet(&build_pat(&[(1, 0x1000)], cc))).collect();
+        let first = rtp_with_csrc(0xFEED, 2, &build_ts_packet(0x100, 0));
+        let framed = frame_switch_psi(raw_psi.clone(), &first);
+        assert_eq!(framed.len(), 2, "eight packets: six, then two");
+        for (p, (seq, len)) in framed.iter().zip([(0u16, 6usize), (1, 2)]) {
+            assert!(!p.is_raw_ts);
+            assert_eq!(header_fields(p), (0x80, 33, seq, 3_000, 0xFEED));
+            assert_eq!(p.sequence_number, seq);
+            assert_eq!(p.data.len(), RTP_HEADER_MIN_SIZE + len * TS_PACKET_SIZE);
+        }
+        let ts: Vec<u8> = framed.iter().flat_map(|p| p.data[RTP_HEADER_MIN_SIZE..].to_vec()).collect();
+        let want: Vec<u8> = raw_psi.iter().flat_map(|p| p.data.to_vec()).collect();
+        assert_eq!(ts, want, "the PSI bytes in order");
+
+        // Numbered back across the wrap.
+        let framed = frame_switch_psi(raw_psi.clone(), &rtp_with_csrc(1, 0, &[]));
+        assert_eq!(framed.iter().map(|p| header_fields(p).2).collect::<Vec<_>>(), [0xFFFE, 0xFFFF]);
+
+        let raw_first = make_rtp_packet(&build_ts_packet(0x100, 0));
+        assert_eq!(frame_switch_psi(raw_psi.clone(), &raw_first).len(), 8, "raw ahead of raw");
+        let short = RtpPacket { data: Bytes::from_static(&[0x80, 33, 0, 1]), is_raw_ts: false, ..raw_first };
+        assert!(frame_switch_psi(raw_psi, &short).is_empty(), "nothing rather than raw TS");
+    }
+
+    fn conformed(framing: &mut FlowFraming, pkt: RtpPacket) -> Vec<RtpPacket> {
+        let mut out = Vec::new();
+        framing.conform(pkt, |p| out.push(p));
+        out
+    }
+
+    /// The flow's framing is its first media datagram's; NULL packets alone
+    /// settle nothing. On an RTP-framed flow raw TS is wrapped in the flow's
+    /// own header — one SSRC, consecutive numbers, the item's timestamp and
+    /// receive time kept, its sender timestamp on the first datagram only —
+    /// six packets to a datagram; RTP passes as it came. On a raw-TS flow
+    /// RTP loses its header, CSRCs included.
+    #[test]
+    fn a_flow_keeps_its_first_datagrams_framing() {
+        let seven: Vec<u8> = (0..7u8).flat_map(|cc| build_ts_packet(0x100, cc)).collect();
+        let null7: Vec<u8> = (0..7).flat_map(|_| build_ts_packet(NULL_PID, 0)).collect();
+
+        let mut rtp_flow = FlowFraming::new();
+        rtp_flow.observe(&make_rtp_packet(&null7));
+        assert!(rtp_flow.passes(&make_rtp_packet(&seven)), "NULL packets settled nothing");
+        let first = rtp_with_csrc(0xA, 9, &build_ts_packet(0x100, 0));
+        rtp_flow.observe(&first);
+        assert_eq!(conformed(&mut rtp_flow, first.clone())[0].data, first.data, "as it came");
+        let mut raw_item = make_rtp_packet(&seven);
+        raw_item.rtp_timestamp = 777;
+        raw_item.recv_time_us = 42;
+        raw_item.sender_timestamp_us = Some(5);
+        assert!(!rtp_flow.passes(&raw_item));
+        let wrapped = conformed(&mut rtp_flow, raw_item.clone());
+        assert_eq!(wrapped.len(), 2);
+        let (_, pt, seq0, ts, ssrc) = header_fields(&wrapped[0]);
+        assert_eq!((pt, ts), (33, 777));
+        assert_ne!(ssrc, 0xA);
+        for (i, p) in wrapped.iter().enumerate() {
+            assert!(!p.is_raw_ts);
+            assert_eq!(header_fields(p).4, ssrc, "one SSRC");
+            assert_eq!(header_fields(p).2, seq0.wrapping_add(i as u16), "numbered on");
+            let sender_timestamp = if i == 0 { Some(5) } else { None };
+            assert_eq!((p.recv_time_us, p.sender_timestamp_us), (42, sender_timestamp), "one sample");
+        }
+        assert_eq!(&wrapped[0].data[RTP_HEADER_MIN_SIZE..], &seven[..6 * TS_PACKET_SIZE]);
+        assert_eq!(&wrapped[1].data[RTP_HEADER_MIN_SIZE..], &seven[6 * TS_PACKET_SIZE..]);
+        let next = conformed(&mut rtp_flow, raw_item);
+        assert_eq!(header_fields(&next[0]).2, seq0.wrapping_add(2), "the numbers carry on");
+
+        let mut raw_flow = FlowFraming::new();
+        raw_flow.observe(&make_rtp_packet(&seven));
+        let stripped = conformed(&mut raw_flow, rtp_with_csrc(0xA, 9, &build_ts_packet(0x100, 3)));
+        assert_eq!(stripped.len(), 1);
+        assert!(stripped[0].is_raw_ts);
+        assert_eq!(&stripped[0].data[..], &build_ts_packet(0x100, 3)[..]);
+        assert!(conformed(&mut raw_flow, rtp_with_csrc(0xA, 10, &[])).is_empty(), "a header alone");
     }
 }
