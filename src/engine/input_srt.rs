@@ -26,10 +26,9 @@ use crate::srt::bond_supervisor::{
 use crate::srt::connection::{
     accept_srt_connection, acquire_redundant_leg, bind_srt_listener_for_bonded_input,
     bind_srt_listener_for_input, bind_srt_listener_for_redundancy, connect_srt_group_observed,
-    connect_srt_with_retry_observed,
-    spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller,
-    release_leg_acquire, spawn_srt_stats_poller, LegAcquire, LegAcquired, SrtConnectionParams,
-    CONNECT_FAILED_THRESHOLD, LEG_REACQUIRE_DELAY,
+    connect_srt_with_retry_observed, leg_release_bound, release_leg_acquire,
+    spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller,
+    LegAcquire, LegAcquired, SrtConnectionParams, CONNECT_FAILED_THRESHOLD, LEG_REACQUIRE_DELAY,
 };
 use crate::stats::collector::{FlowStatsAccumulator, SrtInputSocket, SrtInputStats};
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
@@ -1093,7 +1092,11 @@ async fn srt_input_redundant_loop(
             let _ = listener.close().await;
         }
     };
-    tokio::join!(release_leg_acquire(acquire1), release_leg_acquire(acquire2), attached);
+    tokio::join!(
+        release_leg_acquire(acquire1, leg_release_bound(config.connect_timeout_secs)),
+        release_leg_acquire(acquire2, leg_release_bound(redundancy.connect_timeout_secs)),
+        attached
+    );
     outcome
 }
 

@@ -660,9 +660,9 @@ pub enum LegAcquired {
 /// It is not free while it waits. `select!` polls every enabled branch each
 /// time the loop wakes, so a pending acquisition is polled about once per
 /// packet the input receives or payload the output sends, for as long as its
-/// leg is down: a `CancellationToken::is_cancelled` (an uncontended mutex
-/// lock, the same one the loop's own cancel branch takes every wake) and a
-/// timer or channel poll. Nothing is allocated, and the attached legs' data
+/// leg is down: a `CancellationToken::is_cancelled` (an uncontended lock of
+/// the legs' token's own mutex, a sibling of the one the loop's cancel
+/// branch takes every wake) and a timer or channel poll. Nothing is allocated, and the attached legs' data
 /// path is otherwise untouched.
 pub type LegAcquire<'a> = Pin<Box<dyn Future<Output = LegAcquired> + Send + 'a>>;
 
@@ -755,10 +755,18 @@ pub fn acquire_redundant_leg<'a>(
 }
 
 /// How long a stopping 2022-7 input or output waits in
-/// [`release_leg_acquire`] for a leg's connect to finish: past libsrt's
-/// default 3 s connect timeout, and under the 5 s a flow allows a stopping
-/// task before it gives up on it (or, removing an output, aborts it).
-pub const LEG_RELEASE_BOUND: Duration = Duration::from_secs(4);
+/// [`release_leg_acquire`] for a leg's connect to finish: past srt-transport's
+/// own hard deadline on a connect, the leg's connect timeout (libsrt's 3 s
+/// unless `connect_timeout_secs` sets one) plus 2 s, by a second. That
+/// deadline, not libsrt's, is what ends a rendezvous attempt, whose connector
+/// libsrt keeps for ten times the connect timeout; a fixed 4 s let a
+/// rendezvous leg, or a caller with a longer timeout, be dropped unfinished.
+/// On defaults this outlasts the 5 s a flow allows a stopping task, so a
+/// release still waiting then finishes in the detached task (an output being
+/// removed is aborted at 5 s instead, as a leg 1 connect running inline was).
+pub fn leg_release_bound(connect_timeout_secs: Option<u64>) -> Duration {
+    Duration::from_secs(connect_timeout_secs.unwrap_or(3)) + Duration::from_secs(3)
+}
 
 /// Finish a 2022-7 leg's pending acquisition once its `cancel` has fired,
 /// and close whatever it connected.
@@ -769,16 +777,17 @@ pub const LEG_RELEASE_BOUND: Duration = Duration::from_secs(4);
 /// the connection lives on, sending keepalives and no data, until the
 /// process exits — and a far-end listener leg attached to it never reports
 /// it lost. After the cancel every other wait in an acquisition returns at
-/// once, while a connect already sent finishes within libsrt's connect
-/// timeout, so this waits for it and closes the socket it yields, bounded by
-/// [`LEG_RELEASE_BOUND`]; past that it is dropped, as before. (An accept
+/// once, while a connect already sent finishes within srt-transport's hard
+/// deadline (the connect timeout plus 2 s), so this waits for it and closes
+/// the socket it yields, bounded by `bound` ([`leg_release_bound`] of the
+/// leg's connect timeout); past that it is dropped, as before. (An accept
 /// dropped inside the wrapper's own `from_accepted` has the same hole, which
 /// only srt-transport can close.)
-pub async fn release_leg_acquire(acquire: Option<LegAcquire<'_>>) {
+pub async fn release_leg_acquire(acquire: Option<LegAcquire<'_>>, bound: Duration) {
     let Some(acquire) = acquire else {
         return;
     };
-    match tokio::time::timeout(LEG_RELEASE_BOUND, acquire).await {
+    match tokio::time::timeout(bound, acquire).await {
         Ok(LegAcquired::Connected(socket, listener)) => {
             let _ = socket.close().await;
             if let Some(listener) = listener {
@@ -787,7 +796,7 @@ pub async fn release_leg_acquire(acquire: Option<LegAcquire<'_>>) {
         }
         Ok(LegAcquired::Cancelled | LegAcquired::Failed(_)) => {}
         Err(_) => tracing::warn!(
-            "SRT 2022-7 leg still connecting {LEG_RELEASE_BOUND:?} after its stop; dropped unfinished"
+            "SRT 2022-7 leg still connecting {bound:?} after its stop; dropped unfinished"
         ),
     }
 }
@@ -1938,8 +1947,8 @@ mod tests {
         let peer_cancel = CancellationToken::new();
         let (released, peer) = tokio::join!(
             tokio::time::timeout(
-                super::LEG_RELEASE_BOUND + Duration::from_secs(1),
-                super::release_leg_acquire(Some(acquire)),
+                super::leg_release_bound(None) + Duration::from_secs(1),
+                super::release_leg_acquire(Some(acquire), super::leg_release_bound(None)),
             ),
             async {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1993,8 +2002,8 @@ mod tests {
         );
         cancel.cancel();
         tokio::time::timeout(
-            super::LEG_RELEASE_BOUND + Duration::from_secs(1),
-            super::release_leg_acquire(Some(acquire)),
+            super::leg_release_bound(Some(1)) + Duration::from_secs(1),
+            super::release_leg_acquire(Some(acquire), super::leg_release_bound(Some(1))),
         )
         .await
         .expect("the release ends within its bound");
