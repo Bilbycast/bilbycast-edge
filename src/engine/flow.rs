@@ -7599,7 +7599,10 @@ impl AssemblySwap<'_> {
     /// `pid_bus_assembly_swap_superseded`, `config` untouched. The check
     /// holds until the caller persists, because every route that replaces
     /// a runtime does so before it takes the config write lock to persist,
-    /// or under it.
+    /// or under it, and reads the config it starts the new runtime from only
+    /// once the old one has gone ([`crate::engine::manager::FlowManager::restart_from_config`]):
+    /// a swap saved before that read is what the new runtime runs, and one
+    /// after it finds its runtime gone.
     pub fn record(&self, config: &mut AppConfig, assembly: FlowAssembly) -> Result<()> {
         let runtime = self.runtime;
         let flow_id = &runtime.config.config.id;

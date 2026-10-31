@@ -271,7 +271,7 @@ Retrieve a single input's full `InputDefinition`. **Auth:** any role. Returns 40
 
 ### POST /api/v1/inputs
 
-Create a new input definition. **Auth:** `admin`. Body is an `InputDefinition`. Validated and persisted. Returns 400 on validation failure — an `id` starting with `hitless:`, reserved for the Hitless mergers' PID-bus keys, included (`input_id_reserved`) — 409 if the ID is already used by an input or an output.
+Create a new input definition. **Auth:** `admin`. Body is an `InputDefinition`. Validated and persisted. Returns 400 on validation failure — an `id` starting with `hitless:`, reserved for the Hitless mergers' PID-bus keys, included (`input_id_reserved`), and an input that a seq-aware Hitless slot already names as a leg (a flow can be created naming a leg not yet defined) but that would reach the PID bus without the upstream sequence number that slot merges on (`hitless_seq_aware_leg_unsequenced`, as on an update; until 2026-10-31 such an input was created and only the merger's run-time fallback to primary preference caught it) — 409 if the ID is already used by an input or an output.
 
 ### PUT /api/v1/inputs/{input_id}
 
@@ -647,7 +647,7 @@ curl -X POST http://localhost:8080/api/v1/flows/main-feed/stop \
 
 ### POST /api/v1/flows/{flow_id}/restart
 
-Restart a flow (stop + start). Destroys the running instance (if any) and creates a fresh one from the current configuration. Useful for picking up config changes or recovering from transient errors.
+Restart a flow (stop + start). Destroys the running instance (if any) and creates a fresh one from the configuration as it stands once the old instance has gone, so a PID-bus plan swap saved while the restart runs is either the plan the flow restarts on or refused `pid_bus_assembly_swap_superseded`, never saved beside a flow running another plan (until 2026-10-31 the configuration was read before the stop). Useful for picking up config changes or recovering from transient errors. A flow missing from the configuration answers 404 and one that does not resolve 400, both before anything stops.
 
 **Auth:** Requires `admin` role.
 

@@ -478,25 +478,24 @@ pub async fn restart_flow(
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let config = state.config.read().await;
-    let flow = config
-        .flows
-        .iter()
-        .find(|f| f.id == flow_id)
-        .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?
-        .clone();
-    let resolved = resolve_flow(&config, &flow)?;
-    drop(config);
-
-    // Stop if running
-    if state.flow_manager.is_running(&flow_id) {
-        let _ = state.flow_manager.destroy_flow(&flow_id).await;
+    // Refused before anything stops: a flow the config lacks, or one that
+    // does not resolve.
+    {
+        let config = state.config.read().await;
+        let flow = config
+            .flows
+            .iter()
+            .find(|f| f.id == flow_id)
+            .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?;
+        resolve_flow(&config, flow)?;
     }
 
-    // Start
+    // Stop, then start from the config as it stands once the old run has
+    // gone, so a plan swap saved meanwhile is the plan the flow restarts on
+    // (`FlowManager::restart_from_config`).
     let runtime = state
         .flow_manager
-        .create_flow(resolved)
+        .restart_from_config(&state.config, &flow_id)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to restart flow '{flow_id}': {e}")))?;
 

@@ -3490,8 +3490,18 @@ async fn execute_command(
                 }
                 return Err(e);
             }
-            if !cfg.inputs.iter().any(|i| i.id == input_id) {
-                cfg.inputs.push(input);
+            // The definition saved is the one the flow now runs, which the
+            // checks above judged: an input the node already has takes the
+            // definition sent, keeping its `active` flag, which only
+            // `activate_input` moves. It used to keep the definition it had,
+            // so the flow ran one input and `config.json` named another.
+            match cfg.inputs.iter_mut().find(|i| i.id == input_id) {
+                Some(existing) => {
+                    let active = existing.active;
+                    *existing = input;
+                    existing.active = active;
+                }
+                None => cfg.inputs.push(input),
             }
             if let Some(flow) = cfg.flows.iter_mut().find(|f| f.id == flow_id)
                 && !flow.input_ids.contains(&input_id) {
@@ -3551,6 +3561,12 @@ async fn execute_command(
             if cfg.inputs.iter().any(|i| i.id == input.id) {
                 return Err(CommandError::new(format!("Input '{}' already exists", input.id)));
             }
+            // A seq-aware slot may already name this id — a targeted
+            // `create_flow` accepts a leg not yet defined — and the input
+            // created under it must carry the sequence that slot merges on.
+            crate::config::validation::validate_input_hitless_legs(&input, &cfg).map_err(|e| {
+                CommandError::with_code(format!("Invalid input: {e}"), "hitless_seq_aware_leg_unsequenced")
+            })?;
             let id = input.id.clone();
             cfg.inputs.push(input);
             persist_config(&cfg, config_path, secrets_path).await?;
@@ -8346,6 +8362,101 @@ mod reserved_input_id_tests {
             .await
             .expect_err("no flow f");
         assert_ne!(err.code.as_deref(), Some("input_id_reserved"), "{}", err.message);
+    }
+
+    /// `create_input` refuses an input a seq-aware Hitless slot already names
+    /// as a leg when it would reach the bus without the sequence the slot
+    /// merges on — a targeted `create_flow` accepts a leg not yet defined —
+    /// and `add_input` of an input the node already has saves the definition
+    /// it hot-adds, not the one it had, so the config names what runs.
+    #[tokio::test]
+    async fn create_input_judges_hitless_legs_and_add_input_saves_what_runs() {
+        let (event_sender, _events) = crate::manager::events::event_channel();
+        let fm = Arc::new(FlowManager::new(
+            Arc::new(StatsCollector::new()),
+            false,
+            event_sender.clone(),
+            Arc::new(SystemResourceState::new()),
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ));
+        let tm = Arc::new(TunnelManager::new(event_sender));
+        let udp = |id: &str, port: u16| {
+            serde_json::json!({
+                "id": id, "name": id, "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+            })
+        };
+        let pid = |input_id: &str| {
+            serde_json::json!({ "type": "pid", "input_id": input_id, "source_pid": 256 })
+        };
+        let config = AppConfig {
+            inputs: serde_json::from_value(serde_json::json!([udp("a", 29891), udp("b", 29892)]))
+                .expect("inputs fixture"),
+            flows: serde_json::from_value(serde_json::json!([
+                { "id": "f", "name": "f", "input_ids": ["a"], "output_ids": [] },
+                {
+                    "id": "slots", "name": "slots", "input_ids": [], "output_ids": [],
+                    "assembly": {
+                        "kind": "spts",
+                        "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": [{
+                            "source": {
+                                "type": "hitless", "mode": "seq_aware",
+                                "primary": pid("leg-p"), "backup": pid("leg-b")
+                            },
+                            "out_pid": 256, "stream_type": 27
+                        }] }]
+                    }
+                }
+            ]))
+            .expect("flows fixture"),
+            ..Default::default()
+        };
+        fm.create_flow(config.resolve_flow(&config.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+        let cfg = Arc::new(RwLock::new(config));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = async |action: &str, body: serde_json::Value| {
+            execute_command(
+                action,
+                &body,
+                &fm,
+                &tm,
+                &cfg,
+                &dir.path().join("config.json"),
+                &dir.path().join("secrets.json"),
+                &WebrtcRegistry::default(),
+            )
+            .await
+        };
+        let checks = async {
+            let srt = serde_json::json!({
+                "id": "leg-b", "name": "leg-b", "type": "srt", "mode": "listener",
+                "local_addr": "127.0.0.1:29893"
+            });
+            let err = run("create_input", serde_json::json!({ "input": srt }))
+                .await
+                .expect_err("an SRT leg carries no sequence");
+            assert_eq!(err.code.as_deref(), Some("hitless_seq_aware_leg_unsequenced"), "{}", err.message);
+            assert!(!cfg.read().await.inputs.iter().any(|i| i.id == "leg-b"));
+
+            run("add_input", serde_json::json!({ "flow_id": "f", "input": udp("b", 29894) }))
+                .await
+                .unwrap_or_else(|e| panic!("hot-add: {}", e.message));
+            let running = fm.get_runtime("f").expect("f runs");
+            let def = |inputs: &[InputDefinition]| {
+                let b = inputs.iter().find(|i| i.id == "b").expect("b").clone();
+                serde_json::to_value(b).expect("serialise")["bind_addr"].clone()
+            };
+            assert_eq!(def(&running.live_inputs.read().await), "127.0.0.1:29894", "what runs");
+            assert_eq!(def(&cfg.read().await.inputs), "127.0.0.1:29894", "what is saved");
+        };
+        checks.await;
+        let _ = fm.destroy_flow("f").await;
     }
 }
 
