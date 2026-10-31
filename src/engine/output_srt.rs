@@ -239,10 +239,11 @@ impl SendQueueTx {
             // Never let the byte ceiling mask a dead consumer. This check
             // runs *ahead* of `tx.try_send`, so on a closed channel it would
             // otherwise report `Full` where tokio would have said `Closed` —
-            // and `Closed` is the only thing that triggers a reconnect on a
-            // bonded output, whose `peer_is_gone()` is hardwired `false` for
-            // an `SrtGroup`. Reporting fullness there wedges the output into
-            // dropping every packet forever with no reconnect.
+            // and `Closed` is the reconnect trigger for a send task that died
+            // while libsrt still reads the connection up, which
+            // `peer_is_gone()` cannot see. Reporting fullness there wedges
+            // the output into dropping every packet forever with no
+            // reconnect.
             return Err(if self.tx.is_closed() {
                 tokio::sync::mpsc::error::TrySendError::Closed(item)
             } else {
@@ -396,14 +397,23 @@ impl SrtSendSink {
     /// A cheap poll of the socket's own status costs nothing per packet and
     /// does not depend on that contract holding.
     ///
-    /// Groups are exempt: a member breaking is ordinary bonding failover, and
-    /// the group survives it. Only libsrt's own group status could answer this
-    /// and it means something different, so the bonded path keeps relying on
-    /// the send error.
+    /// A group reads its own status, which a member breaking does not move:
+    /// libsrt keeps a group connected while any member is Idle or Running,
+    /// so ordinary bonding failover is not a gone peer. The bridge turns it
+    /// terminal when libsrt reads the group as failed, at the same moment it
+    /// drops the group's send channel, so this finds exactly what the next
+    /// send would. It is needed when there is no next send: while the input
+    /// is silent `KeepaliveGate` holds the flow's keepalives back, and a
+    /// group with every member lost would otherwise sit unnoticed, never
+    /// redialled, until the source delivers.
     fn peer_is_gone(&self) -> bool {
+        status_is_gone(self.status())
+    }
+
+    fn status(&self) -> SocketStatus {
         match self {
-            SrtSendSink::Socket(s) => socket_is_gone(s),
-            SrtSendSink::Group(_) => false,
+            SrtSendSink::Socket(s) => s.status(),
+            SrtSendSink::Group(g) => g.status(),
         }
     }
 }
@@ -411,8 +421,13 @@ impl SrtSendSink {
 /// `true` once libsrt has given `socket` up: broken (its peer silent past
 /// the idle timeout, or the connection refused) or closed.
 fn socket_is_gone(socket: &SrtSocket) -> bool {
+    status_is_gone(socket.status())
+}
+
+/// `true` for every libsrt state from which no further I/O is possible.
+fn status_is_gone(status: SocketStatus) -> bool {
     matches!(
-        socket.status(),
+        status,
         SocketStatus::Broken
             | SocketStatus::Closing
             | SocketStatus::Closed
@@ -636,19 +651,19 @@ async fn srt_output_listener_loop(
         // Validate the connection is alive before committing to it.
         // Under high delay/loss, the listener may accept a stale connection
         // where the caller's handshake timed out and retried with a new socket ID.
-        // Send a few packets and check for ACK responses within 5 seconds.
+        // Send a few packets and check for ACK responses within 3 seconds of
+        // the first (`ProbeWindow`).
         let is_alive = {
             let mut test_rx = broadcast_tx.subscribe();
             let mut sent = 0u32;
             // The probe sends what it receives as it came, so it holds the
             // flow's keepalives back as the forward loop does.
             let mut keepalive_gate = KeepaliveGate::default();
-            let mut offered = false;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut window = ProbeWindow::new(tokio::time::Instant::now());
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break false,
-                    _ = tokio::time::sleep_until(deadline) => {
+                    _ = tokio::time::sleep_until(window.deadline()) => {
                         // Check if we received any ACKs
                         let srt_stats = socket.stats().await;
                         if srt_stats.pkt_recv_ack_total > 0 {
@@ -659,7 +674,7 @@ async fn srt_output_listener_loop(
                         // come: there is nothing to judge by. A stale
                         // connection then breaks on libsrt's idle timeout,
                         // which the forward loop checks every turn.
-                        if !offered {
+                        if !window.offered() {
                             break true;
                         }
                         tracing::warn!(
@@ -673,7 +688,7 @@ async fn srt_output_listener_loop(
                             if !keepalive_gate.admit(&packet, packet.is_raw_ts) {
                                 continue;
                             }
-                            offered = true;
+                            window.offer(tokio::time::Instant::now());
                             match srt_send_chunked(&socket, &packet.data).await {
                                 Ok(_) => {
                                     sent += 1;
@@ -1089,6 +1104,43 @@ impl KeepaliveGate {
     }
 }
 
+/// How long a listener output's liveness probe waits for an ACK.
+const PROBE_WINDOW: Duration = Duration::from_secs(3);
+
+/// When a listener output's liveness probe gives its verdict on a caller.
+///
+/// It judges the connection by the ACKs to what it sends, so its 3 s run
+/// from the first datagram it offers, not from the accept. While the input
+/// is silent `KeepaliveGate` holds the flow's keepalives back and there is
+/// nothing to send; run from the accept, the window would give media that
+/// first comes near its end no time for an ACK to come back over a long
+/// path, and a healthy caller would be dropped as stale. Offered nothing
+/// within 3 s of the accept, the probe has nothing to judge by and keeps the
+/// caller.
+struct ProbeWindow {
+    accepted: Instant,
+    first_offer: Option<Instant>,
+}
+
+impl ProbeWindow {
+    fn new(accepted: Instant) -> Self {
+        Self { accepted, first_offer: None }
+    }
+
+    /// Note a datagram offered to the caller at `now`.
+    fn offer(&mut self, now: Instant) {
+        self.first_offer.get_or_insert(now);
+    }
+
+    fn offered(&self) -> bool {
+        self.first_offer.is_some()
+    }
+
+    fn deadline(&self) -> Instant {
+        self.first_offer.unwrap_or(self.accepted) + PROBE_WINDOW
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn srt_output_forward_loop(
     config: &SrtOutputConfig,
@@ -1271,10 +1323,7 @@ async fn srt_output_forward_loop(
             tracing::warn!(
                 "SRT output '{}' peer gone (socket status {:?}), will reconnect",
                 config.id,
-                match &sink {
-                    SrtSendSink::Socket(s) => Some(s.status()),
-                    SrtSendSink::Group(_) => None,
-                }
+                sink.status()
             );
             break true;
         }
@@ -2883,10 +2932,11 @@ mod tests {
         // The wedge this guard exists to prevent: the byte check runs ahead
         // of `tx.try_send`, so a counter sitting at the ceiling would
         // report `Full` where tokio would say `Closed`. `Closed` is the
-        // only reconnect trigger on a bonded output — `peer_is_gone()` is
-        // hardwired `false` for an `SrtGroup` — so masking it drops every
-        // packet forever with no reconnect. Simulate the wedged counter
-        // directly rather than relying on a leak the Drop impl now fixes.
+        // only reconnect trigger for a send task that died while libsrt
+        // still reads the connection up — `peer_is_gone()` cannot see it —
+        // so masking it drops every packet forever with no reconnect.
+        // Simulate the wedged counter directly rather than relying on a
+        // leak the Drop impl now fixes.
         let (tx, rx) = send_queue();
         drop(rx);
         tx.queued_bytes
@@ -3929,5 +3979,316 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for the output to notice");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// The listener probe's 3 s run from the first datagram it offers: media
+    /// that first comes late in the window is still given all of it, and a
+    /// probe offered nothing gives its verdict 3 s after the accept.
+    #[test]
+    fn the_listener_probe_judges_from_its_first_offer() {
+        let accepted = Instant::now();
+        let mut window = ProbeWindow::new(accepted);
+        assert!(!window.offered());
+        assert_eq!(window.deadline(), accepted + PROBE_WINDOW);
+
+        let late = accepted + Duration::from_millis(2_800);
+        window.offer(late);
+        assert!(window.offered());
+        assert_eq!(window.deadline(), late + PROBE_WINDOW);
+        window.offer(late + Duration::from_millis(100));
+        assert_eq!(window.deadline(), late + PROBE_WINDOW, "the first offer counts");
+    }
+
+    /// A loopback UDP relay in front of `target`, holding each datagram
+    /// toward it `delay` before passing it on: a second address for one SRT
+    /// listener, or a long path to it. Each client address gets an upstream
+    /// socket of its own, so the far end sees each as a separate peer.
+    async fn udp_relay(
+        target: std::net::SocketAddr,
+        delay: Duration,
+        cancel: CancellationToken,
+    ) -> std::net::SocketAddr {
+        use tokio::net::UdpSocket;
+        let down = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = down.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut upstreams: std::collections::HashMap<
+                std::net::SocketAddr,
+                tokio::sync::mpsc::UnboundedSender<(Instant, Bytes)>,
+            > = std::collections::HashMap::new();
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let (n, client) = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    r = down.recv_from(&mut buf) => match r {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    },
+                };
+                let queue = match upstreams.get(&client) {
+                    Some(queue) => queue.clone(),
+                    None => {
+                        let up = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                        up.connect(target).await.unwrap();
+                        let (back, down, stop) = (up.clone(), down.clone(), cancel.clone());
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 2048];
+                            loop {
+                                tokio::select! {
+                                    _ = stop.cancelled() => break,
+                                    r = back.recv(&mut buf) => if let Ok(n) = r {
+                                        let _ = down.send_to(&buf[..n], client).await;
+                                    },
+                                }
+                            }
+                        });
+                        // One queue per client, so the delay keeps the order.
+                        let (queue, mut held) =
+                            tokio::sync::mpsc::unbounded_channel::<(Instant, Bytes)>();
+                        let stop = cancel.clone();
+                        tokio::spawn(async move {
+                            while let Some((due, datagram)) = held.recv().await {
+                                tokio::select! {
+                                    _ = stop.cancelled() => break,
+                                    _ = tokio::time::sleep_until(due) => {}
+                                }
+                                let _ = up.send(&datagram).await;
+                            }
+                        });
+                        upstreams.insert(client, queue.clone());
+                        queue
+                    }
+                };
+                let datagram = Bytes::copy_from_slice(&buf[..n]);
+                let _ = queue.send((Instant::now() + delay, datagram));
+            }
+        });
+        addr
+    }
+
+    /// Waits up to 10 s for an event whose message is `message`, keeping
+    /// every event read in `events`.
+    async fn wait_for_event(
+        events_rx: &mut tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        events: &mut Vec<crate::manager::events::Event>,
+        message: &str,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            while let Ok(event) = events_rx.try_recv() {
+                events.push(event);
+            }
+            if events.iter().any(|e| e.message == message) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {message:?}; saw {:?}",
+                events.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A listener output whose input first delivers late in the probe's
+    /// window keeps its caller over a long path: the probe judges from that
+    /// first media datagram, not from the accept. Run from the accept, the
+    /// window closed before the caller's ACK, 0.5 s on its way back, could
+    /// arrive, and a healthy caller was dropped as stale.
+    #[tokio::test]
+    async fn a_listener_output_whose_media_comes_late_keeps_a_distant_caller() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o1", "name": "o1", "mode": "listener",
+            "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }))
+        .expect("SRT output fixture");
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(64);
+        let (event_sender, mut events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let _output = spawn_srt_output(
+            config,
+            &tx,
+            stats,
+            cancel.child_token(),
+            SrtOutputCtx {
+                event_sender,
+                flow_id: "f1".into(),
+                input_format: None,
+                compressed_audio_input: false,
+                frame_rate_rx: None,
+                active_input_rx: tokio::sync::watch::channel(String::new()).1,
+            },
+        );
+        // The flow: its keepalive until `media` is set, then raw TS.
+        let media = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (pump_tx, pump_media, stop) = (tx.clone(), media.clone(), cancel.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {
+                        let item = if pump_media.load(Ordering::Relaxed) {
+                            published(PairHarness::media().to_vec(), true)
+                        } else {
+                            crate::engine::flow::null_ts_packet()
+                        };
+                        let _ = pump_tx.send(item);
+                    }
+                }
+            }
+        });
+        // Everything the caller sends, its ACKs among it, takes 0.5 s.
+        let relay = udp_relay(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            Duration::from_millis(500),
+            cancel.clone(),
+        )
+        .await;
+        let caller: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "caller", "remote_addr": relay.to_string(), "latency_ms": 200,
+                "connect_timeout_secs": 10
+            }))
+            .expect("SRT caller fixture");
+        let connect_cancel = cancel.clone();
+        let peer = tokio::spawn(async move {
+            crate::srt::connection::connect_srt_input(&caller, &connect_cancel).await
+        });
+        let mut events = Vec::new();
+        wait_for_event(&mut events_rx, &mut events, "SRT output 'o1' connected").await;
+        let accepted = Instant::now();
+        let peer = tokio::time::timeout(Duration::from_secs(10), peer)
+            .await
+            .expect("caller connects in time")
+            .expect("connect task")
+            .expect("caller connects");
+
+        // First media 2.6 s into the window: its ACK is back at about 3.1 s.
+        tokio::time::sleep_until(accepted + Duration::from_millis(2_600)).await;
+        media.store(true, Ordering::Relaxed);
+        let first = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+            .await
+            .expect("media arrives")
+            .expect("the connection stays up");
+        assert_eq!(&first.data[..], &PairHarness::media()[..]);
+
+        // Past the 3 s from the first media.
+        tokio::time::sleep_until(accepted + Duration::from_millis(6_500)).await;
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            !events.iter().any(|e| e.message.contains("stale connection")
+                || e.message.contains("disconnected")),
+            "{:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let more = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+            .await
+            .expect("media still arrives")
+            .expect("the connection is still up");
+        assert_eq!(&more.data[..], &PairHarness::media()[..]);
+    }
+
+    /// A bonded caller output whose input is silent still notices its group
+    /// fail: every member lost, it raises `disconnected` and redials. It has
+    /// nothing to send — the flow's keepalives are held back — so it reads
+    /// the group's status, which libsrt turns terminal only once no member is
+    /// left; a send used to be what found it.
+    #[tokio::test]
+    async fn a_silent_bonded_caller_output_notices_its_group_fail() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let peer_config: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+            .expect("SRT listener fixture");
+        let mut listener = crate::srt::connection::bind_srt_listener_for_bonded_input(&peer_config)
+            .await
+            .expect("the far end binds");
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        // A second address for the same listener: two members need two
+        // endpoints.
+        let relay = udp_relay(
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            Duration::ZERO,
+            cancel.clone(),
+        )
+        .await;
+        let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o1", "name": "o1", "mode": "caller",
+            "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200,
+            "bonding": { "mode": "broadcast", "endpoints": [
+                { "addr": format!("127.0.0.1:{port}") },
+                { "addr": relay.to_string() },
+            ] },
+        }))
+        .expect("SRT output fixture");
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(64);
+        let (event_sender, mut events_rx) = crate::manager::events::event_channel();
+        let _output = spawn_srt_output(
+            config,
+            &tx,
+            stats,
+            cancel.child_token(),
+            SrtOutputCtx {
+                event_sender,
+                flow_id: "f1".into(),
+                input_format: None,
+                compressed_audio_input: false,
+                frame_rate_rx: None,
+                active_input_rx: tokio::sync::watch::channel(String::new()).1,
+            },
+        );
+        let (pump_tx, stop) = (tx.clone(), cancel.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {
+                        let _ = pump_tx.send(crate::engine::flow::null_ts_packet());
+                    }
+                }
+            }
+        });
+        let group = tokio::time::timeout(
+            Duration::from_secs(10),
+            accept_srt_connection(&mut listener, &cancel),
+        )
+        .await
+        .expect("the output dials in time")
+        .expect("the far end accepts it");
+        // Both members up, so closing the far end leaves the output none.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let up = group
+                .member_stats()
+                .await
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m.member_status,
+                        srt_transport::MemberStatus::Idle | srt_transport::MemberStatus::Running
+                    )
+                })
+                .count();
+            if up == 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for both members");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut events = Vec::new();
+        wait_for_event(&mut events_rx, &mut events, "SRT bonded output 'o1' connected").await;
+
+        group.close().await.unwrap();
+        wait_for_event(&mut events_rx, &mut events, "SRT bonded output 'o1' disconnected").await;
     }
 }
