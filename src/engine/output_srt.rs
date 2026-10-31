@@ -34,6 +34,7 @@ use super::audio_302m::{S302mOutputPipeline, SRT_TS_DATAGRAM_BYTES};
 use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
+use super::ts_parse::is_null_ts_only;
 use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
@@ -401,16 +402,22 @@ impl SrtSendSink {
     /// the send error.
     fn peer_is_gone(&self) -> bool {
         match self {
-            SrtSendSink::Socket(s) => matches!(
-                s.status(),
-                SocketStatus::Broken
-                    | SocketStatus::Closing
-                    | SocketStatus::Closed
-                    | SocketStatus::NonExist
-            ),
+            SrtSendSink::Socket(s) => socket_is_gone(s),
             SrtSendSink::Group(_) => false,
         }
     }
+}
+
+/// `true` once libsrt has given `socket` up: broken (its peer silent past
+/// the idle timeout, or the connection refused) or closed.
+fn socket_is_gone(socket: &SrtSocket) -> bool {
+    matches!(
+        socket.status(),
+        SocketStatus::Broken
+            | SocketStatus::Closing
+            | SocketStatus::Closed
+            | SocketStatus::NonExist
+    )
 }
 
 /// Resolve `interface_binding` → `local_addr` for the primary leg and the
@@ -633,6 +640,10 @@ async fn srt_output_listener_loop(
         let is_alive = {
             let mut test_rx = broadcast_tx.subscribe();
             let mut sent = 0u32;
+            // The probe sends what it receives as it came, so it holds the
+            // flow's keepalives back as the forward loop does.
+            let mut keepalive_gate = KeepaliveGate::default();
+            let mut offered = false;
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
                 tokio::select! {
@@ -643,6 +654,14 @@ async fn srt_output_listener_loop(
                         if srt_stats.pkt_recv_ack_total > 0 {
                             break true;
                         }
+                        // Nothing was offered — a silent input whose
+                        // keepalives the gate held back — so no ACK could
+                        // come: there is nothing to judge by. A stale
+                        // connection then breaks on libsrt's idle timeout,
+                        // which the forward loop checks every turn.
+                        if !offered {
+                            break true;
+                        }
                         tracing::warn!(
                             "SRT output '{}' no ACK received after 3s, connection likely stale",
                             config.id
@@ -651,6 +670,10 @@ async fn srt_output_listener_loop(
                     }
                     result = test_rx.recv() => {
                         if let Ok(packet) = result {
+                            if !keepalive_gate.admit(&packet, packet.is_raw_ts) {
+                                continue;
+                            }
+                            offered = true;
                             match srt_send_chunked(&socket, &packet.data).await {
                                 Ok(_) => {
                                     sent += 1;
@@ -1030,6 +1053,42 @@ fn build_transcode_chain_for_srt(
     }
 }
 
+/// Keeps the flow's idle keepalives out of an SRT stream sent RTP-framed.
+///
+/// While its active input is silent a flow publishes raw-TS NULL packets
+/// (`flow::null_ts_packet`) — from its start until the input delivers, and
+/// through any later gap — and an SRT output sends each packet in its own
+/// framing, an RTP-framed input's with its RTP header, so one SRT stream
+/// would carry both. A receiver that settles the framing on the first
+/// datagram it gets (older bilbycast edges among them) then locks raw TS on
+/// a keepalive and reads every RTP header after it as TS.
+///
+/// So a datagram of NULL packets alone goes out only once the last media
+/// datagram this output sent went out raw TS. Before the first one the
+/// stream's framing is unknown and they are held back: SRT keeps the
+/// connection up with its own transport keepalive, and a NULL packet starts
+/// no decoder, so a receiver loses nothing it could use. A raw-TS stream
+/// still carries them through an input gap, for demuxers that give up on
+/// silence; an RTP-framed one never does.
+#[derive(Default)]
+struct KeepaliveGate {
+    /// Whether the last media datagram sent went out raw TS; `None` before
+    /// the first.
+    raw_ts: Option<bool>,
+}
+
+impl KeepaliveGate {
+    /// Whether to send `packet`, which goes out raw TS when `raw_ts` and
+    /// RTP-framed otherwise.
+    fn admit(&mut self, packet: &RtpPacket, raw_ts: bool) -> bool {
+        if packet.is_raw_ts && is_null_ts_only(&packet.data) {
+            return self.raw_ts == Some(true);
+        }
+        self.raw_ts = Some(raw_ts);
+        true
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn srt_output_forward_loop(
     config: &SrtOutputConfig,
@@ -1195,7 +1254,31 @@ async fn srt_output_forward_loop(
     let mut send_queue_dropped: u64 = 0;
     let mut send_queue_warned_at: Option<Instant> = None;
 
+    // Per connection: a receiver that settles its framing does so on the
+    // first datagram this connection brings it.
+    let mut keepalive_gate = KeepaliveGate::default();
+
     let connection_lost = loop {
+        // Second, independent liveness check. The `Closed` arm below only
+        // fires once the `srt-io` send task has itself errored; if the send
+        // path ever stops surfacing a dead peer, this notices anyway. It is a
+        // status read on a watch channel, so it costs nothing to do per turn.
+        // Made at the top of every turn, so a turn that sends nothing checks
+        // too: while the input is silent and `KeepaliveGate` holds its
+        // keepalives back those are the only turns there are, and libsrt's
+        // own keepalive is what moves the status.
+        if sink.peer_is_gone() {
+            tracing::warn!(
+                "SRT output '{}' peer gone (socket status {:?}), will reconnect",
+                config.id,
+                match &sink {
+                    SrtSendSink::Socket(s) => Some(s.status()),
+                    SrtSendSink::Group(_) => None,
+                }
+            );
+            break true;
+        }
+
         if let Some(ref db) = delay_buf
             && let Some(release_us) = db.next_release_time() {
                 let now = now_us();
@@ -1283,6 +1366,12 @@ async fn srt_output_forward_loop(
                                     }
                                 }
                             }
+                            continue;
+                        }
+                        // Keepalives only into a raw-TS stream (see
+                        // `KeepaliveGate`). The transcode chain sends raw TS.
+                        let raw_ts = packet.is_raw_ts || transcode_chain.is_some();
+                        if !keepalive_gate.admit(&packet, raw_ts) {
                             continue;
                         }
                         // Apply program filter if configured. Skip the packet
@@ -1481,21 +1570,6 @@ async fn srt_output_forward_loop(
             }
         }
         if got_connection_lost {
-            break true;
-        }
-        // Second, independent liveness check. The `Closed` arm above only
-        // fires once the `srt-io` send task has itself errored; if the send
-        // path ever stops surfacing a dead peer, this notices anyway. It is a
-        // status read on a watch channel, so it costs nothing to do per batch.
-        if sink.peer_is_gone() {
-            tracing::warn!(
-                "SRT output '{}' peer gone (socket status {:?}), will reconnect",
-                config.id,
-                match &sink {
-                    SrtSendSink::Socket(s) => Some(s.status()),
-                    SrtSendSink::Group(_) => None,
-                }
-            );
             break true;
         }
     };
@@ -1876,6 +1950,8 @@ async fn srt_output_redundant_loop(
         TsProgramFilter::new(n)
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
+    // Both legs send the same datagrams, so they share the stream's framing.
+    let mut keepalive_gate = KeepaliveGate::default();
 
     // Optional PID remapper. Both legs must emit identical payloads for the
     // receiver merger to dedupe by seq; a single remapper fed by both legs
@@ -1949,6 +2025,8 @@ async fn srt_output_redundant_loop(
             }
 
         let mut payloads_to_send: Vec<(Bytes, u64)> = Vec::new();
+        // Set when the gate held this turn's keepalive back.
+        let mut held_keepalive = false;
 
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -2001,6 +2079,12 @@ async fn srt_output_redundant_loop(
             }
             result = rx.recv() => {
                 match result {
+                    // Keepalives only into a raw-TS stream (see
+                    // `KeepaliveGate`). One held back still checks the legs
+                    // below.
+                    Ok(packet) if !keepalive_gate.admit(&packet, packet.is_raw_ts) => {
+                        held_keepalive = true;
+                    }
                     Ok(packet) => {
                         // Apply program filter if configured.
                         let recv_time_us = packet.recv_time_us;
@@ -2102,8 +2186,12 @@ async fn srt_output_redundant_loop(
 
         // Send to every attached leg. Each payload takes both legs' verdicts
         // first, and only then acts on a loss, so a leg's `other_leg` reads
-        // what the other leg did with that same payload.
-        for (payload, recv_time_us) in payloads_to_send {
+        // what the other leg did with that same payload. A keepalive the gate
+        // held back (`None`) sends nothing and takes each leg's verdict from
+        // its socket instead: a send to a leg libsrt has given up fails, which
+        // is how the keepalives found a leg lost while the input was silent.
+        let held = held_keepalive.then_some(None);
+        for item in payloads_to_send.into_iter().map(Some).chain(held) {
             if tx1.is_none() && tx2.is_none() {
                 // No leg attached: discard, counting nothing. Counted as
                 // drops these would read `dropping` for an output that is
@@ -2111,11 +2199,19 @@ async fn srt_output_redundant_loop(
                 // their own the output was not even subscribed then.
                 break;
             }
-            let queued1 = tx1
-                .as_ref()
-                .map(|tx| redundant_leg_takes(tx, (payload.clone(), recv_time_us), &stats));
-            let queued2 =
-                tx2.as_ref().map(|tx| redundant_leg_takes(tx, (payload, recv_time_us), &stats));
+            let (queued1, queued2) = match item {
+                Some((payload, recv_time_us)) => (
+                    tx1.as_ref().map(|tx| {
+                        redundant_leg_takes(tx, (payload.clone(), recv_time_us), &stats)
+                    }),
+                    tx2.as_ref()
+                        .map(|tx| redundant_leg_takes(tx, (payload, recv_time_us), &stats)),
+                ),
+                None => (
+                    sock1.as_deref().map(|s| !socket_is_gone(s)),
+                    sock2.as_deref().map(|s| !socket_is_gone(s)),
+                ),
+            };
             let lost = redundant_legs_lost([queued1, queued2]);
             if lost == [None, None] {
                 continue;
@@ -2838,7 +2934,10 @@ mod tests {
     }
 
     /// A 2022-7 SRT output with both legs listening on loopback, fed a
-    /// 1316-byte null-TS item every 2 ms, and the events it raised.
+    /// 1316-byte raw-TS item every 2 ms, and the events it raised. The item
+    /// is seven packets on PID 0x100 ([`PairHarness::media`]) unless the
+    /// harness is to feed the keepalive alone, which `KeepaliveGate` holds
+    /// back from both legs.
     ///
     /// Every test-side connect is bounded, so a build that never accepts a
     /// leg fails rather than hangs.
@@ -2858,7 +2957,23 @@ mod tests {
 
     impl PairHarness {
         fn start() -> Self {
-            Self::start_with(None)
+            Self::start_with(None, Self::media())
+        }
+
+        /// Fed nothing but the flow's idle keepalive: a flow whose input
+        /// never delivers.
+        fn start_keepalive_only() -> Self {
+            Self::start_with(None, crate::engine::flow::null_ts_packet().data)
+        }
+
+        /// Seven TS packets on PID 0x100.
+        fn media() -> Bytes {
+            let mut ts = Vec::with_capacity(1316);
+            for _ in 0..7 {
+                ts.extend_from_slice(&[0x47, 0x01, 0x00, 0x10]);
+                ts.extend_from_slice(&[0xFF; 184]);
+            }
+            Bytes::from(ts)
         }
 
         /// Like [`PairHarness::start`], with each leg's slow-connect Warning
@@ -2866,10 +2981,10 @@ mod tests {
         /// without waiting out the 15 s. It runs the redundant loop directly,
         /// which is what `spawn_srt_output` runs for a 2022-7 output.
         fn start_with_warn_after(after: Duration) -> Self {
-            Self::start_with(Some(after))
+            Self::start_with(Some(after), Self::media())
         }
 
-        fn start_with(warn_after: Option<Duration>) -> Self {
+        fn start_with(warn_after: Option<Duration>, data: Bytes) -> Self {
             let free_port = || {
                 std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
             };
@@ -2927,12 +3042,6 @@ mod tests {
             let published = Arc::new(AtomicU64::new(0));
             let (count, stop) = (published.clone(), cancel.clone());
             tokio::spawn(async move {
-                let mut ts = Vec::with_capacity(1316);
-                for _ in 0..7 {
-                    ts.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
-                    ts.extend_from_slice(&[0xFF; 184]);
-                }
-                let data = Bytes::from(ts);
                 let mut tick = tokio::time::interval(Duration::from_millis(2));
                 loop {
                     tokio::select! {
@@ -3173,6 +3282,28 @@ mod tests {
 
         h.pump_events();
         assert_eq!(h.leg_lost(2).len(), 1, "a lost leg is raised once");
+        assert!(h.leg_lost(1).is_empty());
+        assert!(!h.disconnected());
+        h.stop().await;
+    }
+
+    /// A 2022-7 output whose input never delivers sends neither leg the
+    /// flow's keepalive, and still finds a leg lost: the keepalive it holds
+    /// back checks the legs' sockets, as sending it did.
+    #[tokio::test]
+    async fn a_2022_7_output_holds_keepalives_back_and_still_finds_a_lost_leg() {
+        let mut h = PairHarness::start_keepalive_only();
+        let (_leg1, received1) = h.connect(h.ports.0).await;
+        let (leg2, received2) = h.connect(h.ports.1).await;
+        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(h.published.load(Ordering::Relaxed) > 100, "keepalives were published");
+        assert_eq!(received1.load(Ordering::Relaxed), 0, "leg 1 was sent no keepalive");
+        assert_eq!(received2.load(Ordering::Relaxed), 0, "leg 2 was sent no keepalive");
+
+        leg2.close().await.unwrap();
+        h.wait_until("leg 2's loss", |h| !h.leg_lost(2).is_empty()).await;
+        assert_leg_lost(h.leg_lost(2)[0], 2, "carrying");
         assert!(h.leg_lost(1).is_empty());
         assert!(!h.disconnected());
         h.stop().await;
@@ -3574,5 +3705,229 @@ mod tests {
             matches!(closed, Ok(Err(_))),
             "the far end sees the connection closed, not a peer that never sends"
         );
+    }
+
+    /// One broadcast item, as an input publishes it.
+    fn published(data: Vec<u8>, is_raw_ts: bool) -> RtpPacket {
+        RtpPacket {
+            data: Bytes::from(data),
+            sequence_number: 0,
+            rtp_timestamp: 0,
+            recv_time_us: now_us(),
+            is_raw_ts,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        }
+    }
+
+    /// An RTP/TS datagram: the header and six TS packets on PID 0x100.
+    fn rtp_datagram(seq: u16) -> Vec<u8> {
+        let mut d = vec![0x80, 33];
+        d.extend_from_slice(&seq.to_be_bytes());
+        d.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
+        for _ in 0..6 {
+            d.extend_from_slice(&[0x47, 0x01, 0x00, 0x10]);
+            d.extend_from_slice(&[0xFF; 184]);
+        }
+        d
+    }
+
+    /// The flow's keepalive goes only into a raw-TS stream: held back before
+    /// any media and while the media goes out RTP-framed, sent once it goes
+    /// out raw TS, which a transcoding output's always does.
+    #[test]
+    fn keepalives_go_only_into_a_raw_ts_stream() {
+        let keepalive = crate::engine::flow::null_ts_packet();
+        let rtp = published(rtp_datagram(0), false);
+        let raw = published(PairHarness::media().to_vec(), true);
+
+        let mut gate = KeepaliveGate::default();
+        assert!(!gate.admit(&keepalive, true), "before any media");
+        assert!(gate.admit(&rtp, false));
+        assert!(!gate.admit(&keepalive, true), "into an RTP-framed stream");
+        assert!(gate.admit(&raw, true));
+        assert!(gate.admit(&keepalive, true), "into a raw-TS stream");
+        assert!(gate.admit(&rtp, false));
+        assert!(!gate.admit(&keepalive, true), "and not once it turns RTP");
+
+        // An RTP input through a transcode chain goes out raw TS.
+        let mut gate = KeepaliveGate::default();
+        assert!(gate.admit(&rtp, true));
+        assert!(gate.admit(&keepalive, true));
+
+        // NULL packets inside RTP are RTP media, not a keepalive.
+        let mut null_rtp = rtp_datagram(1);
+        null_rtp.truncate(12);
+        null_rtp.extend_from_slice(&keepalive.data[..188 * 6]);
+        let mut gate = KeepaliveGate::default();
+        assert!(gate.admit(&published(null_rtp, false), false));
+        assert!(!gate.admit(&keepalive, true));
+    }
+
+    /// An SRT output carries the flow's keepalive only once its media has
+    /// gone out raw TS: the receiver's first datagram is the RTP the flow
+    /// publishes after its keepalive, and no keepalive reaches it in among
+    /// that RTP. Before, the keepalive went first, and a receiver that
+    /// settles its framing on the first datagram took the RTP for raw TS.
+    #[tokio::test]
+    async fn an_srt_output_carries_keepalives_only_into_a_raw_ts_stream() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let peer_config: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+            .expect("SRT listener fixture");
+        let mut listener = crate::srt::connection::bind_srt_listener_for_input(&peer_config)
+            .await
+            .expect("the far end binds");
+        let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o1", "name": "o1", "mode": "caller",
+            "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }))
+        .expect("SRT output fixture");
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, rx) = broadcast::channel(64);
+        drop(rx);
+        let (event_sender, _events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let _output = spawn_srt_output(
+            config,
+            &tx,
+            stats,
+            cancel.child_token(),
+            SrtOutputCtx {
+                event_sender,
+                flow_id: "f1".into(),
+                input_format: None,
+                compressed_audio_input: false,
+                frame_rate_rx: None,
+                active_input_rx: tokio::sync::watch::channel(String::new()).1,
+            },
+        );
+        let peer = tokio::time::timeout(
+            Duration::from_secs(10),
+            accept_srt_connection(&mut listener, &cancel),
+        )
+        .await
+        .expect("the output dials in time")
+        .expect("the far end accepts it");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tx.receiver_count() == 0 {
+            assert!(Instant::now() < deadline, "timed out waiting for the output to subscribe");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let keepalive = crate::engine::flow::null_ts_packet();
+        let raw = PairHarness::media().to_vec();
+        let sends = [
+            keepalive.clone(),
+            published(rtp_datagram(0), false),
+            keepalive.clone(),
+            published(rtp_datagram(1), false),
+            published(raw.clone(), true),
+            keepalive.clone(),
+            published(raw.clone(), true),
+        ];
+        for item in sends {
+            tx.send(item).expect("the output is subscribed");
+            // One at a time, so the output reads each before the next.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let want = [rtp_datagram(0), rtp_datagram(1), raw.clone(), keepalive.data.to_vec(), raw];
+        for (i, want) in want.iter().enumerate() {
+            let got = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+                .await
+                .unwrap_or_else(|_| panic!("datagram {i} arrives"))
+                .expect("the connection stays up");
+            assert_eq!(&got.data[..], &want[..], "datagram {i}");
+        }
+        let more = tokio::time::timeout(Duration::from_millis(500), peer.recv()).await;
+        assert!(more.is_err(), "nothing else is sent");
+    }
+
+    /// A listener output whose input never delivers holds the caller: its
+    /// liveness probe, offered nothing to send now the keepalives are held
+    /// back, cannot judge the connection and keeps it rather than calling it
+    /// stale every 3 s; and when the caller goes, the output still notices
+    /// with nothing to send, on its peer check, and waits for the next.
+    #[tokio::test]
+    async fn a_silent_listener_output_keeps_its_caller_and_notices_it_go() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o1", "name": "o1", "mode": "listener",
+            "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }))
+        .expect("SRT output fixture");
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(64);
+        let (event_sender, mut events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let _output = spawn_srt_output(
+            config,
+            &tx,
+            stats,
+            cancel.child_token(),
+            SrtOutputCtx {
+                event_sender,
+                flow_id: "f1".into(),
+                input_format: None,
+                compressed_audio_input: false,
+                frame_rate_rx: None,
+                active_input_rx: tokio::sync::watch::channel(String::new()).1,
+            },
+        );
+        let (pump_tx, stop) = (tx.clone(), cancel.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {
+                        let _ = pump_tx.send(crate::engine::flow::null_ts_packet());
+                    }
+                }
+            }
+        });
+        let caller: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+            .expect("SRT caller fixture");
+        let peer = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::srt::connection::connect_srt_input(&caller, &cancel),
+        )
+        .await
+        .expect("caller connects in time")
+        .expect("caller connects");
+
+        // Past the probe's 3 s.
+        let quiet = tokio::time::timeout(Duration::from_secs(4), peer.recv()).await;
+        assert!(quiet.is_err(), "the caller is sent nothing and stays connected");
+        let mut events = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            !events.iter().any(|e| e.message.contains("stale connection")),
+            "{:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+
+        peer.close().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            while let Ok(event) = events_rx.try_recv() {
+                events.push(event);
+            }
+            if events.iter().any(|e| e.message == "SRT output 'o1' disconnected") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for the output to notice");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

@@ -374,8 +374,12 @@ fn process_packet(
         return;
     }
 
-    // Detect payload format on first packet
-    if !*payload_format_detected {
+    // Detect payload format on the first packet that can tell. The flow's
+    // idle keepalive is raw-TS NULL packets whatever its input's framing,
+    // and it is on the broadcast whenever the active input is silent — until
+    // an input that is waiting for its sender delivers, and after a switch to
+    // one — so taken first it would read "raw_ts" for an RTP flow.
+    if !*payload_format_detected && !(packet.is_raw_ts && is_null_ts_only(payload)) {
         let mut state = stats.state.lock().unwrap();
         state.payload_format = if packet.is_raw_ts {
             "raw_ts".to_string()
@@ -2249,6 +2253,35 @@ fn remove_emulation_prevention(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flow's keepalive, raw TS whatever the input's framing, does not
+    /// settle the payload format: the RTP datagram after it does.
+    #[test]
+    fn a_keepalive_first_leaves_the_payload_format_to_the_media() {
+        let acc =
+            MediaAnalysisAccumulator::new("srt".into(), "unknown".into(), false, None, false, None);
+        let mut detected = false;
+        process_packet(&crate::engine::flow::null_ts_packet(), &acc, &mut detected);
+        assert!(!detected);
+        assert_eq!(acc.state.lock().unwrap().payload_format, "unknown");
+
+        let mut rtp = vec![0x80, 33, 0, 1, 0, 0, 0, 90, 0, 0, 0, 1];
+        rtp.extend_from_slice(&[0x47, 0x01, 0x00, 0x10]);
+        rtp.extend_from_slice(&[0xFF; 184]);
+        let media = RtpPacket {
+            data: bytes::Bytes::from(rtp),
+            sequence_number: 1,
+            rtp_timestamp: 90,
+            recv_time_us: 0,
+            is_raw_ts: false,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        };
+        process_packet(&media, &acc, &mut detected);
+        assert!(detected);
+        assert_eq!(acc.state.lock().unwrap().payload_format, "rtp_ts");
+    }
 
     /// VH1.ts: every PMT-PID packet carries a 0xC0 section ahead of the
     /// PMT. The analyzer used to list program 2010 with no streams.
