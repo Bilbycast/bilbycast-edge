@@ -967,8 +967,17 @@ bits on; band-limited MP2 / AAC sources are not.
 - PMT: `src/engine/ts_pmt_edit.rs` (`PsiUnitStage`, `rebuild_pmt_section`,
   `OutVersion`, `detect_flavour`); the engage watchdog is
   `src/engine/transcode_engage.rs`.
-- Wiring: `output_udp.rs`, `output_rtp.rs`, `output_srt.rs` insert a
-  `block_in_place` call between the program filter and the egress buffer.
+- Wiring: `output_udp.rs`, `output_rtp.rs`, `output_srt.rs` (and
+  `output_rist.rs`) hand the program filter's output to a
+  `transcode_chain::TranscodeChain` (audio replacer, video replacer and the
+  trailing PCR stage on a codec thread of their own) and take its output on
+  to the egress pipeline. An SRT output restarts the chain's stream at each
+  connection (`TranscodeChain::restart_stream`): input and output of the
+  last connection still in the chain are dropped, and both replacers reset
+  as on an input switch, so a re-joining receiver starts on the live
+  programme rather than on TS the last one never got followed by a PCR jump
+  over the reconnection gap. See
+  [configuration-guide.md](configuration-guide.md#srt-output) (Reconnections).
 - Decoder: `bilbycast-fdk-aac-rs::AacDecoder::open_adts` (Fraunhofer FDK
   AAC, opened with no added delay) for ADTS; libavcodec for LATM / MP2 /
   AC-3 / E-AC-3.
