@@ -220,9 +220,12 @@ pub struct MasterClockStats {
     pub jitter_us: u64,
     /// Operator-set lipsync trim in 90 kHz ticks. Bounded ±18 000.
     pub lipsync_offset_90k: i64,
-    /// What the operator (or auto-policy) configured. Set when a
-    /// fallback has fired so the UI can render "PCR PLL → Wallclock
-    /// (fallback)". `None` for normal operation. Additive on the wire.
+    /// What the operator (or auto-policy) configured, when it differs
+    /// from `kind`: `auto` (the UI renders "Auto → PTP"), `sender_timestamp`
+    /// and `contribution` (both run the source-PCR PLL), or the kind a
+    /// fallback left (so the UI can render "PCR PLL → Wallclock
+    /// (fallback)"). `None` for an explicit kind that runs as itself.
+    /// Additive on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_kind: Option<String>,
     /// `true` when a fallback has activated. Driven by the PLL

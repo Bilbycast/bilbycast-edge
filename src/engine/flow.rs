@@ -7562,11 +7562,16 @@ fn build_master_clock(
 
     // Auto on a PTP-native input resolved to PTP above — tag it so the UI
     // shows "Auto → PTP" (the contribution/assembly cascade tags itself in
-    // build_auto_cascade).
-    let handle = if is_auto {
-        handle.with_configured_kind("auto")
-    } else {
-        handle
+    // build_auto_cascade). `sender_timestamp` and `contribution` run the
+    // source-PCR PLL too, so they are tagged with what the operator asked
+    // for: the comments above promised that label on `configured_kind`,
+    // and the telemetry carried none, so the manager could not tell a
+    // sender-timestamp flow from a plain `source_pcr_pll` pin.
+    let handle = match cfg.master_clock.as_ref().map(|m| m.kind) {
+        _ if is_auto => handle.with_configured_kind("auto"),
+        Some(MasterClockKindConfig::SenderTimestamp) => handle.with_configured_kind("sender_timestamp"),
+        Some(MasterClockKindConfig::Contribution) => handle.with_configured_kind("contribution"),
+        _ => handle,
     };
 
     if let Some(mc_cfg) = cfg.master_clock.as_ref() {
@@ -8904,5 +8909,43 @@ mod fixer_task_tests {
             .expect("forwarded")
             .expect("on the flow broadcast");
         assert!(!ts_discontinuity_indicator(&out.data[..TS_PACKET_SIZE]), "no DI armed by it");
+    }
+}
+
+#[cfg(test)]
+mod master_clock_label_tests {
+    use super::*;
+    use crate::config::models::{FlowConfig, InputConfig};
+
+    /// The source-PCR PLL kinds the operator names by intent —
+    /// `sender_timestamp`, `contribution` — carry that name on
+    /// `configured_kind`; an explicit `source_pcr_pll` carries none. The
+    /// telemetry used to carry none for all three, so the manager could
+    /// not tell a sender-timestamp flow from a plain PLL pin.
+    #[tokio::test]
+    async fn the_pll_kinds_named_by_intent_carry_their_name() {
+        let input: InputConfig = serde_json::from_value(serde_json::json!({
+            "type": "srt", "mode": "caller", "remote_addr": "127.0.0.1:9000"
+        }))
+        .unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        for (kind, label) in [
+            ("sender_timestamp", Some("sender_timestamp")),
+            ("contribution", Some("contribution")),
+            ("source_pcr_pll", None),
+        ] {
+            let cfg: FlowConfig = serde_json::from_value(serde_json::json!({
+                "id": "f1", "name": "f1", "input_ids": ["in"], "output_ids": [],
+                "master_clock": { "kind": kind }
+            }))
+            .unwrap();
+            let (_tx, rx) = tokio::sync::watch::channel("in".to_string());
+            let (handle, _, _) = build_master_clock(&cfg, Some(&input), rx, &events, &cancel);
+            let t = handle.telemetry();
+            assert_eq!(t.kind, "source_pcr_pll", "{kind}");
+            assert_eq!(t.configured_kind.as_deref(), label, "{kind}");
+        }
     }
 }
