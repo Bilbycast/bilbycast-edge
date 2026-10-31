@@ -2100,7 +2100,12 @@ impl TsAudioReplacer {
     /// The channel / rate stage from decoded `(rate, channels)`: to `out`,
     /// the output format, once the encoder is open; before that, to what
     /// the configuration asks — the rule every re-encoding output shares
-    /// (`audio_transcode::encoder_stage`). `Ok(None)`: no conversion.
+    /// (`audio_transcode::encoder_stage`) — and, with no channel count
+    /// configured, to no more than the target codec takes
+    /// (`AudioCodec::channel_cap`): a 7.1 source to AC-3 is mixed down to
+    /// 5.1, to MP2 to stereo. Opened at the source's eight channels those
+    /// encoders refused, and the audio was dropped. `Ok(None)`: no
+    /// conversion.
     fn build_stage(
         &self,
         rate: u32,
@@ -2110,7 +2115,7 @@ impl TsAudioReplacer {
         super::audio_transcode::encoder_stage(
             self.transcode_cfg.as_ref(),
             self.sample_rate_override,
-            self.channels_override,
+            super::audio_transcode::capped_channels(self.channels_override, self.codec.channel_cap(), channels),
             rate,
             channels,
             out,
@@ -2607,6 +2612,17 @@ impl TsAudioReplacer {
                     self.encode_stats.inc_submitted();
                     match enc.encode_frame(&frame) {
                         Ok(encoded) => {
+                            // A 7.1 frame says so: fdk writes its channel
+                            // configuration 12 masked to 4 (4.0) and no PCE
+                            // (`audio_encode::with_7_1_layout`). This loop
+                            // owns its encoder, so the rewrite the outputs
+                            // built on `AudioEncoder` get is made here too.
+                            let num_samples = encoded.num_samples;
+                            let data = if self.resolved_channels == 8 {
+                                super::audio_encode::with_7_1_layout(encoded.bytes)
+                            } else {
+                                encoded.bytes
+                            };
                             let sr = self.resolved_sample_rate;
                             let model = if sr == 0 {
                                 self.out_pts_90k
@@ -2627,7 +2643,7 @@ impl TsAudioReplacer {
                                 model.wrapping_sub(self.latency.applied_90k) & PTS_MASK;
                             let pes = build_audio_pes(
                                 self.codec.ts_pes_stream_id(),
-                                &encoded.bytes,
+                                &data,
                                 pts_for_pes,
                             );
                             let pkts = packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
@@ -2637,7 +2653,7 @@ impl TsAudioReplacer {
                             self.encode_stats.inc_out(1);
                             self.samples_since_anchor = self
                                 .samples_since_anchor
-                                .saturating_add(encoded.num_samples as u64);
+                                .saturating_add(num_samples as u64);
                         }
                         Err(_) => {
                             self.encode_stats.inc_dropped();
@@ -5972,5 +5988,82 @@ mod tests {
         r.process(&synth_pmt_audio(0x1001, 0x0101, 0x0F), &mut out);
         assert_eq!(r.replaced_pid(), Some(0x0101));
         assert_eq!(r.out_audio_cc, 9, "no rewind to a stale passthrough CC");
+    }
+
+    /// A 7.1 AAC source (channel configuration 0, its PCE in every frame).
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn seven_one_aac_source() -> Vec<u8> {
+        use e2e::*;
+        let aus: Vec<(Vec<u8>, u64)> = encode_source_as(Src::Aac, &content(4_800, 48_000 * 2), 8, RATE)
+            .into_iter()
+            .map(|(f, pts)| (crate::engine::audio_encode::with_7_1_layout(f), pts))
+            .collect();
+        mux(0x0F, &pack(&aus, 1))
+    }
+
+    /// edge#210 on the TS replacer: an AAC-LC target at 7.1 — the source's
+    /// layout kept (no `channels`) or `channels: 8` — went out as fdk wrote
+    /// it, channel configuration 12 masked to 4 (4.0) over five channel
+    /// elements and no PCE, which every receiver opens as 4.0 and ffmpeg
+    /// errors on. Since the decoders hand out all eight channels, that was
+    /// every 7.1 AAC source re-encoded to AAC on a TS output (it went out as
+    /// 5.1 while fdk mixed 7.1 down). Each frame now says channel
+    /// configuration 0 and opens with the 7.1 PCE, and decodes as eight
+    /// channels.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_7_1_aac_target_on_a_ts_output_carries_its_layout() {
+        use e2e::*;
+        let ts = seven_one_aac_source();
+        for channels in [None, Some(8)] {
+            let mut cfg = enc("aac_lc");
+            cfg.channels = channels;
+            cfg.bitrate_kbps = Some(448);
+            let mut r = TsAudioReplacer::new(&cfg, None).unwrap();
+            let pes = audio_pes(&run(&mut r, &ts));
+            assert!(pes.len() >= 60, "{channels:?}: {} PES", pes.len());
+            let mut dec = aac_audio::AacDecoder::open_adts().unwrap();
+            dec.set_max_output_channels(None).unwrap();
+            for (i, (_, es)) in pes.iter().enumerate() {
+                let (au, (profile, sr_idx, ch_cfg)) =
+                    crate::engine::audio_au::adts_access_unit(es).expect("one whole ADTS frame a PES");
+                assert_eq!(ch_cfg, 0, "{channels:?} PES {i}: channel configuration 0, not 12 masked to 4");
+                let layout = crate::engine::aac_config::AacConfig::from_adts(profile, sr_idx, ch_cfg, au)
+                    .unwrap_or_else(|| panic!("{channels:?} PES {i}: the raw_data_block opens with the PCE"));
+                assert_eq!(layout.channels(), 8, "{channels:?} PES {i}");
+                let pcm = dec.decode_frame(es).unwrap_or_else(|e| panic!("{channels:?} PES {i}: {e}"));
+                assert_eq!(pcm.planar.len(), 8, "{channels:?} PES {i}: eight channels");
+            }
+        }
+    }
+
+    /// A 7.1 source on a TS output whose target codec cannot take eight
+    /// channels, with no channel count set: AC-3 opens at 5.1 and MP2 at
+    /// stereo, the source mixed down by the channel stage, and the audio
+    /// flows — the burst on L / R lands at its source time. Opened at eight
+    /// (the decoders hand out all of a 7.1 source's channels), AC-3 and MP2
+    /// refused and every frame of the source's audio was dropped.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_7_1_source_to_ac3_or_mp2_is_mixed_down_to_what_the_codec_takes() {
+        use e2e::*;
+        let ts = seven_one_aac_source();
+        for (target, want) in [("ac3", 6usize), ("mp2", 2)] {
+            let mut r = replacer(target, None, None);
+            let out = run(&mut r, &ts);
+            let pes = audio_pes(&out);
+            assert!(pes.len() >= 40, "{target}: {} PES", pes.len());
+            let codec = if target == "mp2" {
+                video_codec::AudioDecoderCodec::Mp2
+            } else {
+                video_codec::AudioDecoderCodec::Ac3
+            };
+            let mut d = video_engine::AudioDecoder::open(codec).unwrap();
+            d.send_packet(&pes[10].1, 0).unwrap();
+            let f = d.receive_frame().expect("a decoded frame");
+            assert_eq!(f.planar.len(), want, "{target}: the codec's own channel count");
+            let e = err_samples(target, &out, src_time(4_800), 48_000);
+            assert!(e.abs() <= 4.0, "{target}: the burst is {e} samples off its source time");
+        }
     }
 }

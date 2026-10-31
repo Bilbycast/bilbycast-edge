@@ -1902,9 +1902,11 @@ pub const STREAM_CHUNK_FRAMES: usize = 256;
 /// overrides that differ from the decoded format (`None` = no change). A
 /// multichannel source going to stereo gets the standard downmix (ITU-R
 /// BS.775 for 3.0 / 5.0 / 5.1 / 7.1, Lt/Rt for quad) and going to mono
-/// BS.775's mono downmix (see [`mono_downmix`]); mono ↔ stereo the
-/// transcode stage's own default; anything else keeps the channels in order
-/// and silence for the missing ones. `None` when neither differs.
+/// BS.775's mono downmix (see [`mono_downmix`]); 7.1 going to 5.1 folds its
+/// second surround pair into the first at −3 dB ([`seven_one_to_five_one`]);
+/// mono ↔ stereo the transcode stage's own default; anything else keeps the
+/// channels in order and silence for the missing ones. `None` when neither
+/// differs.
 pub fn override_conversion(
     in_channels: u8,
     sample_rate: Option<u32>,
@@ -1919,6 +1921,7 @@ pub fn override_conversion(
             (6, 2) => tj.channel_map_preset = Some("5_1_to_stereo_bs775".into()),
             (8, 2) => tj.channel_map_preset = Some("7_1_to_stereo_bs775".into()),
             (4, 2) => tj.channel_map_preset = Some("4ch_to_stereo_lt_rt".into()),
+            (8, 6) => tj.channel_map_with_gain = Some(seven_one_to_five_one()),
             (3 | 5, 2) => tj.channel_map_with_gain = Some(front_centre_stereo_downmix(in_channels)),
             (1, 2) | (2, 1) => {}
             (n, 1) => tj.channel_map_with_gain = Some(vec![mono_downmix(n)]),
@@ -1962,6 +1965,25 @@ pub fn mono_downmix(in_channels: u8) -> Vec<[f64; 2]> {
         8 => vec![[0.0, l], [1.0, r], [2.0, c], [4.0, s], [5.0, s], [6.0, s], [7.0, s]],
         n => (0..n).map(|i| [f64::from(i), 1.0 / f64::from(n.max(1))]).collect(),
     }
+}
+
+/// 7.1 to 5.1, for the channel order every decoder here hands out (L, R, C,
+/// LFE, then two surround pairs): the fronts, the centre and the LFE as they
+/// are, the first surround pair at unity with the second folded into it at
+/// −3 dB, left into left — the coefficient BS.775's downmixes give a
+/// surround, and what libswresample does with a back pair over a side one.
+/// fdk-aac and libavcodec put the side and the back pair in either order;
+/// each side keeps both of its surrounds whichever it is. Keeping the
+/// channels in order instead dropped the second pair.
+fn seven_one_to_five_one() -> Vec<Vec<[f64; 2]>> {
+    vec![
+        vec![[0.0, 1.0]],
+        vec![[1.0, 1.0]],
+        vec![[2.0, 1.0]],
+        vec![[3.0, 1.0]],
+        vec![[4.0, 1.0], [6.0, BS775_G3]],
+        vec![[5.0, 1.0], [7.0, BS775_G3]],
+    ]
 }
 
 /// BS.775's stereo downmix of 3.0 (L R C) and 5.0 (L R C Ls Rs): the
@@ -2034,6 +2056,17 @@ pub fn encoder_stage(
     }
 }
 
+/// The channel count to hand [`encoder_stage`] for an encoder that takes at
+/// most `cap` channels (`AudioCodec::channel_cap`: AC-3 5.1, MP2 and Opus
+/// stereo): the configured `channels` when set, else `cap` when the decoded
+/// `in_channels` exceed it — a 7.1 source mixed down by
+/// [`override_conversion`] — else `None`, the source's layout kept. Opened
+/// at the source's eight channels such an encoder refused, and the audio
+/// was dropped. A `transcode` block's own `channels` still wins.
+pub fn capped_channels(channels: Option<u8>, cap: Option<u8>, in_channels: u8) -> Option<u8> {
+    channels.or_else(|| cap.filter(|&c| in_channels > c))
+}
+
 /// The output format [`encoder_stage`] converts `(rate, channels)` to for
 /// these settings, without keeping the stage.
 pub fn encoder_stage_format(
@@ -2064,11 +2097,20 @@ pub struct EncoderStage {
     input: (u32, u8),
     stage: Option<PlanarAudioTranscoder>,
     built: bool,
+    /// The most channels the encoder behind takes ([`capped_channels`]).
+    channel_cap: Option<u8>,
 }
 
 impl EncoderStage {
     pub fn new(block: Option<TranscodeJson>, sample_rate: Option<u32>, channels: Option<u8>) -> Self {
-        Self { block, sample_rate, channels, out: None, input: (0, 0), stage: None, built: false }
+        Self { block, sample_rate, channels, out: None, input: (0, 0), stage: None, built: false, channel_cap: None }
+    }
+
+    /// Convert a source wider than `cap` channels down to it when no channel
+    /// count is configured ([`capped_channels`]).
+    pub fn with_channel_cap(mut self, cap: Option<u8>) -> Self {
+        self.channel_cap = cap;
+        self
     }
 
     /// Pin the output format to what an already open encoder takes (an
@@ -2088,7 +2130,7 @@ impl EncoderStage {
             let stage = encoder_stage(
                 self.block.as_ref(),
                 self.sample_rate,
-                self.channels,
+                capped_channels(self.channels, self.channel_cap, channels),
                 rate,
                 channels,
                 self.out,
@@ -2215,9 +2257,28 @@ mod tests {
         let map = tj.channel_map_with_gain.unwrap();
         assert_eq!(map, vec![vec![[0.0, 1.0]], vec![[1.0, 1.0]], vec![[2.0, 1.0]], vec![[0.0, 0.0]]]);
         // Every one builds.
-        for (i, o) in [(6u8, 2u8), (8, 2), (4, 2), (3, 2), (5, 2), (1, 2), (2, 1), (3, 4), (7, 1)] {
+        for (i, o) in [(6u8, 2u8), (8, 2), (8, 6), (4, 2), (3, 2), (5, 2), (1, 2), (2, 1), (3, 4), (7, 1)] {
             let tj = override_conversion(i, Some(44_100), Some(o)).unwrap();
             assert!(PlanarAudioTranscoder::new(48_000, i, &tj).is_ok(), "{i} -> {o}");
+        }
+    }
+
+    /// 7.1 going to 5.1 (an AC-3 target with no channel count): the fronts,
+    /// centre and LFE pass, and each side keeps both of its surrounds, the
+    /// second pair at −3 dB into the first. Keeping the channels in order,
+    /// the generic rule, dropped the second pair.
+    #[test]
+    fn a_7_1_to_5_1_downmix_keeps_both_surround_pairs() {
+        let mut planar = vec![vec![0.0f32; 1024]; 8];
+        for (ch, v) in planar.iter_mut().zip([0.1f32, 0.2, 0.3, 0.4, 0.25, 0.15, 0.5, 0.35]) {
+            ch.fill(v);
+        }
+        let out = EncoderStage::new(None, None, Some(6)).process(&planar, 48_000).unwrap();
+        assert_eq!(out.len(), 6);
+        let g = std::f32::consts::FRAC_1_SQRT_2;
+        let want = [0.1, 0.2, 0.3, 0.4, 0.25 + 0.5 * g, 0.15 + 0.35 * g];
+        for (ch, (o, w)) in out.iter().zip(want).enumerate() {
+            assert!((o[512] - w).abs() < 1e-4, "channel {ch}: {} against {w}", o[512]);
         }
     }
 

@@ -682,19 +682,32 @@ has for them (ISO/IEC 14496-3 §4.4.1.1). Shared code:
   replacer, HLS, CMAF and RTMP — told its receivers 4.0 over five channel
   elements. Each 7.1 frame now says channel configuration 0 and opens with
   the PCE fdk itself writes for that mode (centre, front pair, surround pair,
-  rear pair, LFE: `pce_7_1_back`), nine bytes a frame; CMAF and RTMP carry
+  rear pair, LFE: `pce_7_1_back`), nine bytes a frame
+  (`audio_encode::with_7_1_layout`, applied in the shared `AudioEncoder` and
+  in the TS audio replacer's own frame loop, which owns its encoder and
+  missed it until the release that brought 7.1 sources in at eight
+  channels); CMAF and RTMP carry
   that PCE in the AudioSpecificConfig, as their sample entry and sequence
   header need. ffmpeg decodes it as 7.1 with each input channel (WAV order:
   FL FR FC LFE BL BR SL SR) on its own output channel. `audio_encode.channels`
   (or a `transcode` block's) of 7 is refused for AAC: fdk-aac has no 6.1
   mode, and the count used to pass validation and fail at the first frame.
-- **7.1 sources.** The edge's AAC decoders (the re-encoding outputs', the TS
-  audio replacer's, the display's, the meters') hand out every channel a 7.1
-  stream carries. fdk-aac mixes anything wider than six channels down to 5.1
-  by default, which no decoder here changed, so a 7.1 AAC source decoded as
-  six channels while `AacDecoder::channels()` said eight until the first
-  frame. The channel stage converts the eight to what each output carries,
-  as it does for E-AC-3 7.1.
+- **7.1 sources.** The edge's AAC decoders (the re-encoding outputs' — RTMP,
+  CMAF, WebRTC and HLS — the TS audio replacer's, the display's, the
+  meters') hand out every channel a 7.1 stream carries. fdk-aac mixes
+  anything wider than six channels down to 5.1 by default, which no decoder
+  here changed, so a 7.1 AAC source decoded as six channels while
+  `AacDecoder::channels()` said eight until the first frame. The channel
+  stage converts the eight to what each output carries, as it does for
+  E-AC-3 7.1: to `channels` or the `transcode` block's when set; with
+  neither, an AAC target keeps 7.1 (and says so, above), while a target
+  whose codec takes fewer channels is mixed down to its most
+  (`AudioCodec::channel_cap`, `audio_transcode::capped_channels`): AC-3 to
+  5.1, the second surround pair folded into the first at −3 dB, MP2 to
+  stereo by BS.775 (TS outputs and HLS; WebRTC's Opus already mixed down to
+  stereo). Opened at eight, those encoders refused, and the audio was
+  dropped — which a 7.1 AAC source would otherwise have newly hit, having
+  arrived as 5.1 before.
 - **PCE-signalled sources** (channel configuration 0 — ISDB-T 1seg, e.g.
   NHK's HE-AAC at a 24 kHz core with two single channel elements). The
   layout is in a PCE that only some frames open with (on NHK about one in
@@ -1222,7 +1235,15 @@ CMAF): the stage between the decoder and the encoder is
     centre (the dialogue) dropped — on CMAF a regression from its own
     average-to-mono, since CMAF shares this rule; 3.0 / 5.0 → stereo
     dropped the centre the same way;
+  - **7.1 → 5.1**: the fronts, centre and LFE as they are, the first
+    surround pair at unity with the second folded into it at −3 dB, left
+    into left (it kept the first six channels and dropped the second pair);
   - otherwise the channels in order with silence for any missing.
+
+  With no channel count at all, a source wider than the target codec takes
+  is converted to its most, by the same rule: AC-3 5.1, MP2 stereo (TS
+  outputs and HLS; `AudioCodec::channel_cap`). AAC takes 7.1, so an AAC
+  target keeps an eight-channel source's layout.
 
   They used to be bare encoder parameters: the TS replacer and
   HLS opened the encoder at the new rate and fed

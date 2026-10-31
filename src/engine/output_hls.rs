@@ -789,7 +789,10 @@ impl HlsAudioChain {
         Self {
             codec: enc.codec,
             bitrate_kbps: enc.bitrate_kbps,
-            stage: super::audio_transcode::EncoderStage::new(enc.transcode.clone(), enc.sample_rate, enc.channels),
+            // An AC-3 / MP2 rendition takes no more channels than its codec
+            // does: a 7.1 source is mixed down to it, as on a TS output.
+            stage: super::audio_transcode::EncoderStage::new(enc.transcode.clone(), enc.sample_rate, enc.channels)
+                .with_channel_cap(enc.codec.channel_cap()),
             ctx,
             source: None,
             cutter: None,
@@ -1126,9 +1129,13 @@ impl HlsAudioChain {
             #[cfg(feature = "fdk-aac")]
             {
                 if self.aac_decoder.is_none() {
-                    self.aac_decoder = Some(
-                        aac_audio::AacDecoder::open_adts().map_err(|e| format!("AAC decoder init failed: {e}"))?,
-                    );
+                    let mut d =
+                        aac_audio::AacDecoder::open_adts().map_err(|e| format!("AAC decoder init failed: {e}"))?;
+                    // Every channel the stream carries, as on every other
+                    // output: fdk-aac mixes 7.1 down to 5.1 by default, so
+                    // a 7.1 source kept at its layout went out 5.1 here.
+                    d.set_max_output_channels(None).map_err(|e| format!("AAC decoder init failed: {e}"))?;
+                    self.aac_decoder = Some(d);
                 }
                 let decoder = self.aac_decoder.as_mut().expect("opened above");
                 for (au, au_pts) in aus {
@@ -2021,6 +2028,51 @@ mod pmt_remux_tests {
             samples += f.planar[0].len();
         }
         (d.sample_rate().unwrap(), channels, samples)
+    }
+
+    /// A 7.1 AAC source (its PCE in every frame) on HLS with no channel
+    /// count: an AAC-LC rendition keeps all eight channels, each frame
+    /// naming them in its PCE, as the other outputs' re-encodes do — the
+    /// chain's decoder mixed 7.1 down to 5.1 (fdk's default), so the
+    /// rendition went out 5.1 — and an AC-3 rendition, whose codec takes
+    /// 5.1 at most, is mixed down to it rather than refused at eight.
+    #[test]
+    fn a_7_1_source_keeps_its_layout_or_is_mixed_down_to_ac3() {
+        let aus: Vec<(Vec<u8>, u64)> = aac_frames(48_000, 8, 1.0, 900_000)
+            .into_iter()
+            .map(|(f, pts)| (crate::engine::audio_encode::with_7_1_layout(f), pts))
+            .collect();
+        let seg = aac_segment(&aus);
+        let pes = |out: &[u8]| -> Vec<Vec<u8>> {
+            let mut pes: Vec<Vec<u8>> = Vec::new();
+            for p in out.chunks(188) {
+                if crate::engine::ts_parse::ts_pid(p) != 0x101 || !crate::engine::ts_parse::ts_has_payload(p) {
+                    continue;
+                }
+                let payload = &p[crate::engine::ts_parse::ts_payload_offset(p)..];
+                if crate::engine::ts_parse::ts_pusi(p) {
+                    pes.push(payload.to_vec());
+                } else if let Some(l) = pes.last_mut() {
+                    l.extend_from_slice(payload);
+                }
+            }
+            pes.iter().map(|b| b[9 + b[8] as usize..].to_vec()).collect()
+        };
+        let out = remux_ts_audio_inprocess(&seg, AudioCodec::AacLc, 448, None, None, None).expect("remux");
+        let frames = pes(&out);
+        assert!(frames.len() >= 30, "{} frames", frames.len());
+        for (i, f) in frames.iter().enumerate() {
+            let (au, (profile, sr_idx, ch_cfg)) = crate::engine::audio_au::adts_access_unit(f).expect("one ADTS frame");
+            let layout = crate::engine::aac_config::AacConfig::from_adts(profile, sr_idx, ch_cfg, au)
+                .unwrap_or_else(|| panic!("frame {i}: channel configuration {ch_cfg} without its PCE"));
+            assert_eq!(layout.channels(), 8, "frame {i}: the source's eight channels, not 5.1");
+        }
+        let out = remux_ts_audio_inprocess(&seg, AudioCodec::Ac3, 384, None, None, None).expect("remux");
+        let frames = pes(&out);
+        assert!(frames.len() >= 20, "{} AC-3 frames", frames.len());
+        let mut d = video_engine::AudioDecoder::open(video_codec::AudioDecoderCodec::Ac3).unwrap();
+        d.send_packet(&frames[5], 0).unwrap();
+        assert_eq!(d.receive_frame().expect("a decoded frame").planar.len(), 6, "AC-3 at 5.1");
     }
 
     /// A source that changes format in-band mid-segment is converted to the
