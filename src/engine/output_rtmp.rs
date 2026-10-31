@@ -33,6 +33,7 @@ use super::cmaf::param_sets::{ParamSetCollector, ParamSets};
 use super::cmaf::timeline::{CmafTimeline, Track};
 use super::packet::RtpPacket;
 use super::rtmp::client::{RtmpClient, RtmpConnectError, RtmpFailureKind};
+use super::transcode_engage::{AudioTrackWatch, aac_output_can_publish, emit_audio_codec_unpublishable};
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
 use super::ts_video_replace::VideoEncodeStats;
 
@@ -208,8 +209,9 @@ pub fn spawn_rtmp_output(
         let mut signalled_code: Option<&'static str> = None;
         // What has been said about the audio track the demuxer is on: kept
         // across reconnects, so a dropped connection does not repeat it.
-        let mut audio_watch = RtmpAudioWatch::new(
+        let mut audio_watch = AudioTrackWatch::new(
             config.audio_encode.as_ref().and_then(|a| a.source_audio_pid),
+            aac_output_can_publish,
         );
         loop {
             if cancel.is_cancelled() {
@@ -369,13 +371,15 @@ async fn publish_loop(
     compressed_audio_input: bool,
     flow_id: &str,
     event_sender: &EventSender,
-    audio_watch: &mut RtmpAudioWatch,
+    audio_watch: &mut AudioTrackWatch,
 ) -> anyhow::Result<()> {
-    // The audio track `audio_encode.source_audio_pid` names, when the PMT
-    // carries it; the first audio track otherwise (`audio_watch` says so).
+    // The audio track `audio_encode.source_audio_pid` names, when it is one
+    // this output can publish; the first such track otherwise, or the first
+    // audio track when there is none (`audio_watch` says so).
     let mut demuxer = TsDemuxer::with_audio_pid(
         config.program_number,
         config.audio_encode.as_ref().and_then(|a| a.source_audio_pid),
+        aac_output_can_publish,
     );
     let mut passthrough = PassthroughVideo::default();
     let mut sent_audio_header = false;
@@ -489,7 +493,7 @@ async fn publish_loop(
 
         // Demux TS into elementary stream frames
         let frames = demuxer.demux(ts_data);
-        audio_watch.poll(&demuxer, config, flow_id, event_sender);
+        poll_audio_track(audio_watch, &demuxer, config, flow_id, event_sender);
 
         for frame in frames {
             match frame {
@@ -678,8 +682,8 @@ async fn publish_loop(
                     }
                 }
                 DemuxedFrame::Opus { .. } => {
-                    // RTMP doesn't support Opus — skip (`audio_watch` raises
-                    // `audio_codec_unpublishable` for it).
+                    // RTMP doesn't support Opus — skip (`poll_audio_track`
+                    // raises `audio_codec_unpublishable` for it).
                 }
                 #[cfg(feature = "media-codecs")]
                 DemuxedFrame::OtherAudio { stream_type, data, pts } => {
@@ -688,11 +692,12 @@ async fn publish_loop(
                     let at = timeline.audio(pts);
 
                     // A track no decoder here can read (AC-4) is no audio:
-                    // dropped — `audio_watch` raises `audio_codec_unpublishable`
-                    // for it, since naming `audio_encode` would not help — and
-                    // never taken for real audio, which would hold
-                    // `silent_fallback`'s silence off and publish nothing.
-                    if !rtmp_can_publish_audio(stream_type) {
+                    // dropped — `poll_audio_track` raises
+                    // `audio_codec_unpublishable` for it, since naming
+                    // `audio_encode` would not help — and never taken for
+                    // real audio, which would hold `silent_fallback`'s
+                    // silence off and publish nothing.
+                    if !aac_output_can_publish(stream_type) {
                         continue;
                     }
                     // RTMP carries AAC: MP2 / AC-3 / E-AC-3 / AAC-LATM reach
@@ -773,7 +778,7 @@ async fn publish_loop(
                 DemuxedFrame::OtherAudio { .. } => {
                     // Build without `media-codecs` lacks the libavcodec
                     // bridge needed to decode MP2 / AC-3 / E-AC-3 — drop
-                    // (`audio_watch` raises `audio_codec_unpublishable`).
+                    // (`poll_audio_track` raises `audio_codec_unpublishable`).
                 }
                 // RTMP carries H.264 / HEVC: MPEG-2 video goes out only
                 // re-encoded (`video_encode`), which the decoder layer
@@ -1718,122 +1723,37 @@ fn warn_codec_needs_encode(
     );
 }
 
-/// Whether this output can publish audio the demuxer routes as
-/// `stream_type` (`TsDemuxer::audio_track`): AAC in ADTS (0x0F) as it is,
-/// and — through `audio_encode`, on a build with `media-codecs` — what
-/// libavcodec decodes into the AAC encoder: MP2, AC-3, E-AC-3, AAC-LATM
-/// (without the block `codec_needs_encode` says so). Never Opus, whose frames
-/// have no path to a decoder here, nor AC-4, which nothing here decodes.
-fn rtmp_can_publish_audio(stream_type: u8) -> bool {
-    #[cfg(feature = "media-codecs")]
-    if crate::engine::audio_decode::ff_codec_for_stream_type(stream_type)
-        .is_some_and(|codec| codec != video_codec::AudioDecoderCodec::Opus)
-    {
-        return true;
-    }
-    stream_type == 0x0F
-}
+/// What RTMP publishes, for `audio_codec_unpublishable`
+/// (`aac_output_can_publish`).
+#[cfg(feature = "media-codecs")]
+const RTMP_AUDIO_CARRIES: &str = "AAC, and MP2 / AC-3 / E-AC-3 / AAC-LATM through `audio_encode`";
+#[cfg(not(feature = "media-codecs"))]
+const RTMP_AUDIO_CARRIES: &str = "AAC only: this build has no decoder to re-encode anything else";
 
-/// What an RTMP output tells the operator about the audio track its
-/// demuxer is on. Held by the output task across reconnects, so a
-/// connection that drops and comes back does not say it again.
-struct RtmpAudioWatch {
-    /// `audio_encode.source_audio_pid` not in the PMT
-    /// (`audio_source_pid_not_found`).
-    pin: crate::engine::transcode_engage::AudioPinWatch,
-    /// The `(pid, stream_type)` an `audio_codec_unpublishable` Warning was
-    /// raised for. Cleared once the output is on audio it can publish, so
-    /// each episode on an unpublishable track is reported once.
-    unpublishable: Option<(u16, u8)>,
-}
-
-impl RtmpAudioWatch {
-    fn new(pin: Option<u16>) -> Self {
-        Self {
-            pin: crate::engine::transcode_engage::AudioPinWatch::new(pin),
-            unpublishable: None,
-        }
-    }
-
-    /// The output is on audio `track`: `Some` when an
-    /// `audio_codec_unpublishable` Warning is owed for it.
-    fn unpublishable_notice(&mut self, track: Option<(u16, u8)>) -> Option<(u16, u8)> {
-        let (pid, stream_type) = track?;
-        if rtmp_can_publish_audio(stream_type) {
-            self.unpublishable = None;
-            return None;
-        }
-        if self.unpublishable == Some((pid, stream_type)) {
-            return None;
-        }
-        self.unpublishable = Some((pid, stream_type));
-        Some((pid, stream_type))
-    }
-
-    /// Raise whatever the demuxer's audio track now calls for. Called after
-    /// every `demux`, so a PMT update is answered at once.
-    fn poll(
-        &mut self,
-        demuxer: &TsDemuxer,
-        config: &RtmpOutputConfig,
-        flow_id: &str,
-        event_sender: &EventSender,
-    ) {
-        let track = demuxer.audio_track();
-        if let Some((pinned, actual, stream_type)) = self.pin.check(track) {
-            crate::engine::transcode_engage::emit_pinned_audio_pid_absent(
-                event_sender,
-                &config.id,
-                pinned,
-                actual,
-                stream_type,
-                "the program's first audio stream",
-            );
-        }
-        if let Some((pid, stream_type)) = self.unpublishable_notice(track) {
-            warn_audio_unpublishable(config, pid, stream_type, flow_id, event_sender);
-        }
-    }
-}
-
-/// Tell the operator that the audio track this output is on, PID `pid`, is
-/// in a codec it can neither carry nor re-encode (`rtmp_can_publish_audio`),
-/// so the publish has no audio. An MPTS whose first audio track was AC-4 used
-/// to publish that way without a word; `audio_encode.source_audio_pid` is how
-/// another track is chosen.
-fn warn_audio_unpublishable(
+/// Raise whatever the audio track the demuxer is on now calls for:
+/// `audio_source_pid_not_found` for a missed pin, and
+/// `audio_codec_unpublishable` for a codec RTMP cannot publish — an MPTS
+/// whose first audio track was AC-4 used to publish no audio without a word.
+/// Called after every `demux`, so a PMT update is answered at once.
+fn poll_audio_track(
+    watch: &mut AudioTrackWatch,
+    demuxer: &TsDemuxer,
     config: &RtmpOutputConfig,
-    pid: u16,
-    stream_type: u8,
     flow_id: &str,
     event_sender: &EventSender,
 ) {
-    let codec = crate::engine::ts_demux::audio_codec_name(stream_type);
-    let carries = if cfg!(feature = "media-codecs") {
-        "AAC, and MP2 / AC-3 / E-AC-3 / AAC-LATM through `audio_encode`"
-    } else {
-        "AAC only: this build has no decoder to re-encode anything else"
-    };
-    let msg = format!(
-        "RTMP output '{}': its audio track, PID 0x{pid:04X}, is {codec} (stream_type \
-         0x{stream_type:02X}), which RTMP cannot carry or re-encode here ({carries}); no audio \
-         is published. Pin a track it can publish with `audio_encode.source_audio_pid`",
-        config.id
-    );
-    tracing::warn!("{msg}");
-    event_sender.emit_output_with_details(
-        EventSeverity::Warning,
-        category::RTMP,
-        msg,
-        &config.id,
-        serde_json::json!({
-            "error_code": "audio_codec_unpublishable",
-            "audio_pid": pid,
-            "stream_type": stream_type,
-            "source_codec": codec,
-            "flow_id": flow_id,
-        }),
-    );
+    if let Some((pid, stream_type)) = watch.poll(demuxer.audio_track(), event_sender, &config.id) {
+        emit_audio_codec_unpublishable(
+            event_sender,
+            category::RTMP,
+            "RTMP",
+            &config.id,
+            flow_id,
+            pid,
+            stream_type,
+            RTMP_AUDIO_CARRIES,
+        );
+    }
 }
 
 /// Initialise the per-output video encoder state machine at startup.
@@ -5460,8 +5380,10 @@ pub(super) mod flv_wire_tests {
         drop(tx);
         // Returns once the channel is drained and closed. The input can
         // carry TS audio (it only matters with `audio_encode`).
-        let mut audio_watch =
-            RtmpAudioWatch::new(config.audio_encode.as_ref().and_then(|a| a.source_audio_pid));
+        let mut audio_watch = AudioTrackWatch::new(
+            config.audio_encode.as_ref().and_then(|a| a.source_audio_pid),
+            aac_output_can_publish,
+        );
         publish_loop(
             &config, &mut client, &mut rx, &stats, &CancellationToken::new(), true, "f", &events,
             &mut audio_watch,
@@ -7521,19 +7443,6 @@ pub(crate) mod tests {
 
     const AC4: &[u8] = &[0xAC, 0x03, 0x00, 0x00, 0x00];
 
-    /// What RTMP can publish: AAC as it is; MP2 / AC-3 / E-AC-3 / AAC-LATM
-    /// through `audio_encode` where libavcodec is compiled in; never Opus or
-    /// AC-4.
-    #[test]
-    fn rtmp_publishes_aac_and_what_its_decoders_read_never_opus_or_ac4() {
-        assert!(rtmp_can_publish_audio(0x0F));
-        for st in [0x03, 0x04, 0x80, 0x81, 0xC1, 0x87, 0xC2, 0x11] {
-            assert_eq!(rtmp_can_publish_audio(st), cfg!(feature = "media-codecs"), "stream_type {st:#04x}");
-        }
-        assert!(!rtmp_can_publish_audio(0x06), "Opus");
-        assert!(!rtmp_can_publish_audio(crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4));
-    }
-
     /// An MPTS whose first audio track is AC-4 used to publish no audio and
     /// say nothing. The output now raises `audio_codec_unpublishable`, naming
     /// the PID and codec, once per episode: not again while it stays there,
@@ -7546,19 +7455,20 @@ pub(crate) mod tests {
         }))
         .unwrap();
         let (events, mut rx) = crate::manager::events::event_channel();
-        let mut watch = RtmpAudioWatch::new(None);
-        let mut demux = TsDemuxer::with_audio_pid(None, None);
+        let mut watch = AudioTrackWatch::new(None, aac_output_can_publish);
+        let mut demux = TsDemuxer::with_audio_pid(None, None, aac_output_can_publish);
 
-        watch.poll(&demux, &cfg, "f", &events);
+        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         assert!(raised(&mut rx).is_empty(), "no PMT yet");
 
         demux.demux(&audio_psi(0, &[(0x06, 0x300, AC4), (0x0F, 0x301, &[])]));
-        watch.poll(&demux, &cfg, "f", &events);
+        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         let ev = rx.try_recv().expect("one Warning");
         assert_eq!(ev.severity, EventSeverity::Warning);
         assert_eq!(ev.category, category::RTMP);
         assert_eq!(ev.output_id.as_deref(), Some("r1"));
-        assert!(ev.message.contains("PID 0x0300") && ev.message.contains("AC-4"), "{}", ev.message);
+        assert!(ev.message.starts_with("RTMP output 'r1': its audio track, PID 0x0300, is AC-4"), "{}", ev.message);
+        assert!(ev.message.contains(RTMP_AUDIO_CARRIES), "{}", ev.message);
         let d = ev.details.unwrap();
         assert_eq!(d["error_code"], "audio_codec_unpublishable");
         assert_eq!(d["audio_pid"], 0x300);
@@ -7566,52 +7476,72 @@ pub(crate) mod tests {
         assert_eq!(d["source_codec"], "AC-4");
         assert_eq!(d["flow_id"], "f");
         for _ in 0..3 {
-            watch.poll(&demux, &cfg, "f", &events);
+            poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         }
         assert!(raised(&mut rx).is_empty(), "once per episode");
 
         demux.demux(&audio_psi(1, &[(0x0F, 0x301, &[])]));
-        watch.poll(&demux, &cfg, "f", &events);
+        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         assert!(raised(&mut rx).is_empty(), "AAC publishes");
 
         demux.demux(&audio_psi(2, &[(0x06, 0x300, AC4), (0x0F, 0x301, &[])]));
-        watch.poll(&demux, &cfg, "f", &events);
+        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         assert_eq!(raised(&mut rx), ["audio_codec_unpublishable"], "a new episode");
 
         // Opus-in-TS: no decode path on RTMP, whatever `audio_encode` says.
         demux.demux(&audio_psi(3, &[(0x06, 0x302, &[0x05, 0x04, b'O', b'p', b'u', b's'])]));
-        watch.poll(&demux, &cfg, "f", &events);
+        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         assert_eq!(raised(&mut rx), ["audio_codec_unpublishable"], "Opus");
     }
 
-    /// `audio_encode.source_audio_pid` picks the track RTMP publishes: the
-    /// pinned E-AC-3 behind an AC-4 first track raises nothing (it decodes
-    /// for the re-encode), and a pin the PMT does not carry falls back to the
-    /// first track with the replacers' `audio_source_pid_not_found` — here
-    /// followed by `audio_codec_unpublishable`, since that track is AC-4.
+    /// `audio_encode.source_audio_pid` picks the track RTMP publishes, among
+    /// those it can publish: the pinned E-AC-3 behind an AC-4 first track
+    /// raises nothing (it decodes for the re-encode). A pin it cannot take —
+    /// absent (a typo), or the AC-4 itself — falls back to the first track it
+    /// can publish, the E-AC-3, with the replacers' `audio_source_pid_not_found`,
+    /// as a TS output's replacer does. It used to land on the AC-4.
+    #[cfg(feature = "media-codecs")]
     #[test]
-    fn the_audio_pin_picks_the_published_track_and_a_missing_pin_is_reported() {
+    fn the_audio_pin_picks_a_track_rtmp_can_publish() {
         let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
             "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
-            "audio_encode": { "codec": "aac_lc", "source_audio_pid": 0x301 }
+            "audio_encode": { "codec": "aac_lc" }
         }))
         .unwrap();
-        let pin = cfg.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
         let psi = audio_psi(0, &[(0x06, 0x300, AC4), (0x87, 0x301, &[])]);
         let (events, mut rx) = crate::manager::events::event_channel();
-        let mut watch = RtmpAudioWatch::new(pin);
-        let mut demux = TsDemuxer::with_audio_pid(None, pin);
-        demux.demux(&psi);
-        watch.poll(&demux, &cfg, "f", &events);
-        assert_eq!(demux.audio_track(), Some((0x301, 0x87)));
-        let expected: &[&str] = if cfg!(feature = "media-codecs") { &[] } else { &["audio_codec_unpublishable"] };
-        assert_eq!(raised(&mut rx), expected);
+        for (pin, expected) in [
+            (0x301, &[][..]),
+            (0x305, &["audio_source_pid_not_found"][..]),
+            (0x300, &["audio_source_pid_not_found"][..]),
+        ] {
+            let mut watch = AudioTrackWatch::new(Some(pin), aac_output_can_publish);
+            let mut demux = TsDemuxer::with_audio_pid(None, Some(pin), aac_output_can_publish);
+            demux.demux(&psi);
+            poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
+            poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
+            assert_eq!(demux.audio_track(), Some((0x301, 0x87)), "pin {pin:#05x}");
+            assert_eq!(raised(&mut rx), expected, "pin {pin:#05x}");
+        }
+    }
 
-        let mut watch = RtmpAudioWatch::new(Some(0x305));
-        let mut demux = TsDemuxer::with_audio_pid(None, Some(0x305));
-        demux.demux(&psi);
-        watch.poll(&demux, &cfg, "f", &events);
-        watch.poll(&demux, &cfg, "f", &events);
+    /// A pin on a program with nothing RTMP can publish (AC-4 and Opus)
+    /// falls back to the first audio track and says both things: the pin
+    /// was not taken, and the track it is on publishes no audio.
+    #[test]
+    fn a_pin_on_a_program_rtmp_cannot_publish_says_both() {
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
+        }))
+        .unwrap();
+        let opus: &[u8] = &[0x05, 0x04, b'O', b'p', b'u', b's'];
+        let (events, mut rx) = crate::manager::events::event_channel();
+        let mut watch = AudioTrackWatch::new(Some(0x302), aac_output_can_publish);
+        let mut demux = TsDemuxer::with_audio_pid(None, Some(0x302), aac_output_can_publish);
+        demux.demux(&audio_psi(0, &[(0x06, 0x300, AC4), (0x06, 0x302, opus)]));
+        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
+        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
+        assert_eq!(demux.audio_track(), Some((0x300, crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4)));
         assert_eq!(raised(&mut rx), ["audio_source_pid_not_found", "audio_codec_unpublishable"]);
     }
 }

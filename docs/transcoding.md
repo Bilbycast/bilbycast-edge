@@ -226,9 +226,12 @@ unpinned, whatever the pin said:
 - **RTMP, CMAF and WebRTC** (the shared demuxer,
   `TsDemuxer::with_audio_pid`): unpinned, the program's **first** audio
   stream, any codec the demuxer recognises — AC-4 and Opus included. A pin
-  is taken when the PMT carries it as audio, whatever its codec; otherwise
-  the output falls back to the first audio stream. A later PMT that carries
-  the pin moves the output back onto it.
+  is taken when it is a track the output can publish (below); otherwise —
+  absent, not audio, or a codec the output cannot publish — the output
+  falls back to the **first audio stream it can publish**, as the replacer
+  falls back to the first one it can decode, and to the first audio stream
+  of all only when the program has none it can publish. A later PMT that
+  carries the pin moves the output back onto it.
 - **HLS** (`audio_encode` remux): unpinned, the **last** audio stream it
   can decode, as before. A pin is taken when it is one it can decode;
   otherwise (absent, or AC-4 / DTS) the output falls back to that last
@@ -243,12 +246,21 @@ the stream the output fell back to. It fires once per distinct
 reappears: a WebRTC output raises it once, not once per WHEP viewer or
 WHIP reconnect, and an RTMP output not again on a reconnect.
 
-An RTMP output on a track it cannot publish — AC-4, Opus-in-TS, or on a
-build without `media-codecs` anything but AAC — publishes no audio and
-raises the Warning `audio_codec_unpublishable` naming the PID and codec,
-once per episode (see
+What each of the three can publish: **RTMP and CMAF** carry AAC as it
+is, and MP2 / AC-3 / E-AC-3 / AAC-LATM re-encoded through `audio_encode`
+(a `media-codecs` build) — never Opus-in-TS or AC-4. **WebRTC** carries
+Opus-in-TS, and AAC (plus MP2 / AC-3 / E-AC-3 / AAC-LATM on a
+`media-codecs` build) re-encoded through `audio_encode` — never AC-4. An
+output on a track it cannot publish — the program's first audio stream
+when nothing is pinned; under a pin, only when the program has no audio
+stream it can publish — publishes none of the source's audio and raises
+the Warning `audio_codec_unpublishable` naming the PID and codec, once per
+episode, in its own category (`rtmp`, `cmaf`, `webrtc`; see
 [`events-and-alarms.md`](events-and-alarms.md#rtmp-output-push-to-twitch--youtube--any-rtmp-ingest)).
-Pin a track it can publish to fix it.
+A WebRTC output raises it once for the output, not per viewer, and not at
+all when it is `video_only`. Pin a track it can publish to fix it.
+Releases up to 0.116.0 said nothing, and a WebRTC output under
+`silent_fallback` did not even lay silence on an AC-4 track.
 
 **The in-place transcoder is single-program**, so one output transcodes
 exactly one audio PID. To pull two tracks out of an MPTS — say an
