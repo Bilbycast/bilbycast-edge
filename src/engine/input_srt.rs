@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
-/// Maximum time we wait for the SMPTE 2022-7 leg-2 socket to complete its
-/// initial handshake before giving up and running the input in single-leg
-/// mode. Prevents a misconfigured or unreachable leg-2 peer from gating
-/// ingest on the healthy leg-1.
-const INITIAL_LEG2_CONNECT_BUDGET: Duration = Duration::from_secs(15);
+/// How long a 2022-7 listener leg may wait for its first caller before a
+/// Warning says so. The leg keeps waiting. Caller legs report through the
+/// connect-failure latch instead.
+const LEG_CONNECT_WARN_AFTER: Duration = Duration::from_secs(15);
 
 use bytes::Bytes;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
+use srt_transport::{SocketStatus, SrtListener, SrtSocket};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{SrtInputConfig, SrtMode, SrtRedundancyConfig};
@@ -24,11 +24,11 @@ use crate::srt::bond_supervisor::{
     final_member_report, member_sources_json, plan_bond_members,
 };
 use crate::srt::connection::{
-    accept_srt_connection, bind_srt_listener_for_bonded_input,
+    accept_srt_connection, acquire_redundant_leg, bind_srt_listener_for_bonded_input,
     bind_srt_listener_for_input, bind_srt_listener_for_redundancy, connect_srt_group_observed,
-    connect_srt_redundancy_leg, connect_srt_with_retry_observed,
-    spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller,
-    spawn_srt_stats_poller, SrtConnectionParams, CONNECT_FAILED_THRESHOLD,
+    connect_srt_with_retry_observed, leg_release_bound, release_leg_acquire,
+    spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller,
+    LegAcquire, LegAcquired, SrtConnectionParams, CONNECT_FAILED_THRESHOLD, LEG_REACQUIRE_DELAY,
 };
 use crate::stats::collector::{FlowStatsAccumulator, SrtInputSocket, SrtInputStats};
 use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp_timestamp};
@@ -494,27 +494,37 @@ async fn srt_input_listener_loop(
     }
 }
 
-/// Record one failed caller connect attempt on the shared per-input counter
-/// and report whether this attempt just crossed [`CONNECT_FAILED_THRESHOLD`]
-/// — i.e. whether the latched Critical should fire. Exactly one `true` per
-/// connect cycle: the count keeps climbing past the threshold and only
-/// resets (via the caller loop) on a successful connect.
+/// Store `attempts`, the current connect's count of consecutive failed
+/// attempts, on `counter`, and report whether this attempt is the one that
+/// reaches [`CONNECT_FAILED_THRESHOLD`]: whether the latched event fires (a
+/// Critical, or a Warning on a 2022-7 leg whose other leg is connected).
+/// Every new connect counts `attempts` from 1 again, so the latch fires once
+/// per connect. `counter` is only what the stats read, and nothing re-arms
+/// the latch through it: it is the input's own counter, reset on a connect,
+/// or for a 2022-7 leg 2 a scratch one nothing reads.
 fn record_connect_failure(attempts: u32, counter: &AtomicU32) -> bool {
     counter.store(attempts, Ordering::Relaxed);
     attempts == CONNECT_FAILED_THRESHOLD
 }
 
-/// Build the per-attempt connect-failure observer shared by every SRT
-/// caller-mode connect path (plain, 2022-7 leg 1, bonded group): bumps the
-/// per-input counter (→ state `connect_failed` past the threshold) and
-/// emits the latched Critical once per connect cycle. `static_details`
-/// carries the path-specific fields (mode / remote_addr / leg / endpoints).
+/// Build the per-attempt connect-failure observer shared by the SRT
+/// caller-mode connect paths of a 2022-7 input's legs and a bonded group:
+/// bumps `connect_failures` (→ state `connect_failed` past the threshold,
+/// for the counter the stats read) and emits the latched event once per
+/// acquisition. `static_details` carries the path-specific fields (mode /
+/// remote_addr / leg / endpoints).
+///
+/// `other_leg_up` is the other leg of a 2022-7 pair (`None` elsewhere). The
+/// event is a Warning while that leg is connected, since the input is then
+/// on air, and a Critical otherwise; with a pair, `details.other_leg` says
+/// which (`connected` / `down`).
 fn connect_failure_observer<'a>(
     connect_failures: &'a Arc<AtomicU32>,
     events: &'a EventSender,
     flow_id: &'a str,
     input_id: &'a str,
     static_details: serde_json::Value,
+    other_leg_up: Option<&'a AtomicBool>,
 ) -> impl FnMut(u32, &anyhow::Error) + Send + 'a {
     move |attempts: u32, e: &anyhow::Error| {
         if !record_connect_failure(attempts, connect_failures) {
@@ -523,14 +533,21 @@ fn connect_failure_observer<'a>(
         tracing::error!(
             "SRT input '{input_id}' connection failed {attempts} consecutive times: {e}"
         );
+        let other_up = other_leg_up.map(|up| up.load(Ordering::Relaxed));
         let mut details = static_details.clone();
         if let Some(map) = details.as_object_mut() {
             map.insert("error".into(), serde_json::json!(e.to_string()));
             map.insert("input_id".into(), serde_json::json!(input_id));
             map.insert("consecutive_failures".into(), serde_json::json!(attempts));
+            if let Some(up) = other_up {
+                map.insert(
+                    "other_leg".into(),
+                    serde_json::json!(if up { "connected" } else { "down" }),
+                );
+            }
         }
         events.emit_flow_with_details(
-            EventSeverity::Critical,
+            if other_up == Some(true) { EventSeverity::Warning } else { EventSeverity::Critical },
             category::SRT,
             format!("SRT input connection failed: {e}"),
             flow_id,
@@ -820,19 +837,37 @@ fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64
 /// Dual-leg SRT input with SMPTE 2022-7 hitless merge.
 ///
 /// For **RTP/TS** streams: merge uses the RTP sequence number (standard 2022-7).
-/// For **raw TS** streams: merge uses a synthetic per-leg sequence counter.
-/// Both legs must use the same format — if one leg sends RTP and the other
-/// sends raw TS, the raw TS leg is accepted but merge may not deduplicate
-/// perfectly (documented limitation).
+/// For **raw TS** streams there is no sequence number the legs share, so the
+/// input fails over between them ([`RawTsFailover`]), forwarding one leg at a
+/// time, rather than merging. The format is detected once per pair, from the
+/// first packet either leg delivers, and both legs must send it.
 ///
-/// Listener-mode legs bind once and re-accept on disconnect; caller-mode legs
-/// reconnect with exponential back-off.
+/// Each leg is accepted or dialled on its own ([`acquire_redundant_leg`]),
+/// both from the start, so either leg alone carries the input. Listener-mode
+/// legs bind once and re-accept on that listener; caller-mode legs re-dial
+/// with exponential back-off. A lost leg is re-acquired
+/// [`LEG_REACQUIRE_DELAY`] after it is lost while the other leg carries on in
+/// the same merger. Only a loss that leaves neither leg connected raises
+/// "Both redundant legs lost" and starts the pair afresh — a new merger,
+/// failover and format detection — as each connect cycle used to. A listener
+/// whose accept channel has closed can never accept again: its leg raises a
+/// Critical and is not re-armed, and the task ends only once both legs have
+/// failed so.
+///
+/// A leg returning *ahead* of the leg that carries (a shorter path, or a
+/// lower receive latency) is not hitless. The merger forwards its first
+/// packet at once and the slots it skipped are then filled from the trailing
+/// leg, so for about the lead the output interleaves two stream positions;
+/// a lead of a whole merger window or more is skipped instead. Neither
+/// reaches `packets_lost`: the interleaved seqs are each forwarded once, and
+/// the pair's stats count a skip only as far as the legs' drops confirm it,
+/// which a leg just back has none of.
 ///
 /// Each leg's socket has its own stats poller, into `srt.leg` and
-/// `srt.leg2`. What reaches `srt`'s drops is what the pair lost (see
-/// [`crate::stats::collector::SrtPair`]): with RTP, the packets neither leg
-/// delivered, as the merger counts them; with raw TS, the drops of the leg
-/// the failover forwards.
+/// `srt.leg2`, from each attach until that leg is lost. What reaches `srt`'s
+/// drops is what the pair lost (see [`crate::stats::collector::SrtPair`]):
+/// with RTP, the packets neither leg delivered, as the merger counts them;
+/// with raw TS, the drops of the leg the failover forwards.
 async fn srt_input_redundant_loop(
     config: SrtInputConfig,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
@@ -850,19 +885,20 @@ async fn srt_input_redundant_loop(
         .as_ref()
         .expect("redundancy config must be present");
 
-    // Primary-leg consecutive-connect-failure counter (contract C3 /
-    // `connect_failed` state). Leg 1 only: leg 2 has its own budgeted
-    // single-leg fallback + Warning, and a healthy leg 1 must not be
-    // reported `connect_failed` because leg 2 is down.
+    // Leg 1's consecutive-connect-failure counter (contract C3 /
+    // `connect_failed` state), stored 0 whenever leg 1 attaches. Leg 1 only,
+    // as before the legs were acquired on their own: leg 2's caller attempts
+    // latch their own event through a scratch counter.
     let connect_failures = stats
         .per_input_counters
         .get(input_id)
         .map(|c| c.connect_failures.clone())
         .unwrap_or_default();
 
-    // Bind persistent listeners for any legs in listener mode.
-    // Both stay bound across outer reconnect cycles.
-    let mut listener_leg1 = if config.mode == SrtMode::Listener {
+    // Bind persistent listeners for any legs in listener mode. Each is handed
+    // to its leg's acquisition and back on every attach, so it stays bound
+    // for the life of the input.
+    let listener_leg1 = if config.mode == SrtMode::Listener {
         match bind_srt_listener_for_input(&config).await {
             Ok(l) => Some(l),
             Err(e) => {
@@ -880,7 +916,7 @@ async fn srt_input_redundant_loop(
     } else {
         None
     };
-    let mut listener_leg2 = if redundancy.mode == SrtMode::Listener {
+    let listener_leg2 = if redundancy.mode == SrtMode::Listener {
         match bind_srt_listener_for_redundancy(redundancy).await {
             Ok(l) => Some(l),
             Err(e) => {
@@ -899,289 +935,417 @@ async fn srt_input_redundant_loop(
         None
     };
 
-    // Outer reconnection loop
-    loop {
-        // --- Connect/accept leg 1 ---
-        let socket_leg1 = if let Some(ref mut listener) = listener_leg1 {
-            match accept_srt_connection(listener, &cancel).await {
-                Ok(s) => s,
-                Err(_) if cancel.is_cancelled() => {
-                    if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                    if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-                    return Ok(());
-                }
-                Err(e) => {
-                    if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                    if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-                    return Err(e);
-                }
-            }
-        } else {
-            let mut on_attempt_failed = connect_failure_observer(
-                &connect_failures,
-                events,
-                flow_id,
-                input_id,
-                serde_json::json!({
-                    "mode": format!("{:?}", config.mode),
-                    "remote_addr": config.remote_addr.as_deref().unwrap_or(""),
-                    "stream_id": config.stream_id.as_deref().unwrap_or(""),
-                    "leg": 1,
-                }),
-            );
-            let params = SrtConnectionParams::from(&config);
-            match connect_srt_with_retry_observed(&params, &cancel, &mut on_attempt_failed).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if cancel.is_cancelled() {
-                        if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                        if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-                        return Ok(());
-                    }
-                    if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                    if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-                    return Err(e);
-                }
-            }
-        };
-        connect_failures.store(0, Ordering::Relaxed);
-        tracing::info!(
-            "SRT input leg1 connected: mode={:?} local={}",
-            config.mode,
-            config.local_addr.as_deref().unwrap_or("auto")
-        );
-        events.emit_flow_with_details(
-            EventSeverity::Info, category::SRT,
-            "SRT input connected (mode=listener, redundant leg 1)", flow_id,
-            serde_json::json!({
-                "mode": "listener",
-                "leg": 1,
-                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
-            }),
-        );
+    // Whether each leg is attached. Written on attach and loss only; read by
+    // the connect-failure observers and the slow-connect Warnings, which run
+    // inside the acquisitions and cannot see the sockets.
+    let leg_up = [AtomicBool::new(false), AtomicBool::new(false)];
+    // Leg 2's caller attempts, for the latch alone: nothing reads the count.
+    let leg2_attempts = Arc::new(AtomicU32::new(0));
+    // Cancelled at teardown whether or not `cancel` was, so a pending
+    // acquisition can be let finish (see the end of this function).
+    let legs_cancel = cancel.child_token();
+    let ctx = RedundantInputCtx {
+        config: &config,
+        redundancy,
+        cancel: &legs_cancel,
+        events,
+        flow_id,
+        input_id,
+        leg_up: &leg_up,
+        connect_failures: &connect_failures,
+        leg2_attempts: &leg2_attempts,
+    };
 
-        // Leg 1's stats until it is lost or the cycle ends; leg 2's from
-        // when it comes up.
-        let leg1_poller = cancel.child_token();
-        spawn_srt_stats_poller(
-            socket_leg1.clone(),
-            srt.leg.clone(),
-            Some((srt.clone(), SrtInputSocket::Leg1)),
-            leg1_poller.clone(),
-        );
-        let leg2_poller = cancel.child_token();
+    // Each leg's state in locals of its own, so the select! below borrows one
+    // leg's acquisition mutably beside the other leg's socket.
+    let mut acquire1 = Some(arm_input_leg(&ctx, 1, listener_leg1, Duration::ZERO, true));
+    let mut acquire2 = Some(arm_input_leg(&ctx, 2, listener_leg2, Duration::ZERO, true));
+    // A leg's listener, held from its attach until its next re-arm.
+    let (mut listener1, mut listener2): (Option<SrtListener>, Option<SrtListener>) = (None, None);
+    let (mut sock1, mut sock2): (Option<Arc<SrtSocket>>, Option<Arc<SrtSocket>>) = (None, None);
+    let (mut poller1, mut poller2): (Option<CancellationToken>, Option<CancellationToken>) =
+        (None, None);
+    // A leg whose listener has failed for good.
+    let (mut dead1, mut dead2) = (false, false);
 
-        let mut merger =
-            HitlessMerger::new().with_stale_after_us(pair_stale_after_us(&config, redundancy));
-        // What of the merger's counts the pair's stats have been told.
-        let mut merger_handoff = crate::stats::collector::MergerHandoff::default();
-        let mut failover = RawTsFailover::new();
-        let mut prev_active_leg = ActiveLeg::None;
-        let mut leg1_alive = true;
-        let mut socket_leg2: Option<Arc<srt_transport::SrtSocket>> = None;
-        let mut leg2_alive = false;
-        let mut format = SrtPayloadFormat::Unknown;
-        let mut raw_ts_seq_leg1: u16 = 0;
-        let mut raw_ts_seq_leg2: u16 = 0;
-        let mut raw_ts_timestamp: u32 = 0;
+    let stale_after_us = pair_stale_after_us(&config, redundancy);
+    let mut pair = RedundantPair::new(stale_after_us);
 
-        // Leg-2 connect future, pinned so we can poll it inside select! and
-        // only complete once per reconnect cycle. Bounded by
-        // INITIAL_LEG2_CONNECT_BUDGET so a dead or slow leg-2 peer never
-        // gates ingest on a healthy leg-1. While this is pending the
-        // select! below is already reading from leg-1.
-        let leg2_connect_fut = {
-            let events = events.clone();
-            let flow_id = flow_id.to_string();
-            let redundancy = redundancy.clone();
-            let cancel = cancel.clone();
-            let mut listener_leg2_mut = listener_leg2.take();
-            async move {
-                let result: (Option<Arc<srt_transport::SrtSocket>>, Option<srt_transport::SrtListener>) = if let Some(ref mut listener) = listener_leg2_mut {
-                    let r = tokio::time::timeout(
-                        INITIAL_LEG2_CONNECT_BUDGET,
-                        accept_srt_connection(listener, &cancel),
-                    ).await;
-                    match r {
-                        Ok(Ok(s)) => (Some(s), listener_leg2_mut),
-                        Ok(Err(_)) if cancel.is_cancelled() => (None, listener_leg2_mut),
-                        Ok(Err(e)) => {
-                            tracing::warn!("SRT input leg2 accept failed: {e}, running single-leg");
-                            (None, listener_leg2_mut)
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "SRT input leg2 did not come up within {:?} (accept timed out), running single-leg",
-                                INITIAL_LEG2_CONNECT_BUDGET,
-                            );
-                            events.emit_flow_with_details(
-                                EventSeverity::Warning, category::SRT,
-                                format!("SRT input 2022-7 leg 2 did not connect within {:?}; running single-leg", INITIAL_LEG2_CONNECT_BUDGET),
-                                &flow_id,
-                                serde_json::json!({
-                                    "mode": format!("{:?}", redundancy.mode),
-                                    "leg": 2, "reason": "accept timed out",
-                                    "budget_ms": INITIAL_LEG2_CONNECT_BUDGET.as_millis(),
-                                }),
-                            );
-                            (None, listener_leg2_mut)
-                        }
-                    }
-                } else {
-                    match tokio::time::timeout(
-                        INITIAL_LEG2_CONNECT_BUDGET,
-                        connect_srt_redundancy_leg(&redundancy, &cancel),
-                    ).await {
-                        Ok(Ok(s)) => (Some(s), None),
-                        Ok(Err(_)) if cancel.is_cancelled() => (None, None),
-                        Ok(Err(e)) => {
-                            tracing::warn!("SRT input leg2 connection failed: {e}, running single-leg");
-                            (None, None)
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "SRT input leg2 did not come up within {:?} (caller connect retry budget exhausted), running single-leg",
-                                INITIAL_LEG2_CONNECT_BUDGET,
-                            );
-                            events.emit_flow_with_details(
-                                EventSeverity::Warning, category::SRT,
-                                format!("SRT input 2022-7 leg 2 did not connect within {:?}; running single-leg", INITIAL_LEG2_CONNECT_BUDGET),
-                                &flow_id,
-                                serde_json::json!({
-                                    "mode": format!("{:?}", redundancy.mode),
-                                    "leg": 2, "reason": "caller connect retry budget exhausted",
-                                    "budget_ms": INITIAL_LEG2_CONNECT_BUDGET.as_millis(),
-                                }),
-                            );
-                            (None, None)
-                        }
-                    }
-                };
-                if result.0.is_some() {
-                    tracing::info!(
-                        "SRT input leg2 connected: mode={:?} local={}",
-                        redundancy.mode,
-                        redundancy.local_addr.as_deref().unwrap_or("auto")
-                    );
-                }
-                result
+    let outcome = loop {
+        // A leg's recv future polls only while the leg has a socket.
+        // `std::future::pending()` never resolves, so the branch stays
+        // dormant until the leg attaches.
+        let leg1_recv = async {
+            match &sock1 {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
             }
         };
-        tokio::pin!(leg2_connect_fut);
-        let mut leg2_done = false;
-
-        loop {
-            // Leg-2 recv future: only polls when we have a live leg-2
-            // socket. `std::future::pending()` never resolves, so the
-            // branch stays dormant until leg-2 arrives.
-            let leg2_recv = async {
-                match &socket_leg2 {
-                    Some(s) => s.recv().await,
-                    None => std::future::pending().await,
-                }
-            };
-
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!("SRT input (redundant) stopping (cancelled)");
-                    let _ = socket_leg1.close().await;
-                    if let Some(ref s) = socket_leg2 {
-                        let _ = s.close().await;
-                    }
-                    if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                    if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-                    return Ok(());
-                }
-                (sock, returned_listener) = &mut leg2_connect_fut, if !leg2_done => {
-                    leg2_done = true;
-                    // Give the listener back so next outer-loop iteration can reuse it.
-                    if returned_listener.is_some() {
-                        listener_leg2 = returned_listener;
-                    }
-                    if let Some(s) = sock {
-                        spawn_srt_stats_poller(
-                            s.clone(),
-                            srt.leg2.clone(),
-                            Some((srt.clone(), SrtInputSocket::Leg2)),
-                            leg2_poller.clone(),
-                        );
-                        socket_leg2 = Some(s);
-                        leg2_alive = true;
-                    }
-                    continue;
-                }
-                result = socket_leg1.recv(), if leg1_alive => {
-                    match result {
-                        Ok(pkt) => {
-                            let srctime_us = pkt.sender_timestamp_us;
-                            let data = pkt.data;
-                            if format == SrtPayloadFormat::Unknown {
-                                format = detect_format(&data);
-                                log_detected_format_redundant(format, events, flow_id);
-                                srt.pair.set_merged(format == SrtPayloadFormat::RtpTs);
-                            }
-                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg1, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, merger_handoff: &mut merger_handoff, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
-                        }
-                        Err(_) => {
-                            tracing::warn!("SRT input leg1 connection lost");
-                            events.emit_flow(EventSeverity::Warning, category::REDUNDANCY, "Redundant leg 1 lost", flow_id);
-                            leg1_alive = false;
-                            leg1_poller.cancel();
-                            if !leg2_alive {
-                                tracing::warn!("SRT input (redundant) both legs lost, will reconnect");
-                                events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
-                                break;
-                            }
-                        }
-                    }
-                }
-                result = leg2_recv, if leg2_alive => {
-                    match result {
-                        Ok(pkt) => {
-                            let srctime_us = pkt.sender_timestamp_us;
-                            let data = pkt.data;
-                            if format == SrtPayloadFormat::Unknown {
-                                format = detect_format(&data);
-                                log_detected_format_redundant(format, events, flow_id);
-                                srt.pair.set_merged(format == SrtPayloadFormat::RtpTs);
-                            }
-                            process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, format, RedundantPacketState { raw_ts_seq: &mut raw_ts_seq_leg2, raw_ts_timestamp: &mut raw_ts_timestamp, merger: &mut merger, merger_handoff: &mut merger_handoff, failover: &mut failover, prev_active_leg: &mut prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
-                        }
-                        Err(_) => {
-                            tracing::warn!("SRT input leg2 connection lost");
-                            events.emit_flow(EventSeverity::Warning, category::REDUNDANCY, "Redundant leg 2 lost", flow_id);
-                            leg2_alive = false;
-                            leg2_poller.cancel();
-                            if !leg1_alive {
-                                tracing::warn!("SRT input (redundant) both legs lost, will reconnect");
-                                events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
-                                break;
-                            }
-                        }
-                    }
-                }
+        let leg2_recv = async {
+            match &sock2 {
+                Some(s) => s.recv().await,
+                None => std::future::pending().await,
             }
-        }
-
-        // Cleanup sockets (listeners stay open)
-        leg1_poller.cancel();
-        leg2_poller.cancel();
-        let _ = socket_leg1.close().await;
-        if let Some(ref s) = socket_leg2 {
-            let _ = s.close().await;
-        }
+        };
 
         tokio::select! {
             _ = cancel.cancelled() => {
-                tracing::info!("SRT input (redundant) stopping during reconnect delay");
-                if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                return Ok(());
+                tracing::info!("SRT input (redundant) stopping (cancelled)");
+                break Ok(());
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            acquired = async { acquire1.as_mut().expect("armed").await }, if acquire1.is_some() => {
+                acquire1 = None;
+                match acquired {
+                    LegAcquired::Connected(socket, listener) => {
+                        listener1 = listener;
+                        connect_failures.store(0, Ordering::Relaxed);
+                        poller1 = Some(attach_input_leg(&ctx, 1, &socket, srt));
+                        sock1 = Some(socket);
+                    }
+                    // Produced only once `cancel` has fired; the cancel arm
+                    // returns.
+                    LegAcquired::Cancelled => {}
+                    LegAcquired::Failed(e) => {
+                        dead1 = true;
+                        report_failed_input_leg(&ctx, 1, &e, &sock2);
+                        if dead2 {
+                            break Err(e);
+                        }
+                    }
+                }
+            }
+            acquired = async { acquire2.as_mut().expect("armed").await }, if acquire2.is_some() => {
+                acquire2 = None;
+                match acquired {
+                    LegAcquired::Connected(socket, listener) => {
+                        listener2 = listener;
+                        poller2 = Some(attach_input_leg(&ctx, 2, &socket, srt));
+                        sock2 = Some(socket);
+                    }
+                    LegAcquired::Cancelled => {}
+                    LegAcquired::Failed(e) => {
+                        dead2 = true;
+                        report_failed_input_leg(&ctx, 2, &e, &sock1);
+                        if dead1 {
+                            break Err(e);
+                        }
+                    }
+                }
+            }
+            result = leg1_recv, if sock1.is_some() => {
+                match result {
+                    Ok(pkt) => {
+                        let srctime_us = pkt.sender_timestamp_us;
+                        let data = pkt.data;
+                        if pair.format == SrtPayloadFormat::Unknown {
+                            pair.format = detect_format(&data);
+                            log_detected_format_redundant(pair.format, events, flow_id);
+                            srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
+                        }
+                        process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, pair.format, RedundantPacketState { raw_ts_seq: &mut pair.raw_ts_seq_leg1, raw_ts_timestamp: &mut pair.raw_ts_timestamp, merger: &mut pair.merger, merger_handoff: &mut pair.merger_handoff, failover: &mut pair.failover, prev_active_leg: &mut pair.prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
+                    }
+                    Err(_) => {
+                        lose_input_leg(&ctx, 1, &mut sock1, &mut poller1, &sock2).await;
+                        acquire1 = Some(arm_input_leg(&ctx, 1, listener1.take(), LEG_REACQUIRE_DELAY, false));
+                        if sock2.is_none() {
+                            pair = both_input_legs_lost(events, flow_id, stale_after_us);
+                        }
+                    }
+                }
+            }
+            result = leg2_recv, if sock2.is_some() => {
+                match result {
+                    Ok(pkt) => {
+                        let srctime_us = pkt.sender_timestamp_us;
+                        let data = pkt.data;
+                        if pair.format == SrtPayloadFormat::Unknown {
+                            pair.format = detect_format(&data);
+                            log_detected_format_redundant(pair.format, events, flow_id);
+                            srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
+                        }
+                        process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, pair.format, RedundantPacketState { raw_ts_seq: &mut pair.raw_ts_seq_leg2, raw_ts_timestamp: &mut pair.raw_ts_timestamp, merger: &mut pair.merger, merger_handoff: &mut pair.merger_handoff, failover: &mut pair.failover, prev_active_leg: &mut pair.prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
+                    }
+                    Err(_) => {
+                        lose_input_leg(&ctx, 2, &mut sock2, &mut poller2, &sock1).await;
+                        acquire2 = Some(arm_input_leg(&ctx, 2, listener2.take(), LEG_REACQUIRE_DELAY, false));
+                        if sock1.is_none() {
+                            pair = both_input_legs_lost(events, flow_id, stale_after_us);
+                        }
+                    }
+                }
+            }
         }
+    };
 
-        tracing::info!("SRT input (redundant) attempting reconnection...");
+    // Stop the pending acquisitions and let each finish beside the rest of
+    // the teardown: dropped part-way through a caller's connect, one would
+    // leave a connection nothing closes (`release_leg_acquire`). A pending
+    // accept returns at once and closes the listener it holds. The pollers,
+    // children of `legs_cancel`, stop with it; then the attached legs and
+    // the held listeners close.
+    legs_cancel.cancel();
+    let attached = async move {
+        for socket in [&sock1, &sock2].into_iter().flatten() {
+            let _ = socket.close().await;
+        }
+        for listener in [&listener1, &listener2].into_iter().flatten() {
+            let _ = listener.close().await;
+        }
+    };
+    tokio::join!(
+        release_leg_acquire(acquire1, leg_release_bound(config.connect_timeout_secs)),
+        release_leg_acquire(acquire2, leg_release_bound(redundancy.connect_timeout_secs)),
+        attached
+    );
+    outcome
+}
+
+/// What a 2022-7 input's two legs share while either is up: the merger and
+/// the raw-TS failover, what of the merger's counts the pair's stats have
+/// been told, the payload format and the raw-TS counters. Started afresh
+/// only when a loss leaves neither leg connected.
+struct RedundantPair {
+    merger: HitlessMerger,
+    merger_handoff: crate::stats::collector::MergerHandoff,
+    failover: RawTsFailover,
+    prev_active_leg: ActiveLeg,
+    format: SrtPayloadFormat,
+    raw_ts_seq_leg1: u16,
+    raw_ts_seq_leg2: u16,
+    raw_ts_timestamp: u32,
+}
+
+impl RedundantPair {
+    fn new(stale_after_us: u64) -> Self {
+        Self {
+            merger: HitlessMerger::new().with_stale_after_us(stale_after_us),
+            merger_handoff: crate::stats::collector::MergerHandoff::default(),
+            failover: RawTsFailover::new(),
+            prev_active_leg: ActiveLeg::None,
+            format: SrtPayloadFormat::Unknown,
+            raw_ts_seq_leg1: 0,
+            raw_ts_seq_leg2: 0,
+            raw_ts_timestamp: 0,
+        }
     }
+}
+
+/// What arming and attaching a 2022-7 input's legs needs, borrowed for the
+/// life of the input.
+#[derive(Clone, Copy)]
+struct RedundantInputCtx<'a> {
+    config: &'a SrtInputConfig,
+    redundancy: &'a SrtRedundancyConfig,
+    /// The legs' own token, a child of the input's: it stops the
+    /// acquisitions and the pollers, and is cancelled at teardown however
+    /// the loop ended.
+    cancel: &'a CancellationToken,
+    events: &'a EventSender,
+    flow_id: &'a str,
+    input_id: &'a str,
+    leg_up: &'a [AtomicBool; 2],
+    connect_failures: &'a Arc<AtomicU32>,
+    leg2_attempts: &'a Arc<AtomicU32>,
+}
+
+impl<'a> RedundantInputCtx<'a> {
+    /// Leg `leg`'s connection parameters: leg 1 from the input's own config,
+    /// leg 2 from its `redundancy` block.
+    fn params(&self, leg: u8) -> SrtConnectionParams<'a> {
+        if leg == 1 {
+            SrtConnectionParams::from(self.config)
+        } else {
+            SrtConnectionParams::from(self.redundancy)
+        }
+    }
+
+    fn up(&self, leg: u8) -> &'a AtomicBool {
+        &self.leg_up[if leg == 1 { 0 } else { 1 }]
+    }
+
+    fn other_up(&self, leg: u8) -> &'a AtomicBool {
+        &self.leg_up[if leg == 1 { 1 } else { 0 }]
+    }
+}
+
+/// `details.other_leg` of a 2022-7 input's leg events, read off the other
+/// leg's socket: `connected` only while its status says so, so a socket that
+/// broke a moment ago reads `down` before its own loss is handled.
+fn input_leg_state(socket: &Option<Arc<SrtSocket>>) -> &'static str {
+    match socket {
+        Some(s) if s.status() == SocketStatus::Connected => "connected",
+        _ => "down",
+    }
+}
+
+/// Start one acquisition of leg `leg` ([`acquire_redundant_leg`]).
+///
+/// A caller leg reports every failed attempt to the connect-failure observer:
+/// leg 1 through the input's counter, leg 2 through a scratch one, each
+/// latching its own event, a Warning while the other leg is connected. A
+/// listener leg's `first` acquisition raises a Warning once it has waited
+/// [`LEG_CONNECT_WARN_AFTER`] and keeps waiting; a re-arm after a loss does
+/// not, as the leg-lost event has already said the leg is down.
+fn arm_input_leg<'a>(
+    ctx: &RedundantInputCtx<'a>,
+    leg: u8,
+    listener: Option<SrtListener>,
+    delay: Duration,
+    first: bool,
+) -> LegAcquire<'a> {
+    let ctx = *ctx;
+    let params = ctx.params(leg);
+    let other_up = ctx.other_up(leg);
+    let counter = if leg == 1 { ctx.connect_failures } else { ctx.leg2_attempts };
+    let observer = connect_failure_observer(
+        counter,
+        ctx.events,
+        ctx.flow_id,
+        ctx.input_id,
+        serde_json::json!({
+            "mode": format!("{:?}", params.mode),
+            "remote_addr": params.remote_addr.unwrap_or(""),
+            "stream_id": params.stream_id.unwrap_or(""),
+            "leg": leg,
+        }),
+        Some(other_up),
+    );
+    let slow = (first && *params.mode == SrtMode::Listener).then(|| {
+        let (mode, local_addr) = (*params.mode, params.local_addr.unwrap_or("auto"));
+        let warn: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+            tracing::warn!(
+                "SRT input 2022-7 leg {leg} did not connect within {:?}; still trying",
+                LEG_CONNECT_WARN_AFTER
+            );
+            ctx.events.emit_flow_with_details(
+                EventSeverity::Warning,
+                category::SRT,
+                format!(
+                    "SRT input 2022-7 leg {leg} did not connect within {:?}; still trying",
+                    LEG_CONNECT_WARN_AFTER
+                ),
+                ctx.flow_id,
+                serde_json::json!({
+                    "mode": format!("{mode:?}"),
+                    "leg": leg,
+                    "local_addr": local_addr,
+                    "after_ms": LEG_CONNECT_WARN_AFTER.as_millis() as u64,
+                    "other_leg": if other_up.load(Ordering::Relaxed) { "connected" } else { "down" },
+                }),
+            );
+        });
+        (LEG_CONNECT_WARN_AFTER, warn)
+    });
+    acquire_redundant_leg(params, listener, delay, ctx.cancel, observer, slow)
+}
+
+/// Attach leg `leg`'s new socket: mark it up, start its stats poller (the
+/// returned token stops it) and raise its connected Info, on every attach.
+fn attach_input_leg(
+    ctx: &RedundantInputCtx<'_>,
+    leg: u8,
+    socket: &Arc<SrtSocket>,
+    srt: &Arc<SrtInputStats>,
+) -> CancellationToken {
+    let params = ctx.params(leg);
+    ctx.up(leg).store(true, Ordering::Relaxed);
+    let poller = ctx.cancel.child_token();
+    let (cache, which) = if leg == 1 {
+        (srt.leg.clone(), SrtInputSocket::Leg1)
+    } else {
+        (srt.leg2.clone(), SrtInputSocket::Leg2)
+    };
+    spawn_srt_stats_poller(socket.clone(), cache, Some((srt.clone(), which)), poller.clone());
+    let remote_addr = socket
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| params.remote_addr.unwrap_or("").to_string());
+    tracing::info!(
+        "SRT input leg{leg} connected: mode={:?} local={} remote={remote_addr}",
+        params.mode,
+        params.local_addr.unwrap_or("auto"),
+    );
+    ctx.events.emit_flow_with_details(
+        EventSeverity::Info,
+        category::SRT,
+        format!("SRT input connected (mode={:?}, redundant leg {leg})", params.mode),
+        ctx.flow_id,
+        serde_json::json!({
+            "mode": format!("{:?}", params.mode),
+            "leg": leg,
+            "local_addr": params.local_addr.unwrap_or("auto"),
+            "remote_addr": remote_addr,
+            "stream_id": params.stream_id.unwrap_or(""),
+        }),
+    );
+    poller
+}
+
+/// Detach lost leg `leg` and raise its Warning; the caller re-arms it.
+/// `other` is the other leg's socket, read before this leg's state changes.
+async fn lose_input_leg(
+    ctx: &RedundantInputCtx<'_>,
+    leg: u8,
+    socket: &mut Option<Arc<SrtSocket>>,
+    poller: &mut Option<CancellationToken>,
+    other: &Option<Arc<SrtSocket>>,
+) {
+    tracing::warn!("SRT input leg{leg} connection lost");
+    let other_leg = input_leg_state(other);
+    ctx.up(leg).store(false, Ordering::Relaxed);
+    if let Some(poller) = poller.take() {
+        poller.cancel();
+    }
+    if let Some(socket) = socket.take() {
+        let _ = socket.close().await;
+    }
+    ctx.events.emit_flow_with_details(
+        EventSeverity::Warning,
+        category::REDUNDANCY,
+        format!("Redundant leg {leg} lost"),
+        ctx.flow_id,
+        serde_json::json!({
+            "leg": leg,
+            "mode": format!("{:?}", ctx.params(leg).mode),
+            "other_leg": other_leg,
+        }),
+    );
+}
+
+/// A loss has left neither leg connected: raise the Critical and hand back
+/// a fresh pair, as each connect cycle used to start one. Both legs are
+/// being re-acquired.
+fn both_input_legs_lost(events: &EventSender, flow_id: &str, stale_after_us: u64) -> RedundantPair {
+    tracing::warn!("SRT input (redundant) both legs lost, re-acquiring each");
+    events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
+    RedundantPair::new(stale_after_us)
+}
+
+/// Leg `leg`'s listener can never accept again (see
+/// [`LegAcquired::Failed`]): raise the single-leg listener's Critical. The
+/// leg is not re-armed; the other carries on.
+fn report_failed_input_leg(
+    ctx: &RedundantInputCtx<'_>,
+    leg: u8,
+    e: &anyhow::Error,
+    other: &Option<Arc<SrtSocket>>,
+) {
+    let params = ctx.params(leg);
+    tracing::error!("SRT input 2022-7 leg {leg} accept failed for good: {e}");
+    ctx.events.emit_flow_with_details(
+        EventSeverity::Critical,
+        category::SRT,
+        format!("SRT input connection failed: {e}"),
+        ctx.flow_id,
+        serde_json::json!({
+            "mode": format!("{:?}", params.mode),
+            "leg": leg,
+            "local_addr": params.local_addr.unwrap_or("auto"),
+            "stream_id": params.stream_id.unwrap_or(""),
+            "error": e.to_string(),
+            "other_leg": input_leg_state(other),
+        }),
+    );
 }
 
 fn log_detected_format(format: SrtPayloadFormat) {
@@ -1523,6 +1687,7 @@ async fn srt_input_bonded_caller_loop(
                 // NIC-pinned bond never connects.
                 "members": member_sources_json(&plans),
             }),
+            None,
         );
         let group = match connect_srt_group_observed(&params, &bond, &cancel, &mut on_attempt_failed).await {
             Ok(g) => g,
@@ -1943,6 +2108,517 @@ mod tests {
         assert_eq!(pair.recv_dropped(), 0, "and SRT dropped none of it");
         let codes: Vec<&str> = snap.health_reasons.iter().map(|r| r.code.as_str()).collect();
         assert!(codes.contains(&"packet_loss") && !codes.contains(&"srt_recv_dropped"), "{codes:?}");
+    }
+
+    /// One RTP/TS datagram numbered `seq`: six null packets, since seven and
+    /// the RTP header would overflow SRT's 1316-byte live payload.
+    fn rtp_datagram(seq: u16) -> Vec<u8> {
+        let mut d = vec![0x80, 33];
+        d.extend_from_slice(&seq.to_be_bytes());
+        d.extend_from_slice(&(u32::from(seq) * 90).to_be_bytes());
+        d.extend_from_slice(&[0, 0, 0, 1]);
+        for _ in 0..6 {
+            d.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+            d.extend_from_slice(&[0xFF; 184]);
+        }
+        d
+    }
+
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn srt_config(value: serde_json::Value) -> SrtInputConfig {
+        serde_json::from_value(value).expect("SRT config fixture")
+    }
+
+    /// A 2022-7 SRT input, a pump sending one rising RTP seq every 2 ms to
+    /// whichever test-side peers are present, and the events the input
+    /// raised.
+    struct InputPairHarness {
+        flow: Arc<FlowStatsAccumulator>,
+        events_rx: tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        events: Vec<crate::manager::events::Event>,
+        ports: (u16, u16),
+        /// The test-side peer of each leg the pump sends to.
+        legs: Arc<std::sync::Mutex<[Option<Arc<SrtSocket>>; 2]>>,
+        /// How many seqs the pump sent to at least one leg. A seq is used
+        /// only once it is, so the seqs sent are exactly `0..sent`.
+        sent: Arc<std::sync::atomic::AtomicU64>,
+        pump: CancellationToken,
+        cancel: CancellationToken,
+        _rx: broadcast::Receiver<RtpPacket>,
+    }
+
+    impl InputPairHarness {
+        /// Both legs listening on loopback.
+        fn listeners() -> Self {
+            let ports = (free_port(), free_port());
+            Self::start(
+                serde_json::json!({
+                    "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.0),
+                    "latency_ms": 200,
+                    "redundancy": {
+                        "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.1),
+                        "latency_ms": 200
+                    }
+                }),
+                ports,
+            )
+        }
+
+        fn start(config: serde_json::Value, ports: (u16, u16)) -> Self {
+            let flow =
+                Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+            flow.set_active_input_id("pair");
+            let (tx, rx) = broadcast::channel(4096);
+            let (events, events_rx) = crate::manager::events::event_channel();
+            let cancel = CancellationToken::new();
+            spawn_srt_input(
+                srt_config(config),
+                tx,
+                flow.clone(),
+                cancel.child_token(),
+                events,
+                "f1".into(),
+                "pair".into(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+            );
+            let legs: Arc<std::sync::Mutex<[Option<Arc<SrtSocket>>; 2]>> = Arc::default();
+            let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let pump = cancel.child_token();
+            let (to, count, stop) = (legs.clone(), sent.clone(), pump.clone());
+            tokio::spawn(async move {
+                let mut seq: u16 = 0;
+                let mut tick = tokio::time::interval(Duration::from_millis(2));
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => break,
+                        _ = tick.tick() => {
+                            let peers: Vec<Arc<SrtSocket>> =
+                                to.lock().unwrap().iter().flatten().cloned().collect();
+                            let datagram = rtp_datagram(seq);
+                            let mut sent_to_one = false;
+                            for peer in &peers {
+                                sent_to_one |= peer.send(&datagram).await.is_ok();
+                            }
+                            if sent_to_one {
+                                count.fetch_add(1, Ordering::Relaxed);
+                                seq = seq.wrapping_add(1);
+                            }
+                        }
+                    }
+                }
+            });
+            Self {
+                flow,
+                events_rx,
+                events: Vec::new(),
+                ports,
+                legs,
+                sent,
+                pump,
+                cancel,
+                _rx: rx,
+            }
+        }
+
+        /// A caller to leg `leg`'s listener, added to the pump.
+        async fn connect(&self, leg: usize) -> Arc<SrtSocket> {
+            let port = if leg == 1 { self.ports.0 } else { self.ports.1 };
+            let config = srt_config(serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }));
+            let socket = tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::srt::connection::connect_srt_input(&config, &self.cancel),
+            )
+            .await
+            .expect("the caller connects in time")
+            .expect("the caller connects");
+            self.legs.lock().unwrap()[leg - 1] = Some(socket.clone());
+            socket
+        }
+
+        /// Take leg `leg`'s peer out of the pump, then close it, so every
+        /// seq the pump sends from then on goes to the other leg alone.
+        async fn drop_leg(&self, leg: usize) {
+            let peer = self.legs.lock().unwrap()[leg - 1].take();
+            if let Some(peer) = peer {
+                let _ = peer.close().await;
+            }
+        }
+
+        fn sent(&self) -> u64 {
+            self.sent.load(Ordering::Relaxed)
+        }
+
+        /// Wait until the input has forwarded every seq sent so far. A seq
+        /// sent while only one leg's peer existed is held by that leg's
+        /// TSBPD for its latency, and closing the peer before then discards
+        /// it — an SRT property, not the pair's loss — so a test settles
+        /// before it drops the leg that carried those seqs alone.
+        async fn settle(&mut self) {
+            let sent = self.sent();
+            self.wait_until("the input to catch up", |h| h.forwarded() >= sent).await;
+        }
+
+        fn forwarded(&self) -> u64 {
+            self.flow.input_packets.load(Ordering::Relaxed)
+        }
+
+        /// Stop the pump and give the input time to deliver what it sent
+        /// (the 200 ms latency) and to poll each leg once more.
+        async fn stop_pump(&self) {
+            self.pump.cancel();
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+
+        fn pump_events(&mut self) {
+            while let Ok(event) = self.events_rx.try_recv() {
+                self.events.push(event);
+            }
+        }
+
+        async fn wait_until(&mut self, what: &str, cond: impl Fn(&Self) -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                self.pump_events();
+                if cond(self) {
+                    return;
+                }
+                assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        fn leg_stats(&self, leg: usize) -> bool {
+            let snap = self.flow.snapshot();
+            if leg == 1 { snap.input.srt_stats.is_some() } else { snap.input.srt_leg2_stats.is_some() }
+        }
+
+        /// "Redundant leg N lost" events, in the order they were raised.
+        fn leg_lost(&self, leg: u64) -> Vec<&crate::manager::events::Event> {
+            self.events
+                .iter()
+                .filter(|e| e.message == format!("Redundant leg {leg} lost"))
+                .collect()
+        }
+
+        fn both_lost(&self) -> usize {
+            self.events.iter().filter(|e| e.message == "Both redundant legs lost").count()
+        }
+
+        /// Leg `leg`'s connected Infos: one per attach.
+        fn connected(&self, leg: u64) -> Vec<&crate::manager::events::Event> {
+            self.events
+                .iter()
+                .filter(|e| {
+                    e.severity == EventSeverity::Info
+                        && e.message.starts_with("SRT input connected")
+                        && e.details.as_ref().and_then(|d| d["leg"].as_u64()) == Some(leg)
+                })
+                .collect()
+        }
+
+        /// Every seq the pump sent was forwarded exactly once, and the pair
+        /// lost none of them.
+        fn assert_each_seq_forwarded_once(&self) {
+            assert_eq!(self.forwarded(), self.sent(), "each seq the pump sent forwarded once");
+            assert_eq!(self.flow.snapshot().input.packets_lost, 0, "and none of them lost");
+        }
+    }
+
+    impl Drop for InputPairHarness {
+        fn drop(&mut self) {
+            self.cancel.cancel();
+        }
+    }
+
+    fn other_leg(event: &crate::manager::events::Event) -> &str {
+        event.details.as_ref().and_then(|d| d["other_leg"].as_str()).expect("other_leg")
+    }
+
+    /// Leg 1's caller never comes: leg 2 alone carries the input from the
+    /// start. Before edge#182 every connect cycle waited on leg 1's accept,
+    /// with no timeout, before leg 2 was even tried, so the input stayed off
+    /// air on a healthy leg 2.
+    #[tokio::test]
+    async fn a_2022_7_input_carries_on_leg_2_while_leg_1_never_connects() {
+        let mut h = InputPairHarness::listeners();
+        h.connect(2).await;
+        h.wait_until("leg 2 to carry", |h| h.forwarded() > 100).await;
+        h.wait_until("leg 2's stats", |h| h.leg_stats(2)).await;
+        assert!(!h.leg_stats(1), "leg 1 never connected");
+        let up = h.connected(2)[0];
+        assert_eq!(up.message, "SRT input connected (mode=Listener, redundant leg 2)");
+        let details = up.details.as_ref().unwrap();
+        assert_eq!(details["mode"], "Listener");
+        assert_eq!(details["local_addr"], format!("127.0.0.1:{}", h.ports.1));
+        assert!(h.connected(1).is_empty());
+        assert_eq!(h.both_lost(), 0);
+    }
+
+    /// Leg 2 blips and is re-accepted while leg 1 carries; then leg 1 is
+    /// lost and leg 2 carries alone — in the same merger, so every seq goes
+    /// out exactly once and none is lost. Before edge#182 leg 2 had one
+    /// attempt per connect cycle: it never came back, and the later loss of
+    /// leg 1 took the input off air with a false "Both redundant legs lost".
+    #[tokio::test]
+    async fn a_2022_7_input_reaccepts_a_lost_leg_2_and_survives_leg_1_loss() {
+        let mut h = InputPairHarness::listeners();
+        h.connect(1).await;
+        h.connect(2).await;
+        h.wait_until("both legs' stats", |h| h.leg_stats(1) && h.leg_stats(2)).await;
+        h.settle().await;
+
+        h.drop_leg(2).await;
+        h.wait_until("leg 2's loss", |h| !h.leg_lost(2).is_empty()).await;
+        let lost = h.leg_lost(2)[0];
+        assert_eq!(lost.severity, EventSeverity::Warning);
+        assert_eq!(lost.category, category::REDUNDANCY);
+        assert_eq!(other_leg(lost), "connected");
+        assert_eq!(lost.details.as_ref().unwrap()["mode"], "Listener");
+        h.wait_until("leg 2's stats to clear", |h| !h.leg_stats(2)).await;
+
+        h.connect(2).await;
+        h.wait_until("leg 2 to be re-accepted", |h| h.leg_stats(2)).await;
+        h.wait_until("leg 2's second connected event", |h| h.connected(2).len() == 2).await;
+
+        h.drop_leg(1).await;
+        h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
+        assert_eq!(other_leg(h.leg_lost(1)[0]), "connected", "leg 2 carries");
+        let target = h.sent() + 500;
+        h.wait_until("500 more seqs on leg 2", |h| h.sent() >= target).await;
+        h.stop_pump().await;
+
+        h.assert_each_seq_forwarded_once();
+        h.pump_events();
+        assert_eq!(h.both_lost(), 0, "a leg always carried");
+        assert!(h.leg_stats(2) && !h.leg_stats(1));
+    }
+
+    /// The mirror: leg 1 is lost and re-accepted while leg 2 carries, then
+    /// leg 2 is lost and leg 1 carries alone, every seq still out once.
+    /// Before edge#182 a lost leg 1 was not re-accepted while leg 2 was up.
+    #[tokio::test]
+    async fn a_2022_7_input_reaccepts_a_lost_leg_1_while_leg_2_carries() {
+        let mut h = InputPairHarness::listeners();
+        h.connect(1).await;
+        h.connect(2).await;
+        h.wait_until("both legs' stats", |h| h.leg_stats(1) && h.leg_stats(2)).await;
+        h.settle().await;
+
+        h.drop_leg(1).await;
+        h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
+        assert_eq!(other_leg(h.leg_lost(1)[0]), "connected");
+        h.wait_until("leg 1's stats to clear", |h| !h.leg_stats(1)).await;
+
+        h.connect(1).await;
+        h.wait_until("leg 1 to be re-accepted", |h| h.leg_stats(1)).await;
+        h.wait_until("leg 1's second connected event", |h| h.connected(1).len() == 2).await;
+        assert_eq!(
+            h.connected(1)[1].message,
+            "SRT input connected (mode=Listener, redundant leg 1)"
+        );
+
+        h.drop_leg(2).await;
+        h.wait_until("leg 2's loss", |h| !h.leg_lost(2).is_empty()).await;
+        assert_eq!(other_leg(h.leg_lost(2)[0]), "connected", "leg 1 carries");
+        let target = h.sent() + 500;
+        h.wait_until("500 more seqs on leg 1", |h| h.sent() >= target).await;
+        h.stop_pump().await;
+
+        h.assert_each_seq_forwarded_once();
+        h.pump_events();
+        assert_eq!(h.both_lost(), 0, "a leg always carried");
+    }
+
+    /// Both legs lost together: one Critical, raised by the second loss,
+    /// whose event says the other leg is down. Then leg 2 alone comes back
+    /// and carries. Before edge#182 the next connect cycle waited on leg 1.
+    #[tokio::test]
+    async fn a_2022_7_input_raises_both_lost_once_and_resumes_on_either_leg() {
+        let mut h = InputPairHarness::listeners();
+        h.connect(1).await;
+        h.connect(2).await;
+        h.wait_until("both legs' stats", |h| h.leg_stats(1) && h.leg_stats(2)).await;
+
+        let peers: Vec<Arc<SrtSocket>> =
+            h.legs.lock().unwrap().iter_mut().filter_map(Option::take).collect();
+        for peer in peers {
+            let _ = peer.close().await;
+        }
+        h.wait_until("both legs' losses", |h| {
+            !h.leg_lost(1).is_empty() && !h.leg_lost(2).is_empty()
+        })
+        .await;
+        h.wait_until("the Critical", |h| h.both_lost() > 0).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.pump_events();
+        assert_eq!(h.both_lost(), 1, "one Critical for the pair");
+        let critical = h.events.iter().find(|e| e.message == "Both redundant legs lost").unwrap();
+        assert_eq!(critical.severity, EventSeverity::Critical);
+        let later = h
+            .events
+            .iter()
+            .filter(|e| e.message.starts_with("Redundant leg "))
+            .nth(1)
+            .expect("two losses");
+        assert_eq!(other_leg(later), "down", "the second loss finds no leg up");
+
+        h.wait_until("both legs' stats to clear", |h| !h.leg_stats(1) && !h.leg_stats(2)).await;
+        let before = h.forwarded();
+        h.connect(2).await;
+        h.wait_until("leg 2 to attach again", |h| h.connected(2).len() == 2).await;
+        h.wait_until("leg 2 to carry", |h| h.forwarded() > before + 100).await;
+        h.pump_events();
+        assert_eq!(h.both_lost(), 1);
+    }
+
+    /// Both legs calling: leg 1's peer is absent and leg 2's is a listener
+    /// that sends. Leg 2 is dialled on its own and carries. Before edge#182
+    /// leg 1's connect retried forever before leg 2 was dialled at all.
+    #[tokio::test]
+    async fn a_2022_7_caller_input_reaches_leg_2_while_leg_1_peer_is_absent() {
+        let ports = (free_port(), free_port());
+        let peer2 = srt_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.1), "latency_ms": 200
+        }));
+        let mut listener = crate::srt::connection::bind_srt_listener_for_input(&peer2)
+            .await
+            .expect("leg 2's peer binds");
+        let mut h = InputPairHarness::start(
+            serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{}", ports.0),
+                "latency_ms": 200,
+                "redundancy": {
+                    "mode": "caller", "remote_addr": format!("127.0.0.1:{}", ports.1),
+                    "latency_ms": 200
+                }
+            }),
+            ports,
+        );
+        let socket = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::srt::connection::accept_srt_connection(&mut listener, &h.cancel),
+        )
+        .await
+        .expect("leg 2 dials while leg 1's peer is absent")
+        .expect("leg 2 is accepted");
+        h.legs.lock().unwrap()[1] = Some(socket);
+        h.wait_until("leg 2 to carry", |h| h.forwarded() > 100).await;
+        let up = h.connected(2)[0];
+        assert_eq!(up.message, "SRT input connected (mode=Caller, redundant leg 2)");
+        assert_eq!(up.details.as_ref().unwrap()["remote_addr"], format!("127.0.0.1:{}", ports.1));
+        assert!(h.connected(1).is_empty());
+    }
+
+    /// A stop while leg 1 is still dialling lets that connect finish and
+    /// closes what it made, so the far end sees the connection go. The
+    /// pending acquisition used to be dropped part-way, and a handshake
+    /// completing after that left a connection that sent keepalives and no
+    /// data until the process exited, held by a far end that never saw it
+    /// lost.
+    #[tokio::test]
+    async fn a_2022_7_input_stopping_closes_a_leg_it_was_still_dialling() {
+        let ports = (free_port(), free_port());
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(16);
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let input = spawn_srt_input(
+            srt_config(serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{}", ports.0),
+                "latency_ms": 200,
+                "redundancy": {
+                    "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.1),
+                    "latency_ms": 200
+                }
+            })),
+            tx,
+            flow,
+            cancel.clone(),
+            events,
+            "f1".into(),
+            "pair".into(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        );
+        // Leg 1's first connect is now in flight, with no peer to answer it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+
+        let peer_config = srt_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.0), "latency_ms": 200
+        }));
+        let mut listener = crate::srt::connection::bind_srt_listener_for_input(&peer_config)
+            .await
+            .expect("the far end binds");
+        let peer_cancel = CancellationToken::new();
+        let peer = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::srt::connection::accept_srt_connection(&mut listener, &peer_cancel),
+        )
+        .await
+        .expect("the connect sent before the stop completes")
+        .expect("the far end accepts it");
+        tokio::time::timeout(Duration::from_secs(10), input)
+            .await
+            .expect("the input stops")
+            .expect("the input task does not panic");
+        let closed = tokio::time::timeout(Duration::from_secs(3), peer.recv()).await;
+        assert!(
+            matches!(closed, Ok(Err(_))),
+            "the far end sees the connection closed, not a peer that never sends"
+        );
+    }
+
+    /// The latched connect-failure event of a 2022-7 leg is a Warning while
+    /// the other leg is connected, as the input is on air, and a Critical
+    /// otherwise; a bonded group, with no other leg, keeps the Critical.
+    #[test]
+    fn connect_failure_observer_warns_while_the_other_leg_carries() {
+        let latched = |other_leg_up: Option<&AtomicBool>| {
+            let (events, mut events_rx) = crate::manager::events::event_channel();
+            let counter = Arc::new(AtomicU32::new(0));
+            let mut observer = connect_failure_observer(
+                &counter,
+                &events,
+                "f1",
+                "pair",
+                serde_json::json!({ "leg": 1 }),
+                other_leg_up,
+            );
+            let e = anyhow::anyhow!("connection refused");
+            for attempts in 1..=CONNECT_FAILED_THRESHOLD {
+                observer(attempts, &e);
+            }
+            let mut raised = Vec::new();
+            while let Ok(event) = events_rx.try_recv() {
+                raised.push(event);
+            }
+            assert_eq!(raised.len(), 1, "latched once");
+            raised.pop().unwrap()
+        };
+
+        let connected = AtomicBool::new(true);
+        let warned = latched(Some(&connected));
+        assert_eq!(warned.severity, EventSeverity::Warning);
+        let details = warned.details.as_ref().unwrap();
+        assert_eq!(details["other_leg"], "connected");
+        assert_eq!(details["leg"], 1);
+        assert_eq!(details["consecutive_failures"], CONNECT_FAILED_THRESHOLD);
+
+        let down = AtomicBool::new(false);
+        let critical = latched(Some(&down));
+        assert_eq!(critical.severity, EventSeverity::Critical);
+        assert_eq!(critical.details.as_ref().unwrap()["other_leg"], "down");
+
+        let bonded = latched(None);
+        assert_eq!(bonded.severity, EventSeverity::Critical);
+        assert!(bonded.details.as_ref().unwrap().get("other_leg").is_none());
     }
 
     /// A pair's merger waits out its legs' latency difference: legs at

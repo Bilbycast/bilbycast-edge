@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,17 +14,18 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::models::{SrtMode, SrtOutputConfig};
+use crate::config::models::{SrtMode, SrtOutputConfig, SrtRedundancyConfig};
 use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::srt::bond_supervisor::{
     BondEventScope, BondEvents, BondHealthTracker, BondLatch, BondSupervisor, degrade_after,
     final_member_report, plan_bond_members,
 };
 use crate::srt::connection::{
-    accept_srt_connection, bind_srt_listener_for_bonded_output, bind_srt_listener_for_output,
-    bind_srt_listener_for_redundancy, connect_srt_group, connect_srt_output,
-    connect_srt_output_observed, connect_srt_redundancy_leg, spawn_srt_group_stats_poller,
-    spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller, SrtConnectionParams,
+    accept_srt_connection, acquire_redundant_leg, bind_srt_listener_for_bonded_output,
+    bind_srt_listener_for_output, bind_srt_listener_for_redundancy, connect_srt_group,
+    connect_srt_output_observed, leg_release_bound, release_leg_acquire,
+    spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller,
+    LegAcquire, LegAcquired, SrtConnectionParams, LEG_REACQUIRE_DELAY,
 };
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::time::now_us;
@@ -58,11 +59,10 @@ use super::ts_program_filter::TsProgramFilter;
 /// until edge#166, 5,800 SRT datagrams a second at 8.5 Mbit/s).
 const SRT_LIVE_MAX_MSG_BYTES: usize = SRT_TS_DATAGRAM_BYTES;
 
-/// Maximum time we wait for the SMPTE 2022-7 leg-2 socket to complete its
-/// initial handshake before giving up and running the output in single-leg
-/// mode. Prevents a misconfigured or unreachable leg-2 peer from gating
-/// media flow on the healthy leg-1.
-const INITIAL_LEG2_CONNECT_BUDGET: Duration = Duration::from_secs(15);
+/// How long a SMPTE 2022-7 output leg may take to connect the first time
+/// before a Warning says so. The leg keeps trying; the other leg carries
+/// meanwhile.
+const LEG_CONNECT_WARN_AFTER: Duration = Duration::from_secs(15);
 
 /// Split `data` into ≤[`SRT_LIVE_MAX_MSG_BYTES`] chunks for SRT live-mode
 /// transmission. Pure synchronous helper used by [`srt_send_chunked`] and
@@ -192,7 +192,7 @@ fn release_queued_bytes(counter: &AtomicUsize, n: usize) {
 /// Sender half of the SRT egress queue, bounded in **both** slots and bytes.
 ///
 /// Wraps `mpsc::Sender` rather than replacing it so the item shape and the
-/// redundant loop's both-legs-`Full` reconnect semantics are untouched —
+/// redundant loop's `Full`-versus-`Closed` leg verdicts are untouched —
 /// `try_send` keeps returning `TrySendError` with the item handed back, and
 /// every existing call site reads the same.
 ///
@@ -337,8 +337,9 @@ const SEND_QUEUE_WARN_INTERVAL: Duration = Duration::from_secs(10);
 /// non-awaiting send, which is the 2026-04-20 regression described below.
 ///
 /// Do not read a zero `packets_dropped` at these call sites as evidence the
-/// send path is healthy — the real discard sites are the five `try_send`
-/// calls below (three in the forward loop, two in the redundant loop).
+/// send path is healthy — the real discard sites are the `try_send` calls
+/// below (three in the forward loop, and the redundant loop's
+/// [`redundant_leg_takes`], once per attached leg).
 ///
 /// Historically `SrtSocket::send` used `try_send` onto a 256-slot mpsc and
 /// surfaced this error under bursty input (especially SRT + FEC on the send
@@ -517,7 +518,7 @@ pub fn spawn_srt_output(
         let result = if config.bonding.is_some() {
             srt_output_bonded_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, active_input_rx).await
         } else if config.redundancy.is_some() {
-            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx, active_input_rx, INITIAL_LEG2_CONNECT_BUDGET).await
+            srt_output_redundant_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, frame_rate_rx, active_input_rx, LEG_CONNECT_WARN_AFTER).await
         } else {
             srt_output_loop(&config, &broadcast_tx, output_stats, cancel, &event_sender, &flow_id, input_format, compressed_audio_input, frame_rate_rx, active_input_rx).await
         };
@@ -1511,47 +1512,70 @@ async fn srt_output_forward_loop(
 /// What the other leg of a 2022-7 SRT output pair is doing when one leg is
 /// lost: `details.other_leg` on the leg-lost event.
 ///
-/// This is deliberately **not** the forward loop's teardown verdict
-/// ([`redundant_leg2_alive`]). That verdict counts a leg 2 whose connect is
-/// still pending as able to carry, so the pair is not torn down (dropping
-/// the leg-2 listener held inside the pending connect future) before leg 2
-/// has had its budget. But such a leg carries nothing yet, and an event
-/// saying the output runs on it would be false at exactly the moment the
-/// output is dark.
+/// `queued` is the other leg's verdict on the same payload that found this
+/// leg gone ([`redundant_leg_takes`]): `Some(true)` queued, or shed on
+/// backpressure (a full queue is a live leg); `Some(false)` its send task is
+/// gone; `None` no socket attached, the leg being re-acquired. Only a leg
+/// that took the payload is carrying.
 ///
-/// `queued` is the outcome of handing the leg the current payload:
-/// `Some(true)` queued, or shed on backpressure (a full queue is a live leg);
-/// `Some(false)` its send task is gone; `None` no socket attached.
-/// `connect_done` is whether the leg's connect has resolved this cycle.
-/// Leg 1 is connected before a cycle starts, so it always passes `true`.
-fn redundant_other_leg_state(queued: Option<bool>, connect_done: bool) -> &'static str {
+/// Both legs' verdicts are taken before either loss is handled
+/// ([`redundant_legs_lost`]). Handled leg by leg, a pair whose legs died
+/// together — the receiving edge restarting, a shared uplink dropping —
+/// would have its first leg's event say the other carries at exactly the
+/// moment the output goes dark.
+fn redundant_other_leg_state(queued: Option<bool>) -> &'static str {
     match queued {
         Some(true) => "carrying",
-        Some(false) => "down",
-        None if !connect_done => "connecting",
-        None => "down",
+        Some(false) | None => "down",
     }
 }
 
-/// The forward loop's teardown verdict on leg 2 of a 2022-7 SRT output:
-/// whether it can still carry this cycle. The pair is torn down and
-/// reconnected once neither leg can.
-///
-/// Same inputs as [`redundant_other_leg_state`]. A leg 2 with no socket is
-/// alive while its connect is pending: it may yet connect and take over,
-/// and tearing down then would drop the leg-2 listener held inside the
-/// pending connect future. Once that connect has given up, leg 2 cannot
-/// attach this cycle, so it is gone. It used to count as alive then as
-/// well, and a lost leg 1 left the output dark until it was restarted,
-/// whether leg 1 went after leg 2 gave up or while leg 2 was connecting.
-///
-/// Alive exactly when the leg-lost event would not call it `down`, so the
-/// event and the teardown never disagree.
-fn redundant_leg2_alive(queued: Option<bool>, connect_done: bool) -> bool {
-    queued.unwrap_or(!connect_done)
+/// The legs one payload found lost, each with `details.other_leg` for its
+/// event ([`redundant_other_leg_state`]), from both legs' verdicts on that
+/// payload. A leg is lost when its send task is gone (`Some(false)`); an
+/// absent leg (`None`) is already being re-acquired, and a full queue
+/// (`Some(true)`) is backpressure, not a loss.
+fn redundant_legs_lost(queued: [Option<bool>; 2]) -> [Option<&'static str>; 2] {
+    [
+        (queued[0] == Some(false)).then(|| redundant_other_leg_state(queued[1])),
+        (queued[1] == Some(false)).then(|| redundant_other_leg_state(queued[0])),
+    ]
 }
 
-/// Raise the Warning for a lost leg of a 2022-7 SRT output.
+/// One attached leg's verdict on a payload, for [`redundant_legs_lost`]:
+/// `true` when its queue took the payload, or shed it because it was full;
+/// `false` when its send task is gone.
+///
+/// `Full` and `Closed` are **different verdicts** and must not both mean
+/// "this leg is lost". `Full` is backpressure — the queue doing exactly its
+/// job, shedding a packet while the leg stays up, counted in
+/// `packets_dropped` — and treating it as a lost leg violates the node-wide
+/// rule that slow consumers see dropped packets, never cascading teardown.
+/// Only `Closed` (the leg's send task has died) is a liveness verdict.
+///
+/// This mattered little while `Full` needed 4096 queued whole access units
+/// (~164 MB, effectively unreachable). The 8 MiB ceiling makes it ~56-66
+/// IDRs, which an ordinary burst against a briefly-stalled srt-io task
+/// reaches — so a transient drain stall would otherwise become a lost leg
+/// plus an operator alarm, on precisely the source class that ceiling was
+/// written for.
+fn redundant_leg_takes(
+    tx: &SendQueueTx,
+    item: (Bytes, u64),
+    stats: &OutputStatsAccumulator,
+) -> bool {
+    match tx.try_send(item) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
+/// Raise the Warning for a lost leg of a 2022-7 SRT output. The leg is
+/// re-acquired [`LEG_REACQUIRE_DELAY`] later while the other leg carries on.
 ///
 /// The message is fixed per leg. The manager folds an unacknowledged event
 /// into an existing row with the same message, and `details` are not part of
@@ -1571,7 +1595,7 @@ fn emit_redundant_output_leg_lost(
     events.emit_output_with_details(
         EventSeverity::Warning,
         category::REDUNDANCY,
-        format!("SRT output '{output_id}' 2022-7 leg {leg} lost; down until the pair reconnects"),
+        format!("SRT output '{output_id}' 2022-7 leg {leg} lost; reconnecting"),
         output_id,
         serde_json::json!({
             "error_code": "redundancy_output_leg_lost",
@@ -1582,33 +1606,234 @@ fn emit_redundant_output_leg_lost(
     );
 }
 
+/// Spawn leg `leg`'s send task: it drains the leg's queue into the socket
+/// and returns on the first send error that is not transient backpressure.
+///
+/// Both legs carry identical data, so only one counts what the output sends
+/// (`packets_sent`, `bytes_sent`, latency). Leg 1 always counts; on a send
+/// error it sets `leg1_lost` before it returns, so leg 2, which counts
+/// whenever `leg1_lost` is set, takes over at once. Leg 2 counts a transient
+/// drop only while it counts: until then leg 1 carries the duplicate.
+fn spawn_redundant_send_task(
+    leg: u8,
+    socket: Arc<SrtSocket>,
+    stats: Arc<OutputStatsAccumulator>,
+    leg1_lost: Arc<AtomicBool>,
+    output_id: String,
+) -> (SendQueueTx, JoinHandle<()>) {
+    let (tx, mut rx) = send_queue();
+    let task = tokio::spawn(async move {
+        while let Some((data, recv_time_us)) = rx.recv().await {
+            let counts = leg == 1 || leg1_lost.load(Ordering::Relaxed);
+            match srt_send_chunked(&socket, &data).await {
+                Ok(sent) => {
+                    if counts {
+                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                        stats.record_latency(recv_time_us);
+                    }
+                }
+                Err(e) if is_transient_backpressure(&e) => {
+                    if counts {
+                        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("SRT output '{output_id}' leg{leg} send error: {e}");
+                    if leg == 1 {
+                        leg1_lost.store(true, Ordering::Relaxed);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+    (tx, task)
+}
+
+/// What arming and attaching a 2022-7 output's legs needs, borrowed for the
+/// life of the output.
+#[derive(Clone, Copy)]
+struct RedundantOutputCtx<'a> {
+    config: &'a SrtOutputConfig,
+    redundancy: &'a SrtRedundancyConfig,
+    /// The legs' own token, a child of the output's: it stops the
+    /// acquisitions and the pollers, and is cancelled at teardown however
+    /// the loop ended.
+    cancel: &'a CancellationToken,
+    events: &'a EventSender,
+    /// The loop's own view of which legs are attached, for the slow-connect
+    /// Warnings, which run inside the acquisitions.
+    leg_up: &'a [AtomicBool; 2],
+}
+
+impl<'a> RedundantOutputCtx<'a> {
+    fn params(&self, leg: u8) -> SrtConnectionParams<'a> {
+        if leg == 1 {
+            SrtConnectionParams::from(self.config)
+        } else {
+            SrtConnectionParams::from(self.redundancy)
+        }
+    }
+
+    fn up(&self, leg: u8) -> &'a AtomicBool {
+        &self.leg_up[if leg == 1 { 0 } else { 1 }]
+    }
+}
+
+/// Start one acquisition of leg `leg` ([`acquire_redundant_leg`]). With
+/// `warn_after` (the first acquisition, in either mode) a Warning is raised
+/// once the leg has not connected for that long, and the leg keeps trying;
+/// a re-arm after a loss passes `None`, as the leg-lost event has already
+/// said the leg is down.
+fn arm_output_leg<'a>(
+    ctx: &RedundantOutputCtx<'a>,
+    leg: u8,
+    listener: Option<srt_transport::SrtListener>,
+    delay: Duration,
+    warn_after: Option<Duration>,
+) -> LegAcquire<'a> {
+    let ctx = *ctx;
+    let params = ctx.params(leg);
+    let other_up = ctx.up(if leg == 1 { 2 } else { 1 });
+    let slow = warn_after.map(|after| {
+        let mode = *params.mode;
+        let warn: Box<dyn FnOnce() + Send + 'a> = Box::new(move || {
+            let output_id = &ctx.config.id;
+            tracing::warn!(
+                "SRT output '{output_id}' 2022-7 leg {leg} did not connect within {after:?}; still trying"
+            );
+            ctx.events.emit_output_with_details(
+                EventSeverity::Warning,
+                category::SRT,
+                format!(
+                    "SRT output '{output_id}' 2022-7 leg {leg} did not connect within {after:?}; still trying"
+                ),
+                output_id,
+                serde_json::json!({
+                    "mode": format!("{mode:?}"),
+                    "leg": leg,
+                    "after_ms": after.as_millis() as u64,
+                    "other_leg": if other_up.load(Ordering::Relaxed) { "carrying" } else { "down" },
+                }),
+            );
+        });
+        (after, warn)
+    });
+    acquire_redundant_leg(params, listener, delay, ctx.cancel, |_, _| {}, slow)
+}
+
+/// Attach leg `leg`'s new socket: mark it up, start its stats poller (into
+/// `srt_stats` for leg 1, `srt_leg2_stats` for leg 2) and its send task,
+/// and raise its connected Info, on every attach. Returns the leg's queue,
+/// its send task and the token that stops its poller.
+fn attach_output_leg(
+    ctx: &RedundantOutputCtx<'_>,
+    leg: u8,
+    socket: &Arc<SrtSocket>,
+    stats: &Arc<OutputStatsAccumulator>,
+    leg1_lost: &Arc<AtomicBool>,
+) -> (SendQueueTx, JoinHandle<()>, CancellationToken) {
+    let params = ctx.params(leg);
+    let output_id = &ctx.config.id;
+    ctx.up(leg).store(true, Ordering::Relaxed);
+    let poller = ctx.cancel.child_token();
+    let cache = if leg == 1 {
+        stats.srt_stats_cache.clone()
+    } else {
+        stats.srt_leg2_stats_cache.clone()
+    };
+    spawn_srt_stats_poller(socket.clone(), cache, None, poller.clone());
+    let (tx, task) = spawn_redundant_send_task(
+        leg,
+        socket.clone(),
+        stats.clone(),
+        leg1_lost.clone(),
+        output_id.clone(),
+    );
+    tracing::info!(
+        "SRT output '{output_id}' leg{leg} connected: mode={:?} local={}",
+        params.mode,
+        params.local_addr.unwrap_or("auto"),
+    );
+    // Leg 2's own message: the manager folds an event into an unacknowledged
+    // row with the same message, so leg 1's text would hide this one in leg
+    // 1's row.
+    let message = if leg == 1 {
+        format!("SRT output '{output_id}' connected")
+    } else {
+        format!("SRT output '{output_id}' 2022-7 leg 2 connected")
+    };
+    ctx.events.emit_output_with_details(
+        EventSeverity::Info,
+        category::SRT,
+        message,
+        output_id,
+        serde_json::json!({
+            "mode": format!("{:?}", params.mode),
+            "leg": leg,
+            "local_addr": params.local_addr.unwrap_or("auto"),
+        }),
+    );
+    (tx, task, poller)
+}
+
+/// Detach lost leg `leg` and raise its Warning; the caller re-arms it.
+async fn lose_output_leg(
+    ctx: &RedundantOutputCtx<'_>,
+    leg: u8,
+    other_leg: &'static str,
+    socket: &mut Option<Arc<SrtSocket>>,
+    tx: &mut Option<SendQueueTx>,
+    poller: &mut Option<CancellationToken>,
+) {
+    ctx.up(leg).store(false, Ordering::Relaxed);
+    if let Some(poller) = poller.take() {
+        poller.cancel();
+    }
+    *tx = None;
+    if let Some(socket) = socket.take() {
+        let _ = socket.close().await;
+    }
+    emit_redundant_output_leg_lost(ctx.events, &ctx.config.id, leg, *ctx.params(leg).mode, other_leg);
+}
+
 /// Core send loop for dual-leg SRT output with SMPTE 2022-7 packet duplication.
 ///
-/// Connects two independent SRT legs (leg 1 from the main config, leg 2 from
-/// the redundancy config). Each leg gets its own dedicated Tokio send task
-/// and mpsc channel, following the same pattern as the single-leg output.
+/// Two independent SRT legs (leg 1 from the main config, leg 2 from the
+/// redundancy config), each accepted or dialled on its own
+/// ([`acquire_redundant_leg`]) from the start, so either leg alone carries.
+/// Listener-mode legs bind once and re-accept on that listener; caller-mode
+/// legs re-dial with exponential back-off. A leg that has not connected
+/// `leg_connect_warn_after` into its first acquisition raises a Warning and
+/// keeps trying. Each attached leg gets its own send task and queue,
+/// following the same pattern as the single-leg output.
 ///
-/// Listener-mode legs bind once and re-accept on disconnect; caller-mode legs
-/// reconnect with exponential back-off.
+/// The delay buffer is resolved once, then the broadcast subscribed, both
+/// before either leg is armed: `TargetFrames` waits up to 5 s for a frame
+/// rate, and that wait neither fills the subscription nor holds a connected
+/// leg silent. The loop then runs whether or not a leg is attached; with
+/// none it discards what it receives without counting it, so the output
+/// reads `waiting`, not `dropping` — a broadcast lag included.
 ///
-/// Each leg runs its own SRT stats poller: leg 1 publishes `srt_stats`, leg 2
-/// `srt_leg2_stats`. A leg's poller is cancelled, which clears its stats,
-/// when the leg is lost and at the end of every connect cycle.
+/// Each leg runs its own SRT stats poller from each attach until it is lost:
+/// leg 1 publishes `srt_stats`, leg 2 `srt_leg2_stats`.
 ///
 /// A leg whose send task dies raises a `redundancy` Warning
-/// ([`emit_redundant_output_leg_lost`]) once per cycle. The lost leg stays
-/// down until the pair reconnects, which happens only once both legs are
-/// gone. The other leg carries on alone meanwhile. A leg 2 whose connect
-/// gave up within `leg2_connect_budget` counts as gone
-/// ([`redundant_leg2_alive`]), so losing leg 1 then reconnects the pair and
-/// leg 2 gets a fresh budget.
+/// ([`emit_redundant_output_leg_lost`]) and is re-acquired
+/// [`LEG_REACQUIRE_DELAY`] later, while the other leg carries on. A loss
+/// that leaves neither leg attached also raises "disconnected". A listener
+/// whose accept channel has closed can never accept again: that leg is
+/// logged and not re-armed, as the single-leg output logs it, and the task
+/// returns only once both legs have failed so.
 ///
-/// Stats counting: while leg 1 is up, only leg 1 increments `packets_sent`,
-/// `bytes_sent` and the latency, to avoid double-counting, since both legs
-/// carry identical data. Once leg 1's send fails, leg 2's send task counts
-/// instead, so a pair carried by leg 2 alone does not read `idle`. Around the
-/// handoff a packet can be counted twice or not at all, bounded by how far
-/// the two legs' queues were apart. That is stats only.
+/// Stats counting: only one leg counts `packets_sent`, `bytes_sent` and the
+/// latency, since both carry identical data — leg 1 while it is attached,
+/// leg 2 whenever leg 1 is not ([`spawn_redundant_send_task`]). Around a
+/// handoff a packet can be counted twice or not at all, bounded by the
+/// legs' queues: when leg 1 fails, by how far the two queues were apart;
+/// when leg 1 re-attaches, by what leg 2 still holds, which neither counts.
+/// That is stats only.
 async fn srt_output_redundant_loop(
     config: &SrtOutputConfig,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
@@ -1620,23 +1845,23 @@ async fn srt_output_redundant_loop(
     // Redundant 2022-7 path is passthrough-only (no replacers); kept
     // for signature parity with the single-leg loop.
     _active_input_rx: tokio::sync::watch::Receiver<String>,
-    // How long leg 2 is given to connect in each cycle:
-    // `INITIAL_LEG2_CONNECT_BUDGET`, shorter only in tests.
-    leg2_connect_budget: Duration,
+    // When a leg's first acquisition warns that it has not connected:
+    // `LEG_CONNECT_WARN_AFTER`, shorter only in tests.
+    leg_connect_warn_after: Duration,
 ) -> anyhow::Result<()> {
     let redundancy = config
         .redundancy
         .as_ref()
         .expect("redundancy config must be present");
 
-    // Persistent listeners for any legs in listener mode (kept across
-    // reconnect cycles so ports stay bound).
-    let mut listener_leg1 = if config.mode == SrtMode::Listener {
+    // Persistent listeners for any legs in listener mode, handed to each
+    // leg's acquisition and back on every attach so the ports stay bound.
+    let listener_leg1 = if config.mode == SrtMode::Listener {
         Some(bind_srt_listener_for_output(config).await?)
     } else {
         None
     };
-    let mut listener_leg2 = if redundancy.mode == SrtMode::Listener {
+    let listener_leg2 = if redundancy.mode == SrtMode::Listener {
         Some(bind_srt_listener_for_redundancy(redundancy).await?)
     } else {
         None
@@ -1660,524 +1885,310 @@ async fn srt_output_redundant_loop(
     let mut remap_scratch: Vec<u8> = Vec::new();
     let mut overrides_scratch: Vec<u8> = Vec::new();
 
-    // Outer reconnection loop — restarts both legs on total connection loss
-    loop {
-        // Connect/accept leg 1
-        let socket_leg1 = if let Some(ref mut listener) = listener_leg1 {
-            match accept_srt_connection(listener, &cancel).await {
-                Ok(s) => s,
-                Err(_) if cancel.is_cancelled() => return Ok(()),
-                Err(e) => return Err(e),
-            }
-        } else {
-            match connect_srt_output(config, &cancel).await {
-                Ok(s) => s,
-                Err(e) => {
-                    if cancel.is_cancelled() {
-                        return Ok(());
-                    }
-                    return Err(e);
-                }
-            }
-        };
-        tracing::info!(
-            "SRT output '{}' leg1 connected: mode={:?} local={}",
-            config.id,
-            config.mode,
-            config.local_addr.as_deref().unwrap_or("auto")
-        );
-        events.emit_output_with_details(
-            EventSeverity::Info, category::SRT,
-            format!("SRT output '{}' connected", config.id), &config.id,
-            serde_json::json!({
-                "mode": format!("{:?}", config.mode),
-                "leg": 1,
-                "local_addr": config.local_addr.as_deref().unwrap_or("auto"),
-            }),
-        );
+    // Optional output delay buffer for stream synchronization, resolved
+    // before the subscription and before either leg is armed.
+    let resolved = if let Some(ref delay) = config.delay {
+        resolve_output_delay(delay, &config.id, frame_rate_rx.clone(), &cancel).await
+    } else {
+        None
+    };
+    let (mut delay_buf, _frame_rate_watch) = match resolved {
+        Some((buf, watch)) => (Some(buf), watch),
+        None => (None, None),
+    };
+    let mut rx = broadcast_tx.subscribe();
 
-        // Subscribe to broadcast and spawn leg 1 send task IMMEDIATELY.
-        // Leg 2 is brought up in parallel (below) with `leg2_connect_budget` —
-        // while that handshake is in progress we keep leg 1 hot so the receiver
-        // keeps ACK'ing and the sender's libsrt send buffer never stalls
-        // on an idle socket.
-        let mut rx = broadcast_tx.subscribe();
+    // Set by leg 1's send task when a send fails, and by the loop whenever
+    // leg 1 is lost; cleared when leg 1 attaches, before its task starts.
+    // While it is set leg 2's task counts what the output sends, so a pair
+    // carried by leg 2 alone never reads idle; it starts set, so leg 2
+    // counts until leg 1 carries. It is kept beside `leg_up`, the loop's
+    // own attach view, because leg 1's task sets it at its send error,
+    // before the loop sees the queue `Closed`, and leg 2's task reads it per
+    // item. It is never set when a queue closes at teardown, so a normal
+    // stop does not make leg 2 count what it drains on top of what leg 1
+    // drained. An AtomicBool, not a CancellationToken: `is_cancelled` takes
+    // a lock.
+    let leg1_lost = Arc::new(AtomicBool::new(true));
+    let leg_up = [AtomicBool::new(false), AtomicBool::new(false)];
+    // Cancelled at teardown whether or not `cancel` was, so a pending
+    // acquisition can be let finish (see the end of this function).
+    let legs_cancel = cancel.child_token();
+    let ctx =
+        RedundantOutputCtx { config, redundancy, cancel: &legs_cancel, events, leg_up: &leg_up };
 
-        // Leg 1's stats until it is lost or the cycle ends; leg 2's from
-        // when it attaches.
-        let leg1_poller = cancel.child_token();
-        spawn_srt_stats_poller(socket_leg1.clone(), stats.srt_stats_cache.clone(), None, leg1_poller.clone());
-        let leg2_poller = cancel.child_token();
-        // Set by leg 1's send task when a send fails. From then on leg 2's
-        // task counts what the output sends, so a pair carried by leg 2
-        // alone never reads idle. It is set only on a send error, never when
-        // the queue closes at teardown, so a normal stop does not make leg 2
-        // count what it drains on top of what leg 1 drained. An AtomicBool,
-        // not a CancellationToken: leg 2's task reads it per item, and
-        // `is_cancelled` takes a lock.
-        let leg1_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Each leg raises its leg-lost event at most once per cycle.
-        let (mut leg1_up, mut leg2_up) = (true, false);
+    // Each leg's state in locals of its own, so the select! below borrows
+    // each leg's acquisition mutably on its own.
+    let mut acquire1 =
+        Some(arm_output_leg(&ctx, 1, listener_leg1, Duration::ZERO, Some(leg_connect_warn_after)));
+    let mut acquire2 =
+        Some(arm_output_leg(&ctx, 2, listener_leg2, Duration::ZERO, Some(leg_connect_warn_after)));
+    // A leg's listener, held from its attach until its next re-arm.
+    let (mut listener1, mut listener2) = (None, None);
+    let (mut sock1, mut sock2): (Option<Arc<SrtSocket>>, Option<Arc<SrtSocket>>) = (None, None);
+    let (mut tx1, mut tx2): (Option<SendQueueTx>, Option<SendQueueTx>) = (None, None);
+    let (mut poller1, mut poller2): (Option<CancellationToken>, Option<CancellationToken>) =
+        (None, None);
+    // Leg 1's send task is awaited at the end, so what it has queued goes
+    // out; leg 2's, as before, is not.
+    let mut task1: Option<JoinHandle<()>> = None;
+    // A leg whose listener has failed for good.
+    let (mut dead1, mut dead2) = (false, false);
 
-        let (send_tx_leg1, mut send_rx_leg1) = send_queue();
-        let send_socket1 = socket_leg1.clone();
-        let send_stats1 = stats.clone();
-        let output_id1 = config.id.clone();
-        let leg1_lost_tx = leg1_lost.clone();
-        let send_handle1 = tokio::spawn(async move {
-            while let Some((data, recv_time_us)) = send_rx_leg1.recv().await {
-                match srt_send_chunked(&send_socket1, &data).await {
-                    Ok(sent) => {
-                        send_stats1.packets_sent.fetch_add(1, Ordering::Relaxed);
-                        send_stats1.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                        send_stats1.record_latency(recv_time_us);
-                    }
-                    Err(e) if is_transient_backpressure(&e) => {
-                        send_stats1.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        tracing::warn!("SRT output '{}' leg1 send error: {e}", output_id1);
-                        leg1_lost_tx.store(true, Ordering::Relaxed);
-                        break;
-                    }
-                }
-            }
-        });
+    let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
+    tokio::pin!(delay_sleep);
 
-        // Leg-2 connect/accept future, pinned so we can poll it inside the
-        // main packet select! and complete it exactly once per reconnect
-        // cycle. Bounded by `leg2_connect_budget` so a dead leg-2 peer
-        // never gates leg-1. While this is pending, leg-1 is already pumping.
-        let leg2_connect_fut = {
-            let events = events.clone();
-            let output_id = config.id.clone();
-            let redundancy = redundancy.clone();
-            let cancel = cancel.clone();
-            let mut listener_leg2_mut = listener_leg2.take();
-            async move {
-                let result: (Option<Arc<SrtSocket>>, Option<srt_transport::SrtListener>) = if let Some(ref mut listener) = listener_leg2_mut {
-                    let r = tokio::time::timeout(
-                        leg2_connect_budget,
-                        accept_srt_connection(listener, &cancel),
-                    ).await;
-                    match r {
-                        Ok(Ok(s)) => (Some(s), listener_leg2_mut),
-                        Ok(Err(_)) if cancel.is_cancelled() => (None, listener_leg2_mut),
-                        Ok(Err(e)) => {
-                            tracing::warn!("SRT output '{}' leg2 accept failed: {e}, running single-leg", output_id);
-                            (None, listener_leg2_mut)
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "SRT output '{}' leg2 did not come up within {:?} (accept timed out), running single-leg",
-                                output_id, leg2_connect_budget,
-                            );
-                            events.emit_output_with_details(
-                                EventSeverity::Warning, category::SRT,
-                                format!("SRT output '{}' 2022-7 leg 2 did not connect within {:?}; running single-leg", output_id, leg2_connect_budget),
-                                &output_id,
-                                serde_json::json!({
-                                    "mode": format!("{:?}", redundancy.mode),
-                                    "leg": 2, "reason": "accept timed out",
-                                    "budget_ms": leg2_connect_budget.as_millis(),
-                                }),
-                            );
-                            (None, listener_leg2_mut)
-                        }
-                    }
-                } else {
-                    match tokio::time::timeout(
-                        leg2_connect_budget,
-                        connect_srt_redundancy_leg(&redundancy, &cancel),
-                    ).await {
-                        Ok(Ok(s)) => (Some(s), None),
-                        Ok(Err(_)) if cancel.is_cancelled() => (None, None),
-                        Ok(Err(e)) => {
-                            tracing::warn!("SRT output '{}' leg2 connection failed: {e}, running single-leg", output_id);
-                            (None, None)
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                "SRT output '{}' leg2 did not come up within {:?} (caller connect retry budget exhausted), running single-leg",
-                                output_id, leg2_connect_budget,
-                            );
-                            events.emit_output_with_details(
-                                EventSeverity::Warning, category::SRT,
-                                format!("SRT output '{}' 2022-7 leg 2 did not connect within {:?}; running single-leg", output_id, leg2_connect_budget),
-                                &output_id,
-                                serde_json::json!({
-                                    "mode": format!("{:?}", redundancy.mode),
-                                    "leg": 2, "reason": "caller connect retry budget exhausted",
-                                    "budget_ms": leg2_connect_budget.as_millis(),
-                                }),
-                            );
-                            (None, None)
-                        }
-                    }
-                };
-                if result.0.is_some() {
-                    tracing::info!(
-                        "SRT output '{}' leg2 connected: mode={:?} local={}",
-                        output_id,
-                        redundancy.mode,
-                        redundancy.local_addr.as_deref().unwrap_or("auto")
-                    );
-                }
-                result
-            }
-        };
-        tokio::pin!(leg2_connect_fut);
-        let mut leg2_done = false;
-
-        // leg 2 send task is spawned lazily once the leg-2 future resolves.
-        let mut socket_leg2: Option<Arc<SrtSocket>> = None;
-        let mut send_tx_leg2_opt: Option<SendQueueTx> = None;
-
-        // Optional output delay buffer for stream synchronization.
-        let resolved = if let Some(ref delay) = config.delay {
-            resolve_output_delay(delay, &config.id, frame_rate_rx.clone(), &cancel).await
-        } else {
-            None
-        };
-        let (mut delay_buf, _frame_rate_watch) = match resolved {
-            Some((buf, watch)) => (Some(buf), watch),
-            None => (None, None),
-        };
-
-        let delay_sleep = tokio::time::sleep(Duration::from_secs(86400));
-        tokio::pin!(delay_sleep);
-
-        // Packet forwarding loop — runs until both legs die or cancel
-        let mut broadcast_closed = false;
-        loop {
-            if let Some(ref db) = delay_buf
-                && let Some(release_us) = db.next_release_time() {
-                    let now = now_us();
-                    let wait = release_us.saturating_sub(now);
-                    delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
-                }
-
-            let mut payloads_to_send: Vec<(Bytes, u64)> = Vec::new();
-
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!("SRT output '{}' (redundant) stopping (cancelled)", config.id);
-                    drop(send_tx_leg1);
-                    drop(send_tx_leg2_opt);
-                    let _ = send_handle1.await;
-                    let _ = socket_leg1.close().await;
-                    if let Some(ref s) = socket_leg2 {
-                        let _ = s.close().await;
-                    }
-                    if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                    return Ok(());
-                }
-                // Leg 2 connector finished — attach send task (or stay single-leg).
-                // Guarded by `!leg2_done` so select! won't re-poll a complete future.
-                (sock, returned_listener) = &mut leg2_connect_fut, if !leg2_done => {
-                    leg2_done = true;
-                    if returned_listener.is_some() {
-                        listener_leg2 = returned_listener;
-                    }
-                    if let Some(sock2) = sock {
-                        spawn_srt_stats_poller(sock2.clone(), stats.srt_leg2_stats_cache.clone(), None, leg2_poller.clone());
-                        let (tx2, mut rx2) = send_queue();
-                        let send_socket2 = sock2.clone();
-                        let send_stats2 = stats.clone();
-                        let leg1_lost2 = leg1_lost.clone();
-                        let output_id2 = config.id.clone();
-                        tokio::spawn(async move {
-                            while let Some((data, recv_time_us)) = rx2.recv().await {
-                                // While leg 1 is up it counts what the pair
-                                // sends, so leg 2 counts nothing. Once leg
-                                // 1's send has failed, leg 2 counts.
-                                let counts = leg1_lost2.load(Ordering::Relaxed);
-                                match srt_send_chunked(&send_socket2, &data).await {
-                                    Ok(sent) => {
-                                        if counts {
-                                            send_stats2.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                            send_stats2.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-                                            send_stats2.record_latency(recv_time_us);
-                                        }
-                                    }
-                                    Err(e) if is_transient_backpressure(&e) => {
-                                        // Transient Rust-side channel pressure
-                                        // on leg 2 only. Drop this packet and
-                                        // continue. While leg 1 is up it
-                                        // carries the dupe under 2022-7, so
-                                        // the receiver merge is unaffected
-                                        // and nothing is counted; once leg 1
-                                        // is lost the drop is the output's.
-                                        if counts {
-                                            send_stats2.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("SRT output '{}' leg2 send error: {e}", output_id2);
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-                        socket_leg2 = Some(sock2);
-                        send_tx_leg2_opt = Some(tx2);
-                        leg2_up = true;
-                        // Its own message: the manager folds an event into
-                        // an unacknowledged row with the same message, so
-                        // leg 1's text would hide this one in leg 1's row.
-                        events.emit_output_with_details(
-                            EventSeverity::Info, category::SRT,
-                            format!("SRT output '{}' 2022-7 leg 2 connected", config.id), &config.id,
-                            serde_json::json!({
-                                "mode": format!("{:?}", redundancy.mode),
-                                "leg": 2,
-                                "local_addr": redundancy.local_addr.as_deref().unwrap_or("auto"),
-                            }),
-                        );
-                    }
-                    continue;
-                }
-                result = rx.recv() => {
-                    match result {
-                        Ok(packet) => {
-                            // Apply program filter if configured.
-                            let recv_time_us = packet.recv_time_us;
-                            let payload = if let Some(ref mut filter) = program_filter {
-                                match filter.filter_packet(&packet, &mut filter_scratch) {
-                                    Some(b) => b,
-                                    None => continue,
-                                }
-                            } else {
-                                packet.data
-                            };
-
-                            // Per-program role-keyed PID rewrite (passthrough
-                            // only — the transcoded path runs through
-                            // replacers earlier).
-                            let payload = if let Some(ref mut rw) = pid_overrides_rewriter {
-                                let temp = RtpPacket {
-                                    data: payload,
-                                    sequence_number: packet.sequence_number,
-                                    rtp_timestamp: packet.rtp_timestamp,
-                                    recv_time_us: packet.recv_time_us,
-                                    is_raw_ts: packet.is_raw_ts,
-                                    upstream_seq: None,
-                                    upstream_leg_id: None,
-                                    sender_timestamp_us: None,
-                                };
-                                match rw.process_packet(&temp, &mut overrides_scratch) {
-                                    Some(b) => b,
-                                    None => continue,
-                                }
-                            } else {
-                                payload
-                            };
-
-                            // Apply PID remap so both legs carry the remapped bytes.
-                            let payload = if let Some(ref mut remapper) = pid_remapper {
-                                let temp = RtpPacket {
-                                    data: payload,
-                                    sequence_number: packet.sequence_number,
-                                    rtp_timestamp: packet.rtp_timestamp,
-                                    recv_time_us: packet.recv_time_us,
-                                    is_raw_ts: packet.is_raw_ts,
-                                    upstream_seq: None,
-                                    upstream_leg_id: None,
-                                    sender_timestamp_us: None,
-                                };
-                                match remapper.process_packet(&temp, &mut remap_scratch) {
-                                    Some(b) => b,
-                                    None => continue,
-                                }
-                            } else {
-                                payload
-                            };
-
-                            if let Some(ref mut db) = delay_buf {
-                                db.push(RtpPacket {
-                                    data: payload,
-                                    sequence_number: packet.sequence_number,
-                                    rtp_timestamp: packet.rtp_timestamp,
-                                    recv_time_us: packet.recv_time_us,
-                                    is_raw_ts: packet.is_raw_ts,
-                                    upstream_seq: None,
-                                    upstream_leg_id: None,
-                                    sender_timestamp_us: None,
-                                });
-                            } else {
-                                payloads_to_send.push((payload, recv_time_us));
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
-                            tracing::warn!(
-                                "SRT output '{}' (redundant) lagged, dropped {n} packets",
-                                config.id
-                            );
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            tracing::info!(
-                                "SRT output '{}' broadcast channel closed",
-                                config.id
-                            );
-                            broadcast_closed = true;
-                            break;
-                        }
-                    }
-                }
-                _ = &mut delay_sleep, if delay_buf.as_ref().is_some_and(|db| db.len() > 0) => {
-                    let db = delay_buf.as_mut().unwrap();
-                    let now = now_us();
-                    for packet in db.drain_ready(now) {
-                        payloads_to_send.push((packet.data, packet.recv_time_us));
-                    }
-                }
+    // Packet forwarding loop — runs until cancel, the broadcast closing, or
+    // both legs' listeners failing.
+    let outcome = loop {
+        if let Some(ref db) = delay_buf
+            && let Some(release_us) = db.next_release_time() {
+                let now = now_us();
+                let wait = release_us.saturating_sub(now);
+                delay_sleep.as_mut().reset(Instant::now() + Duration::from_micros(wait));
             }
 
-            // Send to both legs.
-            //
-            // `Full` and `Closed` are **different verdicts** and must not both
-            // mean "this leg is lost". `Full` is backpressure — the queue doing
-            // exactly its job, shedding a packet while the leg stays up — and
-            // treating it as a lost leg violates the node-wide rule that slow
-            // consumers see dropped packets, never cascading teardown. Only
-            // `Closed` (the leg's send task has died) is a liveness verdict.
-            //
-            // This mattered little while `Full` needed 4096 queued whole access
-            // units (~164 MB, effectively unreachable). The 8 MiB ceiling makes
-            // it ~56-66 IDRs, which an ordinary burst against a briefly-stalled
-            // srt-io task reaches — so a transient drain stall would otherwise
-            // become a real dual-socket teardown plus an operator alarm, on
-            // precisely the source class this change was written for.
-            let mut all_legs_lost = false;
-            for (payload, recv_time_us) in payloads_to_send {
-                let leg1_alive = match send_tx_leg1.try_send((payload.clone(), recv_time_us)) {
-                    Ok(()) => true,
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                        true
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-                };
+        let mut payloads_to_send: Vec<(Bytes, u64)> = Vec::new();
 
-                // `None` while no leg-2 socket is attached.
-                let leg2_queued = send_tx_leg2_opt.as_ref().map(|tx2| {
-                    match tx2.try_send((payload, recv_time_us)) {
-                        Ok(()) => true,
-                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                            stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                            true
-                        }
-                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
-                    }
-                });
-                // An absent leg 2 is "not connected yet", not "lost", while
-                // its connect is pending. Leg 2 attaches lazily once its
-                // connect future resolves, and while it was counted as a
-                // dead leg a single rejection on leg 1 was enough to satisfy
-                // the teardown condition for the whole pre-connection
-                // window. Once the connect has resolved with no socket
-                // (`leg2_done`) it is gone, so a lost leg 1 reconnects the
-                // pair, whether leg 1 went after leg 2 gave up or while it
-                // was connecting: in that order the next payload after the
-                // give-up finds both gone.
-                let leg2_alive = redundant_leg2_alive(leg2_queued, leg2_done);
-
-                // Each leg's loss is raised here, at most once per cycle,
-                // and not from its send task: at teardown the sockets close
-                // while leg 2's task, which is never awaited, may still be
-                // draining, and its send error then is no lost leg.
-                if leg1_up && !leg1_alive {
-                    leg1_up = false;
-                    leg1_poller.cancel();
-                    emit_redundant_output_leg_lost(
-                        events,
-                        &config.id,
-                        1,
-                        config.mode,
-                        redundant_other_leg_state(leg2_queued, leg2_done),
-                    );
-                }
-                if leg2_up && !leg2_alive {
-                    leg2_up = false;
-                    leg2_poller.cancel();
-                    emit_redundant_output_leg_lost(
-                        events,
-                        &config.id,
-                        2,
-                        redundancy.mode,
-                        redundant_other_leg_state(Some(leg1_alive), true),
-                    );
-                }
-
-                if !leg1_alive && !leg2_alive {
-                    // Reaching here now means both legs' send tasks are
-                    // genuinely gone (`Closed`), not merely congested. Log the
-                    // queue state anyway so a teardown is always traceable to
-                    // the state that produced it.
-                    tracing::warn!(
-                        output_id = %config.id,
-                        leg1_queued_bytes = send_tx_leg1.queued_bytes(),
-                        leg1_byte_bound_rejections = send_tx_leg1.byte_bound_rejections(),
-                        leg2_queued_bytes = send_tx_leg2_opt
-                            .as_ref()
-                            .map(|t| t.queued_bytes()),
-                        leg2_byte_bound_rejections = send_tx_leg2_opt
-                            .as_ref()
-                            .map(|t| t.byte_bound_rejections()),
-                        max_bytes = SRT_SEND_QUEUE_MAX_BYTES,
-                        "SRT output all legs lost, will reconnect"
-                    );
-                    all_legs_lost = true;
-                    break;
-                }
-            }
-            if all_legs_lost {
-                break;
-            }
-        }
-
-        // Cleanup sockets before reconnect (listeners stay open). The
-        // pollers go first, so neither leg's stats outlive its socket. (On
-        // the cancel arm above they are already gone: both are children of
-        // `cancel`.)
-        leg1_poller.cancel();
-        leg2_poller.cancel();
-        drop(send_tx_leg1);
-        drop(send_tx_leg2_opt);
-        let _ = send_handle1.await;
-        let _ = socket_leg1.close().await;
-        if let Some(ref s) = socket_leg2 {
-            let _ = s.close().await;
-        }
-
-        if broadcast_closed {
-            if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-            if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-            return Ok(());
-        }
-
-        // Brief delay before reconnect attempt
         tokio::select! {
             _ = cancel.cancelled() => {
-                tracing::info!("SRT output '{}' (redundant) stopping during reconnect delay", config.id);
-                if let Some(ref l) = listener_leg1 { let _ = l.close().await; }
-                if let Some(ref l) = listener_leg2 { let _ = l.close().await; }
-                return Ok(());
+                tracing::info!("SRT output '{}' (redundant) stopping (cancelled)", config.id);
+                break Ok(());
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            acquired = async { acquire1.as_mut().expect("armed").await }, if acquire1.is_some() => {
+                acquire1 = None;
+                match acquired {
+                    LegAcquired::Connected(socket, listener) => {
+                        listener1 = listener;
+                        // Counting moves back to leg 1 before its task starts.
+                        leg1_lost.store(false, Ordering::Relaxed);
+                        let (tx, task, poller) = attach_output_leg(&ctx, 1, &socket, &stats, &leg1_lost);
+                        (tx1, task1, poller1, sock1) = (Some(tx), Some(task), Some(poller), Some(socket));
+                    }
+                    // Produced only once `cancel` has fired; the cancel arm
+                    // returns.
+                    LegAcquired::Cancelled => {}
+                    LegAcquired::Failed(e) => {
+                        tracing::error!("SRT output '{}' leg1 accept failed: {e}", config.id);
+                        dead1 = true;
+                        if dead2 {
+                            break Err(e);
+                        }
+                    }
+                }
+                continue;
+            }
+            acquired = async { acquire2.as_mut().expect("armed").await }, if acquire2.is_some() => {
+                acquire2 = None;
+                match acquired {
+                    LegAcquired::Connected(socket, listener) => {
+                        listener2 = listener;
+                        // Leg 2's send task is not awaited at teardown, so
+                        // its handle is let go.
+                        let (tx, _task, poller) = attach_output_leg(&ctx, 2, &socket, &stats, &leg1_lost);
+                        (tx2, poller2, sock2) = (Some(tx), Some(poller), Some(socket));
+                    }
+                    LegAcquired::Cancelled => {}
+                    LegAcquired::Failed(e) => {
+                        tracing::error!("SRT output '{}' leg2 accept failed: {e}", config.id);
+                        dead2 = true;
+                        if dead1 {
+                            break Err(e);
+                        }
+                    }
+                }
+                continue;
+            }
+            result = rx.recv() => {
+                match result {
+                    Ok(packet) => {
+                        // Apply program filter if configured.
+                        let recv_time_us = packet.recv_time_us;
+                        let payload = if let Some(ref mut filter) = program_filter {
+                            match filter.filter_packet(&packet, &mut filter_scratch) {
+                                Some(b) => b,
+                                None => continue,
+                            }
+                        } else {
+                            packet.data
+                        };
+
+                        // Per-program role-keyed PID rewrite (passthrough
+                        // only — the transcoded path runs through
+                        // replacers earlier).
+                        let payload = if let Some(ref mut rw) = pid_overrides_rewriter {
+                            let temp = RtpPacket {
+                                data: payload,
+                                sequence_number: packet.sequence_number,
+                                rtp_timestamp: packet.rtp_timestamp,
+                                recv_time_us: packet.recv_time_us,
+                                is_raw_ts: packet.is_raw_ts,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
+                                sender_timestamp_us: None,
+                            };
+                            match rw.process_packet(&temp, &mut overrides_scratch) {
+                                Some(b) => b,
+                                None => continue,
+                            }
+                        } else {
+                            payload
+                        };
+
+                        // Apply PID remap so both legs carry the remapped bytes.
+                        let payload = if let Some(ref mut remapper) = pid_remapper {
+                            let temp = RtpPacket {
+                                data: payload,
+                                sequence_number: packet.sequence_number,
+                                rtp_timestamp: packet.rtp_timestamp,
+                                recv_time_us: packet.recv_time_us,
+                                is_raw_ts: packet.is_raw_ts,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
+                                sender_timestamp_us: None,
+                            };
+                            match remapper.process_packet(&temp, &mut remap_scratch) {
+                                Some(b) => b,
+                                None => continue,
+                            }
+                        } else {
+                            payload
+                        };
+
+                        if let Some(ref mut db) = delay_buf {
+                            db.push(RtpPacket {
+                                data: payload,
+                                sequence_number: packet.sequence_number,
+                                rtp_timestamp: packet.rtp_timestamp,
+                                recv_time_us: packet.recv_time_us,
+                                is_raw_ts: packet.is_raw_ts,
+                                upstream_seq: None,
+                                upstream_leg_id: None,
+                                sender_timestamp_us: None,
+                            });
+                        } else {
+                            payloads_to_send.push((payload, recv_time_us));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // With no leg attached the output discards what it
+                        // receives uncounted, a lag included: these were
+                        // never going anywhere.
+                        if tx1.is_some() || tx2.is_some() {
+                            stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
+                        }
+                        tracing::warn!(
+                            "SRT output '{}' (redundant) lagged, dropped {n} packets",
+                            config.id
+                        );
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::info!(
+                            "SRT output '{}' broadcast channel closed",
+                            config.id
+                        );
+                        break Ok(());
+                    }
+                }
+            }
+            _ = &mut delay_sleep, if delay_buf.as_ref().is_some_and(|db| db.len() > 0) => {
+                let db = delay_buf.as_mut().unwrap();
+                let now = now_us();
+                for packet in db.drain_ready(now) {
+                    payloads_to_send.push((packet.data, packet.recv_time_us));
+                }
+            }
         }
 
-        events.emit_output_with_details(
-            EventSeverity::Warning, category::SRT,
-            format!("SRT output '{}' disconnected", config.id), &config.id,
-            serde_json::json!({
-                "mode": format!("{:?}", config.mode),
-                "redundant": true,
-            }),
-        );
-        tracing::info!("SRT output '{}' (redundant) attempting reconnection...", config.id);
-    }
+        // Send to every attached leg. Each payload takes both legs' verdicts
+        // first, and only then acts on a loss, so a leg's `other_leg` reads
+        // what the other leg did with that same payload.
+        for (payload, recv_time_us) in payloads_to_send {
+            if tx1.is_none() && tx2.is_none() {
+                // No leg attached: discard, counting nothing. Counted as
+                // drops these would read `dropping` for an output that is
+                // `waiting` for a peer, and before the legs were acquired on
+                // their own the output was not even subscribed then.
+                break;
+            }
+            let queued1 = tx1
+                .as_ref()
+                .map(|tx| redundant_leg_takes(tx, (payload.clone(), recv_time_us), &stats));
+            let queued2 =
+                tx2.as_ref().map(|tx| redundant_leg_takes(tx, (payload, recv_time_us), &stats));
+            let lost = redundant_legs_lost([queued1, queued2]);
+            if lost == [None, None] {
+                continue;
+            }
+            // Losses that leave no leg attached. Log the queue state that
+            // produced them while the queues still exist, so a dark output
+            // is always traceable to it.
+            let none_left = (tx1.is_none() || lost[0].is_some())
+                && (tx2.is_none() || lost[1].is_some());
+            if none_left {
+                tracing::warn!(
+                    output_id = %config.id,
+                    leg1_queued_bytes = tx1.as_ref().map(|t| t.queued_bytes()),
+                    leg1_byte_bound_rejections = tx1.as_ref().map(|t| t.byte_bound_rejections()),
+                    leg2_queued_bytes = tx2.as_ref().map(|t| t.queued_bytes()),
+                    leg2_byte_bound_rejections = tx2.as_ref().map(|t| t.byte_bound_rejections()),
+                    max_bytes = SRT_SEND_QUEUE_MAX_BYTES,
+                    "SRT output all legs lost, re-acquiring each"
+                );
+            }
+            // Each loss is raised here, and not from the leg's send task: at
+            // teardown the sockets close while leg 2's task, which is never
+            // awaited, may still be draining, and its send error then is no
+            // lost leg.
+            if let Some(other_leg) = lost[0] {
+                lose_output_leg(&ctx, 1, other_leg, &mut sock1, &mut tx1, &mut poller1).await;
+                task1 = None;
+                leg1_lost.store(true, Ordering::Relaxed);
+                acquire1 = Some(arm_output_leg(&ctx, 1, listener1.take(), LEG_REACQUIRE_DELAY, None));
+            }
+            if let Some(other_leg) = lost[1] {
+                lose_output_leg(&ctx, 2, other_leg, &mut sock2, &mut tx2, &mut poller2).await;
+                acquire2 = Some(arm_output_leg(&ctx, 2, listener2.take(), LEG_REACQUIRE_DELAY, None));
+            }
+            if none_left {
+                events.emit_output_with_details(
+                    EventSeverity::Warning, category::SRT,
+                    format!("SRT output '{}' disconnected", config.id), &config.id,
+                    serde_json::json!({
+                        "mode": format!("{:?}", config.mode),
+                        "redundant": true,
+                    }),
+                );
+            }
+        }
+    };
+
+    // Stop the pending acquisitions and let each finish beside the rest of
+    // the teardown: dropped part-way through a caller's connect, one would
+    // leave a connection nothing closes (`release_leg_acquire`). A pending
+    // accept returns at once and closes the listener it holds. The pollers,
+    // children of `legs_cancel`, stop with it, before the sockets close, so
+    // neither leg's stats outlive its socket.
+    legs_cancel.cancel();
+    let attached = async move {
+        drop(tx1);
+        drop(tx2);
+        if let Some(task) = task1 {
+            let _ = task.await;
+        }
+        for socket in [&sock1, &sock2].into_iter().flatten() {
+            let _ = socket.close().await;
+        }
+        for listener in [&listener1, &listener2].into_iter().flatten() {
+            let _ = listener.close().await;
+        }
+    };
+    tokio::join!(
+        release_leg_acquire(acquire1, leg_release_bound(config.connect_timeout_secs)),
+        release_leg_acquire(acquire2, leg_release_bound(redundancy.connect_timeout_secs)),
+        attached
+    );
+    outcome
 }
 
 /// One step of the compressed-audio bridge for the SRT output's 302M mode.
@@ -2798,41 +2809,39 @@ mod tests {
     #[test]
     fn the_other_leg_is_reported_by_what_it_carries() {
         // Queued, or shed on backpressure: a full queue is a live leg.
-        assert_eq!(redundant_other_leg_state(Some(true), true), "carrying");
+        assert_eq!(redundant_other_leg_state(Some(true)), "carrying");
         // Its send task is gone.
-        assert_eq!(redundant_other_leg_state(Some(false), true), "down");
-        // No socket yet and its connect still pending. The pair is kept up
-        // for it, but it carries nothing, so it must not read as carrying.
-        assert_eq!(redundant_other_leg_state(None, false), "connecting");
-        // No socket, and its connect has given up.
-        assert_eq!(redundant_other_leg_state(None, true), "down");
+        assert_eq!(redundant_other_leg_state(Some(false)), "down");
+        // No socket attached: it is being re-acquired and carries nothing.
+        assert_eq!(redundant_other_leg_state(None), "down");
     }
 
+    /// Both legs' verdicts on one payload are taken before either loss is
+    /// handled: two legs dying on the same payload each read the other as
+    /// down, never the first as "carrying" while the output goes dark. A
+    /// full queue or an absent leg is no loss.
     #[test]
-    fn a_leg_2_whose_connect_gave_up_is_gone() {
-        // Queued, or shed on backpressure: alive. Send task gone: not.
-        assert!(redundant_leg2_alive(Some(true), true));
-        assert!(!redundant_leg2_alive(Some(false), true));
-        // No socket, connect still pending: kept for its budget, so the
-        // pair is not torn down under it.
-        assert!(redundant_leg2_alive(None, false));
-        // No socket, connect given up: gone, so a lost leg 1 reconnects
-        // the pair. It counted as alive, and the output stayed dark.
-        assert!(!redundant_leg2_alive(None, true));
-        // The teardown and the leg-lost event agree on every input.
-        for queued in [Some(true), Some(false), None] {
-            for connect_done in [false, true] {
-                assert_eq!(
-                    redundant_leg2_alive(queued, connect_done),
-                    redundant_other_leg_state(queued, connect_done) != "down",
-                    "queued {queued:?}, connect done {connect_done}"
-                );
-            }
+    fn legs_lost_on_one_payload_report_each_other_down() {
+        let cases = [
+            ([Some(false), Some(false)], [Some("down"), Some("down")]),
+            ([Some(false), Some(true)], [Some("carrying"), None]),
+            ([Some(false), None], [Some("down"), None]),
+            ([Some(true), Some(false)], [None, Some("carrying")]),
+            ([None, Some(false)], [None, Some("down")]),
+            ([Some(true), Some(true)], [None, None]),
+            ([Some(true), None], [None, None]),
+            ([None, None], [None, None]),
+        ];
+        for (queued, lost) in cases {
+            assert_eq!(redundant_legs_lost(queued), lost, "queued {queued:?}");
         }
     }
 
     /// A 2022-7 SRT output with both legs listening on loopback, fed a
     /// 1316-byte null-TS item every 2 ms, and the events it raised.
+    ///
+    /// Every test-side connect is bounded, so a build that never accepts a
+    /// leg fails rather than hangs.
     struct PairHarness {
         stats: Arc<OutputStatsAccumulator>,
         events_rx: tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
@@ -2852,15 +2861,15 @@ mod tests {
             Self::start_with(None)
         }
 
-        /// Like [`PairHarness::start`], with leg 2 given `budget` to connect
-        /// in each cycle, so a test reaches its give-up without waiting
-        /// out the 15 s. It runs the redundant loop directly, which is
-        /// what `spawn_srt_output` runs for a 2022-7 output.
-        fn start_with_leg2_budget(budget: Duration) -> Self {
-            Self::start_with(Some(budget))
+        /// Like [`PairHarness::start`], with each leg's slow-connect Warning
+        /// raised `after` into its first acquisition, so a test sees it
+        /// without waiting out the 15 s. It runs the redundant loop directly,
+        /// which is what `spawn_srt_output` runs for a 2022-7 output.
+        fn start_with_warn_after(after: Duration) -> Self {
+            Self::start_with(Some(after))
         }
 
-        fn start_with(leg2_budget: Option<Duration>) -> Self {
+        fn start_with(warn_after: Option<Duration>) -> Self {
             let free_port = || {
                 std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
             };
@@ -2881,7 +2890,7 @@ mod tests {
             let (event_sender, events_rx) = crate::manager::events::event_channel();
             let cancel = CancellationToken::new();
             let active_input_rx = tokio::sync::watch::channel(String::new()).1;
-            let output = match leg2_budget {
+            let output = match warn_after {
                 None => spawn_srt_output(
                     config,
                     &tx,
@@ -2896,7 +2905,7 @@ mod tests {
                         active_input_rx,
                     },
                 ),
-                Some(budget) => {
+                Some(after) => {
                     let (tx, stats, cancel) = (tx.clone(), stats.clone(), cancel.child_token());
                     tokio::spawn(async move {
                         srt_output_redundant_loop(
@@ -2908,7 +2917,7 @@ mod tests {
                             "f1",
                             None,
                             active_input_rx,
-                            budget,
+                            after,
                         )
                         .await
                         .expect("the 2022-7 output runs");
@@ -2966,9 +2975,13 @@ mod tests {
                     "latency_ms": 200
                 }))
                 .expect("SRT caller fixture");
-            let socket = crate::srt::connection::connect_srt_input(&config, &self.cancel)
-                .await
-                .expect("caller connects");
+            let socket = tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::srt::connection::connect_srt_input(&config, &self.cancel),
+            )
+            .await
+            .expect("caller connects in time")
+            .expect("caller connects");
             let received = Arc::new(AtomicU64::new(0));
             let (drain, count) = (socket.clone(), received.clone());
             tokio::spawn(async move {
@@ -3012,7 +3025,7 @@ mod tests {
             })
         }
 
-        /// How many times `leg` has connected: once per connect cycle.
+        /// How many times `leg` has connected: once per attach.
         fn connects(&self, leg: u64) -> usize {
             self.events
                 .iter()
@@ -3024,16 +3037,21 @@ mod tests {
                 .count()
         }
 
-        /// Leg 2's "did not connect" Warnings: one per cycle it gave up in.
-        fn leg_2_gave_up(&self) -> Vec<&crate::manager::events::Event> {
+        /// Leg `leg`'s "did not connect" Warnings: at most one, raised by
+        /// its first acquisition.
+        fn leg_slow(&self, leg: u64) -> Vec<&crate::manager::events::Event> {
             self.events
                 .iter()
-                .filter(|e| e.message.contains("2022-7 leg 2 did not connect within"))
+                .filter(|e| e.message.contains(&format!("2022-7 leg {leg} did not connect within")))
                 .collect()
         }
 
         fn disconnected(&self) -> bool {
-            self.events.iter().any(|e| e.message.ends_with("disconnected"))
+            self.disconnects() > 0
+        }
+
+        fn disconnects(&self) -> usize {
+            self.events.iter().filter(|e| e.message.ends_with("disconnected")).count()
         }
 
         fn both_legs_report(&self) -> bool {
@@ -3065,7 +3083,7 @@ mod tests {
         assert_eq!(event.flow_id, None, "an output event");
         assert_eq!(
             event.message,
-            format!("SRT output 'o1' 2022-7 leg {leg} lost; down until the pair reconnects"),
+            format!("SRT output 'o1' 2022-7 leg {leg} lost; reconnecting"),
             "fixed per leg, whatever the other leg is doing"
         );
         let details = event.details.as_ref().expect("details");
@@ -3154,7 +3172,7 @@ mod tests {
         assert_eq!(h.stats.snapshot().state, "active");
 
         h.pump_events();
-        assert_eq!(h.leg_lost(2).len(), 1, "a lost leg is raised once per cycle");
+        assert_eq!(h.leg_lost(2).len(), 1, "a lost leg is raised once");
         assert!(h.leg_lost(1).is_empty());
         assert!(!h.disconnected());
         h.stop().await;
@@ -3168,8 +3186,8 @@ mod tests {
     /// leaves on an empty queue, not on a send error: it guards the forward
     /// loop raising nothing at a stop, not a backlogged leg 2 draining into
     /// a closed socket. The caches clear because both pollers are children
-    /// of the output's token; the explicit poller cancels at the end of a
-    /// connect cycle are not reached here.
+    /// of the legs' token, which teardown cancels however the loop ended; an
+    /// end without a cancel is not reached here.
     #[tokio::test]
     async fn a_2022_7_output_stopping_raises_no_leg_loss_and_clears_both_legs() {
         let mut h = PairHarness::start();
@@ -3192,21 +3210,23 @@ mod tests {
         );
     }
 
-    /// Leg 1 lost while leg 2 is still connecting: the event says leg 2 is
-    /// connecting, not carrying; the pair waits for it rather than tearing
-    /// down; and when leg 2 attaches it counts what it sends from the start.
+    /// Leg 1 lost before leg 2 has ever connected: the event says leg 2 is
+    /// down, the output says it is disconnected, and when leg 2 attaches it
+    /// counts what it sends from the start and carries. Before edge#182 the
+    /// pair waited out leg 2's connect budget, then started a new cycle from
+    /// leg 1.
     #[tokio::test]
-    async fn a_2022_7_output_losing_leg_1_while_leg_2_connects_waits_and_hands_over() {
+    async fn a_2022_7_output_losing_leg_1_before_leg_2_connects_hands_over_when_it_does() {
         let mut h = PairHarness::start();
         let (leg1, _received1) = h.connect(h.ports.0).await;
         h.wait_until("leg 1's stats", |h| h.stats.snapshot().srt_stats.is_some()).await;
 
         leg1.close().await.unwrap();
         h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
-        assert_leg_lost(h.leg_lost(1)[0], 1, "connecting");
+        assert_leg_lost(h.leg_lost(1)[0], 1, "down");
+        h.wait_until("the output to say it is disconnected", PairHarness::disconnected).await;
         h.wait_until("leg 1's stats to clear", |h| h.stats.snapshot().srt_stats.is_none()).await;
 
-        // Well inside leg 2's 15 s connect budget.
         let sent_before = h.stats.packets_sent.load(Ordering::Relaxed);
         let (_leg2, received2) = h.connect(h.ports.1).await;
         h.wait_until("leg 2's stats", |h| h.stats.snapshot().srt_leg2_stats.is_some()).await;
@@ -3217,89 +3237,342 @@ mod tests {
         h.wait_until("leg 2 to carry", |_| received2.load(Ordering::Relaxed) > 0).await;
 
         h.pump_events();
-        assert!(!h.disconnected(), "the pair waited for leg 2 rather than tearing down");
+        assert_eq!(h.disconnects(), 1);
         assert_eq!(h.leg_lost(1).len(), 1);
+        assert!(h.leg_lost(2).is_empty(), "a leg 2 that never connected is never lost");
         h.stop().await;
     }
 
-    /// Leg 2's connect budget in the give-up tests: long enough for a
-    /// loopback caller to connect inside it and for leg 1's loss to be seen
-    /// inside it, short enough not to wait out the 15 s.
-    const GIVE_UP_BUDGET: Duration = Duration::from_secs(4);
+    /// The slow-connect Warning's budget in the tests that watch for it:
+    /// long enough for a loopback caller to connect inside it, short enough
+    /// not to wait out the 15 s.
+    const WARN_AFTER: Duration = Duration::from_secs(2);
 
-    fn assert_leg_2_gave_up(event: &crate::manager::events::Event) {
+    fn assert_leg_slow(event: &crate::manager::events::Event, leg: u64, other_leg: &str) {
         assert_eq!(event.severity, EventSeverity::Warning);
+        assert_eq!(event.category, category::SRT);
         assert_eq!(event.output_id.as_deref(), Some("o1"));
+        assert_eq!(
+            event.message,
+            format!("SRT output 'o1' 2022-7 leg {leg} did not connect within 2s; still trying")
+        );
         let details = event.details.as_ref().expect("details");
-        assert_eq!(details["leg"], 2);
-        assert_eq!(details["reason"], "accept timed out");
-        assert_eq!(details["budget_ms"], GIVE_UP_BUDGET.as_millis() as u64);
+        assert_eq!(details["leg"], leg);
+        assert_eq!(details["mode"], "Listener");
+        assert_eq!(details["after_ms"], WARN_AFTER.as_millis() as u64);
+        assert_eq!(details["other_leg"], other_leg);
     }
 
-    /// Leg 2 gives up, leg 1 carries on alone, then leg 1 is lost: the
-    /// event says leg 2 is down, and the pair reconnects, with leg 1
-    /// accepted again and leg 2 given a fresh budget it now connects in.
-    /// Before the fix a leg 2 whose connect had given up counted as alive,
-    /// so the pair never tore down and the output was dark until restarted.
+    /// Leg 1's receiver never comes: leg 2 alone carries the output from
+    /// the start. Before edge#182 the output waited on leg 1's accept, with
+    /// no timeout, before it even subscribed.
     #[tokio::test]
-    async fn a_2022_7_output_whose_leg_2_gave_up_reconnects_when_leg_1_is_lost() {
-        let mut h = PairHarness::start_with_leg2_budget(GIVE_UP_BUDGET);
-        let (leg1, received1) = h.connect(h.ports.0).await;
-        h.wait_until("leg 2 to give up", |h| !h.leg_2_gave_up().is_empty()).await;
-        assert_leg_2_gave_up(h.leg_2_gave_up()[0]);
-
-        // Giving up alone tears nothing down: leg 1 carries on.
-        let received_before = received1.load(Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(received1.load(Ordering::Relaxed) > received_before, "leg 1 carries on alone");
-        h.pump_events();
-        assert!(!h.disconnected(), "leg 1 still carries, so the pair stays up");
-        assert!(h.leg_lost(1).is_empty() && h.leg_lost(2).is_empty());
-
-        leg1.close().await.unwrap();
-        h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
-        assert_leg_lost(h.leg_lost(1)[0], 1, "down");
-        h.wait_until("the pair to reconnect", PairHarness::disconnected).await;
-
-        // The next cycle: leg 1 is accepted again, and leg 2 tried again.
-        let (_leg1, received1) = h.connect(h.ports.0).await;
+    async fn a_2022_7_output_carries_on_leg_2_while_leg_1_never_connects() {
+        let mut h = PairHarness::start();
         let (_leg2, received2) = h.connect(h.ports.1).await;
-        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
-        h.wait_until("leg 2 to connect in the new cycle", |h| h.connects(2) == 1).await;
-        assert_eq!(h.connects(1), 2, "leg 1 connects once per cycle");
-        h.wait_until("both legs to carry", |_| {
-            received1.load(Ordering::Relaxed) > 0 && received2.load(Ordering::Relaxed) > 0
+        h.wait_until("leg 2 to carry", |_| received2.load(Ordering::Relaxed) > 0).await;
+        h.wait_until("leg 2's stats", |h| h.stats.snapshot().srt_leg2_stats.is_some()).await;
+        assert!(h.stats.snapshot().srt_stats.is_none(), "leg 1 never connected");
+        h.wait_until("leg 2 to count what it sends", |h| {
+            h.stats.packets_sent.load(Ordering::Relaxed) > 0
         })
         .await;
-        assert!(h.leg_lost(2).is_empty(), "a leg 2 that never connected is never lost");
+        h.pump_events();
+        assert_eq!(h.connects(1), 0);
+        assert!(!h.disconnected());
         h.stop().await;
     }
 
-    /// Leg 1 lost while leg 2 is still connecting, and leg 2 then gives up:
-    /// the pair waits out leg 2's budget, then reconnects. Before the fix
-    /// nothing followed the give-up and the output was dark until
-    /// restarted.
+    /// Leg 2 is lost and re-accepted while leg 1 carries; then leg 1 is
+    /// lost and leg 2 carries on alone. Before edge#182 leg 2 was never
+    /// re-accepted until both legs had gone.
     #[tokio::test]
-    async fn a_2022_7_output_losing_leg_1_before_leg_2_gives_up_reconnects() {
-        let mut h = PairHarness::start_with_leg2_budget(GIVE_UP_BUDGET);
+    async fn a_2022_7_output_reaccepts_a_lost_leg_2_and_survives_leg_1_loss() {
+        let mut h = PairHarness::start();
         let (leg1, _received1) = h.connect(h.ports.0).await;
-        h.wait_until("leg 1's stats", |h| h.stats.snapshot().srt_stats.is_some()).await;
+        let (leg2, _received2) = h.connect(h.ports.1).await;
+        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
+
+        leg2.close().await.unwrap();
+        h.wait_until("leg 2's loss", |h| !h.leg_lost(2).is_empty()).await;
+        assert_leg_lost(h.leg_lost(2)[0], 2, "carrying");
+        h.wait_until("leg 2's stats to clear", |h| h.stats.snapshot().srt_leg2_stats.is_none())
+            .await;
+
+        let (_leg2, received2) = h.connect(h.ports.1).await;
+        h.wait_until("leg 2 to be re-accepted", |h| h.connects(2) == 2).await;
+        h.wait_until("leg 2 to carry again", |_| received2.load(Ordering::Relaxed) > 0).await;
+        h.wait_until("leg 2's stats to return", |h| h.stats.snapshot().srt_leg2_stats.is_some())
+            .await;
 
         leg1.close().await.unwrap();
         h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
-        assert!(h.leg_2_gave_up().is_empty(), "leg 1 was lost inside leg 2's budget");
-        assert_leg_lost(h.leg_lost(1)[0], 1, "connecting");
-        assert!(!h.disconnected(), "the pair waits out leg 2's budget");
+        assert_leg_lost(h.leg_lost(1)[0], 1, "carrying");
+        let received_before = received2.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        h.stats.snapshot();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(received2.load(Ordering::Relaxed) > received_before, "leg 2 carries on");
+        assert_eq!(h.stats.snapshot().state, "active");
+        h.pump_events();
+        assert!(!h.disconnected(), "a leg always carried");
+        h.stop().await;
+    }
 
-        h.wait_until("leg 2 to give up", |h| !h.leg_2_gave_up().is_empty()).await;
-        assert_leg_2_gave_up(h.leg_2_gave_up()[0]);
-        h.wait_until("the pair to reconnect", PairHarness::disconnected).await;
+    /// Leg 1 is lost and re-accepted while leg 2 carries, and once back it
+    /// alone counts, so the pair counts each item once. Before edge#182 a
+    /// lost leg 1 was not re-accepted while leg 2 was up.
+    #[tokio::test]
+    async fn a_2022_7_output_reaccepts_a_lost_leg_1_while_leg_2_carries() {
+        let mut h = PairHarness::start();
+        let (leg1, _received1) = h.connect(h.ports.0).await;
+        let (_leg2, _received2) = h.connect(h.ports.1).await;
+        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
+
+        leg1.close().await.unwrap();
+        h.wait_until("leg 1's loss", |h| !h.leg_lost(1).is_empty()).await;
+        assert_leg_lost(h.leg_lost(1)[0], 1, "carrying");
+        h.wait_until("leg 1's stats to clear", |h| h.stats.snapshot().srt_stats.is_none()).await;
 
         let (_leg1, received1) = h.connect(h.ports.0).await;
-        h.wait_until("leg 1 to connect again", |h| h.connects(1) == 2).await;
+        h.wait_until("leg 1 to be re-accepted", |h| h.connects(1) == 2).await;
         h.wait_until("leg 1 to carry again", |_| received1.load(Ordering::Relaxed) > 0).await;
-        assert_eq!(h.leg_lost(1).len(), 1, "one loss in the first cycle");
-        assert!(h.leg_lost(2).is_empty(), "a leg 2 that never connected is never lost");
+        h.wait_until("leg 1's stats to return", |h| h.stats.snapshot().srt_stats.is_some()).await;
+
+        // Both legs up again: leg 1 alone counts, not both.
+        let (published0, sent0) =
+            (h.published.load(Ordering::Relaxed), h.stats.packets_sent.load(Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let published = h.published.load(Ordering::Relaxed) - published0;
+        let sent = h.stats.packets_sent.load(Ordering::Relaxed) - sent0;
+        assert!(
+            sent * 2 > published && sent * 4 < published * 5,
+            "leg 1 back, the pair counts each item once: {sent} sent for {published} published"
+        );
+        h.pump_events();
+        assert!(!h.disconnected(), "leg 2 carried throughout");
+        assert!(h.leg_lost(2).is_empty());
         h.stop().await;
+    }
+
+    /// Both legs lost: one "disconnected", and then either leg takes the
+    /// output back on its own. Before edge#182 the next connect cycle
+    /// waited on leg 1.
+    #[tokio::test]
+    async fn a_2022_7_output_whose_legs_are_both_lost_takes_either_back() {
+        let mut h = PairHarness::start();
+        let (leg1, _received1) = h.connect(h.ports.0).await;
+        let (leg2, _received2) = h.connect(h.ports.1).await;
+        h.wait_until("both legs' stats", PairHarness::both_legs_report).await;
+
+        leg1.close().await.unwrap();
+        leg2.close().await.unwrap();
+        h.wait_until("both legs' losses", |h| {
+            !h.leg_lost(1).is_empty() && !h.leg_lost(2).is_empty()
+        })
+        .await;
+        h.wait_until("the output to say it is disconnected", PairHarness::disconnected).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.pump_events();
+        assert_eq!(h.disconnects(), 1, "one disconnected for the pair");
+
+        let (_leg2, received2) = h.connect(h.ports.1).await;
+        h.wait_until("leg 2 to attach again", |h| h.connects(2) == 2).await;
+        h.wait_until("leg 2 to carry", |_| received2.load(Ordering::Relaxed) > 0).await;
+        assert_eq!(h.connects(1), 1, "leg 1 was not needed");
+        h.pump_events();
+        assert_eq!(h.disconnects(), 1);
+        h.stop().await;
+    }
+
+    /// Leg 2 misses its warning: it says so once, naming leg 1 as carrying,
+    /// and keeps trying, so a receiver arriving later still attaches and
+    /// receives. Before edge#182 leg 2 gave up for the cycle.
+    #[tokio::test]
+    async fn a_2022_7_output_keeps_trying_a_leg_that_missed_its_warning() {
+        let mut h = PairHarness::start_with_warn_after(WARN_AFTER);
+        let (_leg1, received1) = h.connect(h.ports.0).await;
+        h.wait_until("leg 2's warning", |h| !h.leg_slow(2).is_empty()).await;
+        assert_leg_slow(h.leg_slow(2)[0], 2, "carrying");
+        assert!(h.leg_slow(1).is_empty(), "leg 1 connected inside its warning");
+
+        let received_before = received1.load(Ordering::Relaxed);
+        let (_leg2, received2) = h.connect(h.ports.1).await;
+        h.wait_until("leg 2 to attach", |h| h.connects(2) == 1).await;
+        h.wait_until("leg 2 to carry", |_| received2.load(Ordering::Relaxed) > 0).await;
+        assert!(received1.load(Ordering::Relaxed) > received_before, "leg 1 carried on");
+        h.pump_events();
+        assert_eq!(h.leg_slow(2).len(), 1, "warned once");
+        assert!(!h.disconnected());
+        h.stop().await;
+    }
+
+    /// Leg 1 is slow to connect: it says so, naming leg 2 as carrying, and
+    /// leg 2 carries meanwhile. Before edge#182 leg 1 had no warning and
+    /// nothing was sent until it connected.
+    #[tokio::test]
+    async fn a_2022_7_output_warns_of_leg_1_not_connecting_and_carries_on_leg_2() {
+        let mut h = PairHarness::start_with_warn_after(WARN_AFTER);
+        let (_leg2, received2) = h.connect(h.ports.1).await;
+        h.wait_until("leg 1's warning", |h| !h.leg_slow(1).is_empty()).await;
+        assert_leg_slow(h.leg_slow(1)[0], 1, "carrying");
+        assert!(received2.load(Ordering::Relaxed) > 0, "leg 2 carries meanwhile");
+        h.stop().await;
+    }
+
+    /// With no leg attached the output discards what it receives without
+    /// counting it, so it reads `waiting`, not `dropping`.
+    #[tokio::test]
+    async fn a_2022_7_output_with_no_leg_counts_no_drops() {
+        let mut h = PairHarness::start();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(h.published.load(Ordering::Relaxed) > 0, "the flow published meanwhile");
+        let snap = h.stats.snapshot();
+        assert_eq!(h.stats.packets_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(snap.state, "waiting");
+        h.stop().await;
+    }
+
+    /// A 2022-7 output config with leg 1 `leg1` and leg 2 listening on a
+    /// free loopback port, for the tests below that run the loop directly.
+    fn redundant_output_config(leg1: serde_json::Value) -> SrtOutputConfig {
+        let mut config = serde_json::json!({
+            "id": "o1", "name": "o1", "latency_ms": 200,
+            "redundancy": {
+                "mode": "listener",
+                "local_addr": format!(
+                    "127.0.0.1:{}",
+                    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+                ),
+                "latency_ms": 200
+            }
+        });
+        for (key, value) in leg1.as_object().expect("leg 1 fields") {
+            config[key] = value.clone();
+        }
+        serde_json::from_value(config).expect("SRT output fixture")
+    }
+
+    /// Run a 2022-7 output's loop on `tx` until `cancel`.
+    fn spawn_redundant_output(
+        config: SrtOutputConfig,
+        tx: &broadcast::Sender<RtpPacket>,
+        stats: Arc<OutputStatsAccumulator>,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
+        let tx = tx.clone();
+        let (events, events_rx) = crate::manager::events::event_channel();
+        tokio::spawn(async move {
+            let _events_rx = events_rx;
+            let active_input_rx = tokio::sync::watch::channel(String::new()).1;
+            srt_output_redundant_loop(
+                &config,
+                &tx,
+                stats,
+                cancel,
+                &events,
+                "f1",
+                None,
+                active_input_rx,
+                LEG_CONNECT_WARN_AFTER,
+            )
+            .await
+            .expect("the 2022-7 output runs");
+        })
+    }
+
+    /// A broadcast lag while no leg is attached is not counted as drops
+    /// either: the output still reads `waiting`. It used to add the lag to
+    /// `packets_dropped` whether or not a leg was there to send it.
+    #[tokio::test]
+    async fn a_2022_7_output_with_no_leg_counts_no_lag_as_drops() {
+        let config = redundant_output_config(serde_json::json!({
+            "mode": "listener",
+            "local_addr": format!(
+                "127.0.0.1:{}",
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+            ),
+        }));
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, rx) = broadcast::channel(4);
+        drop(rx);
+        let cancel = CancellationToken::new();
+        let output = spawn_redundant_output(config, &tx, stats.clone(), cancel.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tx.receiver_count() == 0 {
+            assert!(Instant::now() < deadline, "timed out waiting for the output to subscribe");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Far past the channel's capacity with no await between sends, so on
+        // this single-threaded runtime the output cannot read any of them
+        // before it lags.
+        for _ in 0..64 {
+            let _ = tx.send(RtpPacket {
+                data: Bytes::from_static(&[0x47; 188]),
+                sequence_number: 0,
+                rtp_timestamp: 0,
+                recv_time_us: now_us(),
+                is_raw_ts: true,
+                upstream_seq: None,
+                upstream_leg_id: None,
+                sender_timestamp_us: None,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(tx.len(), 0, "the output read past the lag");
+        assert_eq!(stats.packets_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.snapshot().state, "waiting");
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(10), output)
+            .await
+            .expect("the output stops")
+            .expect("the output task does not panic");
+    }
+
+    /// A stop while leg 1 is still dialling lets that connect finish and
+    /// closes what it made, so the far end sees the connection go. The
+    /// pending acquisition used to be dropped part-way, and a handshake
+    /// completing after that left a connection that sent keepalives and no
+    /// data until the process exited: a far-end 2022-7 listener leg stayed
+    /// attached to it and never re-armed.
+    #[tokio::test]
+    async fn a_2022_7_output_stopping_closes_a_leg_it_was_still_dialling() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let config = redundant_output_config(serde_json::json!({
+            "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"),
+        }));
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let output = spawn_redundant_output(config, &tx, stats, cancel.clone());
+        // Leg 1's first connect is now in flight, with no peer to answer it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+
+        let peer_config: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+            .expect("SRT listener fixture");
+        let mut listener = crate::srt::connection::bind_srt_listener_for_input(&peer_config)
+            .await
+            .expect("the far end binds");
+        let peer_cancel = CancellationToken::new();
+        let peer = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_srt_connection(&mut listener, &peer_cancel),
+        )
+        .await
+        .expect("the connect sent before the stop completes")
+        .expect("the far end accepts it");
+        tokio::time::timeout(Duration::from_secs(10), output)
+            .await
+            .expect("the output stops")
+            .expect("the output task does not panic");
+        let closed = tokio::time::timeout(Duration::from_secs(3), peer.recv()).await;
+        assert!(
+            matches!(closed, Ok(Err(_))),
+            "the far end sees the connection closed, not a peer that never sends"
+        );
     }
 }
