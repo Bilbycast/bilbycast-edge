@@ -62,7 +62,23 @@ pub(crate) struct RtpWrapState {
     /// timestamp is "target transmission time", so carrying the previous
     /// value forward for filler keeps the wire clock monotonic and honest.
     last_ts: u32,
+    /// The last non-zero upstream timestamp handed in, and what is added to
+    /// each upstream timestamp to put it on this output's timeline. One
+    /// SSRC carries every input a flow switches between, and each input
+    /// brings its own RTP timebase: a Take between them stepped the wire
+    /// timestamp by however far apart their clocks happened to be (±220 s
+    /// on the bench) inside one stream. A step back, or forward by more
+    /// than [`MAX_TS_STEP`], is a new timebase and continues from the last
+    /// timestamp sent.
+    last_src: Option<u32>,
+    offset: u32,
 }
+
+/// The largest forward step between consecutive upstream timestamps taken
+/// as the same timebase: 10 s at 90 kHz, beyond any pause a live source's
+/// own clock runs through (the flow's keepalives carry no timestamp of
+/// their own meanwhile), well short of an unrelated input's clock.
+const MAX_TS_STEP: u32 = 10 * 90_000;
 
 impl RtpWrapState {
     pub(crate) fn new() -> Self {
@@ -70,6 +86,8 @@ impl RtpWrapState {
             seq: rand::random::<u16>(),
             ssrc: rand::random::<u32>(),
             last_ts: 0,
+            last_src: None,
+            offset: 0,
         }
     }
 
@@ -81,7 +99,19 @@ impl RtpWrapState {
     /// timestamp instead — see `last_ts`. Sequence number advances by 1 per
     /// call.
     pub(crate) fn build_header(&mut self, rtp_ts: u32) -> [u8; RTP_HEADER_SIZE] {
-        let rtp_ts = if rtp_ts == 0 { self.last_ts } else { rtp_ts };
+        let rtp_ts = if rtp_ts == 0 {
+            self.last_ts
+        } else {
+            if let Some(last) = self.last_src {
+                let step = rtp_ts.wrapping_sub(last);
+                // A step back reads as more than half the 32-bit space.
+                if step > MAX_TS_STEP {
+                    self.offset = self.last_ts.wrapping_sub(rtp_ts);
+                }
+            }
+            self.last_src = Some(rtp_ts);
+            rtp_ts.wrapping_add(self.offset)
+        };
         self.last_ts = rtp_ts;
         let mut hdr = [0u8; RTP_HEADER_SIZE];
         hdr[0] = 0x80; // V=2, P=0, X=0, CC=0
@@ -1194,6 +1224,27 @@ mod tests {
     /// mid-stream — it reuses the previous packet's timestamp so the wire
     /// clock stays monotonic (observed live 2026-06-06: ts=0 datagrams
     /// read as ±300 s clock jumps to RFC 3550 jitter estimators).
+    #[test]
+    fn a_new_inputs_timebase_continues_the_wire_timestamp() {
+        let ts_of = |h: &[u8; RTP_HEADER_SIZE]| u32::from_be_bytes([h[4], h[5], h[6], h[7]]);
+        let mut s = RtpWrapState::new();
+        assert_eq!(ts_of(&s.build_header(1_000_000)), 1_000_000);
+        assert_eq!(ts_of(&s.build_header(1_003_600)), 1_003_600, "its own steps pass");
+        // A Take to an input whose clock is 220 s ahead, then back.
+        let ahead = 1_003_600 + 220 * 90_000;
+        assert_eq!(ts_of(&s.build_header(ahead)), 1_003_600, "continues from the last sent");
+        assert_eq!(ts_of(&s.build_header(ahead + 3_600)), 1_007_200);
+        assert_eq!(ts_of(&s.build_header(2_000)), 1_007_200, "a step back too");
+        assert_eq!(ts_of(&s.build_header(5_600)), 1_010_800);
+        assert_eq!(ts_of(&s.build_header(0)), 1_010_800, "filler still repeats");
+        // A pause the source's own clock ran through stays on its timeline.
+        assert_eq!(ts_of(&s.build_header(5_600 + 5 * 90_000)), 1_010_800 + 5 * 90_000);
+        // The 32-bit wrap is a forward step, not a new timebase.
+        let mut w = RtpWrapState::new();
+        w.build_header(u32::MAX - 1_000);
+        assert_eq!(ts_of(&w.build_header(2_600)), 2_600);
+    }
+
     #[test]
     fn rtp_wrap_state_carries_timestamp_forward_for_filler() {
         let mut s = RtpWrapState::new();
