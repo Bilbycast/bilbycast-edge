@@ -457,9 +457,10 @@ pub async fn connect_srt(p: &SrtConnectionParams<'_>) -> Result<Arc<SrtSocket>> 
 
 /// Consecutive failed connect attempts after which a caller-mode input is
 /// considered connect-failed: the input's reported stats state flips to
-/// `"connect_failed"` and the latched Critical event fires. Shared by the
-/// retry observer in `engine::input_srt` and the snapshot path in
-/// `stats::collector`.
+/// `"connect_failed"`, and the latched `SRT input connection failed` event
+/// fires on the attempt that reaches it — a Critical, or a Warning on a
+/// 2022-7 leg whose other leg is connected. Shared by the retry observer in
+/// `engine::input_srt` and the snapshot path in `stats::collector`.
 pub const CONNECT_FAILED_THRESHOLD: u32 = 5;
 
 /// Connect with retry logic and exponential back-off.
@@ -653,7 +654,16 @@ pub enum LegAcquired {
 
 /// One acquisition of a 2022-7 leg in flight. Allocated once per arm, never
 /// per packet, and polled by `&mut` across `select!` iterations, so an accept
-/// or a connect is never abandoned half-way except at teardown.
+/// or a connect is never abandoned half-way; at teardown it is handed to
+/// [`release_leg_acquire`] rather than dropped.
+///
+/// It is not free while it waits. `select!` polls every enabled branch each
+/// time the loop wakes, so a pending acquisition is polled about once per
+/// packet the input receives or payload the output sends, for as long as its
+/// leg is down: a `CancellationToken::is_cancelled` (an uncontended mutex
+/// lock, the same one the loop's own cancel branch takes every wake) and a
+/// timer or channel poll. Nothing is allocated, and the attached legs' data
+/// path is otherwise untouched.
 pub type LegAcquire<'a> = Pin<Box<dyn Future<Output = LegAcquired> + Send + 'a>>;
 
 /// Accept or dial one leg of a SMPTE 2022-7 pair, on its own.
@@ -674,6 +684,11 @@ pub type LegAcquire<'a> = Pin<Box<dyn Future<Output = LegAcquired> + Send + 'a>>
 ///   [`LEG_REACQUIRE_DELAY`] after a loss.
 /// - `slow`: called once if the leg has not connected that long after the
 ///   delay; the acquisition carries on regardless.
+///
+/// Once `cancel` has fired neither `on_attempt_failed` nor `slow` is called:
+/// a connect already sent is let finish while [`release_leg_acquire`] waits
+/// for it at teardown, and a stopping input or output must not report a
+/// failed attempt or a slow leg then.
 pub fn acquire_redundant_leg<'a>(
     params: SrtConnectionParams<'a>,
     listener: Option<SrtListener>,
@@ -698,10 +713,13 @@ pub fn acquire_redundant_leg<'a>(
                     Err(e) => LegAcquired::Failed(e),
                 };
             }
+            let mut observe = |attempts: u32, e: &anyhow::Error| {
+                if !cancel.is_cancelled() {
+                    on_attempt_failed(attempts, e);
+                }
+            };
             loop {
-                match connect_srt_with_retry_observed(&params, cancel, &mut on_attempt_failed)
-                    .await
-                {
+                match connect_srt_with_retry_observed(&params, cancel, &mut observe).await {
                     Ok(socket) => return LegAcquired::Connected(socket, None),
                     Err(_) if cancel.is_cancelled() => return LegAcquired::Cancelled,
                     Err(e) => {
@@ -727,11 +745,51 @@ pub fn acquire_redundant_leg<'a>(
         tokio::select! {
             acquired = &mut acquire => acquired,
             _ = tokio::time::sleep(after) => {
-                warn();
+                if !cancel.is_cancelled() {
+                    warn();
+                }
                 acquire.await
             }
         }
     })
+}
+
+/// How long a stopping 2022-7 input or output waits in
+/// [`release_leg_acquire`] for a leg's connect to finish: past libsrt's
+/// default 3 s connect timeout, and under the 5 s a flow allows a stopping
+/// task before it gives up on it (or, removing an output, aborts it).
+pub const LEG_RELEASE_BOUND: Duration = Duration::from_secs(4);
+
+/// Finish a 2022-7 leg's pending acquisition once its `cancel` has fired,
+/// and close whatever it connected.
+///
+/// Dropping an acquisition part-way through a caller's connect leaves the
+/// SRT wrapper's socket registered with nothing to close it: srt-transport
+/// reaps only broken or closed sockets, so if the handshake then completes
+/// the connection lives on, sending keepalives and no data, until the
+/// process exits — and a far-end listener leg attached to it never reports
+/// it lost. After the cancel every other wait in an acquisition returns at
+/// once, while a connect already sent finishes within libsrt's connect
+/// timeout, so this waits for it and closes the socket it yields, bounded by
+/// [`LEG_RELEASE_BOUND`]; past that it is dropped, as before. (An accept
+/// dropped inside the wrapper's own `from_accepted` has the same hole, which
+/// only srt-transport can close.)
+pub async fn release_leg_acquire(acquire: Option<LegAcquire<'_>>) {
+    let Some(acquire) = acquire else {
+        return;
+    };
+    match tokio::time::timeout(LEG_RELEASE_BOUND, acquire).await {
+        Ok(LegAcquired::Connected(socket, listener)) => {
+            let _ = socket.close().await;
+            if let Some(listener) = listener {
+                let _ = listener.close().await;
+            }
+        }
+        Ok(LegAcquired::Cancelled | LegAcquired::Failed(_)) => {}
+        Err(_) => tracing::warn!(
+            "SRT 2022-7 leg still connecting {LEG_RELEASE_BOUND:?} after its stop; dropped unfinished"
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1835,5 +1893,111 @@ mod tests {
             .await
             .expect("a cancel ends the acquisition");
         assert!(matches!(acquired, super::LegAcquired::Cancelled));
+    }
+
+    /// A caller leg's connect still in flight at the cancel is let finish at
+    /// teardown, and the connection it makes is closed, so the far end sees
+    /// it go. Dropped instead, the wrapper's half-connected socket completed
+    /// its handshake with nothing left to close it, and the far end held a
+    /// peer that never sent. Nothing is reported meanwhile: not the slow
+    /// leg, whose time passes during the wait, nor an attempt.
+    #[tokio::test]
+    async fn release_leg_acquire_closes_what_a_cancelled_connect_makes() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        let port = free_port();
+        let caller = input_config(serde_json::json!({
+            "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }));
+        let cancel = CancellationToken::new();
+        let (attempts, warned) = (AtomicU32::new(0), AtomicU32::new(0));
+        let mut acquire = super::acquire_redundant_leg(
+            SrtConnectionParams::from(&caller),
+            None,
+            Duration::ZERO,
+            &cancel,
+            |_, _| {
+                attempts.fetch_add(1, Relaxed);
+            },
+            Some((
+                Duration::from_millis(150),
+                Box::new(|| {
+                    warned.fetch_add(1, Relaxed);
+                }),
+            )),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut acquire).await.is_err(),
+            "no peer yet, so the connect is in flight"
+        );
+        cancel.cancel();
+
+        // The peer appears only after the cancel, and after the slow time.
+        let peer_config = input_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }));
+        let peer_cancel = CancellationToken::new();
+        let (released, peer) = tokio::join!(
+            tokio::time::timeout(
+                super::LEG_RELEASE_BOUND + Duration::from_secs(1),
+                super::release_leg_acquire(Some(acquire)),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let mut listener =
+                    super::bind_srt_listener_for_input(&peer_config).await.expect("the peer binds");
+                let socket = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    super::accept_srt_connection(&mut listener, &peer_cancel),
+                )
+                .await
+                .expect("the connect sent before the cancel completes")
+                .expect("the peer accepts it");
+                (socket, listener)
+            },
+        );
+        released.expect("the release ends within its bound");
+        let (peer, _listener) = peer;
+        let closed = tokio::time::timeout(Duration::from_secs(3), peer.recv()).await;
+        assert!(
+            matches!(closed, Ok(Err(_))),
+            "the far end sees the connection closed, not a peer that never sends"
+        );
+        assert_eq!(attempts.load(Relaxed), 0, "no attempt failed");
+        assert_eq!(warned.load(Relaxed), 0, "a stopping leg is not reported slow");
+    }
+
+    /// A connect that fails after the cancel is not reported: a stopping
+    /// input raises no connect-failure event on its way out.
+    #[tokio::test]
+    async fn release_leg_acquire_reports_no_attempt_failing_after_the_cancel() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        let config = input_config(serde_json::json!({
+            "mode": "caller", "remote_addr": format!("127.0.0.1:{}", free_port()),
+            "latency_ms": 200, "connect_timeout_secs": 1
+        }));
+        let cancel = CancellationToken::new();
+        let attempts = AtomicU32::new(0);
+        let mut acquire = super::acquire_redundant_leg(
+            SrtConnectionParams::from(&config),
+            None,
+            Duration::ZERO,
+            &cancel,
+            |_, _| {
+                attempts.fetch_add(1, Relaxed);
+            },
+            None,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut acquire).await.is_err(),
+            "the first connect is in flight"
+        );
+        cancel.cancel();
+        tokio::time::timeout(
+            super::LEG_RELEASE_BOUND + Duration::from_secs(1),
+            super::release_leg_acquire(Some(acquire)),
+        )
+        .await
+        .expect("the release ends within its bound");
+        assert_eq!(attempts.load(Relaxed), 0, "the attempt failing after the cancel is not reported");
     }
 }

@@ -24,8 +24,8 @@ use crate::srt::connection::{
     accept_srt_connection, acquire_redundant_leg, bind_srt_listener_for_bonded_output,
     bind_srt_listener_for_output, bind_srt_listener_for_redundancy, connect_srt_group,
     connect_srt_output_observed, spawn_srt_group_stats_poller,
-    spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller, LegAcquire, LegAcquired,
-    SrtConnectionParams, LEG_REACQUIRE_DELAY,
+    release_leg_acquire, spawn_srt_socket_group_stats_poller, spawn_srt_stats_poller,
+    LegAcquire, LegAcquired, SrtConnectionParams, LEG_REACQUIRE_DELAY,
 };
 use crate::stats::collector::OutputStatsAccumulator;
 use crate::util::time::now_us;
@@ -1657,6 +1657,9 @@ fn spawn_redundant_send_task(
 struct RedundantOutputCtx<'a> {
     config: &'a SrtOutputConfig,
     redundancy: &'a SrtRedundancyConfig,
+    /// The legs' own token, a child of the output's: it stops the
+    /// acquisitions and the pollers, and is cancelled at teardown however
+    /// the loop ended.
     cancel: &'a CancellationToken,
     events: &'a EventSender,
     /// The loop's own view of which legs are attached, for the slow-connect
@@ -1811,7 +1814,7 @@ async fn lose_output_leg(
 /// rate, and that wait neither fills the subscription nor holds a connected
 /// leg silent. The loop then runs whether or not a leg is attached; with
 /// none it discards what it receives without counting it, so the output
-/// reads `waiting`, not `dropping`.
+/// reads `waiting`, not `dropping` — a broadcast lag included.
 ///
 /// Each leg runs its own SRT stats poller from each attach until it is lost:
 /// leg 1 publishes `srt_stats`, leg 2 `srt_leg2_stats`.
@@ -1908,7 +1911,11 @@ async fn srt_output_redundant_loop(
     // a lock.
     let leg1_lost = Arc::new(AtomicBool::new(true));
     let leg_up = [AtomicBool::new(false), AtomicBool::new(false)];
-    let ctx = RedundantOutputCtx { config, redundancy, cancel: &cancel, events, leg_up: &leg_up };
+    // Cancelled at teardown whether or not `cancel` was, so a pending
+    // acquisition can be let finish (see the end of this function).
+    let legs_cancel = cancel.child_token();
+    let ctx =
+        RedundantOutputCtx { config, redundancy, cancel: &legs_cancel, events, leg_up: &leg_up };
 
     // Each leg's state in locals of its own, so the select! below borrows
     // each leg's acquisition mutably on its own.
@@ -2064,7 +2071,12 @@ async fn srt_output_redundant_loop(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
-                        stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
+                        // With no leg attached the output discards what it
+                        // receives uncounted, a lag included: these were
+                        // never going anywhere.
+                        if tx1.is_some() || tx2.is_some() {
+                            stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
+                        }
                         tracing::warn!(
                             "SRT output '{}' (redundant) lagged, dropped {n} packets",
                             config.id
@@ -2151,26 +2163,27 @@ async fn srt_output_redundant_loop(
         }
     };
 
-    // Pending acquisitions first: dropping one drops (and so closes) the
-    // listener it holds. The pollers go before the sockets, so neither leg's
-    // stats outlive its socket; they are children of `cancel`, but the loop
-    // also ends without it.
-    drop(acquire1);
-    drop(acquire2);
-    for poller in [poller1, poller2].into_iter().flatten() {
-        poller.cancel();
-    }
-    drop(tx1);
-    drop(tx2);
-    if let Some(task) = task1 {
-        let _ = task.await;
-    }
-    for socket in [&sock1, &sock2].into_iter().flatten() {
-        let _ = socket.close().await;
-    }
-    for listener in [&listener1, &listener2].into_iter().flatten() {
-        let _ = listener.close().await;
-    }
+    // Stop the pending acquisitions and let each finish beside the rest of
+    // the teardown: dropped part-way through a caller's connect, one would
+    // leave a connection nothing closes (`release_leg_acquire`). A pending
+    // accept returns at once and closes the listener it holds. The pollers,
+    // children of `legs_cancel`, stop with it, before the sockets close, so
+    // neither leg's stats outlive its socket.
+    legs_cancel.cancel();
+    let attached = async move {
+        drop(tx1);
+        drop(tx2);
+        if let Some(task) = task1 {
+            let _ = task.await;
+        }
+        for socket in [&sock1, &sock2].into_iter().flatten() {
+            let _ = socket.close().await;
+        }
+        for listener in [&listener1, &listener2].into_iter().flatten() {
+            let _ = listener.close().await;
+        }
+    };
+    tokio::join!(release_leg_acquire(acquire1), release_leg_acquire(acquire2), attached);
     outcome
 }
 
@@ -3169,8 +3182,8 @@ mod tests {
     /// leaves on an empty queue, not on a send error: it guards the forward
     /// loop raising nothing at a stop, not a backlogged leg 2 draining into
     /// a closed socket. The caches clear because both pollers are children
-    /// of the output's token; the loop's own poller cancels, for an end
-    /// without a cancel, are not reached here.
+    /// of the legs' token, which teardown cancels however the loop ended; an
+    /// end without a cancel is not reached here.
     #[tokio::test]
     async fn a_2022_7_output_stopping_raises_no_leg_loss_and_clears_both_legs() {
         let mut h = PairHarness::start();
@@ -3414,5 +3427,148 @@ mod tests {
         assert_eq!(h.stats.packets_dropped.load(Ordering::Relaxed), 0);
         assert_eq!(snap.state, "waiting");
         h.stop().await;
+    }
+
+    /// A 2022-7 output config with leg 1 `leg1` and leg 2 listening on a
+    /// free loopback port, for the tests below that run the loop directly.
+    fn redundant_output_config(leg1: serde_json::Value) -> SrtOutputConfig {
+        let mut config = serde_json::json!({
+            "id": "o1", "name": "o1", "latency_ms": 200,
+            "redundancy": {
+                "mode": "listener",
+                "local_addr": format!(
+                    "127.0.0.1:{}",
+                    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+                ),
+                "latency_ms": 200
+            }
+        });
+        for (key, value) in leg1.as_object().expect("leg 1 fields") {
+            config[key] = value.clone();
+        }
+        serde_json::from_value(config).expect("SRT output fixture")
+    }
+
+    /// Run a 2022-7 output's loop on `tx` until `cancel`.
+    fn spawn_redundant_output(
+        config: SrtOutputConfig,
+        tx: &broadcast::Sender<RtpPacket>,
+        stats: Arc<OutputStatsAccumulator>,
+        cancel: CancellationToken,
+    ) -> JoinHandle<()> {
+        let tx = tx.clone();
+        let (events, events_rx) = crate::manager::events::event_channel();
+        tokio::spawn(async move {
+            let _events_rx = events_rx;
+            let active_input_rx = tokio::sync::watch::channel(String::new()).1;
+            srt_output_redundant_loop(
+                &config,
+                &tx,
+                stats,
+                cancel,
+                &events,
+                "f1",
+                None,
+                active_input_rx,
+                LEG_CONNECT_WARN_AFTER,
+            )
+            .await
+            .expect("the 2022-7 output runs");
+        })
+    }
+
+    /// A broadcast lag while no leg is attached is not counted as drops
+    /// either: the output still reads `waiting`. It used to add the lag to
+    /// `packets_dropped` whether or not a leg was there to send it.
+    #[tokio::test]
+    async fn a_2022_7_output_with_no_leg_counts_no_lag_as_drops() {
+        let config = redundant_output_config(serde_json::json!({
+            "mode": "listener",
+            "local_addr": format!(
+                "127.0.0.1:{}",
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+            ),
+        }));
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, rx) = broadcast::channel(4);
+        drop(rx);
+        let cancel = CancellationToken::new();
+        let output = spawn_redundant_output(config, &tx, stats.clone(), cancel.clone());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tx.receiver_count() == 0 {
+            assert!(Instant::now() < deadline, "timed out waiting for the output to subscribe");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Far past the channel's capacity with no await between sends, so on
+        // this single-threaded runtime the output cannot read any of them
+        // before it lags.
+        for _ in 0..64 {
+            let _ = tx.send(RtpPacket {
+                data: Bytes::from_static(&[0x47; 188]),
+                sequence_number: 0,
+                rtp_timestamp: 0,
+                recv_time_us: now_us(),
+                is_raw_ts: true,
+                upstream_seq: None,
+                upstream_leg_id: None,
+                sender_timestamp_us: None,
+            });
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(tx.len(), 0, "the output read past the lag");
+        assert_eq!(stats.packets_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.snapshot().state, "waiting");
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(10), output)
+            .await
+            .expect("the output stops")
+            .expect("the output task does not panic");
+    }
+
+    /// A stop while leg 1 is still dialling lets that connect finish and
+    /// closes what it made, so the far end sees the connection go. The
+    /// pending acquisition used to be dropped part-way, and a handshake
+    /// completing after that left a connection that sent keepalives and no
+    /// data until the process exited: a far-end 2022-7 listener leg stayed
+    /// attached to it and never re-armed.
+    #[tokio::test]
+    async fn a_2022_7_output_stopping_closes_a_leg_it_was_still_dialling() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let config = redundant_output_config(serde_json::json!({
+            "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"),
+        }));
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let output = spawn_redundant_output(config, &tx, stats, cancel.clone());
+        // Leg 1's first connect is now in flight, with no peer to answer it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+
+        let peer_config: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+            .expect("SRT listener fixture");
+        let mut listener = crate::srt::connection::bind_srt_listener_for_input(&peer_config)
+            .await
+            .expect("the far end binds");
+        let peer_cancel = CancellationToken::new();
+        let peer = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_srt_connection(&mut listener, &peer_cancel),
+        )
+        .await
+        .expect("the connect sent before the stop completes")
+        .expect("the far end accepts it");
+        tokio::time::timeout(Duration::from_secs(10), output)
+            .await
+            .expect("the output stops")
+            .expect("the output task does not panic");
+        let closed = tokio::time::timeout(Duration::from_secs(3), peer.recv()).await;
+        assert!(
+            matches!(closed, Ok(Err(_))),
+            "the far end sees the connection closed, not a peer that never sends"
+        );
     }
 }

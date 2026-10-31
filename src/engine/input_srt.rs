@@ -28,7 +28,7 @@ use crate::srt::connection::{
     bind_srt_listener_for_input, bind_srt_listener_for_redundancy, connect_srt_group_observed,
     connect_srt_with_retry_observed,
     spawn_srt_group_stats_poller, spawn_srt_socket_group_stats_poller,
-    spawn_srt_stats_poller, LegAcquire, LegAcquired, SrtConnectionParams,
+    release_leg_acquire, spawn_srt_stats_poller, LegAcquire, LegAcquired, SrtConnectionParams,
     CONNECT_FAILED_THRESHOLD, LEG_REACQUIRE_DELAY,
 };
 use crate::stats::collector::{FlowStatsAccumulator, SrtInputSocket, SrtInputStats};
@@ -495,11 +495,14 @@ async fn srt_input_listener_loop(
     }
 }
 
-/// Record one failed caller connect attempt on the shared per-input counter
-/// and report whether this attempt just crossed [`CONNECT_FAILED_THRESHOLD`]
-/// — i.e. whether the latched Critical should fire. Exactly one `true` per
-/// connect cycle: the count keeps climbing past the threshold and only
-/// resets (via the caller loop) on a successful connect.
+/// Store `attempts`, the current connect's count of consecutive failed
+/// attempts, on `counter`, and report whether this attempt is the one that
+/// reaches [`CONNECT_FAILED_THRESHOLD`]: whether the latched event fires (a
+/// Critical, or a Warning on a 2022-7 leg whose other leg is connected).
+/// Every new connect counts `attempts` from 1 again, so the latch fires once
+/// per connect. `counter` is only what the stats read, and nothing re-arms
+/// the latch through it: it is the input's own counter, reset on a connect,
+/// or for a 2022-7 leg 2 a scratch one nothing reads.
 fn record_connect_failure(attempts: u32, counter: &AtomicU32) -> bool {
     counter.store(attempts, Ordering::Relaxed);
     attempts == CONNECT_FAILED_THRESHOLD
@@ -835,10 +838,10 @@ fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64
 /// Dual-leg SRT input with SMPTE 2022-7 hitless merge.
 ///
 /// For **RTP/TS** streams: merge uses the RTP sequence number (standard 2022-7).
-/// For **raw TS** streams: merge uses a synthetic per-leg sequence counter.
-/// Both legs must use the same format — if one leg sends RTP and the other
-/// sends raw TS, the raw TS leg is accepted but merge may not deduplicate
-/// perfectly (documented limitation).
+/// For **raw TS** streams there is no sequence number the legs share, so the
+/// input fails over between them ([`RawTsFailover`]), forwarding one leg at a
+/// time, rather than merging. The format is detected once per pair, from the
+/// first packet either leg delivers, and both legs must send it.
 ///
 /// Each leg is accepted or dialled on its own ([`acquire_redundant_leg`]),
 /// both from the start, so either leg alone carries the input. Listener-mode
@@ -856,7 +859,10 @@ fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64
 /// lower receive latency) is not hitless. The merger forwards its first
 /// packet at once and the slots it skipped are then filled from the trailing
 /// leg, so for about the lead the output interleaves two stream positions;
-/// a lead of a whole merger window or more is skipped instead.
+/// a lead of a whole merger window or more is skipped instead. Neither
+/// reaches `packets_lost`: the interleaved seqs are each forwarded once, and
+/// the pair's stats count a skip only as far as the legs' drops confirm it,
+/// which a leg just back has none of.
 ///
 /// Each leg's socket has its own stats poller, into `srt.leg` and
 /// `srt.leg2`, from each attach until that leg is lost. What reaches `srt`'s
@@ -936,10 +942,13 @@ async fn srt_input_redundant_loop(
     let leg_up = [AtomicBool::new(false), AtomicBool::new(false)];
     // Leg 2's caller attempts, for the latch alone: nothing reads the count.
     let leg2_attempts = Arc::new(AtomicU32::new(0));
+    // Cancelled at teardown whether or not `cancel` was, so a pending
+    // acquisition can be let finish (see the end of this function).
+    let legs_cancel = cancel.child_token();
     let ctx = RedundantInputCtx {
         config: &config,
         redundancy,
-        cancel: &cancel,
+        cancel: &legs_cancel,
         events,
         flow_id,
         input_id,
@@ -1069,20 +1078,22 @@ async fn srt_input_redundant_loop(
         }
     };
 
-    // Pending acquisitions first: dropping one drops (and so closes) the
-    // listener it holds. Then the attached legs and the held listeners. The
-    // pollers are children of `cancel`, but the task can end without it.
-    drop(acquire1);
-    drop(acquire2);
-    for poller in [poller1, poller2].into_iter().flatten() {
-        poller.cancel();
-    }
-    for socket in [&sock1, &sock2].into_iter().flatten() {
-        let _ = socket.close().await;
-    }
-    for listener in [&listener1, &listener2].into_iter().flatten() {
-        let _ = listener.close().await;
-    }
+    // Stop the pending acquisitions and let each finish beside the rest of
+    // the teardown: dropped part-way through a caller's connect, one would
+    // leave a connection nothing closes (`release_leg_acquire`). A pending
+    // accept returns at once and closes the listener it holds. The pollers,
+    // children of `legs_cancel`, stop with it; then the attached legs and
+    // the held listeners close.
+    legs_cancel.cancel();
+    let attached = async move {
+        for socket in [&sock1, &sock2].into_iter().flatten() {
+            let _ = socket.close().await;
+        }
+        for listener in [&listener1, &listener2].into_iter().flatten() {
+            let _ = listener.close().await;
+        }
+    };
+    tokio::join!(release_leg_acquire(acquire1), release_leg_acquire(acquire2), attached);
     outcome
 }
 
@@ -1122,6 +1133,9 @@ impl RedundantPair {
 struct RedundantInputCtx<'a> {
     config: &'a SrtInputConfig,
     redundancy: &'a SrtRedundancyConfig,
+    /// The legs' own token, a child of the input's: it stops the
+    /// acquisitions and the pollers, and is cancelled at teardown however
+    /// the loop ended.
     cancel: &'a CancellationToken,
     events: &'a EventSender,
     flow_id: &'a str,
@@ -2496,6 +2510,66 @@ mod tests {
         assert_eq!(up.message, "SRT input connected (mode=Caller, redundant leg 2)");
         assert_eq!(up.details.as_ref().unwrap()["remote_addr"], format!("127.0.0.1:{}", ports.1));
         assert!(h.connected(1).is_empty());
+    }
+
+    /// A stop while leg 1 is still dialling lets that connect finish and
+    /// closes what it made, so the far end sees the connection go. The
+    /// pending acquisition used to be dropped part-way, and a handshake
+    /// completing after that left a connection that sent keepalives and no
+    /// data until the process exited, held by a far end that never saw it
+    /// lost.
+    #[tokio::test]
+    async fn a_2022_7_input_stopping_closes_a_leg_it_was_still_dialling() {
+        let ports = (free_port(), free_port());
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(16);
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let input = spawn_srt_input(
+            srt_config(serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{}", ports.0),
+                "latency_ms": 200,
+                "redundancy": {
+                    "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.1),
+                    "latency_ms": 200
+                }
+            })),
+            tx,
+            flow,
+            cancel.clone(),
+            events,
+            "f1".into(),
+            "pair".into(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+        );
+        // Leg 1's first connect is now in flight, with no peer to answer it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        cancel.cancel();
+
+        let peer_config = srt_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.0), "latency_ms": 200
+        }));
+        let mut listener = crate::srt::connection::bind_srt_listener_for_input(&peer_config)
+            .await
+            .expect("the far end binds");
+        let peer_cancel = CancellationToken::new();
+        let peer = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::srt::connection::accept_srt_connection(&mut listener, &peer_cancel),
+        )
+        .await
+        .expect("the connect sent before the stop completes")
+        .expect("the far end accepts it");
+        tokio::time::timeout(Duration::from_secs(10), input)
+            .await
+            .expect("the input stops")
+            .expect("the input task does not panic");
+        let closed = tokio::time::timeout(Duration::from_secs(3), peer.recv()).await;
+        assert!(
+            matches!(closed, Ok(Err(_))),
+            "the far end sees the connection closed, not a peer that never sends"
+        );
     }
 
     /// The latched connect-failure event of a 2022-7 leg is a Warning while
