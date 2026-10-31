@@ -35,6 +35,7 @@ use crate::util::rtp_parse::{is_likely_rtp, parse_rtp_sequence_number, parse_rtp
 use crate::util::time::now_us;
 
 use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
+use super::output_srt::socket_is_gone;
 use super::input_transcode::InputTranscoder;
 use super::packet::RtpPacket;
 use super::ts_parse::is_null_ts_only;
@@ -871,9 +872,12 @@ fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64
 /// Each leg is accepted or dialled on its own ([`acquire_redundant_leg`]),
 /// both from the start, so either leg alone carries the input. Listener-mode
 /// legs bind once and re-accept on that listener; caller-mode legs re-dial
-/// with exponential back-off. A lost leg is re-acquired
-/// [`LEG_REACQUIRE_DELAY`] after it is lost while the other leg carries on in
-/// the same merger. Only a loss that leaves neither leg connected raises
+/// with exponential back-off. A listener leg closes a queued connection
+/// libsrt has already given up as it accepts it ([`input_accepted_gone`]),
+/// and is dropped as a stale accept, and re-armed at once, when it delivers
+/// nothing while the other leg delivers ([`LegJudge`]). A lost leg is
+/// re-acquired [`LEG_REACQUIRE_DELAY`] after it is lost while the other leg
+/// carries on in the same merger. Only a loss that leaves neither leg connected raises
 /// "Both redundant legs lost" and starts the pair afresh — a new merger,
 /// failover and format detection — as each connect cycle used to. A listener
 /// whose accept channel has closed can never accept again: its leg raises a
@@ -999,6 +1003,8 @@ async fn srt_input_redundant_loop(
         (None, None);
     // A leg whose listener has failed for good.
     let (mut dead1, mut dead2) = (false, false);
+    // A listener leg accepted and not yet heard from ([`LegJudge`]).
+    let (mut judge1, mut judge2): (Option<LegJudge>, Option<LegJudge>) = (None, None);
 
     let mut pair = RedundantPair::new(PairMerger::new(&config, redundancy));
 
@@ -1006,6 +1012,15 @@ async fn srt_input_redundant_loop(
         // When a buffered merger next has a packet to release; never for an
         // unbuffered one.
         let drain_at = pair.merger.next_deadline().map(tokio::time::Instant::from_std);
+        // When a silent listener leg's verdict is next due; never while
+        // neither has the other leg's delivery to judge by.
+        let judge_at = match (
+            judge1.as_ref().and_then(LegJudge::deadline),
+            judge2.as_ref().and_then(LegJudge::deadline),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         // A leg's recv future polls only while the leg has a socket.
         // `std::future::pending()` never resolves, so the branch stays
         // dormant until the leg attaches.
@@ -1029,11 +1044,32 @@ async fn srt_input_redundant_loop(
             }
             _ = tokio::time::sleep_until(drain_at.unwrap_or_else(tokio::time::Instant::now)), if drain_at.is_some() => {
                 drain_redundant_pair(&mut pair, &stats, &publisher, transcoder, post);
+                report_pair_ssrc_mismatch(&mut pair, events, flow_id);
+            }
+            _ = tokio::time::sleep_until(judge_at.unwrap_or_else(tokio::time::Instant::now)), if judge_at.is_some() => {
+                let now = tokio::time::Instant::now();
+                if judge1.as_mut().is_some_and(|j| j.stale(now, sock2.is_some())) {
+                    let waited = judge1.take().map(|j| j.waited(now)).unwrap_or_default();
+                    drop_stale_input_leg(&ctx, 1, waited, &mut sock1, &mut poller1).await;
+                    acquire1 = Some(arm_input_leg(&ctx, 1, listener1.take(), Duration::ZERO, false));
+                }
+                if judge2.as_mut().is_some_and(|j| j.stale(now, sock1.is_some())) {
+                    let waited = judge2.take().map(|j| j.waited(now)).unwrap_or_default();
+                    drop_stale_input_leg(&ctx, 2, waited, &mut sock2, &mut poller2).await;
+                    acquire2 = Some(arm_input_leg(&ctx, 2, listener2.take(), Duration::ZERO, false));
+                }
             }
             acquired = async { acquire1.as_mut().expect("armed").await }, if acquire1.is_some() => {
                 acquire1 = None;
                 match acquired {
+                    LegAcquired::Connected(socket, listener) if input_accepted_gone(1, &socket, &listener) => {
+                        let _ = socket.close().await;
+                        acquire1 = Some(arm_input_leg(&ctx, 1, listener, Duration::ZERO, false));
+                    }
                     LegAcquired::Connected(socket, listener) => {
+                        if listener.is_some() {
+                            judge1 = Some(LegJudge::new(&socket, input_leg_latency(&ctx, 1)).await);
+                        }
                         listener1 = listener;
                         connect_failures.store(0, Ordering::Relaxed);
                         poller1 = Some(attach_input_leg(&ctx, 1, &socket, srt));
@@ -1054,7 +1090,14 @@ async fn srt_input_redundant_loop(
             acquired = async { acquire2.as_mut().expect("armed").await }, if acquire2.is_some() => {
                 acquire2 = None;
                 match acquired {
+                    LegAcquired::Connected(socket, listener) if input_accepted_gone(2, &socket, &listener) => {
+                        let _ = socket.close().await;
+                        acquire2 = Some(arm_input_leg(&ctx, 2, listener, Duration::ZERO, false));
+                    }
                     LegAcquired::Connected(socket, listener) => {
+                        if listener.is_some() {
+                            judge2 = Some(LegJudge::new(&socket, input_leg_latency(&ctx, 2)).await);
+                        }
                         listener2 = listener;
                         poller2 = Some(attach_input_leg(&ctx, 2, &socket, srt));
                         sock2 = Some(socket);
@@ -1072,6 +1115,10 @@ async fn srt_input_redundant_loop(
             result = leg1_recv, if sock1.is_some() => {
                 match result {
                     Ok(pkt) => {
+                        judge1 = None;
+                        if let Some(judge) = judge2.as_mut() {
+                            judge.other_delivered(tokio::time::Instant::now());
+                        }
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
                         if pair.format == SrtPayloadFormat::Unknown {
@@ -1085,6 +1132,7 @@ async fn srt_input_redundant_loop(
                         process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, pair.format, RedundantPacketState { raw_ts_seq: &mut pair.raw_ts_seq_leg1, raw_ts_timestamp: &mut pair.raw_ts_timestamp, merger: &mut pair.merger, merger_handoff: &mut pair.merger_handoff, failover: &mut pair.failover, prev_active_leg: &mut pair.prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
                     }
                     Err(_) => {
+                        judge1 = None;
                         lose_input_leg(&ctx, 1, &mut sock1, &mut poller1, &sock2).await;
                         acquire1 = Some(arm_input_leg(&ctx, 1, listener1.take(), LEG_REACQUIRE_DELAY, false));
                         if sock2.is_none() {
@@ -1096,6 +1144,10 @@ async fn srt_input_redundant_loop(
             result = leg2_recv, if sock2.is_some() => {
                 match result {
                     Ok(pkt) => {
+                        judge2 = None;
+                        if let Some(judge) = judge1.as_mut() {
+                            judge.other_delivered(tokio::time::Instant::now());
+                        }
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
                         if pair.format == SrtPayloadFormat::Unknown {
@@ -1109,6 +1161,7 @@ async fn srt_input_redundant_loop(
                         process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, pair.format, RedundantPacketState { raw_ts_seq: &mut pair.raw_ts_seq_leg2, raw_ts_timestamp: &mut pair.raw_ts_timestamp, merger: &mut pair.merger, merger_handoff: &mut pair.merger_handoff, failover: &mut pair.failover, prev_active_leg: &mut pair.prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
                     }
                     Err(_) => {
+                        judge2 = None;
                         lose_input_leg(&ctx, 2, &mut sock2, &mut poller2, &sock1).await;
                         acquire2 = Some(arm_input_leg(&ctx, 2, listener2.take(), LEG_REACQUIRE_DELAY, false));
                         if sock1.is_none() {
@@ -1159,6 +1212,10 @@ struct RedundantPair {
     raw_ts_seq_leg1: u16,
     raw_ts_seq_leg2: u16,
     raw_ts_timestamp: u32,
+    /// How many of a buffered merger's SSRC mismatches have been raised
+    /// ([`report_pair_ssrc_mismatch`]). Kept across [`Self::restart`], as the
+    /// merger's count is.
+    ssrc_mismatch_reported: u64,
 }
 
 impl RedundantPair {
@@ -1173,6 +1230,7 @@ impl RedundantPair {
             raw_ts_seq_leg1: 0,
             raw_ts_seq_leg2: 0,
             raw_ts_timestamp: 0,
+            ssrc_mismatch_reported: 0,
         }
     }
 
@@ -1325,6 +1383,13 @@ impl<'a> RedundantInputCtx<'a> {
     }
 }
 
+/// Leg `leg`'s configured receive latency: `recv_latency_ms`, else
+/// `latency_ms`.
+fn input_leg_latency(ctx: &RedundantInputCtx<'_>, leg: u8) -> Duration {
+    let params = ctx.params(leg);
+    Duration::from_millis(params.recv_latency_ms.unwrap_or(params.latency_ms))
+}
+
 /// `details.other_leg` of a 2022-7 input's leg events, read off the other
 /// leg's socket: `connected` only while its status says so, so a socket that
 /// broke a moment ago reads `down` before its own loss is handled.
@@ -1449,13 +1514,7 @@ async fn lose_input_leg(
 ) {
     tracing::warn!("SRT input leg{leg} connection lost");
     let other_leg = input_leg_state(other);
-    ctx.up(leg).store(false, Ordering::Relaxed);
-    if let Some(poller) = poller.take() {
-        poller.cancel();
-    }
-    if let Some(socket) = socket.take() {
-        let _ = socket.close().await;
-    }
+    detach_input_leg(ctx, leg, socket, poller).await;
     ctx.events.emit_flow_with_details(
         EventSeverity::Warning,
         category::REDUNDANCY,
@@ -1465,6 +1524,164 @@ async fn lose_input_leg(
             "leg": leg,
             "mode": format!("{:?}", ctx.params(leg).mode),
             "other_leg": other_leg,
+        }),
+    );
+}
+
+/// Detach leg `leg`: mark it down, stop its stats poller and close its
+/// socket.
+async fn detach_input_leg(
+    ctx: &RedundantInputCtx<'_>,
+    leg: u8,
+    socket: &mut Option<Arc<SrtSocket>>,
+    poller: &mut Option<CancellationToken>,
+) {
+    ctx.up(leg).store(false, Ordering::Relaxed);
+    if let Some(poller) = poller.take() {
+        poller.cancel();
+    }
+    if let Some(socket) = socket.take() {
+        let _ = socket.close().await;
+    }
+}
+
+/// Whether `socket`, just accepted on listener leg `leg` (`listener` handed
+/// back; `None` on a caller leg, whose connect is always fresh), is one
+/// libsrt has already given up: a connection the listener's backlog held
+/// while the leg was attached, whose caller then closed it or went silent
+/// past the idle timeout. The loop closes it and accepts the next at once,
+/// raising neither a connected Info nor, at its first read, a leg-lost
+/// Warning.
+fn input_accepted_gone(leg: u8, socket: &SrtSocket, listener: &Option<SrtListener>) -> bool {
+    let gone = listener.is_some() && socket_is_gone(socket);
+    if gone {
+        tracing::info!(
+            "SRT input 2022-7 leg {leg}: accepted a connection libsrt had already given up \
+             ({:?}), accepting the next",
+            socket.status(),
+        );
+    }
+    gone
+}
+
+/// How long past its own TSBPD delay a 2022-7 input's freshly accepted
+/// listener leg has to deliver its first packet, from the other leg's first
+/// delivery after the accept ([`LegJudge`]).
+const LEG_FIRST_DELIVERY_WINDOW: Duration = Duration::from_secs(3);
+
+/// How recently the other leg must have delivered for [`LegJudge`] to give
+/// its verdict: the merger's own threshold for a leg being down.
+const LEG_JUDGE_EVIDENCE: Duration = Duration::from_secs(1);
+
+/// A 2022-7 input's listener leg accepted and not yet heard from: whether
+/// it is a stale accept.
+///
+/// A listener leg re-accepts after every loss, and its listener keeps
+/// accepting callers while the leg is attached (srt-transport queues up to
+/// 16), so a re-arm can take a connection whose caller gave up on it long
+/// before — one that will never deliver, while the caller's own new
+/// connection waits behind it. libsrt gives such a connection up only at
+/// the peer idle timeout (`peer_idle_timeout_secs`, 30 s by default), and
+/// until then the pair runs on one leg.
+///
+/// Delivering nothing is no verdict on its own: a healthy leg of a silent
+/// source delivers nothing either, and the receiving end cannot tell the
+/// two apart (the caller's SRT keepalives show in no statistic). The other
+/// leg can: both legs of a 2022-7 pair carry one stream, so while it
+/// delivers the source is not silent. A leg is judged stale when it has
+/// delivered nothing [`LEG_FIRST_DELIVERY_WINDOW`] plus its own TSBPD delay
+/// (which holds its first packet back that long) after the other leg first
+/// delivered since the accept, the other leg still attached and having
+/// delivered within [`LEG_JUDGE_EVIDENCE`]. With the other leg down or
+/// silent nothing is judged, and a stale accept still breaks on libsrt's
+/// idle timeout — as a listener output judges nothing while it has nothing
+/// to send. A caller leg is never judged: its connect is always fresh.
+struct LegJudge {
+    /// How long after the other leg's first delivery the leg has to
+    /// deliver.
+    window: Duration,
+    /// When the other leg first delivered since the accept.
+    since: Option<tokio::time::Instant>,
+    /// When the other leg last delivered.
+    other_last: Option<tokio::time::Instant>,
+}
+
+impl LegJudge {
+    /// A judgement of `socket`, just accepted, whose configured receive
+    /// latency is `latency`: its window takes in the larger of that and the
+    /// TSBPD delay libsrt negotiated, which a sender asking for more raises.
+    async fn new(socket: &SrtSocket, latency: Duration) -> Self {
+        let negotiated = u64::try_from(socket.stats().await.ms_rcv_tsbpd_delay).unwrap_or(0);
+        Self::with_window(LEG_FIRST_DELIVERY_WINDOW + latency.max(Duration::from_millis(negotiated)))
+    }
+
+    fn with_window(window: Duration) -> Self {
+        Self { window, since: None, other_last: None }
+    }
+
+    /// The other leg delivered at `now`.
+    fn other_delivered(&mut self, now: tokio::time::Instant) {
+        self.since.get_or_insert(now);
+        self.other_last = Some(now);
+    }
+
+    /// When the verdict is due: never before the other leg has delivered.
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.since.map(|since| since + self.window)
+    }
+
+    /// Whether, at `now`, the leg is a stale accept. Past the deadline with
+    /// the other leg gone quiet, or no longer attached (`other_attached`),
+    /// the judgement starts over from the other leg's next delivery.
+    fn stale(&mut self, now: tokio::time::Instant, other_attached: bool) -> bool {
+        if self.deadline().is_none_or(|deadline| now < deadline) {
+            return false;
+        }
+        let delivering = other_attached
+            && self
+                .other_last
+                .is_some_and(|last| now.saturating_duration_since(last) <= LEG_JUDGE_EVIDENCE);
+        if !delivering {
+            self.since = None;
+        }
+        delivering
+    }
+
+    /// How long the leg was given, from the other leg's first delivery.
+    fn waited(&self, now: tokio::time::Instant) -> Duration {
+        self.since.map(|since| now.saturating_duration_since(since)).unwrap_or_default()
+    }
+}
+
+/// Detach listener leg `leg`, judged a stale accept ([`LegJudge`]), and
+/// raise its Warning; the loop re-arms the leg to accept at once. It is no
+/// loss of a working leg, so `Redundant leg {n} lost` is not raised for it,
+/// and the other leg, delivering, carries on in the same merger. The message
+/// is fixed per leg.
+async fn drop_stale_input_leg(
+    ctx: &RedundantInputCtx<'_>,
+    leg: u8,
+    waited: Duration,
+    socket: &mut Option<Arc<SrtSocket>>,
+    poller: &mut Option<CancellationToken>,
+) {
+    let params = ctx.params(leg);
+    tracing::warn!(
+        "SRT input 2022-7 leg {leg}: nothing delivered {waited:?} after the other leg did, \
+         stale connection, re-accepting..."
+    );
+    detach_input_leg(ctx, leg, socket, poller).await;
+    ctx.events.emit_flow_with_details(
+        EventSeverity::Warning,
+        category::SRT,
+        format!("SRT input 2022-7 leg {leg} stale connection detected"),
+        ctx.flow_id,
+        serde_json::json!({
+            "leg": leg,
+            "mode": format!("{:?}", params.mode),
+            "local_addr": params.local_addr.unwrap_or("auto"),
+            "waited_ms": u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
+            "other_leg": "connected",
         }),
     );
 }
@@ -1731,7 +1948,14 @@ fn process_redundant_packet(
                     }
                 }
                 PairMerger::Buffered(merger) => {
+                    // 2022-7 sends byte-identical RTP on both legs, SSRC
+                    // included: the merger counts the legs disagreeing for
+                    // good (`ssrc_mismatch`), as the RTP input's does.
+                    // `is_likely_rtp` has seen the 12-byte header.
                     let now = std::time::Instant::now();
+                    let header = &packet.data;
+                    let ssrc = u32::from_be_bytes([header[8], header[9], header[10], header[11]]);
+                    merger.observe_ssrc(leg, ssrc, now);
                     for (chosen_leg, packet) in merger.ingest(seq, leg, packet, now) {
                         publish_redundant_packet(packet, chosen_leg, prev_active_leg, stats, publisher, transcoder, post);
                     }
@@ -1821,6 +2045,22 @@ fn publish_redundant_packet(
     }
 
     crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
+}
+
+/// Raise the Warning `redundancy_ssrc_mismatch`, as the RTP input does, once
+/// for each SSRC mismatch between the legs a buffered pair merger has
+/// counted since the last report; nothing for an unbuffered merger, which
+/// checks no SSRC. Called as the merger releases, so a mismatch is reported
+/// within one hold of the packet that showed it.
+fn report_pair_ssrc_mismatch(pair: &mut RedundantPair, events: &EventSender, flow_id: &str) {
+    let PairMerger::Buffered(merger) = &pair.merger else {
+        return;
+    };
+    let mismatch = merger.stats.ssrc_mismatch.load(Ordering::Relaxed);
+    if mismatch > pair.ssrc_mismatch_reported {
+        pair.ssrc_mismatch_reported = mismatch;
+        crate::engine::input_rtp::emit_ssrc_mismatch(events, flow_id, mismatch);
+    }
 }
 
 /// Release what a buffered pair merger holds past its release time. Nothing
@@ -2742,6 +2982,30 @@ mod tests {
             socket
         }
 
+        /// A caller to leg `leg`'s listener that the pump does not feed.
+        async fn connect_silent(&self, leg: usize) -> Arc<SrtSocket> {
+            let port = if leg == 1 { self.ports.0 } else { self.ports.1 };
+            let config = srt_config(serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }));
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::srt::connection::connect_srt_input(&config, &self.cancel),
+            )
+            .await
+            .expect("the caller connects in time")
+            .expect("the caller connects")
+        }
+
+        /// The `SRT input 2022-7 leg {leg} stale connection detected`
+        /// Warnings.
+        fn stale(&self, leg: u64) -> Vec<&crate::manager::events::Event> {
+            self.events
+                .iter()
+                .filter(|e| e.message == format!("SRT input 2022-7 leg {leg} stale connection detected"))
+                .collect()
+        }
+
         /// Take leg `leg`'s peer out of the pump, then close it, so every
         /// seq the pump sends from then on goes to the other leg alone.
         async fn drop_leg(&self, leg: usize) {
@@ -3320,6 +3584,177 @@ mod tests {
         let snap = bench.flow.snapshot();
         let held = snap.input.buffered_hitless.expect("the buffered merger's stats");
         assert_eq!((held.max_path_diff_ms, held.packets_emitted, held.gap_lost), (1000, 300, 0));
+    }
+
+    /// A buffered pair whose legs go on carrying RTP under different SSRCs
+    /// counts the mismatch on its `buffered_hitless` stats once they have
+    /// disagreed for a second past the hold, and raises the RTP input's
+    /// Warning once for it; legs back on one new SSRC after both were lost
+    /// count nothing more. An SRT pair used to check no SSRC, so its
+    /// `ssrc_mismatch` read 0 whatever the legs carried.
+    #[test]
+    fn a_buffered_pair_reports_legs_carrying_different_ssrcs() {
+        let mut bench = PairBench::new(serde_json::json!({ "path_differential_ms": 20 }));
+        let with_ssrc = |seq: u16, ssrc: u32| {
+            let mut datagram = rtp_datagram(seq);
+            datagram[8..12].copy_from_slice(&ssrc.to_be_bytes());
+            datagram
+        };
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let ssrc_mismatch =
+            |bench: &PairBench| bench.flow.snapshot().input.buffered_hitless.expect("stats").ssrc_mismatch;
+
+        // 1.2 s of both legs delivering, past the 1.02 s confirmation.
+        for seq in 0..60u16 {
+            bench.deliver_datagram(ActiveLeg::Leg1, with_ssrc(seq, 0x1111_1111));
+            bench.deliver_datagram(ActiveLeg::Leg2, with_ssrc(seq, 0x2222_2222));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        bench.drain_when_due();
+        report_pair_ssrc_mismatch(&mut bench.pair, &events, "f1");
+        report_pair_ssrc_mismatch(&mut bench.pair, &events, "f1");
+        assert_eq!(ssrc_mismatch(&bench), 1);
+        let raised: Vec<_> = std::iter::from_fn(|| events_rx.try_recv().ok()).collect();
+        assert_eq!(raised.len(), 1, "once for the one mismatch counted");
+        assert_eq!(raised[0].severity, crate::manager::events::EventSeverity::Warning);
+        assert_eq!(raised[0].category, crate::manager::events::category::REDUNDANCY);
+        assert_eq!(raised[0].flow_id.as_deref(), Some("f1"));
+        let details = raised[0].details.as_ref().expect("details");
+        assert_eq!(details["error_code"], "redundancy_ssrc_mismatch");
+        assert_eq!(details["mismatch_count"], 1);
+
+        // Both legs lost; the sender comes back on a new SSRC on both.
+        bench.pair.restart();
+        for seq in 500..510u16 {
+            bench.deliver_datagram(ActiveLeg::Leg2, with_ssrc(seq, 0x3333_3333));
+            bench.deliver_datagram(ActiveLeg::Leg1, with_ssrc(seq, 0x3333_3333));
+        }
+        bench.drain_when_due();
+        report_pair_ssrc_mismatch(&mut bench.pair, &events, "f1");
+        assert_eq!(ssrc_mismatch(&bench), 1, "one sender on a new SSRC is no mismatch");
+        assert!(events_rx.try_recv().is_err());
+    }
+
+    /// A silent listener leg is judged only by the other leg's delivery: no
+    /// verdict before it, none before the window has passed since it, and
+    /// none with the other leg gone quiet or detached — then the judgement
+    /// waits for the other leg's next delivery.
+    #[test]
+    fn a_silent_leg_is_judged_only_while_the_other_leg_delivers() {
+        let window = Duration::from_millis(3_200);
+        let t0 = tokio::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        let mut judge = LegJudge::with_window(window);
+        assert_eq!(judge.deadline(), None, "nothing to judge by");
+        assert!(!judge.stale(at(60_000), true));
+
+        // The other leg delivers from 100 ms on, every 20 ms.
+        for ms in (100..=3_300).step_by(20) {
+            judge.other_delivered(at(ms));
+        }
+        assert_eq!(judge.deadline(), Some(at(3_300)), "from its first delivery");
+        assert!(!judge.stale(at(3_299), true));
+        assert!(!judge.stale(at(3_300), false), "the other leg detached");
+        assert_eq!(judge.deadline(), None, "starts over");
+
+        for ms in (3_400..=6_600).step_by(20) {
+            judge.other_delivered(at(ms));
+        }
+        assert!(judge.stale(at(6_600), true));
+        assert_eq!(judge.waited(at(6_600)), window);
+
+        // The other leg delivered, then went quiet: no verdict.
+        let mut judge = LegJudge::with_window(window);
+        judge.other_delivered(at(0));
+        judge.other_delivered(at(500));
+        assert!(!judge.stale(at(3_200), true), "quiet for 2.7 s");
+        assert_eq!(judge.deadline(), None);
+        judge.other_delivered(at(10_000));
+        assert_eq!(judge.deadline(), Some(at(13_200)));
+    }
+
+    /// A 2022-7 input's listener leg that delivers nothing while the other
+    /// leg delivers is dropped as a stale accept 3 s plus its latency after
+    /// the other leg's first delivery, with a Warning naming the leg (not
+    /// the leg-lost one), and the leg accepts the next caller at once and
+    /// keeps it. It used to wait for libsrt's idle timeout (30 s by
+    /// default) before the next caller was accepted.
+    #[tokio::test]
+    async fn a_2022_7_input_drops_a_listener_leg_that_delivers_nothing_while_the_other_does() {
+        let mut h = InputPairHarness::listeners();
+        let _leg2 = h.connect(2).await;
+        h.wait_until("leg 2 to deliver", |h| h.forwarded() > 0).await;
+        let _silent = h.connect_silent(1).await;
+        h.wait_until("leg 1 to attach", |h| h.connected(1).len() == 1).await;
+        let attached = std::time::Instant::now();
+        h.wait_until("leg 1's stale verdict", |h| !h.stale(1).is_empty()).await;
+        let after = attached.elapsed();
+        assert!(
+            after >= Duration::from_millis(3_100) && after < Duration::from_secs(5),
+            "stale {after:?} after the attach"
+        );
+        let event = h.stale(1)[0];
+        assert_eq!(event.severity, EventSeverity::Warning);
+        assert_eq!(event.category, crate::manager::events::category::SRT);
+        assert_eq!(event.flow_id.as_deref(), Some("f1"));
+        let details = event.details.as_ref().expect("details");
+        assert_eq!((details["leg"].as_u64(), details["other_leg"].as_str()), (Some(1), Some("connected")));
+        assert_eq!(details["mode"], "Listener");
+
+        let _leg1 = h.connect(1).await;
+        h.wait_until("leg 1 to attach again", |h| h.connected(1).len() == 2).await;
+        tokio::time::sleep(Duration::from_millis(4_500)).await;
+        h.pump_events();
+        assert_eq!(h.stale(1).len(), 1, "a leg that delivers is kept");
+        assert!(h.stale(2).is_empty());
+        assert!(h.leg_lost(1).is_empty() && h.leg_lost(2).is_empty());
+        assert_eq!(h.both_lost(), 0);
+        h.stop_pump().await;
+        h.assert_each_seq_forwarded_once();
+    }
+
+    /// While neither leg delivers, a silent source, nothing is judged: both
+    /// silent legs are kept.
+    #[tokio::test]
+    async fn a_2022_7_input_judges_no_leg_while_neither_delivers() {
+        let mut h = InputPairHarness::listeners();
+        let _leg1 = h.connect_silent(1).await;
+        let _leg2 = h.connect_silent(2).await;
+        h.wait_until("both legs to attach", |h| {
+            h.connected(1).len() == 1 && h.connected(2).len() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        h.pump_events();
+        assert!(h.stale(1).is_empty() && h.stale(2).is_empty());
+        assert!(h.leg_lost(1).is_empty() && h.leg_lost(2).is_empty());
+    }
+
+    /// A connection a 2022-7 input's listener held in its backlog while the
+    /// leg was attached, whose caller then gave it up, is closed when the
+    /// re-armed leg accepts it, and the next one accepted: no connected
+    /// Info and no second leg-lost Warning for it. It used to be attached,
+    /// announced, and lost again at its first read.
+    #[tokio::test]
+    async fn a_2022_7_input_skips_a_backlogged_connection_libsrt_gave_up() {
+        let mut h = InputPairHarness::listeners();
+        let _first = h.connect(1).await;
+        h.wait_until("leg 1 to attach", |h| h.connected(1).len() == 1).await;
+        let backlogged = h.connect_silent(1).await;
+        backlogged.close().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        h.drop_leg(1).await;
+        h.wait_until("leg 1's loss", |h| h.leg_lost(1).len() == 1).await;
+        // Past the re-arm's 1 s and the backlogged connection's turn.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        h.pump_events();
+        assert_eq!(h.connected(1).len(), 1, "the given-up connection is not attached");
+        assert_eq!(h.leg_lost(1).len(), 1);
+
+        let _next = h.connect(1).await;
+        h.wait_until("leg 1 to attach again", |h| h.connected(1).len() == 2).await;
     }
 
     /// Without `path_differential_ms` the pair forwards as it always did:
