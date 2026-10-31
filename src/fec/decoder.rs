@@ -937,9 +937,10 @@ mod tests {
     }
 
     /// Sequence numbers with an upstream gap of 3 inside the second
-    /// matrix (what a 2022-7 output forwarding RTP sends when its upstream
-    /// lost packets): both ends file every cell at seq - SNBase, so a loss
-    /// in a whole column is rebuilt exactly and nothing is made up.
+    /// matrix (what a 2022-7 output of an older edge, which forwarded RTP
+    /// with its upstream numbers, sends when its upstream lost packets):
+    /// both ends file every cell at seq - SNBase, so a loss in a whole
+    /// column is rebuilt exactly and nothing is made up.
     #[test]
     fn encoder_and_decoder_agree_across_an_upstream_gap() {
         let seqs: Vec<u16> = (1000u16..1048).filter(|s| !(1018..=1020).contains(s)).collect();

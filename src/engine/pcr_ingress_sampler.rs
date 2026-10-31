@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use crate::engine::master_clock::SourcePcrPllMaster;
 use crate::engine::packet::RtpPacket;
 use crate::engine::ts_parse::{
-    extract_pcr, extract_pes_dts, extract_pes_pts, ts_pid, ts_pusi,
+    extract_pcr, extract_pes_dts, extract_pes_pts, ts_discontinuity_indicator, ts_pid, ts_pusi,
     TS_PACKET_SIZE, TS_SYNC_BYTE,
 };
 use crate::manager::events::{category, EventSender, EventSeverity};
@@ -162,7 +162,10 @@ pub fn spawn_pcr_ingress_sampler_with_rx(
 /// discontinuity sends a one-shot
 /// `FixerCommand::SignalSourceDiscontinuity` naming the PCR PID that
 /// jumped to the per-flow `TsContinuityFixer`, which stamps the MPEG-TS
-/// adaptation-field `discontinuity_indicator` on that PID's next PCR.
+/// adaptation-field `discontinuity_indicator` on that PID's next PCR —
+/// unless the jumped PCR carries DI already (the muxer-mode rewriter's on a
+/// jump, the fixer's on a switch, or the source's own), when a second one
+/// a PCR later would only announce the same time base twice.
 /// Receivers see DI=1 and flush STC. It arms DI and nothing else: CC
 /// passes through as the source sent it (it used to switch the fixer into
 /// renumbering every CC for the rest of the flow, edge#214). A PTS / DTS
@@ -200,7 +203,7 @@ pub(crate) fn spawn_source_discontinuity_watch(
                     match msg {
                         Ok(pkt) => {
                             // ── PCR jump detection (per PCR PID) ──
-                            for (pid, pcr) in scan_all_pcr_values(&pkt) {
+                            for (pid, pcr, di) in scan_all_pcr_values(&pkt) {
                                 if let Some((prev, gap)) = pcr_watch.observe(pid, pcr) {
                                     flow_stats.source_discontinuities
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -213,7 +216,17 @@ pub(crate) fn spawn_source_discontinuity_watch(
                                     // signal on every loop boundary,
                                     // not just the first one in a
                                     // 30 s window.
-                                    if let Some(tx) = fixer_tx.as_ref() {
+                                    //
+                                    // Not for a jumped PCR that carries
+                                    // DI already: the muxer-mode rewriter
+                                    // stamps one on a jump it sees, the
+                                    // fixer on a switch's first PCR, and a
+                                    // well-behaved source on its own; the
+                                    // watcher's lands on the PID's next
+                                    // PCR, a second DI for one new time
+                                    // base (TR 101 290 gate 10 counts one
+                                    // event per DI).
+                                    if !di && let Some(tx) = fixer_tx.as_ref() {
                                         let _ = tx.try_send(
                                             crate::engine::flow::FixerCommand::SignalSourceDiscontinuity {
                                                 pcr_pid: pid,
@@ -360,11 +373,12 @@ impl PcrJumpWatch {
     }
 }
 
-/// Pure scanner — returns every `(PID, PCR)` found in the datagram, in
-/// order. Used by [`spawn_source_discontinuity_watch`] which doesn't
+/// Pure scanner — returns every `(PID, PCR, DI)` found in the datagram, in
+/// order, DI being whether that packet's `discontinuity_indicator` is set.
+/// Used by [`spawn_source_discontinuity_watch`] which doesn't
 /// have an `SourcePcrPllMaster` to push samples into. Mirrors the
 /// `sample_packet` walk minus the PLL feed.
-fn scan_all_pcr_values(pkt: &RtpPacket) -> Vec<(u16, u64)> {
+fn scan_all_pcr_values(pkt: &RtpPacket) -> Vec<(u16, u64, bool)> {
     let bytes = pkt.data.as_ref();
     let payload = if pkt.is_raw_ts { bytes } else { skip_rtp_header(bytes) };
     let mut out = Vec::new();
@@ -376,7 +390,7 @@ fn scan_all_pcr_values(pkt: &RtpPacket) -> Vec<(u16, u64)> {
         let ts_pkt = &payload[i..i + TS_PACKET_SIZE];
         if ts_pkt[0] == TS_SYNC_BYTE {
             if let Some(pcr) = extract_pcr(ts_pkt) {
-                out.push((ts_pid(ts_pkt), pcr));
+                out.push((ts_pid(ts_pkt), pcr, ts_discontinuity_indicator(ts_pkt)));
             }
             i += TS_PACKET_SIZE;
         } else {
@@ -983,6 +997,69 @@ mod tests {
         ));
         assert!(fixer_rx.try_recv().is_err(), "the PTS jump armed nothing");
         assert_eq!(stats.source_discontinuities.load(std::sync::atomic::Ordering::Relaxed), 2);
+        cancel.cancel();
+        let _ = task.await;
+    }
+
+    /// A PCR jump whose PCR already carries DI — the muxer-mode rewriter's
+    /// on a jump it saw, the fixer's on a switch between inputs of other
+    /// epochs — is counted and reported, but arms no second DI for the
+    /// PID's next PCR: one new time base, one DI. A jump without one still
+    /// arms it.
+    #[tokio::test]
+    async fn a_jump_already_carrying_a_di_arms_no_second() {
+        use crate::engine::ts_parse::pcr_only_packet;
+        let (tx, _keep) = broadcast::channel::<RtpPacket>(64);
+        let (fixer_tx, mut fixer_rx) = tokio::sync::mpsc::channel(16);
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "f".into(),
+            "f".into(),
+            "udp".into(),
+        ));
+        let (_active_tx, active_rx) = tokio::sync::watch::channel("i".to_string());
+        let cancel = CancellationToken::new();
+        let task = spawn_source_discontinuity_watch(
+            &tx,
+            "f".into(),
+            active_rx,
+            events,
+            stats.clone(),
+            Some(fixer_tx),
+            cancel.clone(),
+        );
+        let send = |pid: u16, ms: u64, di: bool| {
+            let _ = tx.send(RtpPacket {
+                data: Bytes::copy_from_slice(&pcr_only_packet(pid, 0, ms * 27_000, di)),
+                sequence_number: 0,
+                rtp_timestamp: 0,
+                recv_time_us: 0,
+                is_raw_ts: true,
+                upstream_seq: None,
+                upstream_leg_id: None,
+                sender_timestamp_us: None,
+            });
+        };
+        for k in 0..3u64 {
+            send(0x100, 1_000 + k * 30, false);
+        }
+        // Jumps with its own DI, then runs on.
+        send(0x100, 9_000, true);
+        send(0x100, 9_030, false);
+        // Jumps back without one.
+        send(0x100, 2_000, false);
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), fixer_rx.recv())
+            .await
+            .expect("a command")
+            .expect("open");
+        assert!(matches!(
+            cmd,
+            crate::engine::flow::FixerCommand::SignalSourceDiscontinuity { pcr_pid: 0x100 }
+        ));
+        assert!(fixer_rx.try_recv().is_err(), "only the jump without a DI armed one");
+        assert_eq!(stats.source_discontinuities.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let event = events_rx.try_recv().expect("the first jump is reported");
+        assert_eq!(event.details.expect("details")["error_code"], "source_pcr_discontinuity");
         cancel.cancel();
         let _ = task.await;
     }

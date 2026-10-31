@@ -46,9 +46,11 @@ const RTP_HEADER_SIZE: usize = 12;
 const RTP_PT_MP2T: u8 = 33;
 
 /// State carried across packets when wrapping raw TS data into RTP.
-/// One per output. SSRC is randomised at construction; sequence number and
-/// timestamp advance monotonically per emitted RTP datagram.
-struct RtpWrapState {
+/// One per output — and one per flow for the datagrams a flow wraps itself
+/// (`ts_continuity_fixer::FlowFraming`). SSRC is randomised at construction;
+/// sequence number and timestamp advance monotonically per emitted RTP
+/// datagram.
+pub(crate) struct RtpWrapState {
     seq: u16,
     ssrc: u32,
     /// Last non-zero RTP timestamp emitted. Edge-generated filler bundles
@@ -63,7 +65,7 @@ struct RtpWrapState {
 }
 
 impl RtpWrapState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             seq: rand::random::<u16>(),
             ssrc: rand::random::<u32>(),
@@ -78,7 +80,7 @@ impl RtpWrapState {
     /// A zero `rtp_ts` (timestamp-less filler) reuses the previous packet's
     /// timestamp instead — see `last_ts`. Sequence number advances by 1 per
     /// call.
-    fn build_header(&mut self, rtp_ts: u32) -> [u8; RTP_HEADER_SIZE] {
+    pub(crate) fn build_header(&mut self, rtp_ts: u32) -> [u8; RTP_HEADER_SIZE] {
         let rtp_ts = if rtp_ts == 0 { self.last_ts } else { rtp_ts };
         self.last_ts = rtp_ts;
         let mut hdr = [0u8; RTP_HEADER_SIZE];
@@ -803,9 +805,10 @@ async fn rtp_output_loop(
 
 /// Dual-leg RTP output with SMPTE 2022-7 duplication.
 ///
-/// Sends every packet to two independent UDP destinations. If FEC encoding
-/// is enabled, FEC packets are also sent to both legs. Only leg 1 increments
-/// `packets_sent`/`bytes_sent` to avoid double-counting.
+/// Sends every packet to two independent UDP destinations, under one SSRC
+/// and sequence of the output's own whatever the flow's framing. If FEC
+/// encoding is enabled, FEC packets are also sent to both legs. Only leg 1
+/// increments `packets_sent`/`bytes_sent` to avoid double-counting.
 async fn rtp_output_redundant_loop(
     config: &RtpOutputConfig,
     rx: &mut broadcast::Receiver<RtpPacket>,
@@ -953,7 +956,8 @@ async fn rtp_output_redundant_loop(
 
     // RTP wrap state shared by both legs — both legs MUST emit identical
     // sequence numbers and SSRC so the receiver-side hitless merger can
-    // dedupe by sequence number per SMPTE 2022-7.
+    // dedupe by sequence number per SMPTE 2022-7. Every datagram this output
+    // sends takes its header from here, RTP in as well as raw TS.
     let mut rtp_wrap = RtpWrapState::new();
 
     // Optional output delay buffer for stream synchronization.
@@ -1115,15 +1119,28 @@ async fn rtp_output_redundant_loop(
                     }
                 }
             } else {
-                // Already-RTP data goes out as it came, upstream header
-                // and all, so FEC is over the upstream sequence numbers --
-                // which may skip, repeat or step back; the encoder files
-                // each datagram by its number, as the decoder does.
+                // Already-RTP data: strip the upstream header and wrap with
+                // the output's own SSRC and sequence, as the single-leg path
+                // does. The raw TS this output wraps above — the flow's
+                // idle keepalives on any flow — is numbered in the same
+                // space, so a receiver sees one stream; forwarded with its
+                // upstream header, an RTP-framed flow went out as two SSRC
+                // and sequence spaces interleaved. FEC follows the numbers
+                // this sends.
+                let inner_ts = if packet.data.len() > crate::engine::ts_parse::RTP_HEADER_MIN_SIZE {
+                    &packet.data[crate::engine::ts_parse::RTP_HEADER_MIN_SIZE..]
+                } else {
+                    &[][..]
+                };
+                let header = rtp_wrap.build_header(packet.rtp_timestamp);
+                let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + inner_ts.len());
+                buf.extend_from_slice(&header);
+                buf.extend_from_slice(inner_ts);
                 send_dual(
                     &wire_tx_leg1,
                     &wire_tx_leg2,
                     fec_encoder.as_mut(),
-                    Bytes::from(packet.data.to_vec()),
+                    Bytes::from(buf),
                     packet.recv_time_us,
                     &stats,
                 );
@@ -1554,38 +1571,33 @@ mod tests {
         check_contiguous(&legs[0], 4, 4, 3);
     }
 
-    /// 2022-7, RTP forwarded unchanged with an upstream gap and one short
-    /// datagram: groups holding a number never sent, or datagrams of two
-    /// sizes, get no FEC; every other loss is rebuilt byte for byte, and
-    /// nothing is ever made up.
+    /// 2022-7, RTP in with an upstream gap, a foreign SSRC and the flow's
+    /// raw-TS keepalive in among it: every datagram goes out under the
+    /// output's own SSRC, numbered contiguously, both legs alike, and the
+    /// FEC follows those numbers. The RTP went out with its upstream header
+    /// and the keepalive under the output's, two streams interleaved.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dual_leg_rtp_forward_fec_follows_upstream_numbers() {
+    async fn dual_leg_rtp_is_rewrapped_in_one_space_with_the_keepalives() {
         let full = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
-        let ts = ts_stream(48 * TS_PACKETS_PER_DATAGRAM);
-        let seqs: Vec<u16> = (40_000u16..40_048).filter(|s| !(40_018..=40_020).contains(s)).collect();
-        let items: Vec<RtpPacket> = seqs
-            .iter()
-            .map(|&s| {
-                let i = (s - 40_000) as usize;
-                let len = if s == 40_034 { 3 * TS_PACKET_SIZE } else { full };
-                upstream_rtp(s, &ts[i * full..i * full + len])
+        let ts = ts_stream(47 * TS_PACKETS_PER_DATAGRAM);
+        let mut items: Vec<RtpPacket> = (0..47u16)
+            .map(|i| {
+                let seq = if i < 18 { 40_000 + i } else { 40_003 + i };
+                let at = i as usize * full;
+                upstream_rtp(seq, &ts[at..at + full])
             })
             .collect();
-        let legs = capture(4, 4, true, items, seqs.len()).await;
+        let mut keepalive = crate::engine::flow::null_ts_packet();
+        keepalive.recv_time_us = now_us();
+        items.insert(24, keepalive);
+        let legs = capture(4, 4, true, items, 48).await;
         assert_eq!(legs[0], legs[1], "both legs byte-identical");
-        let cap = &legs[0];
-        let wire: Vec<u16> = cap.iter().filter(|dg| !is_fec_packet(dg)).map(|dg| seq_of(dg)).collect();
-        assert_eq!(wire, seqs, "upstream numbers forwarded unchanged");
-        assert!(replay(cap, 4, 4, None).is_empty());
-        // Column 1 of the gapped matrix, and a loss in the third matrix.
-        assert_eq!(replay(cap, 4, 4, Some(40_025)), vec![40_025]);
-        assert_eq!(replay(cap, 4, 4, Some(40_047)), vec![40_047]);
-        // Column 2 and row 1 both hold a number upstream never sent.
-        assert!(replay(cap, 4, 4, Some(40_022)).is_empty());
-        // The short datagram: its column and row are of mixed sizes.
-        assert!(replay(cap, 4, 4, Some(40_034)).is_empty());
-        // Same column as the short one, but its row is uniform.
-        assert_eq!(replay(cap, 4, 4, Some(40_046)), vec![40_046]);
+        let media: Vec<&Vec<u8>> = legs[0].iter().filter(|dg| !is_fec_packet(dg)).collect();
+        let ssrc = &media[0][8..12];
+        assert_ne!(ssrc, [0xDE, 0xAD, 0xBE, 0xEF], "not the upstream SSRC");
+        assert!(media.iter().all(|dg| &dg[8..12] == ssrc), "one SSRC, keepalive included");
+        assert!(media[24][RTP_HEADER_SIZE..].chunks(TS_PACKET_SIZE).all(|p| p[1] == 0x1F && p[2] == 0xFF));
+        check_contiguous(&legs[0], 4, 4, 3);
     }
 
     /// L=1: column FEC only, so a receiver publishes each datagram once.

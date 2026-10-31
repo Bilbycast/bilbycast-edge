@@ -74,7 +74,9 @@ use super::output_srt::spawn_srt_output;
 use super::output_udp::spawn_udp_output;
 use super::output_webrtc::spawn_webrtc_output;
 use super::packet::RtpPacket;
-use super::ts_continuity_fixer::{ProcessResult, TsContinuityFixer};
+use super::ts_continuity_fixer::{
+    bundle_switch_psi, frame_switch_psi, FlowFraming, ProcessResult, TsContinuityFixer,
+};
 use super::bandwidth_monitor::spawn_bandwidth_monitor;
 use super::degradation_monitor::spawn_degradation_monitor;
 use super::media_analysis::spawn_media_analyzer;
@@ -1379,15 +1381,27 @@ impl FlowRuntime {
         // source PCRs, so the alarm only fires for passthrough /
         // transcoded flows in practice. For PID-bus flows the equivalent
         // alarm comes from each input's per-input ES bus stats (Phase 4).
-        let _ = crate::engine::pcr_ingress_sampler::spawn_source_discontinuity_watch(
-            &broadcast_tx,
-            config.config.id.clone(),
-            active_input_tx.subscribe(),
-            event_sender.clone(),
-            flow_stats.clone(),
-            Some(fixer_tx.clone()),
-            cancel_token.child_token(),
-        );
+        //
+        // Not on a flow that carries no MPEG-TS (ST 2110-30/-31/-40,
+        // `rtp_audio`, MXL audio without `audio_encode`): there is no PCR to
+        // follow, and PCM or ANC bytes read in 188-byte strides raised
+        // discontinuity events and had the fixer arm DIs on noise. A flow
+        // with no inputs yet may gain TS ones; on a mixed flow (TS plus
+        // ST 2110-40) the fixer ignores a report while a non-TS input is
+        // active.
+        let carries_ts = config.inputs.is_empty()
+            || config.inputs.iter().any(|d| d.config.is_ts_carrier());
+        if carries_ts {
+            let _ = crate::engine::pcr_ingress_sampler::spawn_source_discontinuity_watch(
+                &broadcast_tx,
+                config.config.id.clone(),
+                active_input_tx.subscribe(),
+                event_sender.clone(),
+                flow_stats.clone(),
+                Some(fixer_tx.clone()),
+                cancel_token.child_token(),
+            );
+        }
         {
             let mc = master_clock.clone();
             let acc = flow_stats.clone();
@@ -4245,6 +4259,7 @@ pub(crate) fn spawn_input_runtime(
             ctx.fixer_tx.clone(),
             force_idr.clone(),
             per_input_counters,
+            input_def.config.is_ts_carrier(),
         )
     };
 
@@ -4724,7 +4739,8 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
 /// natural keyframe before they can display the switched feed.
 /// Idle-keepalive period. When the active input's forwarder has gone
 /// this long without receiving a natural packet, it injects a single
-/// NULL-PID (0x1FFF) TS packet into the output so downstream receivers
+/// NULL-PID (0x1FFF) TS packet into the output — on an input that carries
+/// TS; a PCM or ANC input's forwarder sends none — so downstream receivers
 /// (ffplay, VLC, hardware decoders) see a live stream instead of socket
 /// silence. Without this, a 3 s+ gap on the output — which happens
 /// whenever the operator switches to an input that has no source feeding
@@ -4778,14 +4794,25 @@ pub(crate) fn null_ts_packet() -> RtpPacket {
 pub(crate) enum FixerCommand {
     /// The active input just produced a media packet. The fixer stamps a
     /// pending DI on its PCR and forwards it to the flow's broadcast
-    /// channel (its CC as the source sent it).
+    /// channel (its CC as the source sent it), in the flow's framing
+    /// (`FlowFraming`).
     ActivePacket { input_id: String, pkt: RtpPacket },
     /// A passive input produced a packet. The fixer uses it to pre-warm its
     /// per-input PSI cache so the next switch can inject a fresh PAT/PMT.
     PassivePacket { input_id: String, pkt: RtpPacket },
-    /// The active input changed. The fixer emits any cached PSI packets for
-    /// the newly-active input and arms DI on the first PCR.
-    Switch { input_id: String },
+    /// The active input changed, and `pkt` is the first packet of the input
+    /// now active. The fixer emits the input's cached PSI framed like `pkt`
+    /// (`frame_switch_psi`), arms DI on the first PCR, then handles `pkt`
+    /// as an `ActivePacket`. The packet rides with the switch because the
+    /// PSI's framing — and, on an RTP-framed input, its SSRC and sequence
+    /// numbers — is that of the datagram it goes out ahead of.
+    Switch { input_id: String, pkt: RtpPacket },
+    /// The active input carries no MPEG-TS (ST 2110-30/-31/-40, `rtp_audio`,
+    /// MXL audio without `audio_encode` — `InputConfig::is_ts_carrier`).
+    /// Forwarded as it came: nothing in it is read as TS, so no DI lands on
+    /// PCM or ANC bytes that happen to look like a PCR, and while it is
+    /// active a source discontinuity arms nothing.
+    OpaquePacket { pkt: RtpPacket },
     /// Emit a keepalive NULL datagram to keep downstream sockets alive
     /// during a silent active input.
     Keepalive,
@@ -4822,56 +4849,64 @@ async fn ts_fixer_task(
     cancel: CancellationToken,
 ) {
     let mut fixer = TsContinuityFixer::new();
+    let mut framing = FlowFraming::new();
+    // Whether the active input carries MPEG-TS, from the last packet it
+    // handed over. A source discontinuity the watcher reports while it does
+    // not was read off bytes that are not TS.
+    let mut active_ts = true;
+    let publish = |pkt: RtpPacket| {
+        if out_tx.send(pkt).is_err() {
+            FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
+        }
+    };
     loop {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
             cmd = rx.recv() => match cmd {
                 Some(FixerCommand::ActivePacket { input_id, pkt }) => {
-                    match fixer.process_packet(&input_id, &pkt) {
-                        ProcessResult::Rewritten(fixed_data) => {
-                            // The same datagram with one DI bit set: it
-                            // keeps every field it arrived with. The PLL
-                            // sampler reads `sender_timestamp_us` off this
-                            // broadcast, and a datagram without it would
-                            // feed its PCR into the srctime-domain PLL and
-                            // re-anchor it twice per DI (edge#214).
-                            if out_tx.send(RtpPacket { data: fixed_data, ..pkt }).is_err() {
-                                FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        ProcessResult::Unchanged => {
-                            if out_tx.send(pkt).is_err() {
-                                FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
+                    active_ts = true;
+                    framing.observe(&pkt);
+                    framing.conform(fix_active_packet(&mut fixer, &input_id, pkt), publish);
                 }
                 Some(FixerCommand::PassivePacket { input_id, pkt }) => {
                     fixer.observe_passive(&input_id, &pkt);
                 }
-                Some(FixerCommand::Switch { input_id }) => {
+                Some(FixerCommand::Switch { input_id, pkt }) => {
+                    active_ts = true;
+                    // The flow takes its framing from the input's datagram,
+                    // never from the PSI injected ahead of it.
+                    framing.observe(&pkt);
                     let injected = fixer.on_switch(&input_id);
+                    // Framed like the datagram it precedes when that goes
+                    // out as it came; otherwise left raw for `conform` to
+                    // put in the flow's framing with it.
+                    let injected = if framing.passes(&pkt) {
+                        frame_switch_psi(injected, &pkt)
+                    } else {
+                        bundle_switch_psi(injected, &pkt)
+                    };
                     tracing::info!(
-                        "TS fixer: switch to '{}', injecting {} PSI packets",
+                        "TS fixer: switch to '{}', injecting {} PSI datagrams",
                         input_id, injected.len()
                     );
                     for inj_pkt in injected {
-                        if out_tx.send(inj_pkt).is_err() {
-                            FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
-                        }
+                        framing.conform(inj_pkt, publish);
                     }
+                    framing.conform(fix_active_packet(&mut fixer, &input_id, pkt), publish);
                 }
-                Some(FixerCommand::Keepalive) => {
-                    if out_tx.send(null_ts_packet()).is_err() {
-                        FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
-                    }
+                Some(FixerCommand::OpaquePacket { pkt }) => {
+                    active_ts = false;
+                    publish(pkt);
                 }
+                Some(FixerCommand::Keepalive) => publish(null_ts_packet()),
                 Some(FixerCommand::SignalSourceDiscontinuity { pcr_pid }) => {
                     // The watcher saw an upstream PCR jump on `pcr_pid`.
                     // Arm DI for that PID's next PCR through the fixer.
                     // One-shot; consumed inside `process_packet`.
-                    fixer.signal_source_discontinuity(pcr_pid);
+                    if active_ts {
+                        fixer.signal_source_discontinuity(pcr_pid);
+                    }
                 }
                 Some(FixerCommand::DropInputPsi { input_id }) => {
                     // An input was hot-removed. Drop its cached PAT/PMT
@@ -4885,6 +4920,25 @@ async fn ts_fixer_task(
     }
 }
 
+/// `pkt` as the fixer forwards it from the active input: with the DI bit
+/// set on the PCR that takes a pending one, and otherwise as it came.
+fn fix_active_packet(fixer: &mut TsContinuityFixer, input_id: &str, pkt: RtpPacket) -> RtpPacket {
+    match fixer.process_packet(input_id, &pkt) {
+        // The same datagram with one DI bit set: it keeps every field it
+        // arrived with. The PLL sampler reads `sender_timestamp_us` off the
+        // flow broadcast, and a datagram without it would feed its PCR into
+        // the srctime-domain PLL and re-anchor it twice per DI (edge#214).
+        ProcessResult::Rewritten(fixed_data) => RtpPacket { data: fixed_data, ..pkt },
+        ProcessResult::Unchanged => pkt,
+    }
+}
+
+/// Spawn one input's forwarder (described above [`KEEPALIVE_INTERVAL_MS`]).
+/// `ts_carrier` is whether the input produces MPEG-TS
+/// (`InputConfig::is_ts_carrier`); one that does not hands its active
+/// datagrams over as `FixerCommand::OpaquePacket` and its passive ones not
+/// at all, since there is no PSI in them to cache, and sends no keepalive
+/// while silent.
 fn spawn_input_forwarder(
     input_id: String,
     mut rx: broadcast::Receiver<RtpPacket>,
@@ -4893,6 +4947,7 @@ fn spawn_input_forwarder(
     fixer_tx: tokio::sync::mpsc::Sender<FixerCommand>,
     force_idr: Arc<std::sync::atomic::AtomicBool>,
     per_input_counters: Arc<crate::stats::collector::PerInputCounters>,
+    ts_carrier: bool,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut was_active = *active_input_rx.borrow() == input_id;
@@ -4919,36 +4974,52 @@ fn spawn_input_forwarder(
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                         let is_active = *active_input_rx.borrow() == input_id;
+                        let became_active = is_active && !was_active;
+                        was_active = is_active;
 
-                        if is_active && !was_active {
-                            // This input just became active — ask the fixer
-                            // task to switch and inject cached PSI.
-                            if fixer_tx.try_send(FixerCommand::Switch { input_id: input_id.clone() }).is_err() {
-                                FIXER_TS_SWITCH_FULL.fetch_add(1, Ordering::Relaxed);
-                            }
+                        if became_active {
                             // Ask any ingress video re-encoder on this input
                             // to emit an IDR on its next frame. Passthrough
                             // inputs ignore the flag (no encoder to signal).
                             force_idr.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        was_active = is_active;
 
                         if is_active {
-                            // Drop on full — matches broadcast channel drop-on-lag.
-                            if fixer_tx.try_send(FixerCommand::ActivePacket {
-                                input_id: input_id.clone(),
-                                pkt,
-                            }).is_err() {
-                                FIXER_TS_ACTIVE_FULL.fetch_add(1, Ordering::Relaxed);
+                            // Drop on full — matches broadcast channel
+                            // drop-on-lag. An input that just became active
+                            // asks the fixer task to switch, inject its
+                            // cached PSI and arm DI, with this packet.
+                            let (cmd, full) = if !ts_carrier {
+                                (FixerCommand::OpaquePacket { pkt }, &FIXER_TS_ACTIVE_FULL)
+                            } else if became_active {
+                                (
+                                    FixerCommand::Switch { input_id: input_id.clone(), pkt },
+                                    &FIXER_TS_SWITCH_FULL,
+                                )
+                            } else {
+                                (
+                                    FixerCommand::ActivePacket { input_id: input_id.clone(), pkt },
+                                    &FIXER_TS_ACTIVE_FULL,
+                                )
+                            };
+                            if fixer_tx.try_send(cmd).is_err() {
+                                full.fetch_add(1, Ordering::Relaxed);
+                                // A switch the full queue refused goes with
+                                // the input's next packet: the packet is lost
+                                // either way, as an `ActivePacket` would have
+                                // been, but the PSI and DI are not.
+                                if became_active {
+                                    was_active = false;
+                                }
                             }
                             keepalive.reset();
-                        } else {
-                            if fixer_tx.try_send(FixerCommand::PassivePacket {
+                        } else if ts_carrier
+                            && fixer_tx.try_send(FixerCommand::PassivePacket {
                                 input_id: input_id.clone(),
                                 pkt,
-                            }).is_err() {
-                                FIXER_TS_PASSIVE_FULL.fetch_add(1, Ordering::Relaxed);
-                            }
+                            }).is_err()
+                        {
+                            FIXER_TS_PASSIVE_FULL.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -4962,8 +5033,13 @@ fn spawn_input_forwarder(
                 _ = keepalive.tick() => {
                     // Only emit keepalive when *this* input is the active
                     // one. Otherwise every passive forwarder would spam
-                    // null packets into the broadcast channel.
-                    if *active_input_rx.borrow() == input_id
+                    // null packets into the broadcast channel. Never for an
+                    // input that carries no TS: a datagram of TS NULL
+                    // packets in a PCM or ANC stream is no keepalive, and
+                    // its outputs (ST 2110, `rtp_audio`) were handed one
+                    // every 250 ms the input was silent.
+                    if ts_carrier
+                        && *active_input_rx.borrow() == input_id
                         && fixer_tx.try_send(FixerCommand::Keepalive).is_err() {
                             FIXER_TS_KEEPALIVE_FULL.fetch_add(1, Ordering::Relaxed);
                         }
@@ -8448,6 +8524,11 @@ mod fixer_task_tests {
         FixerCommand::ActivePacket { input_id: input.to_string(), pkt: raw(&payload_packet(0x100, cc)) }
     }
 
+    /// The switch to `input`, with its first packet.
+    fn switch(input: &str, cc: u8) -> FixerCommand {
+        FixerCommand::Switch { input_id: input.to_string(), pkt: raw(&payload_packet(0x100, cc)) }
+    }
+
     /// A payload-bearing packet on `pid` carrying a PCR, DI clear.
     fn pcr_packet(pid: u16, cc: u8, pcr_27mhz: u64) -> [u8; TS_PACKET_SIZE] {
         let mut pkt = [0xFFu8; TS_PACKET_SIZE];
@@ -8501,8 +8582,8 @@ mod fixer_task_tests {
     #[tokio::test]
     async fn tr101290_counts_upstream_loss_through_the_fixer() {
         let mut cmds: Vec<_> = (0..10).map(|cc| active("a", cc)).collect();
-        cmds.push(FixerCommand::Switch { input_id: "b".to_string() });
-        cmds.extend([0u8, 1, 2, 3, 4, 7, 8, 9].map(|cc| active("b", cc)));
+        cmds.push(switch("b", 0));
+        cmds.extend([1u8, 2, 3, 4, 7, 8, 9].map(|cc| active("b", cc)));
         assert_eq!(cc_errors_through_the_fixer(cmds, 18).await, 2, "the switch jump plus the gap");
 
         let mut cmds: Vec<_> = (0..5).map(|cc| active("a", cc)).collect();
@@ -8525,7 +8606,6 @@ mod fixer_task_tests {
         let _stop = cancel.clone().drop_guard();
         let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(16);
         tokio::spawn(ts_fixer_task(fixer_rx, tx.clone(), cancel.clone()));
-        fixer_tx.send(FixerCommand::Switch { input_id: "b".to_string() }).await.expect("the fixer task runs");
         let mut pkt = raw(&pcr_packet(0x100, 3, 27_000_000));
         pkt.sequence_number = 41;
         pkt.recv_time_us = 123_456;
@@ -8533,7 +8613,7 @@ mod fixer_task_tests {
         pkt.upstream_seq = Some(7);
         pkt.upstream_leg_id = Some(1);
         fixer_tx
-            .send(FixerCommand::ActivePacket { input_id: "b".to_string(), pkt })
+            .send(FixerCommand::Switch { input_id: "b".to_string(), pkt })
             .await
             .expect("the fixer task runs");
         let out = tokio::time::timeout(Duration::from_secs(5), rx.recv())
@@ -8546,5 +8626,283 @@ mod fixer_task_tests {
         assert_eq!(out.upstream_seq, Some(7));
         assert_eq!(out.upstream_leg_id, Some(1));
         assert_eq!((out.sequence_number, out.recv_time_us), (41, 123_456));
+    }
+
+    /// An RTP datagram numbered `seq` under `ssrc` carrying the TS packets `ts`.
+    fn rtp(ssrc: u32, seq: u16, ts: &[u8]) -> RtpPacket {
+        let mut data = vec![0x80, 33];
+        data.extend_from_slice(&seq.to_be_bytes());
+        data.extend_from_slice(&90_000u32.to_be_bytes());
+        data.extend_from_slice(&ssrc.to_be_bytes());
+        data.extend_from_slice(ts);
+        RtpPacket { data: Bytes::from(data), sequence_number: seq, is_raw_ts: false, ..raw(&[]) }
+    }
+
+    fn ssrc_of(pkt: &RtpPacket) -> u32 {
+        u32::from_be_bytes([pkt.data[8], pkt.data[9], pkt.data[10], pkt.data[11]])
+    }
+
+    fn seq_of(pkt: &RtpPacket) -> u16 {
+        u16::from_be_bytes([pkt.data[2], pkt.data[3]])
+    }
+
+    /// B's PAT and its one-packet PMT on PID 0x1000, back to back.
+    fn psi() -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[])]);
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        ts
+    }
+
+    /// Run `cmds` through a fixer task and collect what it publishes.
+    async fn published(cmds: Vec<FixerCommand>, expect: usize) -> Vec<RtpPacket> {
+        let (tx, mut rx) = broadcast::channel(64);
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(ts_fixer_task(fixer_rx, tx.clone(), cancel.clone()));
+        for cmd in cmds {
+            fixer_tx.send(cmd).await.expect("the fixer task runs");
+        }
+        let mut out = Vec::new();
+        while out.len() < expect {
+            let pkt = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the fixer publishes it")
+                .expect("on the flow broadcast");
+            out.push(pkt);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx.recv()).await.is_err(),
+            "nothing more"
+        );
+        out
+    }
+
+    /// The PSI a switch to an RTP-framed input injects goes out as RTP, in
+    /// that input's stream: its SSRC, numbered just ahead of its first
+    /// datagram. It went out as raw TS, the first datagram of the new input
+    /// on an RTP-framed flow, which an SRT receiver (re)connecting then
+    /// settled its framing on, dropping all the RTP after it.
+    #[tokio::test]
+    async fn a_switch_injects_psi_in_the_rtp_framing_of_the_input_switched_to() {
+        let out = published(
+            vec![
+                FixerCommand::ActivePacket { input_id: "a".into(), pkt: rtp(0xA, 100, &payload_packet(0x100, 0)) },
+                FixerCommand::PassivePacket { input_id: "b".into(), pkt: rtp(0xB, 499, &psi()) },
+                FixerCommand::Switch { input_id: "b".into(), pkt: rtp(0xB, 500, &payload_packet(0x100, 0)) },
+            ],
+            3,
+        )
+        .await;
+        assert!(out.iter().all(|p| !p.is_raw_ts), "nothing raw on an RTP-framed flow");
+        let injected = &out[1];
+        assert_eq!((ssrc_of(injected), seq_of(injected)), (0xB, 499));
+        assert_eq!(injected.sequence_number, 499);
+        assert_eq!(injected.data.len(), 12 + 2 * TS_PACKET_SIZE, "PAT and PMT in one datagram");
+        assert_eq!(&injected.data[12..12 + 4], &psi()[..4], "the PAT first");
+        assert_eq!((ssrc_of(&out[2]), seq_of(&out[2])), (0xB, 500), "then the input's own datagram");
+    }
+
+    /// A flow switching between an RTP-framed input and a raw-TS one keeps
+    /// the framing it started with: the raw-TS input — and the PSI injected
+    /// ahead of it — goes out wrapped in the flow's own RTP header, one
+    /// SSRC, numbered on, six TS packets to a datagram; the RTP input back
+    /// on air goes out as it came. A flow that started raw strips the RTP
+    /// input's header instead.
+    #[tokio::test]
+    async fn a_flow_keeps_the_framing_it_started_with_across_takes() {
+        let seven: Vec<u8> = (0..7).flat_map(|cc| payload_packet(0x100, cc)).collect();
+        let out = published(
+            vec![
+                FixerCommand::ActivePacket { input_id: "a".into(), pkt: rtp(0xA, 100, &payload_packet(0x100, 0)) },
+                FixerCommand::PassivePacket { input_id: "b".into(), pkt: raw(&psi()) },
+                FixerCommand::Switch { input_id: "b".into(), pkt: raw(&seven) },
+                FixerCommand::Switch { input_id: "a".into(), pkt: rtp(0xA, 140, &payload_packet(0x100, 1)) },
+            ],
+            5,
+        )
+        .await;
+        assert!(out.iter().all(|p| !p.is_raw_ts));
+        let wrapped = &out[1..4];
+        let ssrc = ssrc_of(&wrapped[0]);
+        assert_ne!(ssrc, 0xA, "the flow's own SSRC");
+        for (i, p) in wrapped.iter().enumerate() {
+            assert_eq!(ssrc_of(p), ssrc);
+            assert_eq!(seq_of(p), seq_of(&wrapped[0]).wrapping_add(i as u16), "numbered on");
+        }
+        let injected: Vec<u16> =
+            wrapped[0].data[12..].chunks(TS_PACKET_SIZE).map(crate::engine::ts_parse::ts_pid).collect();
+        assert_eq!(injected, [0, 0x1000], "the PAT and PMT ahead of the input, in one datagram");
+        assert_eq!(wrapped[1].data.len(), 12 + 6 * TS_PACKET_SIZE);
+        assert_eq!(&wrapped[1].data[12..], &seven[..6 * TS_PACKET_SIZE]);
+        assert_eq!(&wrapped[2].data[12..], &seven[6 * TS_PACKET_SIZE..]);
+        assert_eq!((ssrc_of(&out[4]), seq_of(&out[4])), (0xA, 140), "the RTP input as it came");
+
+        let out = published(
+            vec![
+                FixerCommand::ActivePacket { input_id: "b".into(), pkt: raw(&seven) },
+                FixerCommand::Switch { input_id: "a".into(), pkt: rtp(0xA, 7, &payload_packet(0x100, 2)) },
+            ],
+            2,
+        )
+        .await;
+        assert!(out.iter().all(|p| p.is_raw_ts));
+        assert_eq!(&out[1].data[..], &payload_packet(0x100, 2)[..], "stripped of its header");
+    }
+
+    /// `input`'s forwarder, reading `input_tx`, with its liveness counters.
+    fn forwarder(
+        input: &str,
+        ts_carrier: bool,
+        input_tx: &broadcast::Sender<RtpPacket>,
+        active_rx: watch::Receiver<String>,
+        fixer_tx: &tokio::sync::mpsc::Sender<FixerCommand>,
+        cancel: &CancellationToken,
+    ) -> (JoinHandle<()>, Arc<crate::stats::collector::PerInputCounters>) {
+        let meta = crate::stats::collector::InputConfigMeta {
+            mode: None,
+            local_addr: None,
+            remote_addr: None,
+            listen_addr: None,
+            bind_addr: None,
+            rtsp_url: None,
+            whep_url: None,
+        };
+        let counters = Arc::new(crate::stats::collector::PerInputCounters::new("test".into(), meta));
+        let handle = spawn_input_forwarder(
+            input.into(),
+            input_tx.subscribe(),
+            active_rx,
+            cancel.clone(),
+            fixer_tx.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            counters.clone(),
+            ts_carrier,
+        );
+        (handle, counters)
+    }
+
+    /// A silent active input that carries no TS sends no keepalive: a
+    /// datagram of TS NULL packets is nothing a PCM or ANC output can take,
+    /// and its forwarder sent one every 250 ms. A TS input's still does.
+    #[tokio::test]
+    async fn a_silent_non_ts_input_sends_no_keepalive() {
+        for ts_carrier in [false, true] {
+            let (flow_tx, mut flow_rx) = broadcast::channel(64);
+            let (input_tx, _) = broadcast::channel(64);
+            let cancel = CancellationToken::new();
+            let _stop = cancel.clone().drop_guard();
+            let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(64);
+            tokio::spawn(ts_fixer_task(fixer_rx, flow_tx.clone(), cancel.clone()));
+            let (_active_tx, active_rx) = watch::channel("in".to_string());
+            let _fwd = forwarder("in", ts_carrier, &input_tx, active_rx, &fixer_tx, &cancel);
+            let got = tokio::time::timeout(Duration::from_millis(700), flow_rx.recv()).await;
+            if ts_carrier {
+                let pkt = got.expect("a keepalive within 700 ms").expect("on the flow broadcast");
+                assert!(crate::engine::ts_parse::is_null_ts_only(&pkt.data));
+            } else {
+                assert!(got.is_err(), "no keepalive from an input that carries no TS");
+            }
+        }
+    }
+
+    /// A switch the fixer's full queue refuses goes with the input's next
+    /// packet, so the switch's DI still lands. It went with the first packet
+    /// alone, and both were lost: the switch's PSI and DI never came.
+    #[tokio::test]
+    async fn a_switch_refused_by_a_full_queue_goes_with_the_next_packet() {
+        let (flow_tx, mut flow_rx) = broadcast::channel(64);
+        let (input_tx, _) = broadcast::channel(64);
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(1);
+        fixer_tx.try_send(FixerCommand::Keepalive).expect("room for one");
+        let (active_tx, active_rx) = watch::channel("a".to_string());
+        let (_fwd, counters) = forwarder("b", true, &input_tx, active_rx, &fixer_tx, &cancel);
+        // Let the forwarder start while "a" is on air, then take "b".
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        active_tx.send("b".to_string()).expect("the forwarder watches");
+        let published = |cc: u8| {
+            input_tx.send(raw(&pcr_packet(0x100, cc, 27_000_000 + cc as u64 * 1_080_000))).expect("subscribed");
+        };
+        published(0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while counters.packets.load(Ordering::Relaxed) < 1 {
+            assert!(std::time::Instant::now() < deadline, "the forwarder reads it");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The queue drains; the next packet carries the switch.
+        tokio::spawn(ts_fixer_task(fixer_rx, flow_tx.clone(), cancel.clone()));
+        published(1);
+        let out = loop {
+            let pkt = tokio::time::timeout(Duration::from_secs(5), flow_rx.recv())
+                .await
+                .expect("published")
+                .expect("on the flow broadcast");
+            if !crate::engine::ts_parse::is_null_ts_only(&pkt.data) {
+                break pkt;
+            }
+        };
+        assert_eq!(ts_cc(&out.data[..TS_PACKET_SIZE]), 1, "the next packet");
+        assert!(ts_discontinuity_indicator(&out.data[..TS_PACKET_SIZE]), "with the switch's DI");
+    }
+
+    /// An input that carries no MPEG-TS reaches the flow as it came: a
+    /// 188-byte stride of its PCM that starts 0x47 and reads as a PCR on a
+    /// PID with a pending DI takes no DI bit, and a source discontinuity
+    /// reported while it is on air arms nothing. Its forwarder used to hand
+    /// it to the fixer like any TS input.
+    #[tokio::test]
+    async fn a_non_ts_input_passes_the_fixer_untouched() {
+        use crate::engine::ts_parse::pcr_only_packet;
+        let (flow_tx, mut flow_rx) = broadcast::channel(64);
+        let (input_tx, _) = broadcast::channel(64);
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(ts_fixer_task(fixer_rx, flow_tx.clone(), cancel.clone()));
+        let (_active_tx, active_rx) = watch::channel("pcm".to_string());
+        let (_fwd, _) = forwarder("pcm", false, &input_tx, active_rx, &fixer_tx, &cancel);
+        // A DI armed for PID 0x100 while a TS input was on air.
+        fixer_tx
+            .send(FixerCommand::SignalSourceDiscontinuity { pcr_pid: 0x100 })
+            .await
+            .expect("the fixer task runs");
+        // PCM whose bytes after the RTP header happen to read as a PCR on
+        // PID 0x100.
+        let pcm = RtpPacket {
+            data: Bytes::from(
+                [&[0x80, 97, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1][..], &pcr_only_packet(0x100, 0, 27_000_000, false)]
+                    .concat(),
+            ),
+            is_raw_ts: false,
+            ..raw(&[])
+        };
+        input_tx.send(pcm.clone()).expect("the forwarder subscribes");
+        let out = tokio::time::timeout(Duration::from_secs(5), flow_rx.recv())
+            .await
+            .expect("forwarded")
+            .expect("on the flow broadcast");
+        assert_eq!(out.data, pcm.data, "byte for byte");
+
+        // Reported while the PCM is on air: ignored.
+        fixer_tx
+            .send(FixerCommand::SignalSourceDiscontinuity { pcr_pid: 0x200 })
+            .await
+            .expect("the fixer task runs");
+        fixer_tx
+            .send(FixerCommand::ActivePacket {
+                input_id: "ts".into(),
+                pkt: raw(&pcr_only_packet(0x200, 0, 27_000_000, false)),
+            })
+            .await
+            .expect("the fixer task runs");
+        let out = tokio::time::timeout(Duration::from_secs(5), flow_rx.recv())
+            .await
+            .expect("forwarded")
+            .expect("on the flow broadcast");
+        assert!(!ts_discontinuity_indicator(&out.data[..TS_PACKET_SIZE]), "no DI armed by it");
     }
 }

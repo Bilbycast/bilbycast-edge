@@ -226,7 +226,16 @@ broadcast IRDs) do not lose lock during a switch:
    shared). Passive inputs observe PSI tables while running warm. On switch,
    the *new* input's cached PAT and PMTs are immediately injected before the
    first data packet, so receivers can re-acquire the stream structure without
-   waiting for the next natural PAT/PMT cycle (~200 ms).
+   waiting for the next natural PAT/PMT cycle (~200 ms). The forwarder hands
+   the fixer task that first packet with the switch (`FixerCommand::Switch`),
+   and the PSI goes out in its framing (`frame_switch_psi`): ahead of an
+   RTP datagram, as RTP datagrams of up to six TS packets under the input's
+   SSRC, payload type and timestamp, numbered up to the one before it —
+   numbers of the input's own datagrams that never left the flow while it
+   was passive. Injected as raw TS whatever the input's framing (until
+   2026-10), it was the first datagram of the new input on an RTP-framed
+   flow, which an SRT output passes through and a (re)connecting receiver
+   that settles its framing on its first datagram took for raw TS.
 
 3. **PSI version bump — monotonic, per-fixer.** Injected PAT/PMT packets have
    their `version_number` rewritten in place (with CRC32 recalculated) to a
@@ -245,6 +254,13 @@ broadcast IRDs) do not lose lock during a switch:
    gets a fresh stamp. Wraps at 32; each consecutive switch is still
    different from the previous.
 
+   The switch also arms the `discontinuity_indicator` for the new input's
+   first PCR and for the first PCR on every PCR PID its cached PMTs name, so
+   each program of an MPTS marks its new clock (until 2026-10 only the first
+   PCR of any program did, and the source-discontinuity watch added the
+   others' a PCR late). A switch the fixer's full queue refuses goes with
+   the input's next packet rather than being lost with the first.
+
 4. **Immediate forwarding** — All packets (video, audio, data) are forwarded
    immediately after a switch. The CC jump signals receivers to flush and
    resync on the next PES start. **Fully format-agnostic**: inputs can use
@@ -252,12 +268,34 @@ broadcast IRDs) do not lose lock during a switch:
    JPEG 2000, uncompressed video, SMPTE ST 2110-30/-31/-40, AAC, HE-AAC,
    Opus, MP2, AC-3, LPCM, SMPTE 302M, or any future format. Inputs do not
    need to share the same codec, resolution, frame rate, sample rate, channel
-   count, or stream structure. For non-TS transports (e.g., raw ST 2110 RTP,
-   `rtp_audio`, MXL audio) the switch mechanism (watch channel) works
-   identically, and the fixer leaves the payload unchanged except for one
-   bit: while a DI is pending (on any PID after a switch, on that PID after
-   a source discontinuity), a 188-byte stride that happens to start 0x47 and
-   parse as a PCR has its discontinuity-indicator bit set.
+   count, or stream structure. For non-TS transports (raw ST 2110-30/-31/-40
+   RTP, `rtp_audio`, MXL audio without `audio_encode`: every input
+   `InputConfig::is_ts_carrier` says is not TS) the switch mechanism (watch
+   channel) works identically, and the payload never reaches the fixer: the
+   forwarder hands an active datagram over as `FixerCommand::OpaquePacket`,
+   forwarded byte for byte, and a passive one not at all. While such an
+   input is on air a source discontinuity arms nothing, and a flow whose
+   inputs carry no TS runs no source-discontinuity watcher. Until 2026-10
+   the fixer read such a payload as TS: while a DI was pending, a 188-byte
+   stride that happened to start 0x47 and parse as a PCR had its
+   discontinuity-indicator bit set.
+
+   **One framing per flow.** The fixer task also keeps the flow's broadcast
+   in one TS framing (`FlowFraming`): the framing of the first media
+   datagram it forwards, RTP-wrapped or raw. A flow switching between an
+   RTP-framed input and a raw-TS one converts the input in the other
+   framing, once, for every output — an RTP datagram on a raw-TS flow loses
+   its header; a raw-TS datagram on an RTP-framed flow is wrapped in the
+   flow's own RTP header (its own SSRC and sequence numbers, six TS packets
+   to a datagram, so an SRT output carries each in one 1316-byte message).
+   That SSRC changes at the Take like any switch between two RTP inputs and
+   is never interleaved with an input's. Outputs that pass framing through
+   (SRT) therefore carry one framing for the flow's life; outputs that strip
+   (UDP, RIST, bonded) or re-wrap (RTP, single-leg and 2022-7) never cared.
+   A flow whose inputs share a framing converts nothing. An SRT output still
+   has to fit each datagram to one 1316-byte live message: from the first
+   RTP datagram that does not fit, it numbers the stream itself, six TS
+   packets to a datagram (`KeepaliveGate::fit`).
 
 5. **Force IDR on the newly-active ingress re-encoder** — When the incoming
    input has an `video_encode` stage (ingress transcoding), the forwarder
@@ -279,13 +317,16 @@ broadcast IRDs) do not lose lock during a switch:
    flushes it immediately rather than letting it sit in the buffer.
    Receivers are required by spec to drop NULL packets; the keepalive
    exists purely to keep sockets and decoder state alive during dead-
-   input periods. Without it, a 3 s+ silence on the output triggers
+   input periods. Only an input that carries TS gets it: a PCM or ANC
+   input's forwarder sends none (it used to). Without it, a 3 s+ silence on the output triggers
    time-out / EOF behaviour in several downstream receivers that cannot
    be recovered by later data resuming. The keepalive is raw TS whatever
    the input's framing; an SRT output keeps each packet's framing, so it
    sends the keepalive only once its media has gone out raw TS
    (`output_srt::KeepaliveGate`), and an SRT input never settles its
-   payload format on one.
+   payload format on one. It is not conformed to the flow's framing: an RTP
+   output wraps it itself, under the same SSRC and numbers as the rest of
+   what it sends.
 
 With mechanisms 1–6 combined, the visible switch latency at the receiver is
 one to two frames regardless of whether the target input is passthrough or

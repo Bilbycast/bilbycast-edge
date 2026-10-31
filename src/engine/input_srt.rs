@@ -65,23 +65,182 @@ enum SrtPayloadFormat {
 /// What an SRT input's receive loop carries across reconnects: the payload
 /// format detected on the first packet that can tell and the sequence it
 /// numbers packets with, so a reconnect neither re-detects nor restarts the
-/// gap check.
+/// gap check, and the watch for a sender that has changed framing since
+/// ([`FormatRecheck`]).
 struct SrtRecvState {
     format: SrtPayloadFormat,
     last_seq: Option<u16>,
     raw_ts_seq_counter: u16,
     raw_ts_timestamp: u32,
+    recheck: FormatRecheck,
 }
 
 impl SrtRecvState {
-    fn new() -> Self {
+    fn new(events: &EventSender, flow_id: &str, input_id: &str) -> Self {
         Self {
             format: SrtPayloadFormat::Unknown,
             last_seq: None,
             raw_ts_seq_counter: 0,
             raw_ts_timestamp: 0,
+            recheck: FormatRecheck::new(events, flow_id, input_id),
         }
     }
+}
+
+/// Datagrams in a row that must show the other framing beyond doubt
+/// ([`clear_framing`]) before a settled single-socket input re-detects
+/// ([`FormatRecheck`]). Well above the few datagrams of raw PSI a bilbycast
+/// sender older than this rule injects into an RTP stream at a Take, one per
+/// PAT / PMT packet, which must not move it; at 1316-byte datagrams a tenth
+/// of a second of a 5 Mbit/s stream.
+const FORMAT_RECHECK_RUN: u32 = 50;
+
+/// The framing `data` shows beyond doubt: an RTP version-2 header followed
+/// by whole TS packets, each starting with the sync byte, or whole TS
+/// packets alone that are not all NULL. `None` for anything less clear — a
+/// datagram cut off a byte stream (which reads as RTP version 2 a quarter
+/// of the time), a datagram of NULL packets alone (raw TS whatever framing
+/// its sender's media takes), anything else.
+fn clear_framing(data: &[u8]) -> Option<SrtPayloadFormat> {
+    let whole_ts = |ts: &[u8]| {
+        !ts.is_empty()
+            && ts.len().is_multiple_of(TS_PACKET_SIZE)
+            && ts.chunks_exact(TS_PACKET_SIZE).all(|p| p[0] == TS_SYNC_BYTE)
+    };
+    if whole_ts(data) {
+        return (!is_null_ts_only(data)).then_some(SrtPayloadFormat::RawTs);
+    }
+    if !is_likely_rtp(data) {
+        return None;
+    }
+    let mut header = 12 + 4 * (data[0] & 0x0F) as usize;
+    if data[0] & 0x10 != 0 {
+        let ext = data.get(header + 2..header + 4)?;
+        header += 4 + 4 * u16::from_be_bytes([ext[0], ext[1]]) as usize;
+    }
+    whole_ts(data.get(header..)?).then_some(SrtPayloadFormat::RtpTs)
+}
+
+/// What a settled single-socket input does with a datagram, by
+/// [`FormatRecheck::check`].
+#[derive(Debug, PartialEq)]
+enum Recheck {
+    /// Handle it in the settled format.
+    Keep,
+    /// Drop it: clearly in the other framing, before a run has re-settled.
+    Drop,
+    /// Re-settled on the other framing: handle it, and what follows, in it.
+    Resettle(SrtPayloadFormat),
+}
+
+/// How a settled single-socket SRT input follows a sender that changes its
+/// framing — or recovers from settling on the wrong one, from a first
+/// datagram that misled it (a bilbycast sender older than this rule could
+/// put raw PSI ahead of RTP at a Take).
+///
+/// The input settles its format on the first datagram that can tell
+/// ([`settle_format`]) and keeps it across reconnects, so a sender
+/// restarted with the other framing used to be dropped for good: an RTP
+/// input drops what is not RTP, and a raw-TS input published every RTP
+/// header inside the TS. Now [`FORMAT_RECHECK_RUN`] datagrams in a row that
+/// are clearly in the other framing ([`clear_framing`]) re-settle it, with
+/// a Warning `srt_payload_format_changed`; one in the settled framing
+/// starts the count again, and one that is not clear either way leaves it
+/// where it is. Until then such a datagram is dropped rather than published
+/// in a framing it is not in. A 2022-7 pair is not rechecked: it detects
+/// afresh only when both legs are down.
+struct FormatRecheck {
+    run: u32,
+    events: EventSender,
+    flow_id: String,
+    input_id: String,
+}
+
+impl FormatRecheck {
+    fn new(events: &EventSender, flow_id: &str, input_id: &str) -> Self {
+        Self {
+            run: 0,
+            events: events.clone(),
+            flow_id: flow_id.to_string(),
+            input_id: input_id.to_string(),
+        }
+    }
+
+    /// What to do with `data` on an input settled on `format`, raising the
+    /// Warning when it re-settles.
+    fn check(&mut self, format: SrtPayloadFormat, data: &[u8]) -> Recheck {
+        match clear_framing(data) {
+            Some(shown) if shown == format => {
+                self.run = 0;
+                Recheck::Keep
+            }
+            Some(shown) => {
+                self.run += 1;
+                if self.run < FORMAT_RECHECK_RUN {
+                    return Recheck::Drop;
+                }
+                self.run = 0;
+                log_detected_format(shown);
+                let (from, to) = (format_label(format), format_label(shown));
+                self.events.emit_flow_with_details(
+                    EventSeverity::Warning,
+                    category::SRT,
+                    format!(
+                        "SRT input '{}' payload format changed from {from} to {to}",
+                        self.input_id
+                    ),
+                    &self.flow_id,
+                    serde_json::json!({
+                        "error_code": "srt_payload_format_changed",
+                        "input_id": self.input_id,
+                        "from": from,
+                        "to": to,
+                        "datagrams": FORMAT_RECHECK_RUN,
+                    }),
+                );
+                Recheck::Resettle(shown)
+            }
+            None => Recheck::Keep,
+        }
+    }
+}
+
+/// The wire name of a settled format, as the events carry it.
+fn format_label(format: SrtPayloadFormat) -> &'static str {
+    match format {
+        SrtPayloadFormat::RtpTs => "rtp_ts",
+        SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => "raw_ts",
+    }
+}
+
+/// Settle or recheck a single-socket receive loop's payload format on
+/// `data`; `false` when the datagram is to be dropped. A re-settle starts
+/// the sequence gap check afresh, since the numbering changes with it.
+fn follow_format(
+    state_format: &mut SrtPayloadFormat,
+    last_seq: &mut Option<u16>,
+    recheck: &mut FormatRecheck,
+    srt: &SrtInputStats,
+    data: &[u8],
+) -> bool {
+    if *state_format == SrtPayloadFormat::Unknown {
+        if !settle_format(state_format, data) {
+            return false;
+        }
+    } else {
+        match recheck.check(*state_format, data) {
+            Recheck::Keep => return true,
+            Recheck::Drop => return false,
+            Recheck::Resettle(to) => {
+                *state_format = to;
+                *last_seq = None;
+            }
+        }
+    }
+    // libsrt's too-late drops then also leave RTP sequence gaps, which the
+    // stats must not count a second time.
+    srt.rtp_framed.store(*state_format == SrtPayloadFormat::RtpTs, Ordering::Relaxed);
+    true
 }
 
 /// Detect the payload format of an SRT datagram.
@@ -443,7 +602,7 @@ async fn srt_input_listener_loop(
             return Err(e);
         }
     };
-    let mut recv_state = SrtRecvState::new();
+    let mut recv_state = SrtRecvState::new(events, flow_id, input_id);
 
     loop {
         let socket = match accept_srt_connection(&mut listener, &cancel).await {
@@ -600,7 +759,7 @@ async fn srt_input_caller_loop(
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
-    let mut recv_state = SrtRecvState::new();
+    let mut recv_state = SrtRecvState::new(events, flow_id, input_id);
 
     // Per-input consecutive-connect-failure counter, registered by
     // `spawn_input_runtime` before this task starts. The snapshot path maps
@@ -727,7 +886,7 @@ async fn srt_input_recv_loop(
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<bool> {
-    let SrtRecvState { format, last_seq, raw_ts_seq_counter, raw_ts_timestamp } = state;
+    let SrtRecvState { format, last_seq, raw_ts_seq_counter, raw_ts_timestamp, recheck } = state;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -747,14 +906,9 @@ async fn srt_input_recv_loop(
                         let data = pkt.data;
                         // Auto-detect format on the first packet that can
                         // tell: NULL packets alone are dropped until one does.
-                        if *format == SrtPayloadFormat::Unknown {
-                            if !settle_format(format, &data) {
-                                continue;
-                            }
-                            // libsrt's too-late drops then also leave RTP
-                            // sequence gaps, which the stats must not count
-                            // a second time.
-                            srt.rtp_framed.store(*format == SrtPayloadFormat::RtpTs, Ordering::Relaxed);
+                        // Then follow a sender that changes framing.
+                        if !follow_format(format, last_seq, recheck, srt, &data) {
+                            continue;
                         }
 
                         let (seq, ts, is_raw) = match *format {
@@ -2133,7 +2287,7 @@ async fn srt_input_bonded_caller_loop(
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<()> {
     let bond = config.bonding.as_ref().expect("bonding must be set").clone();
-    let mut recv_state = SrtRecvState::new();
+    let mut recv_state = SrtRecvState::new(events, flow_id, input_id);
     // Validation guarantees the plan; if it cannot be made, the connect
     // below fails with the same error and reports it.
     let plans = plan_bond_members(&bond).unwrap_or_default();
@@ -2292,7 +2446,7 @@ async fn srt_input_bonded_listener_loop(
 ) -> anyhow::Result<()> {
     let bond = config.bonding.as_ref().expect("bonding must be set").clone();
     let mut listener = bind_srt_listener_for_bonded_input(&config).await?;
-    let mut recv_state = SrtRecvState::new();
+    let mut recv_state = SrtRecvState::new(events, flow_id, input_id);
 
     loop {
         let socket = match accept_srt_connection(&mut listener, &cancel).await {
@@ -2405,7 +2559,7 @@ async fn srt_bonded_group_recv_loop(
     transcoder: &mut Option<InputTranscoder>,
     post: &mut Option<InputPostProcess>,
 ) -> anyhow::Result<bool> {
-    let SrtRecvState { format, last_seq, raw_ts_seq_counter, raw_ts_timestamp } = state;
+    let SrtRecvState { format, last_seq, raw_ts_seq_counter, raw_ts_timestamp, recheck } = state;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(false),
@@ -2414,13 +2568,9 @@ async fn srt_bonded_group_recv_loop(
                     Ok(pkt) => {
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
-                        if *format == SrtPayloadFormat::Unknown {
-                            if !settle_format(format, &data) {
-                                continue;
-                            }
-                            // As in `srt_input_recv_loop`: an RTP payload's
-                            // drops are sequence gaps too.
-                            srt.rtp_framed.store(*format == SrtPayloadFormat::RtpTs, Ordering::Relaxed);
+                        // As in `srt_input_recv_loop`.
+                        if !follow_format(format, last_seq, recheck, srt, &data) {
+                            continue;
                         }
                         let (seq, ts, is_raw) = match *format {
                             SrtPayloadFormat::RtpTs => {
@@ -2658,11 +2808,24 @@ mod tests {
         datagrams: &[Vec<u8>],
         expect: usize,
     ) -> (Vec<RtpPacket>, Arc<FlowStatsAccumulator>) {
+        let (published, flow, _events) = published_and_raised_by_single_input(datagrams, expect).await;
+        (published, flow)
+    }
+
+    /// [`published_by_single_input`], with the events the input raised.
+    async fn published_and_raised_by_single_input(
+        datagrams: &[Vec<u8>],
+        expect: usize,
+    ) -> (
+        Vec<RtpPacket>,
+        Arc<FlowStatsAccumulator>,
+        tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+    ) {
         let port = free_port();
         let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
         flow.set_active_input_id("in");
         let (tx, mut rx) = broadcast::channel(4096);
-        let (events, _events_rx) = crate::manager::events::event_channel();
+        let (events, events_rx) = crate::manager::events::event_channel();
         let cancel = CancellationToken::new();
         let _stop = cancel.clone().drop_guard();
         spawn_srt_input(
@@ -2702,7 +2865,7 @@ mod tests {
         while let Ok(Ok(packet)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             published.push(packet);
         }
-        (published, flow)
+        (published, flow, events_rx)
     }
 
     /// The flow's keepalive reaching an input ahead of an RTP sender's first
@@ -2740,6 +2903,78 @@ mod tests {
         assert_eq!(got, [&raw[..], &ka[..], &raw[..]]);
         assert!(published.iter().all(|p| p.is_raw_ts));
         assert_eq!(flow.input_packets.load(Ordering::Relaxed), 3);
+    }
+
+    /// A settled input re-settles only on a sustained run of datagrams that
+    /// are clearly in the other framing: one in the settled framing starts
+    /// the count again, and NULL packets alone or a datagram cut off a byte
+    /// stream leave it where it is. The few raw PSI datagrams an older
+    /// sender puts into an RTP stream at a Take never move it.
+    #[test]
+    fn a_settled_format_follows_only_a_sustained_change() {
+        assert_eq!(clear_framing(&rtp_datagram(0)), Some(SrtPayloadFormat::RtpTs));
+        assert_eq!(clear_framing(&raw_ts_datagram()), Some(SrtPayloadFormat::RawTs));
+        assert_eq!(clear_framing(&keepalive()), None, "NULL packets alone");
+        assert_eq!(clear_framing(&raw_ts_datagram()[100..]), None, "cut off a byte stream");
+        let mut cut = raw_ts_datagram()[..1000].to_vec();
+        cut[0] = 0x80;
+        assert_eq!(clear_framing(&cut), None, "reads as RTP v2, with no TS after it");
+
+        let (events, mut raised) = crate::manager::events::event_channel();
+        let mut recheck = FormatRecheck::new(&events, "f1", "in");
+        let raw = SrtPayloadFormat::RawTs;
+        for _ in 0..FORMAT_RECHECK_RUN - 1 {
+            assert_eq!(recheck.check(raw, &rtp_datagram(1)), Recheck::Drop);
+            assert_eq!(recheck.check(raw, &keepalive()), Recheck::Keep, "neutral");
+        }
+        assert_eq!(recheck.check(raw, &raw_ts_datagram()), Recheck::Keep, "the count restarts");
+        for _ in 0..FORMAT_RECHECK_RUN - 1 {
+            assert_eq!(recheck.check(raw, &rtp_datagram(1)), Recheck::Drop);
+        }
+        assert!(raised.try_recv().is_err(), "nothing raised before the run completes");
+        assert_eq!(
+            recheck.check(raw, &rtp_datagram(1)),
+            Recheck::Resettle(SrtPayloadFormat::RtpTs)
+        );
+        let event = raised.try_recv().expect("the change is raised");
+        assert_eq!(event.severity, EventSeverity::Warning);
+        let details = event.details.expect("details");
+        assert_eq!(details["error_code"], "srt_payload_format_changed");
+        assert_eq!((&details["from"], &details["to"]), (&"raw_ts".into(), &"rtp_ts".into()));
+
+        let mut recheck = FormatRecheck::new(&events, "f1", "in");
+        for _ in 0..3 {
+            for _ in 0..11 {
+                assert_eq!(recheck.check(SrtPayloadFormat::RtpTs, &raw_ts_datagram()), Recheck::Drop);
+            }
+            assert_eq!(recheck.check(SrtPayloadFormat::RtpTs, &rtp_datagram(2)), Recheck::Keep);
+        }
+    }
+
+    /// An input that settled raw TS on a first datagram that misled it — raw
+    /// PSI ahead of an RTP stream — follows the RTP once it has run on: the
+    /// RTP until then is dropped, not published with its header inside the
+    /// TS, and a Warning says the format changed. It used to stay raw TS for
+    /// good.
+    #[tokio::test]
+    async fn a_mis_settled_input_follows_the_framing_its_sender_keeps_to() {
+        let run = FORMAT_RECHECK_RUN as u16;
+        let mut datagrams = vec![raw_ts_datagram()];
+        datagrams.extend((0..run + 10).map(rtp_datagram));
+        let (published, flow, mut raised) =
+            published_and_raised_by_single_input(&datagrams, 12).await;
+        assert_eq!(published.len(), 12, "the raw TS, then the RTP from the re-settle on");
+        assert!(published[0].is_raw_ts);
+        for (packet, seq) in published[1..].iter().zip(run - 1..) {
+            assert!(!packet.is_raw_ts, "published as RTP");
+            assert_eq!(&packet.data[..], &rtp_datagram(seq)[..]);
+        }
+        assert_eq!(flow.input_loss.load(Ordering::Relaxed), 0, "the numbering starts afresh");
+        let changed: Vec<_> = std::iter::from_fn(|| raised.try_recv().ok())
+            .filter_map(|e| e.details)
+            .filter(|d| d["error_code"] == "srt_payload_format_changed")
+            .collect();
+        assert_eq!(changed.len(), 1);
     }
 
     /// A 2022-7 SRT listener input on loopback with a caller on each leg.

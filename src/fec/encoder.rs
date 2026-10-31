@@ -22,9 +22,11 @@
 //!
 //! The one thing the two ends can hold differently is a cell whose sequence
 //! number is sent twice with different bytes (an upstream that restarts, or
-//! is switched onto a stream numbered nearby, forwarded unchanged by a
-//! 2022-7 output): the encoder keeps the first copy and a receiver whichever
-//! reached it first. So from then on no FEC goes out for that cell's column
+//! is switched onto a stream numbered nearby, forwarded unchanged — as a
+//! 2022-7 RTP output did until it numbered what it sends itself, like every
+//! RTP output of this edge now; the rule stays for a sender that forwards
+//! upstream numbers): the encoder keeps the first copy and a receiver
+//! whichever reached it first. So from then on no FEC goes out for that cell's column
 //! or row in that matrix. A full matrix keeps its cells until the next
 //! matrix starts, so a step back into one the encoder has finished is a
 //! repeat of every cell it touches and sends nothing: a receiver whose own
