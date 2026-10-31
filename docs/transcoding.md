@@ -492,8 +492,8 @@ Required whenever:
 - Packaging **low-latency CMAF / CMAF-LL** — the segmenter expects
   monotonic audio timestamps per segment; gaps cause player stalls.
 
-On CMAF and RTMP the silence is **measured against the picture, not
-ticked by the clock** — one rule, shared by both outputs
+On CMAF, RTMP and WebRTC the silence is **measured against the picture,
+not ticked by the clock** — one rule, shared by all three outputs
 (`audio_encode::EncoderInputClock`). The 500 ms grace is the trigger;
 once it has elapsed, each tick lays down as much silence as it takes to
 bring the audio up to where the audio would be — the newest video PTS
@@ -554,7 +554,28 @@ joins it; further past (a stray timestamp, or a hole in the audio
 meanwhile) that one picture goes out where the audio is, and the next at
 its own time.
 RTMP's silence used to be one chunk a tick, wall-clock, and every tick
-observed late was lost for good.
+observed late was lost for good. While the channel / rate stage converts
+the source's rate, the silence goes through the stage at the source's
+format (`audio_encode::lay_silence`), so the real audio its resampler
+still holds (up to ~8 ms) goes out ahead of the silence on time; laid
+straight into the encoder, the silence went in ahead of that audio,
+which came out after it, late by the whole silence.
+
+WebRTC (WHEP viewer and WHIP client) places its Opus encoder the same
+way, by the rule RTMP shares: re-anchored where the source's PTS leaves
+its input (a loop, a switch, a gap — through its stage, so what either
+holds of the old timeline goes out on it), a forward gap zero-filled
+under `silent_fallback`, a frame behind its input held back, each frame
+of an MP2 / AC-3 / E-AC-3 PES at its own time, and `silent_fallback`'s
+silence laid to the newest picture less its lead (4 s reach, a second a
+tick), or with no picture one chunk a tick from the input or the newest
+audio. Every Opus frame's RTP time is its place on the source's
+timeline, like the picture's. Up to 0.116.0 the encoder anchored on its
+first frame and took every frame after as the next: a loop whose audio
+ends 320 ms before its picture put the audio's RTP time 320 ms further
+behind the picture's at every lap, and the silence ran from RTP time 0
+(the generator's own count), whatever the picture's time. Nothing is
+laid before the session has seen a picture or audio.
 
 The demuxer hands an MP2 / AC-3 / E-AC-3 PES out only when the next one
 begins, so the last PES before an outage reaches the output beside the
@@ -1106,6 +1127,8 @@ output takes it off its stamps:
   left in the stage, that tail came out after the new anchor, late by the
   jump, and the input it still had queued (under one 256-frame chunk) put
   every stamp after the anchor that much late. HLS does the same.
+  `silent_fallback`'s silence goes through a stage that converts the rate
+  (see "Silent fallback" above).
 - HLS: one re-encode chain runs across the output's segments
   (`output_hls::HlsAudioChain`) — the AU cutter, the decoder, the stage and
   the same `AudioEncoder` RTMP and WebRTC use, so its delay comes off the

@@ -20,7 +20,7 @@ use crate::stats::collector::OutputStatsAccumulator;
 #[cfg(feature = "webrtc")]
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 #[cfg(feature = "webrtc")]
-use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
+use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderInputClock, EncoderParams, Placement};
 #[cfg(feature = "webrtc")]
 use super::audio_silence::SilenceGenerator;
 #[cfg(all(feature = "webrtc", feature = "media-codecs"))]
@@ -65,6 +65,14 @@ enum WebrtcEncoderState {
         /// Silent-PCM generator + audio-drop watchdog. `Some` iff
         /// `audio_encode.silent_fallback = true`.
         silence: Option<SilenceGenerator>,
+        /// Where the encoder's input is on the source's timeline: what
+        /// re-anchors it where the source leaves it — a loop, a switch, a
+        /// gap — and lays `silent_fallback`'s silence to the picture, the
+        /// rule RTMP and CMAF apply (`audio_encode::EncoderInputClock`). The
+        /// encoder used to anchor on its first frame and count samples for
+        /// the life of the session, so the audio ran on across every seam
+        /// while the video followed the source.
+        input: EncoderInputClock,
     },
     /// Decoder or encoder construction failed once. Drop audio for the
     /// rest of the session's lifetime.
@@ -1635,6 +1643,10 @@ async fn whep_viewer_loop(
     // flow stopped.
     let mut idle = tokio::time::interval(IDLE_DRIVE_INTERVAL);
     idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The newest source picture and audio PTS seen: where the re-encoded
+    // audio's silence is placed (`emit_webrtc_silence_if_needed`).
+    let mut newest_picture: Option<u64> = None;
+    let mut newest_audio: Option<u64> = None;
 
     loop {
         if session.is_disconnected() {
@@ -1663,6 +1675,8 @@ async fn whep_viewer_loop(
                     &mut session,
                     audio_mid,
                     audio_pt,
+                    newest_picture,
+                    newest_audio,
                     &stats,
                     output_id,
                 ).await;
@@ -1707,6 +1721,9 @@ async fn whep_viewer_loop(
                             }
                             match frame {
                                 super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, pts_known, .. } => {
+                                    if pts_known {
+                                        newest_picture = Some(pts);
+                                    }
                                     let Some((video_mid, video_pt)) = video else { continue };
                                     handle_webrtc_video_frame(
                                         WebrtcVideoSource::H264(&nalus),
@@ -1724,6 +1741,9 @@ async fn whep_viewer_loop(
                                     ).await;
                                 }
                                 super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, pts_known, .. } => {
+                                    if pts_known {
+                                        newest_picture = Some(pts);
+                                    }
                                     let Some((video_mid, video_pt)) = video else { continue };
                                     // WebRTC carries H.264: HEVC goes out
                                     // re-encoded or not at all — said once.
@@ -1806,6 +1826,7 @@ async fn whep_viewer_loop(
                                             decode_stats,
                                             stage,
                                             silence,
+                                            input,
                                         },
                                         Some(audio_mid),
                                         Some(audio_pt),
@@ -1815,9 +1836,8 @@ async fn whep_viewer_loop(
                                             && let Some(c) = demuxer.cached_aac_config() {
                                                 webrtc_lazy_build_decoder(decoder, c, output_id);
                                             }
-                                        if let Some(sg) = silence.as_mut() {
-                                            sg.mark_real_audio(pts);
-                                        }
+                                        newest_audio = Some(pts);
+                                        note_webrtc_real_audio(silence.as_mut(), input, pts, newest_picture);
                                         let Some(dec) = decoder.as_mut() else {
                                             continue;
                                         };
@@ -1825,15 +1845,16 @@ async fn whep_viewer_loop(
                                         match dec.decode_frame(&data) {
                                             Ok(planar) => {
                                                 decode_stats.inc_output();
-                                                match encoder.submit_through(stage, &planar, dec.sample_rate(), pts) {
-                                                    Ok(_) => {}
-                                                    Err(e) => {
-                                                        tracing::debug!(
-                                                            "WHEP viewer '{}' transcode failed: {}",
-                                                            session_id, e
-                                                        );
-                                                    }
-                                                }
+                                                submit_webrtc_audio(
+                                                    encoder,
+                                                    stage,
+                                                    input,
+                                                    silence.is_some(),
+                                                    &planar,
+                                                    dec.sample_rate(),
+                                                    pts,
+                                                    session_id,
+                                                );
                                             }
                                             Err(_) => {
                                                 decode_stats.inc_error();
@@ -1893,7 +1914,7 @@ async fn whep_viewer_loop(
                                     );
                                     let (
                                         WebrtcEncoderState::Active {
-                                            encoder, silence, stage, ..
+                                            encoder, silence, stage, input, ..
                                         },
                                         Some(audio_mid),
                                         Some(audio_pt),
@@ -1901,14 +1922,17 @@ async fn whep_viewer_loop(
                                     else {
                                         continue;
                                     };
-                                    if let Some(sg) = silence.as_mut() {
-                                        sg.mark_real_audio(pts);
-                                    }
+                                    newest_audio = Some(pts);
+                                    note_webrtc_real_audio(silence.as_mut(), input, pts, newest_picture);
+                                    // To the encoder's format (a 5.1 AC-3 source
+                                    // was refused, MP2 at another rate
+                                    // mislabelled), each frame of the PES at its
+                                    // own time — the PES's PTS stamps its first.
+                                    let fill_gaps = silence.is_some();
+                                    let mut frame_at = pts;
                                     for frame in &decoded {
-                                        // To the encoder's format (a 5.1
-                                        // AC-3 source was refused, MP2 at
-                                        // another rate mislabelled).
-                                        let _ = encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts);
+                                        submit_webrtc_audio(encoder, stage, input, fill_gaps, &frame.planar, frame.sample_rate, frame_at, session_id);
+                                        frame_at = frame_at.saturating_add(super::output_rtmp::audio_ticks(frame.samples_per_channel, frame.sample_rate));
                                     }
                                     for frame in encoder.drain() {
                                         let media_time = MediaTime::new(
@@ -1940,6 +1964,9 @@ async fn whep_viewer_loop(
                                 // operator told once — it used to be dropped
                                 // either way, silently.
                                 super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { es, pts, pts_known, .. } => {
+                                    if pts_known {
+                                        newest_picture = Some(pts);
+                                    }
                                     let Some((video_mid, video_pt)) = video else { continue };
                                     if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
                                         if !needs_encode.video {
@@ -2291,6 +2318,10 @@ async fn whip_client_loop(
         // restarted.
         let mut idle = tokio::time::interval(IDLE_DRIVE_INTERVAL);
         idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The newest source picture and audio PTS seen, as on the WHEP
+        // viewer loop.
+        let mut newest_picture: Option<u64> = None;
+        let mut newest_audio: Option<u64> = None;
 
         loop {
             if session.is_disconnected() {
@@ -2340,6 +2371,8 @@ async fn whip_client_loop(
                         &mut session,
                         audio_mid,
                         audio_pt,
+                        newest_picture,
+                        newest_audio,
                         &stats,
                         &config.id,
                     ).await;
@@ -2382,6 +2415,9 @@ async fn whip_client_loop(
                                 }
                                 match frame {
                                     super::webrtc::ts_demux::DemuxedFrame::H264 { nalus, pts, pts_known, .. } => {
+                                        if pts_known {
+                                            newest_picture = Some(pts);
+                                        }
                                         handle_webrtc_video_frame(
                                             WebrtcVideoSource::H264(&nalus),
                                             pts,
@@ -2398,6 +2434,9 @@ async fn whip_client_loop(
                                         ).await;
                                     }
                                     super::webrtc::ts_demux::DemuxedFrame::H265 { nalus, pts, pts_known, .. } => {
+                                        if pts_known {
+                                            newest_picture = Some(pts);
+                                        }
                                         // WebRTC carries H.264: HEVC goes out
                                         // re-encoded or not at all — said once.
                                         if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
@@ -2475,6 +2514,7 @@ async fn whip_client_loop(
                                                 decode_stats,
                                                 stage,
                                                 silence,
+                                                input,
                                             },
                                             Some(audio_mid),
                                             Some(audio_pt),
@@ -2484,9 +2524,8 @@ async fn whip_client_loop(
                                                 && let Some(c) = demuxer.cached_aac_config() {
                                                     webrtc_lazy_build_decoder(decoder, c, &config.id);
                                                 }
-                                            if let Some(sg) = silence.as_mut() {
-                                                sg.mark_real_audio(pts);
-                                            }
+                                            newest_audio = Some(pts);
+                                            note_webrtc_real_audio(silence.as_mut(), input, pts, newest_picture);
                                             let Some(dec) = decoder.as_mut() else {
                                                 continue;
                                             };
@@ -2494,15 +2533,16 @@ async fn whip_client_loop(
                                             match dec.decode_frame(&data) {
                                                 Ok(planar) => {
                                                     decode_stats.inc_output();
-                                                    match encoder.submit_through(stage, &planar, dec.sample_rate(), pts) {
-                                                        Ok(_) => {}
-                                                        Err(e) => {
-                                                            tracing::debug!(
-                                                                "WHIP '{}' transcode failed: {}",
-                                                                config.id, e
-                                                            );
-                                                        }
-                                                    }
+                                                    submit_webrtc_audio(
+                                                        encoder,
+                                                        stage,
+                                                        input,
+                                                        silence.is_some(),
+                                                        &planar,
+                                                        dec.sample_rate(),
+                                                        pts,
+                                                        &config.id,
+                                                    );
                                                 }
                                                 Err(_) => {
                                                     decode_stats.inc_error();
@@ -2561,7 +2601,7 @@ async fn whip_client_loop(
                                         );
                                         let (
                                             WebrtcEncoderState::Active {
-                                                encoder, silence, stage, ..
+                                                encoder, silence, stage, input, ..
                                             },
                                             Some(audio_mid),
                                             Some(audio_pt),
@@ -2569,11 +2609,13 @@ async fn whip_client_loop(
                                         else {
                                             continue;
                                         };
-                                        if let Some(sg) = silence.as_mut() {
-                                            sg.mark_real_audio(pts);
-                                        }
+                                        newest_audio = Some(pts);
+                                        note_webrtc_real_audio(silence.as_mut(), input, pts, newest_picture);
+                                        let fill_gaps = silence.is_some();
+                                        let mut frame_at = pts;
                                         for frame in &decoded {
-                                            let _ = encoder.submit_through(stage, &frame.planar, frame.sample_rate, pts);
+                                            submit_webrtc_audio(encoder, stage, input, fill_gaps, &frame.planar, frame.sample_rate, frame_at, &config.id);
+                                            frame_at = frame_at.saturating_add(super::output_rtmp::audio_ticks(frame.samples_per_channel, frame.sample_rate));
                                         }
                                         for frame in encoder.drain() {
                                             let media_time = MediaTime::new(
@@ -2601,6 +2643,9 @@ async fn whip_client_loop(
                                     // MPEG-2 video: re-encoded, or dropped
                                     // and reported once (as on WHEP).
                                     super::webrtc::ts_demux::DemuxedFrame::Mpeg2 { es, pts, pts_known, .. } => {
+                                        if pts_known {
+                                            newest_picture = Some(pts);
+                                        }
                                         if matches!(video_encoder_state, WebrtcVideoEncoderState::Disabled) {
                                             if !needs_encode.video {
                                                 needs_encode.video = true;
@@ -2906,6 +2951,7 @@ fn build_webrtc_encoder_for_format(
         decode_stats,
         stage,
         silence: None,
+        input: EncoderInputClock::default(),
     }
 }
 
@@ -3110,22 +3156,33 @@ fn build_webrtc_encoder_state_eager_for_silent_fallback(
         decode_stats,
         stage,
         silence: Some(silence),
+        input: EncoderInputClock::default(),
     }
 }
 
-/// Shared silence-tick handler for WebRTC sessions. Submits one
-/// zero-filled planar chunk to the encoder, drains any encoded Opus
-/// frames, and writes them to the audio MID. Early-returns when:
+/// Shared silence-tick handler for WebRTC sessions: lays silence beside
+/// `picture` — the newest picture, unless the audio has run on past it —
+/// or, with none, one chunk from the encoder's input (else from
+/// `newest_audio`), by the rule RTMP shares (`audio_encode::lay_silence`),
+/// drains the encoded Opus frames and writes them to the audio MID, each at
+/// its own place on the source's timeline. Nothing is laid before the
+/// session has seen a picture or audio to place it by. The generator's own
+/// PTS (from 0) is not used: the encoder used to anchor there, putting
+/// every silent frame of a video-only source at RTP time 0 and on, beside
+/// a picture at its source time. Early-returns when:
 /// - the encoder state is not Active with a silence generator, or
 /// - real audio has arrived within the grace window, or
 /// - the session has no audio MID / payload type (SDP negotiated
 ///   video-only).
 #[cfg(feature = "webrtc")]
+#[allow(clippy::too_many_arguments)]
 async fn emit_webrtc_silence_if_needed(
     state: &mut WebrtcEncoderState,
     session: &mut super::webrtc::session::WebrtcSession,
     audio_mid: Option<str0m::media::Mid>,
     audio_pt: Option<str0m::media::Pt>,
+    picture: Option<u64>,
+    newest_audio: Option<u64>,
     stats: &Arc<OutputStatsAccumulator>,
     output_id: &str,
 ) {
@@ -3138,6 +3195,8 @@ async fn emit_webrtc_silence_if_needed(
     let WebrtcEncoderState::Active {
         encoder,
         silence: Some(sg),
+        stage,
+        input,
         ..
     } = state
     else {
@@ -3146,14 +3205,23 @@ async fn emit_webrtc_silence_if_needed(
     if !sg.should_emit() {
         return;
     }
-    if !sg.is_emitting() {
-        tracing::info!(
-            "WebRTC output '{}': source audio absent/stalled — starting silent-Opus injection",
-            output_id
-        );
-    }
-    let (planar, pts) = sg.next_chunk();
-    encoder.submit_planar(planar, pts);
+    crate::engine::audio_encode::lay_silence(
+        encoder,
+        stage,
+        sg,
+        input,
+        live_picture(picture, newest_audio),
+        newest_audio,
+        crate::engine::audio_encode::SILENCE_FILL_CAP_TICKS,
+        crate::engine::audio_encode::SILENCE_PER_TICK_90K,
+        || {
+            tracing::info!(
+                "WebRTC output '{}': source audio absent/stalled — starting silent-Opus injection",
+                output_id
+            )
+        },
+        |_| {},
+    );
     for frame in encoder.drain() {
         let media_time = MediaTime::new(
             frame.pts * 48_000 / 90_000,
@@ -3172,6 +3240,91 @@ async fn emit_webrtc_silence_if_needed(
         }
         session.drain_outputs().await;
         count_sent(stats, on_wire, 1, frame.data.len(), None);
+    }
+}
+
+/// The newest picture, unless the audio has run on past it by the CMAF
+/// timeline's cross window — the video has gone (a switch to an audio-only
+/// backup) while the audio carried on, and silence laid to it would stop
+/// short of where the audio already is. RTMP's `FlvTimeline::live_picture`.
+#[cfg(feature = "webrtc")]
+fn live_picture(picture: Option<u64>, newest_audio: Option<u64>) -> Option<u64> {
+    let window = super::cmaf::timeline::CROSS_WINDOW_90K as u64;
+    picture.filter(|&v| newest_audio.is_none_or(|a| a <= v.saturating_add(window)))
+}
+
+/// Real audio at `pts` reached the session: the silence watchdog is told,
+/// and the picture's lead over it measured for silence to stop short by —
+/// unless the encoder's input is already past it, a frame
+/// [`submit_webrtc_audio`] holds back (RTMP's `note_real_audio`).
+#[cfg(feature = "webrtc")]
+fn note_webrtc_real_audio(
+    silence: Option<&mut SilenceGenerator>,
+    input: &mut EncoderInputClock,
+    pts: u64,
+    picture: Option<u64>,
+) {
+    if let Some(sg) = silence {
+        sg.mark_real_audio(pts);
+    }
+    if !input.passed(pts) {
+        input.mark_real_audio(pts, picture);
+    }
+}
+
+/// Submit one decoded source frame (`planar` at `rate`, from source time
+/// `pts`) at its place on the encoder's input timeline — CMAF's rule
+/// (`EncoderInputClock::place`): the encoder re-anchored where the source
+/// left it (through its stage, `AudioEncoder::reanchor_through`, so what
+/// either still holds of the old timeline goes out on it), a forward gap
+/// covered with zeros under `silent_fallback` (`fill_gaps`), a frame behind
+/// the input held back. The encoder used to take every frame as the next,
+/// so a loop whose audio is shorter than its video put the audio's RTP time
+/// behind the picture's by the difference every lap.
+#[cfg(feature = "webrtc")]
+#[allow(clippy::too_many_arguments)]
+fn submit_webrtc_audio(
+    encoder: &mut AudioEncoder,
+    stage: &mut super::audio_transcode::EncoderStage,
+    input: &mut EncoderInputClock,
+    fill_gaps: bool,
+    planar: &[Vec<f32>],
+    rate: u32,
+    pts: u64,
+    output_id: &str,
+) {
+    let n = planar.first().map_or(0, Vec::len) as u64;
+    if n == 0 {
+        return;
+    }
+    input.set_rate(rate);
+    match input.place(pts, fill_gaps) {
+        Placement::Skip => return,
+        Placement::Submit { reanchor: true } => {
+            encoder.reanchor_through(stage);
+            input.anchor(pts, rate);
+        }
+        Placement::FillThenSubmit { samples } => {
+            let zeros = vec![vec![0.0f32; samples as usize]; planar.len()];
+            let filled = crate::timed_block_in_place!(
+                "output_webrtc.audio_gap_fill",
+                crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
+                { encoder.submit_through(stage, &zeros, rate, input.position().unwrap_or(pts)) }
+            );
+            match filled {
+                Ok(true) => input.took(samples),
+                _ => input.refused(),
+            }
+        }
+        Placement::Submit { reanchor: false } => {}
+    }
+    match encoder.submit_through(stage, planar, rate, input.position().unwrap_or(pts)) {
+        Ok(true) => input.took(n),
+        Ok(false) => input.refused(),
+        Err(e) => {
+            tracing::debug!("WebRTC output '{output_id}': transcode failed: {e}");
+            input.refused();
+        }
     }
 }
 
@@ -4711,6 +4864,14 @@ mod whep_server_tests {
     /// and an IDR slice of filler: enough to be passed through, not decoded.
     #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
     fn feed_live_aac(tx: broadcast::Sender<RtpPacket>, stop: CancellationToken) -> JoinHandle<()> {
+        feed_lapped_aac(tx, stop, None)
+    }
+
+    /// [`feed_live_aac`], and with `hole: Some((every, len))` the audio
+    /// stops for the last `len` of every `every` 40 ms ticks while its PTS
+    /// runs on with the picture's: each lap of a looping file whose audio
+    /// ends before its picture.
+    fn feed_lapped_aac(tx: broadcast::Sender<RtpPacket>, stop: CancellationToken, hole: Option<(u64, u64)>) -> JoinHandle<()> {
         use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_packets, pmt_section};
         const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
         let mut frames = Vec::new();
@@ -4746,9 +4907,12 @@ mod whep_server_tests {
                 }
                 n += 1;
                 ts.extend(pes_packets(0x100, 0xE0, &au, pts_v, &mut cc_v));
+                let silent = hole.is_some_and(|(every, len)| n % every >= every - len);
                 while pts_a < pts_v + 3600 {
-                    ts.extend(pes_packets(0x101, 0xC0, &frames[frame % frames.len()], pts_a, &mut cc_a));
-                    frame += 1;
+                    if !silent {
+                        ts.extend(pes_packets(0x101, 0xC0, &frames[frame % frames.len()], pts_a, &mut cc_a));
+                        frame += 1;
+                    }
                     pts_a += 1920;
                 }
                 pts_v += 3600;
@@ -4769,6 +4933,53 @@ mod whep_server_tests {
         })
     }
 
+    /// (arrival time, is audio, lag) of every media frame heard for `dur`.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    async fn listen(
+        viewer: &mut super::super::webrtc::session::WebrtcSession,
+        (audio_mid, video_mid): (str0m::media::Mid, str0m::media::Mid),
+        t0: std::time::Instant,
+        dur: std::time::Duration,
+    ) -> Vec<(f64, bool, f64)> {
+        let mut heard = Vec::new();
+        let cancel = CancellationToken::new();
+        let _ = tokio::time::timeout(dur, async {
+            loop {
+                match viewer.poll_event(&cancel).await {
+                    super::super::webrtc::session::SessionEvent::MediaData { mid, rtp_time, data, .. }
+                        if !data.is_empty() && (mid == audio_mid || mid == video_mid) =>
+                    {
+                        let t = t0.elapsed().as_secs_f64();
+                        heard.push((t, mid == audio_mid, t - rtp_time.as_seconds()));
+                    }
+                    super::super::webrtc::session::SessionEvent::Disconnected => {
+                        panic!("the viewer's own session ended")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        heard
+    }
+
+    /// The median lag of one stream's frames heard between `from` and `to`.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn lag(heard: &[(f64, bool, f64)], audio: bool, from: f64, to: f64) -> f64 {
+        let mut lags: Vec<f64> = heard
+            .iter()
+            .filter(|h| h.1 == audio && h.0 >= from && h.0 <= to)
+            .map(|h| h.2)
+            .collect();
+        assert!(
+            !lags.is_empty(),
+            "no {} heard {from:.1}-{to:.1} s",
+            if audio { "audio" } else { "video" }
+        );
+        lags.sort_by(f64::total_cmp);
+        lags[lags.len() / 2]
+    }
+
     /// A viewer of a live AAC source re-encoded to Opus (`audio_encode`, the
     /// output's config) pauses for 18 s — ICE goes down at 15 s — and comes
     /// back. Each stream's lag (arrival time less RTP time) is measured over
@@ -4778,50 +4989,7 @@ mod whep_server_tests {
     /// amount. Returns how far audio's moved against video's, in seconds.
     #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
     async fn audio_slip_against_video_across_an_outage(audio_encode: serde_json::Value) -> f64 {
-        use super::super::webrtc::session::{SessionEvent, WebrtcSession};
         use std::time::{Duration, Instant};
-
-        /// (arrival time, is audio, lag) of every media frame heard for `dur`.
-        async fn listen(
-            viewer: &mut WebrtcSession,
-            (audio_mid, video_mid): (str0m::media::Mid, str0m::media::Mid),
-            t0: Instant,
-            dur: Duration,
-        ) -> Vec<(f64, bool, f64)> {
-            let mut heard = Vec::new();
-            let cancel = CancellationToken::new();
-            let _ = tokio::time::timeout(dur, async {
-                loop {
-                    match viewer.poll_event(&cancel).await {
-                        SessionEvent::MediaData { mid, rtp_time, data, .. }
-                            if !data.is_empty() && (mid == audio_mid || mid == video_mid) =>
-                        {
-                            let t = t0.elapsed().as_secs_f64();
-                            heard.push((t, mid == audio_mid, t - rtp_time.as_seconds()));
-                        }
-                        SessionEvent::Disconnected => panic!("the viewer's own session ended"),
-                        _ => {}
-                    }
-                }
-            })
-            .await;
-            heard
-        }
-        /// The median lag of one stream's frames heard between `from` and `to`.
-        fn lag(heard: &[(f64, bool, f64)], audio: bool, from: f64, to: f64) -> f64 {
-            let mut lags: Vec<f64> = heard
-                .iter()
-                .filter(|h| h.1 == audio && h.0 >= from && h.0 <= to)
-                .map(|h| h.2)
-                .collect();
-            assert!(
-                !lags.is_empty(),
-                "no {} heard {from:.1}-{to:.1} s",
-                if audio { "audio" } else { "video" }
-            );
-            lags.sort_by(f64::total_cmp);
-            lags[lags.len() / 2]
-        }
 
         let (broadcast_tx, session_tx, mut raised, cancel, task, stats) =
             whep_output_with_ts_audio(serde_json::json!({ "audio_encode": audio_encode }));
@@ -4872,6 +5040,33 @@ mod whep_server_tests {
     async fn an_encoded_viewers_audio_keeps_time_with_its_video_across_an_outage() {
         let slip = audio_slip_against_video_across_an_outage(serde_json::json!({ "codec": "opus" })).await;
         assert!(slip.abs() < 0.5, "audio slipped {slip:.3} s against video across the outage");
+    }
+
+    /// A looping source whose audio ends 320 ms before its picture at every
+    /// 2 s lap (a media-player file whose audio is shorter than its video):
+    /// the viewer's audio keeps time with its video lap after lap. The Opus
+    /// encoder used to anchor on its first frame and take every frame after
+    /// as the next, so the audio's RTP time fell 320 ms further behind the
+    /// picture's at every lap — over a second by the fourth. It is placed on
+    /// the source's timeline now (`EncoderInputClock`), re-anchored at each
+    /// lap, as RTMP and CMAF are.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[tokio::test]
+    async fn an_encoded_viewers_audio_keeps_time_with_its_video_across_loops() {
+        use std::time::{Duration, Instant};
+        let (broadcast_tx, session_tx, _raised, cancel, _task, _stats) =
+            whep_output_with_ts_audio(serde_json::json!({ "audio_encode": { "codec": "opus" } }));
+        let _feed = feed_lapped_aac(broadcast_tx.clone(), cancel.child_token(), Some((50, 8)));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut viewer = viewer().await;
+        join_and_listen(&session_tx, &mut viewer).await;
+        let mids = (viewer.audio_mid.unwrap(), viewer.video_mid.unwrap());
+        let t0 = Instant::now();
+        let heard = listen(&mut viewer, mids, t0, Duration::from_secs(9)).await;
+        cancel.cancel();
+        let slip = (lag(&heard, true, 7.0, 9.0) - lag(&heard, true, 0.0, 1.5))
+            - (lag(&heard, false, 7.0, 9.0) - lag(&heard, false, 0.0, 1.5));
+        assert!(slip.abs() < 0.2, "audio slipped {slip:.3} s against video over three laps");
     }
 
     /// The same with `silent_fallback`, whose encoder is opened at once and

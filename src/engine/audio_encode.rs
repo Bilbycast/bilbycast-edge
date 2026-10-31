@@ -1731,6 +1731,103 @@ impl EncoderInputClock {
     }
 }
 
+/// The most silence one tick of [`lay_silence`] lays beside a picture (46
+/// AAC frames at 48 kHz): a longer pause is caught up over the next ticks,
+/// at about 46 times real time, rather than encoded in one go.
+pub(crate) const SILENCE_PER_TICK_90K: u64 = 90_000;
+
+/// Lay `silent_fallback`'s silence while its watchdog says real audio is
+/// absent, the rule RTMP and WebRTC share (CMAF's
+/// `encode_silence_if_needed` is the same rule without a rate stage): up
+/// to `picture` — the newest picture, unless the audio has run on past it
+/// — less the video's lead over the audio, filling at most `per_tick` and
+/// reaching at most `reach` ahead of the input (past it the silence
+/// re-anchors at the picture); with no picture, one chunk a tick from the
+/// encoder's input, else from `newest_audio`, each chunk's position handed
+/// to `laid_alone`. `starting` is called ahead of a burst's first chunk.
+/// The caller decides whether the watchdog allows any.
+///
+/// While the stage converts the rate the silence goes through it, at the
+/// source's rate and channel count, so the real audio its resampler still
+/// holds (up to ~8 ms) goes out ahead of the silence on time and the stage
+/// runs on unbroken. Laid straight into the encoder, the silence went in
+/// ahead of that audio, which came out after it — when the real audio
+/// returned, late by the whole silence. A re-anchor runs the stage out
+/// instead ([`AudioEncoder::reanchor_through`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lay_silence(
+    encoder: &mut AudioEncoder,
+    stage: &mut crate::engine::audio_transcode::EncoderStage,
+    sg: &mut crate::engine::audio_silence::SilenceGenerator,
+    input: &mut EncoderInputClock,
+    picture: Option<u64>,
+    newest_audio: Option<u64>,
+    reach: u64,
+    per_tick: u64,
+    mut starting: impl FnMut(),
+    mut laid_alone: impl FnMut(u64),
+) {
+    let enc_rate = encoder.params().sample_rate.max(1);
+    let through = stage.rate_converted_input();
+    let (rate, chunk) = match through {
+        Some((src_rate, _)) => {
+            (src_rate, (sg.chunk_samples() as u64 * u64::from(src_rate) / u64::from(enc_rate)).max(1))
+        }
+        None => (enc_rate, sg.chunk_samples() as u64),
+    };
+    let mut submit = |encoder: &mut AudioEncoder,
+                      stage: &mut crate::engine::audio_transcode::EncoderStage,
+                      sg: &mut crate::engine::audio_silence::SilenceGenerator,
+                      at: u64| {
+        if !sg.is_emitting() {
+            starting();
+        }
+        let (planar, _) = sg.next_chunk();
+        match through {
+            Some((src_rate, channels)) => {
+                let zeros = vec![vec![0.0f32; chunk as usize]; channels as usize];
+                matches!(encoder.submit_through(stage, &zeros, src_rate, at), Ok(true))
+            }
+            None => encoder.submit_planar(planar, at),
+        }
+    };
+    match picture {
+        Some(video) => {
+            let target = input.silence_target(video);
+            if input.silence_start_within(target, rate, reach) {
+                encoder.reanchor_through(stage);
+            }
+            let end = input.position().map_or(target, |at| target.min(at.saturating_add(per_tick)));
+            while let Some(at) = input.next_silence(chunk, end) {
+                if !submit(encoder, stage, sg, at) {
+                    input.refused();
+                    break;
+                }
+                input.took(chunk);
+                input.mark_silence();
+            }
+        }
+        None => {
+            let Some(start) = input.position().or(newest_audio) else {
+                return;
+            };
+            if input.silence_start(start, rate) {
+                encoder.reanchor_through(stage);
+            }
+            let Some(at) = input.position() else {
+                return;
+            };
+            if submit(encoder, stage, sg, at) {
+                input.took(chunk);
+                input.mark_silence();
+                laid_alone(at);
+            } else {
+                input.refused();
+            }
+        }
+    }
+}
+
 // ── Internal: ffmpeg command line ───────────────────────────────────────────
 
 /// Build the ffmpeg argv for the requested codec. All commands include

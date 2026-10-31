@@ -24,6 +24,7 @@ use super::audio_au::adts_access_unit;
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 use super::audio_encode::{
     AudioCodec, AudioEncoder, AudioEncoderError, EncodedFrame, EncoderInputClock, EncoderParams, Placement,
+    SILENCE_PER_TICK_90K,
 };
 use super::audio_silence::SilenceGenerator;
 use super::cmaf::codecs::{push_avcc_record, push_hvcc_record};
@@ -838,11 +839,6 @@ const FLV_MS_90K: u64 = 90;
 /// a step past it is a jump and is continued one frame on.
 const FLV_LONE_GAP_90K: u64 = 10 * 90_000;
 
-/// The most silence one tick lays beside a picture (46 AAC frames at
-/// 48 kHz). A pause the timeline keeps (up to [`FLV_LONE_GAP_90K`]) is
-/// caught up over the next ticks, at about 46 times real time, rather than
-/// encoded in one go: 470 frames at the lone gap.
-const SILENCE_PER_TICK_90K: u64 = 90_000;
 
 /// The 64-bit value of the 33-bit `ts` that lies nearest `near`.
 fn unwrap_near(ts: u64, near: u64) -> u64 {
@@ -852,7 +848,7 @@ fn unwrap_near(ts: u64, near: u64) -> u64 {
 
 /// One audio frame's length in 90 kHz ticks.
 #[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
-fn audio_ticks(samples: usize, rate: u32) -> u64 {
+pub(super) fn audio_ticks(samples: usize, rate: u32) -> u64 {
     samples as u64 * 90_000 / u64::from(rate.max(1))
 }
 
@@ -1192,11 +1188,14 @@ fn submit_source_audio(
 /// ([`FLV_LONE_GAP_90K`]), not CMAF's 4 s: a kept step past the fill's
 /// reach would re-anchor the silence at the picture with nothing laid, and
 /// a video-only source with a picture every 5 s would send no audio at
-/// all. With no picture, or one the audio has run on past
-/// ([`FlvTimeline::live_picture`]), one chunk a tick from the encoder's
+/// all (a pause the timeline keeps is caught up over the next ticks: 470
+/// frames at the lone gap). With no picture, or one the audio has run on
+/// past ([`FlvTimeline::live_picture`]), one chunk a tick from the encoder's
 /// input, else from the newest audio mapped, and put on the timeline's audio
 /// track ([`FlvTimeline::silent_audio`]) so the audio returning is placed
-/// after it. Never before an essence has anchored the FLV epoch.
+/// after it. Never before an essence has anchored the FLV epoch. The rule
+/// is shared with WebRTC (`audio_encode::lay_silence`): through the rate
+/// stage while it converts, so the real audio it holds goes out first.
 ///
 /// Silence laid beside a picture stays off the audio track: the picture
 /// already says where the audio is. Audio coming back behind it — the last
@@ -1225,54 +1224,24 @@ fn lay_silence(
     if !timeline.anchored() || !sg.should_emit() {
         return;
     }
-    let rate = encoder.params().sample_rate;
-    let chunk = sg.chunk_samples() as u64;
-    let starting = |sg: &SilenceGenerator| {
-        if !sg.is_emitting() {
+    let picture = timeline.live_picture();
+    let newest_audio = timeline.newest_audio();
+    crate::engine::audio_encode::lay_silence(
+        encoder,
+        stage,
+        sg,
+        input,
+        picture,
+        newest_audio,
+        FLV_LONE_GAP_90K,
+        SILENCE_PER_TICK_90K,
+        || {
             tracing::info!(
                 "RTMP output '{output_id}': source audio absent/stalled — starting silent-AAC injection"
-            );
-        }
-    };
-    match timeline.live_picture() {
-        Some(video) => {
-            let target = input.silence_target(video);
-            if input.silence_start_within(target, rate, FLV_LONE_GAP_90K) {
-                encoder.reanchor_through(stage);
-            }
-            let end = input.position().map_or(target, |at| target.min(at.saturating_add(SILENCE_PER_TICK_90K)));
-            while let Some(at) = input.next_silence(chunk, end) {
-                starting(sg);
-                let (planar, _) = sg.next_chunk();
-                if !encoder.submit_planar(planar, at) {
-                    input.refused();
-                    break;
-                }
-                input.took(chunk);
-                input.mark_silence();
-            }
-        }
-        None => {
-            let Some(start) = input.position().or(timeline.newest_audio()) else {
-                return;
-            };
-            if input.silence_start(start, rate) {
-                encoder.reanchor_through(stage);
-            }
-            let Some(at) = input.position() else {
-                return;
-            };
-            starting(sg);
-            let (planar, _) = sg.next_chunk();
-            if encoder.submit_planar(planar, at) {
-                input.took(chunk);
-                input.mark_silence();
-                timeline.silent_audio(at);
-            } else {
-                input.refused();
-            }
-        }
-    }
+            )
+        },
+        |at| timeline.silent_audio(at),
+    );
 }
 
 /// Send what `encoder` has encoded, each frame at its own stamp on the
@@ -4792,6 +4761,102 @@ mod flv_timestamp_tests {
         assert!(encoder.drain().is_empty(), "held back");
         assert_eq!(input.position(), position);
         assert!(stamps.windows(2).all(|w| w[1] > w[0]), "the audio never steps back");
+    }
+
+    /// Silence that starts where a 44.1 kHz source left the encoder's input
+    /// (no re-anchor), with the rate stage converting it to the encoder's
+    /// 48 kHz, goes through the stage: the real audio its resampler still
+    /// holds — its queue (255 frames here) and its delay line, where a 3 ms
+    /// burst ending 20 samples from the source's last sits — goes out ahead
+    /// of the silence, on time, and real audio returning where the silence
+    /// ends lands on its own time. Laid straight into the encoder, the
+    /// silence went in ahead of that audio, which came out after it: a
+    /// second late.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn silence_after_a_rate_converted_source_goes_through_the_stage() {
+        let mut st = silent_fallback_state();
+        let EncoderState::Active { encoder, silence: Some(sg), input, stage, .. } = &mut st else {
+            panic!("silent fallback builds eagerly");
+        };
+        let burst = |rate: u32, hz: f32, ms: u32| -> Vec<f32> {
+            let n = (rate * ms / 1_000) as usize;
+            (0..n)
+                .map(|k| {
+                    let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / (n - 1) as f32).cos();
+                    0.5 * w * (2.0 * std::f32::consts::PI * hz * k as f32 / rate as f32).sin()
+                })
+                .collect()
+        };
+        let ticks = |n: u64| n * 90_000 / 44_100;
+        let mut tl = FlvTimeline::new("o");
+        // A second of 44.1 kHz audio from T0 beside 25 fps pictures 100 ms
+        // ahead of it, its length leaving 255 frames in the stage's queue,
+        // ending in a 3 ms 2 kHz burst.
+        let real = 172 * 256 + 255;
+        let mut pcm = vec![0.0f32; real];
+        let end_burst = burst(44_100, 2_000.0, 3);
+        let end_at = real - end_burst.len() - 20;
+        pcm[end_at..end_at + end_burst.len()].copy_from_slice(&end_burst);
+        let mut frames = Vec::new();
+        let mut next_picture = 0u64;
+        let mut first_at = None;
+        for (j, chunk) in pcm.chunks(1_024).enumerate() {
+            let t = T0 + ticks(j as u64 * 1_024);
+            while T0 + 9_000 + next_picture * STEP_25FPS <= t + 9_000 {
+                tl.video(T0 + 9_000 + next_picture * STEP_25FPS, None, true);
+                next_picture += 1;
+            }
+            let at = tl.audio(t);
+            first_at.get_or_insert(at);
+            note_real_audio(Some(sg), input, at, tl.newest_picture());
+            submit_source_audio(encoder, stage, input, true, &[chunk.to_vec(), chunk.to_vec()], 44_100, at, "o");
+            frames.extend(encoder.drain());
+        }
+        let base = first_at.unwrap();
+        // The audio stops; past the watchdog's grace, a second more of
+        // pictures and the silence laid beside them.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        for k in next_picture..next_picture + 25 {
+            tl.video(T0 + 9_000 + k * STEP_25FPS, None, true);
+            lay_silence(encoder, stage, sg, input, &mut tl, "o");
+            frames.extend(encoder.drain());
+        }
+        assert!(sg.is_emitting(), "silence was laid");
+        // Real audio returns where the silence ends, a 3 kHz burst 333
+        // samples in.
+        let back = input.position().unwrap();
+        let mut ret = vec![0.0f32; 22_050];
+        ret[333..333 + 441].copy_from_slice(&burst(44_100, 3_000.0, 10));
+        for (j, chunk) in ret.chunks(1_024).enumerate() {
+            let at = back + ticks(j as u64 * 1_024);
+            note_real_audio(Some(sg), input, at, tl.newest_picture());
+            submit_source_audio(encoder, stage, input, true, &[chunk.to_vec(), chunk.to_vec()], 44_100, at, "o");
+            frames.extend(encoder.drain());
+        }
+        assert!(frames.windows(2).all(|w| w[1].pts > w[0].pts), "the stamps never step back");
+        let mut d = aac_audio::AacDecoder::open_adts().unwrap();
+        let (mut times, mut out) = (Vec::new(), Vec::new());
+        for f in &frames {
+            let p = d.decode_frame(&f.data).unwrap().planar[0].clone();
+            times.extend((0..p.len()).map(|i| f.pts as f64 + i as f64 * 90_000.0 / 48_000.0));
+            out.extend(p);
+        }
+        let found = |hz: f32, ms: u32, expected: f64| -> f64 {
+            let b = burst(48_000, hz, ms);
+            let k = (0..out.len() - b.len())
+                .filter(|&k| (times[k] - expected).abs() <= 50.0 * 90.0)
+                .max_by(|&x, &y| {
+                    let s = |k: usize| -> f32 { b.iter().zip(&out[k..]).map(|(p, q)| p * q).sum() };
+                    s(x).total_cmp(&s(y))
+                })
+                .expect("output near the burst");
+            (times[k] - expected) * 48_000.0 / 90_000.0
+        };
+        let e = found(2_000.0, 3, base as f64 + ticks(end_at as u64) as f64);
+        assert!(e.abs() <= 5.0, "the audio before the silence is {e:.1} samples off");
+        let e = found(3_000.0, 10, back as f64 + 333.0 * 90_000.0 / 44_100.0);
+        assert!(e.abs() <= 3.0, "the audio after the silence is {e:.1} samples off");
     }
 
     /// `n` real AAC frames from source time `from`, placed as the publish

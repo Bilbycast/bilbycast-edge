@@ -2137,6 +2137,15 @@ impl EncoderStage {
     pub fn output(&self) -> Option<(u32, u8)> {
         self.out
     }
+
+    /// The decoded `(rate, channels)` the stage is built for, while it
+    /// converts the rate — the only stage that holds audio back.
+    pub fn rate_converted_input(&self) -> Option<(u32, u8)> {
+        self.stage
+            .as_ref()
+            .filter(|t| t.in_sample_rate() != t.out_sample_rate())
+            .map(|_| self.input)
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
