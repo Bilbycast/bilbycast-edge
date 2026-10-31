@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -807,6 +807,31 @@ async fn srt_output_listener_loop(
     }
 }
 
+/// Whether the `attempt`th consecutive failed connect of a caller-mode
+/// output, or of a 2022-7 output's caller leg, raises
+/// `srt_output_peer_unreachable`: once as the count reaches
+/// [`CONNECT_FAILED_THRESHOLD`](crate::srt::connection::CONNECT_FAILED_THRESHOLD),
+/// as the state flips to `connect_failed`, then every 20th attempt (~10 min
+/// at the retry loop's 30 s cap), so a long outage leaves a trail without
+/// flooding the events feed.
+fn peer_unreachable_due(attempt: u32) -> bool {
+    let threshold = crate::srt::connection::CONNECT_FAILED_THRESHOLD;
+    attempt == threshold || (attempt > threshold && attempt.is_multiple_of(20))
+}
+
+/// The message of `srt_output_peer_unreachable`. `leg` names the leg of a
+/// 2022-7 output, so each leg's events fold into rows of their own.
+fn peer_unreachable_message(output_id: &str, leg: Option<u8>, attempt: u32) -> String {
+    let output = match leg {
+        Some(leg) => format!("SRT output '{output_id}' 2022-7 leg {leg}"),
+        None => format!("SRT output '{output_id}'"),
+    };
+    format!(
+        "{output} cannot reach its peer — {attempt} consecutive connection attempts failed, \
+         still retrying"
+    )
+}
+
 /// Caller-mode output: reconnects with exponential back-off on disconnect.
 #[allow(clippy::too_many_arguments)]
 async fn srt_output_caller_loop(
@@ -855,17 +880,11 @@ async fn srt_output_caller_loop(
             attempt_stats
                 .connect_failures
                 .store(attempt, std::sync::atomic::Ordering::Relaxed);
-            // One event as the state flips to `connect_failed`, then every
-            // 20th attempt (~10 min at the 30 s cap) so a long outage leaves
-            // a trail without flooding the events feed.
-            let threshold = crate::srt::connection::CONNECT_FAILED_THRESHOLD;
-            if attempt == threshold || (attempt > threshold && attempt.is_multiple_of(20)) {
+            if peer_unreachable_due(attempt) {
                 attempt_events.emit_output_with_details(
                     EventSeverity::Critical,
                     category::SRT,
-                    format!(
-                        "SRT output '{attempt_output_id}' cannot reach its peer —                          {attempt} consecutive connection attempts failed, still retrying"
-                    ),
+                    peer_unreachable_message(&attempt_output_id, None, attempt),
                     &attempt_output_id,
                     serde_json::json!({
                         "error_code": "srt_output_peer_unreachable",
@@ -1199,13 +1218,21 @@ const SEND_LIVENESS_TICK: Duration = Duration::from_millis(100);
 /// the caller's retry off for the idle timeout (30 s by default) where the
 /// probe caught it in about 3 s.
 async fn forward_sends_unacknowledged(socket: &SrtSocket, stats: &OutputStatsAccumulator) -> bool {
-    let before = stats.packets_sent.load(Ordering::Relaxed);
+    sends_unacknowledged(socket, &stats.packets_sent).await
+}
+
+/// [`forward_sends_unacknowledged`] over any count of what the connection
+/// has sent: `sent` is the output's `packets_sent` on a single-leg output,
+/// and on a 2022-7 output's listener leg that leg's own count, since only
+/// one leg counts what the output sends ([`spawn_redundant_send_task`]).
+async fn sends_unacknowledged(socket: &SrtSocket, sent: &AtomicU64) -> bool {
+    let before = sent.load(Ordering::Relaxed);
     let mut window = ProbeWindow::new(Instant::now());
     let mut tick = tokio::time::interval(SEND_LIVENESS_TICK);
     loop {
         tick.tick().await;
         let now = Instant::now();
-        if stats.packets_sent.load(Ordering::Relaxed) > before {
+        if sent.load(Ordering::Relaxed) > before {
             window.offer(now);
         }
         if !window.offered() {
@@ -1841,11 +1868,16 @@ fn emit_redundant_output_leg_lost(
 /// error it sets `leg1_lost` before it returns, so leg 2, which counts
 /// whenever `leg1_lost` is set, takes over at once. Leg 2 counts a transient
 /// drop only while it counts: until then leg 1 carries the duplicate.
+///
+/// `leg_sent` counts every item this leg's socket took, whichever leg counts
+/// the output's: what a listener leg's stale-accept verdict judges the ACKs
+/// against ([`sends_unacknowledged`]).
 fn spawn_redundant_send_task(
     leg: u8,
     socket: Arc<SrtSocket>,
     stats: Arc<OutputStatsAccumulator>,
     leg1_lost: Arc<AtomicBool>,
+    leg_sent: Arc<AtomicU64>,
     output_id: String,
 ) -> (SendQueueTx, JoinHandle<()>) {
     let (tx, mut rx) = send_queue();
@@ -1854,6 +1886,7 @@ fn spawn_redundant_send_task(
             let counts = leg == 1 || leg1_lost.load(Ordering::Relaxed);
             match srt_send_chunked(&socket, &data).await {
                 Ok(sent) => {
+                    leg_sent.fetch_add(1, Ordering::Relaxed);
                     if counts {
                         stats.packets_sent.fetch_add(1, Ordering::Relaxed);
                         stats.bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
@@ -1890,8 +1923,15 @@ struct RedundantOutputCtx<'a> {
     cancel: &'a CancellationToken,
     events: &'a EventSender,
     /// The loop's own view of which legs are attached, for the slow-connect
-    /// Warnings, which run inside the acquisitions.
+    /// Warnings and the connect observers, which run inside the
+    /// acquisitions.
     leg_up: &'a [AtomicBool; 2],
+    /// Leg 1's consecutive failed connect attempts: the output's own
+    /// `connect_failures`, which the stats read (`connect_failed` past the
+    /// threshold), stored 0 whenever leg 1 attaches.
+    connect_failures: &'a AtomicU32,
+    /// Leg 2's, for its observer alone: nothing reads the count.
+    leg2_attempts: &'a AtomicU32,
 }
 
 impl<'a> RedundantOutputCtx<'a> {
@@ -1912,7 +1952,8 @@ impl<'a> RedundantOutputCtx<'a> {
 /// `warn_after` (the first acquisition, in either mode) a Warning is raised
 /// once the leg has not connected for that long, and the leg keeps trying;
 /// a re-arm after a loss passes `None`, as the leg-lost event has already
-/// said the leg is down.
+/// said the leg is down. A caller leg reports every failed attempt, on
+/// every acquisition, to [`output_leg_connect_observer`].
 fn arm_output_leg<'a>(
     ctx: &RedundantOutputCtx<'a>,
     leg: u8,
@@ -1947,23 +1988,96 @@ fn arm_output_leg<'a>(
         });
         (after, warn)
     });
-    acquire_redundant_leg(params, listener, delay, ctx.cancel, |_, _| {}, slow)
+    let observer = output_leg_connect_observer(ctx, leg);
+    acquire_redundant_leg(params, listener, delay, ctx.cancel, observer, slow)
 }
+
+/// Leg `leg`'s per-attempt connect observer, called after each failed
+/// attempt of a caller or rendezvous leg (a listener leg has none). It
+/// stores the acquisition's count of consecutive failures — leg 1's on the
+/// output's `connect_failures`, leg 2's on a scratch counter — and raises
+/// `srt_output_peer_unreachable` naming the leg when [`peer_unreachable_due`],
+/// as the single-leg caller output does: a Warning while the other leg is
+/// attached, since the output is then on air, and a Critical otherwise.
+/// Each acquisition counts from 1 again, so a lost leg whose peer does not
+/// come back raises it afresh.
+///
+/// Before, the legs passed no observer: a caller leg whose peer never
+/// answered said so once, in the 15 s Warning of its first acquisition, and
+/// a leg lost and re-dialled said nothing after its leg-lost event however
+/// long the peer stayed away.
+fn output_leg_connect_observer<'a>(
+    ctx: RedundantOutputCtx<'a>,
+    leg: u8,
+) -> impl FnMut(u32, &anyhow::Error) + Send + 'a {
+    let params = ctx.params(leg);
+    let (mode, remote_addr) = (*params.mode, params.remote_addr.unwrap_or(""));
+    let counter = if leg == 1 { ctx.connect_failures } else { ctx.leg2_attempts };
+    let other_up = ctx.up(if leg == 1 { 2 } else { 1 });
+    move |attempt: u32, err: &anyhow::Error| {
+        counter.store(attempt, Ordering::Relaxed);
+        if !peer_unreachable_due(attempt) {
+            return;
+        }
+        let output_id = &ctx.config.id;
+        let carrying = other_up.load(Ordering::Relaxed);
+        tracing::warn!(
+            "SRT output '{output_id}' 2022-7 leg {leg} cannot reach its peer: \
+             {attempt} consecutive connection attempts failed: {err}"
+        );
+        ctx.events.emit_output_with_details(
+            if carrying { EventSeverity::Warning } else { EventSeverity::Critical },
+            category::SRT,
+            peer_unreachable_message(output_id, Some(leg), attempt),
+            output_id,
+            serde_json::json!({
+                "error_code": "srt_output_peer_unreachable",
+                "output_id": output_id,
+                "remote_addr": remote_addr,
+                "attempts": attempt,
+                "error": err.to_string(),
+                "leg": leg,
+                "mode": format!("{mode:?}"),
+                "other_leg": if carrying { "carrying" } else { "down" },
+            }),
+        );
+    }
+}
+
+/// A 2022-7 output's listener leg's stale-accept verdict in flight
+/// ([`sends_unacknowledged`]), polled by the loop from the leg's attach
+/// until it answers: `true` when the caller left the leg's first sends
+/// unacknowledged. Allocated once per attach, never per packet.
+type LegStaleCheck = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
 
 /// Attach leg `leg`'s new socket: mark it up, start its stats poller (into
 /// `srt_stats` for leg 1, `srt_leg2_stats` for leg 2) and its send task,
 /// and raise its connected Info, on every attach. Returns the leg's queue,
-/// its send task and the token that stops its poller.
+/// its send task, the token that stops its poller and, on a listener leg,
+/// its stale-accept verdict.
+///
+/// A listener leg's caller is judged as the single-leg listener output
+/// judges one it cannot probe: by the ACKs to the leg's own first sends,
+/// within [`PROBE_WINDOW`] of the first ([`sends_unacknowledged`]). Each
+/// leg re-accepts on every loss, and its listener's backlog keeps
+/// accepting while the leg is attached — srt-transport queues up to 16
+/// accepted connections — so a re-arm can take a connection whose caller
+/// timed out its handshake, or gave up on it, long before. Attached
+/// unjudged, such a leg sent into nothing until libsrt's idle timeout
+/// (`peer_idle_timeout_secs`, 30 s by default) and only then re-accepted.
 fn attach_output_leg(
     ctx: &RedundantOutputCtx<'_>,
     leg: u8,
     socket: &Arc<SrtSocket>,
     stats: &Arc<OutputStatsAccumulator>,
     leg1_lost: &Arc<AtomicBool>,
-) -> (SendQueueTx, JoinHandle<()>, CancellationToken) {
+) -> (SendQueueTx, JoinHandle<()>, CancellationToken, Option<LegStaleCheck>) {
     let params = ctx.params(leg);
     let output_id = &ctx.config.id;
     ctx.up(leg).store(true, Ordering::Relaxed);
+    if leg == 1 {
+        ctx.connect_failures.store(0, Ordering::Relaxed);
+    }
     let poller = ctx.cancel.child_token();
     let cache = if leg == 1 {
         stats.srt_stats_cache.clone()
@@ -1971,13 +2085,19 @@ fn attach_output_leg(
         stats.srt_leg2_stats_cache.clone()
     };
     spawn_srt_stats_poller(socket.clone(), cache, None, poller.clone());
+    let leg_sent = Arc::new(AtomicU64::new(0));
     let (tx, task) = spawn_redundant_send_task(
         leg,
         socket.clone(),
         stats.clone(),
         leg1_lost.clone(),
+        leg_sent.clone(),
         output_id.clone(),
     );
+    let stale = (*params.mode == SrtMode::Listener).then(|| {
+        let socket = socket.clone();
+        Box::pin(async move { sends_unacknowledged(&socket, &leg_sent).await }) as LegStaleCheck
+    });
     tracing::info!(
         "SRT output '{output_id}' leg{leg} connected: mode={:?} local={}",
         params.mode,
@@ -2002,14 +2122,38 @@ fn attach_output_leg(
             "local_addr": params.local_addr.unwrap_or("auto"),
         }),
     );
-    (tx, task, poller)
+    (tx, task, poller, stale)
 }
 
-/// Detach lost leg `leg` and raise its Warning; the caller re-arms it.
-async fn lose_output_leg(
+/// Whether `socket`, just accepted on listener leg `leg` (`listener` handed
+/// back; `None` on a caller leg, whose connect is always fresh), is one
+/// libsrt has already given up: a connection the listener's backlog held
+/// while the leg was attached, whose caller then went silent past the idle
+/// timeout. The loop closes it and accepts the next at once, raising
+/// neither a connected Info nor, at its first send, a leg-lost Warning.
+fn accepted_gone(
     ctx: &RedundantOutputCtx<'_>,
     leg: u8,
-    other_leg: &'static str,
+    socket: &SrtSocket,
+    listener: &Option<srt_transport::SrtListener>,
+) -> bool {
+    let gone = listener.is_some() && socket_is_gone(socket);
+    if gone {
+        tracing::info!(
+            "SRT output '{}' 2022-7 leg {leg}: accepted a connection libsrt had already given \
+             up ({:?}), accepting the next",
+            ctx.config.id,
+            socket.status(),
+        );
+    }
+    gone
+}
+
+/// Detach leg `leg`: mark it down, stop its poller, drop its queue (its
+/// send task ends once it has drained it) and close its socket.
+async fn detach_output_leg(
+    ctx: &RedundantOutputCtx<'_>,
+    leg: u8,
     socket: &mut Option<Arc<SrtSocket>>,
     tx: &mut Option<SendQueueTx>,
     poller: &mut Option<CancellationToken>,
@@ -2022,7 +2166,57 @@ async fn lose_output_leg(
     if let Some(socket) = socket.take() {
         let _ = socket.close().await;
     }
+}
+
+/// Detach lost leg `leg` and raise its Warning; the caller re-arms it.
+async fn lose_output_leg(
+    ctx: &RedundantOutputCtx<'_>,
+    leg: u8,
+    other_leg: &'static str,
+    socket: &mut Option<Arc<SrtSocket>>,
+    tx: &mut Option<SendQueueTx>,
+    poller: &mut Option<CancellationToken>,
+) {
+    detach_output_leg(ctx, leg, socket, tx, poller).await;
     emit_redundant_output_leg_lost(ctx.events, &ctx.config.id, leg, *ctx.params(leg).mode, other_leg);
+}
+
+/// Detach listener leg `leg`, whose caller left its first sends
+/// unacknowledged ([`attach_output_leg`]), and raise its Warning; the loop
+/// re-arms the leg to accept at once, as the single-leg listener output
+/// re-accepts.
+///
+/// The message names the leg and is fixed per leg, as the leg-lost one is,
+/// so each leg's stale accepts fold into a row of their own. `other_leg` is
+/// the other leg's attach state: `carrying` or `down`. A stale accept is
+/// no loss of a working leg, so neither the leg-lost Warning nor, when no
+/// leg is left, `disconnected` is raised for it — as the single-leg output
+/// raises only its stale Warning.
+async fn drop_stale_output_leg(
+    ctx: &RedundantOutputCtx<'_>,
+    leg: u8,
+    socket: &mut Option<Arc<SrtSocket>>,
+    tx: &mut Option<SendQueueTx>,
+    poller: &mut Option<CancellationToken>,
+) {
+    let output_id = &ctx.config.id;
+    let carrying = ctx.up(if leg == 1 { 2 } else { 1 }).load(Ordering::Relaxed);
+    tracing::info!(
+        "SRT output '{output_id}' 2022-7 leg {leg}: no ACK received 3s after its first send, \
+         stale connection, re-accepting..."
+    );
+    detach_output_leg(ctx, leg, socket, tx, poller).await;
+    ctx.events.emit_output_with_details(
+        EventSeverity::Warning,
+        category::SRT,
+        format!("SRT output '{output_id}' 2022-7 leg {leg} stale connection detected"),
+        output_id,
+        serde_json::json!({
+            "mode": format!("{:?}", ctx.params(leg).mode),
+            "leg": leg,
+            "other_leg": if carrying { "carrying" } else { "down" },
+        }),
+    );
 }
 
 /// Core send loop for dual-leg SRT output with SMPTE 2022-7 packet duplication.
@@ -2033,8 +2227,13 @@ async fn lose_output_leg(
 /// Listener-mode legs bind once and re-accept on that listener; caller-mode
 /// legs re-dial with exponential back-off. A leg that has not connected
 /// `leg_connect_warn_after` into its first acquisition raises a Warning and
-/// keeps trying. Each attached leg gets its own send task and queue,
-/// following the same pattern as the single-leg output.
+/// keeps trying. A caller leg reports every failed attempt
+/// ([`output_leg_connect_observer`]). A listener leg's caller is judged by
+/// the ACKs to the leg's first sends and, when none come, dropped as stale
+/// and the leg re-armed at once ([`attach_output_leg`]); a connection libsrt
+/// has already given up is closed as it is accepted ([`accepted_gone`]).
+/// Each attached leg gets its own send task and queue, following the same
+/// pattern as the single-leg output.
 ///
 /// The delay buffer is resolved once, then the broadcast subscribed, both
 /// before either leg is armed: `TargetFrames` waits up to 5 s for a frame
@@ -2140,11 +2339,19 @@ async fn srt_output_redundant_loop(
     // a lock.
     let leg1_lost = Arc::new(AtomicBool::new(true));
     let leg_up = [AtomicBool::new(false), AtomicBool::new(false)];
+    let leg2_attempts = AtomicU32::new(0);
     // Cancelled at teardown whether or not `cancel` was, so a pending
     // acquisition can be let finish (see the end of this function).
     let legs_cancel = cancel.child_token();
-    let ctx =
-        RedundantOutputCtx { config, redundancy, cancel: &legs_cancel, events, leg_up: &leg_up };
+    let ctx = RedundantOutputCtx {
+        config,
+        redundancy,
+        cancel: &legs_cancel,
+        events,
+        leg_up: &leg_up,
+        connect_failures: &stats.connect_failures,
+        leg2_attempts: &leg2_attempts,
+    };
 
     // Each leg's state in locals of its own, so the select! below borrows
     // each leg's acquisition mutably on its own.
@@ -2158,6 +2365,9 @@ async fn srt_output_redundant_loop(
     let (mut tx1, mut tx2): (Option<SendQueueTx>, Option<SendQueueTx>) = (None, None);
     let (mut poller1, mut poller2): (Option<CancellationToken>, Option<CancellationToken>) =
         (None, None);
+    // A listener leg's stale-accept verdict, from its attach until it
+    // answers or the leg is lost.
+    let (mut stale1, mut stale2): (Option<LegStaleCheck>, Option<LegStaleCheck>) = (None, None);
     // Leg 1's send task is awaited at the end, so what it has queued goes
     // out; leg 2's, as before, is not.
     let mut task1: Option<JoinHandle<()>> = None;
@@ -2189,12 +2399,17 @@ async fn srt_output_redundant_loop(
             acquired = async { acquire1.as_mut().expect("armed").await }, if acquire1.is_some() => {
                 acquire1 = None;
                 match acquired {
+                    LegAcquired::Connected(socket, listener) if accepted_gone(&ctx, 1, &socket, &listener) => {
+                        let _ = socket.close().await;
+                        acquire1 = Some(arm_output_leg(&ctx, 1, listener, Duration::ZERO, None));
+                    }
                     LegAcquired::Connected(socket, listener) => {
                         listener1 = listener;
                         // Counting moves back to leg 1 before its task starts.
                         leg1_lost.store(false, Ordering::Relaxed);
-                        let (tx, task, poller) = attach_output_leg(&ctx, 1, &socket, &stats, &leg1_lost);
-                        (tx1, task1, poller1, sock1) = (Some(tx), Some(task), Some(poller), Some(socket));
+                        let (tx, task, poller, stale) = attach_output_leg(&ctx, 1, &socket, &stats, &leg1_lost);
+                        (tx1, task1, poller1, stale1, sock1) =
+                            (Some(tx), Some(task), Some(poller), stale, Some(socket));
                     }
                     // Produced only once `cancel` has fired; the cancel arm
                     // returns.
@@ -2212,12 +2427,16 @@ async fn srt_output_redundant_loop(
             acquired = async { acquire2.as_mut().expect("armed").await }, if acquire2.is_some() => {
                 acquire2 = None;
                 match acquired {
+                    LegAcquired::Connected(socket, listener) if accepted_gone(&ctx, 2, &socket, &listener) => {
+                        let _ = socket.close().await;
+                        acquire2 = Some(arm_output_leg(&ctx, 2, listener, Duration::ZERO, None));
+                    }
                     LegAcquired::Connected(socket, listener) => {
                         listener2 = listener;
                         // Leg 2's send task is not awaited at teardown, so
                         // its handle is let go.
-                        let (tx, _task, poller) = attach_output_leg(&ctx, 2, &socket, &stats, &leg1_lost);
-                        (tx2, poller2, sock2) = (Some(tx), Some(poller), Some(socket));
+                        let (tx, _task, poller, stale) = attach_output_leg(&ctx, 2, &socket, &stats, &leg1_lost);
+                        (tx2, poller2, stale2, sock2) = (Some(tx), Some(poller), stale, Some(socket));
                     }
                     LegAcquired::Cancelled => {}
                     LegAcquired::Failed(e) => {
@@ -2227,6 +2446,24 @@ async fn srt_output_redundant_loop(
                             break Err(e);
                         }
                     }
+                }
+                continue;
+            }
+            stale = async { stale1.as_mut().expect("armed").await }, if stale1.is_some() => {
+                stale1 = None;
+                if stale {
+                    drop_stale_output_leg(&ctx, 1, &mut sock1, &mut tx1, &mut poller1).await;
+                    task1 = None;
+                    leg1_lost.store(true, Ordering::Relaxed);
+                    acquire1 = Some(arm_output_leg(&ctx, 1, listener1.take(), Duration::ZERO, None));
+                }
+                continue;
+            }
+            stale = async { stale2.as_mut().expect("armed").await }, if stale2.is_some() => {
+                stale2 = None;
+                if stale {
+                    drop_stale_output_leg(&ctx, 2, &mut sock2, &mut tx2, &mut poller2).await;
+                    acquire2 = Some(arm_output_leg(&ctx, 2, listener2.take(), Duration::ZERO, None));
                 }
                 continue;
             }
@@ -2391,12 +2628,14 @@ async fn srt_output_redundant_loop(
             // lost leg.
             if let Some(other_leg) = lost[0] {
                 lose_output_leg(&ctx, 1, other_leg, &mut sock1, &mut tx1, &mut poller1).await;
+                stale1 = None;
                 task1 = None;
                 leg1_lost.store(true, Ordering::Relaxed);
                 acquire1 = Some(arm_output_leg(&ctx, 1, listener1.take(), LEG_REACQUIRE_DELAY, None));
             }
             if let Some(other_leg) = lost[1] {
                 lose_output_leg(&ctx, 2, other_leg, &mut sock2, &mut tx2, &mut poller2).await;
+                stale2 = None;
                 acquire2 = Some(arm_output_leg(&ctx, 2, listener2.take(), LEG_REACQUIRE_DELAY, None));
             }
             if none_left {
@@ -3861,6 +4100,368 @@ mod tests {
             matches!(closed, Ok(Err(_))),
             "the far end sees the connection closed, not a peer that never sends"
         );
+    }
+
+    /// Run a 2022-7 output's loop on `tx` until `cancel`, with the events
+    /// it raises.
+    fn spawn_redundant_output_with_events(
+        config: SrtOutputConfig,
+        tx: &broadcast::Sender<RtpPacket>,
+        stats: Arc<OutputStatsAccumulator>,
+        cancel: CancellationToken,
+    ) -> (JoinHandle<()>, tokio::sync::mpsc::Receiver<crate::manager::events::Event>) {
+        let tx = tx.clone();
+        let (events, events_rx) = crate::manager::events::event_channel();
+        let output = tokio::spawn(async move {
+            let active_input_rx = tokio::sync::watch::channel(String::new()).1;
+            srt_output_redundant_loop(
+                &config,
+                &tx,
+                stats,
+                cancel,
+                &events,
+                "f1",
+                None,
+                active_input_rx,
+                LEG_CONNECT_WARN_AFTER,
+            )
+            .await
+            .expect("the 2022-7 output runs");
+        });
+        (output, events_rx)
+    }
+
+    /// Publish [`PairHarness::media`] on `tx` every 2 ms while `media` is
+    /// set, and nothing otherwise, until `cancel`.
+    fn pump_media_while(
+        tx: &broadcast::Sender<RtpPacket>,
+        media: Arc<AtomicBool>,
+        cancel: &CancellationToken,
+    ) {
+        let (tx, stop) = (tx.clone(), cancel.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(2));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {
+                        if media.load(Ordering::Relaxed) {
+                            let _ = tx.send(published(PairHarness::media().to_vec(), true));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Wait up to 10 s until `count` events read into `events` carry
+    /// `message`.
+    async fn wait_for_events(
+        events_rx: &mut tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        events: &mut Vec<crate::manager::events::Event>,
+        message: &str,
+        count: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            while let Ok(event) = events_rx.try_recv() {
+                events.push(event);
+            }
+            if events.iter().filter(|e| e.message == message).count() >= count {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {count} of {message:?}; saw {:?}",
+                events.iter().map(|e| &e.message).collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The single-leg and 2022-7 `srt_output_peer_unreachable` messages: the
+    /// leg named when there is one, and no run of spaces in either (the
+    /// single-leg one carried 26 from a lost line continuation).
+    #[test]
+    fn peer_unreachable_names_the_leg_and_reads_as_one_sentence() {
+        assert_eq!(
+            peer_unreachable_message("o1", None, 5),
+            "SRT output 'o1' cannot reach its peer — 5 consecutive connection attempts failed, \
+             still retrying"
+        );
+        assert_eq!(
+            peer_unreachable_message("o1", Some(2), 20),
+            "SRT output 'o1' 2022-7 leg 2 cannot reach its peer — 20 consecutive connection \
+             attempts failed, still retrying"
+        );
+        let due: Vec<u32> = (1..=60).filter(|&a| peer_unreachable_due(a)).collect();
+        assert_eq!(due, vec![5, 20, 40, 60]);
+    }
+
+    /// A 2022-7 output's caller legs report their failed attempts as the
+    /// single-leg caller output does: leg 1's count is the output's
+    /// `connect_failures`, leg 2's is not, and `srt_output_peer_unreachable`
+    /// names the leg at the fifth attempt and every twentieth after it — a
+    /// Warning while the other leg carries, a Critical while it does not. The
+    /// legs used to pass no observer, so neither said anything past the 15 s
+    /// Warning of its first acquisition.
+    #[test]
+    fn a_2022_7_output_caller_leg_reports_its_unreachable_peer() {
+        let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o1", "name": "o1", "mode": "caller", "remote_addr": "127.0.0.1:9001",
+            "redundancy": { "mode": "caller", "remote_addr": "127.0.0.1:9002" }
+        }))
+        .expect("SRT output fixture");
+        let redundancy = config.redundancy.clone().expect("leg 2");
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let leg_up = [AtomicBool::new(false), AtomicBool::new(true)];
+        let (connect_failures, leg2_attempts) = (AtomicU32::new(0), AtomicU32::new(0));
+        let ctx = RedundantOutputCtx {
+            config: &config,
+            redundancy: &redundancy,
+            cancel: &cancel,
+            events: &events,
+            leg_up: &leg_up,
+            connect_failures: &connect_failures,
+            leg2_attempts: &leg2_attempts,
+        };
+        let failed = anyhow::anyhow!("connection setup failure: connection timed out");
+
+        // Leg 1 failing while leg 2 carries.
+        let mut leg1 = output_leg_connect_observer(ctx, 1);
+        for attempt in 1..=20 {
+            leg1(attempt, &failed);
+        }
+        assert_eq!(connect_failures.load(Ordering::Relaxed), 20, "the output's own count");
+        let raised: Vec<_> = std::iter::from_fn(|| events_rx.try_recv().ok()).collect();
+        assert_eq!(raised.len(), 2, "at the 5th and 20th attempts");
+        for (event, attempts) in raised.iter().zip([5, 20]) {
+            assert_eq!(event.severity, EventSeverity::Warning, "leg 2 carries");
+            assert_eq!(event.category, category::SRT);
+            assert_eq!(event.output_id.as_deref(), Some("o1"));
+            assert_eq!(event.message, peer_unreachable_message("o1", Some(1), attempts));
+            let details = event.details.as_ref().expect("details");
+            assert_eq!(details["error_code"], "srt_output_peer_unreachable");
+            assert_eq!(details["leg"], 1);
+            assert_eq!(details["attempts"], attempts);
+            assert_eq!(details["remote_addr"], "127.0.0.1:9001");
+            assert_eq!(details["mode"], "Caller");
+            assert_eq!(details["other_leg"], "carrying");
+        }
+
+        // Leg 2 failing with leg 1 down: a Critical, and the output's count
+        // untouched.
+        leg_up[1].store(false, Ordering::Relaxed);
+        connect_failures.store(0, Ordering::Relaxed);
+        let mut leg2 = output_leg_connect_observer(ctx, 2);
+        for attempt in 1..=5 {
+            leg2(attempt, &failed);
+        }
+        assert_eq!(connect_failures.load(Ordering::Relaxed), 0, "leg 2 is not the output's count");
+        assert_eq!(leg2_attempts.load(Ordering::Relaxed), 5);
+        let raised: Vec<_> = std::iter::from_fn(|| events_rx.try_recv().ok()).collect();
+        assert_eq!(raised.len(), 1);
+        assert_eq!(raised[0].severity, EventSeverity::Critical, "leg 1 is down too");
+        let details = raised[0].details.as_ref().expect("details");
+        assert_eq!((details["leg"].as_u64(), details["other_leg"].as_str()), (Some(2), Some("down")));
+        assert_eq!(details["remote_addr"], "127.0.0.1:9002");
+    }
+
+    /// A 2022-7 output's caller leg 1 counts its failed attempts on the
+    /// output's `connect_failures` while its peer is away, and clears them
+    /// once it connects, as the single-leg caller output does. The count
+    /// used to stay 0 however long leg 1's peer stayed away.
+    #[tokio::test]
+    async fn a_2022_7_output_counts_leg_1_connect_failures_and_clears_them_on_connect() {
+        // Held, answering nothing, until the far end binds it, so no other
+        // test takes the port while leg 1 fails against it.
+        let hold = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = hold.local_addr().unwrap().port();
+        let config = redundant_output_config(serde_json::json!({
+            "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"),
+            "connect_timeout_secs": 1,
+        }));
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let output = spawn_redundant_output(config, &tx, stats.clone(), cancel.clone());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while stats.connect_failures.load(Ordering::Relaxed) == 0 {
+            assert!(Instant::now() < deadline, "leg 1's failed attempts are counted");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        drop(hold);
+        let peer_config: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+            .expect("SRT listener fixture");
+        let mut listener = crate::srt::connection::bind_srt_listener_for_input(&peer_config)
+            .await
+            .expect("the far end binds");
+        let peer_cancel = CancellationToken::new();
+        let _peer = tokio::time::timeout(
+            Duration::from_secs(10),
+            accept_srt_connection(&mut listener, &peer_cancel),
+        )
+        .await
+        .expect("leg 1 redials in time")
+        .expect("the far end accepts it");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stats.connect_failures.load(Ordering::Relaxed) != 0 {
+            assert!(Instant::now() < deadline, "leg 1's connect clears the count");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(10), output)
+            .await
+            .expect("the output stops")
+            .expect("the output task does not panic");
+    }
+
+    /// A 2022-7 output's listener leg whose caller goes silent from the
+    /// accept is dropped as stale within 3 s of its first send and
+    /// re-accepted at once, with a Warning naming the leg (not the leg-lost
+    /// one, and no `disconnected`); the next caller is attached and kept. A
+    /// leg used to send into such a caller until libsrt's idle timeout (30 s
+    /// by default) before it re-accepted.
+    #[tokio::test]
+    async fn a_2022_7_output_drops_a_stale_listener_leg_and_reaccepts() {
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let config = redundant_output_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{port}"),
+        }));
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(4096);
+        let (_output, mut events_rx) =
+            spawn_redundant_output_with_events(config, &tx, stats, cancel.child_token());
+        let media = Arc::new(AtomicBool::new(false));
+        pump_media_while(&tx, media.clone(), &cancel);
+
+        let cut = Arc::new(AtomicBool::new(false));
+        let relay =
+            cuttable_udp_relay(format!("127.0.0.1:{port}").parse().unwrap(), cut.clone(), cancel.clone())
+                .await;
+        let caller: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "caller", "remote_addr": relay.to_string(), "latency_ms": 200,
+                "connect_timeout_secs": 10
+            }))
+            .expect("SRT caller fixture");
+        let connect_cancel = cancel.clone();
+        let _silent = tokio::spawn(async move {
+            crate::srt::connection::connect_srt_input(&caller, &connect_cancel).await
+        });
+        let mut events = Vec::new();
+        wait_for_event(&mut events_rx, &mut events, "SRT output 'o1' connected").await;
+        // Silent from the accept, and only then anything to send, so no ACK
+        // can have come.
+        cut.store(true, Ordering::Relaxed);
+        media.store(true, Ordering::Relaxed);
+        let first_send = Instant::now();
+        let stale = "SRT output 'o1' 2022-7 leg 1 stale connection detected";
+        wait_for_event(&mut events_rx, &mut events, stale).await;
+        let after = first_send.elapsed();
+        assert!(
+            after >= Duration::from_millis(2_900) && after < Duration::from_secs(5),
+            "stale {after:?} after the first send"
+        );
+        let event = events.iter().find(|e| e.message == stale).unwrap();
+        assert_eq!(event.severity, EventSeverity::Warning);
+        assert_eq!(event.category, category::SRT);
+        assert_eq!(event.output_id.as_deref(), Some("o1"));
+        let details = event.details.as_ref().expect("details");
+        assert_eq!(details["leg"], 1);
+        assert_eq!(details["mode"], "Listener");
+        assert_eq!(details["other_leg"], "down");
+
+        // Re-accepted at once: the next caller attaches and is kept.
+        let peer = caller_of(port, &cancel).await;
+        wait_for_events(&mut events_rx, &mut events, "SRT output 'o1' connected", 2).await;
+        tokio::time::sleep(Duration::from_millis(4_000)).await;
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(events.iter().filter(|e| e.message == stale).count(), 1, "a caller that ACKs is kept");
+        assert!(
+            !events.iter().any(|e| e.message.contains("lost; reconnecting")
+                || e.message.contains("disconnected")),
+            "{:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let more = tokio::time::timeout(Duration::from_secs(1), peer.recv())
+            .await
+            .expect("media arrives")
+            .expect("the connection is up");
+        assert_eq!(&more.data[..], &PairHarness::media()[..]);
+    }
+
+    /// A connection a 2022-7 output's listener held in its backlog while
+    /// the leg was attached, whose caller then went silent past the idle
+    /// timeout, is closed when the re-armed leg accepts it, and the next one
+    /// accepted: no connected Info and no second leg-lost Warning for it. It
+    /// used to be attached, announced, and lost again at its first send.
+    #[tokio::test]
+    async fn a_2022_7_output_skips_a_backlogged_connection_libsrt_gave_up() {
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let config = redundant_output_config(serde_json::json!({
+            "mode": "listener", "local_addr": format!("127.0.0.1:{port}"),
+            "peer_idle_timeout_secs": 2,
+        }));
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, _rx) = broadcast::channel(4096);
+        let (_output, mut events_rx) =
+            spawn_redundant_output_with_events(config, &tx, stats, cancel.child_token());
+        pump_media_while(&tx, Arc::new(AtomicBool::new(true)), &cancel);
+        let mut events = Vec::new();
+        let connected = "SRT output 'o1' connected";
+        let lost = "SRT output 'o1' 2022-7 leg 1 lost; reconnecting";
+
+        let first = caller_of(port, &cancel).await;
+        wait_for_event(&mut events_rx, &mut events, connected).await;
+
+        // A second caller while leg 1 is attached: the listener's backlog
+        // takes it. It then goes silent until libsrt gives it up, which
+        // takes its 17th expiry timer as well as the idle timeout: about
+        // 5 s at loopback round trips, however short the timeout.
+        let cut = Arc::new(AtomicBool::new(false));
+        let relay =
+            cuttable_udp_relay(format!("127.0.0.1:{port}").parse().unwrap(), cut.clone(), cancel.clone())
+                .await;
+        let _backlogged = caller_of(relay.port(), &cancel).await;
+        cut.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(7)).await;
+
+        first.close().await.unwrap();
+        wait_for_event(&mut events_rx, &mut events, lost).await;
+        // Past the re-arm's 1 s and the backlogged connection's turn.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        while let Ok(event) = events_rx.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events.iter().filter(|e| e.message == connected).count(),
+            1,
+            "{:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert_eq!(events.iter().filter(|e| e.message == lost).count(), 1);
+
+        let next = caller_of(port, &cancel).await;
+        wait_for_events(&mut events_rx, &mut events, connected, 2).await;
+        let media = tokio::time::timeout(Duration::from_secs(2), next.recv())
+            .await
+            .expect("media arrives")
+            .expect("the connection is up");
+        assert_eq!(&media.data[..], &PairHarness::media()[..]);
     }
 
     /// One broadcast item, as an input publishes it.

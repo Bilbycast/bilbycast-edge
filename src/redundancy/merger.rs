@@ -1890,6 +1890,11 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     /// What is held was delivered before the loss, and every packet that
     /// arrives after it is held from a later instant, so the old stretch has
     /// drained before the new one releases anything.
+    ///
+    /// Both legs' SSRCs are forgotten with the stream ([`Self::observe_ssrc`]):
+    /// a sender that restarts on a new SSRC brings both legs back on it, and
+    /// the first leg back judged against the other's old one would count a
+    /// mismatch that is not there.
     pub fn restart(&mut self) {
         self.dedup.restart();
         let last = self.buffer.keys().next_back().map(|&(virt, _)| virt);
@@ -1898,6 +1903,9 @@ impl<T: Clone> BufferedHitlessMerger<T> {
             self.stretches.push_back(past + 1);
         }
         self.anchor_set = false;
+        for leg in &mut self.leg_state {
+            leg.ssrc = 0;
+        }
     }
 }
 
@@ -2480,6 +2488,27 @@ mod buffered_tests {
         m.observe_ssrc(ActiveLeg::Leg1, 0xdeadbeef);
         m.observe_ssrc(ActiveLeg::Leg2, 0xdeadbeef);
         assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0);
+    }
+
+    /// A restart (an SRT pair that lost both legs) forgets both legs' SSRCs:
+    /// a sender back on a new SSRC on both legs is no mismatch, while legs
+    /// that disagree after it still are, and the count carries on.
+    #[test]
+    fn a_restart_forgets_the_legs_ssrcs_and_keeps_the_count() {
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
+        m.observe_ssrc(ActiveLeg::Leg1, 0xdeadbeef);
+        m.observe_ssrc(ActiveLeg::Leg2, 0xdeadbeef);
+        m.restart();
+        m.observe_ssrc(ActiveLeg::Leg2, 0xfeedface);
+        m.observe_ssrc(ActiveLeg::Leg1, 0xfeedface);
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0, "one sender, a new SSRC");
+
+        m.observe_ssrc(ActiveLeg::Leg2, 0x0bad_cafe);
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 1);
+        m.restart();
+        m.observe_ssrc(ActiveLeg::Leg1, 1);
+        m.observe_ssrc(ActiveLeg::Leg2, 2);
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 2, "counted on across it");
     }
 
     #[test]

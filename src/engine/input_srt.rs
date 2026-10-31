@@ -1029,6 +1029,7 @@ async fn srt_input_redundant_loop(
             }
             _ = tokio::time::sleep_until(drain_at.unwrap_or_else(tokio::time::Instant::now)), if drain_at.is_some() => {
                 drain_redundant_pair(&mut pair, &stats, &publisher, transcoder, post);
+                report_pair_ssrc_mismatch(&mut pair, events, flow_id);
             }
             acquired = async { acquire1.as_mut().expect("armed").await }, if acquire1.is_some() => {
                 acquire1 = None;
@@ -1159,6 +1160,10 @@ struct RedundantPair {
     raw_ts_seq_leg1: u16,
     raw_ts_seq_leg2: u16,
     raw_ts_timestamp: u32,
+    /// How many of a buffered merger's SSRC mismatches have been raised
+    /// ([`report_pair_ssrc_mismatch`]). Kept across [`Self::restart`], as the
+    /// merger's count is.
+    ssrc_mismatch_reported: u64,
 }
 
 impl RedundantPair {
@@ -1173,6 +1178,7 @@ impl RedundantPair {
             raw_ts_seq_leg1: 0,
             raw_ts_seq_leg2: 0,
             raw_ts_timestamp: 0,
+            ssrc_mismatch_reported: 0,
         }
     }
 
@@ -1731,6 +1737,12 @@ fn process_redundant_packet(
                     }
                 }
                 PairMerger::Buffered(merger) => {
+                    // 2022-7 sends byte-identical RTP on both legs, SSRC
+                    // included: the merger counts the legs disagreeing
+                    // (`ssrc_mismatch`), as the RTP input's does.
+                    // `is_likely_rtp` has seen the 12-byte header.
+                    let header = &packet.data;
+                    merger.observe_ssrc(leg, u32::from_be_bytes([header[8], header[9], header[10], header[11]]));
                     let now = std::time::Instant::now();
                     for (chosen_leg, packet) in merger.ingest(seq, leg, packet, now) {
                         publish_redundant_packet(packet, chosen_leg, prev_active_leg, stats, publisher, transcoder, post);
@@ -1821,6 +1833,22 @@ fn publish_redundant_packet(
     }
 
     crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
+}
+
+/// Raise the Warning `redundancy_ssrc_mismatch`, as the RTP input does, once
+/// for each SSRC mismatch between the legs a buffered pair merger has
+/// counted since the last report; nothing for an unbuffered merger, which
+/// checks no SSRC. Called as the merger releases, so a mismatch is reported
+/// within one hold of the packet that showed it.
+fn report_pair_ssrc_mismatch(pair: &mut RedundantPair, events: &EventSender, flow_id: &str) {
+    let PairMerger::Buffered(merger) = &pair.merger else {
+        return;
+    };
+    let mismatch = merger.stats.ssrc_mismatch.load(Ordering::Relaxed);
+    if mismatch > pair.ssrc_mismatch_reported {
+        pair.ssrc_mismatch_reported = mismatch;
+        crate::engine::input_rtp::emit_ssrc_mismatch(events, flow_id, mismatch);
+    }
 }
 
 /// Release what a buffered pair merger holds past its release time. Nothing
@@ -3320,6 +3348,52 @@ mod tests {
         let snap = bench.flow.snapshot();
         let held = snap.input.buffered_hitless.expect("the buffered merger's stats");
         assert_eq!((held.max_path_diff_ms, held.packets_emitted, held.gap_lost), (1000, 300, 0));
+    }
+
+    /// A buffered pair whose legs carry RTP under different SSRCs counts the
+    /// mismatch on its `buffered_hitless` stats and raises the RTP input's
+    /// Warning once for it; legs back on one new SSRC after both were lost
+    /// count nothing more. An SRT pair used to check no SSRC, so its
+    /// `ssrc_mismatch` read 0 whatever the legs carried.
+    #[test]
+    fn a_buffered_pair_reports_legs_carrying_different_ssrcs() {
+        let mut bench = PairBench::new(serde_json::json!({ "path_differential_ms": 20 }));
+        let with_ssrc = |seq: u16, ssrc: u32| {
+            let mut datagram = rtp_datagram(seq);
+            datagram[8..12].copy_from_slice(&ssrc.to_be_bytes());
+            datagram
+        };
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let ssrc_mismatch =
+            |bench: &PairBench| bench.flow.snapshot().input.buffered_hitless.expect("stats").ssrc_mismatch;
+
+        for seq in 0..10u16 {
+            bench.deliver_datagram(ActiveLeg::Leg1, with_ssrc(seq, 0x1111_1111));
+            bench.deliver_datagram(ActiveLeg::Leg2, with_ssrc(seq, 0x2222_2222));
+        }
+        bench.drain_when_due();
+        report_pair_ssrc_mismatch(&mut bench.pair, &events, "f1");
+        report_pair_ssrc_mismatch(&mut bench.pair, &events, "f1");
+        assert_eq!(ssrc_mismatch(&bench), 1);
+        let raised: Vec<_> = std::iter::from_fn(|| events_rx.try_recv().ok()).collect();
+        assert_eq!(raised.len(), 1, "once for the one mismatch counted");
+        assert_eq!(raised[0].severity, crate::manager::events::EventSeverity::Warning);
+        assert_eq!(raised[0].category, crate::manager::events::category::REDUNDANCY);
+        assert_eq!(raised[0].flow_id.as_deref(), Some("f1"));
+        let details = raised[0].details.as_ref().expect("details");
+        assert_eq!(details["error_code"], "redundancy_ssrc_mismatch");
+        assert_eq!(details["mismatch_count"], 1);
+
+        // Both legs lost; the sender comes back on a new SSRC on both.
+        bench.pair.restart();
+        for seq in 500..510u16 {
+            bench.deliver_datagram(ActiveLeg::Leg2, with_ssrc(seq, 0x3333_3333));
+            bench.deliver_datagram(ActiveLeg::Leg1, with_ssrc(seq, 0x3333_3333));
+        }
+        bench.drain_when_due();
+        report_pair_ssrc_mismatch(&mut bench.pair, &events, "f1");
+        assert_eq!(ssrc_mismatch(&bench), 1, "one sender on a new SSRC is no mismatch");
+        assert!(events_rx.try_recv().is_err());
     }
 
     /// Without `path_differential_ms` the pair forwards as it always did:

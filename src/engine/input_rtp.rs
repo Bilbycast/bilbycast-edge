@@ -883,17 +883,7 @@ async fn rtp_input_redundant_loop(
                     let mismatch =
                         m.stats.ssrc_mismatch.load(std::sync::atomic::Ordering::Relaxed);
                     if mismatch > prev_ssrc_mismatch {
-                        events.emit_flow_with_details(
-                            crate::manager::events::EventSeverity::Warning,
-                            crate::manager::events::category::REDUNDANCY,
-                            "SMPTE 2022-7: leg SSRC mismatch — both legs must \
-                             carry byte-identical RTP including SSRC",
-                            flow_id,
-                            serde_json::json!({
-                                "error_code": "redundancy_ssrc_mismatch",
-                                "mismatch_count": mismatch,
-                            }),
-                        );
+                        emit_ssrc_mismatch(events, flow_id, mismatch);
                         prev_ssrc_mismatch = mismatch;
                     }
                 }
@@ -922,6 +912,24 @@ async fn rtp_input_redundant_loop(
     }
 
     Ok(())
+}
+
+/// Raise the Warning `redundancy_ssrc_mismatch` for a 2022-7 input whose
+/// buffered merger has counted `mismatch_count` SSRC mismatches between its
+/// legs, one more than at the last report. Shared by the RTP input and an
+/// SRT input pair ([`crate::engine::input_srt`]).
+pub(crate) fn emit_ssrc_mismatch(events: &EventSender, flow_id: &str, mismatch_count: u64) {
+    events.emit_flow_with_details(
+        EventSeverity::Warning,
+        category::REDUNDANCY,
+        "SMPTE 2022-7: leg SSRC mismatch — both legs must \
+         carry byte-identical RTP including SSRC",
+        flow_id,
+        serde_json::json!({
+            "error_code": "redundancy_ssrc_mismatch",
+            "mismatch_count": mismatch_count,
+        }),
+    );
 }
 
 /// Emit a `leg_dropped` / `leg_recovered` event when a leg's health
