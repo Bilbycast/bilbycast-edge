@@ -4,9 +4,12 @@
 //! SMPTE 2022-1 FEC Encoder -- generates column and row FEC packets.
 //!
 //! Places each media packet in an L x D matrix at `seq - SNBase`, the same
-//! rule [`super::decoder::FecDecoder`] files received packets by, so both
-//! ends put every cell in the same place whatever gaps, repeats or steps
-//! back the sequence numbers carry. When a column holds all D of its
+//! rule [`super::decoder::FecDecoder`] files received packets by
+//! ([`super::matrix::Placement`]), so both ends put every cell in the same
+//! place whatever gaps, repeats or steps back the sequence numbers carry. A
+//! packet less than a matrix behind SNBase is late: the encoder sends it
+//! unprotected and keeps the open matrix, and the decoder keeps its own
+//! (edge#214). When a column holds all D of its
 //! packets, a column FEC packet is emitted. When the packet in the matrix's
 //! last cell (by sequence number) arrives, a row FEC packet is emitted for
 //! every complete row.
@@ -36,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
-use super::matrix::FecMatrix;
+use super::matrix::{FecMatrix, Placement};
 use super::{FEC_HEADER_LEN, FEC_MAGIC};
 
 /// How many columns, and how many rows, the FEC header can name.
@@ -106,17 +109,26 @@ impl FecEncoder {
     ///   closed the matrix would publish a second time;
     /// - no cell of it has had its sequence number sent again with other
     ///   bytes in this matrix: a receiver may hold either copy.
+    ///
+    /// Where a packet goes is the placement rule the decoder shares
+    /// ([`FecMatrix::place`]). A packet past the window, or a whole matrix
+    /// or more behind SNBase, starts the next matrix at its own number. One
+    /// less than a matrix behind SNBase is late (an upstream that reordered
+    /// it, forwarded unchanged by a 2022-7 output, or one that restarted a
+    /// few numbers back): it goes out unprotected and changes nothing. It
+    /// used to start a new matrix, which left the open one's groups without
+    /// FEC. It never moves SNBase back, as the decoder's may: a restart's
+    /// first packet would then complete groups of the copies sent first
+    /// just before the restart sends them again with other bytes.
     pub fn process(&mut self, seq: u16, payload: &[u8]) -> Vec<Bytes> {
-        // The decoder's placement rule (`FecDecoder::process_media`): a cell
-        // sits at `seq - SNBase`, and a packet outside
-        // [SNBase, SNBase + L*D) -- past the window, or any step back --
-        // starts the next matrix at its own number.
-        if !self.initialized || seq.wrapping_sub(self.base_seq) >= self.matrix_size {
-            self.reset_matrix();
-            self.base_seq = seq;
-            self.initialized = true;
-        }
-        let position = seq.wrapping_sub(self.base_seq) as usize;
+        let position = match self.initialized.then(|| self.matrix.place(self.base_seq, seq)) {
+            Some(Placement::Cell(position)) => position,
+            Some(Placement::Late(_)) => return Vec::new(),
+            None | Some(Placement::Past | Placement::Moved) => {
+                self.start_matrix(seq);
+                0
+            }
+        };
         if self.matrix.has_cell(position) {
             // A repeat. With the same bytes the cell and every parity over
             // it are unchanged. With other bytes a receiver holds whichever
@@ -183,11 +195,13 @@ impl FecEncoder {
         fec_packets
     }
 
-    /// Empty the matrix for the next one.
-    fn reset_matrix(&mut self) {
+    /// Open the next matrix at `seq`, empty.
+    fn start_matrix(&mut self, seq: u16) {
         self.matrix.reset();
         self.unprotected_cols = 0;
         self.unprotected_rows = 0;
+        self.base_seq = seq;
+        self.initialized = true;
     }
 
     /// Whether every cell at `positions` holds a packet of one length.
@@ -393,11 +407,13 @@ mod tests {
         assert_eq!(out.iter().filter(|f| f.is_column).count(), 1, "column 0 of 108..");
     }
 
-    /// A packet outside the current window -- forward past it, or any
-    /// step back -- starts the next matrix at its own sequence number.
+    /// A packet past the current window, or a whole matrix or more behind
+    /// it, starts the next matrix at its own sequence number. (A step back
+    /// of less than a matrix is late:
+    /// `a_late_packet_goes_out_unprotected_and_changes_nothing`.)
     #[test]
     fn a_packet_outside_the_window_starts_the_next_matrix() {
-        for jump in [200u16, 95] {
+        for jump in [200u16, 92] {
             let mut enc = FecEncoder::new(2, 4, Arc::new(AtomicU64::new(0)));
             for seq in 100u16..=102 {
                 assert!(feed(&mut enc, seq).is_empty());
@@ -410,6 +426,39 @@ mod tests {
             assert!(out.iter().all(|f| f.sn_base == jump), "jump to {jump}: {out:?}");
             assert_eq!(out[0].payload, xor_of([jump, jump + 2, jump + 4, jump + 6]));
         }
+    }
+
+    /// A packet less than a matrix behind SNBase (an upstream that
+    /// reordered it) is late: it gets no FEC and never starts a new matrix
+    /// (edge#214), so the open matrix is protected exactly as without it.
+    /// L=2 D=4:
+    /// - the open matrix's own first packet after its second and third
+    ///   (101, 102, 100, 103..): SNBase stays 101;
+    /// - a straggler from the matrix before (107 after 108);
+    /// - a late packet behind a matrix half sent (99 after 100..=106),
+    ///   which used to start a matrix at 99 and leave 100's column 1 and
+    ///   rows unprotected.
+    #[test]
+    fn a_late_packet_goes_out_unprotected_and_changes_nothing() {
+        let run = |seqs: &[u16]| {
+            let mut enc = FecEncoder::new(2, 4, Arc::new(AtomicU64::new(0)));
+            seqs.iter().map(|&s| feed(&mut enc, s)).collect::<Vec<_>>()
+        };
+        let without = |seqs: &[u16], late: u16| {
+            run(&seqs.iter().copied().filter(|&s| s != late).collect::<Vec<_>>()).concat()
+        };
+        let cases: [(Vec<u16>, u16); 3] = [
+            ([101, 102, 100].into_iter().chain(103..109).collect(), 100),
+            ((100..107).chain([108, 107]).chain(109..116).collect(), 107),
+            ((100..107).chain([99, 107]).collect(), 99),
+        ];
+        for (seqs, late) in cases {
+            let out = run(&seqs);
+            let at = seqs.iter().position(|&s| s == late).unwrap();
+            assert!(out[at].is_empty(), "{late}: {:?}", out[at]);
+            assert_eq!(out.concat(), without(&seqs, late), "{seqs:?}");
+        }
+        assert_eq!(without(&[101, 102, 103, 104, 105, 106, 107, 108], 0).len(), 2 + 4);
     }
 
     /// A repeated sequence number neither moves a cell nor counts twice.
