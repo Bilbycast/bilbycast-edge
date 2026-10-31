@@ -7477,6 +7477,17 @@ fn build_master_clock(
             .unwrap_or_else(|| "<auto>".to_string()),
     );
 
+    // `sender_timestamp` and `contribution` run the source-PCR PLL too, and
+    // are named on `configured_kind` with what the operator asked for: the
+    // handle tags the locked PLL, and the fallback wrapper its wallclock rung
+    // (`PcrPllWithFallback::with_pll_label`), so the name holds across a
+    // fallback. An explicit `source_pcr_pll` carries none.
+    let pll_label = match cfg.master_clock.as_ref().map(|m| m.kind) {
+        Some(MasterClockKindConfig::SenderTimestamp) => Some("sender_timestamp"),
+        Some(MasterClockKindConfig::Contribution) => Some("contribution"),
+        _ => None,
+    };
+
     let (handle, pll_master, ptp_handle) = match kind {
         MasterClockKind::SourcePcrPll => {
             // Operator override for the PLL lock-jitter threshold. Defaults
@@ -7511,6 +7522,10 @@ fn build_master_clock(
             // dispatches based on an internal atomic flag.
             let wrapper =
                 crate::engine::master_clock::PcrPllWithFallback::new(pll_inner.clone());
+            let wrapper = match pll_label {
+                Some(label) => wrapper.with_pll_label(label),
+                None => wrapper,
+            };
             // Assembled flows with an explicit PLL pin still key
             // telemetry + the degraded chip to the designated
             // `assembly.pcr_source` input (contract C4).
@@ -7572,16 +7587,15 @@ fn build_master_clock(
 
     // Auto on a PTP-native input resolved to PTP above — tag it so the UI
     // shows "Auto → PTP" (the contribution/assembly cascade tags itself in
-    // build_auto_cascade). `sender_timestamp` and `contribution` run the
-    // source-PCR PLL too, so they are tagged with what the operator asked
-    // for: the comments above promised that label on `configured_kind`,
-    // and the telemetry carried none, so the manager could not tell a
-    // sender-timestamp flow from a plain `source_pcr_pll` pin.
-    let handle = match cfg.master_clock.as_ref().map(|m| m.kind) {
+    // build_auto_cascade). `sender_timestamp` and `contribution` are tagged
+    // with what the operator asked for (`pll_label` above): the comments
+    // above promised that label on `configured_kind`, and the telemetry
+    // carried none, so the manager could not tell a sender-timestamp flow
+    // from a plain `source_pcr_pll` pin.
+    let handle = match pll_label {
         _ if is_auto => handle.with_configured_kind("auto"),
-        Some(MasterClockKindConfig::SenderTimestamp) => handle.with_configured_kind("sender_timestamp"),
-        Some(MasterClockKindConfig::Contribution) => handle.with_configured_kind("contribution"),
-        _ => handle,
+        Some(label) => handle.with_configured_kind(label),
+        None => handle,
     };
 
     if let Some(mc_cfg) = cfg.master_clock.as_ref() {
@@ -8934,7 +8948,11 @@ mod master_clock_label_tests {
     /// `sender_timestamp`, `contribution` — carry that name on
     /// `configured_kind`; an explicit `source_pcr_pll` carries none. The
     /// telemetry used to carry none for all three, so the manager could
-    /// not tell a sender-timestamp flow from a plain PLL pin.
+    /// not tell a sender-timestamp flow from a plain PLL pin. The name
+    /// holds once the PLL, fed nothing, falls back to wallclock, so the
+    /// manager reads "fallback from sender_timestamp": the wallclock rung's
+    /// own label, `source_pcr_pll`, replaced it for as long as the
+    /// fallback lasted.
     #[tokio::test]
     async fn the_pll_kinds_named_by_intent_carry_their_name() {
         let input: InputConfig = serde_json::from_value(serde_json::json!({
@@ -8944,6 +8962,7 @@ mod master_clock_label_tests {
         let (events, _rx) = crate::manager::events::event_channel();
         let cancel = CancellationToken::new();
         let _stop = cancel.clone().drop_guard();
+        let mut handles = Vec::new();
         for (kind, label) in [
             ("sender_timestamp", Some("sender_timestamp")),
             ("contribution", Some("contribution")),
@@ -8951,14 +8970,29 @@ mod master_clock_label_tests {
         ] {
             let cfg: FlowConfig = serde_json::from_value(serde_json::json!({
                 "id": "f1", "name": "f1", "input_ids": ["in"], "output_ids": [],
-                "master_clock": { "kind": kind }
+                "master_clock": { "kind": kind, "pll_lock_timeout_s": 1 }
             }))
             .unwrap();
-            let (_tx, rx) = tokio::sync::watch::channel("in".to_string());
+            let (tx, rx) = tokio::sync::watch::channel("in".to_string());
             let (handle, _, _) = build_master_clock(&cfg, Some(&input), rx, &events, &cancel);
             let t = handle.telemetry();
             assert_eq!(t.kind, "source_pcr_pll", "{kind}");
             assert_eq!(t.configured_kind.as_deref(), label, "{kind}");
+            assert!(!t.fallback_active, "{kind}");
+            handles.push((kind, label, handle, tx));
+        }
+
+        // No PCR reaches the PLLs: each falls back a second in.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handles.iter().any(|(_, _, h, _)| !h.telemetry().fallback_active) {
+            assert!(std::time::Instant::now() < deadline, "no fallback within 5 s");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        for (kind, label, handle, _) in &handles {
+            let t = handle.telemetry();
+            assert_eq!(t.kind, "wallclock", "{kind}");
+            assert_eq!(t.fallback_reason.as_deref(), Some("no_pcr_observed"), "{kind}");
+            assert_eq!(t.configured_kind.as_deref(), Some(label.unwrap_or("source_pcr_pll")), "{kind}");
         }
     }
 }

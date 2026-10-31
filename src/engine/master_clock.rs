@@ -184,10 +184,12 @@ pub struct MasterClockTelemetry {
     pub rate_offset_ppm: f64,
     /// Recent jitter in microseconds (p99 over last 1 s window).
     pub jitter_us: u64,
-    /// What the operator (or auto-policy) configured, regardless of
-    /// whether a fallback has since fired. `None` when the field is
-    /// not relevant (e.g. on bare wallclock flows that never had a
-    /// PLL configured). Additive — older managers ignore it.
+    /// What the operator (or auto-policy) configured when it differs from
+    /// `kind`: `auto`, `sender_timestamp` / `contribution` (held across a
+    /// fallback), or `source_pcr_pll` on an explicit pin while its fallback
+    /// runs. Not a fallback signal by itself — `fallback_active` is. `None`
+    /// on an explicit kind running as itself. Additive — older managers
+    /// ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_kind: Option<String>,
     /// `true` when the PLL→Wallclock fallback has fired on this
@@ -199,23 +201,24 @@ pub struct MasterClockTelemetry {
     /// Set only when `fallback_active`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
-    /// ID of the input currently feeding the clock. For
-    /// `source_pcr_pll` this is the active input whose PCR samples the
-    /// PLL is tracking (refreshes on operator-driven input switches
-    /// without re-creating the master). For assembled (PID-bus) flows
-    /// this is the operator-designated `assembly.pcr_source` input —
-    /// the clock identity never follows the switcher's active input.
-    /// `None` for clock kinds that don't take their rate from a single
-    /// ingress stream (`ptp`, bare `wallclock`). Additive — older
-    /// managers ignore it.
+    /// ID of the input feeding the clock, as far as the clock knows it:
+    /// set here only by an assembled (PID-bus) flow's PLL wrapper, to the
+    /// operator-designated `assembly.pcr_source` input — the clock
+    /// identity never follows the switcher's active input. Every other
+    /// flow's 1 Hz telemetry tick (`FlowRuntime::start`) fills it with the
+    /// flow's active input whatever the kind, so on `ptp`, `wallclock` and
+    /// `passthrough` it names the input on air, not a clock source.
+    /// Additive — older managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_input_id: Option<String>,
     /// Which rate-sample source last fed the PLL. `"sender_timestamp"`
     /// for SRT/RIST inputs delivering libsrt's `SRT_MsgCtrl::srctime`,
     /// `"pcr"` for MPEG-TS PCR sampled from the adaptation field,
-    /// `"none"` before the first sample lands. Additive — older
-    /// managers ignore it; only meaningful for `source_pcr_pll`-class
-    /// clocks.
+    /// `"none"` before the first sample lands. Set by the PLL's own
+    /// telemetry, so present while the PLL is the clock and no fallback
+    /// has fired — locked, or acquiring while the output holds on
+    /// wallclock — and absent on the fallback rungs. Additive — older
+    /// managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_source: Option<String>,
 }
@@ -633,6 +636,16 @@ pub struct PcrPllWithFallback {
     /// cascade so the UI renders "Auto → PTP/Wallclock"; `None` for the
     /// classic wrapper (which reports `source_pcr_pll`).
     configured_kind: Option<&'static str>,
+    /// The classic wrapper's name for its PLL when the operator named it by
+    /// intent (`sender_timestamp`, `contribution`), reported as
+    /// `configured_kind` on the wallclock rung in place of
+    /// `source_pcr_pll`, so the UI reads "fallback from sender_timestamp".
+    /// The handle tags the locked PLL with the same name; without this the
+    /// rung's own label won, and the flow's `configured_kind` turned to
+    /// `source_pcr_pll` for as long as each fallback lasted. Unlike
+    /// `configured_kind` it leaves the alarm chip as the classic wrapper
+    /// raises it. `None` = an explicit `source_pcr_pll`.
+    pll_label: Option<&'static str>,
     /// Assembled (PID-bus) flows only: the operator-designated
     /// `assembly.pcr_source` input id. When set, telemetry (a) stamps
     /// `active_input_id` with it so the manager UI attributes clock
@@ -658,9 +671,18 @@ impl PcrPllWithFallback {
             fallback_uses_ptp: AtomicBool::new(false),
             fallback_reason: std::sync::RwLock::new(None),
             configured_kind: None,
+            pll_label: None,
             clock_source_input: None,
             source_id,
         }
+    }
+
+    /// Name the classic wrapper's PLL as the operator did
+    /// (`sender_timestamp`, `contribution`) — see the `pll_label` field.
+    /// Call before the `Arc` wrap.
+    pub fn with_pll_label(mut self, label: &'static str) -> Self {
+        self.pll_label = Some(label);
+        self
     }
 
     /// Cascade constructor for `master_clock.kind = "auto"`: PLL primary,
@@ -681,6 +703,7 @@ impl PcrPllWithFallback {
             fallback_uses_ptp: AtomicBool::new(false),
             fallback_reason: std::sync::RwLock::new(None),
             configured_kind: Some(label),
+            pll_label: None,
             clock_source_input: None,
             source_id,
         }
@@ -801,6 +824,7 @@ impl PcrPllWithFallback {
             t.kind = MasterClockKind::Wallclock.as_str().to_string();
             t.configured_kind = Some(
                 self.configured_kind
+                    .or(self.pll_label)
                     .unwrap_or(MasterClockKind::SourcePcrPll.as_str())
                     .to_string(),
             );
