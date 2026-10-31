@@ -84,6 +84,12 @@ pub struct AudioReencoder {
     /// picture's lead over the audio silence stops short by — the placement
     /// rule the RTMP output shares (`audio_encode::EncoderInputClock`).
     input: EncoderInputClock,
+    /// What an encoder retired for another input rate still held, run out
+    /// on its own timeline (`ensure_encoder_rate`), for the next frames
+    /// handed back; and the last of its stamps, at or before which the new
+    /// encoder's priming frames are not handed back.
+    retired: Vec<(Vec<u8>, u64)>,
+    retired_until: Option<u64>,
 }
 
 struct LazyAudioInit {
@@ -179,6 +185,8 @@ impl AudioReencoder {
             out_stats,
             silence,
             input: EncoderInputClock::default(),
+            retired: Vec::new(),
+            retired_until: None,
         })
     }
 
@@ -347,9 +355,7 @@ impl AudioReencoder {
                     } else {
                         self.input.refused();
                     }
-                    while let Some(f) = enc.try_recv() {
-                        out.push((f.data.to_vec(), f.pts));
-                    }
+                    self.collect_encoded(out);
                 }
             }
             Placement::Submit { reanchor: false } | Placement::Skip => {}
@@ -440,13 +446,23 @@ impl AudioReencoder {
             opus_dtx: false,
             opus_frame_duration_ms: None,
         };
-        if let Some(old) = self.encoder.take() {
+        if let Some(mut old) = self.encoder.take() {
             tracing::info!(
                 "CMAF output '{}': audio source is {source_sr} Hz / {source_ch} ch, the \
                  encoder was built for {} Hz; rebuilding it for the source's rate",
                 self.output_id,
                 old.params().sample_rate,
             );
+            // What it still holds — the partial frame and its delay line,
+            // the end of the audio (or silence) before this frame — goes out
+            // on its own timeline: dropped with it, it left that much of a
+            // hole, filled by the new encoder's priming.
+            old.reanchor_pts();
+            let tail: Vec<(Vec<u8>, u64)> = old.drain().into_iter().map(|f| (f.data.to_vec(), f.pts)).collect();
+            if let Some(&(_, last)) = tail.last() {
+                self.retired_until = Some(last);
+            }
+            self.retired.extend(tail);
             old.cancel();
         }
         // On a child of the output's token: `old.cancel()` above reached
@@ -532,7 +548,7 @@ impl AudioReencoder {
 
     /// Submit real PCM at `pts`, placed on the encoder's input timeline.
     fn submit_real(&mut self, planar: &[Vec<f32>], pts: u64) -> Result<Vec<(Vec<u8>, u64)>> {
-        let mut out = Vec::new();
+        let mut out = std::mem::take(&mut self.retired);
         if self.place_source(pts, &mut out) == Placement::Skip {
             return Ok(out);
         }
@@ -554,10 +570,26 @@ impl AudioReencoder {
         } else {
             self.input.refused();
         }
+        self.collect_encoded(&mut out);
+        Ok(out)
+    }
+
+    /// Hand back what the encoder has encoded — after a rebuild, none of
+    /// the new encoder's priming frames that sit at or before the retired
+    /// one's run-out (they overlap it, and carry nothing but the priming).
+    fn collect_encoded(&mut self, out: &mut Vec<(Vec<u8>, u64)>) {
+        let Some(enc) = self.encoder.as_mut() else {
+            return;
+        };
         while let Some(frame) = enc.try_recv() {
+            if let Some(until) = self.retired_until {
+                if frame.pts <= until {
+                    continue;
+                }
+                self.retired_until = None;
+            }
             out.push((frame.data.to_vec(), frame.pts));
         }
-        Ok(out)
     }
 
     /// Tell the re-encoder the ADTS parameters observed by the demuxer
@@ -1218,6 +1250,72 @@ mod reencoder_tests {
         let again = r.encode_planar(&pcm, near, 48_000, 2).unwrap();
         assert!(!again.is_empty());
         assert_eq!(again[0].1, resumed[resumed.len() - 1].1 + frame);
+    }
+
+    /// A source that changes rate mid-stream (a 48 kHz programme, then a
+    /// 44.1 kHz break) rebuilds the encoder: what the retired one still
+    /// held — the end of the 48 kHz audio, its delay line and partial frame
+    /// — goes out on its own timeline first, then the new encoder's frames
+    /// after it, none at or before the last of those. Dropped with the old
+    /// encoder, that audio left a hole the new encoder's priming filled:
+    /// the burst at the programme's end was never sent.
+    #[test]
+    #[cfg(feature = "fdk-aac")]
+    fn a_rebuild_for_another_rate_runs_the_old_encoder_out_on_its_timeline() {
+        let cancel = CancellationToken::new();
+        let mut r = AudioReencoder::new(&ae("aac_lc", false), None, &cancel, "out5", "flow5")
+            .expect("fdk-aac in-process encoder");
+        const P0: u64 = 900_000;
+        let burst = |rate: u32| -> Vec<f32> {
+            let n = (rate / 100) as usize;
+            (0..n)
+                .map(|k| {
+                    let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / (n - 1) as f32).cos();
+                    0.5 * w * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / rate as f32).sin()
+                })
+                .collect()
+        };
+        // A second of 48 kHz ending in a burst 300 samples from its end,
+        // then a second of 44.1 kHz silence, contiguous.
+        let old_len = 48_000usize;
+        let at = old_len - 480 - 300;
+        let mut old = vec![0.0f32; old_len];
+        old[at..at + 480].copy_from_slice(&burst(48_000));
+        let mut out = Vec::new();
+        let mut fed = 0u64;
+        for chunk in old.chunks(1_024) {
+            let pts = P0 + fed * 90_000 / 48_000;
+            out.extend(r.encode_planar(&[chunk.to_vec(), chunk.to_vec()], pts, 48_000, 2).unwrap());
+            fed += chunk.len() as u64;
+        }
+        let p1 = P0 + 90_000;
+        let new = vec![0.0f32; 44_100];
+        let mut fed = 0u64;
+        for chunk in new.chunks(1_024) {
+            let pts = p1 + fed * 90_000 / 44_100;
+            out.extend(r.encode_planar(&[chunk.to_vec(), chunk.to_vec()], pts, 44_100, 2).unwrap());
+            fed += chunk.len() as u64;
+        }
+        assert_eq!(r.encoder.as_ref().unwrap().params().sample_rate, 44_100, "rebuilt");
+        assert!(out.windows(2).all(|w| w[1].1 > w[0].1), "the stamps never step back");
+        let mut d = aac_audio::AacDecoder::open_adts().unwrap();
+        let (mut times, mut pcm) = (Vec::new(), Vec::new());
+        for (data, pts) in &out {
+            let p = d.decode_frame(data).unwrap().planar[0].clone();
+            times.extend((0..p.len()).map(|i| *pts as f64 + i as f64 * 90_000.0 / 48_000.0));
+            pcm.extend(p);
+        }
+        let b = burst(48_000);
+        let best = (0..pcm.len() - b.len())
+            .max_by(|&x, &y| {
+                let s = |k: usize| -> f32 { b.iter().zip(&pcm[k..]).map(|(p, q)| p * q).sum() };
+                s(x).total_cmp(&s(y))
+            })
+            .unwrap();
+        let energy: f32 = b.iter().zip(&pcm[best..]).map(|(p, q)| p * q).sum();
+        let expected = P0 as f64 + at as f64 * 90_000.0 / 48_000.0;
+        assert!(energy > 10.0, "the burst before the rebuild is sent: {energy}");
+        assert!((times[best] - expected).abs() <= 2.0 * 90_000.0 / 48_000.0, "at {} for {expected}", times[best]);
     }
 
     /// The eager silent-fallback encoder is built at the declared rate before

@@ -523,7 +523,13 @@ picture, and the partial frame was dropped. HLS's re-encode chain
 re-anchors the same way. The eager silent-fallback encoder is
 built at the declared rate and rebuilt, with a resampler, on the first
 real frame whose rate or channel count differs — a 44.1 kHz source
-through a 48 kHz encoder used to run 8.8 % slow. On RTMP (since
+through a 48 kHz encoder used to run 8.8 % slow. A rebuild for another
+source rate (an eager encoder meeting its first source, or a source
+changing rate mid-stream) first runs the retired encoder out on its own
+timeline, as a re-anchor does, and the new encoder's priming frames
+that would overlap that run-out are not sent; the retired encoder was
+dropped with the end of the audio before the change in it, a hole the
+new encoder's priming filled. On RTMP (since
 edge#211) the measure is the connection's FLV timeline, the encoder's
 channel / rate stage converts the source instead of a rebuild, and three
 things differ from CMAF. A tick lays at most a second of silence, off
