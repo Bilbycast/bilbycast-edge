@@ -2087,7 +2087,8 @@ impl TsAudioReplacer {
                 self.aac_decoder = Some(d);
             }
             let decoder = self.aac_decoder.as_mut().expect("opened above");
-            let d = decoder.decode_frame(au).map_err(|_| ())?;
+            let mut d = decoder.decode_frame(au).map_err(|_| ())?;
+            crate::engine::audio_decode::seven_one_by_element(decoder, &mut d.planar);
             return Ok(vec![Decoded {
                 planar: d.planar,
                 sample_rate: decoder.sample_rate().unwrap_or(48_000),
@@ -6162,6 +6163,82 @@ mod tests {
             assert_eq!(f.planar.len(), want, "{target}: the codec's own channel count");
             let e = err_samples(target, &out, src_time(4_800), 48_000);
             assert!(e.abs() <= 4.0, "{target}: the burst is {e} samples off its source time");
+        }
+    }
+
+    /// N1 through the whole chain: a 7.1 source in channel configuration 7
+    /// (ffmpeg's `aac -ac 8`, channel `k` a tone of its own) re-encoded on a
+    /// TS output. The 7.1 AAC target carries each source channel in its
+    /// own slot; the AC-3 5.1 mixdown keeps the front pair in front and
+    /// folds the side pair into the back pair; the MP2 stereo mixdown has
+    /// each front channel at unity over the surrounds at −3 dB. fdk decoded
+    /// configuration 7 by the letter, and the source's front pair came out
+    /// as the AAC target's side pair, in AC-3's surrounds and at −3 dB in
+    /// MP2, its side pair in front.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn a_7_1_source_keeps_each_channel_in_its_place_through_a_re_encode() {
+        use crate::engine::audio_decode::seven_one_fixture::{
+            FULL_RANGE, adts_frames, append, dominant_tone, dominant_tones, tone_hz, tone_power,
+        };
+        use e2e::*;
+        let aus: Vec<(Vec<u8>, u64)> =
+            adts_frames(200).into_iter().enumerate().map(|(i, f)| (f, P0 + i as u64 * 1_920)).collect();
+        let ts = mux(0x0F, &pack(&aus, 1));
+        let skip = 40;
+        // 7.1 AAC: decoded from its PCE, slot k carries tone k.
+        let mut cfg = enc("aac_lc");
+        cfg.bitrate_kbps = Some(448);
+        let mut r = TsAudioReplacer::new(&cfg, None).unwrap();
+        let pes = audio_pes(&run(&mut r, &ts));
+        assert!(pes.len() >= 150, "{} PES", pes.len());
+        let mut dec = aac_audio::AacDecoder::open_adts().unwrap();
+        dec.set_max_output_channels(None).unwrap();
+        let mut acc = Vec::new();
+        for (_, es) in pes.iter().skip(skip) {
+            append(&mut acc, &dec.decode_frame(es).unwrap().planar);
+        }
+        let got = dominant_tones(&acc, RATE);
+        for k in FULL_RANGE {
+            assert_eq!(got[k], k, "AAC 7.1: slot {k} carries {} Hz: {got:?}", tone_hz(got[k]));
+        }
+        // AC-3 5.1 and MP2 stereo, decoded by libavcodec.
+        let decode = |target: &str| -> Vec<Vec<f32>> {
+            let mut r = replacer(target, None, None);
+            let pes = audio_pes(&run(&mut r, &ts));
+            assert!(pes.len() >= 100, "{target}: {} PES", pes.len());
+            let codec = if target == "mp2" {
+                video_codec::AudioDecoderCodec::Mp2
+            } else {
+                video_codec::AudioDecoderCodec::Ac3
+            };
+            let mut d = video_engine::AudioDecoder::open(codec).unwrap();
+            let mut acc = Vec::new();
+            for (_, es) in pes.iter().skip(skip) {
+                d.send_packet(es, 0).unwrap();
+                while let Ok(f) = d.receive_frame() {
+                    append(&mut acc, &f.planar);
+                }
+            }
+            acc
+        };
+        let p = |pcm: &[f32], k: usize| tone_power(pcm, tone_hz(k), RATE);
+        let ac3 = decode("ac3");
+        assert_eq!(ac3.len(), 6);
+        for (slot, front) in [(0usize, 0usize), (1, 1), (2, 2)] {
+            assert_eq!(dominant_tone(&ac3[slot], RATE), front, "AC-3 slot {slot}");
+        }
+        for (slot, back, side, front) in [(4usize, 4usize, 6usize, 0usize), (5, 5, 7, 1)] {
+            let s = &ac3[slot];
+            assert!(p(s, back) > 100.0 * p(s, front), "AC-3 surround {slot}: back {} front {}", p(s, back), p(s, front));
+            assert!(p(s, side) > 100.0 * p(s, front), "AC-3 surround {slot}: side {} front {}", p(s, side), p(s, front));
+        }
+        let mp2 = decode("mp2");
+        assert_eq!(mp2.len(), 2);
+        for (slot, front, side) in [(0usize, 0usize, 6usize), (1, 1, 7)] {
+            let s = &mp2[slot];
+            let ratio = p(s, front) / p(s, side);
+            assert!((1.6..2.4).contains(&ratio), "MP2 {slot}: front over side {ratio} (unity over -3 dB is 2)");
         }
     }
 

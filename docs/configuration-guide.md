@@ -1661,17 +1661,55 @@ loop, each playlist transition — continues one wire timeline:
   took them for that frame's tail: a capture whose last E-AC-3 frame is
   349 of its 512 bytes, and whose first packets on that PID continue
   another frame, put a 14 ms burst of up to full scale into every
-  re-encoding output at every loop. Now the next file's first PES opens
-  inside the frame the truncated one claims, with a header of its own,
-  and the edge's audio framer discards the truncated frame. The PIDs come
-  from the PMTs in the same head (a PMT further in gates only PIDs nothing
-  has gone out on yet). A passthrough output still carries the truncated
-  last PES to its receiver, as it is in the file. A PID that starts no PES
-  in its first 1 024 packets is passed through from there.
+  re-encoding output at every loop. The PIDs come from the PMTs in the
+  same head (a PMT further in gates only PIDs nothing has gone out on yet)
+  and, until every program the PAT names has shown its PMT, every other
+  PID is gated on its first packet (PSI and null aside): an MPTS played
+  whole whose first PAT lies past the head (`tnt-paris-uhf-24.ts`, 1.5 MB
+  in) had every ES out before its PMT named it, so nothing was gated. A PID
+  that starts no PES in its first 1 024 packets is passed through from
+  there.
+- Each audio PID ends on a whole access unit. Before a file plays, its last
+  4 MB are read and each audio PID's elementary stream is rebuilt from its
+  PES there and walked frame by frame (ADTS, LATM / LOAS, MPEG audio,
+  AC-3 / E-AC-3 — an E-AC-3 time slot whole); from where a frame runs past
+  the file's end, nothing of that PID's payload goes out (a packet carrying
+  a PCR or a DI goes adaptation-field-only), and a PES the cut falls in
+  declares only what it keeps. An audio track the edge does not frame
+  (AC-4, DTS) loses its last PES when that PES falls short of the length it
+  declares. Every other packet leaves when it did; nothing is held back.
+  The truncated frame used to reach every output at every loop: a capture
+  whose AAC straddles its PES (NHK's 1seg services) opens its next loop
+  mid-frame, so the edge's audio framer could not tell the frame was cut
+  short and completed its 176 bytes with the next loop's first 70, a frame
+  of garbage every passthrough output forwarded and every re-encode decoded
+  with an error; and while the leading continuation still went out
+  (above), a cut E-AC-3 frame completed with it put a burst of up to full
+  scale into every RTMP and HLS re-encode, and on a TS output, whose
+  replacer had filled the loop's audio hole with silence by then, took the
+  whole fill back from the next loop's audio (650 ms of silence, and 0.3 s
+  of programme lost, for a 320 ms hole). A file whose audio is denser than
+  half a second of a 64 Mbit/s service in its last 4 MB — fewer than two
+  PES of a PID there — is not judged for that PID.
 - The next file's timeline starts past the previous file's last video
   decode time, not only its last audio and PCR — a capture leads its PCR by
   more video at its end than at its start, which stepped video DTS back at
   every loop.
+- The base of that timeline puts the next file's first PCR 30 ms after the
+  later of the previous file's last audio PTS and last PCR. That keeps
+  every PID moving forward whatever the head of the next file shows, but
+  it pauses each loop for as long as the next file's audio leads its PCR at
+  its start. On a broadcast capture that is tens of milliseconds; ffmpeg's
+  mpegts muxer starts its PCR 0.7 s ahead of its first timestamp
+  (`-muxdelay`), so a file it made loops 0.7 s longer than it plays:
+  `av-71.ts` (20 s; first PCR 0.721 s, audio PTS 1.400 to 21.411 s)
+  restarts every 20.736 s — its last audio PTS less its first PCR, plus the
+  30 ms guard, is 20.719 s, and the whole-frames move below adds the rest
+  — with its audio back about 0.7 s into each lap. The per-PID terms above
+  would place each PID right after its own end, but the base is the guard
+  for a PID they cannot place (one whose first PES lies past the 512 KB
+  head scan), so it stands; mux such a file with a smaller `-muxdelay`
+  (0.1 s, say) to loop it tight.
 - The previous file's last audio, PCR and PES timestamps are found
   modulo 2^33. The flow's first file maps its first PCR to 0, so a PES it
   holds from before that PCR — ffmpeg's muxer opens with audio 42 ms behind

@@ -585,9 +585,11 @@ pub fn expand_preset(preset: &str, in_channels: u8) -> Result<ChannelMatrix, Str
             ]))
         }
         "7_1_to_stereo_bs775" => {
-            // 7.1 channel order: L, R, C, LFE, Lss, Rss, Lrs, Rrs
-            // BS.775 extension: Lt = L + (-3 dB)·C + (-3 dB)·Lss + (-3 dB)·Lrs
-            //                   Rt = R + (-3 dB)·C + (-3 dB)·Rss + (-3 dB)·Rrs
+            // 7.1 channel order: L, R, C, LFE, Lrs, Rrs, Lss, Rss (WAVE,
+            // what every decoder here hands out —
+            // `audio_decode::seven_one_by_element`)
+            // BS.775 extension: Lt = L + (-3 dB)·C + (-3 dB)·Lrs + (-3 dB)·Lss
+            //                   Rt = R + (-3 dB)·C + (-3 dB)·Rrs + (-3 dB)·Rss
             require_in_channels(preset, in_channels, 8)?;
             const G3: f32 = 0.707_106_77;
             Ok(ChannelMatrix(vec![
@@ -1948,9 +1950,9 @@ const BS775_G3: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
 /// ITU-R BS.775's downmix of a multichannel source to mono, as one
 /// `channel_map_with_gain` row, for the channel order every decoder here
-/// hands out (L, R, C, LFE, Ls, Rs, then the back pair): L and R at −3 dB,
-/// C at unity, each surround at −6 dB, the LFE left out — BS.775 feeds it to
-/// no full-range channel. 3.0 (L R C), quad (L R Ls Rs), 5.0 (L R C Ls Rs),
+/// hands out (L, R, C, LFE, then the surrounds — for 7.1 the back pair, then
+/// the side pair): L and R at −3 dB, C at unity, each surround at −6 dB, the
+/// LFE left out — BS.775 feeds it to no full-range channel. 3.0 (L R C), quad (L R Ls Rs), 5.0 (L R C Ls Rs),
 /// 5.1 and 7.1 by that rule; any other layout, whose channels this cannot
 /// name, as the average of all of them. Taking channel 0 alone — the rule
 /// for every pair without a preset until now — kept front-left and dropped
@@ -1972,9 +1974,11 @@ pub fn mono_downmix(in_channels: u8) -> Vec<[f64; 2]> {
 /// are, the first surround pair at unity with the second folded into it at
 /// −3 dB, left into left — the coefficient BS.775's downmixes give a
 /// surround, and what libswresample does with a back pair over a side one.
-/// fdk-aac and libavcodec put the side and the back pair in either order;
-/// each side keeps both of its surrounds whichever it is. Keeping the
-/// channels in order instead dropped the second pair.
+/// Every decoder here hands out the back pair, then the side pair
+/// (`audio_decode::seven_one_by_element` puts fdk-aac's configuration 7 in
+/// that order), so the side pair is the one folded in; each side keeps
+/// both of its surrounds. Keeping the channels in order instead dropped
+/// the second pair.
 fn seven_one_to_five_one() -> Vec<Vec<[f64; 2]>> {
     vec![
         vec![[0.0, 1.0]],

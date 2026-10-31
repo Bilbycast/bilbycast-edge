@@ -730,6 +730,21 @@ has for them (ISO/IEC 14496-3 §4.4.1.1). Shared code:
   stereo). Opened at eight, those encoders refused, and the audio was
   dropped — which a 7.1 AAC source would otherwise have newly hit, having
   arrived as 5.1 before.
+  Every decoder hands the eight out in one order — L, R, C, LFE, back pair,
+  side pair — with each channel element in the slot its position in the
+  stream means (`audio_decode::seven_one_by_element`). A source in channel
+  configuration 7 is read as the encoders that write it mean it: ADTS
+  cannot carry 7.1's own configuration (12), so ffmpeg's `aac` and Nero
+  write 7.1 (centre, then the front, side and back pairs) as 7, and
+  libavcodec and FAAD decode 7 that way by default. fdk-aac decodes 7 by
+  the letter of ISO/IEC 14496-3, as 7.1(wide) — the first pair a
+  front-centre pair, the second the front pair — so until this was put
+  right the source's front pair went out as a 7.1 AAC target's side pair
+  and its side pair in front, and an AC-3 5.1 target folded the front pair
+  into its surrounds (an MP2 stereo target kept every tone, the front pair
+  at −3 dB and the side pair at unity). A program_config_element that
+  names three front elements — a 7.1(wide) stated outright — is still
+  decoded as fdk reads it, its front-centre pair in the side slots.
 - **PCE-signalled sources** (channel configuration 0 — ISDB-T 1seg, e.g.
   NHK's HE-AAC at a 24 kHz core with two single channel elements). The
   layout is in a PCE that only some frames open with (on NHK about one in
@@ -949,8 +964,17 @@ the sample:
     the replacer has sent is now dropped instead (`ClockFill::keep_frame`;
     `D` already covers the others, being never less than a frame's lateness
     plus 40 ms), with an info log line naming the seam and the count. The
-    cost is the last up to ~65 ms of audio before such a pause, which on
-    its old timeline could only be late. A source
+    cost is what the pipeline held of the audio before such a pause, which
+    on its old timeline could only be late: the 2 ms crossfade tail, the
+    stage's queue, the encoder's part-filled frame (under one output frame)
+    and the pipeline's declared latency (the AAC-LC encoder's 2048 samples,
+    plus a decoder's own delay, such as an HE-AAC source's SBR delay) — at
+    most 66 ms of audio for an AAC-LC target at 48 kHz with no stage and a
+    decoder adding none. The count in the log line is of output frames, and
+    the run-out pushes the held audio through with silence enough to clear
+    all of that plus a frame (`run_out`), so those frames carry silence
+    too: in that case 3 to 5 AAC-LC frames, 64 to 107 ms of output (the
+    bench saw 3 and 4). A source
     that resets its clock back (an encoder restart, an ffmpeg
     `-stream_loop` wrap) takes its PCR and its video back with it, and the
     transcode chain's PCR stage drops re-encoded PES left on the old

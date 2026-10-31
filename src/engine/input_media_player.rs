@@ -1596,10 +1596,23 @@ async fn play_ts_file(
     // anchor's video term (7b) and the file-start gate.
     let head_info = scan_ts_head(&head, stride, program_number);
     drop(head);
+    // Where each audio PID's last whole access unit ends (see
+    // `scan_ts_tail`): applied by file offset as the packets are read.
+    let tail_trims = read_tail_trims(&mut file, stride, &head_info).await;
+    for t in &tail_trims {
+        tracing::debug!(
+            "media-player: {}: PID 0x{:04X} ends on an access unit cut short — its end leaves from file offset {}",
+            path.display(),
+            t.pid,
+            t.cut_at
+        );
+    }
     file.seek(std::io::SeekFrom::Start(0))
         .await
         .with_context(|| format!("rewind {} after head probe", path.display()))?;
     let mut reader = BufReader::new(file);
+    // File offset of the next byte the reader hands out.
+    let mut file_pos: u64 = 0;
 
     let trailer_len = stride - TS_PACKET;
     let mut trailer_buf = [0u8; MAX_TS_TRAILER];
@@ -1868,14 +1881,18 @@ async fn play_ts_file(
                     .context(format!("read {}", path.display())));
             }
         }
+        let mut packet_at = file_pos;
+        file_pos += TS_PACKET as u64;
 
         if packet[0] != SYNC_BYTE {
             // Best-effort resync — scan one byte at a time until 0x47 is the
             // 0th byte of a complete 188-byte slot. Bail after 1 MiB so a
             // malformed file doesn't burn CPU forever.
-            if !resync_to_sync_byte(&mut reader, &mut packet).await? {
+            let Some(skipped) = resync_to_sync_byte(&mut reader, &mut packet).await? else {
                 break;
-            }
+            };
+            packet_at = file_pos + skipped;
+            file_pos = packet_at + TS_PACKET as u64;
         }
 
         // Discard the per-packet trailer for non-188 strides. 192-byte M2TS
@@ -1894,6 +1911,12 @@ async fn play_ts_file(
                         .context(format!("trailer read {}", path.display())));
                 }
             }
+            file_pos += trailer_len as u64;
+        }
+
+        // An audio PID's end past its last whole access unit stays home.
+        if !tail_trims.is_empty() && !apply_tail_trims(&mut packet, packet_at, &tail_trims) {
+            continue;
         }
 
         // MPTS → SPTS down-select runs first so other-program packets are
@@ -2485,6 +2508,8 @@ struct TsFileSplice {
     /// ahead of the anchor PCR's (4070), and its audio high-water mark put
     /// every loop's target 1.27 s out — a 1.27 s gap in every program.
     pat_pmt_pids: Vec<u16>,
+    /// PMT PIDs whose PMT has parsed this file ([`Self::psi_learned`]).
+    learned_pmts: Vec<u16>,
     /// One section assembler per PMT PID: a PMT past ~180 bytes (an MPTS
     /// program with a dozen ES and their descriptors) spans packets, and
     /// read off one packet it named no PCR_PID and no ES at all.
@@ -2528,6 +2553,7 @@ impl TsFileSplice {
             max_emitted_audio_pts_90k: None,
             max_emitted_pcr_90k: target_pts_90k,
             pat_pmt_pids: Vec::new(),
+            learned_pmts: Vec::new(),
             pmt_asms: Vec::new(),
             audio_from_anchor: false,
             audio_pids: HashSet::with_capacity(4),
@@ -2552,7 +2578,7 @@ impl TsFileSplice {
     fn gate_es_heads(&mut self, pids: &[u16]) {
         for &pid in pids {
             if Some(pid) != self.gate.pid {
-                self.es_gate.arm(pid);
+                self.es_gate.arm(pid, true);
             }
         }
     }
@@ -2605,6 +2631,16 @@ impl TsFileSplice {
                     self.learn_pmt(pkt_pid, &view, anchor_pcr_pid);
                 }
             }
+        }
+        // Before the PSI is all known, any PID's head (see `EsHeadGate`).
+        if !self.seen_pids[(pkt_pid & 0x1FFF) as usize]
+            && pkt_pid > 0x1F
+            && pkt_pid != 0x1FFF
+            && Some(pkt_pid) != self.gate.pid
+            && !self.pat_pmt_pids.contains(&pkt_pid)
+            && !self.psi_learned()
+        {
+            self.es_gate.arm(pkt_pid, false);
         }
         let Some(packet) = self.es_gate.feed(packet) else {
             return;
@@ -2659,9 +2695,17 @@ impl TsFileSplice {
         // only if nothing of it has gone out yet, as the video's.
         for e in &view.es {
             if !self.seen_pids[(e.pid & 0x1FFF) as usize] && Some(e.pid) != self.gate.pid {
-                self.es_gate.arm(e.pid);
+                self.es_gate.arm(e.pid, true);
             }
         }
+        if !self.learned_pmts.contains(&pmt_pid) {
+            self.learned_pmts.push(pmt_pid);
+        }
+    }
+
+    /// Whether every program the PAT names has shown its PMT.
+    fn psi_learned(&self) -> bool {
+        !self.pat_pmt_pids.is_empty() && self.pat_pmt_pids.iter().all(|p| self.learned_pmts.contains(p))
     }
 
     /// The gate and everything after it (see [`Self::push`]).
@@ -3093,20 +3137,33 @@ const ES_HEAD_GATE_GIVE_UP_PACKETS: u32 = 1_024;
 /// claims, which the shared framer (`audio_au::AuCutter`) takes as a frame
 /// cut short upstream and discards. A packet carrying a PCR or a DI leaves
 /// adaptation-field-only, as the video gate's do.
+///
+/// The PIDs gated are the ES the PMTs name — those the head scan saw from
+/// byte 0, the rest as the in-stream PMTs name them if nothing of them has
+/// gone out yet — and, until every program the PAT names has shown its PMT,
+/// every other PID on its first packet (PSI and null aside): an MPTS whose
+/// first PAT lies past the head scan (tnt-paris-uhf-24.ts, 1.5 MB in) had
+/// every ES PID out before its PMT named it, so nothing was gated and the
+/// leading continuation still joined the truncated frame at every loop.
 #[derive(Debug, Default)]
 struct EsHeadGate {
     /// PIDs still waiting for their first PES start, with the payload
-    /// packets each has dropped.
-    waiting: Vec<(u16, u32)>,
+    /// packets each has dropped and whether a PMT names it.
+    waiting: Vec<(u16, u32, bool)>,
     /// PIDs whose head is settled for this file.
     settled: Vec<u16>,
 }
 
 impl EsHeadGate {
-    /// Gate `pid`'s head, unless it is gated or settled already.
-    fn arm(&mut self, pid: u16) {
-        if !self.settled.contains(&pid) && !self.waiting.iter().any(|(p, _)| *p == pid) {
-            self.waiting.push((pid, 0));
+    /// Gate `pid`'s head, unless it is gated or settled already. `named`: a
+    /// PMT names it as an ES.
+    fn arm(&mut self, pid: u16, named: bool) {
+        if self.settled.contains(&pid) {
+            return;
+        }
+        match self.waiting.iter_mut().find(|(p, _, _)| *p == pid) {
+            Some(w) => w.2 |= named,
+            None => self.waiting.push((pid, 0, named)),
         }
     }
 
@@ -3116,7 +3173,7 @@ impl EsHeadGate {
             return Some(pkt);
         }
         let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
-        let Some(i) = self.waiting.iter().position(|(p, _)| *p == pid) else {
+        let Some(i) = self.waiting.iter().position(|(p, _, _)| *p == pid) else {
             return Some(pkt);
         };
         if pkt[1] & 0x40 != 0 || !crate::engine::ts_parse::ts_has_payload(&pkt) {
@@ -3126,13 +3183,22 @@ impl EsHeadGate {
             }
             return Some(pkt);
         }
-        let dropped = &mut self.waiting[i].1;
+        let (_, dropped, named) = &mut self.waiting[i];
         *dropped += 1;
         if *dropped > ES_HEAD_GATE_GIVE_UP_PACKETS {
-            tracing::warn!(
-                "media-player: PID 0x{pid:04X} started no PES in its first \
-                 {ES_HEAD_GATE_GIVE_UP_PACKETS} packets — passing it through from here"
-            );
+            // A PID no PMT names that never starts a unit (a data-piping
+            // stream) is no fault of the file's.
+            if *named {
+                tracing::warn!(
+                    "media-player: PID 0x{pid:04X} started no PES in its first \
+                     {ES_HEAD_GATE_GIVE_UP_PACKETS} packets — passing it through from here"
+                );
+            } else {
+                tracing::debug!(
+                    "media-player: PID 0x{pid:04X} started no unit in its first \
+                     {ES_HEAD_GATE_GIVE_UP_PACKETS} packets — passing it through from here"
+                );
+            }
             self.waiting.swap_remove(i);
             self.settled.push(pid);
             return Some(pkt);
@@ -3164,6 +3230,10 @@ pub(super) struct TsHeadInfo {
     pub(super) audio_au: Vec<(u16, u32, u32)>,
     /// Every ES PID the head's PMTs name, for [`EsHeadGate`].
     pub(super) es_pids: Vec<u16>,
+    /// Every audio ES the head's PMTs name, with its access-unit framing
+    /// when the shared cutter frames it — what [`scan_ts_tail`] judges a
+    /// file's end by when its tail carries no PMT.
+    pub(super) audio_es: Vec<(u16, Option<crate::engine::audio_au::AuFormat>)>,
 }
 
 /// The access-unit framing of an audio ES (a DVB `0x06` one by its
@@ -3339,6 +3409,11 @@ pub(super) fn scan_ts_head(head: &[u8], stride: usize, program: Option<u16>) -> 
                         {
                             audio.push((e.pid, fmt));
                         }
+                        if es_is_audio(e.stream_type, v.es_info(e))
+                            && !info.audio_es.iter().any(|(p, _)| *p == e.pid)
+                        {
+                            info.audio_es.push((e.pid, au_format_of(e.stream_type, v.es_info(e))));
+                        }
                     }
                 }
             }
@@ -3388,6 +3463,358 @@ pub(super) fn scan_ts_head(head: &[u8], stride: usize, program: Option<u16>) -> 
         info.first_rap_dts_90k = gate.rap_dts_90k;
     }
     info
+}
+
+/// Whether a PMT entry is audio: the stream types the splice counts as
+/// audio, and a DVB `0x06` whose descriptors name an audio codec — AC-4 and
+/// DTS included, which the shared cutter does not frame.
+fn es_is_audio(stream_type: u8, es_info: &[u8]) -> bool {
+    es_carries_audio(stream_type, es_info)
+        || (stream_type == 0x06 && crate::engine::ts_parse::descriptor_audio_kind(es_info).is_some())
+}
+
+/// How much of a TS file's end [`scan_ts_tail`] reads at each open: 4 MB,
+/// half a second of a 64 Mbit/s service — room for the last two PES of
+/// every audio PID of anything the player paces short of that with PES up
+/// to 250 ms. A PID whose stream the walk cannot pick up in that much goes
+/// out as it is.
+const TAIL_SCAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// [`scan_ts_tail`] on `file`'s last [`TAIL_SCAN_BYTES`]. A file that cannot
+/// be read there is not judged.
+async fn read_tail_trims(file: &mut tokio::fs::File, stride: usize, head: &TsHeadInfo) -> Vec<TailTrim> {
+    let read = async {
+        let len = file.metadata().await?.len();
+        let from = len.saturating_sub(TAIL_SCAN_BYTES);
+        file.seek(std::io::SeekFrom::Start(from)).await?;
+        let mut tail = Vec::with_capacity((len - from) as usize);
+        file.take(TAIL_SCAN_BYTES).read_to_end(&mut tail).await?;
+        std::io::Result::Ok((from, tail))
+    };
+    match read.await {
+        Ok((from, tail)) => scan_ts_tail(&tail, from, stride, &head.audio_es),
+        Err(e) => {
+            tracing::debug!("media-player: tail of the file not read ({e}) — its end goes out as it is");
+            Vec::new()
+        }
+    }
+}
+
+/// How one audio PID's packets end a file on a whole access unit
+/// ([`scan_ts_tail`]): from the packet at file offset `cut_at` on, nothing
+/// of the PID's payload goes out but the first `keep` payload bytes of that
+/// packet — what is left of a packet carrying a PCR or a DI goes out
+/// adaptation-field-only — and the PES the cut falls in, when it keeps
+/// some of its bytes and declares its length, declares what it keeps
+/// (`pes_len`: its header's packet's file offset, the new
+/// PES_packet_length).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct TailTrim {
+    pub(super) pid: u16,
+    pub(super) cut_at: u64,
+    pub(super) keep: usize,
+    pub(super) pes_len: Option<(u64, u16)>,
+}
+
+/// Where each audio PID of a TS file stops being whole access units, from
+/// its last [`TAIL_SCAN_BYTES`] (`tail`, read from file offset
+/// `tail_start`, packets `stride` apart).
+///
+/// A capture cut at an arbitrary byte ends each audio PID with a PES its
+/// file does not finish, and its last access unit with it. Played once that
+/// is harmless; at a loop or a playlist splice the next file's audio comes
+/// right after it on the same PID, CC running on, and the shared framer
+/// (`audio_au::AuCutter`) can tell the access unit was cut short only when
+/// the next file's first PES opens with a frame header of its own. One that
+/// does not — ADTS straddling its PES, as NHK's 1seg services carry it,
+/// whose next file opens mid-frame — had the truncated frame (176 of its
+/// 246 bytes) completed with the next file's first 70 bytes, a frame of
+/// garbage that every passthrough output forwarded and every re-encode
+/// decoded (fdk `0x4002`) once per loop. And while the next file's leading
+/// continuation packets went out too (see [`EsHeadGate`]), a cut E-AC-3
+/// frame (349 of 512 bytes) was completed with them: a burst of up to full
+/// scale at every loop on the RTMP and HLS re-encodes, and, on a TS
+/// output's replacer, a frame whose PES timestamp arrived after the clock
+/// fill had covered the loop's hole, so the whole fill was taken back from
+/// the next loop's programme (~0.3 s lost, 650 ms of silence for a 320 ms
+/// hole).
+///
+/// So the end is judged before the file plays: each audio PID's ES is
+/// rebuilt from its PES in the tail (each PES's bytes up to the length it
+/// declares; a PES whose header leaves its first packet, or a CC break,
+/// starts it afresh) and walked frame by frame from a header whose
+/// successor vouches for it (ADTS, LOAS, MPEG audio, AC-3 / E-AC-3 —
+/// `audio_au::parse_header`); where a frame runs past the end, or a header
+/// does, the PID is cut, an E-AC-3 time slot whole (from its independent
+/// frame). A PID the cutter does not frame (AC-4, DTS) is cut at its last
+/// PES when that PES does not reach the length it declares. A cut further
+/// back than the PID's second-to-last PES is not made — the walk lost its
+/// way. Since the tail is read ahead, nothing is held back on the way out:
+/// every packet leaves when it did, less what the cut takes.
+pub(super) fn scan_ts_tail(
+    tail: &[u8],
+    tail_start: u64,
+    stride: usize,
+    head_audio: &[(u16, Option<crate::engine::audio_au::AuFormat>)],
+) -> Vec<TailTrim> {
+    let stride = stride.max(TS_PACKET);
+    // The packets' alignment: the first offset from which eight packets in
+    // a row (or all there are) open with a sync byte.
+    let Some(align) = (0..stride.min(tail.len())).find(|&o| {
+        let n = (tail.len().saturating_sub(o) / stride).min(8);
+        n > 0 && (0..n).all(|k| tail[o + k * stride] == SYNC_BYTE)
+    }) else {
+        return Vec::new();
+    };
+    let packets: Vec<(u64, &[u8])> = (align..tail.len())
+        .step_by(stride)
+        .take_while(|&o| o + TS_PACKET <= tail.len())
+        .filter(|&o| tail[o] == SYNC_BYTE)
+        .map(|o| (tail_start + o as u64, &tail[o..o + TS_PACKET]))
+        .collect();
+    let pid_of = |p: &[u8]| ((p[1] as u16 & 0x1F) << 8) | p[2] as u16;
+    // The audio ES: the tail's own PMTs, then the head's.
+    let mut audio: Vec<(u16, Option<crate::engine::audio_au::AuFormat>)> = Vec::new();
+    let mut asms: Vec<(u16, crate::engine::ts_parse::SectionAssembler)> = Vec::new();
+    for &(_, pkt) in &packets {
+        let pid = pid_of(pkt);
+        if pid == 0 && pkt[1] & 0x40 != 0 && asms.is_empty() {
+            asms = crate::engine::ts_parse::parse_pat_programs(pkt)
+                .iter()
+                .map(|(_, p)| (*p, crate::engine::ts_parse::SectionAssembler::new()))
+                .collect();
+        } else if let Some((_, asm)) = asms.iter_mut().find(|(p, _)| *p == pid) {
+            for sec in asm.push_packet(pkt) {
+                let Some(v) = crate::engine::ts_pmt_edit::parse_pmt(sec) else {
+                    continue;
+                };
+                for e in &v.es {
+                    if es_is_audio(e.stream_type, v.es_info(e)) && !audio.iter().any(|(p, _)| *p == e.pid) {
+                        audio.push((e.pid, au_format_of(e.stream_type, v.es_info(e))));
+                    }
+                }
+            }
+        }
+    }
+    for &(pid, fmt) in head_audio {
+        if !audio.iter().any(|(p, _)| *p == pid) {
+            audio.push((pid, fmt));
+        }
+    }
+    audio
+        .into_iter()
+        .filter_map(|(pid, fmt)| {
+            let pid_packets = packets.iter().filter(|(_, p)| pid_of(p) == pid).copied();
+            tail_trim(pid, fmt, pid_packets)
+        })
+        .collect()
+}
+
+/// [`scan_ts_tail`] for one audio PID, from its packets in the tail.
+fn tail_trim<'a>(
+    pid: u16,
+    fmt: Option<crate::engine::audio_au::AuFormat>,
+    packets: impl Iterator<Item = (u64, &'a [u8])>,
+) -> Option<TailTrim> {
+    use crate::engine::audio_au::{AuFormat, Head, parse_header};
+    use crate::engine::ts_parse::{ts_cc, ts_has_payload, ts_payload_offset, ts_pusi};
+    struct Pes {
+        header_at: u64,
+        declared: usize,
+        header_data: usize,
+        es_from: usize,
+    }
+    /// ES bytes `es_from..es_from + len`, from the packet at `at`, starting
+    /// `payload_from` bytes into its payload.
+    struct Chunk {
+        at: u64,
+        es_from: usize,
+        len: usize,
+        payload_from: usize,
+    }
+    let mut pes: Vec<Pes> = Vec::new();
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let mut es: Vec<u8> = Vec::new();
+    // ES bytes the open PES still declares (`None`: no length), and
+    // whether one is open.
+    let mut left: Option<usize> = None;
+    let mut open = false;
+    let mut last: Option<(u8, &[u8])> = None;
+    // Every PES start of the PID in the tail, whatever the walk keeps: no
+    // cut reaches back past the second-to-last.
+    let mut starts: Vec<u64> = Vec::new();
+    for (at, pkt) in packets {
+        if !ts_has_payload(pkt) {
+            continue;
+        }
+        let off = ts_payload_offset(pkt);
+        if off >= TS_PACKET {
+            continue;
+        }
+        let payload = &pkt[off..];
+        let cc = ts_cc(pkt);
+        if last.is_some_and(|(c, p)| c == cc && p == payload) {
+            // A duplicate (ISO/IEC 13818-1 §2.4.3.3) brings nothing.
+            continue;
+        }
+        let broken = last.is_some_and(|(c, _)| cc != (c + 1) & 0x0F);
+        last = Some((cc, payload));
+        if ts_pusi(pkt) {
+            starts.push(at);
+        }
+        let start_afresh = |pes: &mut Vec<Pes>, chunks: &mut Vec<Chunk>, es: &mut Vec<u8>| {
+            pes.clear();
+            chunks.clear();
+            es.clear();
+        };
+        let from = if ts_pusi(pkt) {
+            if payload.len() < 9 || payload[..3] != [0, 0, 1] || 9 + payload[8] as usize > payload.len() {
+                start_afresh(&mut pes, &mut chunks, &mut es);
+                open = false;
+                continue;
+            }
+            if broken {
+                start_afresh(&mut pes, &mut chunks, &mut es);
+            }
+            let header_data = payload[8] as usize;
+            let declared = u16::from_be_bytes([payload[4], payload[5]]) as usize;
+            left = (declared > 0).then(|| declared.saturating_sub(3 + header_data));
+            pes.push(Pes { header_at: at, declared, header_data, es_from: es.len() });
+            open = true;
+            9 + header_data
+        } else if open && !broken {
+            0
+        } else {
+            start_afresh(&mut pes, &mut chunks, &mut es);
+            open = false;
+            continue;
+        };
+        let mut n = payload.len() - from;
+        if let Some(l) = left.as_mut() {
+            n = n.min(*l);
+            *l -= n;
+        }
+        if n > 0 {
+            chunks.push(Chunk { at, es_from: es.len(), len: n, payload_from: from });
+            es.extend_from_slice(&payload[from..from + n]);
+        }
+    }
+    let last = pes.last()?;
+    let total = es.len();
+    let cut = match fmt {
+        None => {
+            // No framing to walk: the last PES alone, by its length.
+            let want = last.declared.checked_sub(3 + last.header_data).filter(|_| last.declared > 0)?;
+            if total - last.es_from >= want {
+                return None;
+            }
+            last.es_from
+        }
+        Some(fmt) => {
+            let is_pes_start = |q: usize| pes.iter().any(|p| p.es_from == q);
+            // A header the walk may start (or resume) at: one whose
+            // successor is a header of its stream, or — at a PES start —
+            // one whose frame runs past the end (the frame the walk is
+            // looking for).
+            let vouched = |q: usize| match parse_header(fmt, &es[q..]) {
+                Head::Valid(h) => match es.get(q + h.len..).map(|b| parse_header(fmt, b)) {
+                    Some(Head::Valid(n)) => n.key == h.key,
+                    None => is_pes_start(q),
+                    _ => false,
+                },
+                _ => false,
+            };
+            let mut p = (pes[0].es_from..total).find(|&q| vouched(q))?;
+            // The time slot's independent frame (AC-3 / E-AC-3).
+            let mut slot = p;
+            loop {
+                if p >= total {
+                    return None;
+                }
+                match parse_header(fmt, &es[p..]) {
+                    Head::Valid(h) if p + h.len <= total => {
+                        if fmt != AuFormat::Ac3 || h.samples != 0 {
+                            slot = p;
+                        }
+                        p += h.len;
+                    }
+                    Head::Valid(h) => break if fmt == AuFormat::Ac3 && h.samples == 0 { slot } else { p },
+                    Head::NeedMore => break p,
+                    Head::Invalid => p = (p + 1..total).find(|&q| vouched(q))?,
+                }
+            }
+        }
+    };
+    // Not further back than the PID's second-to-last PES.
+    if cut < pes[pes.len().saturating_sub(2)].es_from {
+        return None;
+    }
+    let j = pes.iter().rposition(|p| p.es_from <= cut)?;
+    if pes[j].header_at < starts[starts.len().saturating_sub(2)] {
+        return None;
+    }
+    if cut == pes[j].es_from {
+        // The whole PES goes, its header with it.
+        return Some(TailTrim { pid, cut_at: pes[j].header_at, keep: 0, pes_len: None });
+    }
+    let c = chunks.iter().find(|c| c.es_from <= cut && cut < c.es_from + c.len)?;
+    let pes_len = (pes[j].declared > 0)
+        .then(|| (pes[j].header_at, (3 + pes[j].header_data + cut - pes[j].es_from) as u16));
+    Some(TailTrim { pid, cut_at: c.at, keep: c.payload_from + cut - c.es_from, pes_len })
+}
+
+/// Run one packet, read at file offset `at`, through the file's
+/// [`TailTrim`]s: `false` when nothing of it goes out.
+fn apply_tail_trims(pkt: &mut [u8; TS_PACKET], at: u64, trims: &[TailTrim]) -> bool {
+    use crate::engine::ts_parse::{extract_pcr, strip_to_af_only, ts_discontinuity_indicator, ts_has_payload, ts_payload_offset, ts_pusi};
+    let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
+    let Some(t) = trims.iter().find(|t| t.pid == pid) else {
+        return true;
+    };
+    if let Some((header_at, len)) = t.pes_len
+        && header_at == at
+        && ts_pusi(pkt)
+    {
+        let off = ts_payload_offset(pkt);
+        if off + 6 <= TS_PACKET && pkt[off..off + 3] == [0, 0, 1] {
+            pkt[off + 4..off + 6].copy_from_slice(&len.to_be_bytes());
+        }
+    }
+    if at < t.cut_at || !ts_has_payload(pkt) {
+        return true;
+    }
+    if at == t.cut_at && t.keep > 0 {
+        keep_payload_head(pkt, t.keep);
+        return true;
+    }
+    let carrier = extract_pcr(pkt).is_some() || ts_discontinuity_indicator(pkt);
+    carrier && strip_to_af_only(pkt)
+}
+
+/// Shorten `pkt`'s payload to its first `keep` bytes, the adaptation field
+/// grown with stuffing in front of them (its fields kept).
+fn keep_payload_head(pkt: &mut [u8; TS_PACKET], keep: usize) {
+    let off = crate::engine::ts_parse::ts_payload_offset(pkt);
+    if off >= TS_PACKET || keep >= TS_PACKET - off {
+        return;
+    }
+    let mut out = [0xFFu8; TS_PACKET];
+    out[..4].copy_from_slice(&pkt[..4]);
+    out[3] |= 0x30;
+    // The adaptation field, its length byte included, fills all but the
+    // header and the payload kept.
+    let af = TS_PACKET - 4 - keep;
+    out[4] = (af - 1) as u8;
+    let old = if pkt[3] & 0x20 != 0 { pkt[4] as usize } else { 0 };
+    if af > 1 {
+        if old > 0 {
+            out[5..5 + old].copy_from_slice(&pkt[5..5 + old]);
+        } else {
+            out[5] = 0x00;
+        }
+    }
+    out[TS_PACKET - keep..].copy_from_slice(&pkt[off..off + keep]);
+    *pkt = out;
 }
 
 /// 3d: where the first anchor PCR of a TS file that follows another lands
@@ -3621,15 +4048,17 @@ pub(super) fn detect_ts_packet_size_in_buf(buf: &[u8]) -> usize {
 /// Find the next sync byte and align — read one byte at a time, when 0x47
 /// shows up, treat it as the start of a new packet and read the remaining
 /// 187 bytes. Bails after 1 MiB of slop.
+/// `Some(n)` once aligned — the bytes skipped before the sync byte — and
+/// `None` at the end of the file.
 async fn resync_to_sync_byte<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     packet: &mut [u8; TS_PACKET],
-) -> Result<bool> {
+) -> Result<Option<u64>> {
     let mut byte = [0u8; 1];
-    for _ in 0..(1 << 20) {
+    for skipped in 0..(1u64 << 20) {
         match reader.read_exact(&mut byte).await {
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(anyhow::Error::from(e).context("resync read")),
         }
         if byte[0] == SYNC_BYTE {
@@ -3638,7 +4067,7 @@ async fn resync_to_sync_byte<R: AsyncReadExt + Unpin>(
                 .read_exact(&mut packet[1..])
                 .await
                 .map_err(|e| anyhow::Error::from(e).context("resync follow-on read"))?;
-            return Ok(true);
+            return Ok(Some(skipped));
         }
     }
     Err(anyhow!(
@@ -6872,7 +7301,307 @@ mod tests {
         let fills: Vec<u8> = aus.iter().map(|a| a.data[100]).collect();
         assert!(aus.iter().all(|a| a.data == ac3_frame(a.data[100])), "every access unit a whole frame: {fills:?}");
         assert_eq!(aus.len(), 60, "both loops' 30 whole frames: {fills:?}");
-        assert_eq!(cutter.take_discarded(), 2 * 170, "each loop's truncated frame, and nothing else");
+        // Each loop's truncated frame stays home (`scan_ts_tail`): nothing
+        // reaches the framer that is not a whole frame.
+        assert_eq!(cutter.take_discarded(), 0, "nothing to discard");
+    }
+
+    /// [`loop_fixture_cut_ac3`] as an MPTS capture can lay it out: its
+    /// leading continuation packets first, its first PAT and PMT behind
+    /// 2 900 null packets — past the 512 KB the head scan reads.
+    fn loop_fixture_cut_ac3_late_psi() -> Vec<u8> {
+        let ts = loop_fixture_cut_ac3();
+        let mut packets: Vec<[u8; TS_PACKET]> = ts.chunks(TS_PACKET).map(|c| c.try_into().unwrap()).collect();
+        let pid = |p: &[u8; TS_PACKET]| (p[1] as u16 & 0x1F) << 8 | p[2] as u16;
+        let psi: Vec<[u8; TS_PACKET]> = packets.iter().filter(|p| matches!(pid(p), 0 | 0x1000)).take(2).copied().collect();
+        assert_eq!(psi.len(), 2, "the PAT and PMT");
+        packets.retain(|p| !psi.contains(p));
+        let after_cont = packets.iter().rposition(|p| pid(p) == 0x101 && p[4..].iter().all(|&b| b == 0x55)).unwrap() + 1;
+        let mut tail = packets.split_off(after_cont);
+        packets.extend(std::iter::repeat_n(TS_NULL_PACKET, 2_900));
+        packets.extend(psi);
+        packets.append(&mut tail);
+        packets.concat()
+    }
+
+    /// The bench's `tnt-paris-uhf-24.ts`: the MPTS played whole, its first
+    /// PAT 1.5 MB in. The head scan saw no PMT, and the in-stream PMT gates
+    /// only a PID nothing of which has gone out — the audio's leading
+    /// continuation had — so nothing was gated, and those packets went out
+    /// at every loop after the truncated last frame: completed with them, it
+    /// decoded a burst of up to full scale on every RTMP / HLS re-encode,
+    /// and on a TS output took the loop's clock fill back from the next
+    /// loop's programme (`ClockFill`). Until the PSI is known every PID's
+    /// head is gated, so they stay home, and (`scan_ts_tail`) so does the
+    /// truncated frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_whose_psi_lies_past_the_head_still_drops_its_leading_continuation() {
+        use crate::engine::audio_au::{AuCutter, AuFormat};
+        let ts = loop_fixture_cut_ac3_late_psi();
+        let head = scan_ts_head(&ts[..512 * 1024], TS_PACKET, None);
+        assert!(head.es_pids.is_empty(), "the head scan sees no PMT");
+        let trace = loop_ts_twice("cut-ac3-late-psi.ts", &ts).await;
+        let audio: Vec<&[u8]> = trace
+            .iter()
+            .flat_map(|(_, b)| b.chunks(TS_PACKET))
+            .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x101)
+            .collect();
+        assert!(
+            !audio.iter().any(|p| p[4..].iter().all(|&b| b == 0x55)),
+            "no leading continuation packet goes out"
+        );
+        let mut cutter = AuCutter::new(AuFormat::Ac3);
+        let mut aus = Vec::new();
+        for p in &audio {
+            cutter.push_packet(p);
+            aus.extend(std::iter::from_fn(|| cutter.next(false)));
+        }
+        aus.extend(std::iter::from_fn(|| cutter.next(true)));
+        let fills: Vec<u8> = aus.iter().map(|a| a.data[100]).collect();
+        assert!(aus.iter().all(|a| a.data == ac3_frame(a.data[100])), "every access unit a whole frame: {fills:?}");
+        assert_eq!(aus.len(), 60, "both loops' 30 whole frames: {fills:?}");
+        assert_eq!(cutter.take_discarded(), 0);
+    }
+
+    /// The gate on its own: before the PSI is known, a PID's leading
+    /// continuation is dropped whatever it is (a PCR it carries leaves
+    /// adaptation-field-only); once every PMT the PAT names has parsed, a
+    /// PID no PMT names passes from its first packet.
+    #[test]
+    fn before_the_psi_is_known_every_pids_head_is_gated() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, payload_packet, pes_start_packet, pmt_section};
+        let mut splice = TsFileSplice::new(0, None);
+        let mut cont = SpliceContinuity::default();
+        let mut out = Vec::new();
+        let pid_of = |p: &[u8; TS_PACKET]| (p[1] as u16 & 0x1F) << 8 | p[2] as u16;
+        splice.push(payload_packet(0x101, 3), None, &mut cont, &mut out);
+        splice.push(with_pcr(payload_packet(0x100, 7), 27_000_000), Some(0x100), &mut cont, &mut out);
+        assert_eq!(out.len(), 1, "only the PCR goes out");
+        assert_eq!(pid_of(&out[0]), 0x100);
+        assert!(!crate::engine::ts_parse::ts_has_payload(&out[0]), "adaptation-field-only");
+        out.clear();
+        splice.push(pes_start_packet(0x101, 4, 0xC0, 900_000, None), None, &mut cont, &mut out);
+        splice.push(payload_packet(0x101, 5), None, &mut cont, &mut out);
+        assert_eq!(out.len(), 2, "from its first PES start on");
+        out.clear();
+        splice.push(pat_packet(&[(1, 0x1000)], 0, 0), None, &mut cont, &mut out);
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x03, 0x101, &[])]);
+        splice.push(packetize_sections(0x1000, &[&pmt], 0)[0], None, &mut cont, &mut out);
+        assert!(splice.psi_learned());
+        out.clear();
+        splice.push(payload_packet(0x0200, 0), None, &mut cont, &mut out);
+        assert_eq!(out.len(), 1, "after the PSI, a PID no PMT names is not gated");
+    }
+
+    /// An ADTS frame of `len` bytes (AAC-LC, 48 kHz, stereo, no CRC) whose
+    /// body is `fill`.
+    fn adts_frame(len: usize, fill: u8) -> Vec<u8> {
+        let mut f = vec![fill; len];
+        f[..7].copy_from_slice(&[
+            0xFF,
+            0xF1,
+            (1 << 6) | (3 << 2),
+            (2 << 6) | ((len >> 11) as u8 & 0x03),
+            (len >> 3) as u8,
+            ((len as u8) << 5) | 0x1F,
+            0xFC,
+        ]);
+        f
+    }
+
+    /// A one-second file whose AAC (0x101) straddles its PES as NHK's 1seg
+    /// services carry it — 246-byte ADTS frames (frame `k` filled with
+    /// `k + 1`) cut into PES of 720 bytes, data_alignment_indicator 0 — cut
+    /// out of a capture: its first PES opens 146 bytes from the end of frame
+    /// 0, and its last frame, 46, stops 70 bytes short, in a last PES
+    /// short of the length it declares. `whole`: frame 46 complete instead,
+    /// the last PES as long as it says. Video and PCR as
+    /// [`loop_fixture_cut_ac3`].
+    fn loop_fixture_straddling_adts(whole: bool) -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        const T0: u64 = 10_000; // ms
+        const FRAME: usize = 246;
+        let es: Vec<u8> = (0..47u8).flat_map(|k| adts_frame(FRAME, k + 1)).collect();
+        let end = if whole { es.len() } else { es.len() - 70 };
+        let es = &es[100..end];
+        let mut ev: Vec<(u64, u8, [u8; TS_PACKET])> = Vec::new();
+        ev.push((0, 0, pat_packet(&[(1, 0x1000)], 0, 0)));
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+        ev.push((0, 1, packetize_sections(0x1000, &[&pmt], 0)[0]));
+        for k in 0..50u64 {
+            let t = k * 20;
+            ev.push((t, 3, crate::engine::ts_parse::pcr_only_packet(0x100, 0, (T0 + t) * 27_000, false)));
+        }
+        let mut cc = 0u8;
+        for (j, chunk) in es.chunks(720).enumerate() {
+            // The PTS of the first frame that starts in this PES.
+            let first = (100 + j * 720).div_ceil(FRAME) as u64;
+            let t = first * 1_024 * 1_000 / 48_000;
+            let mut pes = vec![0x00, 0x00, 0x01, 0xC0];
+            pes.extend_from_slice(&(8u16 + 720).to_be_bytes());
+            pes.extend_from_slice(&[0x80, 0x80, 0x05]);
+            let mut stamp = [0u8; 5];
+            crate::engine::ts_test_fixtures::put_ts(&mut stamp, 0x2, (T0 + t + 50) * 90);
+            pes.extend_from_slice(&stamp);
+            pes.extend_from_slice(chunk);
+            for part in pes.chunks(184) {
+                let mut p = [0xFFu8; TS_PACKET];
+                p[0] = SYNC_BYTE;
+                p[1] = if part.as_ptr() == pes.as_ptr() { 0x40 } else { 0x00 } | 0x01;
+                p[2] = 0x01;
+                if part.len() == 184 {
+                    p[3] = 0x10 | cc;
+                    p[4..].copy_from_slice(part);
+                } else {
+                    p[3] = 0x30 | cc;
+                    let af = 184 - part.len();
+                    p[4] = (af - 1) as u8;
+                    if af > 1 {
+                        p[5] = 0x00;
+                    }
+                    p[TS_PACKET - part.len()..].copy_from_slice(part);
+                }
+                cc = (cc + 1) & 0x0F;
+                ev.push((t, 4, p));
+            }
+        }
+        for k in 0..25u64 {
+            let t = k * 40;
+            let ts = (T0 + t + 100) * 90;
+            let es = if k == 0 { SPS } else { P_SLICE };
+            let order = if k == 0 { 2 } else { 5 };
+            ev.push((t, order, video_pes(0x100, 0, ts, Some(ts), es)));
+        }
+        ev.sort_by_key(|(t, o, _)| (*t, *o));
+        ev.iter().flat_map(|(_, _, p)| p.iter().copied()).collect()
+    }
+
+    /// Where the tail scan cuts: a frame straddling into a last PES its
+    /// file does not finish is cut where it starts — inside the PES before,
+    /// which then declares only what it keeps; a cut AC-3 frame alone in
+    /// its PES takes its PES with it; a file whose audio ends on a whole
+    /// frame is left alone, and so is an audio track the shared cutter
+    /// does not frame whose last PES is whole.
+    #[test]
+    fn the_tail_scan_cuts_each_audio_pid_after_its_last_whole_frame() {
+        use crate::engine::audio_au::{AuCutter, AuFormat};
+        let ts = loop_fixture_straddling_adts(false);
+        let trims = scan_ts_tail(&ts, 0, TS_PACKET, &[]);
+        assert_eq!(trims.len(), 1, "{trims:?}");
+        let t = &trims[0];
+        assert_eq!(t.pid, 0x101);
+        // Applied, the PID's stream ends on a whole frame and every PES
+        // carries the length it declares.
+        let mut kept = Vec::new();
+        for (i, p) in ts.chunks(TS_PACKET).enumerate() {
+            let mut p: [u8; TS_PACKET] = p.try_into().unwrap();
+            if apply_tail_trims(&mut p, (i * TS_PACKET) as u64, &trims) {
+                kept.push(p);
+            }
+        }
+        let audio: Vec<&[u8; TS_PACKET]> =
+            kept.iter().filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x101).collect();
+        let mut cutter = AuCutter::new(AuFormat::Adts);
+        let mut aus = Vec::new();
+        for p in &audio {
+            cutter.push_packet(*p);
+            aus.extend(std::iter::from_fn(|| cutter.next(false)));
+        }
+        assert_eq!(cutter.take_discarded(), 146, "the head's partial frame");
+        aus.extend(std::iter::from_fn(|| cutter.next(true)));
+        assert_eq!(cutter.take_discarded(), 0, "no partial frame at the end");
+        assert_eq!(aus.len(), 45, "frames 1 to 45");
+        assert_eq!(aus.last().unwrap().data, adts_frame(246, 46));
+        let mut pes: Vec<Vec<u8>> = Vec::new();
+        for p in &audio {
+            let payload = &p[crate::engine::ts_parse::ts_payload_offset(*p)..];
+            if p[1] & 0x40 != 0 {
+                pes.push(payload.to_vec());
+            } else if let Some(last) = pes.last_mut() {
+                last.extend_from_slice(payload);
+            }
+        }
+        for (i, b) in pes.iter().enumerate() {
+            assert_eq!(u16::from_be_bytes([b[4], b[5]]) as usize, b.len() - 6, "PES {i} carries what it declares");
+        }
+        // Frame 46 starts 6 bytes before the end of the second-to-last
+        // PES (100 + 15 * 720 = 46 * 246 + 6), which keeps 714 bytes.
+        assert_eq!(pes.len(), 16, "the last PES has gone");
+        assert!(t.pes_len.is_some() && t.keep > 0, "{t:?}");
+        // A whole end, and a cut AC-3 frame alone in its PES.
+        assert!(scan_ts_tail(&loop_fixture_straddling_adts(true), 0, TS_PACKET, &[]).is_empty());
+        let ac3 = loop_fixture_cut_ac3();
+        let trims = scan_ts_tail(&ac3, 0, TS_PACKET, &[]);
+        let last_pes_at = ac3
+            .chunks(TS_PACKET)
+            .rposition(|p| p[1] & 0x40 != 0 && ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x101)
+            .unwrap();
+        assert_eq!(trims, vec![TailTrim { pid: 0x101, cut_at: (last_pes_at * TS_PACKET) as u64, keep: 0, pes_len: None }]);
+        // Read from another offset (a 4 MB tail of a longer file), the
+        // offsets follow; with no PAT in it the head names the audio.
+        assert!(scan_ts_tail(&ac3[188..], 188, TS_PACKET, &[]).is_empty(), "no audio known");
+        let trims = scan_ts_tail(&ac3[188..], 188, TS_PACKET, &[(0x101, Some(AuFormat::Ac3))]);
+        assert_eq!(trims[0].cut_at, (last_pes_at * TS_PACKET) as u64);
+        // A track the cutter does not frame: its last PES whole is left
+        // alone, cut short it goes.
+        assert!(scan_ts_tail(&ac3, 0, TS_PACKET, &[(0x101, None)]).len() == 1, "the PMT's framing wins");
+        let unframed: Vec<u8> = ac3
+            .chunks(TS_PACKET)
+            .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) != 0)
+            .flatten()
+            .copied()
+            .collect();
+        let trims = scan_ts_tail(&unframed, 0, TS_PACKET, &[(0x101, None)]);
+        assert_eq!(trims.len(), 1, "the cut last PES");
+        assert_eq!((trims[0].keep, trims[0].pes_len), (0, None));
+        // However the walk goes, no cut reaches back past the PID's
+        // second-to-last PES start: here every PES is one packet with CC 0
+        // and a lone header whose frame runs past it (a fixture, but a
+        // stream the walk keeps restarting on). Taken for duplicates, its
+        // packets once left only the first PES to judge, and the whole PID
+        // went from there.
+        let mp2 = loop_fixture_mp2();
+        let starts: Vec<u64> = mp2
+            .chunks(TS_PACKET)
+            .enumerate()
+            .filter(|(_, p)| p[1] & 0x40 != 0 && ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x101)
+            .map(|(i, _)| (i * TS_PACKET) as u64)
+            .collect();
+        for t in scan_ts_tail(&mp2, 0, TS_PACKET, &[]) {
+            assert!(t.cut_at >= starts[starts.len() - 2], "{t:?}");
+        }
+    }
+
+    /// N3: the straddling AAC's truncated last frame never reaches an output
+    /// at a loop. It used to: the next file's first PES opens mid-frame, so
+    /// the shared framer could not tell the frame was cut short, and
+    /// completed it with the next file's first 70 bytes — a frame of
+    /// garbage every passthrough output forwarded once per loop, and every
+    /// re-encode decoded (fdk 0x4002).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loop_never_completes_a_cut_last_frame_with_the_next_files_head() {
+        use crate::engine::audio_au::{AuCutter, AuFormat};
+        let ts = loop_fixture_straddling_adts(false);
+        let trace = loop_ts_twice("straddling-adts.ts", &ts).await;
+        let audio: Vec<&[u8]> = trace
+            .iter()
+            .flat_map(|(_, b)| b.chunks(TS_PACKET))
+            .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x101)
+            .collect();
+        let mut cutter = AuCutter::new(AuFormat::Adts);
+        let mut aus = Vec::new();
+        for p in &audio {
+            cutter.push_packet(p);
+            aus.extend(std::iter::from_fn(|| cutter.next(false)));
+        }
+        aus.extend(std::iter::from_fn(|| cutter.next(true)));
+        let fills: Vec<u8> = aus.iter().map(|a| a.data[100]).collect();
+        assert!(
+            aus.iter().all(|a| a.data == adts_frame(246, a.data[100])),
+            "every access unit a whole frame of the file: {fills:?}"
+        );
+        assert_eq!(aus.len(), 90, "both loops' frames 1 to 45: {fills:?}");
+        assert_eq!(cutter.take_discarded(), 2 * 146, "each loop's leading partial frame, nothing else");
     }
 
     /// An audio PID's carry is the longest of its recent PES steps — but a

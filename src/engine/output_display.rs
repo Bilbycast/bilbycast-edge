@@ -1399,7 +1399,8 @@ fn demux_decode_loop(
                         if let Some(decoder) = aac_decoder.as_mut() {
                             audio_decode_counters.inc_input();
                             match decoder.decode_frame(&data) {
-                                Ok(decoded) => {
+                                Ok(mut decoded) => {
+                                    crate::engine::audio_decode::seven_one_by_element(decoder, &mut decoded.planar);
                                     audio_decode_counters.inc_output();
                                     let sr = decoder.sample_rate().unwrap_or(48_000);
                                     let ch = decoder.channels().unwrap_or(2);
