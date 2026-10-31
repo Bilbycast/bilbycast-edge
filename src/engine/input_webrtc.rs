@@ -2155,9 +2155,12 @@ mod tests {
     }
 
     /// A WHEP server whose answer this input cannot apply — not SDP at all,
-    /// here — raises a Warning naming str0m's error, once for the episode
-    /// however many pulls it refuses, and each pull's resource is released.
-    /// It was a log line only: from the manager, a pull that never started.
+    /// here — raises a Warning saying so, once for the episode however many
+    /// pulls it refuses, and each pull's resource is released. It was a log
+    /// line only: from the manager, a pull that never started. str0m's parse
+    /// error stays in the log: it spans several lines of parser internals and
+    /// names a heap address of this process (`PointerOffset(0x…)`), which the
+    /// event's message and `details.error` carried to the manager.
     #[cfg(feature = "webrtc")]
     #[tokio::test]
     async fn a_whep_answer_that_cannot_be_applied_raises_a_warning_once() {
@@ -2170,8 +2173,14 @@ mod tests {
         assert_eq!(unusable_answers(&raised), vec!["not_applied"], "once for both pulls");
         let warning = raised
             .iter()
-            .find(|e| e.message.starts_with("WHEP server's answer could not be applied: "));
-        assert!(warning.is_some(), "{:?}", raised.iter().map(|e| &e.message).collect::<Vec<_>>());
+            .find(|e| e.message.starts_with("WHEP server's answer could not be applied: "))
+            .unwrap_or_else(|| panic!("{:?}", raised.iter().map(|e| &e.message).collect::<Vec<_>>()));
+        let error = warning.details.as_ref().unwrap()["error"].as_str().unwrap().to_string();
+        for text in [&warning.message, &error] {
+            assert!(text.contains("the answer is not valid SDP"), "{text}");
+            assert!(!text.contains("0x") && !text.contains("PointerOffset"), "{text}");
+            assert_eq!(text.lines().count(), 1, "{text}");
+        }
         assert_eq!(deleted, vec!["res-0".to_string(), "res-1".to_string()]);
     }
 }
