@@ -2598,9 +2598,13 @@ pub struct BufferedHitlessSnapshot {
     /// longer. A reading above `max_path_diff_ms` says the hold is shorter
     /// than the skew: the later leg's copies come after the release
     /// (`late_duplicates`), and a gap the earlier leg leaves is not filled
-    /// (`late_dropped`). Until 2026-10-31 only copies that met within the
-    /// hold were measured, so it never read above the hold however far
-    /// apart the legs were.
+    /// (`late_dropped`). Until 2026-10-31 only a copy that found its twin
+    /// still held was measured, so with the legs further apart than the
+    /// hold it read at or below the hold, or nothing, except after the
+    /// leading leg lost a run of packets lasting longer than the skew less
+    /// the hold: the other leg's late gap fills kept the packets after the
+    /// run held past their release (the hold releases in sequence order),
+    /// and their copies read the full skew.
     pub max_observed_path_diff_us: u64,
     /// Total packets emitted by the merger.
     pub packets_emitted: u64,

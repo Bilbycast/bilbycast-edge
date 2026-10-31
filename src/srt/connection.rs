@@ -781,8 +781,10 @@ pub fn leg_release_bound(connect_timeout_secs: Option<u64>) -> Duration {
 /// deadline (the connect timeout plus 2 s), so this waits for it and closes
 /// the socket it yields, bounded by `bound` ([`leg_release_bound`] of the
 /// leg's connect timeout); past that it is dropped, as before. (An accept
-/// dropped inside the wrapper's own `from_accepted` has the same hole, which
-/// only srt-transport can close.)
+/// dropped inside the wrapper's own `from_accepted` had the same hole, as
+/// had a connection the wrapper accepted that its listener's owner never
+/// took; srt-transport closes both itself since 2026-11, its listener fix
+/// for a caller left connected to nothing when a listening flow restarts.)
 pub async fn release_leg_acquire(acquire: Option<LegAcquire<'_>>, bound: Duration) {
     let Some(acquire) = acquire else {
         return;

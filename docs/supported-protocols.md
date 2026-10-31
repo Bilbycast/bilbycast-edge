@@ -147,7 +147,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 ### RTP (SMPTE ST 2022-2)
 - **Direction:** Output
 - **Transport:** UDP unicast or multicast
-- **Payload:** RTP-wrapped MPEG-TS packets with RTP headers — under the output's own SSRC and contiguous sequence numbers, single-leg and 2022-7 alike, whatever the flow's framing (a 2022-7 output forwarded an RTP-framed flow's upstream headers until 2026-10)
+- **Payload:** RTP-wrapped MPEG-TS packets with RTP headers — under the output's own SSRC and contiguous sequence numbers, seven TS packets to a datagram, single-leg and 2022-7 alike, whatever the flow's framing or datagram sizes (a 2022-7 output forwarded an RTP-framed flow's upstream headers until 2026-10, and both re-wrapped an RTP-framed flow datagram for datagram until 2026-11)
 - **Features:**
   - SMPTE 2022-1 FEC encode (column + row parity over the datagrams as sent; bilbycast `BCFE` framing on the media port, read by a bilbycast `fec_decode` input, not by third-party 2022-1 decoders; columns and rows 0-7 only, so at most `8 x 8` is fully protected — see [configuration-guide.md](configuration-guide.md#smpte-2022-1-fec-configuration))
   - DSCP/QoS marking (default: 46 Expedited Forwarding)

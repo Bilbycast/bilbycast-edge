@@ -222,6 +222,103 @@ fn send_dual(
     }
 }
 
+/// The TS an RTP datagram from upstream carries, when it carries whole TS
+/// packets: what the output re-cuts into seven-packet datagrams. `None` for
+/// any other payload (an ST 2110 or SMPTE 2022-6 essence, or an empty or
+/// ragged one), which goes out datagram for datagram as it came. Only the
+/// first packet's sync byte is read: a later one damaged in transit keeps
+/// its packet in place in the stream, as on raw TS.
+fn whole_ts_packets(payload: &[u8]) -> Option<&[u8]> {
+    let whole = payload.first() == Some(&TS_SYNC_BYTE) && payload.len().is_multiple_of(TS_PACKET_SIZE);
+    whole.then_some(payload)
+}
+
+/// Re-cuts the TS an RTP output sends into datagrams of
+/// [`TS_PACKETS_PER_DATAGRAM`] packets, whatever the sizes it comes in.
+///
+/// Raw TS arrives in chunks that need not end on a packet boundary (SRT's
+/// 1456-byte byte-stream chunks), and an RTP-framed flow carries short
+/// datagrams among its seven-packet ones: the PAT and PMT a Take injects
+/// (two packets) and the remainders a `media_player` slate's loop splice
+/// leaves, which the flow wraps one datagram to each item
+/// (`ts_continuity_fixer::FlowFraming`). Re-wrapped as they came, those went
+/// out short, and a FEC column or row holding datagrams of mixed sizes gets
+/// no protection; until 2026-11 an RTP-framed flow went out datagram for
+/// datagram. Every datagram the output sends from TS now takes seven
+/// packets. A tail short of seven waits for the bytes after it — the next
+/// item, or the flow's keepalive through a gap — so nothing is padded or
+/// dropped, and a re-cut adds at most one item's wait.
+///
+/// Each datagram is stamped with the RTP timestamp of the item its first
+/// byte came from: RFC 2250 times the first byte of the payload. On a flow
+/// of seven-packet items every datagram starts with its item, so the
+/// stamps are the items' own.
+struct TsRealigner {
+    buf: BytesMut,
+    /// Whether `buf` is aligned on a TS sync byte yet.
+    synced: bool,
+    /// The RTP timestamp of the item the first byte in `buf` came from.
+    head_ts: u32,
+}
+
+impl TsRealigner {
+    fn new() -> Self {
+        Self { buf: BytesMut::new(), synced: false, head_ts: 0 }
+    }
+
+    /// Add `ts`, from an item stamped `rtp_ts`, and hand `emit` each
+    /// datagram's worth of TS it completes, with its timestamp.
+    fn push(&mut self, output_id: &str, ts: &[u8], rtp_ts: u32, mut emit: impl FnMut(BytesMut, u32)) {
+        if self.buf.is_empty() {
+            self.head_ts = rtp_ts;
+        }
+        self.buf.extend_from_slice(ts);
+        if !self.synced && self.buf.len() >= TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE {
+            let aligned_at = (0..TS_PACKET_SIZE).find(|&offset| {
+                (0..TS_SYNC_CONFIRM_COUNT).all(|i| self.buf[offset + i * TS_PACKET_SIZE] == TS_SYNC_BYTE)
+            });
+            match aligned_at {
+                Some(offset) => {
+                    if offset > 0 {
+                        tracing::info!(
+                            "RTP output '{output_id}': TS sync found at offset {offset}, discarding {offset} leading bytes"
+                        );
+                        let _ = self.buf.split_to(offset);
+                    } else {
+                        tracing::info!("RTP output '{output_id}': TS sync found at offset 0 (already aligned)");
+                    }
+                    self.synced = true;
+                }
+                None => {
+                    tracing::warn!(
+                        "RTP output '{output_id}': no TS sync found in {} bytes, discarding",
+                        self.buf.len()
+                    );
+                    self.buf.clear();
+                }
+            }
+        }
+        if !self.synced {
+            return;
+        }
+        let size = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
+        while self.buf.len() >= size {
+            emit(self.buf.split_to(size), self.head_ts);
+            // Less than a datagram waited ahead of `ts`, so what is left
+            // starts inside it.
+            self.head_ts = rtp_ts;
+        }
+    }
+}
+
+/// One RTP datagram: `header` and `payload`.
+fn rtp_datagram(header: [u8; RTP_HEADER_SIZE], payload: &[u8]) -> Bytes {
+    let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + payload.len());
+    buf.extend_from_slice(&header);
+    buf.extend_from_slice(payload);
+    Bytes::from(buf)
+}
+
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// RTP packets out over a UDP socket. If FEC encode is configured,
 /// FEC packets are also generated and sent. If redundancy is configured,
@@ -347,15 +444,9 @@ async fn rtp_output_loop(
         .as_ref()
         .map(|fec| new_fec_encoder(&config.id, fec, fec_sent_counter.clone()));
 
-    // Buffer for re-aligning raw TS data into 188-byte aligned datagrams.
-    // SRT may deliver data in chunks that don't align to TS packet boundaries
-    // (e.g., 1456-byte byte-stream chunks). This buffer accumulates incoming
-    // data, finds the TS sync byte (0x47) boundary, and sends properly aligned
-    // chunks (7 × 188 = 1316 bytes) — the standard for MPEG-TS over UDP.
-    let mut ts_realign_buf = BytesMut::new();
-    let ts_datagram_size = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
-    let mut is_raw_ts_stream = false;
-    let mut ts_sync_found = false;
+    // Every datagram this output sends from TS takes seven packets, raw TS
+    // and RTP alike (`TsRealigner`).
+    let mut realigner = TsRealigner::new();
 
     // Optional MPTS → SPTS program filter.
     let mut program_filter = config.program_number.map(|n| {
@@ -643,142 +734,76 @@ async fn rtp_output_loop(
         // or the delay buffer drain. This shared code path avoids duplicating
         // the raw-TS re-alignment, RTP wrapping, FEC, and socket send logic.
         for packet in &packets_to_send {
-            // When audio_encode or video_encode is active we must rewrite
-            // TS bytes, so even RTP-wrapped inputs get stripped and forced
-            // through the raw-TS path (output is then re-wrapped with
-            // fresh RTP framing).
-            let force_raw_ts = transcode_chain.is_some();
-
-            if packet.is_raw_ts || force_raw_ts {
-                if !is_raw_ts_stream {
-                    is_raw_ts_stream = true;
-                    tracing::info!(
-                        "RTP output '{}': raw TS detected, enabling TS re-alignment ({} TS pkts/datagram)",
-                        config.id,
-                        TS_PACKETS_PER_DATAGRAM
-                    );
-                }
-
-                // Extract TS payload: strip RTP header (CSRCs and extension
-                // included) if forced-raw and the input was RTP-wrapped;
-                // otherwise use packet.data as-is.
-                let ts_input: &[u8] = if !packet.is_raw_ts && force_raw_ts {
-                    match crate::engine::ts_parse::strip_rtp_header(packet) {
-                        [] => continue,
-                        ts => ts,
-                    }
-                } else {
-                    &packet.data[..]
-                };
-
-                // If transcode chain is active, submit the ts_input
-                // bytes (non-blocking) and drain any ready transcoded
-                // bytes back into the realign buffer through the same
-                // padder. The transcoded output may arrive across one
-                // or more iterations; this loop continues to consume
-                // from ts_realign_buf normally.
-                if let Some(ref chain) = transcode_chain {
-                    if chain.try_submit(Bytes::copy_from_slice(ts_input)).is_err() {
-                        stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                    }
-                    while let Some(transcoded) = transcode_chain.as_mut().and_then(|c| c.try_recv())
-                    {
-                        if let Some(ref mut padder) = null_padder {
-                            pad_scratch.clear();
-                            padder.process(&transcoded, &mut pad_scratch);
-                            ts_realign_buf.extend_from_slice(&pad_scratch);
-                        } else {
-                            ts_realign_buf.extend_from_slice(&transcoded);
-                        }
-                    }
-                } else {
-                    if let Some(ref mut padder) = null_padder {
-                        pad_scratch.clear();
-                        padder.process(ts_input, &mut pad_scratch);
-                        ts_realign_buf.extend_from_slice(&pad_scratch);
-                    } else {
-                        ts_realign_buf.extend_from_slice(ts_input);
-                    }
-                }
-
-                if !ts_sync_found {
-                    let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
-                    if ts_realign_buf.len() >= min_bytes {
-                        let mut found_offset = None;
-                        for offset in 0..TS_PACKET_SIZE {
-                            let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
-                                let pos = offset + i * TS_PACKET_SIZE;
-                                pos < ts_realign_buf.len()
-                                    && ts_realign_buf[pos] == TS_SYNC_BYTE
-                            });
-                            if all_sync {
-                                found_offset = Some(offset);
-                                break;
-                            }
-                        }
-
-                        if let Some(offset) = found_offset {
-                            if offset > 0 {
-                                tracing::info!(
-                                    "RTP output '{}': TS sync found at offset {}, discarding {} leading bytes",
-                                    config.id,
-                                    offset,
-                                    offset
-                                );
-                                let _ = ts_realign_buf.split_to(offset);
-                            } else {
-                                tracing::info!(
-                                    "RTP output '{}': TS sync found at offset 0 (already aligned)",
-                                    config.id
-                                );
-                            }
-                            ts_sync_found = true;
-                        } else {
-                            tracing::warn!(
-                                "RTP output '{}': no TS sync found in {} bytes, discarding",
-                                config.id,
-                                ts_realign_buf.len()
-                            );
-                            ts_realign_buf.clear();
-                        }
-                    }
-                }
-
-                if ts_sync_found {
-                    while ts_realign_buf.len() >= ts_datagram_size {
-                        let datagram = ts_realign_buf.split_to(ts_datagram_size);
-                        let header = rtp_wrap.build_header(packet.rtp_timestamp);
-                        let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + ts_datagram_size);
-                        buf.extend_from_slice(&header);
-                        buf.extend_from_slice(&datagram);
-                        send_single(
-                            &wire_tx,
-                            fec_encoder.as_mut(),
-                            Bytes::from(buf),
-                            packet.recv_time_us,
-                            &stats,
-                        );
-                    }
-                }
+            // The TS this item carries, re-cut into seven-packet datagrams
+            // below (`TsRealigner`): raw TS as it is, RTP without its whole
+            // upstream header, CSRCs and extension included. When
+            // audio_encode or video_encode is active every RTP payload goes
+            // to the transcode chain. An RTP payload that is not whole TS
+            // packets goes out as it came, under this output's header.
+            let ts_input: &[u8] = if packet.is_raw_ts {
+                &packet.data[..]
             } else {
-                // Already-RTP-wrapped data: strip the upstream header,
-                // wrap with our local SSRC + seq so receivers see a
-                // coherent stream from us regardless of upstream
-                // synthesis quirks. The header goes whole, CSRCs and
-                // extension included: a fixed 12-byte strip put them
-                // ahead of the TS, misaligning every packet.
-                let inner_ts = crate::engine::ts_parse::strip_rtp_header(packet);
-                let header = rtp_wrap.build_header(packet.rtp_timestamp);
-                let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + inner_ts.len());
-                buf.extend_from_slice(&header);
-                buf.extend_from_slice(inner_ts);
+                let inner = crate::engine::ts_parse::strip_rtp_header(packet);
+                if transcode_chain.is_some() {
+                    if inner.is_empty() {
+                        continue;
+                    }
+                    inner
+                } else if let Some(ts) = whole_ts_packets(inner) {
+                    ts
+                } else {
+                    let header = rtp_wrap.build_header(packet.rtp_timestamp);
+                    send_single(
+                        &wire_tx,
+                        fec_encoder.as_mut(),
+                        rtp_datagram(header, inner),
+                        packet.recv_time_us,
+                        &stats,
+                    );
+                    continue;
+                }
+            };
+
+            // Everything that reaches the realigner — the item's TS, or the
+            // transcode chain's output and the null padder's packets — is
+            // stamped with this item's RTP timestamp.
+            let mut send = |datagram: BytesMut, rtp_ts: u32| {
                 send_single(
                     &wire_tx,
                     fec_encoder.as_mut(),
-                    Bytes::from(buf),
+                    rtp_datagram(rtp_wrap.build_header(rtp_ts), &datagram),
                     packet.recv_time_us,
                     &stats,
                 );
+            };
+
+            // If transcode chain is active, submit the ts_input bytes
+            // (non-blocking) and drain any ready transcoded bytes into the
+            // realigner through the same padder. The transcoded output may
+            // arrive across one or more iterations.
+            if let Some(ref chain) = transcode_chain {
+                if chain.try_submit(Bytes::copy_from_slice(ts_input)).is_err() {
+                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                while let Some(transcoded) = transcode_chain.as_mut().and_then(|c| c.try_recv()) {
+                    let ts: &[u8] = if let Some(ref mut padder) = null_padder {
+                        pad_scratch.clear();
+                        padder.process(&transcoded, &mut pad_scratch);
+                        &pad_scratch
+                    } else {
+                        &transcoded
+                    };
+                    realigner.push(&config.id, ts, packet.rtp_timestamp, &mut send);
+                }
+            } else {
+                let ts: &[u8] = if let Some(ref mut padder) = null_padder {
+                    pad_scratch.clear();
+                    padder.process(ts_input, &mut pad_scratch);
+                    &pad_scratch
+                } else {
+                    ts_input
+                };
+                realigner.push(&config.id, ts, packet.rtp_timestamp, &mut send);
             }
 
             // FEC went out with each datagram it protects (`send_single`);
@@ -919,11 +944,9 @@ async fn rtp_output_redundant_loop(
         .as_ref()
         .map(|fec| new_fec_encoder(&config.id, fec, fec_sent_counter.clone()));
 
-    // Raw TS re-alignment buffer (shared for both legs)
-    let mut ts_realign_buf = BytesMut::new();
-    let ts_datagram_size = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
-    let mut is_raw_ts_stream = false;
-    let mut ts_sync_found = false;
+    // Seven-packet datagrams from TS, raw TS and RTP alike (`TsRealigner`),
+    // shared by both legs.
+    let mut realigner = TsRealigner::new();
 
     // Optional MPTS → SPTS program filter (shared by both legs).
     let mut program_filter = config.program_number.map(|n| {
@@ -1058,88 +1081,49 @@ async fn rtp_output_redundant_loop(
         }
 
         for packet in &packets_to_send {
-            if packet.is_raw_ts {
-                if !is_raw_ts_stream {
-                    is_raw_ts_stream = true;
-                    tracing::info!(
-                        "RTP output '{}': raw TS detected, enabling TS re-alignment ({} TS pkts/datagram)",
-                        config.id,
-                        TS_PACKETS_PER_DATAGRAM
-                    );
-                }
-
-                ts_realign_buf.extend_from_slice(&packet.data);
-
-                if !ts_sync_found {
-                    let min_bytes = TS_SYNC_CONFIRM_COUNT * TS_PACKET_SIZE;
-                    if ts_realign_buf.len() >= min_bytes {
-                        let mut found_offset = None;
-                        for offset in 0..TS_PACKET_SIZE {
-                            let all_sync = (0..TS_SYNC_CONFIRM_COUNT).all(|i| {
-                                let pos = offset + i * TS_PACKET_SIZE;
-                                pos < ts_realign_buf.len()
-                                    && ts_realign_buf[pos] == TS_SYNC_BYTE
-                            });
-                            if all_sync {
-                                found_offset = Some(offset);
-                                break;
-                            }
-                        }
-
-                        if let Some(offset) = found_offset {
-                            if offset > 0 {
-                                let _ = ts_realign_buf.split_to(offset);
-                            }
-                            ts_sync_found = true;
-                        } else {
-                            ts_realign_buf.clear();
-                        }
-                    }
-                }
-
-                if ts_sync_found {
-                    while ts_realign_buf.len() >= ts_datagram_size {
-                        let datagram = ts_realign_buf.split_to(ts_datagram_size);
+            // Raw TS, and RTP whose payload is whole TS packets with its
+            // upstream header stripped whole (CSRCs and extension included),
+            // are re-cut into seven-packet datagrams numbered in the output's
+            // own SSRC and sequence (`TsRealigner`), as the single-leg path
+            // does. Re-wrapped datagram for datagram, an RTP-framed flow's
+            // short datagrams (a Take's PSI, a slate's loop-splice
+            // remainders) went out short and cost their FEC groups their
+            // protection. Forwarded with its upstream header, an RTP-framed
+            // flow went out as two SSRC and sequence spaces interleaved with
+            // the raw-TS keepalives this output wraps. Any other RTP payload
+            // goes out as it came, under the output's header.
+            let ts_input: &[u8] = if packet.is_raw_ts {
+                &packet.data[..]
+            } else {
+                let inner = crate::engine::ts_parse::strip_rtp_header(packet);
+                match whole_ts_packets(inner) {
+                    Some(ts) => ts,
+                    None => {
                         let header = rtp_wrap.build_header(packet.rtp_timestamp);
-                        let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + ts_datagram_size);
-                        buf.extend_from_slice(&header);
-                        buf.extend_from_slice(&datagram);
-                        // Both legs receive the same Bytes (refcount
-                        // bump only — no copy).
                         send_dual(
                             &wire_tx_leg1,
                             &wire_tx_leg2,
                             fec_encoder.as_mut(),
-                            Bytes::from(buf),
+                            rtp_datagram(header, inner),
                             packet.recv_time_us,
                             &stats,
                         );
+                        continue;
                     }
                 }
-            } else {
-                // Already-RTP data: strip the upstream header and wrap with
-                // the output's own SSRC and sequence, as the single-leg path
-                // does. The raw TS this output wraps above — the flow's
-                // idle keepalives on any flow — is numbered in the same
-                // space, so a receiver sees one stream; forwarded with its
-                // upstream header, an RTP-framed flow went out as two SSRC
-                // and sequence spaces interleaved. FEC follows the numbers
-                // this sends. The upstream header goes whole, CSRCs and
-                // extension included, so the TS stays aligned.
-                let inner_ts = crate::engine::ts_parse::strip_rtp_header(packet);
-                let header = rtp_wrap.build_header(packet.rtp_timestamp);
-                let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + inner_ts.len());
-                buf.extend_from_slice(&header);
-                buf.extend_from_slice(inner_ts);
+            };
+            // Both legs receive the same Bytes (refcount bump only — no
+            // copy).
+            realigner.push(&config.id, ts_input, packet.rtp_timestamp, |datagram, rtp_ts| {
                 send_dual(
                     &wire_tx_leg1,
                     &wire_tx_leg2,
                     fec_encoder.as_mut(),
-                    Bytes::from(buf),
+                    rtp_datagram(rtp_wrap.build_header(rtp_ts), &datagram),
                     packet.recv_time_us,
                     &stats,
                 );
-            }
+            });
 
             // FEC went out on both legs with each datagram it protects
             // (`send_dual`); publish the running count.
@@ -1625,6 +1609,80 @@ mod tests {
                 assert_eq!(&dg[RTP_HEADER_SIZE..], &ts[i * full..(i + 1) * full], "dual {dual}: the TS alone");
             }
             check_contiguous(&legs[0], 4, 4, 3);
+        }
+    }
+
+    /// A Take onto an RTP-framed flow and a slate's loop splices on it: the
+    /// two-packet PSI datagram the Take injects, and three- and two-packet
+    /// remainders the flow wraps one datagram to each item, among
+    /// seven-packet datagrams. Single-leg and 2022-7, every datagram goes out
+    /// with seven packets, the TS in order with nothing padded or dropped,
+    /// each stamped with the RTP timestamp of the item its first byte came
+    /// from, and the FEC protects them all. Re-wrapped as they came, the
+    /// three went out short (388, 576 and 388 bytes) and the FEC matrices
+    /// holding them were left without protection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn short_rtp_datagrams_are_recut_into_seven_packet_datagrams() {
+        let full = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
+        let ts = ts_stream(48 * TS_PACKETS_PER_DATAGRAM);
+        let mut packets_per_item = vec![TS_PACKETS_PER_DATAGRAM; 20];
+        packets_per_item.extend([2, 3, 2]);
+        packets_per_item.extend([TS_PACKETS_PER_DATAGRAM; 27]);
+        let items = || -> Vec<RtpPacket> {
+            let mut at = 0;
+            packets_per_item
+                .iter()
+                .zip(0u16..)
+                .map(|(&n, i)| {
+                    let end = at + n * TS_PACKET_SIZE;
+                    let dg = upstream_rtp(7_000 + i, &ts[at..end]);
+                    at = end;
+                    dg
+                })
+                .collect()
+        };
+        // The item each TS packet came in.
+        let item_of: Vec<usize> = packets_per_item
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &n)| std::iter::repeat_n(i, n))
+            .collect();
+        let stamps: Vec<u32> = items().iter().map(|it| it.rtp_timestamp).collect();
+        for dual in [false, true] {
+            let legs = capture(4, 4, dual, items(), 48).await;
+            if dual {
+                assert_eq!(legs[0], legs[1], "both legs byte-identical");
+            }
+            let media: Vec<&Vec<u8>> = legs[0].iter().filter(|dg| !is_fec_packet(dg)).collect();
+            assert!(
+                media.iter().all(|dg| dg.len() == RTP_HEADER_SIZE + full),
+                "dual {dual}: every datagram 1328 bytes, got {:?}",
+                media.iter().map(|dg| dg.len()).filter(|&n| n != RTP_HEADER_SIZE + full).collect::<Vec<_>>(),
+            );
+            let sent: Vec<u8> = media.iter().flat_map(|dg| dg[RTP_HEADER_SIZE..].iter().copied()).collect();
+            assert!(sent == ts, "dual {dual}: the TS in order, nothing padded or dropped");
+            for (i, dg) in media.iter().enumerate() {
+                let stamp = u32::from_be_bytes([dg[4], dg[5], dg[6], dg[7]]);
+                assert_eq!(stamp, stamps[item_of[i * TS_PACKETS_PER_DATAGRAM]], "dual {dual}: datagram {i}");
+            }
+            check_contiguous(&legs[0], 4, 4, 3);
+        }
+    }
+
+    /// An RTP payload that is not whole TS packets (an essence) goes out as
+    /// it came, datagram for datagram, under the output's own header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_rtp_payload_that_is_not_ts_goes_out_as_it_came() {
+        let payload = |i: u16| vec![0x5A ^ i as u8; 1200];
+        let items = || -> Vec<RtpPacket> { (0..6u16).map(|i| upstream_rtp(500 + i, &payload(i))).collect() };
+        for dual in [false, true] {
+            let legs = capture(4, 4, dual, items(), 6).await;
+            let media: Vec<&Vec<u8>> = legs[0].iter().filter(|dg| !is_fec_packet(dg)).collect();
+            assert_eq!(media.len(), 6);
+            for (i, dg) in media.iter().enumerate() {
+                assert_ne!(dg[8..12], [0xDE, 0xAD, 0xBE, 0xEF], "the output's own SSRC");
+                assert_eq!(dg[RTP_HEADER_SIZE..], payload(i as u16)[..], "dual {dual}: datagram {i} as it came");
+            }
         }
     }
 

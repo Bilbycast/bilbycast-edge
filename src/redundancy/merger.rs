@@ -2921,10 +2921,11 @@ mod buffered_tests {
 
     /// A leg further behind than the hold: leg 2's copies come 300 ms after
     /// leg 1's, past a 100 ms hold, so each finds its twin already released.
-    /// They are measured all the same — the skew reads 300 ms, not at most
-    /// the hold — and counted as late duplicates, not as loss. Leg 1's hole
-    /// at 50, which leg 2 fills too late, is the one packet `late_dropped`
-    /// counts.
+    /// They are measured all the same — the skew reads 300 ms; until
+    /// 2026-10-31 only a copy that found its twin still held was measured,
+    /// which none here does, so it read nothing — and counted as late
+    /// duplicates, not as loss. Leg 1's hole at 50, which leg 2 fills too
+    /// late, is the one packet `late_dropped` counts.
     #[test]
     fn a_copy_whose_twin_was_released_is_measured_and_no_loss() {
         let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(100));
