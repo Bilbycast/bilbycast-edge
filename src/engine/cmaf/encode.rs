@@ -1461,7 +1461,10 @@ mod reencoder_tests {
         }
         assert_eq!(r.encoder.as_ref().unwrap().params().sample_rate, 44_100, "rebuilt");
         assert!(out.windows(2).all(|w| w[1].1 > w[0].1), "the stamps never step back");
-        let mut d = aac_audio::AacDecoder::open_adts().unwrap();
+        // Frames come back as bare access units: decode them against the
+        // configuration the track announces.
+        let asc = r.encoder_track().expect("a frame is out").audio_specific_config();
+        let mut d = aac_audio::AacDecoder::open_raw(&asc).unwrap();
         let (mut times, mut pcm) = (Vec::new(), Vec::new());
         for (data, pts) in &out {
             let p = d.decode_frame(data).unwrap().planar[0].clone();
