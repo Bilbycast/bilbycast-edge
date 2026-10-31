@@ -85,7 +85,7 @@ benefits from offloading decode to dedicated silicon.
 
 | Codec | Encode backend | Decode backend | Sample rates exposed in UI | Channels | Notes |
 |---|---|---|---|---|---|
-| **AAC-LC** | FDK-AAC in-process (`fdk-aac`) | FDK-AAC | 8 k–48 k | 1–8 (mono–7.1) | Production AAC; lowest latency |
+| **AAC-LC** | FDK-AAC in-process (`fdk-aac`) | FDK-AAC | 8 k–48 k | 1–6, 8 (mono–5.1, 7.1; 7 is refused) | Production AAC; lowest latency. 7.1 goes out as channel configuration 0 with a program_config_element; decoded, 7.1 is eight channels (fdk-aac's default downmix to six is switched off) |
 | **HE-AAC v1** | FDK-AAC in-process | FDK-AAC | 8 k–48 k | 1–2 | SBR adds chroma-bandwidth dependency |
 | **HE-AAC v2** | FDK-AAC in-process | FDK-AAC | 8 k–48 k | 2 (stereo only) | Parametric Stereo — manager UI hard-filters mono |
 | **Opus** | libopus via libavcodec in-process (`media-codecs`); ffmpeg-subprocess `-c:a libopus` fallback when `media-codecs` off | libopus via libavcodec | 48 k | 1–2 | Encode surface is WebRTC only (MPEG-TS has no standard Opus mapping). Decode wired (transcode-from-Opus-on-TS works). Opus-in-TS reaches a WebRTC output without either: passed through packet for packet when no `audio_encode` is set (mono / stereo single-stream only) |

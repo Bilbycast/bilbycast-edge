@@ -153,7 +153,8 @@ pub struct AudioTrack {
     pub sample_rate: u32,
     /// Channel count (1 = mono, 2 = stereo). For AC-3 / E-AC-3 this is
     /// the decoded channel count derived from `acmod + lfeon`; for AAC
-    /// it's the `channel_configuration` value.
+    /// it's the channels the configuration describes — its
+    /// `channel_configuration`'s, or its program_config_element's.
     pub channels: u16,
 }
 
@@ -165,9 +166,10 @@ pub enum AudioCodec {
     /// MPEG-4 AAC-LC (ISO/IEC 14496-3). Sample entry `mp4a` + `esds`
     /// with `objectTypeIndication = 0x40` (MPEG-4 Audio).
     Aac {
-        /// 2-byte AudioSpecificConfig from
-        /// [`super::codecs::aac_audio_specific_config`].
-        audio_specific_config: [u8; 2],
+        /// AudioSpecificConfig ([`crate::engine::aac_config::AacConfig`]):
+        /// two bytes, or more when it carries a program_config_element
+        /// (channel configuration 0).
+        audio_specific_config: Vec<u8>,
         /// Average bitrate in bits per second (written into the esds DCD).
         avg_bitrate: u32,
     },
@@ -200,7 +202,7 @@ impl AudioTrack {
     /// Build an AAC-LC audio track. Convenience constructor used by every
     /// AAC ingest path (RTMP / RTSP / WebRTC / TS demux).
     pub fn aac(
-        audio_specific_config: [u8; 2],
+        audio_specific_config: Vec<u8>,
         sample_rate: u32,
         channels: u16,
         avg_bitrate: u32,
@@ -215,10 +217,25 @@ impl AudioTrack {
         }
     }
 
-    /// Returns the 2-byte AAC AudioSpecificConfig if this track carries
-    /// AAC, else `None`. Used by manifest builders (DASH MPD, HLS m3u8)
-    /// that quote the ASC bytes when computing the codec string.
-    pub fn aac_asc(&self) -> Option<&[u8; 2]> {
+    /// The AAC track for configuration `cfg` (the demuxer's for a source
+    /// passed through, the encoder's first frame's for a re-encode): its
+    /// AudioSpecificConfig, the core's rate as the timescale — an HE-AAC
+    /// frame is 1024 samples of it, SBR / PS signalled implicitly — and the
+    /// channels the configuration describes (a program_config_element's for
+    /// channel configuration 0).
+    pub fn for_aac(cfg: &crate::engine::aac_config::AacConfig, avg_bitrate: u32) -> Self {
+        Self::aac(
+            cfg.audio_specific_config(),
+            super::codecs::sample_rate_from_index(cfg.sr_idx),
+            u16::from(cfg.channels()),
+            avg_bitrate,
+        )
+    }
+
+    /// Returns the AAC AudioSpecificConfig if this track carries AAC, else
+    /// `None`. Used by manifest builders (DASH MPD, HLS m3u8) that quote the
+    /// ASC bytes when computing the codec string.
+    pub fn aac_asc(&self) -> Option<&[u8]> {
         match &self.codec {
             AudioCodec::Aac { audio_specific_config, .. } => Some(audio_specific_config),
             _ => None,
@@ -1692,7 +1709,7 @@ mod tests {
             "000003032080",
         ));
         let pps265 = hx("4401c02524f87640");
-        let aac = AudioTrack::aac([0x11, 0x90], 48_000, 2, 128_000);
+        let aac = AudioTrack::aac(vec![0x11, 0x90], 48_000, 2, 128_000);
         let kid = [0x11u8; 16];
         let cenc = CencInitParams { scheme: Scheme::Cenc, key_id: &kid, extra_pssh: Vec::new() };
         let cbcs = CencInitParams { scheme: Scheme::Cbcs, key_id: &kid, extra_pssh: Vec::new() };
@@ -1841,7 +1858,7 @@ mod tests {
         let audio: Vec<Sample> = (0..20).map(|_| sample(1024)).collect();
         let vtrack =
             VideoTrack::from_h264(vec![0x67, 0x42, 0x00, 0x1f], vec![0x68, 0xce, 0x3c, 0x80]);
-        let atrack = AudioTrack::aac([0x11, 0x90], 48_000, 2, 128_000);
+        let atrack = AudioTrack::aac(vec![0x11, 0x90], 48_000, 2, 128_000);
         let out = build_progressive_mp4(&vtrack, &video, Some(&atrack), &audio);
 
         // Durations, in movie-timescale (1000) units.
@@ -1948,7 +1965,7 @@ mod tests {
     }
 
     fn synthetic_audio_track() -> AudioTrack {
-        AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000)
+        AudioTrack::aac(vec![0x11, 0x90], 48000, 2, 128_000)
     }
 
     /// Resolve a sample's sync flag the way a player does: per-sample flags in

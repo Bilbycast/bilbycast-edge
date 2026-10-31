@@ -23,6 +23,8 @@
 //!   from the subscriber loop.
 
 #[cfg(test)]
+mod aac_track_tests;
+#[cfg(test)]
 mod arrival_tests;
 mod box_writer;
 mod cenc;
@@ -64,7 +66,6 @@ use super::packet::RtpPacket;
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
 use super::ts_program_filter::TsProgramFilter;
 
-use codecs::aac_audio_specific_config;
 use encode::{AudioReencoder, VideoReencoder};
 use fmp4::{AudioTrack, Sample, VideoCodec, VideoTrack};
 use manifest::{
@@ -782,6 +783,18 @@ struct CmafState {
     /// Latched once the "audio arrived too late to be carried" warning has
     /// been raised, so it is said once per flow rather than on every frame.
     late_audio_warned: bool,
+    /// How long a PCE-signalled AAC source (channel_configuration 0) has been
+    /// held back for want of a frame carrying its layout — neither its track
+    /// nor its decoder can be built without it — so the wait is said once
+    /// (`aac_channel_layout_missing`).
+    layout_wait: crate::engine::aac_config::LayoutWait,
+    /// The source configuration a passed-through AAC track was built from,
+    /// and the one a change away from it was last reported for
+    /// (`aac_config_changed`): the init describes the first for the life of
+    /// the output, so a change is said once, and again only after the
+    /// source has come back to it.
+    passthrough_aac: Option<crate::engine::aac_config::AacConfig>,
+    aac_change_said: Option<crate::engine::aac_config::AacConfig>,
     /// Estimated video bitrate in bps (EWMA over emitted segments).
     video_bps_ewma: u64,
     /// Estimated audio bitrate in bps.
@@ -1353,6 +1366,9 @@ impl CmafState {
             audio_muxing: None,
             video_ready_at: None,
             late_audio_warned: false,
+            layout_wait: crate::engine::aac_config::LayoutWait::default(),
+            passthrough_aac: None,
+            aac_change_said: None,
             video_bps_ewma: 0,
             audio_bps_ewma: 0,
             availability_start_unix: 0,
@@ -1705,29 +1721,27 @@ async fn run(
                     config.id, enc_cfg.codec, reenc.has_silent_fallback(),
                 );
                 // Silent-fallback path: build the AudioSegmenter eagerly
-                // using the declared target params so silent AAC frames
+                // using the eager encoder's format so silent AAC frames
                 // can flow into the current segment before any source
-                // audio arrives. The ASC is synthesised from the
-                // declared sample_rate / channels (AOT=2, AAC-LC).
+                // audio arrives. The ASC is what that encoder will write
+                // (`encode::expected_adts_config`: for HE-AAC its core,
+                // SBR / PS implicit) — no frame exists yet to read it off.
                 if reenc.has_silent_fallback() {
-                    if let Some((profile, sr_idx, ch_cfg)) = reenc.silent_fallback_track() {
-                        let asc = aac_audio_specific_config(profile, sr_idx, ch_cfg);
-                        let sample_rate = codecs::sample_rate_from_index(sr_idx);
-                        let track = AudioTrack::aac(
-                            asc,
-                            sample_rate,
-                            ch_cfg as u16,
+                    if let Some(track_cfg) = reenc.silent_fallback_track() {
+                        let track = AudioTrack::for_aac(
+                            &track_cfg,
                             enc_cfg
                                 .bitrate_kbps
                                 .map(|k| k * 1000)
                                 .unwrap_or(128_000),
                         );
+                        let (sample_rate, channels) = (track.sample_rate, track.channels);
                         state.audio_seg =
                             Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
                         state.audio_ready = true;
                         tracing::info!(
                             "CMAF output '{}': audio track pre-built for silent_fallback (sr={} ch={})",
-                            config.id, sample_rate, ch_cfg,
+                            config.id, sample_rate, channels,
                         );
                     } else {
                         tracing::warn!(
@@ -2259,17 +2273,16 @@ fn handle_other_audio_frame(
     // audio_encode's, or the source's — exactly as on the AAC path.
     if state.audio_seg.is_none()
         && let Some(reenc) = state.audio_reencoder.as_ref()
-        && let Some((profile, sr_idx, ch)) = reenc.encoder_track()
+        && let Some(track_cfg) = reenc.encoder_track()
     {
-        let sample_rate = codecs::sample_rate_from_index(sr_idx);
         let bitrate = config
             .audio_encode
             .as_ref()
             .and_then(|e| e.bitrate_kbps)
             .map(|k| k * 1000)
             .unwrap_or(128_000);
-        let track =
-            AudioTrack::aac(aac_audio_specific_config(profile, sr_idx, ch), sample_rate, ch as u16, bitrate);
+        let track = AudioTrack::for_aac(&track_cfg, bitrate);
+        let (sample_rate, ch) = (track.sample_rate, track.channels);
         state.audio_seg =
             Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
         state.audio_ready = true;
@@ -2828,28 +2841,52 @@ fn handle_audio_frame(
         .map(|k| k * 1000)
         .unwrap_or(128_000);
 
-    // Passthrough: the track is the source's, from the demuxer-cached ADTS
-    // config. With `audio_encode` it is the ENCODER's — built below, after
-    // the first frame has settled what the encoder actually emits. A source
-    // whose rate or layout differs from the configured target is converted
-    // on the way in, so a track built from the source declared one channel
-    // count (or rate) while every frame carried another, which a browser's
-    // decoder refuses as a mid-stream change.
+    // A PCE-signalled source (channel_configuration 0, ISDB-T 1seg) whose
+    // layout no frame has carried yet is held back: the track's
+    // AudioSpecificConfig must carry that program_config_element, or no
+    // decoder opens it, and a re-encode's decoder needs it too. Once one
+    // has arrived every frame goes, with or without a PCE of its own. It
+    // used to build the two-byte configuration (an init no player decodes)
+    // or, re-encoding, raise an `audio_encode` error on every frame.
+    if let Some(sr_idx) = demuxer.aac_layout_pending() {
+        let rate = crate::engine::audio_decode::sample_rate_from_index(sr_idx).unwrap_or(48_000);
+        if state.layout_wait.hold(rate) {
+            crate::engine::aac_config::emit_layout_missing(
+                event_sender,
+                category::CMAF,
+                "CMAF",
+                &config.id,
+                flow_id,
+                state.layout_wait.held_secs(rate),
+            );
+        }
+        return;
+    }
+    state.layout_wait.clear();
+
+    // Passthrough: the track is the source's, from the demuxer-cached
+    // configuration. With `audio_encode` it is the ENCODER's — built below,
+    // after the first frame has settled what the encoder actually emits. A
+    // source whose rate or layout differs from the configured target is
+    // converted on the way in, so a track built from the source declared one
+    // channel count (or rate) while every frame carried another, which a
+    // browser's decoder refuses as a mid-stream change.
     if state.audio_seg.is_none() && state.audio_reencoder.is_none() {
-        let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() else {
+        let Some(source) = demuxer.cached_aac_specific_config() else {
             return;
         };
-        let asc = aac_audio_specific_config(profile, sr_idx, ch_cfg);
-        let sample_rate = codecs::sample_rate_from_index(sr_idx);
-        let track = AudioTrack::aac(asc, sample_rate, ch_cfg as u16, bitrate);
+        let track = AudioTrack::for_aac(&source, bitrate);
+        let (sample_rate, channels) = (track.sample_rate, track.channels);
         state.audio_seg =
                             Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
         state.audio_ready = true;
+        state.passthrough_aac = Some(source);
         tracing::info!(
             "CMAF output '{}': audio track detected AAC sr={} ch={}",
-            config.id, sample_rate, ch_cfg,
+            config.id, sample_rate, channels,
         );
     }
+    note_passthrough_aac_change(state, demuxer, config, event_sender, flow_id);
 
     // Phase 3: audio_encode hook — pump the source AAC frame through
     // the AudioReencoder and substitute the re-encoded frame(s).
@@ -2858,10 +2895,11 @@ fn handle_audio_frame(
         // Reset the silent-fallback drop watchdog — real audio is flowing —
         // and let it measure the picture's lead over the audio.
         reenc.mark_real_audio(pts, video_at);
-        // Propagate the ADTS triplet from the demuxer so lazy decoder
-        // construction inside AudioReencoder can succeed.
-        if let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() {
-            reenc.set_adts_config(profile, sr_idx, ch_cfg);
+        // Propagate the source's configuration from the demuxer so lazy
+        // decoder construction inside AudioReencoder can succeed — a
+        // PCE-signalled source's with its program_config_element.
+        if let Some(source) = demuxer.cached_aac_specific_config() {
+            reenc.set_source_config(source);
         }
         let out = match crate::timed_block_in_place!(
             "cmaf.audio_reencoder",
@@ -2882,13 +2920,13 @@ fn handle_audio_frame(
         };
         // The encoder has now settled its target from the decoder's real
         // output — SBR-doubled rate and PS-widened layout included — and the
-        // track is built from that, so the init describes the frames.
+        // track is built from what its first frame's ADTS header says it
+        // emits, so the init describes the frames.
         if state.audio_seg.is_none()
-            && let Some((profile, sr_idx, ch)) = reenc.encoder_track()
+            && let Some(track_cfg) = reenc.encoder_track()
         {
-            let sample_rate = codecs::sample_rate_from_index(sr_idx);
-            let track =
-                AudioTrack::aac(aac_audio_specific_config(profile, sr_idx, ch), sample_rate, ch as u16, bitrate);
+            let track = AudioTrack::for_aac(&track_cfg, bitrate);
+            let (sample_rate, ch) = (track.sample_rate, track.channels);
             state.audio_seg =
                 Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
             state.audio_ready = true;
@@ -2903,6 +2941,59 @@ fn handle_audio_frame(
     };
 
     buffer_audio_frames(state, config, frames_to_buffer);
+}
+
+/// A passed-through AAC source whose configuration (rate, channels, object
+/// type, layout) has changed since its track was built: Warning
+/// `aac_config_changed`, once per change. The track list is committed at the
+/// first `init.mp4`, the audio sample entry with it, and a new init
+/// generation opens only at a video IDR — audio of the new configuration
+/// buffered before that IDR would still go out under the old init — so the
+/// frames keep going under the init that describes the first configuration,
+/// as they always did, and the operator is told: a restart builds the track
+/// from the new one (and, over a restored window, opens a new generation).
+/// It used to change silently.
+fn note_passthrough_aac_change(
+    state: &mut CmafState,
+    demuxer: &TsDemuxer,
+    config: &CmafOutputConfig,
+    event_sender: &EventSender,
+    flow_id: &str,
+) {
+    let Some(track_cfg) = state.passthrough_aac.as_ref() else {
+        return;
+    };
+    let Some(now) = demuxer.cached_aac_specific_config() else {
+        return;
+    };
+    if &now == track_cfg {
+        state.aac_change_said = None;
+        return;
+    }
+    if state.aac_change_said.as_ref() == Some(&now) {
+        return;
+    }
+    let message = format!(
+        "CMAF output '{}': the source's AAC configuration changed ({} -> {}); the init still \
+         describes the first, so players may not decode the audio until the output is restarted",
+        config.id,
+        track_cfg.describe(),
+        now.describe(),
+    );
+    tracing::warn!(error_code = "aac_config_changed", "{message}");
+    event_sender.emit_output_with_details(
+        EventSeverity::Warning,
+        category::CMAF,
+        message,
+        &config.id,
+        serde_json::json!({
+            "error_code": "aac_config_changed",
+            "from": track_cfg.describe(),
+            "to": now.describe(),
+            "flow_id": flow_id,
+        }),
+    );
+    state.aac_change_said = Some(now);
 }
 
 /// Encrypt `samples` in place and re-build the video segment with

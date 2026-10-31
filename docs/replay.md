@@ -1136,7 +1136,12 @@ recorder restart is refused with `replay_export_spans_restart`, which is
 settled rather than transient; with no `to_pts_90khz` that guard covers the
 whole recording, so a `format: "mp4"` export of a recording that has ever
 restarted is refused this way. Unsupported essence (MPEG-2 video, Opus audio)
-surfaces `replay_export_format_unsupported`. The edge advertises the
+surfaces `replay_export_format_unsupported`, and so does PCE-signalled AAC
+(channel configuration 0, ISDB-T 1seg) when no frame in the range carries
+its program_config_element: the `esds` must carry it, and with it every
+frame of the range decodes, those before it included. Before edge#210 the
+`esds` was two bytes naming channel configuration 0, an MP4 whose audio no
+decoder opened. The edge advertises the
 `replay_export_mp4` capability so the manager UI lights up the ⬇ MP4
 button alongside ⬇ TS.
 

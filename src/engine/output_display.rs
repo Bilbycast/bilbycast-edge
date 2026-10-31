@@ -1721,7 +1721,11 @@ fn aac_decoder_from_adts_config(
     config: (u8, u8, u8),
 ) -> Result<AacDecoder, aac_audio::AacError> {
     let asc = aac_audio::decoder::build_audio_specific_config(config.0, config.1, config.2);
-    AacDecoder::open_raw(&asc)
+    let mut decoder = AacDecoder::open_raw(&asc)?;
+    // Every channel the stream carries, as from E-AC-3 7.1: fdk-aac mixes
+    // 7.1 down to 5.1 by default.
+    decoder.set_max_output_channels(None)?;
+    Ok(decoder)
 }
 
 /// HW-decode lifecycle state for one demux loop run. Tracks the active

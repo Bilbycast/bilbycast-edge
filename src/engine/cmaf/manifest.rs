@@ -380,8 +380,9 @@ pub struct DashVideoRep<'a> {
 }
 
 pub struct DashAudioRep<'a> {
-    /// AudioSpecificConfig — 2 bytes for AAC-LC/HE-AAC.
-    pub asc: &'a [u8; 2],
+    /// AudioSpecificConfig — 2 bytes for AAC-LC/HE-AAC, more with a
+    /// program_config_element.
+    pub asc: &'a [u8],
     pub sample_rate: u32,
     pub channels: u16,
     pub bandwidth_bps: u64,

@@ -462,6 +462,13 @@ pub struct TsDemuxer {
     /// an input switch from AAC → AC-3 still has the AAC config available for
     /// the AAC samples it captured before the switch).
     cached_aac_config: Option<(u8, u8, u8)>,
+    /// The program_config_element the AAC stream last opened a frame with,
+    /// while its header says channel_configuration 0 — the layout a raw-AAC
+    /// writer's AudioSpecificConfig must carry
+    /// ([`Self::cached_aac_specific_config`]). Not every frame carries it
+    /// (ISDB-T 1seg: about one in twelve), so it is kept from frame to frame;
+    /// cleared when the configuration changes.
+    cached_aac_pce: Option<crate::engine::aac_config::ProgramConfig>,
     /// The `channel_config_code` the PMT signals for the selected audio
     /// track when it is Opus (`ts_parse::opus_channel_config_code`), `None`
     /// when that track is not Opus or its PMT entry carries no Opus
@@ -526,6 +533,7 @@ impl TsDemuxer {
             cached_h265_sps: None,
             cached_h265_pps: None,
             cached_aac_config: None,
+            cached_aac_pce: None,
             opus_channel_config: None,
             pmt_version: None,
             pending_discontinuity: false,
@@ -566,6 +574,7 @@ impl TsDemuxer {
             cached_h265_sps: None,
             cached_h265_pps: None,
             cached_aac_config: None,
+            cached_aac_pce: None,
             opus_channel_config: None,
             pmt_version: None,
             pending_discontinuity: false,
@@ -690,6 +699,32 @@ impl TsDemuxer {
     /// Parsed from the first ADTS header encountered.
     pub fn cached_aac_config(&self) -> Option<(u8, u8, u8)> {
         self.cached_aac_config
+    }
+
+    /// `Some(sampling-frequency index)` while the AAC stream signals its
+    /// layout in a program_config_element (channel_configuration 0) and no
+    /// frame has carried one yet — what a writer holding its header back
+    /// measures the wait by; `None` otherwise.
+    pub fn aac_layout_pending(&self) -> Option<u8> {
+        match self.cached_aac_config {
+            Some((_, sr_idx, 0)) if self.cached_aac_pce.is_none() => Some(sr_idx),
+            _ => None,
+        }
+    }
+
+    /// The cached AAC configuration as a raw-AAC writer (FLV, MP4) or a raw
+    /// decoder needs it: the ADTS header's alone, or — for
+    /// channel_configuration 0 — with the program_config_element the stream
+    /// last carried. `None` before any AAC, and for channel_configuration 0
+    /// until a frame has opened with its PCE: a header without it is one no
+    /// decoder opens.
+    pub fn cached_aac_specific_config(&self) -> Option<crate::engine::aac_config::AacConfig> {
+        use crate::engine::aac_config::AacConfig;
+        let (profile, sr_idx, ch_cfg) = self.cached_aac_config?;
+        match &self.cached_aac_pce {
+            Some(pce) if ch_cfg == 0 => Some(AacConfig::with_pce(profile, sr_idx, pce.clone())),
+            _ => AacConfig::new(profile, sr_idx, ch_cfg),
+        }
     }
 
     /// The Opus `channel_config_code` the PMT signals for the selected
@@ -1284,8 +1319,15 @@ impl TsDemuxer {
                         cfg.0 + 1, cfg.1, cfg.2,
                     );
                     self.cached_aac_config = Some(cfg);
+                    self.cached_aac_pce = None;
                 }
-                out.push(DemuxedFrame::Aac { data: d[header_len..].to_vec(), pts });
+                let raw = &d[header_len..];
+                if cfg.2 == 0
+                    && let Some(pce) = crate::engine::aac_config::ProgramConfig::from_raw_data_block(raw)
+                {
+                    self.cached_aac_pce = Some(pce);
+                }
+                out.push(DemuxedFrame::Aac { data: raw.to_vec(), pts });
             } else {
                 if au.pes_start {
                     out.extend(a.take_group());
@@ -2572,6 +2614,40 @@ mod tests {
     /// the first byte of each PES that was not a sync word: the straddling
     /// frame and the whole next PES were lost, on every path that decodes
     /// through this demuxer (display, SDI, CMAF, RTMP, WebRTC, ST 2110-30).
+    /// A PCE-signalled AAC stream (channel_configuration 0, ISDB-T 1seg):
+    /// the configuration a raw-AAC writer needs exists only once a frame has
+    /// opened with its program_config_element — until then the layout is
+    /// pending — and is kept from frame to frame after it, the frames
+    /// without a PCE included; the frames themselves are handed out as they
+    /// came, PCE and all.
+    #[test]
+    fn a_pce_signalled_stream_has_its_configuration_from_its_first_pce() {
+        use crate::engine::ts_test_fixtures::{aac_program_ts, pce_signalled_adts, sine_aac_lc_frames};
+        let adts = pce_signalled_adts(&sine_aac_lc_frames(), 5, 12);
+        let mut demux = TsDemuxer::new(None);
+        let mut seen = Vec::new();
+        for pkt in aac_program_ts(&adts).chunks(TS_PACKET_SIZE) {
+            for f in demux.demux(pkt) {
+                if let DemuxedFrame::Aac { data, .. } = f {
+                    seen.push((data[0] >> 5 == 5, demux.aac_layout_pending(), demux.cached_aac_specific_config()));
+                }
+            }
+        }
+        assert_eq!(seen.len(), 25);
+        assert_eq!(demux.cached_aac_config(), Some((1, 3, 0)));
+        let opens_with_pce: Vec<usize> = (0..seen.len()).filter(|&i| seen[i].0).collect();
+        assert_eq!(opens_with_pce, [5, 17], "the frames keep their PCE");
+        for (i, (_, pending, cfg)) in seen.iter().enumerate().take(5) {
+            assert_eq!((*pending, cfg), (Some(3), &None), "frame {i}: the layout is not known yet");
+        }
+        for (i, (_, pending, cfg)) in seen.iter().enumerate().skip(5) {
+            let cfg = cfg.as_ref().unwrap_or_else(|| panic!("frame {i}: no configuration"));
+            assert_eq!(*pending, None);
+            assert_eq!((cfg.ch_cfg, cfg.channels()), (0, 2), "frame {i}: the PCE's one channel pair");
+            assert_eq!(&cfg.audio_specific_config()[..2], [0x11, 0x80]);
+        }
+    }
+
     #[test]
     fn an_adts_frame_straddling_two_pes_is_demuxed_with_the_rest() {
         const P0: u64 = 900_000;

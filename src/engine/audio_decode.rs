@@ -861,6 +861,8 @@ pub struct AacDecoder {
     sample_rate: u32,
     channels: u8,
     next_ts: u64,
+    /// The configuration it was built from ([`Self::config`]).
+    config: crate::engine::aac_config::AacConfig,
 }
 
 #[cfg(feature = "fdk-aac")]
@@ -875,19 +877,14 @@ impl std::fmt::Debug for AacDecoder {
     }
 }
 
-/// The PCM format an [`AacDecoder`] built from this ADTS config produces
-/// for `frame` (an ADTS-stripped access unit): the header's rate and
-/// channel count describe the AAC core, which is not what HE-AAC decodes
-/// to — SBR doubles the rate (a 48 kHz service carries 24000 in its
-/// header) and PS widens v2's mono core to stereo. `None` when the frame
-/// does not decode (the next one may).
-pub fn aac_decoded_format(
-    profile: u8,
-    sample_rate_index: u8,
-    channel_config: u8,
-    frame: &[u8],
-) -> Option<(u32, u8)> {
-    let mut d = AacDecoder::from_adts_config(profile, sample_rate_index, channel_config).ok()?;
+/// The PCM format an [`AacDecoder`] built from `config` produces for
+/// `frame` (an ADTS-stripped access unit): the header's rate and channel
+/// count describe the AAC core, which is not what HE-AAC decodes to — SBR
+/// doubles the rate (a 48 kHz service carries 24000 in its header) and PS
+/// widens v2's mono core to stereo. `None` when the frame does not decode
+/// (the next one may).
+pub fn aac_decoded_format(config: &crate::engine::aac_config::AacConfig, frame: &[u8]) -> Option<(u32, u8)> {
+    let mut d = AacDecoder::from_config(config).ok()?;
     let planar = d.decode_frame(frame).ok()?;
     if planar.first().is_none_or(|c| c.is_empty()) {
         return None;
@@ -911,44 +908,54 @@ impl AacDecoder {
         sample_rate_index: u8,
         channel_config: u8,
     ) -> Result<Self, AacDecodeError> {
-        let sample_rate = sample_rate_from_index(sample_rate_index)
-            .ok_or(AacDecodeError::UnsupportedSampleRateIndex(sample_rate_index))?;
+        // Channel configuration 0 names its layout in a program_config_element
+        // the header does not carry: `from_config` with the PCE the stream
+        // sent.
+        let config = crate::engine::aac_config::AacConfig::new(profile, sample_rate_index, channel_config)
+            .ok_or(AacDecodeError::UnsupportedChannelConfig(channel_config))?;
+        Self::from_config(&config)
+    }
 
-        if channel_config == 0 || channel_config > 7 {
-            return Err(AacDecodeError::UnsupportedChannelConfig(channel_config));
+    /// Construct an AAC decoder from a stream's whole configuration — for
+    /// channel configuration 0 (ISDB-T 1seg, a PCE-signalled layout) the
+    /// AudioSpecificConfig carries the program_config_element, which fdk-aac
+    /// reads the layout from. The demuxer already stripped the ADTS header,
+    /// so the decoder takes raw access units (TT_MP4_RAW) and the
+    /// configuration explicitly; a PCE a frame carries in band is read too.
+    pub fn from_config(config: &crate::engine::aac_config::AacConfig) -> Result<Self, AacDecodeError> {
+        let sample_rate = config
+            .sample_rate()
+            .ok_or(AacDecodeError::UnsupportedSampleRateIndex(config.sr_idx))?;
+        if config.ch_cfg > 7 {
+            return Err(AacDecodeError::UnsupportedChannelConfig(config.ch_cfg));
         }
 
-        // Build a 2-byte AudioSpecificConfig from the ADTS fields.
-        // The demuxer already stripped the ADTS header, so we use TT_MP4_RAW
-        // transport and provide the ASC explicitly.
-        let asc = aac_audio::decoder::build_audio_specific_config(
-            profile,
-            sample_rate_index,
-            channel_config,
-        );
-
-        let inner = aac_audio::AacDecoder::open_raw(&asc)
+        let mut inner = aac_audio::AacDecoder::open_raw(&config.audio_specific_config())
             .map_err(AacDecodeError::FdkAac)?;
+        // fdk-aac mixes anything wider than six channels down to 5.1 unless
+        // told otherwise, so a 7.1 stream decoded as six channels while
+        // `channels()` said eight until the first frame. Every channel the
+        // stream carries is handed out; the re-encoding outputs' channel
+        // stage converts to what they carry, as for E-AC-3 7.1.
+        inner.set_max_output_channels(None).map_err(AacDecodeError::FdkAac)?;
 
-        // Channel count from channel_config — fdk-aac will confirm after
-        // first decode, but we need it for pre-decode callers.
-        let channels = match channel_config {
-            1 => 1,
-            2 => 2,
-            3 => 3,
-            4 => 4,
-            5 => 5,
-            6 => 6,
-            7 => 8, // 7.1
-            _ => return Err(AacDecodeError::UnsupportedChannelConfig(channel_config)),
-        };
-
+        // Channel count from the configuration (7 is 7.1; a PCE's its
+        // elements') — fdk-aac confirms it after the first decode (an
+        // HE-AAC v2 decoder widens a mono core to stereo), but pre-decode
+        // callers need it.
         Ok(Self {
             inner,
             sample_rate,
-            channels,
+            channels: config.channels(),
             next_ts: 0,
+            config: config.clone(),
         })
+    }
+
+    /// The configuration this decoder was built from: a source whose
+    /// configuration has changed since needs a decoder of its own.
+    pub fn config(&self) -> &crate::engine::aac_config::AacConfig {
+        &self.config
     }
 
     /// Sample rate of the decoded PCM, in Hz.
@@ -1026,6 +1033,8 @@ pub struct AacDecoder {
     sample_rate: u32,
     channels: u8,
     next_ts: u64,
+    /// The configuration it was built from ([`Self::config`]).
+    config: crate::engine::aac_config::AacConfig,
 }
 
 #[cfg(not(feature = "fdk-aac"))]
@@ -1087,7 +1096,21 @@ impl AacDecoder {
             sample_rate,
             channels,
             next_ts: 0,
+            config: crate::engine::aac_config::AacConfig::new(profile, sample_rate_index, channel_config)
+                .ok_or(AacDecodeError::UnsupportedChannelConfig(channel_config))?,
         })
+    }
+
+    /// The configuration this decoder was built from.
+    pub fn config(&self) -> &crate::engine::aac_config::AacConfig {
+        &self.config
+    }
+
+    /// [`Self::from_adts_config`] for a whole configuration. Symphonia
+    /// reads no program_config_element, so channel configuration 0 is
+    /// refused as before.
+    pub fn from_config(config: &crate::engine::aac_config::AacConfig) -> Result<Self, AacDecodeError> {
+        Self::from_adts_config(config.profile, config.sr_idx, config.ch_cfg)
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -1491,6 +1514,84 @@ mod tests {
     /// built with `volume=0.5` on top of that and came out 18 dB down, which
     /// read as a decoder fault until ffmpeg agreed with us to 4 decimal places.
     /// The correct chain is `sine=...,volume=4.0` for a 0.5 peak.
+    /// A PCE-signalled stream (channel configuration 0, ISDB-T 1seg) decodes
+    /// from its whole configuration, the program_config_element in the
+    /// AudioSpecificConfig — every frame, those that carry no PCE of their own
+    /// (frames 0-4 and 6-16 here) as well as those that do. From the ADTS
+    /// fields alone it is refused, as before: they do not name the layout.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn a_pce_signalled_stream_decodes_from_its_whole_configuration() {
+        use crate::engine::ts_test_fixtures::{pce_signalled_adts, sine_aac_lc_frames};
+        let adts = pce_signalled_adts(&sine_aac_lc_frames(), 5, 12);
+        let mut raw = Vec::new();
+        let mut off = 0;
+        while off + 7 <= adts.len() {
+            let len = (usize::from(adts[off + 3] & 0x03) << 11) | (usize::from(adts[off + 4]) << 3) | (usize::from(adts[off + 5]) >> 5);
+            raw.push(&adts[off + 7..off + len]);
+            off += len;
+        }
+        assert!(matches!(AacDecoder::from_adts_config(1, 3, 0), Err(AacDecodeError::UnsupportedChannelConfig(0))));
+        let cfg = crate::engine::aac_config::AacConfig::from_adts(1, 3, 0, raw[5]).expect("frame 5 opens with the PCE");
+        let mut dec = AacDecoder::from_config(&cfg).expect("a decoder from the configuration with the PCE");
+        assert_eq!(dec.channels(), 2);
+        for (i, frame) in raw.iter().enumerate() {
+            let pcm = dec.decode_frame(frame).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert_eq!((pcm.len(), pcm[0].len(), dec.sample_rate()), (2, 1024, 48_000), "frame {i}");
+        }
+    }
+
+    /// A 7.1 AAC stream decodes as eight channels, and `channels()` says so
+    /// before the first frame and after it. fdk-aac mixes anything wider than
+    /// six channels down to 5.1 by default, so it decoded as six while
+    /// `channels()` said eight until the first frame.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn a_7_1_stream_decodes_to_eight_channels() {
+        let mut enc = crate::engine::audio_encode::AudioEncoder::spawn(
+            crate::engine::audio_encode::EncoderParams {
+                codec: crate::engine::audio_encode::AudioCodec::AacLc,
+                sample_rate: 48_000,
+                channels: 8,
+                target_bitrate_kbps: 448,
+                target_sample_rate: 48_000,
+                target_channels: 8,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            "f".into(),
+            "o".into(),
+            std::sync::Arc::new(crate::stats::collector::OutputStatsAccumulator::new("o".into(), "o".into(), "ts".into())),
+            None,
+        )
+        .expect("an 8-channel encoder");
+        for k in 0..12u64 {
+            enc.submit_planar(&vec![vec![0.1f32; 1024]; 8], k * 1_920);
+        }
+        let adts: Vec<u8> = enc.drain().into_iter().flat_map(|f| f.data.to_vec()).collect();
+        let mut demux = crate::engine::ts_demux::TsDemuxer::new(None);
+        let raw: Vec<Vec<u8>> = demux
+            .demux(&crate::engine::ts_test_fixtures::aac_program_ts(&adts))
+            .into_iter()
+            .filter_map(|f| match f {
+                crate::engine::ts_demux::DemuxedFrame::Aac { data, .. } => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert!(raw.len() >= 8, "{} frames", raw.len());
+        let cfg = demux.cached_aac_specific_config().expect("the 7.1 PCE");
+        let mut dec = AacDecoder::from_config(&cfg).expect("a decoder");
+        assert_eq!(dec.channels(), 8, "before the first frame");
+        for (i, frame) in raw.iter().enumerate() {
+            let pcm = dec.decode_frame(frame).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert_eq!(pcm.len(), 8, "frame {i}");
+        }
+        assert_eq!(dec.channels(), 8, "after it");
+    }
+
     #[test]
     fn decodes_real_aac_lc_sine_to_expected_rms() {
         const FIXTURE: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
@@ -1570,7 +1671,9 @@ mod tests {
     #[cfg(feature = "fdk-aac")]
     #[test]
     fn rejects_invalid_channel_config_fdk() {
-        // channel_config=0 (program_config_element, unsupported in this API)
+        // channel_config=0 names its layout in a program_config_element the
+        // ADTS fields do not carry: `from_config` takes the configuration
+        // with it.
         let err = AacDecoder::from_adts_config(1, 3, 0).unwrap_err();
         assert!(matches!(err, AacDecodeError::UnsupportedChannelConfig(0)));
     }

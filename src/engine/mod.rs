@@ -276,17 +276,25 @@ pub mod webrtc;
 /// `rtp_audio`, and SMPTE 302M-over-SRT/UDP/RTP outputs.
 pub mod audio_transcode;
 
-/// In-process AAC-LC decoder. Bridges compressed contribution audio (AAC in
+/// In-process AAC decoder. Bridges compressed contribution audio (AAC in
 /// MPEG-TS via RTMP/RTSP/SRT/UDP inputs) into the PCM pipeline so it can land
 /// into the existing PCM-only outputs (ST 2110-30/-31, `rtp_audio`,
-/// SMPTE 302M). Pure Rust via `symphonia-codec-aac`. AAC-LC mono/stereo only;
-/// HE-AAC and multichannel AAC are rejected with a clear error.
+/// SMPTE 302M) and the re-encoders. Fraunhofer FDK AAC with the default
+/// `fdk-aac` feature: AAC-LC, HE-AAC v1/v2, every channel up to 7.1, a
+/// PCE-signalled layout from its full AudioSpecificConfig. Without it, pure
+/// Rust via `symphonia-codec-aac`: AAC-LC mono/stereo only, the rest
+/// refused with a clear error.
 pub mod audio_decode;
 
 /// Audio access-unit framing (ADTS / LOAS / MPEG audio / AC-3 / E-AC-3
 /// headers) and the continuous-ES cutter the TS audio replacer decodes from:
 /// whole AUs as soon as they are complete, across PES boundaries.
 pub mod audio_au;
+
+/// The AudioSpecificConfig FLV and MP4 need for an AAC stream that arrived
+/// in ADTS, the program_config_element of a channel_configuration-0 stream
+/// included, and the PCE the encoder's 7.1 frames need.
+pub mod aac_config;
 
 /// Lock-free counters for the video-decode stage. Shared between
 /// [`ts_video_replace::TsVideoReplacer`] (paired with `VideoEncodeStats` for

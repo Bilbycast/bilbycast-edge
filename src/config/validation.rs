@@ -5335,6 +5335,41 @@ fn validate_video_encode(
 /// Validate an `audio_encode` block. Each output type passes its allowed
 /// codec set so we can reject invalid combinations (e.g. Opus on RTMP)
 /// at config load time rather than at output start time.
+/// Why an AAC encoder of `codec` cannot open at `channels`, or `None` when it
+/// can (or `codec` is not AAC). fdk-aac has a channel mode for 1-6 and 8
+/// channels (`aac_codec::ChannelMode::from_channels`), none for 7 (6.1) or
+/// past eight, and HE-AAC v2's parametric stereo takes stereo alone. Such a
+/// count used to pass validation and leave the output with no audio and a
+/// Critical `audio_encode` event at its first frame.
+fn aac_layout_refusal(codec: &str, channels: u8) -> Option<String> {
+    match codec {
+        "aac_lc" | "he_aac_v1" if !matches!(channels, 1..=6 | 8) => Some(format!(
+            "{channels} has no {codec} encoder mode: AAC encodes 1-6 (mono to 5.1) or 8 (7.1) channels{}",
+            if channels == 7 { "; use 6 or 8" } else { "" }
+        )),
+        "he_aac_v2" if channels != 2 => Some(format!(
+            "{channels} has no he_aac_v2 encoder mode: parametric stereo encodes 2 channels"
+        )),
+        _ => None,
+    }
+}
+
+/// The `transcode` block's `channels`, which the AAC encoder `enc` names
+/// opens at (the block wins over `audio_encode.channels`), refused when the
+/// encoder has no mode for it ([`aac_layout_refusal`]).
+fn validate_transcode_aac_layout(
+    enc: Option<&crate::config::models::AudioEncodeConfig>,
+    tj: &crate::engine::audio_transcode::TranscodeJson,
+    context: &str,
+) -> Result<()> {
+    if let (Some(enc), Some(ch)) = (enc, tj.channels)
+        && let Some(why) = aac_layout_refusal(&enc.codec, ch)
+    {
+        bail!("{context}.channels {why}");
+    }
+    Ok(())
+}
+
 fn validate_audio_encode(
     enc: &crate::config::models::AudioEncodeConfig,
     allowed_codecs: &[&str],
@@ -5415,6 +5450,9 @@ fn validate_audio_encode(
                 "{context}: audio_encode.channels must be 1-{max_ch} for {}, got {}",
                 enc.codec, ch
             );
+        }
+        if let Some(why) = aac_layout_refusal(&enc.codec, ch) {
+            bail!("{context}: audio_encode.channels {why}");
         }
         // HE-AAC v2 (Parametric Stereo) requires stereo input — libfdk_aac
         // hard-rejects mono. Catch this at config-load so the operator
@@ -5518,6 +5556,7 @@ fn validate_input_transcode_group_a(
     }
     if let Some(tj) = transcode {
         validate_transcode_block_deferred(tj, &format!("{label} transcode"))?;
+        validate_transcode_aac_layout(audio_encode, tj, &format!("{label} transcode"))?;
     }
     Ok(())
 }
@@ -6026,6 +6065,11 @@ pub fn validate_output_with_input(
                     tj,
                     &format!("RTP output '{}' transcode", rtp.id),
                 )?;
+                validate_transcode_aac_layout(
+                    rtp.audio_encode.as_ref(),
+                    tj,
+                    &format!("RTP output '{}' transcode", rtp.id),
+                )?;
             }
             if let Some(ref enc) = rtp.video_encode {
                 if rtp.redundancy.is_some() {
@@ -6106,6 +6150,11 @@ pub fn validate_output_with_input(
                     );
                 }
                 validate_transcode_block_deferred(
+                    tj,
+                    &format!("UDP output '{}' transcode", udp.id),
+                )?;
+                validate_transcode_aac_layout(
+                    udp.audio_encode.as_ref(),
                     tj,
                     &format!("UDP output '{}' transcode", udp.id),
                 )?;
@@ -6266,6 +6315,11 @@ pub fn validate_output_with_input(
                     tj,
                     &format!("SRT output '{}' transcode", srt.id),
                 )?;
+                validate_transcode_aac_layout(
+                    srt.audio_encode.as_ref(),
+                    tj,
+                    &format!("SRT output '{}' transcode", srt.id),
+                )?;
             }
             if let Some(ref enc) = srt.video_encode {
                 if srt.transport_mode.as_deref() == Some("audio_302m") {
@@ -6335,6 +6389,11 @@ pub fn validate_output_with_input(
                     );
                 }
                 validate_transcode_block_deferred(
+                    tj,
+                    &format!("RTMP output '{}' transcode", rtmp.id),
+                )?;
+                validate_transcode_aac_layout(
+                    rtmp.audio_encode.as_ref(),
                     tj,
                     &format!("RTMP output '{}' transcode", rtmp.id),
                 )?;
@@ -6422,6 +6481,11 @@ pub fn validate_output_with_input(
                     );
                 }
                 validate_transcode_block_deferred(
+                    tj,
+                    &format!("HLS output '{}' transcode", hls.id),
+                )?;
+                validate_transcode_aac_layout(
+                    hls.audio_encode.as_ref(),
                     tj,
                     &format!("HLS output '{}' transcode", hls.id),
                 )?;
@@ -6704,6 +6768,11 @@ pub fn validate_output_with_input(
                     );
                 }
                 validate_transcode_block_deferred(
+                    tj,
+                    &format!("CMAF output '{}' transcode", cmaf.id),
+                )?;
+                validate_transcode_aac_layout(
+                    cmaf.audio_encode.as_ref(),
                     tj,
                     &format!("CMAF output '{}' transcode", cmaf.id),
                 )?;
@@ -8165,6 +8234,7 @@ fn validate_rist_output(rist: &RistOutputConfig) -> Result<()> {
             tj,
             &format!("RIST output '{}' transcode", rist.id),
         )?;
+        validate_transcode_aac_layout(rist.audio_encode.as_ref(), tj, &format!("RIST output '{}' transcode", rist.id))?;
     }
     if let Some(ref enc) = rist.video_encode {
         if rist.redundancy.is_some() {
@@ -12916,6 +12986,43 @@ mod tests {
         // None (unset) accepted.
         enc.source_audio_pid = None;
         assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok());
+    }
+
+    /// A channel count no AAC encoder mode exists for is refused, from
+    /// `audio_encode.channels` and from a `transcode` block's (which the
+    /// encoder opens at). Both used to pass and leave the output with no
+    /// audio and a Critical event at its first frame.
+    #[test]
+    fn an_aac_layout_the_encoder_has_no_mode_for_is_refused() {
+        let mut enc: AudioEncodeConfig = serde_json::from_value(serde_json::json!({ "codec": "aac_lc", "channels": 7 })).unwrap();
+        let err = validate_audio_encode(&enc, &["aac_lc"], "test").unwrap_err().to_string();
+        assert!(err.contains("channels 7 has no aac_lc encoder mode") && err.contains("use 6 or 8"), "{err}");
+        for ch in [1u8, 2, 6, 8] {
+            enc.channels = Some(ch);
+            assert!(validate_audio_encode(&enc, &["aac_lc"], "test").is_ok(), "{ch} channels");
+        }
+        let tj = |ch: u8| -> crate::engine::audio_transcode::TranscodeJson {
+            serde_json::from_value(serde_json::json!({ "channels": ch })).unwrap()
+        };
+        enc.channels = None;
+        let err = validate_transcode_aac_layout(Some(&enc), &tj(7), "RTMP output 'o' transcode").unwrap_err().to_string();
+        assert!(err.starts_with("RTMP output 'o' transcode.channels 7 has no aac_lc encoder mode"), "{err}");
+        assert!(validate_transcode_aac_layout(Some(&enc), &tj(12), "t").is_err());
+        assert!(validate_transcode_aac_layout(Some(&enc), &tj(8), "t").is_ok());
+        enc.codec = "he_aac_v2".into();
+        assert!(validate_transcode_aac_layout(Some(&enc), &tj(6), "t").is_err());
+        assert!(validate_transcode_aac_layout(Some(&enc), &tj(2), "t").is_ok());
+        enc.codec = "opus".into();
+        assert!(validate_transcode_aac_layout(Some(&enc), &tj(7), "t").is_ok(), "not an AAC encoder");
+        assert!(validate_transcode_aac_layout(None, &tj(7), "t").is_ok());
+        // Through the whole output.
+        let output: crate::config::models::OutputConfig = serde_json::from_value(serde_json::json!({
+            "type": "rtmp", "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc" }, "transcode": { "channels": 7 }
+        }))
+        .unwrap();
+        let err = validate_output(&output).unwrap_err().to_string();
+        assert!(err.contains("transcode.channels 7 has no aac_lc encoder mode"), "{err}");
     }
 
     #[test]

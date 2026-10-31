@@ -1955,7 +1955,11 @@ impl TsAudioReplacer {
         #[cfg(feature = "fdk-aac")]
         if self.source_stream_type == 0x0F {
             if self.aac_decoder.is_none() {
-                self.aac_decoder = Some(aac_audio::AacDecoder::open_adts().map_err(|_| ())?);
+                let mut d = aac_audio::AacDecoder::open_adts().map_err(|_| ())?;
+                // Every channel the stream carries: fdk-aac mixes 7.1 down
+                // to 5.1 by default.
+                d.set_max_output_channels(None).map_err(|_| ())?;
+                self.aac_decoder = Some(d);
             }
             let decoder = self.aac_decoder.as_mut().expect("opened above");
             let d = decoder.decode_frame(au).map_err(|_| ())?;

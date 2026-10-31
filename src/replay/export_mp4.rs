@@ -62,8 +62,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::engine::cmaf::codecs::{
-    Ac3FrameInfo, Mp2FrameInfo, aac_audio_specific_config, build_dac3_payload, build_dec3_payload,
-    parse_ac3_syncframe, parse_eac3_syncframe, parse_mp2_frame, sample_rate_from_index,
+    Ac3FrameInfo, Mp2FrameInfo, build_dac3_payload, build_dec3_payload, parse_ac3_syncframe,
+    parse_eac3_syncframe, parse_mp2_frame,
 };
 use crate::engine::cmaf::fmp4::{
     AudioCodec, AudioTrack, Sample, VideoCodec as CmafVideoCodec, VideoTrack,
@@ -440,12 +440,24 @@ fn build_mp4_from_ts(ts: &[u8]) -> Result<Vec<u8>> {
     // already-split frames; AC-3 / E-AC-3 / MP2 split each PES blob on
     // the codec's sync word and assign per-frame PTS from frame size.
     let (audio_track, audio_samples_built, audio_pts) = if !aac_pts.is_empty() {
-        let (profile, sr_idx, ch_cfg) = demux
-            .cached_aac_config()
+        // A PCE-signalled source (channel_configuration 0, ISDB-T 1seg)
+        // needs the program_config_element in the track's configuration;
+        // the demuxer keeps the one the window's frames last carried, and
+        // with it every frame of the window decodes, those before it
+        // included. A window none of whose frames carries one has no
+        // layout to write: refused, as an MP4 no decoder opens would be
+        // worse (the TS export carries it as it came). It used to be
+        // written with the two-byte configuration regardless.
+        if demux.aac_layout_pending().is_some() {
+            bail!(
+                "replay_export_format_unsupported: the AAC signals its channel layout in a \
+                 program_config_element and no frame in the window carries one"
+            );
+        }
+        let source = demux
+            .cached_aac_specific_config()
             .ok_or_else(|| anyhow!("replay_export_failed: missing AAC config"))?;
-        let asc = aac_audio_specific_config(profile, sr_idx, ch_cfg);
-        let sample_rate = sample_rate_from_index(sr_idx);
-        let track = AudioTrack::aac(asc, sample_rate, ch_cfg.max(1) as u16, 128_000);
+        let track = AudioTrack::for_aac(&source, 128_000);
         // AAC frame duration is always 1024 samples (LC) at the
         // configured sample rate, expressed in the audio track's
         // own timescale (== sample_rate).
