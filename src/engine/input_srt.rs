@@ -979,6 +979,10 @@ async fn srt_input_redundant_loop(
     let (mut dead1, mut dead2) = (false, false);
 
     let mut pair = RedundantPair::new(PairMerger::new(&config, redundancy));
+    // A buffered merger's stats, on the flow's stats as this input's for as
+    // long as the loop runs. The pair keeps its merger across both legs
+    // being lost, so they carry on with it.
+    let _buffered_stats = pair.merger.publish_stats(&stats, input_id);
 
     let outcome = loop {
         // When a buffered merger next has a packet to release; never for an
@@ -1208,6 +1212,23 @@ impl PairMerger {
         match self {
             Self::Bare(_) => None,
             Self::Buffered(merger) => merger.next_deadline(),
+        }
+    }
+
+    /// Publish a buffered merger's stats on the flow's as `input_id`'s,
+    /// until what this returns drops; the bare merger has none.
+    fn publish_stats(
+        &self,
+        flow: &Arc<FlowStatsAccumulator>,
+        input_id: &str,
+    ) -> Option<crate::stats::collector::BufferedHitlessPublication> {
+        match self {
+            Self::Bare(_) => None,
+            Self::Buffered(merger) => Some(crate::stats::collector::BufferedHitlessPublication::new(
+                flow,
+                input_id,
+                merger.stats_handle(),
+            )),
         }
     }
 }
@@ -1735,9 +1756,10 @@ fn publish_redundant_packet(
     crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
 }
 
-/// Release what a buffered pair merger holds past its release time, and
-/// refresh the flow's `buffered_hitless` snapshot from it, as the RTP input
-/// does on its drain. Nothing for an unbuffered merger, which holds nothing.
+/// Release what a buffered pair merger holds past its release time. Nothing
+/// for an unbuffered merger, which holds nothing. The flow's stats read the
+/// merger's counters where it writes them ([`PairMerger::publish_stats`]), so
+/// a drain takes no lock to refresh a copy.
 fn drain_redundant_pair(
     pair: &mut RedundantPair,
     stats: &FlowStatsAccumulator,
@@ -1750,9 +1772,6 @@ fn drain_redundant_pair(
     };
     for (leg, packet) in merger.drain_expired(std::time::Instant::now()) {
         publish_redundant_packet(packet, leg, &mut pair.prev_active_leg, stats, publisher, transcoder, post);
-    }
-    if let Ok(mut snapshot) = stats.buffered_hitless_snapshot.write() {
-        *snapshot = Some(merger.snapshot());
     }
 }
 
@@ -2837,6 +2856,8 @@ mod tests {
         pair: RedundantPair,
         transcoder: Option<InputTranscoder>,
         post: Option<InputPostProcess>,
+        /// The buffered merger's stats on the flow, as the loop holds them.
+        _published: Option<crate::stats::collector::BufferedHitlessPublication>,
     }
 
     impl PairBench {
@@ -2863,7 +2884,17 @@ mod tests {
                 flow.clone(),
             );
             let merger = PairMerger::new(&config, config.redundancy.as_ref().unwrap());
-            Self { flow, srt, publisher, rx, pair: RedundantPair::new(merger), transcoder: None, post: None }
+            let _published = merger.publish_stats(&flow, "pair");
+            Self {
+                flow,
+                srt,
+                publisher,
+                rx,
+                pair: RedundantPair::new(merger),
+                transcoder: None,
+                post: None,
+                _published,
+            }
         }
 
         /// Leg `leg`'s recv delivered RTP seq `seq`.
@@ -2975,6 +3006,25 @@ mod tests {
         let at = |seq: u16| forwarded.iter().position(|&s| s == seq).unwrap();
         assert!(at(100) < at(96) && at(161) < at(157), "interleaved: {forwarded:?}");
         assert!(bench.flow.snapshot().input.buffered_hitless.is_none());
+    }
+
+    /// A buffered pair's stats are its own input's: a passive pair's merger
+    /// shows nothing under the flow's active input (a UDP one, say), and
+    /// what the pair counted shows once it is active, with no drain having
+    /// run. They go when the pair's loop does.
+    #[test]
+    fn a_passive_buffered_pairs_stats_stay_its_own() {
+        let mut bench = PairBench::new(serde_json::json!({ "path_differential_ms": 200 }));
+        bench.flow.set_active_input_id("udp");
+        for seq in 0..10u16 {
+            bench.deliver(ActiveLeg::Leg1, seq);
+        }
+        assert!(bench.flow.snapshot().input.buffered_hitless.is_none(), "not under the UDP input");
+        bench.flow.set_active_input_id("pair");
+        let held = bench.flow.snapshot().input.buffered_hitless.expect("its own, once active");
+        assert_eq!((held.leg1_packets_received, held.current_buffer_depth), (10, 10));
+        bench._published = None;
+        assert!(bench.flow.snapshot().input.buffered_hitless.is_none(), "gone with the loop");
     }
 
     /// Both legs lost with packets held: the Critical, a fresh format

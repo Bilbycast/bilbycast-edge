@@ -4405,7 +4405,10 @@ pub struct SrtRedundancyConfig {
     /// and releases in seq order, so a leg that runs ahead of the other with
     /// a hole — one just re-attached, whose first retransmissions miss their
     /// deadline, or a leading leg returning — no longer puts the other leg's
-    /// fills out after newer packets. `None` keeps the unbuffered merger.
+    /// fills out after newer packets, while that leg's lead stays inside the
+    /// hold and the merger's 1024-seq window
+    /// ([`crate::redundancy::merger::REORDER_WINDOW`]); a longer lead still
+    /// leaves a gap. `None` keeps the unbuffered merger.
     /// Range: 5..=2000 ms. Inputs only: an SRT output has no merger, so
     /// validation refuses it there; a raw-TS payload has no sequence number
     /// to hold on, so the pair's failover Warning says it does not apply.

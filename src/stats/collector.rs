@@ -4203,6 +4203,38 @@ impl SrtInputStats {
     }
 }
 
+/// An input's buffered 2022-7 merger stats, published on its flow's stats
+/// under the input's id while this is held, and withdrawn when it drops: a
+/// receive loop holds it for as long as it runs, so an input stopped,
+/// removed or swapped in place for one without the merger takes its card
+/// with it. A successor published under the same id first keeps its own.
+pub struct BufferedHitlessPublication {
+    flow: Arc<FlowStatsAccumulator>,
+    input_id: String,
+    stats: Arc<crate::redundancy::merger::BufferedHitlessStats>,
+}
+
+impl BufferedHitlessPublication {
+    /// Publish `stats` as `input_id`'s on `flow`.
+    pub fn new(
+        flow: &Arc<FlowStatsAccumulator>,
+        input_id: &str,
+        stats: Arc<crate::redundancy::merger::BufferedHitlessStats>,
+    ) -> Self {
+        flow.buffered_hitless_stats
+            .insert(input_id.to_string(), stats.clone());
+        Self { flow: flow.clone(), input_id: input_id.to_string(), stats }
+    }
+}
+
+impl Drop for BufferedHitlessPublication {
+    fn drop(&mut self) {
+        self.flow
+            .buffered_hitless_stats
+            .remove_if(&self.input_id, |_, published| Arc::ptr_eq(published, &self.stats));
+    }
+}
+
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
 ///
 /// Holds input-side counters (`input_packets`, `input_bytes`, `input_loss`,
@@ -4236,12 +4268,16 @@ pub struct FlowStatsAccumulator {
     /// UI's flow card can show "12 source discontinuities since
     /// start" alongside the recent-events panel.
     pub source_discontinuities: AtomicU64,
-    /// Latest snapshot of the buffered SMPTE 2022-7 merger, when the
-    /// input runs in industry-standard buffered mode. The redundant
-    /// RTP listener publishes to this from the data-path task at the
-    /// natural drain cadence; the snapshot path just clones it.
-    pub buffered_hitless_snapshot:
-        std::sync::RwLock<Option<crate::stats::models::BufferedHitlessSnapshot>>,
+    /// The stats of each input's buffered SMPTE 2022-7 merger, keyed by
+    /// `input_id`: an RTP or SRT 2022-7 input with `path_differential_ms`
+    /// publishes its merger's for as long as its receive loop runs
+    /// ([`BufferedHitlessPublication`]). The snapshot reads the **active**
+    /// input's through an `active_key` lookup, as it does
+    /// `ingress_dejitter_stats`: one flow-wide slot showed a passive input's
+    /// merger under whichever input was active, and kept a removed input's
+    /// last values for the life of the flow.
+    pub buffered_hitless_stats:
+        DashMap<String, Arc<crate::redundancy::merger::BufferedHitlessStats>>,
     /// Ingress de-jitter telemetry, keyed by `input_id` (one entry per
     /// de-jittered raw UDP / RTP input). The snapshot surfaces the **active**
     /// input's `shed` + `depth` on its `InputStats` via an `active_key`
@@ -4509,7 +4545,7 @@ impl FlowStatsAccumulator {
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
             source_discontinuities: AtomicU64::new(0),
-            buffered_hitless_snapshot: std::sync::RwLock::new(None),
+            buffered_hitless_stats: DashMap::new(),
             ingress_dejitter_stats: DashMap::new(),
             sdi_capture_stats: DashMap::new(),
             media_player_stats: DashMap::new(),
@@ -5624,10 +5660,9 @@ impl FlowStatsAccumulator {
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
                     source_discontinuities: self.source_discontinuities.load(Ordering::Relaxed),
                     buffered_hitless: self
-                        .buffered_hitless_snapshot
-                        .read()
-                        .ok()
-                        .and_then(|g| g.clone()),
+                        .buffered_hitless_stats
+                        .get(active_key)
+                        .map(|h| h.snapshot()),
                     ingress_dejitter_shed: self
                         .ingress_dejitter_stats
                         .get(active_key)
@@ -7115,6 +7150,53 @@ mod input_audio_replacer_stats_tests {
         flow.remove_av_skew_reporter("in-1");
         let e = flow.snapshot().input.audio_encode_stats.expect("the encode handle stays");
         assert_eq!(e.timeline_corrections, 0);
+    }
+}
+
+#[cfg(test)]
+mod buffered_hitless_publication_tests {
+    use super::*;
+    use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger};
+    use std::time::Duration;
+
+    fn merger(hold_ms: u64) -> BufferedHitlessMerger<u16> {
+        BufferedHitlessMerger::new(Duration::from_millis(hold_ms))
+    }
+
+    /// A buffered merger's stats show on the input snapshot only while its
+    /// input is the active one, read live from what the merger writes, and
+    /// go when its receive loop lets them go. A passive 2022-7 input's
+    /// merger used to show under whichever input was active, and a removed
+    /// one's last values stayed for the life of the flow.
+    #[test]
+    fn the_snapshot_shows_the_active_inputs_merger_while_it_runs() {
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+        let mut held = merger(200);
+        let published = BufferedHitlessPublication::new(&flow, "pair", held.stats_handle());
+
+        flow.set_active_input_id("udp");
+        assert!(flow.snapshot().input.buffered_hitless.is_none(), "not the active input's");
+
+        flow.set_active_input_id("pair");
+        let _ = held.ingest(7, ActiveLeg::Leg1, 7, std::time::Instant::now());
+        let snap = flow.snapshot().input.buffered_hitless.expect("the active input's merger");
+        assert_eq!((snap.max_path_diff_ms, snap.leg1_packets_received), (200, 1));
+
+        drop(published);
+        assert!(flow.snapshot().input.buffered_hitless.is_none(), "gone with its loop");
+    }
+
+    /// An input swapped in place publishes before the old loop has wound
+    /// down: the old loop letting go leaves the successor's stats in place.
+    #[test]
+    fn a_predecessor_letting_go_keeps_its_successors_stats() {
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "rtp".into()));
+        flow.set_active_input_id("in-1");
+        let old = BufferedHitlessPublication::new(&flow, "in-1", merger(100).stats_handle());
+        let _new = BufferedHitlessPublication::new(&flow, "in-1", merger(300).stats_handle());
+        drop(old);
+        let snap = flow.snapshot().input.buffered_hitless.expect("the successor's");
+        assert_eq!(snap.max_path_diff_ms, 300);
     }
 }
 

@@ -38,7 +38,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   - FEC (Forward Error Correction) via `packet_filter` — XOR-based row/column parity, staircase layout, ARQ integration modes (`always`/`onreq`/`never`), wire-compatible with libsrt v1.5.5
   - Configurable latency buffer (symmetric or asymmetric receiver/sender latency)
   - Retransmission bandwidth capping (Token Bucket shaper via `max_rexmit_bw`)
-  - SMPTE 2022-7 hitless redundancy merge (dual-leg input), each leg re-acquired on its own; optional `redundancy.path_differential_ms` holds each packet and releases in sequence order, as on the RTP input, so a leg running ahead with a hole is merged in order
+  - SMPTE 2022-7 hitless redundancy merge (dual-leg input), each leg re-acquired on its own; optional `redundancy.path_differential_ms` holds each packet and releases in sequence order, as on the RTP input, so a leg running ahead with a hole is merged in order while its lead stays within the hold and under 1024 packets
   - Automatic reconnection
   - **`transport_mode: "audio_302m"`** (deferred — see [audio-gateway.md](audio-gateway.md#limitations-and-deferred-items)): demux SMPTE 302M LPCM-in-MPEG-TS from `ffmpeg -c:a s302m`, `srt-live-transmit`, or hardware encoders, and republish as RTP audio packets onto the broadcast channel
 

@@ -1680,6 +1680,7 @@ mod tests {
 //     task forwards to the manager.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1732,8 +1733,10 @@ pub struct BufferedHitlessMerger<T: Clone, D = HitlessMerger> {
     /// Per-leg arrival tracking for SSRC validation, drift detection,
     /// and operator-facing health.
     leg_state: [LegState; 2],
-    /// Aggregate stats (lock-free).
-    pub stats: BufferedHitlessStats,
+    /// Aggregate stats (lock-free), shared with the flow's stats so its
+    /// snapshot reads them where the merger writes them
+    /// ([`Self::stats_handle`]).
+    pub stats: Arc<BufferedHitlessStats>,
     /// The origin of the microsecond clock handed to the dedup.
     epoch: Instant,
     /// What the last call released, reused from call to call.
@@ -1776,6 +1779,9 @@ pub enum LegHealth {
 /// `AtomicU64` so the snapshot path never blocks the data path.
 #[derive(Debug, Default)]
 pub struct BufferedHitlessStats {
+    /// The merger's hold ([`BufferedHitlessMerger::max_path_diff`]), fixed
+    /// when it is built.
+    pub max_path_diff_ms: u32,
     pub packets_emitted: AtomicU64,
     pub packets_emitted_leg1: AtomicU64,
     pub packets_emitted_leg2: AtomicU64,
@@ -1977,7 +1983,10 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
             max_path_diff: bounded,
             max_buffer_packets,
             leg_state: [LegState::default(), LegState::default()],
-            stats: BufferedHitlessStats::default(),
+            stats: Arc::new(BufferedHitlessStats {
+                max_path_diff_ms: u32::try_from(bounded.as_millis()).unwrap_or(u32::MAX),
+                ..BufferedHitlessStats::default()
+            }),
             epoch: Instant::now(),
             out: Vec::new(),
         }
@@ -2292,30 +2301,42 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
         [self.leg_state[0].health, self.leg_state[1].health]
     }
 
+    /// The merger's stats, for a caller to publish where the flow's stats
+    /// snapshot reads them
+    /// ([`crate::stats::collector::BufferedHitlessPublication`]): the
+    /// snapshot then reads the counters the merger writes, and the receive
+    /// loop takes no lock to refresh a copy.
+    pub fn stats_handle(&self) -> Arc<BufferedHitlessStats> {
+        self.stats.clone()
+    }
+}
+
+impl BufferedHitlessStats {
     /// Build a [`BufferedHitlessSnapshot`] off the live atomic state.
     /// Called from the 1 Hz stats path; never blocks the data path.
+    ///
+    /// [`BufferedHitlessSnapshot`]: crate::stats::models::BufferedHitlessSnapshot
     pub fn snapshot(&self) -> crate::stats::models::BufferedHitlessSnapshot {
-        let s = &self.stats;
         crate::stats::models::BufferedHitlessSnapshot {
-            max_path_diff_ms: self.max_path_diff.as_millis() as u32,
-            current_path_diff_us: s.current_path_diff_us.load(Ordering::Relaxed),
-            max_observed_path_diff_us: s.max_observed_path_diff_us.load(Ordering::Relaxed),
-            packets_emitted: s.packets_emitted.load(Ordering::Relaxed),
-            packets_via_both_legs: s.packets_via_both_legs.load(Ordering::Relaxed),
-            packets_via_leg1_only: s.packets_via_leg1_only.load(Ordering::Relaxed),
-            packets_via_leg2_only: s.packets_via_leg2_only.load(Ordering::Relaxed),
-            dups_dropped: s.dups_dropped.load(Ordering::Relaxed),
-            gap_lost: s.gap_lost.load(Ordering::Relaxed),
-            late_dropped: s.late_dropped.load(Ordering::Relaxed),
-            buffer_overflow_dropped: s.buffer_overflow_dropped.load(Ordering::Relaxed),
-            stream_resets: s.stream_resets.load(Ordering::Relaxed),
-            failovers: s.failovers.load(Ordering::Relaxed),
-            current_buffer_depth: s.current_buffer_depth.load(Ordering::Relaxed),
-            ssrc_mismatch: s.ssrc_mismatch.load(Ordering::Relaxed),
-            leg1_packets_received: s.leg1_packets_received.load(Ordering::Relaxed),
-            leg2_packets_received: s.leg2_packets_received.load(Ordering::Relaxed),
-            leg1_health: s.leg1_health.load(Ordering::Relaxed) as u8,
-            leg2_health: s.leg2_health.load(Ordering::Relaxed) as u8,
+            max_path_diff_ms: self.max_path_diff_ms,
+            current_path_diff_us: self.current_path_diff_us.load(Ordering::Relaxed),
+            max_observed_path_diff_us: self.max_observed_path_diff_us.load(Ordering::Relaxed),
+            packets_emitted: self.packets_emitted.load(Ordering::Relaxed),
+            packets_via_both_legs: self.packets_via_both_legs.load(Ordering::Relaxed),
+            packets_via_leg1_only: self.packets_via_leg1_only.load(Ordering::Relaxed),
+            packets_via_leg2_only: self.packets_via_leg2_only.load(Ordering::Relaxed),
+            dups_dropped: self.dups_dropped.load(Ordering::Relaxed),
+            gap_lost: self.gap_lost.load(Ordering::Relaxed),
+            late_dropped: self.late_dropped.load(Ordering::Relaxed),
+            buffer_overflow_dropped: self.buffer_overflow_dropped.load(Ordering::Relaxed),
+            stream_resets: self.stream_resets.load(Ordering::Relaxed),
+            failovers: self.failovers.load(Ordering::Relaxed),
+            current_buffer_depth: self.current_buffer_depth.load(Ordering::Relaxed),
+            ssrc_mismatch: self.ssrc_mismatch.load(Ordering::Relaxed),
+            leg1_packets_received: self.leg1_packets_received.load(Ordering::Relaxed),
+            leg2_packets_received: self.leg2_packets_received.load(Ordering::Relaxed),
+            leg1_health: self.leg1_health.load(Ordering::Relaxed) as u8,
+            leg2_health: self.leg2_health.load(Ordering::Relaxed) as u8,
         }
     }
 }
