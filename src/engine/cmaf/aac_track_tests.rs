@@ -41,8 +41,8 @@ fn run(ts: &[u8], config: &CmafOutputConfig) -> (CmafState, Vec<bool>, Vec<Event
     let mut built = Vec::new();
     for pkt in ts.chunks(188) {
         for f in demux.demux(pkt) {
-            if let DemuxedFrame::Aac { data, pts } = f {
-                handle_audio_frame(&mut state, &demux, config, &data, pts, &events, "f");
+            if let DemuxedFrame::Aac { data, pts, config: source } = f {
+                handle_audio_frame(&mut state, &demux, config, &data, pts, source, &events, "f");
                 built.push(state.audio_seg.is_some());
             }
         }

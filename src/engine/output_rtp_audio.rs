@@ -308,7 +308,7 @@ fn run_compressed_302m_step(
     }
 
     for frame in frames {
-        let DemuxedFrame::Aac { data, pts: _ } = frame else {
+        let DemuxedFrame::Aac { data, .. } = frame else {
             continue;
         };
 

@@ -555,7 +555,7 @@ async fn publish_loop(
                     {
                     }
                 }
-                DemuxedFrame::Aac { data, pts } => {
+                DemuxedFrame::Aac { data, pts, config: source } => {
                     // On the connection's timeline whether or not it is sent:
                     // a frame dropped below still anchors the epoch, as before.
                     let at = timeline.audio(pts);
@@ -566,7 +566,7 @@ async fn publish_loop(
                     if matches!(encoder_state, EncoderState::Lazy) {
                         encoder_state = build_encoder_state(
                             config,
-                            &demuxer,
+                            source.as_ref(),
                             Some(&data),
                             compressed_audio_input,
                             cancel,
@@ -589,11 +589,11 @@ async fn publish_loop(
                     // AAC-LC source re-encodes to AAC-LC fine.
                     if matches!(encoder_state, EncoderState::Transparent)
                         && audio_header.is_some()
-                        && demuxer.cached_aac_specific_config() != audio_header
+                        && source != audio_header
                     {
                         match build_encoder_state(
                             config,
-                            &demuxer,
+                            source.as_ref(),
                             Some(&data),
                             compressed_audio_input,
                             cancel,
@@ -630,8 +630,11 @@ async fn publish_loop(
                     // signalled implicitly, as in the ADTS it arrived in —
                     // and a PCE-signalled source's program_config_element.
                     // A re-encode's comes from its encoder's first frame
-                    // (`send_encoded_audio`).
-                    let header_format = aac_sequence_header_format(&encoder_state, demuxer.cached_aac_specific_config());
+                    // (`send_encoded_audio`). The frame's own, not the
+                    // demuxer's after the chunk: a frame of the old
+                    // configuration in the chunk of a change went out
+                    // behind the new one's header.
+                    let header_format = aac_sequence_header_format(&encoder_state, source.clone());
 
                     match &mut encoder_state {
                         EncoderState::Disabled | EncoderState::Transparent => {
@@ -687,7 +690,7 @@ async fn publish_loop(
                             // pinned to the encoder's format, converts
                             // whatever it decodes to, so the encoder and its
                             // header stay as they are.
-                            if let Some(source) = demuxer.cached_aac_specific_config()
+                            if let Some(source) = source
                                 && decoder.as_ref().is_none_or(|d| d.config() != &source)
                             {
                                 if decoder.is_some() {
@@ -2756,7 +2759,7 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) {
 ///   logs the reason and returns `Failed`.
 fn build_encoder_state(
     config: &RtmpOutputConfig,
-    demuxer: &TsDemuxer,
+    source: Option<&AacConfig>,
     first_frame: Option<&[u8]>,
     compressed_audio_input: bool,
     cancel: &CancellationToken,
@@ -2783,13 +2786,21 @@ fn build_encoder_state(
         return EncoderState::Failed;
     }
 
-    let Some((profile, sr_idx, _)) = demuxer.cached_aac_config() else {
-        tracing::warn!(
-            "RTMP output '{}': audio_encode requested but demuxer has no cached AAC config yet; deferring",
+    // The frame's own configuration (`DemuxedFrame::Aac::config`): `None`
+    // while a PCE-signalled source's layout has not arrived. Channel
+    // configuration 0 (ISDB-T 1seg) names its layout in a
+    // program_config_element some frames carry: the decoder is built from the
+    // configuration with it, once one has arrived (the caller holds the
+    // frames back meanwhile, `hold_for_layout`). It used to be refused here
+    // with only a log line.
+    let Some(source) = source.cloned() else {
+        tracing::debug!(
+            "RTMP output '{}': audio_encode waits for the source's AAC configuration",
             config.id
         );
         return EncoderState::Lazy;
     };
+    let (profile, sr_idx) = (source.profile, source.sr_idx);
 
     if profile != 1 {
         let msg = format!(
@@ -2814,20 +2825,11 @@ fn build_encoder_state(
         );
         return EncoderState::Failed;
     }
-    // Channel configuration 0 (ISDB-T 1seg) names its layout in a
-    // program_config_element some frames carry: the decoder is built from the
-    // configuration with it, once one has arrived (the caller holds the
-    // frames back meanwhile, `hold_for_layout`). It used to be refused here
-    // with only a log line.
-    //
     // A source wider than stereo (5.1, 7.1) is decoded whole and goes
     // through the channel stage like an MP2 / AC-3 / E-AC-3 one: kept at its
     // layout, or converted to `audio_encode.channels` / the `transcode`
     // block's. It used to be refused (log line only), a restriction from a
     // decoder that took mono and stereo alone.
-    let Some(source) = demuxer.cached_aac_specific_config() else {
-        return EncoderState::Lazy;
-    };
 
     let Some(codec) = AudioCodec::parse(&enc_cfg.codec) else {
         tracing::error!(
@@ -7106,24 +7108,45 @@ pub(super) mod flv_wire_tests {
     /// every frame goes out as it came. The header used to be sent once a
     /// connection, so a receiver went on decoding the 44.1 kHz frames as
     /// 48 kHz, 9 % fast.
+    ///
+    /// Each frame is judged by its own configuration, however the TS is cut
+    /// into chunks: as the muxer delivers it, re-cut into seven-packet
+    /// datagrams as an RTP / UDP source carries it, and all in one chunk.
+    /// The configuration used to be read
+    /// off the demuxer after the whole chunk, by then the newest frame's,
+    /// so the 48 kHz frames in the chunk of the change went out behind the
+    /// 44.1 kHz header — all of them, from one chunk.
     #[cfg(feature = "fdk-aac")]
     #[tokio::test]
     async fn a_passed_through_source_changing_configuration_is_re_announced() {
+        for cut in ["as muxed", "seven packets", "one chunk"] {
+            a_passed_through_source_changing_configuration_is_re_announced_cut(cut).await;
+        }
+    }
+
+    #[cfg(feature = "fdk-aac")]
+    async fn a_passed_through_source_changing_configuration_is_re_announced_cut(cut: &str) {
         let (frames, first) = rate_switch();
         let refs: Vec<(u64, &[u8])> = frames.iter().map(|(at, f)| (*at, f.as_slice())).collect();
-        let tags = publish(programme_timed(&refs), passthrough_output()).await;
+        let muxed = programme_timed(&refs);
+        let ts = match cut {
+            "as muxed" => muxed,
+            "seven packets" => muxed.concat().chunks(7 * 188).map(Bytes::copy_from_slice).collect(),
+            _ => vec![Bytes::from(muxed.concat())],
+        };
+        let tags = publish(ts, passthrough_output()).await;
         let audio: Vec<&WireTag> = tags.iter().filter(|t| !t.video).collect();
         let headers: Vec<usize> = (0..audio.len()).filter(|&i| audio[i].data[..2] == [0xAF, 0x00]).collect();
-        assert_eq!(headers.len(), 2, "the first header and one for the new configuration");
-        assert_eq!(&audio[headers[0]].data[2..], [0x11, 0x90], "AAC-LC, 48 kHz, stereo");
-        assert_eq!(&audio[headers[1]].data[2..], [0x12, 0x10], "AAC-LC, 44.1 kHz, stereo");
-        assert_eq!(audio[headers[1]].ts, audio[headers[1] + 1].ts, "at the first 44.1 kHz frame's time");
+        assert_eq!(headers.len(), 2, "{cut}: the first header and one for the new configuration");
+        assert_eq!(&audio[headers[0]].data[2..], [0x11, 0x90], "{cut}: AAC-LC, 48 kHz, stereo");
+        assert_eq!(&audio[headers[1]].data[2..], [0x12, 0x10], "{cut}: AAC-LC, 44.1 kHz, stereo");
+        assert_eq!(audio[headers[1]].ts, audio[headers[1] + 1].ts, "{cut}: at the first 44.1 kHz frame's time");
         let bodies = |r: std::ops::Range<usize>| -> Vec<&[u8]> { audio[r].iter().map(|t| &t.data[2..]).collect() };
         let before = bodies(1..headers[1]);
         let after = bodies(headers[1] + 1..audio.len());
-        assert_eq!(before.len(), first, "every 48 kHz frame, under the first header");
+        assert_eq!(before.len(), first, "{cut}: every 48 kHz frame, under the first header");
         assert!(before.iter().zip(&frames).all(|(b, (_, f))| *b == &f[7..]));
-        assert_eq!(after.len(), frames.len() - first, "every 44.1 kHz frame, under the second");
+        assert_eq!(after.len(), frames.len() - first, "{cut}: every 44.1 kHz frame, under the second");
         assert!(after.iter().zip(&frames[first..]).all(|(b, (_, f))| *b == &f[7..]));
     }
 
@@ -7234,7 +7257,7 @@ pub(crate) mod tests {
         let (events, _rx) = crate::manager::events::event_channel();
         let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
         let first = first_aac_frame(&mut TsDemuxer::new(None), &crate::engine::ts_test_fixtures::aac_program_ts(ADTS));
-        let st = build_encoder_state(&cfg, &demux, Some(&first), true, &CancellationToken::new(), &stats, "f", &events);
+        let st = build_encoder_state(&cfg, demux.cached_aac_specific_config().as_ref(), Some(&first), true, &CancellationToken::new(), &stats, "f", &events);
         let EncoderState::Active { encoder, mut stage, .. } = st else {
             panic!("the output must re-encode, not fail");
         };
@@ -7283,7 +7306,7 @@ pub(crate) mod tests {
             let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
             let st = build_encoder_state(
                 &cfg,
-                &demux,
+                demux.cached_aac_specific_config().as_ref(),
                 Some(&first),
                 true,
                 &CancellationToken::new(),
@@ -7327,7 +7350,7 @@ pub(crate) mod tests {
             assert_eq!(demux.cached_aac_config().map(|c| c.0), Some(1), "{what}: the LC profile in ADTS");
             let (events, _rx) = crate::manager::events::event_channel();
             let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
-            let st = build_encoder_state(&cfg, &demux, Some(&first), true, &CancellationToken::new(), &stats, "f", &events);
+            let st = build_encoder_state(&cfg, demux.cached_aac_specific_config().as_ref(), Some(&first), true, &CancellationToken::new(), &stats, "f", &events);
             match st {
                 EncoderState::Transparent => assert!(transparent, "{what}: passed through"),
                 EncoderState::Active { encoder, .. } => {
@@ -7365,7 +7388,7 @@ pub(crate) mod tests {
         demux.demux(&ts);
         let (events, _rx) = crate::manager::events::event_channel();
         let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
-        let lazy = build_encoder_state(&cfg, &demux, Some(&[]), true, &CancellationToken::new(), &stats, "f", &events);
+        let lazy = build_encoder_state(&cfg, demux.cached_aac_specific_config().as_ref(), Some(&[]), true, &CancellationToken::new(), &stats, "f", &events);
         assert!(matches!(lazy, EncoderState::Lazy), "a frame that does not decode leaves it waiting");
         assert_eq!(aac_sequence_header_format(&lazy, he_aac_v2), None);
     }

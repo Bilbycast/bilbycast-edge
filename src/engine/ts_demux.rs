@@ -191,6 +191,15 @@ pub enum DemuxedFrame {
         /// it is the first AU that commences in that PES, else where the
         /// samples before it end.
         pts: u64,
+        /// The stream's configuration as of this frame: its own ADTS
+        /// header's, with the PCE the stream last carried for channel
+        /// configuration 0 — what [`TsDemuxer::cached_aac_specific_config`]
+        /// said when it was cut, `None` while such a stream's layout is
+        /// pending. Read from the demuxer after a whole chunk was demuxed,
+        /// the cache had already moved to the newest frame's, so the frames
+        /// of the old configuration in the chunk of a change (a feed switch)
+        /// were sent, or decoded, under the new one.
+        config: Option<crate::engine::aac_config::AacConfig>,
     },
     /// Non-AAC compressed audio frame (MP2 / AC-3 / E-AC-3 / AC-4) —
     /// payload is the elementary stream the FFmpeg audio decoder consumes
@@ -400,6 +409,20 @@ fn pes_assembler_cap(stream_type: u8) -> usize {
         // MPEG-1/2 video, MPEG-4 part 2, H.264, HEVC, VVC, AVS2/AVS3, VC-1.
         0x01 | 0x02 | 0x10 | 0x1B | 0x24 | 0x33 | 0x42 | 0xD1 | 0xEA => PES_ASSEMBLER_CAP_VIDEO,
         _ => PES_ASSEMBLER_CAP_OTHER,
+    }
+}
+
+/// The configuration an ADTS header `(profile, sampling_frequency_index,
+/// channel_configuration)` names, with `pce` for channel configuration 0 —
+/// `None` for that without one, which no decoder opens.
+fn aac_config_of(
+    (profile, sr_idx, ch_cfg): (u8, u8, u8),
+    pce: Option<&crate::engine::aac_config::ProgramConfig>,
+) -> Option<crate::engine::aac_config::AacConfig> {
+    use crate::engine::aac_config::AacConfig;
+    match pce {
+        Some(pce) if ch_cfg == 0 => Some(AacConfig::with_pce(profile, sr_idx, pce.clone())),
+        _ => AacConfig::new(profile, sr_idx, ch_cfg),
     }
 }
 
@@ -719,12 +742,7 @@ impl TsDemuxer {
     /// until a frame has opened with its PCE: a header without it is one no
     /// decoder opens.
     pub fn cached_aac_specific_config(&self) -> Option<crate::engine::aac_config::AacConfig> {
-        use crate::engine::aac_config::AacConfig;
-        let (profile, sr_idx, ch_cfg) = self.cached_aac_config?;
-        match &self.cached_aac_pce {
-            Some(pce) if ch_cfg == 0 => Some(AacConfig::with_pce(profile, sr_idx, pce.clone())),
-            _ => AacConfig::new(profile, sr_idx, ch_cfg),
-        }
+        aac_config_of(self.cached_aac_config?, self.cached_aac_pce.as_ref())
     }
 
     /// The Opus `channel_config_code` the PMT signals for the selected
@@ -1341,7 +1359,8 @@ impl TsDemuxer {
                 {
                     self.cached_aac_pce = Some(pce);
                 }
-                out.push(DemuxedFrame::Aac { data: raw.to_vec(), pts });
+                let config = aac_config_of(cfg, self.cached_aac_pce.as_ref());
+                out.push(DemuxedFrame::Aac { data: raw.to_vec(), pts, config });
             } else {
                 if au.pes_start {
                     out.extend(a.take_group());
@@ -2455,7 +2474,7 @@ mod tests {
         ts.chunks(TS_PACKET_SIZE)
             .flat_map(|p| demux.demux(p))
             .filter_map(|f| match f {
-                DemuxedFrame::Aac { data, pts } => Some((pts, data)),
+                DemuxedFrame::Aac { data, pts, .. } => Some((pts, data)),
                 _ => None,
             })
             .collect()
@@ -2704,6 +2723,33 @@ mod tests {
         }
     }
 
+    /// Each `Aac` frame carries the configuration its own header names,
+    /// however many frames one `demux` call hands out: across a switch from
+    /// 48 kHz to 44.1 kHz in one chunk, the frames before it say 48 kHz,
+    /// though the demuxer's cache already says 44.1 when the call returns —
+    /// which is what a consumer reading the cache after the chunk took for
+    /// all of them.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn each_aac_frame_carries_its_own_configuration() {
+        use crate::engine::ts_test_fixtures::{aac_program_ts_timed, rate_switch_frames};
+        let (frames, first) = rate_switch_frames(10);
+        let refs: Vec<(u64, &[u8])> = frames.iter().map(|(pts, f)| (*pts, f.as_slice())).collect();
+        let mut demux = TsDemuxer::new(None);
+        let out = demux.demux(&aac_program_ts_timed(&refs));
+        let rates: Vec<u8> = out
+            .iter()
+            .filter_map(|f| match f {
+                DemuxedFrame::Aac { config, .. } => Some(config.as_ref().expect("a configuration").sr_idx),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rates.len(), frames.len());
+        assert!(rates[..first].iter().all(|&r| r == 3), "48 kHz before the switch: {rates:?}");
+        assert!(rates[first..].iter().all(|&r| r == 4), "44.1 kHz after it: {rates:?}");
+        assert_eq!(demux.cached_aac_config().map(|c| c.1), Some(4), "the cache is the newest frame's");
+    }
+
     #[test]
     fn an_adts_frame_straddling_two_pes_is_demuxed_with_the_rest() {
         const P0: u64 = 900_000;
@@ -2723,7 +2769,7 @@ mod tests {
             .chunks(TS_PACKET_SIZE)
             .flat_map(|p| demux.demux(p))
             .filter_map(|f| match f {
-                DemuxedFrame::Aac { data, pts } => Some((data, pts)),
+                DemuxedFrame::Aac { data, pts, .. } => Some((data, pts)),
                 _ => None,
             })
             .collect();

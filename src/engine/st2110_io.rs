@@ -1058,7 +1058,7 @@ fn run_compressed_audio_step(
 
     let mut emitted: Vec<Bytes> = Vec::new();
     for frame in frames {
-        let DemuxedFrame::Aac { data, pts } = frame else {
+        let DemuxedFrame::Aac { data, pts, .. } = frame else {
             // H.264 / Opus / other elementary streams: ignored. Audio
             // outputs are AAC-only in Phase A.
             continue;
