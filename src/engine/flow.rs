@@ -8513,9 +8513,9 @@ mod fixer_task_tests {
     /// with one bit set, so it keeps its upstream metadata. The fixer task
     /// used to forward every datagram it rewrote with `sender_timestamp_us`,
     /// `upstream_seq` and `upstream_leg_id` cleared; from the first switch
-    /// or source PCR jump that was every datagram, so the PLL of a
-    /// `passthrough_clock: true` SRT input ran on PCR for the rest of the
-    /// flow (edge#214).
+    /// or source PCR jump that was every datagram holding a non-null
+    /// packet, so the PLL of a `passthrough_clock: true` SRT input lost its
+    /// sender-timestamp reference for the rest of the flow (edge#214).
     #[tokio::test]
     async fn a_di_stamped_datagram_keeps_its_upstream_metadata() {
         let (tx, mut rx) = broadcast::channel(16);

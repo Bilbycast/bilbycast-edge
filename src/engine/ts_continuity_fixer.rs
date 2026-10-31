@@ -11,8 +11,8 @@
 //!    unchanged (PSI observed for the switch cache).
 //! 2. **On switch**: lets the new input's CCs through (one CC jump per
 //!    PID) and injects the new input's cached PAT/PMTs for fast receiver
-//!    re-acquisition, with their
-//!    `version_number` rewritten from a per-fixer **monotonic counter**
+//!    re-acquisition, with their `version_number` rewritten from a
+//!    per-fixer **monotonic counter**
 //!    that advances on every switch (see [`TsContinuityFixer::on_switch`]
 //!    for the motivation — the alternative `cached_version + 1` stamping
 //!    was empirically broken for the `A → B → A` round-trip case). The

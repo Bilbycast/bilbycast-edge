@@ -753,13 +753,17 @@ else: CC is untouched. Until edge#214 its first signal also switched the
 fixer into renumbering every CC for the rest of the flow, so after the
 first outage or loop no later loss showed on the outputs or in
 `cc_errors`. Every datagram the fixer rewrote, which from then on was every
-one, also went out without `sender_timestamp_us`, so the PLL of an SRT input
-with `passthrough_clock: true` and no `program_number`, `pid_overrides`,
-`pid_map` or ingress transcode ran on PCR for the rest of the flow
-(`master_clock.rate_source` read `pcr`). On any other SRT input one of those
-stages, or the muxer-mode rewriter that `passthrough_clock: true` turns off,
-already drops that field at ingress, so its PLL runs on PCR either way. Now the fixer rewrites only a datagram that takes a DI,
-and that datagram keeps every field it arrived with
+one holding a non-null packet, also went out without `sender_timestamp_us`,
+so the PLL of an SRT input with `passthrough_clock: true` and no
+`program_number`, `pid_overrides`, `pid_map` or ingress transcode lost its
+sender-timestamp reference for the rest of the flow: it ran on PCR
+(`master_clock.rate_source` read `pcr`), or, on a CBR-padded source whose
+all-null datagrams kept the field, switched between the two and
+re-anchored. On any other SRT input one of those stages, or the muxer-mode
+rewriter that `passthrough_clock: true` turns off, already drops that field
+at ingress, so its PLL runs on PCR either way.
+Now the fixer rewrites only a datagram that takes a DI, and that datagram
+keeps every field it arrived with
 (`a_di_stamped_datagram_keeps_its_upstream_metadata`).
 
 The **PLL sampler** on the same broadcast (`sample_packet`) had the same
