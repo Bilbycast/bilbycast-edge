@@ -202,6 +202,10 @@ const DEADBAND_90K: u64 = 450; // 5 ms
 const PERSIST_90K: i64 = 13_500; // 150 ms
 /// `av_skew` is not published for this long after an anchor.
 const AV_SKEW_HOLDOFF_90K: u64 = 90_000; // 1 s
+/// How much later than any of the replacer's own frames a held frame may
+/// go out behind the program clock ([`ClockFill::keep_frame`]): half
+/// the least margin the PCR stage leaves over a frame's lateness (40 ms).
+const HELD_LATE_TOL_90K: i64 = 1_800; // 20 ms
 /// Resampler chunk (input frames) of the replacer's rate conversion.
 const SRC_CHUNK_FRAMES: usize = super::audio_transcode::STREAM_CHUNK_FRAMES;
 
@@ -412,6 +416,11 @@ struct ClockFill {
     active: bool,
     filled_90k: i64,
     outage: bool,
+    /// The furthest behind the program's last PCR any re-encoded frame of
+    /// the replacer's own has gone out, in this time base — what the
+    /// chain's PCR stage has measured too, so its delay already covers it
+    /// (see [`Self::keep_frame`]). `None` before the first.
+    late_max_90k: Option<i64>,
 }
 
 impl ClockFill {
@@ -424,6 +433,10 @@ impl ClockFill {
             step_90k: self.step_90k,
             ext_pcr_90k: self.ext_pcr_90k,
             last_reading_90k: self.last_reading_90k,
+            // A property of the clock and the pipeline, not of the
+            // timeline: the PCR stage's delay does not come down with an
+            // anchor.
+            late_max_90k: self.late_max_90k,
             ..ClockFill::default()
         };
     }
@@ -467,6 +480,53 @@ impl ClockFill {
             Some(last) => self.ext_pcr_90k + pts_diff(c, last).max(0) as u64,
             None => c,
         }
+    }
+
+    /// Whether a re-encoded frame stamped `pts` (its PES's PTS) goes out.
+    ///
+    /// A frame of the audio the pipeline held across a seam — run out on
+    /// the old timeline ahead of a re-anchor
+    /// ([`TsAudioReplacer::run_out`]), or still on the timeline before a
+    /// [`GapFill::Relabel`] step ([`PendingRelabel`]) — leaves only when the
+    /// audio after the seam arrives. When the source's audio paused while
+    /// its PCR ran on (a stream that stopped and came back, a
+    /// `media_player` file whose audio ends before its picture), that is
+    /// about the pause after its stamp: sent, it reached the transcode
+    /// chain's PCR stage (`ts_pcr_remux`) that late, and the stage raised
+    /// its delay `D` by as much for the life of the flow, a PCR
+    /// discontinuity and a `transcode_pcr_late` Warning each time — the
+    /// same hold the PCR stage drops as stale on the video, which the audio
+    /// replacer did not report. Such a frame is dropped instead when it is
+    /// more than 20 ms further behind the program's last PCR than any of
+    /// the replacer's other frames has gone out: `D` already covers those
+    /// (the stage never leaves it below a frame's lateness plus 40 ms), so a
+    /// held frame within that raises nothing, and one past it was late for
+    /// good. Without a frame to measure against since the time base began, a
+    /// held frame goes out only ahead of the clock. With no PCR seen, every
+    /// frame goes out.
+    ///
+    /// Every other frame goes out, and its lateness is noted. A dropped
+    /// frame is counted in `dropped`.
+    fn keep_frame(&mut self, pts: u64, held: bool, dropped: &mut u32) -> bool {
+        let Some(c) = self.last_pcr_90k else {
+            return true;
+        };
+        let late = pts_diff(c, pts);
+        if !held {
+            self.late_max_90k = Some(self.late_max_90k.map_or(late, |m| m.max(late)));
+            return true;
+        }
+        let allowed = self.late_max_90k.map_or(0, |m| m + HELD_LATE_TOL_90K);
+        if late <= allowed {
+            return true;
+        }
+        *dropped += 1;
+        tracing::debug!(
+            late_ms = late / 90,
+            allowed_ms = allowed / 90,
+            "ts_audio_replace: held audio frame behind the program clock dropped"
+        );
+        false
     }
 
     /// The window's lowest headroom and longest stretch, over the seconds
@@ -675,6 +735,12 @@ pub struct TsAudioReplacer {
     /// output frames still to come whose content is from before the step
     /// keep the old stamps ([`PendingRelabel`]).
     pending_relabel: Option<PendingRelabel>,
+    /// The pipeline is being run out ahead of a re-anchor ([`Self::run_out`]):
+    /// the frames it makes are held audio of the old timeline.
+    running_out: bool,
+    /// Held frames dropped as behind the program clock since the last
+    /// report ([`ClockFill::keep_frame`]).
+    held_late_dropped: u32,
 
     /// The source audio timeline the output is held to.
     timeline: Timeline,
@@ -857,6 +923,8 @@ impl TsAudioReplacer {
             out_pts_90k: 0,
             samples_since_anchor: 0,
             pending_relabel: None,
+            running_out: false,
+            held_late_dropped: 0,
             timeline: Timeline::default(),
             gap_fill: GapFill::default(),
             pcr_pid: None,
@@ -2350,15 +2418,34 @@ impl TsAudioReplacer {
     /// 500 ms went out on the new timeline, late (or early) by the step.
     /// After a step back of over 1 s the transcode chain's PCR stage drops
     /// these frames as the previous epoch's, rather than presenting them on
-    /// the new one. The silence is no gap in the source, so it is not
-    /// counted in `silence_inserted_samples`.
+    /// the new one; a frame the program clock has already passed — the
+    /// source's audio paused while its PCR ran on — is dropped here
+    /// ([`ClockFill::keep_frame`]). The silence is no gap in the source, so
+    /// it is not counted in `silence_inserted_samples`.
     fn run_out(&mut self, output: &mut Vec<u8>) {
         if !self.codecs_ready || self.timeline.rate == 0 {
             return;
         }
         let held_90k = self.pending_out_90k() + self.latency.applied_90k + self.out_frame_90k().max(0) as u64;
         let n = (u128::from(held_90k) * u128::from(self.timeline.rate)).div_ceil(90_000) as u64;
+        self.running_out = true;
         self.send_silence(n, output);
+        self.running_out = false;
+        self.report_held_late("re-anchor");
+    }
+
+    /// Say how many held frames [`ClockFill::keep_frame`] dropped at the seam
+    /// just passed (`what`), if any.
+    fn report_held_late(&mut self, what: &str) {
+        let n = std::mem::take(&mut self.held_late_dropped);
+        if n > 0 {
+            tracing::info!(
+                frames = n,
+                "ts_audio_replace: dropped the audio held across a {what} that the program clock had \
+                 passed while the source audio paused, rather than send it late and raise the \
+                 transcode PCR delay"
+            );
+        }
     }
 
     /// `n` samples of silence at the source rate: the held tail faded out
@@ -2589,6 +2676,11 @@ impl TsAudioReplacer {
     /// Pull as many encoded frames as the encoder has ready given the
     /// current PCM accumulator, re-packetize them as TS, and emit.
     fn drain_encoder(&mut self, output: &mut Vec<u8>) {
+        // A relabel step has landed since frames held before it were
+        // dropped (`ClockFill::keep_frame`).
+        if !self.running_out && self.pending_relabel.is_none() && self.held_late_dropped > 0 {
+            self.report_held_late("relabel step");
+        }
         let audio_pid = match self.audio_pid {
             // Encoded packets always ride the source PID. Any operator
             // PID rename lands on the downstream `TsPidOverridesRewriter`
@@ -2641,16 +2733,19 @@ impl TsAudioReplacer {
                             );
                             let pts_for_pes =
                                 model.wrapping_sub(self.latency.applied_90k) & PTS_MASK;
-                            let pes = build_audio_pes(
-                                self.codec.ts_pes_stream_id(),
-                                &data,
-                                pts_for_pes,
-                            );
-                            let pkts = packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
-                            for p in &pkts {
-                                output.extend_from_slice(p);
+                            let held = self.running_out || self.pending_relabel.is_some();
+                            if self.clock_fill.keep_frame(pts_for_pes, held, &mut self.held_late_dropped) {
+                                let pes = build_audio_pes(
+                                    self.codec.ts_pes_stream_id(),
+                                    &data,
+                                    pts_for_pes,
+                                );
+                                let pkts = packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
+                                for p in &pkts {
+                                    output.extend_from_slice(p);
+                                }
+                                self.encode_stats.inc_out(1);
                             }
-                            self.encode_stats.inc_out(1);
                             self.samples_since_anchor = self
                                 .samples_since_anchor
                                 .saturating_add(num_samples as u64);
@@ -2697,17 +2792,20 @@ impl TsAudioReplacer {
                                 );
                                 let pts_for_pes =
                                     model.wrapping_sub(self.latency.applied_90k) & PTS_MASK;
-                                let pes = build_audio_pes(
-                                    self.codec.ts_pes_stream_id(),
-                                    &ef.data,
-                                    pts_for_pes,
-                                );
-                                let pkts =
-                                    packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
-                                for p in &pkts {
-                                    output.extend_from_slice(p);
+                                let held = self.running_out || self.pending_relabel.is_some();
+                                if self.clock_fill.keep_frame(pts_for_pes, held, &mut self.held_late_dropped) {
+                                    let pes = build_audio_pes(
+                                        self.codec.ts_pes_stream_id(),
+                                        &ef.data,
+                                        pts_for_pes,
+                                    );
+                                    let pkts =
+                                        packetize_ts(audio_pid, &pes, &mut self.out_audio_cc);
+                                    for p in &pkts {
+                                        output.extend_from_slice(p);
+                                    }
+                                    self.encode_stats.inc_out(1);
                                 }
-                                self.encode_stats.inc_out(1);
                                 self.samples_since_anchor = self
                                     .samples_since_anchor
                                     .saturating_add(ef.num_samples as u64);
@@ -6064,6 +6162,67 @@ mod tests {
             assert_eq!(f.planar.len(), want, "{target}: the codec's own channel count");
             let e = err_samples(target, &out, src_time(4_800), 48_000);
             assert!(e.abs() <= 4.0, "{target}: the burst is {e} samples off its source time");
+        }
+    }
+
+    /// Run `ts` through a `target` replacer filling gaps by `gap_fill`, and
+    /// the chain's PCR stage behind it.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    fn pcr_chain(
+        target: &str,
+        gap_fill: GapFill,
+        ts: &[u8],
+    ) -> (Arc<TsAudioReplacerStats>, crate::stats::models::TranscodePcrStats, Vec<u8>) {
+        let mut r = e2e::replacer(target, None, None);
+        r.set_gap_fill(gap_fill);
+        let stats = r.stats_handle();
+        let out = e2e::run(&mut r, ts);
+        let mut remux = crate::engine::ts_pcr_remux::TsPcrRemux::new();
+        remux.set_replaced_pids(Some(0x0101), None);
+        let mut wire = Vec::new();
+        for p in out.chunks(TS_PACKET_SIZE) {
+            remux.process(p, &mut wire);
+        }
+        (stats, remux.stats_handle().snapshot(), wire)
+    }
+
+    /// The source's audio pauses while its PCR runs on, and comes back past
+    /// what the replacer settles in place: a re-anchor (a pause of more than
+    /// 500 ms within the clock fill's 2 s warm-up, or one longer than the
+    /// fill's 500 ms cap after it), or a `media_player` input's relabel
+    /// step. What the pipeline held of the audio before the pause — the
+    /// encoder's delay line and accumulator, the stage's queue — is stamped
+    /// on the old timeline, and goes out only when the audio comes back:
+    /// behind the PCR by about the pause. Sent, it reached the chain's PCR
+    /// stage that late, and the stage raised `D` by as much for the life of
+    /// the flow, each raise a PCR discontinuity and a `transcode_pcr_late`
+    /// Warning (here, with the audio 100 ms ahead of its PCR, MP2 / AAC-LC:
+    /// a 600 ms pause at 1 s, `D` 80 -> 494 / 516 ms; a 2 s pause after the
+    /// warm-up, -> 1430 / 1457 ms; a 320 ms relabel step, -> 254 / 268 ms; a
+    /// 700 ms one, -> 614 / 628 ms). It is dropped instead: `D` stays at
+    /// 80 ms, nothing is late, and the audio after the pause still lands at
+    /// its source time.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn audio_held_across_a_pause_the_pcr_ran_through_never_raises_the_pcr_delay() {
+        for (what, hole, gap_fill, secs) in [
+            ("a 600 ms pause in the warm-up", (1_000u64, 600u64), GapFill::Silence, 4u64),
+            ("a 2 s pause after it", (4_000, 2_000), GapFill::Silence, 8),
+            ("a 320 ms relabel step", (4_000, 320), GapFill::Relabel, 7),
+            ("a 700 ms relabel re-anchor", (4_000, 700), GapFill::Relabel, 7),
+        ] {
+            // The burst in the first whole PES after the pause.
+            let at = (48 * (hole.0 + hole.1 + 120)) as usize;
+            let src = clock_fill_source(|_| 100, Some(hole), at, secs, true);
+            for target in ["mp2", "aac_lc"] {
+                let (_, pcr, wire) = pcr_chain(target, gap_fill, &src);
+                assert_eq!((pcr.offset_raises, pcr.late_frames), (0, 0), "{what}, {target}: {pcr:?}");
+                assert_eq!(pcr.offset_ms, 80.0, "{what}, {target}: {pcr:?}");
+                if gap_fill == GapFill::Silence {
+                    let e = e2e::err_samples(target, &wire, e2e::src_time(at), 48_000);
+                    assert!(e.abs() <= 48.0, "{what}, {target}: the audio after the pause is {e} samples off");
+                }
+            }
         }
     }
 }

@@ -899,7 +899,10 @@ the sample:
     decoder, the stage and the encoder still hold when that PES arrives
     (AAC-LC's delay line alone is 2048 samples) is audio from before the
     step and keeps the old stamps. Up to 0.116.0 the step went on the next
-    frame out, presenting that audio late by the whole step;
+    frame out, presenting that audio late by the whole step. (Those frames
+    leave only when the audio after the step arrives; where the file's
+    audio paused before it with the PCR running on, they are behind the
+    program clock and are dropped — see below the re-anchor);
   - an **overlap**, by the same rules: that much audio dropped from the
     head of what follows (the count of placed content may go below the
     anchor: a PES stamped 150 ms behind one AU after an anchor drops
@@ -910,7 +913,22 @@ the sample:
     silence, which is not counted in `silence_inserted_samples` (until
     0.116.0 it went out just ahead of the new PTS, on the new timeline;
     after a step back of over 1 s the PCR stage drops it as the previous
-    epoch's). A source
+    epoch's). **Held audio the program clock has passed is dropped.** That
+    run-out, and the frames a relabel step leaves on the old timeline, go
+    out only when the audio after the seam arrives. When the source's audio
+    paused while its PCR ran on (a pause of more than 500 ms within the
+    clock fill's 2 s warm-up, one longer than the fill's 500 ms cap after
+    it, a `media_player` file whose audio ends before its picture), that is
+    about the pause behind the PCR. Sent, such a frame reached the chain's
+    PCR stage that late and raised `D` by as much for the life of the flow,
+    with a PCR discontinuity and a `transcode_pcr_late` Warning (a 2 s
+    pause after the warm-up: `D` 80 ms to about 1.45 s). A held frame more
+    than 20 ms further behind the program's last PCR than any other frame
+    the replacer has sent is now dropped instead (`ClockFill::keep_frame`;
+    `D` already covers the others, being never less than a frame's lateness
+    plus 40 ms), with an info log line naming the seam and the count. The
+    cost is the last up to ~65 ms of audio before such a pause, which on
+    its old timeline could only be late. A source
     that resets its clock back (an encoder restart, an ffmpeg
     `-stream_loop` wrap) takes its PCR and its video back with it, and the
     transcode chain's PCR stage drops re-encoded PES left on the old
