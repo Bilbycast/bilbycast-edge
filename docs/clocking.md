@@ -402,6 +402,28 @@ nothing is dropped (PCR and PES agree there). Pinned by
 `a_pes_started_before_the_first_pcr_is_dropped_whole` and
 `a_pid_joined_mid_pes_keeps_its_cc_across_the_pes_the_gate_holds`.
 
+**A restarted rewriter's first packet on each PID carries DI=1.** A
+rewriter is built when its input (or, on an assembled flow, its
+assembler) starts, so after a flow restart the receiver's last packet on
+each PID came from the previous instance, and the first from the new one
+carries whatever CC the source has reached by then — or, on the PAT and
+PMT PIDs, the rewriter's own, seeded from the source. One restart in 16
+per PID, that was the previous instance's last CC with other bytes, which
+a strict receiver drops as a duplicate (ISO/IEC 13818-1 §2.4.3.3): a
+bench saw the first audio PES after 7 of 20 restarts read so. The first
+packet the rewriter emits on every PID but the null PID now carries
+`discontinuity_indicator`: set in its adaptation field when it has one,
+else on an adaptation-field-only packet sent just ahead of it whose CC is
+one before the packet's (an adaptation-field-only packet repeats the CC
+before it, so the packet still follows on). With the DI the standard lets
+the CC start anew there, and nothing reads as a duplicate. Only the first
+packet per PID is marked, so a flow's first start sends one marked packet
+per PID too, and later CCs pass through as before (a PES gate drop still
+lowers them). The flow's TR 101 290 analyzer counts CC on payload packets
+only, as before. Inputs with `passthrough_clock: true`, which run no
+rewriter, are not marked. Pinned by
+`a_restarted_rewriters_first_packets_never_read_as_duplicates`.
+
 The hold is bounded. Once it has held 2 s of PES time on a PID (forward
 steps only, each capped at 1 s) or 2 s of wall time, it gives up waiting:
 

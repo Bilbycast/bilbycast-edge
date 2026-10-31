@@ -2307,7 +2307,11 @@ mod tests {
                             Ok(Ok(bundle)) => {
                                 for ts in bundle.data.chunks_exact(188) {
                                     let pid = (u16::from(ts[1] & 0x1F) << 8) | u16::from(ts[2]);
-                                    if pid == 257 {
+                                    // Payload packets only: the assembler's
+                                    // rewriter marks its first packet on a PID
+                                    // with a DI, on an adaptation-field-only
+                                    // packet ahead of one that has no room.
+                                    if pid == 257 && ts[3] & 0x10 != 0 {
                                         *markers.entry(ts[187]).or_default() += 1;
                                     }
                                 }
