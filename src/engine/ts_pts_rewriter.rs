@@ -481,6 +481,10 @@ pub struct TsPtsRewriter {
     /// `(PCR value, delay it added)` (see
     /// [`Self::note_upstream_pcr_steps`]).
     upstream_pcr_steps: Vec<(u64, i64)>,
+    /// One bit per PID: the rewriter has emitted a packet on it, the first
+    /// of which carried `discontinuity_indicator`
+    /// ([`Self::mark_first_packets`]).
+    di_marked: Box<[u64; 128]>,
 }
 
 /// How much PES time (per PID, forward steps only, each capped at 1 s) or
@@ -539,6 +543,7 @@ impl TsPtsRewriter {
             pes_hold_since: None,
             clock_passthrough_no_pcr: false,
             upstream_pcr_steps: Vec::new(),
+            di_marked: Box::new([0; 128]),
         }
     }
 
@@ -607,6 +612,7 @@ impl TsPtsRewriter {
     /// Output length may exceed input length when synthetic packets are
     /// injected for PCR_RR (40 ms) or PSI_RR (500 ms) compliance.
     pub fn process(&mut self, ts_in: &[u8], out: &mut Vec<u8>) {
+        let start = out.len();
         self.publish_av_skew();
         // MPTS guard: latched on the first PAT showing > 1 program.
         // Verbatim passthrough — the shared `ClockAnchor` model is
@@ -984,6 +990,59 @@ impl TsPtsRewriter {
         }
         // The upstream steps named this chunk's PCRs only.
         self.upstream_pcr_steps.clear();
+        self.mark_first_packets(out, start);
+    }
+
+    /// As if a packet had gone out on every PID already, so none takes the
+    /// mark [`Self::mark_first_packets`] puts on the first: for the tests
+    /// whose subject is what comes after, byte for byte.
+    #[cfg(test)]
+    fn without_start_marks(mut self) -> Self {
+        self.di_marked.fill(u64::MAX);
+        self
+    }
+
+    /// Set `discontinuity_indicator` on the first packet this rewriter
+    /// emits on each PID (from `start` in `out`), or — on a packet with no
+    /// adaptation field to carry it — send an adaptation-field-only packet
+    /// with it just ahead, its CC one before the packet's (an
+    /// adaptation-field-only packet repeats the CC before it, so the packet
+    /// still follows on). A rewriter is built when its input starts: on a
+    /// flow restart, the receiver's last packet on each PID came from the
+    /// previous instance, and the first from this one carries whatever CC
+    /// the source has reached (or the rewriter's own, on PSI) — the same
+    /// as that last one 1 time in 16, with other bytes, which a strict
+    /// receiver drops as a duplicate (ISO/IEC 13818-1 §2.4.3.3): the first
+    /// audio PES after 7 of 20 restarts, 170-320 ms in. With the DI the
+    /// standard says the CC may start anew there, so it never reads as one.
+    fn mark_first_packets(&mut self, out: &mut Vec<u8>, start: usize) {
+        let mut carriers: Vec<(usize, [u8; TS_PACKET_SIZE])> = Vec::new();
+        let mut at = start;
+        while at + TS_PACKET_SIZE <= out.len() {
+            let pkt = &mut out[at..at + TS_PACKET_SIZE];
+            let pid = ts_pid(pkt);
+            let (word, bit) = (pid as usize >> 6, 1u64 << (pid & 63));
+            if pkt[0] == TS_SYNC_BYTE && pid != NULL_PID && self.di_marked[word] & bit == 0 {
+                self.di_marked[word] |= bit;
+                if !set_discontinuity_indicator(pkt) {
+                    let cc = pkt[3] & 0x0F;
+                    let before = if ts_has_payload(pkt) { cc.wrapping_sub(1) & 0x0F } else { cc };
+                    carriers.push((at - start, di_carrier_packet(pid, before)));
+                }
+            }
+            at += TS_PACKET_SIZE;
+        }
+        if carriers.is_empty() {
+            return;
+        }
+        let emitted = out.split_off(start);
+        let mut from = 0;
+        for (rel, carrier) in carriers {
+            out.extend_from_slice(&emitted[from..rel]);
+            out.extend_from_slice(&carrier);
+            from = rel;
+        }
+        out.extend_from_slice(&emitted[from..]);
     }
 
     /// Whether `pid` can carry PES the gate must hold: not PSI / SI, not a
@@ -1759,6 +1818,21 @@ fn rewrite_scte35_pts_adjustment(
     Some(())
 }
 
+/// An adaptation-field-only packet on `pid` with CC `cc` whose only content
+/// is `discontinuity_indicator` (the rest stuffing): what carries the DI
+/// ahead of a first packet that has no adaptation field
+/// ([`TsPtsRewriter::mark_first_packets`]).
+fn di_carrier_packet(pid: u16, cc: u8) -> [u8; TS_PACKET_SIZE] {
+    let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+    pkt[0] = TS_SYNC_BYTE;
+    pkt[1] = (pid >> 8) as u8 & 0x1F;
+    pkt[2] = pid as u8;
+    pkt[3] = 0x20 | (cc & 0x0F); // AFC=10 (AF only)
+    pkt[4] = 183;
+    pkt[5] = 0x80; // discontinuity_indicator
+    pkt
+}
+
 /// Construct a synthetic PCR-only padding packet:
 /// `adaptation_field_control = 0b10` (AF only, no payload), AF length
 /// 183 with PCR_flag set and 176 bytes of 0xFF stuffing. CC is the
@@ -2140,6 +2214,99 @@ mod tests {
         Arc::new(AvSyncPacer::new(handle))
     }
 
+    /// The PIDs whose packets in `stream` a strict receiver drops as
+    /// duplicates: a payload packet with the CC of the PID's last payload
+    /// packet, with no `discontinuity_indicator` on it or on an
+    /// adaptation-field-only packet just before it.
+    fn read_as_duplicates(stream: &[u8]) -> Vec<u16> {
+        use crate::engine::ts_parse::{ts_cc, ts_discontinuity_indicator, ts_has_payload};
+        let mut last: HashMap<u16, u8> = HashMap::new();
+        let mut di: HashSet<u16> = HashSet::new();
+        let mut dups = Vec::new();
+        for pkt in stream.chunks(TS_PACKET_SIZE) {
+            let pid = ts_pid(pkt);
+            if ts_discontinuity_indicator(pkt) {
+                di.insert(pid);
+            }
+            if !ts_has_payload(pkt) {
+                continue;
+            }
+            let cc = ts_cc(pkt);
+            if last.get(&pid) == Some(&cc) && !di.contains(&pid) {
+                dups.push(pid);
+            }
+            di.remove(&pid);
+            last.insert(pid, cc);
+        }
+        dups
+    }
+
+    /// A restarted flow's rewriter marks its first packet on each PID with
+    /// `discontinuity_indicator` — in place where the packet has an
+    /// adaptation field, else on an adaptation-field-only packet just ahead
+    /// of it, one CC before — so whatever CC the source has reached when it
+    /// comes back, no packet reads as a duplicate of the previous
+    /// instance's last on that PID. Without it, 1 restart in 16 per PID put
+    /// the previous instance's last CC on the first packet with other bytes,
+    /// and a strict receiver dropped that PES (7 of 20 restarts on a bench).
+    /// Only the first packet per PID is touched.
+    #[test]
+    fn a_restarted_rewriters_first_packets_never_read_as_duplicates() {
+        use crate::engine::ts_parse::{ts_cc, ts_discontinuity_indicator, ts_has_payload};
+        const V: u16 = 0x100;
+        const A: u16 = 0x101;
+        let base: u64 = 5_000_000_000;
+        // Chunk `k` of the source: PSI, a PCR on the video PID and an audio
+        // PES start, each PID's CC counting on by one a chunk.
+        let chunk = |k: u64| {
+            let cc = (k & 0x0F) as u8;
+            let mut c = build_psi(V, A);
+            let mut pcr = build_pcr_packet(V, base + k * 40 * 27_000);
+            let mut audio = build_pes_packet_pts_only(A, base / 300 + k * 3_600 + 9_000);
+            for p in [&mut pcr[..], &mut audio[..]] {
+                p[3] = (p[3] & 0xF0) | cc;
+            }
+            for p in c.chunks_mut(TS_PACKET_SIZE) {
+                p[3] = (p[3] & 0xF0) | cc;
+            }
+            c.extend_from_slice(&pcr);
+            c.extend_from_slice(&audio);
+            c
+        };
+        for lost in 0..16u64 {
+            let mut wire = Vec::new();
+            let mut first = TsPtsRewriter::new(make_wallclock_pacer());
+            for k in 0..20 {
+                first.process(&chunk(k), &mut wire);
+            }
+            let restart = wire.len();
+            let mut second = TsPtsRewriter::new(make_wallclock_pacer());
+            for k in 20 + lost..40 + lost {
+                second.process(&chunk(k), &mut wire);
+            }
+            assert!(read_as_duplicates(&wire).is_empty(), "{lost} chunks lost: {:?}", read_as_duplicates(&wire));
+            // Each PID's first packet after the restart carries the DI, or
+            // follows an adaptation-field-only packet that does.
+            let after: Vec<&[u8]> = wire[restart..].chunks(TS_PACKET_SIZE).collect();
+            for pid in [0, PSI_PMT_PID, V, A] {
+                let i = after.iter().position(|p| ts_pid(p) == pid).expect("the PID goes out");
+                let p = after[i];
+                if !ts_discontinuity_indicator(p) {
+                    assert!(ts_has_payload(p), "0x{pid:X}");
+                    let carrier = after[..i].iter().rev().find(|q| ts_pid(q) == pid).expect("a carrier");
+                    assert!(ts_discontinuity_indicator(carrier), "0x{pid:X}");
+                    assert!(!ts_has_payload(carrier), "0x{pid:X}: AF only");
+                    assert_eq!(ts_cc(carrier), ts_cc(p).wrapping_sub(1) & 0x0F, "0x{pid:X}: one CC before");
+                }
+                let later = after[i + 1..].iter().filter(|q| ts_pid(q) == pid);
+                assert!(
+                    later.into_iter().all(|q| !ts_discontinuity_indicator(q) || pid == V),
+                    "0x{pid:X}: only the first is marked"
+                );
+            }
+        }
+    }
+
     /// VH1.ts: the PMT sits behind a 0xC0 section on its PID. The rewriter
     /// used to give up on the pointer-target table, re-anchor every PCR and
     /// leave every PES timestamp in the source timeline (−12.6 h PTS−PCR).
@@ -2166,7 +2333,7 @@ mod tests {
         use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, two_packet_pmt};
         let (sec, target) = two_packet_pmt(1, 0);
         let pmt = packetize_sections(0x100, &[&sec], 7);
-        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer()).without_start_marks();
         let mut out = Vec::new();
         r.process(&pat_packet(&[(1, 0x100)], 0, 0), &mut out);
         out.clear();
@@ -2209,7 +2376,7 @@ mod tests {
         af_only[3] = 0x20 | 13; // AF only, the source's last payload CC
         af_only[4] = 183;
         af_only[5] = 0x00;
-        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer()).without_start_marks();
         let mut out = Vec::new();
         r.process(&pat_packet(&[(1, 0x100)], 0, 0), &mut out);
         out.clear();
@@ -2355,7 +2522,7 @@ mod tests {
     fn an_mpts_sends_no_pcr_before_its_pat_and_only_source_pcrs_after() {
         use crate::engine::ts_parse::ts_discontinuity_indicator;
         use crate::engine::ts_test_fixtures::pes_start_packet;
-        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer()).without_start_marks();
         let ms = 27_000u64;
         let clocks = [(0x515u16, 92_934_974 * ms), (0x44D, 92_934_939 * ms), (0x4B1, 92_892_909 * ms)];
         let mut out = Vec::new();
@@ -2459,7 +2626,7 @@ mod tests {
     /// PSI passes through unchanged.
     #[test]
     fn psi_packets_unchanged() {
-        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer()).without_start_marks();
         let psi = build_psi(0x100, 0x101);
         let mut buf = Vec::new();
         r.process(&psi, &mut buf);
@@ -2572,7 +2739,7 @@ mod tests {
         use crate::engine::ts_parse::{pcr_add_27mhz, pcr_fwd_27mhz, ts_discontinuity_indicator};
         const MS: u64 = 27_000;
         let (master, pacer) = step_pacer(5_000 * MS);
-        let mut r = TsPtsRewriter::new(pacer);
+        let mut r = TsPtsRewriter::new(pacer).without_start_marks();
         let mut out = Vec::new();
         r.process(&build_psi(0x100, 0x101), &mut out);
         let src0 = PCR_MODULUS_27MHZ - 3_000 * MS;
@@ -3070,7 +3237,7 @@ mod tests {
     #[test]
     fn psi_rr_natural_emit_advances_past_injections() {
         let pacer = make_wallclock_pacer();
-        let mut r = TsPtsRewriter::new(pacer.clone());
+        let mut r = TsPtsRewriter::new(pacer.clone()).without_start_marks();
         let pcr_pkt = build_pcr_packet(0x100, 50_000_000);
 
         // 1) First natural PSI emit: CC preserved from source (=0).
@@ -3160,7 +3327,7 @@ mod tests {
     #[test]
     fn psi_first_emit_preserves_source_cc() {
         let pacer = make_wallclock_pacer();
-        let mut r = TsPtsRewriter::new(pacer);
+        let mut r = TsPtsRewriter::new(pacer).without_start_marks();
         let mut psi = build_psi(0x100, 0x101);
         // Patch source CCs to non-zero values so the seed is visible.
         psi[3] = (psi[3] & 0xF0) | 0x07;
@@ -3754,7 +3921,7 @@ mod tests {
     /// (commonly multi-second on real-world MPTS captures).
     #[test]
     fn mpts_pat_latches_into_verbatim_passthrough() {
-        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer()).without_start_marks();
         let mut buf = Vec::new();
         // 10-program PAT — typical of a broadcast MPTS capture (matches
         // `broadcast-mpts-hevc-1080p-hd-russia-dttv.ts` shape that
@@ -3951,7 +4118,7 @@ mod tests {
             MasterClockKind::Wallclock,
         );
         handle.set_lipsync_offset_90k(LIPSYNC_90K);
-        let mut r = TsPtsRewriter::new(Arc::new(AvSyncPacer::new(handle)));
+        let mut r = TsPtsRewriter::new(Arc::new(AvSyncPacer::new(handle))).without_start_marks();
 
         let ac3_descs: &[u8] = &[0x0A, 0x04, b'e', b'n', b'g', 0x00, 0x6A, 0x01, 0x44];
         let ttxt_descs: &[u8] = &[0x56, 0x05, b'e', b'n', b'g', 0x10, 0x01];
@@ -4016,7 +4183,7 @@ mod tests {
         const VIDEO_PID: u16 = 0x100;
         const KLV_PID: u16 = 0x103;
 
-        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer()).without_start_marks();
         let psi = build_psi_with_es(&[(0x1B, VIDEO_PID, &[]), (0x06, KLV_PID, &[])]);
         let mut buf = Vec::new();
         r.process(&psi, &mut buf);
@@ -4047,7 +4214,7 @@ mod tests {
         const VIDEO_PID: u16 = 0x100;
         const AIT_PID: u16 = 0x104;
 
-        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer()).without_start_marks();
         let psi = build_psi_with_es(&[(0x1B, VIDEO_PID, &[]), (0x05, AIT_PID, &[])]);
         let mut buf = Vec::new();
         r.process(&psi, &mut buf);

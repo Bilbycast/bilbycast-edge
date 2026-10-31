@@ -1591,6 +1591,11 @@ pub struct PlanarAudioTranscoder {
     fixed_chunk: Option<usize>,
     /// Routed input frames waiting for a whole chunk (streaming mode).
     fifo: Vec<Vec<f32>>,
+    /// Input frames resampled and output frames produced since the
+    /// resampler last started (streaming mode): where the content its delay
+    /// line still holds ends ([`Self::flush_tail`]).
+    src_in: u64,
+    src_out: u64,
 }
 
 impl PlanarAudioTranscoder {
@@ -1638,6 +1643,8 @@ impl PlanarAudioTranscoder {
             src_quality: cfg.src_quality,
             fixed_chunk: None,
             fifo: vec![Vec::new(); cfg.out_channels as usize],
+            src_in: 0,
+            src_out: 0,
         })
     }
 
@@ -1768,14 +1775,7 @@ impl PlanarAudioTranscoder {
                 q.extend_from_slice(src);
             }
             let mut out: Vec<Vec<f32>> = vec![Vec::new(); self.out_channels as usize];
-            while self.buffered_frames() >= chunk {
-                let block: Vec<Vec<f32>> =
-                    self.fifo.iter_mut().map(|q| q.drain(..chunk).collect()).collect();
-                let written = self.resample_block(&block, chunk)?;
-                for (o, c) in out.iter_mut().zip(self.resample_out_scratch.iter()) {
-                    o.extend_from_slice(&c[..written]);
-                }
-            }
+            self.resample_queued(chunk, &mut out)?;
             return Ok(out);
         }
 
@@ -1793,6 +1793,67 @@ impl PlanarAudioTranscoder {
             .iter()
             .map(|c| c[..written].to_vec())
             .collect())
+    }
+
+    /// Resample every whole `chunk` queued in the FIFO (streaming mode),
+    /// appending the output to `out`.
+    fn resample_queued(&mut self, chunk: usize, out: &mut [Vec<f32>]) -> Result<(), String> {
+        while self.buffered_frames() >= chunk {
+            let block: Vec<Vec<f32>> = self.fifo.iter_mut().map(|q| q.drain(..chunk).collect()).collect();
+            let written = self.resample_block(&block, chunk)?;
+            for (o, c) in out.iter_mut().zip(self.resample_out_scratch.iter()) {
+                o.extend_from_slice(&c[..written]);
+            }
+            self.src_in += chunk as u64;
+            self.src_out += written as u64;
+        }
+        Ok(())
+    }
+
+    /// Run out what a streaming stage still holds — the input queued for
+    /// the next chunk and the content in the resampler's delay line — as
+    /// exactly the output frames that carry it, not the zeros fed to push
+    /// it out, and start the resampler afresh (zero history, as when it was
+    /// built, so [`Self::output_delay`] again says where the next input
+    /// comes out). Nothing without rate conversion, where nothing is held,
+    /// or outside streaming mode.
+    ///
+    /// An encoder's re-anchor takes this under its old anchor
+    /// (`AudioEncoder::reanchor_through`): left in the stage, it came out
+    /// after the new one.
+    pub fn flush_tail(&mut self) -> Result<Vec<Vec<f32>>, String> {
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); self.out_channels as usize];
+        let Some(chunk) = self.fixed_chunk.filter(|_| !self.rate_unchanged && self.resampler.is_some()) else {
+            return Ok(out);
+        };
+        let ratio = self.out_rate as f64 / self.in_rate.max(1) as f64;
+        let queued = self.buffered_frames() as u64;
+        let end = ((self.src_in + queued) as f64 * ratio).round() as u64 + self.output_delay() as u64;
+        let want = end.saturating_sub(self.src_out) as usize;
+        // A chunk of zeros outruns the delay line (about half the filter's
+        // length) many times over: two rounds at most.
+        for _ in 0..4 {
+            if out.first().map_or(0, Vec::len) >= want {
+                break;
+            }
+            let fill = chunk - self.buffered_frames() % chunk;
+            for q in self.fifo.iter_mut() {
+                q.resize(q.len() + fill, 0.0);
+            }
+            self.resample_queued(chunk, &mut out)?;
+        }
+        for o in out.iter_mut() {
+            o.truncate(want);
+        }
+        for q in self.fifo.iter_mut() {
+            q.clear();
+        }
+        if let Some(r) = self.resampler.as_mut() {
+            r.reset();
+        }
+        self.src_in = 0;
+        self.src_out = 0;
+        Ok(out)
     }
 
     /// Resample one `n_in`-frame block (the resampler's chunk size) into
@@ -2056,6 +2117,16 @@ impl EncoderStage {
         }
     }
 
+    /// Run out what the stage still holds of what it was fed
+    /// ([`PlanarAudioTranscoder::flush_tail`]) and start it afresh: empty
+    /// without rate conversion, or before it is built.
+    pub fn flush(&mut self) -> Result<Vec<Vec<f32>>, String> {
+        match self.stage.as_mut() {
+            Some(t) => t.flush_tail(),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// The stage's constant delay in output frames (0 without a rate
     /// change, or before it is built).
     pub fn delay(&self) -> usize {
@@ -2065,6 +2136,15 @@ impl EncoderStage {
     /// The output format, once built or pinned.
     pub fn output(&self) -> Option<(u32, u8)> {
         self.out
+    }
+
+    /// The decoded `(rate, channels)` the stage is built for, while it
+    /// converts the rate — the only stage that holds audio back.
+    pub fn rate_converted_input(&self) -> Option<(u32, u8)> {
+        self.stage
+            .as_ref()
+            .filter(|t| t.in_sample_rate() != t.out_sample_rate())
+            .map(|_| self.input)
     }
 }
 

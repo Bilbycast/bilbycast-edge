@@ -262,7 +262,7 @@ split across **two** families — there is no combined `_pcr_errors_total`.
 |--------|------|--------|-------------|
 | `bilbycast_edge_tr101290_ts_packets_total` | counter | `flow_id` | TS packets examined. |
 | `bilbycast_edge_tr101290_sync_byte_errors_total` | counter | `flow_id` | 0x47 sync-byte mismatches. |
-| `bilbycast_edge_tr101290_cc_errors_total` | counter | `flow_id` | Continuity counter discontinuities. |
+| `bilbycast_edge_tr101290_cc_errors_total` | counter | `flow_id` | Continuity counter discontinuities. A break signalled by `discontinuity_indicator` (on the packet, or on an adaptation-field-only packet just ahead of it) is not counted (ISO/IEC 13818-1 §2.4.3.4); up to 0.116.0 it was. A duplicate packet is not counted either. |
 | `bilbycast_edge_tr101290_pat_errors_total` | counter | `flow_id` | PAT-related errors. |
 | `bilbycast_edge_tr101290_pmt_errors_total` | counter | `flow_id` | PMT-related errors. |
 | `bilbycast_edge_tr101290_pid_errors_total` | counter | `flow_id` | PID errors — expected ES PIDs missing. |

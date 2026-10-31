@@ -503,8 +503,8 @@ Required whenever:
 - Packaging **low-latency CMAF / CMAF-LL** — the segmenter expects
   monotonic audio timestamps per segment; gaps cause player stalls.
 
-On CMAF and RTMP the silence is **measured against the picture, not
-ticked by the clock** — one rule, shared by both outputs
+On CMAF, RTMP and WebRTC the silence is **measured against the picture,
+not ticked by the clock** — one rule, shared by all three outputs
 (`audio_encode::EncoderInputClock`). The 500 ms grace is the trigger;
 once it has elapsed, each tick lays down as much silence as it takes to
 bring the audio up to where the audio would be — the newest video PTS
@@ -518,10 +518,29 @@ tracks where the encoder's input is on the source's timeline and
 re-anchors the encoder when a real frame is more than a frame past it (a
 splice, a lost PES, a gap), holds a frame back that is behind it
 (silence overshot the return by the part of the lead the estimate
-missed), and otherwise continues. The eager silent-fallback encoder is
+missed), and otherwise continues. A re-anchor first runs out what the
+encoder still holds of the old timeline under the old anchor
+(`AudioEncoder::reanchor_pts`): the partial frame in its accumulator,
+what its own resampler has queued and the codec's delay line (AAC-LC
+2048 samples, libavcodec its `initial_padding`), pushed through with
+zeros in whole frames, each frame stamped by the content it carries.
+The zeros then fill the delay line, and of the frames after the new
+anchor that carry nothing else all but the last are dropped, so an
+AAC-LC re-anchor's first frame is one frame (21.3 ms at 48 kHz) before
+the new PTS. Up to 0.116.0 the delay line came out first under the new
+anchor: the old programme's last 42.7 ms presented late by the whole
+jump, +320 ms at each loop of a file whose audio ends 320 ms before its
+picture, and the partial frame was dropped. HLS's re-encode chain
+re-anchors the same way. The eager silent-fallback encoder is
 built at the declared rate and rebuilt, with a resampler, on the first
 real frame whose rate or channel count differs — a 44.1 kHz source
-through a 48 kHz encoder used to run 8.8 % slow. On RTMP (since
+through a 48 kHz encoder used to run 8.8 % slow. A rebuild for another
+source rate (an eager encoder meeting its first source, or a source
+changing rate mid-stream) first runs the retired encoder out on its own
+timeline, as a re-anchor does, and the new encoder's priming frames
+that would overlap that run-out are not sent; the retired encoder was
+dropped with the end of the audio before the change in it, a hole the
+new encoder's priming filled. On RTMP (since
 edge#211) the measure is the connection's FLV timeline, the encoder's
 channel / rate stage converts the source instead of a rebuild, and three
 things differ from CMAF. A tick lays at most a second of silence, off
@@ -552,7 +571,28 @@ joins it; further past (a stray timestamp, or a hole in the audio
 meanwhile) that one picture goes out where the audio is, and the next at
 its own time.
 RTMP's silence used to be one chunk a tick, wall-clock, and every tick
-observed late was lost for good.
+observed late was lost for good. While the channel / rate stage converts
+the source's rate, the silence goes through the stage at the source's
+format (`audio_encode::lay_silence`), so the real audio its resampler
+still holds (up to ~8 ms) goes out ahead of the silence on time; laid
+straight into the encoder, the silence went in ahead of that audio,
+which came out after it, late by the whole silence.
+
+WebRTC (WHEP viewer and WHIP client) places its Opus encoder the same
+way, by the rule RTMP shares: re-anchored where the source's PTS leaves
+its input (a loop, a switch, a gap — through its stage, so what either
+holds of the old timeline goes out on it), a forward gap zero-filled
+under `silent_fallback`, a frame behind its input held back, each frame
+of an MP2 / AC-3 / E-AC-3 PES at its own time, and `silent_fallback`'s
+silence laid to the newest picture less its lead (4 s reach, a second a
+tick), or with no picture one chunk a tick from the input or the newest
+audio. Every Opus frame's RTP time is its place on the source's
+timeline, like the picture's. Up to 0.116.0 the encoder anchored on its
+first frame and took every frame after as the next: a loop whose audio
+ends 320 ms before its picture put the audio's RTP time 320 ms further
+behind the picture's at every lap, and the silence ran from RTP time 0
+(the generator's own count), whatever the picture's time. Nothing is
+laid before the session has seen a picture or audio.
 
 The demuxer hands an MP2 / AC-3 / E-AC-3 PES out only when the next one
 begins, so the last PES before an outage reaches the output beside the
@@ -839,14 +879,25 @@ the sample:
     silence, inserted at the source rate ahead of the PES's audio and
     passed through the rate / channel stage; on a `media_player` input the
     output PTS step over the gap instead, because its file splices step PTS
-    over audio that is continuous — at the PES that shows the step, since a
-    file's timestamps carry no jitter to wait out (waiting 150 ms presented
-    that much audio early by the step at every loop);
+    over audio that is continuous — found at the PES that shows the step,
+    since a file's timestamps carry no jitter to wait out (waiting 150 ms
+    presented that much audio early by the step at every loop), and taken
+    on the first output frame whose content is mostly past it: what the
+    decoder, the stage and the encoder still hold when that PES arrives
+    (AAC-LC's delay line alone is 2048 samples) is audio from before the
+    step and keeps the old stamps. Up to 0.116.0 the step went on the next
+    frame out, presenting that audio late by the whole step;
   - an **overlap**, by the same rules: that much audio dropped from the
     head of what follows (the count of placed content may go below the
     anchor: a PES stamped 150 ms behind one AU after an anchor drops
     exactly 150 ms);
-  - a step over 500 ms, **either way**: re-anchor at the new PTS. A source
+  - a step over 500 ms, **either way**: re-anchor at the new PTS, after
+    running out what the pipeline still holds (the held tail, the stage,
+    the encoder's accumulator and delay line) on the old timeline with
+    silence, which is not counted in `silence_inserted_samples` (until
+    0.116.0 it went out just ahead of the new PTS, on the new timeline;
+    after a step back of over 1 s the PCR stage drops it as the previous
+    epoch's). A source
     that resets its clock back (an encoder restart, an ffmpeg
     `-stream_loop` wrap) takes its PCR and its video back with it, and the
     transcode chain's PCR stage drops re-encoded PES left on the old
@@ -1215,7 +1266,15 @@ output takes it off its stamps:
   declares the stage's delay as it stands first: a stage built after the
   encoder (a silent fallback's, on the first real frame) or rebuilt for
   another source format gains its resampler late, and declared once at
-  build time (as 0) its delay stayed on every stamp.
+  build time (as 0) its delay stayed on every stamp. A re-anchor goes
+  through `AudioEncoder::reanchor_through`, which runs the stage's queue
+  and delay line (up to ~8 ms) out under the old anchor and restarts its
+  resampler, so the new anchor's declared delay is what the stage holds:
+  left in the stage, that tail came out after the new anchor, late by the
+  jump, and the input it still had queued (under one 256-frame chunk) put
+  every stamp after the anchor that much late. HLS does the same.
+  `silent_fallback`'s silence goes through a stage that converts the rate
+  (see "Silent fallback" above).
 - HLS: one re-encode chain runs across the output's segments
   (`output_hls::HlsAudioChain`) — the AU cutter, the decoder, the stage and
   the same `AudioEncoder` RTMP and WebRTC use, so its delay comes off the
