@@ -1079,12 +1079,11 @@ async fn srt_input_redundant_loop(
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
                         if pair.format == SrtPayloadFormat::Unknown {
-                            // NULL packets alone decide nothing (`detect_format`).
-                            let Some(detected) = detect_format(&data) else {
+                            // Settled once (`settle_pair_format`); NULL
+                            // packets alone decide nothing.
+                            if !settle_pair_format(&mut pair.format, &data, events, flow_id, redundancy.path_differential_ms) {
                                 continue;
-                            };
-                            pair.format = detected;
-                            log_detected_format_redundant(pair.format, events, flow_id, redundancy.path_differential_ms);
+                            }
                             srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
                         }
                         process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, pair.format, RedundantPacketState { raw_ts_seq: &mut pair.raw_ts_seq_leg1, raw_ts_timestamp: &mut pair.raw_ts_timestamp, merger: &mut pair.merger, merger_handoff: &mut pair.merger_handoff, failover: &mut pair.failover, prev_active_leg: &mut pair.prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
@@ -1104,12 +1103,11 @@ async fn srt_input_redundant_loop(
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
                         if pair.format == SrtPayloadFormat::Unknown {
-                            // NULL packets alone decide nothing (`detect_format`).
-                            let Some(detected) = detect_format(&data) else {
+                            // Settled once (`settle_pair_format`); NULL
+                            // packets alone decide nothing.
+                            if !settle_pair_format(&mut pair.format, &data, events, flow_id, redundancy.path_differential_ms) {
                                 continue;
-                            };
-                            pair.format = detected;
-                            log_detected_format_redundant(pair.format, events, flow_id, redundancy.path_differential_ms);
+                            }
                             srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
                         }
                         process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, pair.format, RedundantPacketState { raw_ts_seq: &mut pair.raw_ts_seq_leg2, raw_ts_timestamp: &mut pair.raw_ts_timestamp, merger: &mut pair.merger, merger_handoff: &mut pair.merger_handoff, failover: &mut pair.failover, prev_active_leg: &mut pair.prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
@@ -1495,21 +1493,29 @@ fn log_detected_format(format: SrtPayloadFormat) {
     }
 }
 
-/// Variant of `log_detected_format` for the redundant-input loop. When raw
-/// TS lands on a 2022-7-configured input, real hitless dedup is impossible
-/// (no shared transport-layer seq across legs) — the runtime falls back to
-/// active-leg protection-switching. Emit a Warning event so operators
-/// understand what mode they're actually getting. A `path_differential_ms`
-/// the input sets has nothing to hold on either, which the event says too:
-/// the message stays the same, so filters on it keep matching.
-fn log_detected_format_redundant(
-    format: SrtPayloadFormat,
+/// Settle a 2022-7 pair's payload format from `data`, a datagram either leg
+/// delivered while it was still unknown, as [`settle_format`] settles a
+/// single socket's: data that is neither RTP nor raw TS is taken for raw TS,
+/// so the format is settled once. When raw TS lands on a 2022-7-configured
+/// input, real hitless dedup is impossible (no shared transport-layer seq
+/// across legs) — the runtime falls back to active-leg protection-switching.
+/// Emit a Warning event, once per settle, so operators understand what mode
+/// they're actually getting. Returns `false`, leaving the format unknown,
+/// for a datagram that cannot decide it, which the loop then drops. A
+/// `path_differential_ms` the input sets has nothing to hold on raw TS
+/// either, which the event says too: the message stays the same, so filters
+/// on it keep matching.
+fn settle_pair_format(
+    format: &mut SrtPayloadFormat,
+    data: &[u8],
     events: &EventSender,
     flow_id: &str,
     path_differential_ms: Option<u32>,
-) {
-    log_detected_format(format);
-    if matches!(format, SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown) {
+) -> bool {
+    if !settle_format(format, data) {
+        return false;
+    }
+    if *format == SrtPayloadFormat::RawTs {
         tracing::warn!(
             "SRT redundant input: raw TS has no shared cross-leg seq — running active-leg failover, NOT hitless dedup. \
              Configure the publisher to send RTP/TS (SMPTE ST 2022-2) for true 2022-7 hitless behaviour."
@@ -1538,6 +1544,7 @@ fn log_detected_format_redundant(
             details,
         );
     }
+    true
 }
 
 /// Stall threshold for the raw-TS active-leg failover path. If the active
@@ -2465,6 +2472,87 @@ mod tests {
         assert_eq!(flow.input_packets.load(Ordering::Relaxed), 3);
     }
 
+    /// A 2022-7 SRT listener input on loopback with a caller on each leg.
+    struct PairInput {
+        published: broadcast::Receiver<RtpPacket>,
+        events: tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        leg1: Arc<SrtSocket>,
+        leg2: Arc<SrtSocket>,
+        _stop: tokio_util::sync::DropGuard,
+    }
+
+    impl PairInput {
+        async fn start() -> Self {
+            let (port1, port2) = (free_port(), free_port());
+            let flow =
+                Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+            flow.set_active_input_id("pair");
+            let (tx, published) = broadcast::channel(4096);
+            let (events, events_rx) = crate::manager::events::event_channel();
+            let cancel = CancellationToken::new();
+            spawn_srt_input(
+                srt_config(serde_json::json!({
+                    "mode": "listener", "local_addr": format!("127.0.0.1:{port1}"),
+                    "latency_ms": 200,
+                    "redundancy": {
+                        "mode": "listener", "local_addr": format!("127.0.0.1:{port2}"),
+                        "latency_ms": 200
+                    }
+                })),
+                tx,
+                flow,
+                cancel.child_token(),
+                events,
+                "f1".into(),
+                "pair".into(),
+                Arc::new(AtomicBool::new(false)),
+                None,
+            );
+            let caller = |port: u16| {
+                srt_config(serde_json::json!({
+                    "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+                }))
+            };
+            let leg1 = crate::srt::connection::connect_srt_input(&caller(port1), &cancel)
+                .await
+                .expect("leg 1 connects");
+            let leg2 = crate::srt::connection::connect_srt_input(&caller(port2), &cancel)
+                .await
+                .expect("leg 2 connects");
+            Self { published, events: events_rx, leg1, leg2, _stop: cancel.drop_guard() }
+        }
+
+        /// What the pair published once `expect` packets were (or 5 s
+        /// passed), plus half a second more to show nothing else comes.
+        async fn published(&mut self, expect: usize) -> Vec<RtpPacket> {
+            let mut published = Vec::new();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while published.len() < expect {
+                match tokio::time::timeout_at(deadline, self.published.recv()).await {
+                    Ok(Ok(packet)) => published.push(packet),
+                    _ => break,
+                }
+            }
+            while let Ok(Ok(packet)) =
+                tokio::time::timeout(Duration::from_millis(500), self.published.recv()).await
+            {
+                published.push(packet);
+            }
+            published
+        }
+
+        /// The `error_code` of every event raised so far.
+        fn error_codes(&mut self) -> Vec<String> {
+            let mut codes = Vec::new();
+            while let Ok(event) = self.events.try_recv() {
+                if let Some(code) = event.details.as_ref().and_then(|d| d["error_code"].as_str()) {
+                    codes.push(code.to_string());
+                }
+            }
+            codes
+        }
+    }
+
     /// A 2022-7 pair whose first datagram is the flow's keepalive, on leg 1,
     /// settles on the RTP both legs send after it: each seq is published
     /// once as RTP and no raw-TS failover Warning is raised. It used to
@@ -2472,73 +2560,43 @@ mod tests {
     /// header inside the TS until both legs dropped.
     #[tokio::test]
     async fn a_keepalive_first_on_a_2022_7_pair_leaves_the_rtp_to_settle_the_format() {
-        let (port1, port2) = (free_port(), free_port());
-        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
-        flow.set_active_input_id("pair");
-        let (tx, mut rx) = broadcast::channel(4096);
-        let (events, mut events_rx) = crate::manager::events::event_channel();
-        let cancel = CancellationToken::new();
-        let _stop = cancel.clone().drop_guard();
-        spawn_srt_input(
-            srt_config(serde_json::json!({
-                "mode": "listener", "local_addr": format!("127.0.0.1:{port1}"), "latency_ms": 200,
-                "redundancy": {
-                    "mode": "listener", "local_addr": format!("127.0.0.1:{port2}"),
-                    "latency_ms": 200
-                }
-            })),
-            tx,
-            flow.clone(),
-            cancel.child_token(),
-            events,
-            "f1".into(),
-            "pair".into(),
-            Arc::new(AtomicBool::new(false)),
-            None,
-        );
-        let caller = |port: u16| {
-            srt_config(serde_json::json!({
-                "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
-            }))
-        };
-        let leg1 = crate::srt::connection::connect_srt_input(&caller(port1), &cancel)
-            .await
-            .expect("leg 1 connects");
-        let leg2 = crate::srt::connection::connect_srt_input(&caller(port2), &cancel)
-            .await
-            .expect("leg 2 connects");
-
-        leg1.send(&keepalive()).await.expect("leg 1 sends");
+        let mut pair = PairInput::start().await;
+        pair.leg1.send(&keepalive()).await.expect("leg 1 sends");
         // Delivered a latency after it is sent, well ahead of the RTP.
         tokio::time::sleep(Duration::from_millis(100)).await;
         for seq in 0..20u16 {
-            leg1.send(&rtp_datagram(seq)).await.expect("leg 1 sends");
-            leg2.send(&rtp_datagram(seq)).await.expect("leg 2 sends");
+            pair.leg1.send(&rtp_datagram(seq)).await.expect("leg 1 sends");
+            pair.leg2.send(&rtp_datagram(seq)).await.expect("leg 2 sends");
         }
 
-        let mut published = Vec::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while published.len() < 20 {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Ok(packet)) => published.push(packet),
-                _ => break,
-            }
-        }
-        while let Ok(Ok(packet)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
-            published.push(packet);
-        }
+        let published = pair.published(20).await;
         assert_eq!(published.len(), 20, "each seq once, nothing else");
         for (seq, packet) in published.iter().enumerate() {
             assert!(!packet.is_raw_ts, "published as RTP");
             assert_eq!(&packet.data[..], &rtp_datagram(seq as u16)[..]);
         }
-        let mut codes = Vec::new();
-        while let Ok(event) = events_rx.try_recv() {
-            if let Some(code) = event.details.as_ref().and_then(|d| d["error_code"].as_str()) {
-                codes.push(code.to_string());
-            }
-        }
+        let codes = pair.error_codes();
         assert!(!codes.iter().any(|c| c == "redundancy_failover_mode"), "{codes:?}");
+    }
+
+    /// A 2022-7 pair fed data that is neither RTP nor TS takes it for raw TS
+    /// once, as a single-socket input does: one `redundancy_failover_mode`
+    /// Warning for the lot, and each datagram published through the raw-TS
+    /// failover. The pair used to leave its format unknown, detect it again
+    /// on every datagram and raise the Warning on each, at packet rate.
+    #[tokio::test]
+    async fn unrecognised_data_settles_a_2022_7_pair_once() {
+        let mut pair = PairInput::start().await;
+        for _ in 0..20 {
+            pair.leg1.send(&[0u8; 64]).await.expect("leg 1 sends");
+        }
+
+        let published = pair.published(20).await;
+        assert_eq!(published.len(), 20, "each datagram once");
+        assert!(published.iter().all(|p| p.is_raw_ts && p.data[..] == [0u8; 64]));
+        let codes = pair.error_codes();
+        let warnings = codes.iter().filter(|c| *c == "redundancy_failover_mode").count();
+        assert_eq!(warnings, 1, "{codes:?}");
     }
 
     fn srt_config(value: serde_json::Value) -> SrtInputConfig {
@@ -3302,8 +3360,12 @@ mod tests {
     #[test]
     fn raw_ts_failover_warning_says_the_hold_does_not_apply() {
         let (events, mut events_rx) = crate::manager::events::event_channel();
-        log_detected_format_redundant(SrtPayloadFormat::RawTs, &events, "f1", Some(200));
-        log_detected_format_redundant(SrtPayloadFormat::RawTs, &events, "f1", None);
+        let raw_ts = vec![0x47u8; 188];
+        let mut format = SrtPayloadFormat::Unknown;
+        assert!(settle_pair_format(&mut format, &raw_ts, &events, "f1", Some(200)));
+        let mut format = SrtPayloadFormat::Unknown;
+        assert!(settle_pair_format(&mut format, &raw_ts, &events, "f1", None));
+        assert_eq!(format, SrtPayloadFormat::RawTs);
         let held = events_rx.try_recv().expect("the Warning");
         let plain = events_rx.try_recv().expect("the Warning");
         assert_eq!(held.message, plain.message);

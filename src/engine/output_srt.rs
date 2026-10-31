@@ -653,12 +653,30 @@ async fn srt_output_listener_loop(
         // where the caller's handshake timed out and retried with a new socket ID.
         // Send a few packets and check for ACK responses within 3 seconds of
         // the first (`ProbeWindow`).
-        let is_alive = {
+        //
+        // The probe sends what the flow publishes as it came, so it runs only
+        // on an output whose forward loop does too (`forwards_unchanged`).
+        // On any other, the caller's first datagrams would be a stream the
+        // one after them contradicts — an RTP-framed input's datagrams ahead
+        // of the transcode chain's raw TS, which a receiver that settles its
+        // framing on the first datagram then drops — so there is nothing the
+        // probe may send and the caller is kept, as a probe offered nothing
+        // keeps it.
+        //
+        // The probe holds the flow's keepalives back as the forward loop
+        // does, and the forward loop goes on from what it learnt of the
+        // connection's framing.
+        let mut keepalive_gate = KeepaliveGate::default();
+        let probe = forwards_unchanged(
+            config,
+            program_filter.as_ref(),
+            pid_remapper.as_ref(),
+            pid_overrides_rewriter.as_ref(),
+            transcode_chain.as_ref(),
+        );
+        let is_alive = if probe {
             let mut test_rx = broadcast_tx.subscribe();
             let mut sent = 0u32;
-            // The probe sends what it receives as it came, so it holds the
-            // flow's keepalives back as the forward loop does.
-            let mut keepalive_gate = KeepaliveGate::default();
             let mut window = ProbeWindow::new(tokio::time::Instant::now());
             loop {
                 tokio::select! {
@@ -712,6 +730,8 @@ async fn srt_output_listener_loop(
                     }
                 }
             }
+        } else {
+            true
         };
 
         if !is_alive {
@@ -733,7 +753,7 @@ async fn srt_output_listener_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), None, poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone(), keepalive_gate).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -887,7 +907,7 @@ async fn srt_output_caller_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), None, poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone(), KeepaliveGate::default()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -1141,6 +1161,31 @@ impl ProbeWindow {
     }
 }
 
+/// Whether `srt_output_forward_loop` sends each datagram the flow publishes
+/// as it came — the same bytes in the same framing, when they came. A
+/// listener output's liveness probe sends them so, and may only where the
+/// stream after it does too. Every stage the forward loop can run changes
+/// that: SMPTE 302M re-muxes the audio (taken as running whenever
+/// `transport_mode` asks for it), the program filter and the PID rewrites
+/// (`pid_overrides`, `pid_map`) rewrite the TS, the transcode chain
+/// re-encodes it and sends it raw TS whatever the input's framing (the CBR
+/// padder runs on the chain's output alone), and the delay buffer holds it
+/// back.
+fn forwards_unchanged(
+    config: &SrtOutputConfig,
+    program_filter: Option<&TsProgramFilter>,
+    pid_remapper: Option<&TsPidRemapper>,
+    pid_overrides_rewriter: Option<&TsPidOverridesRewriter>,
+    transcode_chain: Option<&crate::engine::transcode_chain::TranscodeChain>,
+) -> bool {
+    !matches!(config.transport_mode.as_deref(), Some("audio_302m"))
+        && config.delay.is_none()
+        && program_filter.is_none()
+        && pid_remapper.is_none()
+        && pid_overrides_rewriter.is_none()
+        && transcode_chain.is_none()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn srt_output_forward_loop(
     config: &SrtOutputConfig,
@@ -1156,6 +1201,10 @@ async fn srt_output_forward_loop(
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
+    // Per connection: a receiver that settles its framing does so on the
+    // first datagram this connection brings it. Fresh on a new connection,
+    // or what a listener output's liveness probe learnt on this one.
+    mut keepalive_gate: KeepaliveGate,
 ) -> anyhow::Result<bool> {
     let (send_tx, mut send_rx) = send_queue();
     let send_sink = sink.clone();
@@ -1305,10 +1354,6 @@ async fn srt_output_forward_loop(
     // `Lagged` path (which does log) stays quiet throughout. Warn, throttled.
     let mut send_queue_dropped: u64 = 0;
     let mut send_queue_warned_at: Option<Instant> = None;
-
-    // Per connection: a receiver that settles its framing does so on the
-    // first datagram this connection brings it.
-    let mut keepalive_gate = KeepaliveGate::default();
 
     let connection_lost = loop {
         // Second, independent liveness check. The `Closed` arm below only
@@ -2578,6 +2623,7 @@ async fn srt_output_bonded_loop(
                     &mut transcode_chain,
                     &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
+                    KeepaliveGate::default(),
                 )
                 .await?;
                 poller_cancel.cancel();
@@ -2675,6 +2721,7 @@ async fn srt_output_bonded_loop(
                     &mut transcode_chain,
                     &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
+                    KeepaliveGate::default(),
                 )
                 .await?;
                 poller_cancel.cancel();
@@ -3773,14 +3820,76 @@ mod tests {
 
     /// An RTP/TS datagram: the header and six TS packets on PID 0x100.
     fn rtp_datagram(seq: u16) -> Vec<u8> {
+        let mut ts = Vec::with_capacity(6 * 188);
+        for _ in 0..6 {
+            ts.extend_from_slice(&[0x47, 0x01, 0x00, 0x10]);
+            ts.extend_from_slice(&[0xFF; 184]);
+        }
+        rtp_carrying(seq, &ts)
+    }
+
+    /// An RTP/TS datagram numbered `seq` carrying the TS packets `ts`.
+    fn rtp_carrying(seq: u16, ts: &[u8]) -> Vec<u8> {
         let mut d = vec![0x80, 33];
         d.extend_from_slice(&seq.to_be_bytes());
         d.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 1]);
-        for _ in 0..6 {
-            d.extend_from_slice(&[0x47, 0x01, 0x00, 0x10]);
-            d.extend_from_slice(&[0xFF; 184]);
-        }
+        d.extend_from_slice(ts);
         d
+    }
+
+    /// Spawns `config` on a flow of its own whose sender nothing else has
+    /// subscribed, stopped by `cancel`: the flow's sender, and the events the
+    /// output raises.
+    fn spawn_output_alone(
+        config: SrtOutputConfig,
+        cancel: &CancellationToken,
+    ) -> (broadcast::Sender<RtpPacket>, tokio::sync::mpsc::Receiver<crate::manager::events::Event>)
+    {
+        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
+        let (tx, rx) = broadcast::channel(64);
+        drop(rx);
+        let (event_sender, events_rx) = crate::manager::events::event_channel();
+        let _output = spawn_srt_output(
+            config,
+            &tx,
+            stats,
+            cancel.child_token(),
+            SrtOutputCtx {
+                event_sender,
+                flow_id: "f1".into(),
+                input_format: None,
+                compressed_audio_input: false,
+                frame_rate_rx: None,
+                active_input_rx: tokio::sync::watch::channel(String::new()).1,
+            },
+        );
+        (tx, events_rx)
+    }
+
+    /// A caller connected to the listener output on `port`.
+    async fn caller_of(port: u16, cancel: &CancellationToken) -> Arc<SrtSocket> {
+        let caller: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+            .expect("SRT caller fixture");
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::srt::connection::connect_srt_input(&caller, cancel),
+        )
+        .await
+        .expect("caller connects in time")
+        .expect("caller connects")
+    }
+
+    /// A listener output on `port` with `extra` in its config.
+    fn listener_output(port: u16, extra: serde_json::Value) -> SrtOutputConfig {
+        let mut config = serde_json::json!({
+            "id": "o1", "name": "o1", "mode": "listener",
+            "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        });
+        config.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(config).expect("SRT output fixture")
     }
 
     /// The flow's keepalive goes only into a raw-TS stream: held back before
@@ -3836,26 +3945,9 @@ mod tests {
             "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
         }))
         .expect("SRT output fixture");
-        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
-        let (tx, rx) = broadcast::channel(64);
-        drop(rx);
-        let (event_sender, _events_rx) = crate::manager::events::event_channel();
         let cancel = CancellationToken::new();
         let _stop = cancel.clone().drop_guard();
-        let _output = spawn_srt_output(
-            config,
-            &tx,
-            stats,
-            cancel.child_token(),
-            SrtOutputCtx {
-                event_sender,
-                flow_id: "f1".into(),
-                input_format: None,
-                compressed_audio_input: false,
-                frame_rate_rx: None,
-                active_input_rx: tokio::sync::watch::channel(String::new()).1,
-            },
-        );
+        let (tx, _events_rx) = spawn_output_alone(config, &cancel);
         let peer = tokio::time::timeout(
             Duration::from_secs(10),
             accept_srt_connection(&mut listener, &cancel),
@@ -3905,30 +3997,10 @@ mod tests {
     #[tokio::test]
     async fn a_silent_listener_output_keeps_its_caller_and_notices_it_go() {
         let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
-            "id": "o1", "name": "o1", "mode": "listener",
-            "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
-        }))
-        .expect("SRT output fixture");
-        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
-        let (tx, _rx) = broadcast::channel(64);
-        let (event_sender, mut events_rx) = crate::manager::events::event_channel();
         let cancel = CancellationToken::new();
         let _stop = cancel.clone().drop_guard();
-        let _output = spawn_srt_output(
-            config,
-            &tx,
-            stats,
-            cancel.child_token(),
-            SrtOutputCtx {
-                event_sender,
-                flow_id: "f1".into(),
-                input_format: None,
-                compressed_audio_input: false,
-                frame_rate_rx: None,
-                active_input_rx: tokio::sync::watch::channel(String::new()).1,
-            },
-        );
+        let (tx, mut events_rx) =
+            spawn_output_alone(listener_output(port, serde_json::json!({})), &cancel);
         let (pump_tx, stop) = (tx.clone(), cancel.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -3941,18 +4013,7 @@ mod tests {
                 }
             }
         });
-        let caller: crate::config::models::SrtInputConfig =
-            serde_json::from_value(serde_json::json!({
-                "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
-            }))
-            .expect("SRT caller fixture");
-        let peer = tokio::time::timeout(
-            Duration::from_secs(10),
-            crate::srt::connection::connect_srt_input(&caller, &cancel),
-        )
-        .await
-        .expect("caller connects in time")
-        .expect("caller connects");
+        let peer = caller_of(port, &cancel).await;
 
         // Past the probe's 3 s.
         let quiet = tokio::time::timeout(Duration::from_secs(4), peer.recv()).await;
@@ -4098,30 +4159,10 @@ mod tests {
     #[tokio::test]
     async fn a_listener_output_whose_media_comes_late_keeps_a_distant_caller() {
         let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
-            "id": "o1", "name": "o1", "mode": "listener",
-            "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
-        }))
-        .expect("SRT output fixture");
-        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
-        let (tx, _rx) = broadcast::channel(64);
-        let (event_sender, mut events_rx) = crate::manager::events::event_channel();
         let cancel = CancellationToken::new();
         let _stop = cancel.clone().drop_guard();
-        let _output = spawn_srt_output(
-            config,
-            &tx,
-            stats,
-            cancel.child_token(),
-            SrtOutputCtx {
-                event_sender,
-                flow_id: "f1".into(),
-                input_format: None,
-                compressed_audio_input: false,
-                frame_rate_rx: None,
-                active_input_rx: tokio::sync::watch::channel(String::new()).1,
-            },
-        );
+        let (tx, mut events_rx) =
+            spawn_output_alone(listener_output(port, serde_json::json!({})), &cancel);
         // The flow: its keepalive until `media` is set, then raw TS.
         let media = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (pump_tx, pump_media, stop) = (tx.clone(), media.clone(), cancel.clone());
@@ -4229,23 +4270,7 @@ mod tests {
             ] },
         }))
         .expect("SRT output fixture");
-        let stats = Arc::new(OutputStatsAccumulator::new("o1".into(), "o1".into(), "srt".into()));
-        let (tx, _rx) = broadcast::channel(64);
-        let (event_sender, mut events_rx) = crate::manager::events::event_channel();
-        let _output = spawn_srt_output(
-            config,
-            &tx,
-            stats,
-            cancel.child_token(),
-            SrtOutputCtx {
-                event_sender,
-                flow_id: "f1".into(),
-                input_format: None,
-                compressed_audio_input: false,
-                frame_rate_rx: None,
-                active_input_rx: tokio::sync::watch::channel(String::new()).1,
-            },
-        );
+        let (tx, mut events_rx) = spawn_output_alone(config, &cancel);
         let (pump_tx, stop) = (tx.clone(), cancel.clone());
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(50));
@@ -4290,5 +4315,154 @@ mod tests {
 
         group.close().await.unwrap();
         wait_for_event(&mut events_rx, &mut events, "SRT bonded output 'o1' disconnected").await;
+    }
+
+    /// The listener probe runs only on an output whose forward loop sends
+    /// what the flow publishes unchanged: not with SMPTE 302M, a delay, a
+    /// program filter or a PID rewrite, nor with a transcode chain
+    /// (`a_transcoding_listener_output_sends_no_rtp_ahead_of_its_raw_ts`).
+    #[test]
+    fn only_an_output_running_no_stage_forwards_unchanged() {
+        let unchanged = |extra: serde_json::Value| {
+            let config = listener_output(9000, extra);
+            let filter = config.program_number.map(TsProgramFilter::new);
+            forwards_unchanged(
+                &config,
+                filter.as_ref(),
+                build_pid_remapper(&config).as_ref(),
+                build_pid_overrides_rewriter(&config).as_ref(),
+                None,
+            )
+        };
+        assert!(unchanged(serde_json::json!({})));
+        for stage in [
+            serde_json::json!({ "transport_mode": "audio_302m" }),
+            serde_json::json!({ "delay": { "mode": "fixed", "ms": 100 } }),
+            serde_json::json!({ "program_number": 1 }),
+            serde_json::json!({ "pid_map": { "256": 512 } }),
+            serde_json::json!({ "pid_overrides": { "1": { "video_pid": 512 } } }),
+        ] {
+            assert!(!unchanged(stage.clone()), "{stage}");
+        }
+    }
+
+    /// A listener output that transcodes, fed an RTP-framed input, sends a
+    /// new caller the transcode chain's raw TS and nothing ahead of it. Its
+    /// liveness probe sends what the flow publishes as it came, so it does
+    /// not run there: it sent the input's RTP datagrams first, and a receiver
+    /// that settles its framing on the first datagram then dropped every
+    /// raw-TS datagram after them.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn a_transcoding_listener_output_sends_no_rtp_ahead_of_its_raw_ts() {
+        use crate::engine::ts_test_fixtures::{
+            packetize_sections, pat_packet, payload_packet, pmt_section,
+        };
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let config =
+            listener_output(port, serde_json::json!({ "audio_encode": { "codec": "aac_lc" } }));
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (tx, _events_rx) = spawn_output_alone(config, &cancel);
+        // The flow: an RTP input whose program carries video alone, which the
+        // chain passes through, raw TS.
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[])]);
+        let (pump_tx, stop) = (tx.clone(), cancel.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(20));
+            let mut seq = 0u16;
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                let cc = seq as u8;
+                let mut ts = pat_packet(&[(1, 0x1000)], 0, cc).to_vec();
+                ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], cc)[0]);
+                for i in 0..5 {
+                    let video_cc = cc.wrapping_mul(5).wrapping_add(i);
+                    ts.extend_from_slice(&payload_packet(0x100, video_cc));
+                }
+                let _ = pump_tx.send(published(rtp_carrying(seq, &ts), false));
+                seq = seq.wrapping_add(1);
+            }
+        });
+        let peer = caller_of(port, &cancel).await;
+
+        // Everything the caller is sent over 2 s from the first datagram.
+        let first = tokio::time::timeout(Duration::from_secs(10), peer.recv())
+            .await
+            .expect("the transcoded stream arrives")
+            .expect("the connection stays up");
+        let mut got = vec![first.data];
+        let until = Instant::now() + Duration::from_secs(2);
+        while let Ok(Ok(datagram)) = tokio::time::timeout_at(until, peer.recv()).await {
+            got.push(datagram.data);
+        }
+        for (i, datagram) in got.iter().enumerate() {
+            assert_eq!(datagram[0], 0x47, "datagram {i} of {} is raw TS, not RTP", got.len());
+        }
+    }
+
+    /// A listener output's forward loop goes on from what its liveness probe
+    /// learnt of the connection's framing: once the probe has sent raw-TS
+    /// media, the flow's keepalives through the input gap after it go on
+    /// reaching the caller when the probe is done, as they did during it.
+    /// Started afresh, the forward loop took the framing for unknown and held
+    /// them back until the input delivered again.
+    #[tokio::test]
+    async fn a_listener_output_goes_on_from_the_framing_its_probe_learnt() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (tx, _events_rx) =
+            spawn_output_alone(listener_output(port, serde_json::json!({})), &cancel);
+        let peer = caller_of(port, &cancel).await;
+        // The probe subscribes once it has accepted the caller.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tx.receiver_count() == 0 {
+            assert!(Instant::now() < deadline, "timed out waiting for the probe to subscribe");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Five media datagrams, then the input falls silent: the flow's
+        // keepalive alone, every 50 ms.
+        let media = PairHarness::media();
+        for _ in 0..5 {
+            tx.send(published(media.to_vec(), true)).expect("the probe is subscribed");
+        }
+        let (pump_tx, stop) = (tx.clone(), cancel.clone());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {
+                        let _ = pump_tx.send(crate::engine::flow::null_ts_packet());
+                    }
+                }
+            }
+        });
+        let first = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+            .await
+            .expect("media arrives")
+            .expect("the connection stays up");
+        assert_eq!(&first.data[..], &media[..]);
+        let first_at = Instant::now();
+
+        // The probe's 3 s run from its first datagram, which reached the
+        // caller a latency after it went: a keepalive arriving 3.6 s after it
+        // came from the forward loop.
+        let keepalive = crate::engine::flow::null_ts_packet().data;
+        let mut from_forward_loop = 0;
+        let until = first_at + Duration::from_secs(5);
+        while let Ok(Ok(datagram)) = tokio::time::timeout_at(until, peer.recv()).await {
+            if datagram.data == keepalive
+                && Instant::now() > first_at + Duration::from_millis(3_600)
+            {
+                from_forward_loop += 1;
+            }
+        }
+        assert!(from_forward_loop > 0, "the forward loop sends the keepalives on");
     }
 }
