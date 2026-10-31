@@ -86,9 +86,9 @@ impl RedundantMerger {
         }
     }
 
-    fn observe_ssrc(&mut self, leg: ActiveLeg, ssrc: u32) {
+    fn observe_ssrc(&mut self, leg: ActiveLeg, ssrc: u32, now: std::time::Instant) {
         if let Self::Buffered(m) = self {
-            m.observe_ssrc(leg, ssrc);
+            m.observe_ssrc(leg, ssrc, now);
         }
     }
 }
@@ -1082,14 +1082,15 @@ fn process_redundant_rtp_packet(
     let seq = parse_rtp_sequence_number(data).unwrap_or(0);
     let ts = parse_rtp_timestamp(data).unwrap_or(0);
     // SSRC validation: 2022-7 mandates byte-identical RTP on both legs,
-    // including the same SSRC. Mismatch lights the `ssrc_mismatch`
-    // counter on the buffered merger so the manager can fire an event.
+    // including the same SSRC. A persistent mismatch lights the
+    // `ssrc_mismatch` counter on the buffered merger so the manager can
+    // fire an event.
+    let now = std::time::Instant::now();
     if data.len() >= 12 {
         let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-        merger.observe_ssrc(leg, ssrc);
+        merger.observe_ssrc(leg, ssrc, now);
     }
     let bytes_data = Bytes::copy_from_slice(data);
-    let now = std::time::Instant::now();
 
     // FEC decode (per-leg), then merge each resulting packet.
     if let Some(decoder) = fec_decoder {

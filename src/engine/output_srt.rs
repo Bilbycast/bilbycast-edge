@@ -419,8 +419,9 @@ impl SrtSendSink {
 }
 
 /// `true` once libsrt has given `socket` up: broken (its peer silent past
-/// the idle timeout, or the connection refused) or closed.
-fn socket_is_gone(socket: &SrtSocket) -> bool {
+/// the idle timeout, or the connection refused) or closed. Also what a
+/// 2022-7 input's listener leg skips at accept.
+pub(crate) fn socket_is_gone(socket: &SrtSocket) -> bool {
     status_is_gone(socket.status())
 }
 

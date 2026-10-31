@@ -1733,6 +1733,13 @@ pub struct BufferedHitlessMerger<T: Clone, D = HitlessMerger> {
     /// Per-leg arrival tracking for SSRC validation, drift detection,
     /// and operator-facing health.
     leg_state: [LegState; 2],
+    /// How long the legs must go on carrying different SSRCs, both
+    /// delivering, before [`Self::observe_ssrc`] counts it: the dedup's
+    /// stale time, a second past the hold and the legs' configured lag.
+    ssrc_confirm: Duration,
+    /// Since when the legs have carried different SSRCs, both delivering,
+    /// and whether that has been counted; `None` while they agree.
+    ssrc_disagreement: Option<(Instant, bool)>,
     /// Aggregate stats (lock-free), shared with the flow's stats so its
     /// snapshot reads them where the merger writes them
     /// ([`Self::stats_handle`]).
@@ -1763,6 +1770,8 @@ struct LegState {
     last_arrival: Option<Instant>,
     /// Observed RTP SSRC (when the input layer fills it). 0 = unset.
     ssrc: u32,
+    /// When `ssrc` was last observed.
+    ssrc_seen: Option<Instant>,
     /// State machine — Up → Down.
     health: LegHealth,
 }
@@ -1859,12 +1868,14 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     /// configuration sets.
     pub fn with_leg_lag(max_path_diff: Duration, window: u16, leg_lag: Duration) -> Self {
         let max_path_diff = bounded_path_diff(max_path_diff);
-        Self::build(
-            HitlessMerger::with_window(window)
-                .with_stale_after_us(stale_after_lag_us(max_path_diff.saturating_add(leg_lag))),
+        let stale_after_us = stale_after_lag_us(max_path_diff.saturating_add(leg_lag));
+        let mut merger = Self::build(
+            HitlessMerger::with_window(window).with_stale_after_us(stale_after_us),
             max_path_diff,
             DEFAULT_MAX_BUFFER_PACKETS,
-        )
+        );
+        merger.ssrc_confirm = Duration::from_micros(stale_after_us);
+        merger
     }
 
     /// Ingest a packet. Returns the (leg, payload) pairs that are now
@@ -1893,8 +1904,7 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     ///
     /// Both legs' SSRCs are forgotten with the stream ([`Self::observe_ssrc`]):
     /// a sender that restarts on a new SSRC brings both legs back on it, and
-    /// the first leg back judged against the other's old one would count a
-    /// mismatch that is not there.
+    /// the first leg back is not judged against the other's old one.
     pub fn restart(&mut self) {
         self.dedup.restart();
         let last = self.buffer.keys().next_back().map(|&(virt, _)| virt);
@@ -1904,8 +1914,9 @@ impl<T: Clone> BufferedHitlessMerger<T> {
         }
         self.anchor_set = false;
         for leg in &mut self.leg_state {
-            leg.ssrc = 0;
+            (leg.ssrc, leg.ssrc_seen) = (0, None);
         }
+        self.ssrc_disagreement = None;
     }
 }
 
@@ -1991,6 +2002,8 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
             max_path_diff: bounded,
             max_buffer_packets,
             leg_state: [LegState::default(), LegState::default()],
+            ssrc_confirm: Duration::from_micros(stale_after_lag_us(bounded)),
+            ssrc_disagreement: None,
             stats: Arc::new(BufferedHitlessStats {
                 max_path_diff_ms: u32::try_from(bounded.as_millis()).unwrap_or(u32::MAX),
                 ..BufferedHitlessStats::default()
@@ -2029,20 +2042,43 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
         virt
     }
 
-    /// Set the SSRC observed for one leg. Called by the input layer
-    /// after parsing the RTP header. Cross-leg mismatch increments the
-    /// `ssrc_mismatch` counter.
-    pub fn observe_ssrc(&mut self, leg: ActiveLeg, ssrc: u32) {
-        let idx = match leg {
-            ActiveLeg::Leg1 => 0,
-            ActiveLeg::Leg2 => 1,
-            ActiveLeg::None => return,
+    /// Note the SSRC of a packet leg `leg` delivered at `now`. Called by the
+    /// input layer after parsing the RTP header, for every packet.
+    ///
+    /// 2022-7 sends byte-identical RTP on both legs, SSRC included, so legs
+    /// that go on carrying different SSRCs are a misconfiguration (two
+    /// senders, say), counted once per episode in `ssrc_mismatch`: when they
+    /// have disagreed for `ssrc_confirm` with both delivering.
+    /// A disagreement is no mismatch until then, because a source that
+    /// changes its SSRC changes it on both legs and the legs' copies of the
+    /// change reach the merger apart — by up to the hold and the configured
+    /// lag, which the confirmation outlasts. It used to count at the first
+    /// packet that disagreed, so every SSRC change at the source counted one.
+    /// A leg that has delivered nothing for [`LEG_DOWN_THRESHOLD`] is not
+    /// delivering, and its last SSRC is no evidence either way: the
+    /// disagreement starts afresh once it delivers again.
+    pub fn observe_ssrc(&mut self, leg: ActiveLeg, ssrc: u32, now: Instant) {
+        let Some(idx) = leg_idx(leg) else {
+            return;
         };
-        let prev = self.leg_state[idx].ssrc;
-        self.leg_state[idx].ssrc = ssrc;
-        let other = self.leg_state[1 - idx].ssrc;
-        if other != 0 && other != ssrc && prev != ssrc {
-            self.stats.ssrc_mismatch.fetch_add(1, Ordering::Relaxed);
+        let own = &mut self.leg_state[idx];
+        (own.ssrc, own.ssrc_seen) = (ssrc, Some(now));
+        let other = &self.leg_state[1 - idx];
+        let other_delivering = other
+            .ssrc_seen
+            .is_some_and(|seen| now.saturating_duration_since(seen) <= LEG_DOWN_THRESHOLD);
+        if !other_delivering || other.ssrc == ssrc {
+            self.ssrc_disagreement = None;
+            return;
+        }
+        match &mut self.ssrc_disagreement {
+            None => self.ssrc_disagreement = Some((now, false)),
+            Some((since, counted)) => {
+                if !*counted && now.saturating_duration_since(*since) >= self.ssrc_confirm {
+                    *counted = true;
+                    self.stats.ssrc_mismatch.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
     }
 
@@ -2474,20 +2510,96 @@ mod buffered_tests {
         assert_eq!(m.stats.gap_lost.load(Ordering::Relaxed), 1);
     }
 
+    /// Both legs delivering, each on its own SSRC, from the first packet
+    /// through the confirmation (`ssrc_confirm`, a second past the hold).
+    fn deliver_ssrcs(
+        m: &mut BufferedHitlessMerger<u16>,
+        t0: Instant,
+        over: Duration,
+        ssrcs: (u32, u32),
+    ) {
+        let mut at = Duration::ZERO;
+        while at <= over {
+            m.observe_ssrc(ActiveLeg::Leg1, ssrcs.0, t0 + at);
+            m.observe_ssrc(ActiveLeg::Leg2, ssrcs.1, t0 + at + Duration::from_millis(1));
+            at += Duration::from_millis(20);
+        }
+    }
+
+    /// Legs that go on carrying different SSRCs, both delivering, count one
+    /// mismatch once they have disagreed for a second past the hold — and
+    /// only one, however long it lasts.
     #[test]
     fn ssrc_mismatch_detected() {
         let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
-        m.observe_ssrc(ActiveLeg::Leg1, 0xdeadbeef);
-        m.observe_ssrc(ActiveLeg::Leg2, 0xfeedface);
+        let t0 = Instant::now();
+        deliver_ssrcs(&mut m, t0, Duration::from_millis(1_000), (0xdeadbeef, 0xfeedface));
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0, "not yet a second past the hold");
+        deliver_ssrcs(&mut m, t0 + Duration::from_millis(1_020), Duration::from_millis(3_000), (0xdeadbeef, 0xfeedface));
         assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 1);
     }
 
     #[test]
     fn matching_ssrc_no_mismatch() {
         let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
-        m.observe_ssrc(ActiveLeg::Leg1, 0xdeadbeef);
-        m.observe_ssrc(ActiveLeg::Leg2, 0xdeadbeef);
+        deliver_ssrcs(&mut m, Instant::now(), Duration::from_secs(3), (0xdeadbeef, 0xdeadbeef));
         assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0);
+    }
+
+    /// A source that changes its SSRC changes it on both legs, whose copies
+    /// of the change reach the merger apart: no mismatch, even with the
+    /// later leg 900 ms behind (inside a hold and a second). It used to
+    /// count one at every SSRC change.
+    #[test]
+    fn a_source_changing_its_ssrc_on_both_legs_is_no_mismatch() {
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        deliver_ssrcs(&mut m, t0, Duration::from_secs(1), (0x1111, 0x1111));
+        // Leg 1 on the new SSRC at 1 s; leg 2's packets of the old one keep
+        // coming for another 900 ms.
+        let change = t0 + Duration::from_millis(1_020);
+        deliver_ssrcs(&mut m, change, Duration::from_millis(900), (0x2222, 0x1111));
+        deliver_ssrcs(&mut m, change + Duration::from_millis(920), Duration::from_secs(3), (0x2222, 0x2222));
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0);
+    }
+
+    /// A leg's last SSRC while it delivers nothing is no evidence: the other
+    /// leg moving to a new SSRC meanwhile is no mismatch, and a disagreement
+    /// that resumes when it delivers again is judged from then.
+    #[test]
+    fn a_silent_legs_last_ssrc_counts_for_nothing() {
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        deliver_ssrcs(&mut m, t0, Duration::from_millis(500), (0x1111, 0x1111));
+        // Leg 2 silent; leg 1 alone, on a new SSRC, for 3 s.
+        let mut at = Duration::from_millis(520);
+        while at <= Duration::from_millis(3_500) {
+            m.observe_ssrc(ActiveLeg::Leg1, 0x2222, t0 + at);
+            at += Duration::from_millis(20);
+        }
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0, "leg 2 delivers nothing");
+        // Leg 2 back on its old SSRC: a disagreement from now on.
+        let back = t0 + Duration::from_millis(3_520);
+        deliver_ssrcs(&mut m, back, Duration::from_millis(500), (0x2222, 0x1111));
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0, "judged from its return");
+        deliver_ssrcs(&mut m, back + Duration::from_millis(520), Duration::from_secs(1), (0x2222, 0x1111));
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 1);
+    }
+
+    /// The confirmation is the merger's stale time: a second past the hold
+    /// and, on an SRT pair, the legs' configured lag.
+    #[test]
+    fn the_ssrc_confirmation_takes_in_the_hold_and_the_legs_lag() {
+        let mut m = BufferedHitlessMerger::<u16>::with_leg_lag(
+            Duration::from_millis(200),
+            REORDER_WINDOW,
+            Duration::from_millis(1_300),
+        );
+        let t0 = Instant::now();
+        deliver_ssrcs(&mut m, t0, Duration::from_millis(2_480), (1, 2));
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0, "inside 1.3 s + 200 ms + 1 s");
+        deliver_ssrcs(&mut m, t0 + Duration::from_millis(2_500), Duration::from_millis(100), (1, 2));
+        assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 1);
     }
 
     /// A restart (an SRT pair that lost both legs) forgets both legs' SSRCs:
@@ -2496,18 +2608,19 @@ mod buffered_tests {
     #[test]
     fn a_restart_forgets_the_legs_ssrcs_and_keeps_the_count() {
         let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
-        m.observe_ssrc(ActiveLeg::Leg1, 0xdeadbeef);
-        m.observe_ssrc(ActiveLeg::Leg2, 0xdeadbeef);
+        let t0 = Instant::now();
+        deliver_ssrcs(&mut m, t0, Duration::from_millis(500), (0xdeadbeef, 0xdeadbeef));
         m.restart();
-        m.observe_ssrc(ActiveLeg::Leg2, 0xfeedface);
-        m.observe_ssrc(ActiveLeg::Leg1, 0xfeedface);
+        let back = t0 + Duration::from_millis(520);
+        m.observe_ssrc(ActiveLeg::Leg2, 0xfeedface, back);
+        deliver_ssrcs(&mut m, back, Duration::from_secs(2), (0xfeedface, 0xfeedface));
         assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 0, "one sender, a new SSRC");
 
-        m.observe_ssrc(ActiveLeg::Leg2, 0x0bad_cafe);
+        let split = back + Duration::from_millis(2_020);
+        deliver_ssrcs(&mut m, split, Duration::from_secs(2), (0xfeedface, 0x0bad_cafe));
         assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 1);
         m.restart();
-        m.observe_ssrc(ActiveLeg::Leg1, 1);
-        m.observe_ssrc(ActiveLeg::Leg2, 2);
+        deliver_ssrcs(&mut m, split + Duration::from_millis(2_020), Duration::from_secs(2), (1, 2));
         assert_eq!(m.stats.ssrc_mismatch.load(Ordering::Relaxed), 2, "counted on across it");
     }
 
