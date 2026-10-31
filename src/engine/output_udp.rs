@@ -41,9 +41,6 @@ const TS_PACKETS_PER_DATAGRAM: usize = 7;
 /// Minimum consecutive sync bytes needed to confirm TS alignment.
 const TS_SYNC_CONFIRM_COUNT: usize = 3;
 
-/// Minimum RTP header size (version 2, no CSRC, no extensions).
-const RTP_HEADER_MIN_SIZE: usize = 12;
-
 /// Spawn a task that subscribes to the broadcast channel and sends
 /// raw MPEG-TS datagrams (no RTP headers) over a UDP socket.
 ///
@@ -607,14 +604,13 @@ async fn udp_output_loop(
         };
 
         for packet in &packets_to_send {
-            // Extract raw TS payload: strip RTP header if present
-            let ts_data = if packet.is_raw_ts {
-                &packet.data[..]
-            } else if packet.data.len() > RTP_HEADER_MIN_SIZE {
-                &packet.data[RTP_HEADER_MIN_SIZE..]
-            } else {
+            // Extract raw TS payload: strip the whole RTP header if present,
+            // CSRCs and extension included (a fixed 12 bytes left them ahead
+            // of the TS, misaligned).
+            let ts_data = crate::engine::ts_parse::strip_rtp_header(packet);
+            if ts_data.is_empty() {
                 continue;
-            };
+            }
 
             // Apply program filter (MPTS → SPTS) if configured.
             let filtered_bytes: &[u8] = if let Some(ref mut filter) = program_filter {
