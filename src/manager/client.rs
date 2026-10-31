@@ -3390,10 +3390,11 @@ async fn execute_command(
             validate_input_definition(&input)
                 .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
             // What the node's config must allow of the input: an id that is
-            // not reserved, if the input is new; no port another entity holds;
-            // and, the flow taking it on, no seq-aware Hitless leg left without
-            // the sequence number it merges on — its own definition or the
-            // flow's clock regeneration could take it.
+            // not reserved, if the input is new; no other flow holding it; no
+            // port another entity holds; and, the flow taking it on, no
+            // seq-aware Hitless leg left without the sequence number it
+            // merges on — its own definition or the flow's clock regeneration
+            // could take it.
             let refusal = |cfg: &AppConfig| {
                 if !cfg.inputs.iter().any(|i| i.id == input.id) {
                     crate::config::validation::validate_new_input_id(&input.id).map_err(|e| {
@@ -3403,6 +3404,8 @@ async fn execute_command(
                         )
                     })?;
                 }
+                crate::config::validation::validate_add_input_assignment(&flow_id, &input.id, cfg)
+                    .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
                 validate_port_conflicts_with_input(cfg, &input)
                     .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
                 crate::config::validation::validate_add_input_hitless_legs(&flow_id, &input, cfg)
@@ -8362,6 +8365,84 @@ mod reserved_input_id_tests {
             .await
             .expect_err("no flow f");
         assert_ne!(err.code.as_deref(), Some("input_id_reserved"), "{}", err.message);
+    }
+
+    /// `add_input` refuses an input another enabled flow holds, before
+    /// anything is spawned or saved, as a whole config refuses one input in
+    /// two flows. It spawned it and saved it in both flows' `input_ids`, a
+    /// config the next load refused. An input a disabled flow holds may be
+    /// taken, as a whole config allows.
+    #[tokio::test]
+    async fn add_input_refuses_an_input_another_flow_holds() {
+        let (event_sender, _events) = crate::manager::events::event_channel();
+        let fm = Arc::new(FlowManager::new(
+            Arc::new(StatsCollector::new()),
+            false,
+            event_sender.clone(),
+            Arc::new(SystemResourceState::new()),
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ));
+        let tm = Arc::new(TunnelManager::new(event_sender));
+        let udp = |id: &str, port: u16| {
+            serde_json::json!({
+                "id": id, "name": id, "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+            })
+        };
+        let config = AppConfig {
+            inputs: serde_json::from_value(serde_json::json!([
+                udp("a", 29895), udp("b", 29896), udp("c", 29897)
+            ]))
+            .expect("inputs fixture"),
+            flows: serde_json::from_value(serde_json::json!([
+                { "id": "f", "name": "f", "input_ids": ["a"], "output_ids": [] },
+                { "id": "g", "name": "g", "input_ids": ["b"], "output_ids": [] },
+                { "id": "h", "name": "h", "enabled": false, "input_ids": ["c"], "output_ids": [] }
+            ]))
+            .expect("flows fixture"),
+            ..Default::default()
+        };
+        crate::config::validation::validate_config(&config).expect("a valid config to start");
+        fm.create_flow(config.resolve_flow(&config.flows[0]).expect("resolve"))
+            .await
+            .expect("create_flow");
+        let cfg = Arc::new(RwLock::new(config));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = async |action: &str, body: serde_json::Value| {
+            execute_command(
+                action,
+                &body,
+                &fm,
+                &tm,
+                &cfg,
+                &dir.path().join("config.json"),
+                &dir.path().join("secrets.json"),
+                &WebrtcRegistry::default(),
+            )
+            .await
+        };
+        let checks = async {
+            let err = run("add_input", serde_json::json!({ "flow_id": "f", "input": udp("b", 29896) }))
+                .await
+                .expect_err("g holds b");
+            assert_eq!(err.code.as_deref(), Some("validation_error"), "{}", err.message);
+            assert!(err.message.contains("already assigned to another flow ('g')"), "{}", err.message);
+            let running = fm.get_runtime("f").expect("f runs");
+            assert!(!running.live_inputs.read().await.iter().any(|i| i.id == "b"), "nothing spawned");
+            assert_eq!(cfg.read().await.flows[0].input_ids, vec!["a".to_string()], "nothing saved");
+
+            run("add_input", serde_json::json!({ "flow_id": "f", "input": udp("c", 29897) }))
+                .await
+                .unwrap_or_else(|e| panic!("h is disabled: {}", e.message));
+            crate::config::validation::validate_config(&*cfg.read().await)
+                .expect("the saved config loads");
+        };
+        checks.await;
+        let _ = fm.destroy_flow("f").await;
     }
 
     /// `create_input` refuses an input a seq-aware Hitless slot already names
