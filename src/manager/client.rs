@@ -1535,6 +1535,13 @@ pub fn edge_capabilities() -> Vec<&'static str> {
         // tolerance) and always signals AC-3 as 0x81, so gate on either
         // bit, never on this one alone.
         "audio-ts-signalling",
+        // `redundancy.path_differential_ms` on an SRT input is honoured:
+        // the 2022-7 pair holds each packet that long and releases in seq
+        // order, as the RTP input does. An edge WITHOUT this bit accepts
+        // the field on a push and ignores it (serde unknown-field
+        // tolerance), merging unbuffered, which looks like success — so
+        // the manager UI must gate the SRT field on it.
+        "srt-path-differential",
     ];
     // Strict mode (`SO_BINDTODEVICE`) requires `CAP_NET_RAW`. Probed
     // once at startup; advertised only when the setsockopt actually
@@ -10000,6 +10007,14 @@ mod multiviewer_capability_gate {
     fn audio_ts_signalling_is_advertised() {
         let caps = super::edge_capabilities();
         assert!(caps.contains(&"audio-ts-signalling"), "caps = {caps:?}");
+    }
+
+    /// An SRT input's `redundancy.path_differential_ms` is gated on this
+    /// string in the manager UI, on every build.
+    #[test]
+    fn srt_path_differential_is_advertised() {
+        let caps = super::edge_capabilities();
+        assert!(caps.contains(&"srt-path-differential"), "caps = {caps:?}");
     }
 
     #[cfg(feature = "multiviewer")]

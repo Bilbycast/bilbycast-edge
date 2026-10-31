@@ -1422,6 +1422,13 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             }
             if let Some(ref red) = srt.redundancy {
                 validate_srt_redundancy(red, "SRT input")?;
+                if let Some(ms) = red.path_differential_ms
+                    && !(5..=2000).contains(&ms) {
+                        bail!(
+                            "SRT input redundancy: path_differential_ms must be in 5..=2000 \
+                             (got {ms})"
+                        );
+                    }
             }
             if let Some(ref bond) = srt.bonding {
                 validate_srt_bonding(bond, &srt.mode, "SRT input")?;
@@ -6125,6 +6132,16 @@ pub fn validate_output_with_input(
             }
             if let Some(ref red) = srt.redundancy {
                 validate_srt_redundancy(red, "SRT output")?;
+                // The hold belongs to the input's merger: an output duplicates
+                // to both legs and merges nothing.
+                if red.path_differential_ms.is_some() {
+                    bail!(
+                        "SRT output '{}': redundancy.path_differential_ms applies only to an \
+                         SRT input, whose merger holds the legs' packets; an output sends to \
+                         both legs and holds nothing",
+                        srt.id
+                    );
+                }
             }
             if let Some(ref bond) = srt.bonding {
                 validate_srt_bonding(bond, &srt.mode, &format!("SRT output '{}'", srt.id))?;
@@ -15585,6 +15602,56 @@ mod tests {
         assert!(
             msg.contains("65") && msg.contains("64"),
             "the refusal must name both the cap and what was asked for, got: {msg}"
+        );
+    }
+
+    /// An SRT input pair takes `path_differential_ms` in the RTP input's
+    /// range, 5..=2000, and nothing outside it.
+    #[test]
+    fn srt_input_path_differential_is_bounded() {
+        use crate::config::models::InputConfig;
+        let input = |ms: u32| -> InputConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "srt", "mode": "listener", "local_addr": "0.0.0.0:9000",
+                "redundancy": {
+                    "mode": "listener", "local_addr": "0.0.0.0:9001",
+                    "path_differential_ms": ms
+                }
+            }))
+            .expect("SRT input fixture")
+        };
+        for ms in [5, 200, 2000] {
+            assert!(validate_input(&input(ms)).is_ok(), "{ms} ms is in range");
+        }
+        for ms in [0, 4, 2001] {
+            let err = validate_input(&input(ms)).expect_err("out of range");
+            assert!(err.to_string().contains("path_differential_ms must be in 5..=2000"), "{err}");
+        }
+    }
+
+    /// The hold is the input merger's. An SRT output shares the redundancy
+    /// block, merges nothing and would silently ignore it, so it is refused
+    /// there whatever its value.
+    #[test]
+    fn srt_output_refuses_path_differential() {
+        use crate::config::models::OutputConfig;
+        let output = |red: serde_json::Value| -> OutputConfig {
+            serde_json::from_value(serde_json::json!({
+                "type": "srt", "id": "out-1", "name": "out-1",
+                "mode": "caller", "remote_addr": "192.0.2.1:9000",
+                "redundancy": red
+            }))
+            .expect("SRT output fixture")
+        };
+        let leg2 = serde_json::json!({ "mode": "caller", "remote_addr": "192.0.2.2:9000" });
+        assert!(validate_output(&output(leg2.clone())).is_ok());
+        let mut held = leg2;
+        held["path_differential_ms"] = serde_json::json!(200);
+        let err = validate_output(&output(held)).expect_err("refused on an output");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("out-1") && msg.contains("path_differential_ms applies only to an SRT input"),
+            "{msg}"
         );
     }
 }

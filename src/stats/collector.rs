@@ -3683,16 +3683,18 @@ pub enum SrtInputSocket {
 /// they count the packets the pair lost rather than its legs' drops. A packet
 /// one leg drops is no loss while the other leg delivers it.
 ///
-/// When the legs merge ([`HitlessMerger`]), the pair's loss is what the
-/// merger counts, and the pollers name each lost packet's cause from the
+/// When the legs merge ([`HitlessMerger`], or with `path_differential_ms` a
+/// [`BufferedHitlessMerger`] holding each packet), the pair's loss is what
+/// the merger counts, and the pollers name each lost packet's cause from the
 /// legs' own too-late drops (`PairLedger`). Two kinds:
 ///
 /// - seqs that left the merger's window with neither leg delivering them
-///   ([`HitlessMerger::lost`]): loss whatever caused it. The part both legs'
-///   libsrt drop counters explain is SRT's, counted as drops
-///   (`srt_recv_dropped`, whose remedy is more latency); the rest was
-///   missing upstream of SRT on both legs, counted as sequence-gap loss (the
-///   generic `packet_loss`);
+///   ([`HitlessMerger::lost`]), and behind a hold the seqs a leg delivered
+///   only once the hold had released past them: loss whatever caused it.
+///   The part both legs' libsrt drop counters explain is SRT's, counted as
+///   drops (`srt_recv_dropped`, whose remedy is more latency); the rest was
+///   missing upstream of SRT on both legs, or came too late for the hold,
+///   counted as sequence-gap loss (the generic `packet_loss`);
 /// - seqs a re-anchor of the window jumped over ([`HitlessMerger::skipped`]):
 ///   a burst both legs lost, or nothing at all when the source restarted on
 ///   a new ISN, which the sequence numbers alone cannot tell apart. Counted
@@ -3700,6 +3702,7 @@ pub enum SrtInputSocket {
 ///   loss.
 ///
 /// [`HitlessMerger`]: crate::redundancy::merger::HitlessMerger
+/// [`BufferedHitlessMerger`]: crate::redundancy::merger::BufferedHitlessMerger
 /// [`HitlessMerger::lost`]: crate::redundancy::merger::HitlessMerger::lost
 /// [`HitlessMerger::skipped`]: crate::redundancy::merger::HitlessMerger::skipped
 #[derive(Default)]
@@ -3725,10 +3728,8 @@ pub struct SrtPair {
     ledger: Mutex<PairLedger>,
 }
 
-/// What of a [`HitlessMerger`]'s counts a receive loop has handed its
-/// [`SrtPair`] (see [`SrtPair::hand_off`]).
-///
-/// [`HitlessMerger`]: crate::redundancy::merger::HitlessMerger
+/// What of a merger's counts a receive loop has handed its [`SrtPair`] (see
+/// [`SrtPair::hand_off`]).
 #[derive(Default)]
 pub struct MergerHandoff {
     lost: u64,
@@ -3743,13 +3744,14 @@ impl SrtPair {
     }
 
     /// Hand the pair what `merger` counted since the previous call: seqs that
-    /// left its window unfilled, seqs re-anchors skipped, and the re-anchors.
+    /// left its window unfilled (and, behind a hold, seqs it could not
+    /// release in order), seqs re-anchors skipped, and the re-anchors.
     /// Called per merged packet: three compares, and an atomic add only when
     /// a count moved, which is rare.
     #[inline]
     pub fn hand_off(
         &self,
-        merger: &crate::redundancy::merger::HitlessMerger,
+        merger: &impl crate::redundancy::merger::LossCounts,
         handed: &mut MergerHandoff,
     ) {
         let lost = merger.lost();
@@ -7532,6 +7534,32 @@ mod srt_input_stats_tests {
         assert!(reason.contains("4 packets"), "{reason}");
         // The hint is the slower of the two legs.
         assert!(reason.contains("RTT 90 ms"), "{reason}");
+    }
+
+    /// Behind a hold, a seq a leg delivered only once the hold had released
+    /// past it is the pair's loss, handed off as the merger drops it. No
+    /// leg's drops explain it, so it counts as a sequence gap. A restart
+    /// after both legs are lost hands nothing off again: the buffered
+    /// merger's counts carry on, and so does the hand-off.
+    #[test]
+    fn a_buffered_mergers_late_fill_is_the_pairs_loss_once() {
+        use crate::redundancy::merger::BufferedHitlessMerger;
+        use std::time::{Duration, Instant};
+        let mut pair = MergedPair::new();
+        let mut merger = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let _ = merger.ingest(101, ActiveLeg::Leg1, 101, t0);
+        let _ = merger.drain_expired(t0 + Duration::from_millis(60));
+        let _ = merger.ingest(100, ActiveLeg::Leg2, 100, t0 + Duration::from_millis(80));
+        pair.srt.pair.hand_off(&merger, &mut pair.handed);
+        merger.restart();
+        let _ = merger.ingest(7, ActiveLeg::Leg1, 7, t0 + Duration::from_secs(2));
+        pair.srt.pair.hand_off(&merger, &mut pair.handed);
+        for delivered in 2..=4 {
+            pair.poll(SrtInputSocket::Leg1, 0, delivered);
+            pair.poll(SrtInputSocket::Leg2, 0, delivered);
+        }
+        assert_eq!(pair.lost(), (1, 0));
     }
 
     /// A burst of a whole merger window or more that both legs dropped

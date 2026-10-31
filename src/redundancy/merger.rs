@@ -297,6 +297,19 @@ impl HitlessMerger {
         self.resets
     }
 
+    /// Forget every seq and every leg's sequence, as a new merger would, and
+    /// anchor afresh on the next packet: an SRT pair that lost both legs
+    /// starts over on whatever stream they bring back. The window, the stale
+    /// time and the counts ([`Self::lost`], [`Self::skipped`],
+    /// [`Self::resets`]) carry on, so a caller handing the counts on by
+    /// difference keeps doing so; the seqs left unfilled in the window are
+    /// forgotten, not counted.
+    pub fn restart(&mut self) {
+        let (lost, skipped, resets) = (self.lost, self.skipped, self.resets);
+        *self = Self::with_window(self.window).with_stale_after_us(self.stale_after_us);
+        (self.lost, self.skipped, self.resets) = (lost, skipped, resets);
+    }
+
     /// The slot `ahead` seqs past `highest_seq` (`ahead < window`).
     #[inline]
     fn slot_ahead(&self, ahead: u16) -> usize {
@@ -654,6 +667,33 @@ pub trait SeqDedup {
     /// Re-anchors so far ([`HitlessMerger::resets`]): the buffered merger
     /// re-projects a seq that re-anchored the window from behind it.
     fn resets(&self) -> u64;
+}
+
+/// What a 2022-7 merger counts of the seqs it never forwarded, for a caller
+/// that names their cause from elsewhere — an SRT pair from its legs' own
+/// drops ([`crate::stats::collector::SrtPair::hand_off`]). Each count only
+/// grows.
+pub trait LossCounts {
+    /// Seqs no leg delivered in time to go out ([`HitlessMerger::lost`]).
+    fn lost(&self) -> u64;
+    /// Seqs re-anchors jumped over ([`HitlessMerger::skipped`]).
+    fn skipped(&self) -> u64;
+    /// Re-anchors ([`HitlessMerger::resets`]).
+    fn resets(&self) -> u64;
+}
+
+impl LossCounts for HitlessMerger {
+    fn lost(&self) -> u64 {
+        HitlessMerger::lost(self)
+    }
+
+    fn skipped(&self) -> u64 {
+        HitlessMerger::skipped(self)
+    }
+
+    fn resets(&self) -> u64 {
+        HitlessMerger::resets(self)
+    }
 }
 
 /// One packet per seq, so `index` is always 0.
@@ -1639,7 +1679,7 @@ mod tests {
 //     5 % rolling. The merger surfaces these as events the input
 //     task forwards to the manager.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1673,6 +1713,15 @@ pub struct BufferedHitlessMerger<T: Clone, D = HitlessMerger> {
     /// index after the packet's. Every key below it has been passed. None
     /// until the first packet has been emitted.
     cursor: Option<(i64, u16)>,
+    /// The first virtual seq of each stretch a [`Self::restart`] began that
+    /// nothing released has reached yet, oldest first: the seqs between the
+    /// last one released before a stretch and the first released in it are
+    /// no gap.
+    stretches: VecDeque<i64>,
+    /// Packets the dedup admitted that were never held for release: a gap
+    /// fill whose seq the cursor had already passed, or one past the buffer
+    /// cap. The dedup counts neither as lost, having admitted them.
+    unreleased: u64,
     /// Path-differential window. Every accepted packet is held this
     /// long from first arrival before release. Constant emission
     /// latency.
@@ -1793,10 +1842,20 @@ impl<T: Clone> BufferedHitlessMerger<T> {
     /// slower leg's copy that arrives more than `window` seqs behind the
     /// faster one is dropped as late, however long the hold.
     pub fn with_window(max_path_diff: Duration, window: u16) -> Self {
+        Self::with_leg_lag(max_path_diff, window, Duration::ZERO)
+    }
+
+    /// A merger as [`Self::with_window`]'s, one of whose legs reaches it up
+    /// to `leg_lag` behind the other by configuration — an SRT pair's legs at
+    /// different receive latencies. Its dedup's stale time is a second past
+    /// that and the hold together, as [`Self::with_runs`] sets it: the hold
+    /// budgets the legs' networks, which come on top of the lag their
+    /// configuration sets.
+    pub fn with_leg_lag(max_path_diff: Duration, window: u16, leg_lag: Duration) -> Self {
         let max_path_diff = bounded_path_diff(max_path_diff);
         Self::build(
             HitlessMerger::with_window(window)
-                .with_stale_after_us(stale_after_lag_us(max_path_diff)),
+                .with_stale_after_us(stale_after_lag_us(max_path_diff.saturating_add(leg_lag))),
             max_path_diff,
             DEFAULT_MAX_BUFFER_PACKETS,
         )
@@ -1812,6 +1871,44 @@ impl<T: Clone> BufferedHitlessMerger<T> {
         now: Instant,
     ) -> std::vec::Drain<'_, (ActiveLeg, T)> {
         self.ingest_at(seq, 0, leg, payload, now)
+    }
+
+    /// Start over on whatever stream comes next, as a new merger would,
+    /// while what is held goes out at its own release time: an SRT pair that
+    /// lost both legs. The dedup restarts ([`HitlessMerger::restart`]), its
+    /// counts carrying on, and the next packet begins a new stretch of
+    /// virtual seqs a whole window past everything held or released, so a
+    /// packet the dedup admits behind it still lands past them. No gap is
+    /// counted between the two stretches. The stats carry on too.
+    ///
+    /// What is held was delivered before the loss, and every packet that
+    /// arrives after it is held from a later instant, so the old stretch has
+    /// drained before the new one releases anything.
+    pub fn restart(&mut self) {
+        self.dedup.restart();
+        let last = self.buffer.keys().next_back().map(|&(virt, _)| virt);
+        if let Some(past) = last.max(self.cursor.map(|(virt, _)| virt)) {
+            self.anchor_virtual = past + i64::from(self.dedup.window);
+            self.stretches.push_back(past + 1);
+        }
+        self.anchor_set = false;
+    }
+}
+
+/// `lost` counts what the dedup lost and what it admitted that the hold
+/// could not release in order: a gap fill the cursor had already passed, or
+/// one past the buffer cap.
+impl<T: Clone> LossCounts for BufferedHitlessMerger<T> {
+    fn lost(&self) -> u64 {
+        self.dedup.lost() + self.unreleased
+    }
+
+    fn skipped(&self) -> u64 {
+        self.dedup.skipped()
+    }
+
+    fn resets(&self) -> u64 {
+        self.dedup.resets()
     }
 }
 
@@ -1875,6 +1972,8 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
             anchor_virtual: 0,
             anchor_set: false,
             cursor: None,
+            stretches: VecDeque::new(),
+            unreleased: 0,
             max_path_diff: bounded,
             max_buffer_packets,
             leg_state: [LegState::default(), LegState::default()],
@@ -1899,10 +1998,10 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
     /// exactly 0x8000 (cell16, 2026-05-21).
     fn project(&mut self, seq: u16) -> i64 {
         if !self.anchor_set {
+            // 0 for a new merger; past what is held after a restart.
             self.anchor_real = seq;
-            self.anchor_virtual = 0;
             self.anchor_set = true;
-            return 0;
+            return self.anchor_virtual;
         }
         let diff = seq.wrapping_sub(self.anchor_real) as i16 as i64;
         let virt = self.anchor_virtual + diff;
@@ -2030,10 +2129,12 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
                 // gap-fill — the receiver has already moved on.
                 if let Some(c) = self.cursor
                     && key < c {
+                        self.unreleased += 1;
                         self.stats.late_dropped.fetch_add(1, Ordering::Relaxed);
                         return self.drain_ready(now);
                     }
                 if self.buffer.len() >= self.max_buffer_packets {
+                    self.unreleased += 1;
                     self.stats
                         .buffer_overflow_dropped
                         .fetch_add(1, Ordering::Relaxed);
@@ -2064,6 +2165,19 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
         self.drain_ready(now)
     }
 
+    /// Release everything held now, in seq order, whatever its release time:
+    /// for a caller about to publish packets that do not pass through the
+    /// merger, which would otherwise go out ahead of older ones it holds.
+    pub fn release_all(&mut self) -> std::vec::Drain<'_, (ActiveLeg, T)> {
+        match self.buffer.values().map(|e| e.release_at).max() {
+            Some(last) => self.drain_ready(last),
+            None => {
+                self.out.clear();
+                self.out.drain(..)
+            }
+        }
+    }
+
     fn drain_ready(&mut self, now: Instant) -> std::vec::Drain<'_, (ActiveLeg, T)> {
         // Whatever a caller left of the previous release went when its
         // `Drain` dropped.
@@ -2076,9 +2190,16 @@ impl<T: Clone, D: SeqDedup> BufferedHitlessMerger<T, D> {
             }
             let (virt, index) = key;
             // Account for any seq gap relative to the cursor: the seqs
-            // between the last one emitted and this one.
+            // between the last one emitted and this one, unless a restart's
+            // stretch begins between them. Every stretch begins past the
+            // cursor, so the first key released at or past it crosses it.
+            let mut new_stretch = false;
+            while self.stretches.front().is_some_and(|&from| virt >= from) {
+                self.stretches.pop_front();
+                new_stretch = true;
+            }
             if let Some((last, _)) = self.cursor
-                && virt > last + 1 {
+                && virt > last + 1 && !new_stretch {
                     let gap = (virt - last - 1) as u64;
                     self.stats.gap_lost.fetch_add(gap, Ordering::Relaxed);
                 }
@@ -2522,6 +2643,128 @@ mod buffered_tests {
         released.extend(m.drain_expired(at(back + 1_000_000)).map(|(_, p)| p));
         assert_eq!(released, (0..1_200).collect::<Vec<_>>());
         assert_eq!(m.stats.stream_resets.load(Ordering::Relaxed), 0);
+    }
+
+    /// A leg back ahead of the leg that carries, with a hole: leg 1 returns
+    /// 5 ms ahead of leg 2 at seq 100 and skips 150..=160 (its fresh
+    /// connection's first retransmissions too late), while leg 2 delivers
+    /// every seq. Held 50 ms from its first arrival, every seq is released
+    /// once and in order: leg 2's copies of what leg 1 came back ahead of,
+    /// and of what it skipped, fill in behind leg 1's newer packets. The
+    /// unbuffered merger forwards past each at once, so leg 2's fills follow
+    /// newer packets — two stream positions interleaved.
+    #[test]
+    fn a_leg_back_ahead_with_a_hole_is_released_in_order() {
+        let mut arrivals: Vec<(u64, u16, ActiveLeg)> = Vec::new();
+        for seq in 0..300u16 {
+            let t = u64::from(seq) * 1_000;
+            arrivals.push((t + 5_000, seq, ActiveLeg::Leg2));
+            if seq >= 100 && !(150..=160).contains(&seq) {
+                arrivals.push((t, seq, ActiveLeg::Leg1));
+            }
+        }
+        arrivals.sort_by_key(|&(t, seq, _)| (t, seq));
+        let every: Vec<u16> = (0..300).collect();
+
+        let mut m = BufferedHitlessMerger::<u16>::with_leg_lag(
+            Duration::from_millis(50),
+            REORDER_WINDOW,
+            Duration::ZERO,
+        );
+        let t0 = Instant::now();
+        let mut released = Vec::new();
+        for &(t, seq, leg) in &arrivals {
+            released.extend(m.ingest(seq, leg, seq, t0 + Duration::from_micros(t)).map(|(_, p)| p));
+        }
+        released.extend(m.drain_expired(t0 + Duration::from_secs(1)).map(|(_, p)| p));
+        assert_eq!(released, every, "every seq once, in order");
+        assert_eq!(LossCounts::lost(&m), 0);
+        assert_eq!(m.stats.gap_lost.load(Ordering::Relaxed), 0);
+        assert_eq!(m.stats.late_dropped.load(Ordering::Relaxed), 0);
+
+        let mut bare = HitlessMerger::new();
+        let forwarded: Vec<u16> = arrivals
+            .iter()
+            .filter(|&&(t, seq, leg)| bare.try_merge(seq, leg, t).is_some())
+            .map(|&(_, seq, _)| seq)
+            .collect();
+        let mut once = forwarded.clone();
+        once.sort_unstable();
+        assert_eq!(once, every, "unbuffered, each seq still goes once");
+        let at = |seq: u16| forwarded.iter().position(|&s| s == seq).unwrap();
+        assert!(at(100) < at(96), "leg 2's fills follow leg 1's return: {forwarded:?}");
+        assert!(at(161) < at(157), "and what leg 1 skipped: {forwarded:?}");
+    }
+
+    /// The stale time of a merger whose legs lag by configuration takes in
+    /// both the lag and the hold: a second past them together.
+    #[test]
+    fn a_leg_lag_lengthens_the_stale_time_past_the_hold() {
+        let m = BufferedHitlessMerger::<u16>::with_leg_lag(
+            Duration::from_millis(200),
+            REORDER_WINDOW,
+            Duration::from_millis(1_380),
+        );
+        assert_eq!(m.dedup.stale_after_us, 2_580_000);
+        let m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(200));
+        assert_eq!(m.dedup.stale_after_us, 1_200_000);
+    }
+
+    /// Both legs lost and the merger restarted: what it holds goes out at its
+    /// own release time, then the stream the legs bring back on a new ISN far
+    /// behind the old, anchored at once — a packet behind its first one
+    /// included. No gap is counted between the two, and the counts carry on:
+    /// the late fill the hold dropped before the restart stays lost, once.
+    #[test]
+    fn a_restart_releases_what_is_held_then_the_new_stream() {
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let _ = m.ingest(40_000, ActiveLeg::Leg1, 40_000, at(0));
+        let _ = m.ingest(40_002, ActiveLeg::Leg1, 40_002, at(0));
+        let early: Vec<u16> = m.drain_expired(at(60)).map(|(_, p)| p).collect();
+        assert_eq!(early, vec![40_000, 40_002]);
+        // Leg 2's 40 001 after the hold has passed it: dropped, and lost.
+        assert_eq!(m.ingest(40_001, ActiveLeg::Leg2, 40_001, at(70)).count(), 0);
+        assert_eq!(LossCounts::lost(&m), 1);
+        for seq in 40_003..=40_010u16 {
+            let _ = m.ingest(seq, ActiveLeg::Leg1, seq, at(80));
+        }
+        let resets = LossCounts::resets(&m);
+
+        m.restart();
+        let _ = m.ingest(100, ActiveLeg::Leg2, 100, at(100));
+        let _ = m.ingest(99, ActiveLeg::Leg1, 99, at(101));
+        for seq in 101..=110u16 {
+            let _ = m.ingest(seq, ActiveLeg::Leg2, seq, at(102));
+        }
+        assert_eq!(m.drain_expired(at(125)).count(), 0, "nothing before its release time");
+        let held: Vec<u16> = m.drain_expired(at(140)).map(|(_, p)| p).collect();
+        assert_eq!(held, (40_003..=40_010).collect::<Vec<_>>());
+        let new: Vec<u16> = m.drain_expired(at(200)).map(|(_, p)| p).collect();
+        assert_eq!(new, (99..=110).collect::<Vec<_>>());
+
+        assert_eq!(m.stats.gap_lost.load(Ordering::Relaxed), 1, "40 001 alone");
+        assert_eq!(m.stats.packets_emitted.load(Ordering::Relaxed), 22);
+        assert_eq!(m.stats.stream_resets.load(Ordering::Relaxed), 0);
+        assert_eq!(LossCounts::lost(&m), 1, "carried, not counted again");
+        assert_eq!(LossCounts::skipped(&m), 0);
+        assert_eq!(LossCounts::resets(&m), resets, "a restart is no re-anchor");
+    }
+
+    /// `release_all` puts out everything held at once, in order, whatever
+    /// its release time, and nothing when nothing is held.
+    #[test]
+    fn release_all_empties_the_hold_in_order() {
+        let mut m = BufferedHitlessMerger::<u16>::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+        assert_eq!(m.release_all().count(), 0);
+        for seq in [3u16, 1, 2] {
+            let _ = m.ingest(seq, ActiveLeg::Leg1, seq, t0);
+        }
+        let out: Vec<u16> = m.release_all().map(|(_, p)| p).collect();
+        assert_eq!(out, vec![1, 2, 3]);
+        assert!(m.next_deadline().is_none());
     }
 
     /// A run merger over seven packets a seq, each payload its `(seq, index)`.
