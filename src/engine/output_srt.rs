@@ -4211,8 +4211,10 @@ mod tests {
             .await
             .expect("the far end binds");
         let peer_cancel = CancellationToken::new();
+        // Generous: libsrt re-sends the handshake on its own schedule, and a
+        // loaded host (a full parallel test run) has missed 5 s.
         let peer = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             accept_srt_connection(&mut listener, &peer_cancel),
         )
         .await
