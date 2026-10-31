@@ -630,8 +630,8 @@ async fn udp_output_loop(
 
             // If a transcode chain is active, hand the filtered bytes
             // to the codec thread (non-blocking — drop-on-full). The
-            // transcoded output arrives asynchronously on the
-            // `chain.recv()` branch of the outer select! below.
+            // transcoded output arrives asynchronously and is drained at
+            // the end of this turn.
             if let Some(ref chain) = transcode_chain {
                 if chain.try_submit(Bytes::copy_from_slice(filtered_bytes)).is_err() {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
@@ -655,11 +655,11 @@ async fn udp_output_loop(
             }
         }
 
-        // Drain any transcoded chunks that the codec thread has produced
-        // since the last poll. Non-blocking — the outer select! also has
-        // a `chain.recv()` branch that wakes us when new chunks arrive
-        // without busy-waiting; this drain catches anything that came in
-        // alongside the broadcast.recv path.
+        // Drain every transcoded chunk the codec thread has produced since
+        // the last poll. Non-blocking, and only here: the select! above
+        // wakes on the broadcast and the delay buffer, not on the chain, so
+        // a chunk the thread finishes after this drain goes out on the
+        // next turn, at the next packet the flow publishes.
         if let Some(ref mut chain) = transcode_chain {
             while let Some(transcoded) = chain.try_recv() {
                 forward_downstream(

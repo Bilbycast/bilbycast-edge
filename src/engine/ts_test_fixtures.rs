@@ -325,3 +325,141 @@ pub fn he_aac_adts(v2: bool) -> Vec<u8> {
     }
     out
 }
+
+/// A live programme for the transcode tests: MP2 48 kHz stereo on PID
+/// 0x101 and its PCR on PID 0x100, which the PMT names a video PID and
+/// which carries nothing else, the audio 100 ms ahead of the PCR. One chunk
+/// per 40 ms of the source ([`Mp2Programme::chunk`]).
+#[cfg(feature = "media-codecs")]
+pub struct Mp2Programme {
+    frames: Vec<Vec<u8>>,
+    mux: crate::engine::rtmp::ts_mux::TsMuxer,
+    next: usize,
+}
+
+#[cfg(feature = "media-codecs")]
+impl Mp2Programme {
+    pub const PCR_PID: u16 = 0x100;
+    pub const AUDIO_PID: u16 = 0x101;
+    /// The PCR of chunk 0, 27 MHz.
+    pub const T0_27MHZ: u64 = 900_000_000;
+    /// One MP2 frame (1 152 samples at 48 kHz), 90 kHz.
+    pub const FRAME_90K: u64 = 2_160;
+    /// One chunk of the source, 27 MHz.
+    pub const CHUNK_27MHZ: u64 = 40 * 27_000;
+
+    /// `seconds` of a tone, encoded.
+    pub fn new(seconds: usize) -> Self {
+        let mut enc = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
+            codec: video_codec::AudioCodecType::Mp2,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_kbps: 192,
+        })
+        .expect("MP2 encoder");
+        let fs = enc.frame_size();
+        let mut frames = Vec::new();
+        for k in 0..seconds * 48_000 / fs {
+            let pcm: Vec<f32> = (0..fs).map(|i| ((k * fs + i) as f32 * 0.0625).sin() * 0.25).collect();
+            for f in enc.encode_frame(&[pcm.clone(), pcm]).expect("encode") {
+                frames.push(f.data.to_vec());
+            }
+        }
+        let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
+        mux.set_pids(None, Some(Self::PCR_PID), Some(Self::AUDIO_PID), Some(Self::PCR_PID));
+        mux.set_has_audio(true);
+        mux.set_audio_stream(0x03, None);
+        Self { frames, mux, next: 0 }
+    }
+
+    /// The PTS of audio frame `n`, 90 kHz.
+    pub fn frame_pts(n: usize) -> u64 {
+        Self::T0_27MHZ / 300 + 9_000 + n as u64 * Self::FRAME_90K
+    }
+
+    /// The source's `k`th 40 ms: its PCR, then every frame due within
+    /// 100 ms of it. Chunks go in increasing `k`; a `k` skipped is a gap in
+    /// the source, its frames lost. `None` once the frames run out.
+    pub fn chunk(&mut self, k: u64) -> Option<Vec<u8>> {
+        let t = Self::T0_27MHZ + k * Self::CHUNK_27MHZ;
+        while self.next < self.frames.len() && Self::frame_pts(self.next) < t / 300 {
+            self.next += 1;
+        }
+        if self.next >= self.frames.len() {
+            return None;
+        }
+        let mut c = super::ts_parse::pcr_only_packet(Self::PCR_PID, 0, t, false).to_vec();
+        while self.next < self.frames.len() && Self::frame_pts(self.next) <= t / 300 + 9_000 {
+            for p in self.mux.mux_audio_pre_adts(&self.frames[self.next], Self::frame_pts(self.next)) {
+                c.extend_from_slice(&p);
+            }
+            self.next += 1;
+        }
+        Some(c)
+    }
+}
+
+/// What a TS stream carries on [`Mp2Programme`]'s PIDs, in order: each PCR
+/// (27 MHz) and each audio PES's PTS (90 kHz).
+#[cfg(feature = "media-codecs")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgrammeEvent {
+    Pcr(u64),
+    AudioPts(u64),
+}
+
+/// The [`ProgrammeEvent`]s of `ts`, in stream order.
+#[cfg(feature = "media-codecs")]
+pub fn programme_events(ts: &[u8]) -> Vec<ProgrammeEvent> {
+    use super::ts_parse::{extract_pcr, extract_pes_pts, ts_pid, ts_pusi};
+    ts.chunks_exact(TS_PACKET_SIZE)
+        .filter(|p| p[0] == TS_SYNC_BYTE)
+        .flat_map(|p| {
+            let pcr = (ts_pid(p) == Mp2Programme::PCR_PID).then(|| extract_pcr(p)).flatten();
+            let pts = (ts_pid(p) == Mp2Programme::AUDIO_PID && ts_pusi(p))
+                .then(|| extract_pes_pts(p))
+                .flatten();
+            pcr.map(ProgrammeEvent::Pcr).into_iter().chain(pts.map(ProgrammeEvent::AudioPts))
+        })
+        .collect()
+}
+
+/// What makes a stream on [`Mp2Programme`]'s PIDs one a receiver can
+/// follow from its first byte: every PCR after `after_27mhz` (nothing of
+/// an earlier stream in it), each 30–50 ms after the one before (no step
+/// back, no jump), and every audio PES after the first PCR 0–1 s ahead of
+/// the PCR before it. Panics naming the first that is not.
+#[cfg(feature = "media-codecs")]
+pub fn assert_one_followable_stream(events: &[ProgrammeEvent], after_27mhz: u64) {
+    let mut last_pcr: Option<u64> = None;
+    let mut pcrs = 0;
+    let mut audio = 0;
+    for (i, e) in events.iter().enumerate() {
+        match *e {
+            ProgrammeEvent::Pcr(v) => {
+                assert!(v > after_27mhz, "event {i}: PCR {v} is from before {after_27mhz}: {events:?}");
+                if let Some(prev) = last_pcr {
+                    let step = v as i64 - prev as i64;
+                    assert!(
+                        (30 * 27_000..=50 * 27_000).contains(&step),
+                        "event {i}: the PCR steps {:.1} ms: {events:?}",
+                        step as f64 / 27_000.0
+                    );
+                }
+                last_pcr = Some(v);
+                pcrs += 1;
+            }
+            ProgrammeEvent::AudioPts(pts) => {
+                let Some(pcr) = last_pcr else { continue };
+                let lead = pts as i64 - (pcr / 300) as i64;
+                assert!(
+                    (0..=90_000).contains(&lead),
+                    "event {i}: audio PTS {pts} leads its PCR by {:.1} ms: {events:?}",
+                    lead as f64 / 90.0
+                );
+                audio += 1;
+            }
+        }
+    }
+    assert!(pcrs >= 10 && audio >= 10, "{pcrs} PCRs and {audio} audio PES: too little to judge");
+}

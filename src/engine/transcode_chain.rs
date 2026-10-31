@@ -56,6 +56,17 @@
 //!   `flush()` on each replacer to drain trailing PES / encoder state,
 //!   sends the residue, then exits cleanly.
 //!
+//! ## New streams
+//!
+//! An output whose receiver changes — an SRT output's next connection —
+//! calls [`TranscodeChain::restart_stream`]. Its input has a gap across the
+//! change (nothing is submitted while no receiver is connected), and the
+//! new receiver's stream must start from the input as it is now: every
+//! chunk is tagged with the stream it was submitted for, the codec thread
+//! drops input of a stream the output has left and resets both replacers
+//! at the first chunk of the new one, and [`TranscodeChain::try_recv`]
+//! drops output produced for an earlier one.
+//!
 //! ## Stats + shared flags
 //!
 //! All the Arc-based shared handles each replacer exposes
@@ -68,7 +79,7 @@
 //! plumbing.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -200,14 +211,20 @@ impl From<TsVideoReplaceError> for TranscodeChainError {
 /// output receiver, and all shared handles output spawn code needs to
 /// register with stats / event plumbing.
 pub struct TranscodeChain {
-    /// `Bytes` chunks the output task wants the chain to transcode.
+    /// `Bytes` chunks the output task wants the chain to transcode, each
+    /// tagged with the stream it was submitted for (`stream`).
     /// Wrapped in `Option` so `Drop` can drop the sender explicitly
     /// **before** joining the codec thread — otherwise the thread
     /// blocks on `blocking_recv` forever and the join deadlocks.
-    input_tx: Option<mpsc::Sender<Bytes>>,
+    input_tx: Option<mpsc::Sender<(u64, Bytes)>>,
     /// `Bytes` chunks the chain has produced, awaiting the output
-    /// task's downstream pipeline.
-    output_rx: mpsc::Receiver<Bytes>,
+    /// task's downstream pipeline, tagged with the stream of the input
+    /// they came from.
+    output_rx: mpsc::Receiver<(u64, Bytes)>,
+    /// The stream the output is carrying now, bumped by
+    /// [`Self::restart_stream`]. Shared with the codec thread, which drops
+    /// input submitted for an earlier stream.
+    stream: Arc<AtomicU64>,
     /// JoinHandle for the codec thread. Held so the thread is joined
     /// on drop (graceful shutdown).
     thread: Option<JoinHandle<()>>,
@@ -268,16 +285,20 @@ impl TranscodeChain {
             parts.join(", ")
         };
 
-        let (input_tx, input_rx) = mpsc::channel::<Bytes>(TRANSCODE_CHAIN_INPUT_DEPTH);
-        let (output_tx, output_rx) = mpsc::channel::<Bytes>(TRANSCODE_CHAIN_OUTPUT_DEPTH);
+        let (input_tx, input_rx) = mpsc::channel::<(u64, Bytes)>(TRANSCODE_CHAIN_INPUT_DEPTH);
+        let (output_tx, output_rx) = mpsc::channel::<(u64, Bytes)>(TRANSCODE_CHAIN_OUTPUT_DEPTH);
+        let stream = Arc::new(AtomicU64::new(0));
 
         // Move the replacers into the codec thread. The thread owns
         // them for its entire lifetime — no per-frame ownership
         // transfer.
-        let thread = spawn_codec_thread(
-            CodecThreadConfig::realtime(format!("transcode-{}", who.clone())),
-            move || run_chain(input_rx, output_tx, audio, video, pcr, backpressure),
-        );
+        let thread = {
+            let (who, stream) = (who.clone(), stream.clone());
+            spawn_codec_thread(
+                CodecThreadConfig::realtime(format!("transcode-{who}")),
+                move || run_chain(who, input_rx, output_tx, stream, audio, video, pcr, backpressure),
+            )
+        };
 
         tracing::info!(
             "transcode-chain '{}' started: {}",
@@ -287,6 +308,7 @@ impl TranscodeChain {
         Self {
             input_tx: Some(input_tx),
             output_rx,
+            stream,
             thread: Some(thread),
             audio_external_reset,
             video_external_reset,
@@ -301,10 +323,10 @@ impl TranscodeChain {
         let Some(input_tx) = self.input_tx.as_ref() else {
             return Err(raw_ts);
         };
-        match input_tx.try_send(raw_ts) {
+        match input_tx.try_send((self.stream.load(Ordering::Acquire), raw_ts)) {
             Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(b)) => Err(b),
-            Err(mpsc::error::TrySendError::Closed(b)) => Err(b),
+            Err(mpsc::error::TrySendError::Full((_, b))) => Err(b),
+            Err(mpsc::error::TrySendError::Closed((_, b))) => Err(b),
         }
     }
 
@@ -313,9 +335,59 @@ impl TranscodeChain {
     /// codec thread has exited (channel closed). Production output
     /// tasks drain via this on each iteration — the async `recv`
     /// pattern would require splitting the receiver out of the chain
-    /// to avoid borrow conflicts in `tokio::select!`.
+    /// to avoid borrow conflicts in `tokio::select!`. A chunk produced
+    /// for a stream before the last [`Self::restart_stream`] is dropped
+    /// here, unseen.
     pub fn try_recv(&mut self) -> Option<Bytes> {
-        self.output_rx.try_recv().ok()
+        let stream = self.stream.load(Ordering::Acquire);
+        loop {
+            match self.output_rx.try_recv() {
+                Ok((s, chunk)) if s == stream => return Some(chunk),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Everything the codec thread has ready, as one chunk; `None` when
+    /// nothing is. What an output that hands the chain's output on once per
+    /// chunk it submits takes each time round: taking one chunk per chunk
+    /// submitted, every chunk the thread produced while the output ran
+    /// ahead of it (a bursty source, a slow encode) stayed queued for good,
+    /// latency on the output for as long as it ran.
+    pub fn try_recv_ready(&mut self) -> Option<Bytes> {
+        let first = self.try_recv()?;
+        let Some(second) = self.try_recv() else {
+            return Some(first);
+        };
+        let mut joined = Vec::with_capacity(first.len() + second.len());
+        joined.extend_from_slice(&first);
+        joined.extend_from_slice(&second);
+        while let Some(more) = self.try_recv() {
+            joined.extend_from_slice(&more);
+        }
+        Some(Bytes::from(joined))
+    }
+
+    /// The output this chain feeds has started a new stream to a new
+    /// receiver — an SRT output's next connection. Nothing submitted
+    /// before this call reaches the new stream: input still queued is
+    /// dropped by the codec thread, and output it produced is dropped by
+    /// [`Self::try_recv`]. The first chunk submitted after it resets both
+    /// replacers as an input switch does (decoder, encoder and PTS anchor
+    /// afresh, the video's next frame an IDR), so the new receiver's stream
+    /// starts from the input as it is now.
+    ///
+    /// The output submits nothing while no receiver is connected, so its
+    /// input has a gap across the change. Carried across it, the chain
+    /// handed the new receiver the TS the last one never got (its PCR the
+    /// whole gap behind the next one, with no discontinuity indicator) and
+    /// restamped the audio it held from before the gap for after it, ahead
+    /// of the PCR that moved there: a receiving edge, bridging that PCR
+    /// jump, then stepped the audio PTS by about a second. Costs nothing on
+    /// a chain that has carried no stream yet.
+    pub fn restart_stream(&mut self) {
+        self.stream.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Human-readable summary used at output startup logs.
@@ -498,10 +570,14 @@ impl Drop for TranscodeChain {
 }
 
 /// Codec-thread body. Owns both replacers, the PCR stage and the scratch
-/// buffers for the chain's lifetime.
+/// buffers for the chain's lifetime. `stream` is the output's current
+/// stream ([`TranscodeChain::restart_stream`]).
+#[allow(clippy::too_many_arguments)]
 fn run_chain(
-    mut input_rx: mpsc::Receiver<Bytes>,
-    output_tx: mpsc::Sender<Bytes>,
+    who: String,
+    mut input_rx: mpsc::Receiver<(u64, Bytes)>,
+    output_tx: mpsc::Sender<(u64, Bytes)>,
+    stream: Arc<AtomicU64>,
     mut audio: Option<TsAudioReplacer>,
     mut video: Option<TsVideoReplacer>,
     mut pcr: TsPcrRemux,
@@ -517,6 +593,9 @@ fn run_chain(
     if let Some(v) = video.as_mut() {
         v.set_pcr_remux_stats(pcr.stats_handle());
     }
+    // The stream the last chunk processed was submitted for; `None` until
+    // the first.
+    let mut carrying: Option<u64> = None;
 
     loop {
         // Codec → wire_emit backpressure. When the wire_tx queue is
@@ -533,8 +612,8 @@ fn run_chain(
             bp.wait_until_drained();
         }
 
-        let input = match input_rx.blocking_recv() {
-            Some(b) => b,
+        let (input_stream, input) = match input_rx.blocking_recv() {
+            Some(item) => item,
             None => {
                 // Input channel closed — drain replacer trailing state
                 // (PES buffer, encoder pipeline residue) through the rest
@@ -558,11 +637,40 @@ fn run_chain(
                 after_pcr_scratch.clear();
                 pcr.process(&after_video_scratch, &mut after_pcr_scratch);
                 if !after_pcr_scratch.is_empty() {
-                    let _ = output_tx.try_send(Bytes::copy_from_slice(&after_pcr_scratch));
+                    let _ = output_tx.try_send((
+                        carrying.unwrap_or_default(),
+                        Bytes::copy_from_slice(&after_pcr_scratch),
+                    ));
                 }
                 break;
             }
         };
+
+        // Input submitted for a stream the output has since left reaches
+        // no receiver: skip it. The first chunk of a new stream after one
+        // was carried resets both replacers, so nothing of the old stream
+        // (a partial access unit, audio waiting in the encoder, the PTS
+        // anchor, the video decoder's references) runs on across the gap
+        // into it. The PCR stage needs no reset: the gap is a forward
+        // input PCR step without DI, which it carries as the step it is —
+        // the clock ran on, only the delivery paused — and a new receiver
+        // never saw the PCR before it.
+        if input_stream < stream.load(Ordering::Acquire) {
+            continue;
+        }
+        if carrying.is_some_and(|s| s != input_stream) {
+            tracing::info!(
+                "transcode-chain '{who}': the output started a new stream; \
+                 resetting the replacers"
+            );
+            if let Some(a) = audio.as_ref() {
+                a.external_reset_handle().store(true, Ordering::Relaxed);
+            }
+            if let Some(v) = video.as_ref() {
+                v.external_reset_handle().store(true, Ordering::Relaxed);
+            }
+        }
+        carrying = Some(input_stream);
 
         // The PCR stage sees the input's own PES ahead of the replacers:
         // an input PCR step they carry straight on across is the PCR's
@@ -607,7 +715,7 @@ fn run_chain(
             // reorder window, the pre-PMT gate). Skip this iteration.
             continue;
         }
-        let result = Bytes::copy_from_slice(&after_pcr_scratch);
+        let result = (input_stream, Bytes::copy_from_slice(&after_pcr_scratch));
 
         // Drop-on-full: live broadcast never wants to buffer past the
         // configured depth. The output task's per-flow stats accumulator
@@ -872,6 +980,169 @@ mod tests {
         assert!(pcr.epochs >= 1, "the ingress met the step");
         assert_eq!(pcr.stale_frames_dropped, 0, "no re-encoded frame taken for stale");
         assert_all_mp2_out(&wire, frames);
+    }
+
+    /// Everything `chain` produces until it has been quiet for 500 ms.
+    #[cfg(feature = "media-codecs")]
+    fn drain_until_quiet(chain: &mut TranscodeChain) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut quiet = std::time::Instant::now();
+        while quiet.elapsed() < std::time::Duration::from_millis(500) {
+            match chain.try_recv() {
+                Some(o) => {
+                    wire.extend_from_slice(&o);
+                    quiet = std::time::Instant::now();
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        wire
+    }
+
+    #[cfg(feature = "media-codecs")]
+    fn submit(chain: &TranscodeChain, chunk: Vec<u8>) {
+        let mut b = Bytes::from(chunk);
+        while let Err(back) = chain.try_submit(b) {
+            b = back;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// A chain restarted for a new stream hands it nothing of the old one,
+    /// across the gap the output's input has while no receiver is
+    /// connected. The old stream's last chunks are submitted and transcoded
+    /// but never taken (the receiver left), the source runs on 1.2 s
+    /// unseen, then the new stream: its first PCR is the new input's, its
+    /// PCR runs on at 40 ms, and its audio stays ahead of its PCR. Carried
+    /// across (an SRT output kept its chain from one connection to the
+    /// next), the new receiver got the old stream's PCR first, then a 1.2 s
+    /// PCR jump with no DI, with the held audio restamped for after the
+    /// jump ahead of it: a receiving edge stepped its audio PTS by a second.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_new_stream_gets_nothing_of_the_last_across_the_gap() {
+        use crate::engine::ts_test_fixtures::{
+            assert_one_followable_stream, programme_events, Mp2Programme,
+        };
+        let stats = Arc::new(crate::stats::collector::OutputStatsAccumulator::new(
+            "out".into(),
+            "out".into(),
+            "srt".into(),
+        ));
+        let mut chain = build_for_output("out", Some(&mp2_config()), None, None, &stats, None, None)
+            .unwrap()
+            .expect("an audio chain");
+        let mut source = Mp2Programme::new(8);
+        // The first connection: 2 s, its last 400 ms never taken.
+        for k in 0..40 {
+            submit(&chain, source.chunk(k).unwrap());
+            while chain.try_recv().is_some() {}
+        }
+        for k in 40..50 {
+            submit(&chain, source.chunk(k).unwrap());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // The next connection, after 1.2 s of the source no one saw.
+        chain.restart_stream();
+        let first_new = Mp2Programme::T0_27MHZ + 80 * Mp2Programme::CHUNK_27MHZ;
+        let mut wire = Vec::new();
+        for k in 80..180 {
+            submit(&chain, source.chunk(k).unwrap());
+            while let Some(o) = chain.try_recv() {
+                wire.extend_from_slice(&o);
+            }
+        }
+        wire.extend(drain_until_quiet(&mut chain));
+        // Output PCR is the input's less a delay of under a second.
+        assert_one_followable_stream(
+            &programme_events(&wire),
+            first_new - 27_000_000,
+        );
+    }
+
+    /// The `version_number` of every PMT section starting in `ts`.
+    #[cfg(feature = "media-codecs")]
+    fn pmt_versions(ts: &[u8]) -> Vec<u8> {
+        use crate::engine::ts_parse::{ts_has_payload, ts_payload_offset, ts_pusi, TS_PACKET_SIZE};
+        ts.chunks_exact(TS_PACKET_SIZE)
+            .filter(|p| ts_pusi(p) && ts_has_payload(p))
+            .filter_map(|p| {
+                let sec = ts_payload_offset(p) + 1 + *p.get(ts_payload_offset(p))? as usize;
+                let version = *p.get(sec + 5)?;
+                (p.get(sec) == Some(&0x02)).then_some((version >> 1) & 0x1F)
+            })
+            .collect()
+    }
+
+    /// The first chunk of a new stream resets the replacers as an input
+    /// switch does, which re-stamps the output PMT with a new version: the
+    /// old stream's partial access unit, held audio and PTS anchor do not
+    /// run on across the gap into the new one.
+    #[cfg(feature = "media-codecs")]
+    #[test]
+    fn a_new_stream_resets_the_replacers() {
+        use crate::engine::ts_test_fixtures::Mp2Programme;
+        let stats = Arc::new(crate::stats::collector::OutputStatsAccumulator::new(
+            "out".into(),
+            "out".into(),
+            "srt".into(),
+        ));
+        let mut chain = build_for_output("out", Some(&mp2_config()), None, None, &stats, None, None)
+            .unwrap()
+            .expect("an audio chain");
+        let mut source = Mp2Programme::new(6);
+        let mut first = Vec::new();
+        for k in 0..50 {
+            submit(&chain, source.chunk(k).unwrap());
+            while let Some(o) = chain.try_recv() {
+                first.extend_from_slice(&o);
+            }
+        }
+        first.extend(drain_until_quiet(&mut chain));
+        let before: std::collections::BTreeSet<u8> = pmt_versions(&first).into_iter().collect();
+        assert_eq!(before.len(), 1, "one PMT version on the first stream: {before:?}");
+
+        chain.restart_stream();
+        let mut second = Vec::new();
+        for k in 80..130 {
+            submit(&chain, source.chunk(k).unwrap());
+            while let Some(o) = chain.try_recv() {
+                second.extend_from_slice(&o);
+            }
+        }
+        second.extend(drain_until_quiet(&mut chain));
+        let after = pmt_versions(&second);
+        assert!(!after.is_empty(), "the new stream carries its PMT");
+        assert!(
+            after.iter().all(|v| !before.contains(v)),
+            "the new stream's PMT is re-stamped: {before:?} then {after:?}"
+        );
+    }
+
+    /// `try_recv_ready` hands on everything the codec thread has ready, in
+    /// order, as one chunk.
+    #[test]
+    fn try_recv_ready_takes_everything_ready_at_once() {
+        let mut chain = make_audio_only_chain();
+        // Null packets pass the pre-PMT gate unchanged: one output chunk per
+        // chunk submitted.
+        let null = |cc: u8| {
+            let mut p = [0xFFu8; 188];
+            p[..4].copy_from_slice(&[0x47, 0x1F, 0xFF, 0x10 | (cc & 0x0F)]);
+            p
+        };
+        for cc in 0..5u8 {
+            chain.try_submit(Bytes::copy_from_slice(&null(cc))).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while chain.output_rx.len() < 5 {
+            assert!(std::time::Instant::now() < deadline, "the codec thread passes all five");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let want: Vec<u8> = (0..5u8).flat_map(null).collect();
+        assert_eq!(chain.try_recv_ready().as_deref(), Some(&want[..]), "all five, in order, at once");
+        assert!(chain.try_recv_ready().is_none(), "nothing left");
     }
 
     /// Construct + immediately drop. Verifies the codec thread sees

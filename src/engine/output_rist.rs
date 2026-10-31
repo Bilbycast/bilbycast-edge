@@ -474,11 +474,14 @@ async fn rist_output_loop(
                 if chain.try_submit(Bytes::copy_from_slice(filtered_bytes)).is_err() {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                 }
-                // Drain any transcoded chunks emitted by the codec
-                // thread since last poll. If at least one chunk is
-                // ready we splice it through; otherwise this iteration
-                // contributes nothing (the encoder's still pipelining).
-                match transcode_chain.as_mut().and_then(|c| c.try_recv()) {
+                // Drain every transcoded chunk the codec thread has
+                // emitted since last poll, as one (`try_recv_ready`). If
+                // any is ready we splice it through; otherwise this
+                // iteration contributes nothing (the encoder's still
+                // pipelining). It took one chunk per chunk submitted, so
+                // what the thread produced while this loop ran ahead of it
+                // stayed queued for good, adding to the output's latency.
+                match transcode_chain.as_mut().and_then(|c| c.try_recv_ready()) {
                     Some(t) => {
                         transcoded_holder = Some(t);
                         transcoded_holder.as_ref().unwrap()
@@ -585,4 +588,99 @@ async fn build_sender_redundancy(
         parent.retransmit_buffer_capacity,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A free even port whose odd RTCP partner is free too.
+    fn free_even_port_pair() -> u16 {
+        for _ in 0..200 {
+            let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            let even = port & !1;
+            if even < 1024 {
+                continue;
+            }
+            let a = std::net::UdpSocket::bind(("127.0.0.1", even));
+            let b = std::net::UdpSocket::bind(("127.0.0.1", even + 1));
+            if a.is_ok() && b.is_ok() {
+                return even;
+            }
+        }
+        panic!("no free even RIST port pair");
+    }
+
+    /// A transcoding RIST output hands on everything its chain has ready
+    /// each time round: after a burst the chain has worked through, the
+    /// next packet the flow publishes takes the whole burst's output to the
+    /// receiver. It took one chunk per chunk submitted, so the output of a
+    /// burst stayed queued behind the flow, adding its length to the
+    /// output's latency for as long as it ran.
+    #[cfg(feature = "media-codecs")]
+    #[tokio::test]
+    async fn a_transcoding_rist_output_hands_on_a_burst_at_once() {
+        use crate::engine::ts_test_fixtures::{programme_events, Mp2Programme, ProgrammeEvent};
+        let port = free_even_port_pair();
+        let mut receiver = RistSocket::receiver(RistSocketConfig {
+            local_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            buffer_size: Duration::from_millis(100),
+            ..Default::default()
+        })
+        .await
+        .expect("the receiver binds");
+        let config: RistOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "r1", "remote_addr": format!("127.0.0.1:{port}"),
+            "buffer_ms": 100, "audio_encode": { "codec": "mp2" }
+        }))
+        .expect("RIST output fixture");
+        let (tx, _keep) = broadcast::channel(256);
+        let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rist".into()));
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let _output = spawn_rist_output(
+            config,
+            &tx,
+            stats,
+            cancel.child_token(),
+            None,
+            events,
+            "f1".into(),
+            tokio::sync::watch::channel(String::new()).1,
+        );
+        let published = |data: Vec<u8>| RtpPacket {
+            data: Bytes::from(data),
+            sequence_number: 0,
+            rtp_timestamp: 0,
+            recv_time_us: now_us(),
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        };
+        let mut source = Mp2Programme::new(4);
+        for k in 0..40 {
+            tx.send(published(source.chunk(k).unwrap())).expect("the output is subscribed");
+        }
+        // The chain works through the burst; then one more packet.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        tx.send(published(source.chunk(40).unwrap())).expect("the output is subscribed");
+
+        let mut ts = Vec::new();
+        let until = Instant::now() + Duration::from_millis(1_500);
+        while let Ok(Some(datagram)) = tokio::time::timeout_at(until, receiver.recv()).await {
+            ts.extend_from_slice(&datagram);
+        }
+        let pcrs = programme_events(&ts)
+            .iter()
+            .filter(|e| matches!(e, ProgrammeEvent::Pcr(_)))
+            .count();
+        // The first chunk's PCR comes ahead of the programme's first PMT and
+        // is held back by the replacer's pre-PMT gate; the 7-packet
+        // re-chunker may hold the last.
+        assert!(pcrs >= 37, "{pcrs} of the burst's 40 PCRs reached the receiver");
+    }
 }

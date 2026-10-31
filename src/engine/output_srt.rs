@@ -605,9 +605,6 @@ async fn srt_output_listener_loop(
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
         build_transcode_chain_for_srt(config, events, &stats);
-    let mut null_padder = config
-        .cbr_pad_to_kbps
-        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         transcode_chain.as_ref(),
@@ -753,7 +750,7 @@ async fn srt_output_listener_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), None, poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let forward = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone(), keepalive_gate);
+        let forward = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, input_format, compressed_audio_input, frame_rate_rx.clone(), keepalive_gate);
         tokio::pin!(forward);
         // `None`: the caller left the forward loop's first sends
         // unacknowledged — the probe's stale verdict, on an output the
@@ -832,9 +829,6 @@ async fn srt_output_caller_loop(
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
         build_transcode_chain_for_srt(config, events, &stats);
-    let mut null_padder = config
-        .cbr_pad_to_kbps
-        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         transcode_chain.as_ref(),
@@ -930,7 +924,7 @@ async fn srt_output_caller_loop(
         spawn_srt_stats_poller(socket.clone(), stats.srt_stats_cache.clone(), None, poller_cancel.clone());
 
         let sink = SrtSendSink::Socket(socket.clone());
-        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, &mut null_padder, input_format, compressed_audio_input, frame_rate_rx.clone(), KeepaliveGate::default()).await?;
+        let disconnected = srt_output_forward_loop(config, &mut rx, &stats, &cancel, &sink, &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter, &mut transcode_chain, input_format, compressed_audio_input, frame_rate_rx.clone(), KeepaliveGate::default()).await?;
         poller_cancel.cancel();
         let _ = socket.close().await;
 
@@ -961,15 +955,6 @@ async fn srt_output_caller_loop(
     Ok(())
 }
 
-/// Inner packet forwarding loop shared by listener and caller output modes.
-///
-/// Bridges the broadcast receiver to the SRT socket via a bounded mpsc channel
-/// and a dedicated Tokio send task. Returns `Ok(true)` if the connection was
-/// lost (caller should reconnect), `Ok(false)` if the broadcast channel closed
-/// (flow is shutting down).
-///
-/// `program_filter` is owned by the caller so its PAT/PMT state survives
-/// reconnects.
 /// Build a [`TsPidRemapper`] from `config.pid_map`. Returns `None` when
 /// the map is absent or empty (no-op).
 fn build_pid_remapper(config: &SrtOutputConfig) -> Option<TsPidRemapper> {
@@ -1245,6 +1230,51 @@ fn forwards_unchanged(
         && transcode_chain.is_none()
 }
 
+/// Start a connection's stream for a single-connection SRT output, whose
+/// stages outlive the connection. Nothing reaches them while no receiver is
+/// connected, so the flow's stream has a gap of a second or more across a
+/// reconnection, and the new receiver's stream must start from the flow as
+/// it is now:
+///
+/// - the transcode chain restarts its stream
+///   ([`TranscodeChain::restart_stream`](crate::engine::transcode_chain::TranscodeChain::restart_stream)).
+///   Carried across, it handed the new receiver the TS the last one never
+///   got, its PCR the whole gap behind the next one with no discontinuity
+///   indicator, and the audio it held from before the gap restamped for
+///   after it: a receiving edge bridged that PCR jump, and the audio PTS on
+///   its output stepped by about a second (bench, 2026-10-31);
+/// - the connection gets a CBR padder of its own, returned here: the
+///   padder's budget runs on the wall clock, so one carried across owed the
+///   gap's worth of NULL packets and sent them in bursts of up to 350
+///   packets with the new connection's first chunks.
+///
+/// The program filter and the PID rewrites keep what they learnt of the
+/// PSI, so a new connection is filtered from its first packet; nothing in
+/// them runs on a clock or holds media back.
+fn start_connection_stream(
+    config: &SrtOutputConfig,
+    transcode_chain: &mut Option<crate::engine::transcode_chain::TranscodeChain>,
+) -> Option<crate::engine::ts_null_padder::TsNullPadder> {
+    if let Some(chain) = transcode_chain.as_mut() {
+        chain.restart_stream();
+    }
+    config
+        .cbr_pad_to_kbps
+        .map(crate::engine::ts_null_padder::TsNullPadder::new)
+}
+
+/// Inner packet forwarding loop shared by listener and caller output modes
+/// (and the bonded one), run once per connection.
+///
+/// Bridges the broadcast receiver to the SRT socket via a bounded mpsc channel
+/// and a dedicated Tokio send task. Returns `Ok(true)` if the connection was
+/// lost (caller should reconnect), `Ok(false)` if the broadcast channel closed
+/// (flow is shutting down).
+///
+/// The stages are owned by the caller and outlive the connection: the
+/// program filter's PAT/PMT state survives reconnects, while the transcode
+/// chain starts each connection's stream afresh and the CBR padder is the
+/// connection's own ([`start_connection_stream`]).
 #[allow(clippy::too_many_arguments)]
 async fn srt_output_forward_loop(
     config: &SrtOutputConfig,
@@ -1256,7 +1286,6 @@ async fn srt_output_forward_loop(
     pid_remapper: &mut Option<TsPidRemapper>,
     pid_overrides_rewriter: &mut Option<TsPidOverridesRewriter>,
     transcode_chain: &mut Option<crate::engine::transcode_chain::TranscodeChain>,
-    null_padder: &mut Option<crate::engine::ts_null_padder::TsNullPadder>,
     input_format: Option<InputFormat>,
     compressed_audio_input: bool,
     frame_rate_rx: Option<tokio::sync::watch::Receiver<Option<f64>>>,
@@ -1265,6 +1294,7 @@ async fn srt_output_forward_loop(
     // or what a listener output's liveness probe learnt on this one.
     mut keepalive_gate: KeepaliveGate,
 ) -> anyhow::Result<bool> {
+    let mut null_padder = start_connection_stream(config, transcode_chain);
     let (send_tx, mut send_rx) = send_queue();
     let send_sink = sink.clone();
     let send_stats = stats.clone();
@@ -1561,28 +1591,29 @@ async fn srt_output_forward_loop(
                                 stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
                             }
                             // Drain whatever the codec thread has produced
-                            // since last poll. If nothing's ready yet,
-                            // skip this iteration — encoded output will
-                            // come on a later iteration.
+                            // since last poll — all of it, as one payload
+                            // (`TranscodeChain::try_recv_ready`). If
+                            // nothing's ready yet, skip this iteration —
+                            // encoded output will come on a later one.
                             let Some(transcoded) =
-                                transcode_chain.as_mut().and_then(|c| c.try_recv())
+                                transcode_chain.as_mut().and_then(|c| c.try_recv_ready())
                             else {
                                 continue;
                             };
                             // Apply CBR null padding to the transcoded
                             // bytes, then forward.
-                            let mut pad_out: Vec<u8> = Vec::new();
-                            let final_bytes: &[u8] =
-                                if let Some(padder) = null_padder.as_mut() {
+                            let final_bytes = match null_padder.as_mut() {
+                                Some(padder) => {
+                                    let mut pad_out: Vec<u8> = Vec::new();
                                     padder.process(&transcoded, &mut pad_out);
-                                    &pad_out
-                                } else {
-                                    &transcoded
-                                };
+                                    Bytes::from(pad_out)
+                                }
+                                None => transcoded,
+                            };
                             if final_bytes.is_empty() {
                                 continue;
                             }
-                            Bytes::copy_from_slice(final_bytes)
+                            final_bytes
                         } else {
                             payload
                         };
@@ -2609,9 +2640,6 @@ async fn srt_output_bonded_loop(
     let mut pid_overrides_rewriter = build_pid_overrides_rewriter(config);
     let mut transcode_chain =
         build_transcode_chain_for_srt(config, events, &stats);
-    let mut null_padder = config
-        .cbr_pad_to_kbps
-        .map(crate::engine::ts_null_padder::TsNullPadder::new);
     spawn_replacer_switch_watcher(
         &config.id,
         transcode_chain.as_ref(),
@@ -2680,7 +2708,6 @@ async fn srt_output_bonded_loop(
                     config, &mut rx, &stats, &cancel, &sink,
                     &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter,
                     &mut transcode_chain,
-                    &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                     KeepaliveGate::default(),
                 )
@@ -2778,7 +2805,6 @@ async fn srt_output_bonded_loop(
                     config, &mut rx, &stats, &cancel, &sink,
                     &mut program_filter, &mut pid_remapper, &mut pid_overrides_rewriter,
                     &mut transcode_chain,
-                    &mut null_padder,
                     input_format, compressed_audio_input, frame_rate_rx.clone(),
                     KeepaliveGate::default(),
                 )
@@ -4684,5 +4710,94 @@ mod tests {
             }
         }
         assert!(from_forward_loop > 0, "the forward loop sends the keepalives on");
+    }
+
+    /// A connection's stream starts the CBR padder afresh: carried over from
+    /// the last connection, its wall-clock budget owed the reconnection
+    /// gap's worth of NULL packets and sent them in bursts with the new
+    /// connection's first chunks.
+    #[test]
+    fn a_connection_owes_no_padding_for_the_gap_before_it() {
+        let config = listener_output(9, serde_json::json!({ "cbr_pad_to_kbps": 8_000 }));
+        let mut chain = None;
+        let mut padder = start_connection_stream(&config, &mut chain).expect("a padder");
+        let chunk = PairHarness::media();
+        let mut out = Vec::new();
+        padder.process(&chunk, &mut out);
+        // The gap: no receiver, nothing through the padder.
+        std::thread::sleep(Duration::from_millis(60));
+        let mut padder = start_connection_stream(&config, &mut chain).expect("a padder");
+        out.clear();
+        padder.process(&chunk, &mut out);
+        assert_eq!(out.len(), chunk.len(), "no NULL packets owed for the gap");
+    }
+
+    /// The bench's N3, on loopback: a listener output re-encoding a live
+    /// programme's audio, its caller re-joining. The second caller's stream
+    /// starts on the programme as it is when it joins and is one a receiver
+    /// can follow from its first byte. The output kept its transcode chain
+    /// from one connection to the next and took one chunk from it per chunk
+    /// it gave it: the second caller first got TS the first one never did,
+    /// then the PCR jumped over the reconnection gap with no DI, and a
+    /// receiving edge stepped its audio PTS by about a second.
+    #[cfg(feature = "media-codecs")]
+    #[tokio::test]
+    async fn a_transcoding_listener_output_starts_a_rejoining_caller_on_the_live_programme() {
+        use crate::engine::ts_test_fixtures::{
+            assert_one_followable_stream, programme_events, Mp2Programme, ProgrammeEvent,
+        };
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (tx, _events_rx) = spawn_output_alone(
+            listener_output(port, serde_json::json!({ "audio_encode": { "codec": "aac_lc" } })),
+            &cancel,
+        );
+        // The programme, live: chunk k published 40 ms * k after the start.
+        let (pump_tx, stop) = (tx.clone(), cancel.clone());
+        tokio::spawn(async move {
+            let mut source = Mp2Programme::new(20);
+            let start = Instant::now();
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            let mut k = 0u64;
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tick.tick() => {
+                        while start.elapsed() >= Duration::from_millis(40 * k) {
+                            let Some(chunk) = source.chunk(k) else { return };
+                            let _ = pump_tx.send(published(chunk, true));
+                            k += 1;
+                        }
+                    }
+                }
+            }
+        });
+        async fn read_for(peer: &SrtSocket, how_long: Duration) -> Vec<u8> {
+            let mut ts = Vec::new();
+            let until = Instant::now() + how_long;
+            while let Ok(Ok(datagram)) = tokio::time::timeout_at(until, peer.recv()).await {
+                ts.extend_from_slice(&datagram.data);
+            }
+            ts
+        }
+
+        let first = caller_of(port, &cancel).await;
+        let first_events = programme_events(&read_for(&first, Duration::from_millis(1_500)).await);
+        let last_seen = first_events
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                ProgrammeEvent::Pcr(v) => Some(*v),
+                _ => None,
+            })
+            .expect("the first caller got the programme");
+        first.close().await.unwrap();
+
+        // The output re-accepts a second after it sees the first caller go,
+        // so the second one joins the programme at least that much later.
+        let second = caller_of(port, &cancel).await;
+        let second_ts = read_for(&second, Duration::from_millis(3_000)).await;
+        assert_one_followable_stream(&programme_events(&second_ts), last_seen + 13_500_000);
     }
 }

@@ -236,7 +236,12 @@ unpinned, whatever the pin said:
   AC-4 published silence. A pin is taken when it is a track the output can
   publish; otherwise — absent, not audio, or a codec the output cannot
   publish — the output takes the track it would take unpinned. A later PMT
-  that carries the pin moves the output back onto it.
+  that carries the pin moves the output back onto it. A PMT update that
+  drops every audio stream leaves the output on none: it stops demuxing
+  the old PID and holds nothing of it, and a later PMT bringing audio back
+  is selected afresh by the same rule. Until 2026-10 the shared demuxer
+  stayed on the dropped PID, so the output went on reporting and expecting
+  that track and demuxing whatever still came on the PID.
 - **HLS** (`audio_encode` remux): unpinned, the **last** audio stream it
   can decode, as before. A pin is taken when it is one it can decode;
   otherwise (absent, or AC-4 / DTS) the output falls back to that last
@@ -962,8 +967,22 @@ bits on; band-limited MP2 / AAC sources are not.
 - PMT: `src/engine/ts_pmt_edit.rs` (`PsiUnitStage`, `rebuild_pmt_section`,
   `OutVersion`, `detect_flavour`); the engage watchdog is
   `src/engine/transcode_engage.rs`.
-- Wiring: `output_udp.rs`, `output_rtp.rs`, `output_srt.rs` insert a
-  `block_in_place` call between the program filter and the egress buffer.
+- Wiring: `output_udp.rs`, `output_rtp.rs`, `output_srt.rs` (and
+  `output_rist.rs`) hand the program filter's output to a
+  `transcode_chain::TranscodeChain` (audio replacer, video replacer and the
+  trailing PCR stage on a codec thread of their own) and take its output on
+  to the egress pipeline. An SRT output restarts the chain's stream at each
+  connection (`TranscodeChain::restart_stream`): input and output of the
+  last connection still in the chain are dropped, and both replacers reset
+  as on an input switch, so a re-joining receiver starts on the live
+  programme rather than on TS the last one never got followed by a PCR jump
+  over the reconnection gap. See
+  [configuration-guide.md](configuration-guide.md#srt-output) (Reconnections).
+  The SRT and RIST outputs take everything the chain has ready each time
+  round (`TranscodeChain::try_recv_ready`), as UDP and RTP always did:
+  taking one chunk per chunk submitted, a chunk the chain finished after the
+  output had moved on stayed queued for as long as the output ran, adding to
+  its latency.
 - Decoder: `bilbycast-fdk-aac-rs::AacDecoder::open_adts` (Fraunhofer FDK
   AAC, opened with no added delay) for ADTS; libavcodec for LATM / MP2 /
   AC-3 / E-AC-3.
