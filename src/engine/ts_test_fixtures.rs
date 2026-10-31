@@ -185,7 +185,7 @@ pub fn two_packet_pmt(program_number: u16, version: u8) -> (Vec<u8>, u16) {
 
 /// Write a 5-byte PES timestamp (`marker` = 0x2 PTS-only, 0x3 PTS with DTS
 /// following, 0x1 DTS).
-fn put_ts(dst: &mut [u8], marker: u8, v: u64) {
+pub fn put_ts(dst: &mut [u8], marker: u8, v: u64) {
     let v = v & 0x1_FFFF_FFFF;
     dst[0] = (marker << 4) | (((v >> 29) as u8) & 0x0E) | 0x01;
     dst[1] = (v >> 22) as u8;
