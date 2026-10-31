@@ -132,25 +132,21 @@
 //!   with no PCR on a PCR PID — an audio-only RTMP publish whose PMT names
 //!   an absent video PID as PCR_PID — PES pass on the source clock
 //!   (Warning `clock_rewrite_no_pcr`) until a PCR establishes the anchor.
-//! - **PCR repetition rate** (TR 101 290 §PCR_RR ≤ 40 ms): kept inline, by
-//!   [`PcrFill`]. Between two real PCRs the rewriter counts the packets it
-//!   passes and estimates where the stream has got from the PID's own recent
-//!   PCR intervals over the packets between them (ticks per packet, as a
-//!   remultiplexer does). Where the next real PCR would come more than 40 ms
-//!   after the last one — a source whose own cadence is longer (one PCR a
-//!   frame at 24 fps, 41.7 ms; a steady 80 ms), or PCR-bearing datagrams
-//!   lost upstream — it puts an AF-only PCR packet on the PCR PID in at the
-//!   position it has reached, valued `last PCR + packets since × ticks per
-//!   packet`, so each synthetic sits where its value says and `wire_emit`
-//!   (which paces a datagram by its first PCR) sends it on time. Never before
-//!   the rate is known (two real PCRs), never across a DI or a re-anchor,
-//!   never more than 500 ms past the last real PCR, and never past where the
-//!   source's next PCR could still come. Up to 0.116.0 it filled a gap only
-//!   once the next real PCR arrived, putting the synthetics immediately ahead
-//!   of it with values from mid-gap, so each read up to a whole gap behind its
-//!   position and `wire_emit` sent the real PCR early by that much (filling
-//!   lost-PCR gaps that way took the transport bench's PCR_AC p99 from 5.9 ms
-//!   to 27.5 ms).
+//! - **PCR repetition rate** (TR 101 290 §PCR_RR ≤ 40 ms): restored in
+//!   value, not in arrival time, where PCR-bearing datagrams were lost
+//!   upstream. When the gap to the next source PCR exceeds 40 ms and is
+//!   more than 1.5 times the source's own recent PCR interval (the median
+//!   of the last 16, [`PcrCadence`]), the rewriter injects synthetic
+//!   AF-only PCR packets on the PCR PID, evenly spaced so no interval
+//!   exceeds 40 ms (`maybe_inject_pcr_rr_padding`) — except across a
+//!   discontinuity (DI=1), which is signalled instead. A gap within the
+//!   source's own cadence is left alone, however long: the synthetics are
+//!   emitted with the next source PCR, immediately ahead of it, and
+//!   `wire_emit` paces a datagram by its first PCR, so padding every gap
+//!   of a source with one PCR per frame at 24 fps (41.7 ms) sent each real
+//!   PCR about half an interval early. In arrival time they bunch at the
+//!   end of the gap; whether that satisfies an analyser timing PCR
+//!   arrivals rather than reading their values is untested.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -176,250 +172,51 @@ const DISCONTINUITY_THRESHOLD_27MHZ: u64 = 500 * 27_000;
 const PCR_MODULUS_27MHZ: u64 = (1u64 << 33) * 300;
 
 /// TR 101 290 §PCR_RR maximum inter-PCR interval: 40 ms.
+/// When the inter-PCR gap exceeds this, the rewriter injects synthetic
+/// PCR-only adaptation-field padding packets to maintain compliance.
 const PCR_RR_MAX_27MHZ: u64 = 40 * 27_000;
 
-/// The spacing [`PcrFill`] plans between the PCRs it emits across a long
-/// interval: 30 ms, 10 ms inside the PCR_RR ceiling for its packet-count
-/// clock running slow. It counts the packets it receives, so packets lost
-/// upstream make the stream read less far on than it is: four lost 7-packet
-/// datagrams of a 15 ms-PCR source at 4 Mbit/s are 9.4 ms.
-const PCR_FILL_SPACING_27MHZ: u64 = 30 * 27_000;
+/// Hard cap on synthetic PCR packets injected per source PCR gap.
+/// Protects against pathological cases (very large source gaps).
+/// 50 × 40 ms = 2 s of padding maximum.
+const PCR_RR_MAX_INJECTIONS: usize = 50;
 
-/// How many recent real PCR intervals [`PcrFill`]'s ticks per packet is
-/// taken over: few, so a rate that drifts is followed.
-const PCR_FILL_RATE_INTERVALS: usize = 4;
+/// How many recent source PCR intervals PCR_RR padding judges a gap
+/// against ([`PcrCadence`]).
+const PCR_CADENCE_WINDOW: usize = 16;
 
-/// How many recent real PCR intervals [`PcrFill`] reads the source's PCR
-/// cadence and its densest and sparsest packet spacing from.
-const PCR_FILL_HISTORY: usize = 32;
+/// The fewest intervals [`PcrCadence`] needs before PCR_RR padding judges
+/// a gap at all: until the source has shown its cadence, nothing is
+/// padded.
+const PCR_CADENCE_MIN: usize = 4;
 
-/// The fewest real PCR intervals [`PcrFill`] needs before it fills past the
-/// source's next expected PCR (one presumed lost upstream), or fills a source
-/// with no regular PCR cadence at all.
-const PCR_FILL_MIN_HISTORY: usize = 4;
-
-/// The least step a synthetic PCR takes past the PCR before it.
-const PCR_FILL_MIN_STEP_27MHZ: u64 = 27_000;
-
-/// Inline PCR_RR filler (TR 101 290 §PCR_RR ≤ 40 ms) for the PCR PID the
-/// rewriter regenerates. It holds the last real PCR that went out, the input
-/// packets since, and the last real intervals in ticks and packets, and
-/// before each input packet says whether a synthetic PCR is due there
-/// ([`Self::due`]) and with what value: `last PCR + packets since × ticks per
-/// packet`, the rate taken from the PID's own recent intervals. Each
-/// synthetic therefore sits at the position its value names, and `wire_emit`,
-/// which paces a datagram by its first PCR, sends it when that value says.
-///
-/// **Where.** A source with a regular PCR cadence (every interval a whole
-/// multiple of the shortest, which is at least 8 ms, within a millisecond or
-/// 10 % per multiple) whose next PCR is due more than 40 ms after the last
-/// PCR emitted gets the fewest synthetics that leave no interval to it over
-/// [`PCR_FILL_SPACING_27MHZ`], the first as early in the interval as that
-/// allows (41.7 ms: one, 11.7 ms in; 80 ms: two, 20 and 50 ms in); a cadence
-/// of 40 ms or less gets none. Early because the estimate's error grows with
-/// the distance from the last real PCR: on a VBR source whose frames differ
-/// threefold in size the packet count is a poor clock by mid-interval, and
-/// the synthetic still has to land before the next real PCR. A source with
-/// no regular cadence gets one every [`PCR_FILL_SPACING_27MHZ`] of estimated
-/// time, and only while its packet rate is steady (CBR).
-///
-/// **Never past the next real PCR.** A synthetic valued past a real PCR that
-/// comes after it would step the clock back. Its value is held under the
-/// source's next PCR that could still come: on a regular cadence, the first
-/// multiple of it the stream has not surely passed, less the tolerance; with
-/// none, the time the stream has surely reached. "Surely" reads the packet
-/// count at the densest interval in the history, slowed by the history's own
-/// spread of densities and 2 % more (a CBR source: 2 %; intervals threefold
-/// apart in density: a third of the densest), so on a VBR source a real PCR
-/// is presumed lost only far past where it was due, and the gap it leaves
-/// goes unfilled.
-///
-/// **Never across a discontinuity.** The history is forgotten at a DI (the
-/// rewriter's or the source's), a re-anchor, an input transcode's own PCR
-/// step, a backward or 500 ms step, a new PCR PID and every clock fallback:
-/// the filler waits for two clean PCRs again. It extrapolates no further than
-/// 500 ms past the last real PCR, the step the rewriter takes for a
-/// discontinuity.
+/// The intervals between the last [`PCR_CADENCE_WINDOW`] source PCRs the
+/// rewriter emitted, discontinuities left out: the source's own PCR
+/// cadence. PCR_RR padding fills only a gap clearly longer than its median
+/// (PCRs lost upstream), never the cadence itself.
 #[derive(Default)]
-struct PcrFill {
-    /// PID of the last real PCR the rewriter regenerated; `None` disarmed.
-    pid: Option<u16>,
-    /// That PCR's output value (27 MHz).
-    last_real_27mhz: u64,
-    /// Input packets since the one that carried it.
-    since: u64,
-    /// The last PCR emitted on the PID — that one, or a synthetic since — as
-    /// ticks past it.
-    last_emitted: u64,
-    /// The last real intervals, `(27 MHz ticks, input packets)`, ring.
-    history: [(u64, u64); PCR_FILL_HISTORY],
+struct PcrCadence {
+    intervals: [u64; PCR_CADENCE_WINDOW],
     len: usize,
     next: usize,
-    /// What the history says, worked out at each real PCR.
-    plan: Option<PcrFillPlan>,
 }
 
-/// [`PcrFill`]'s reading of its history.
-#[derive(Clone, Copy, Debug)]
-struct PcrFillPlan {
-    /// Ticks per input packet over the last [`PCR_FILL_RATE_INTERVALS`]
-    /// intervals: how far on the stream is.
-    ticks_per_packet: f64,
-    /// Ticks per packet the stream has surely reached: the densest interval
-    /// in the history, slowed by the history's spread and 2 % more.
-    floor_ticks_per_packet: f64,
-    /// The source's regular PCR cadence, `(interval, tolerance per
-    /// multiple)`, when every interval in the history is a whole multiple of
-    /// the shortest.
-    cadence: Option<(u64, u64)>,
-    /// At least [`PCR_FILL_MIN_HISTORY`] intervals.
-    deep: bool,
-    /// Every interval's ticks per packet within 5 % of the others: a CBR
-    /// source, whose packet count is a clock.
-    steady: bool,
-}
-
-impl PcrFill {
-    /// Forget everything: no synthetic until two clean real PCRs.
-    fn disarm(&mut self) {
-        *self = Self::default();
+impl PcrCadence {
+    fn push(&mut self, interval: u64) {
+        self.intervals[self.next] = interval;
+        self.next = (self.next + 1) % PCR_CADENCE_WINDOW;
+        self.len = (self.len + 1).min(PCR_CADENCE_WINDOW);
     }
 
-    /// The real PCR the rewriter just emitted on `pid`, valued `value`.
-    /// `clean`: it carries no DI and continues the timeline of the one before
-    /// with no step of the rewriter's or an input transcode's. Its interval
-    /// joins the history only when it is clean, on the same PID, forward,
-    /// past every synthetic sent since and under 500 ms; otherwise the history
-    /// is forgotten.
-    fn real_pcr(&mut self, pid: u16, value: u64, clean: bool) {
-        let ticks = pcr_fwd_27mhz(value, self.last_real_27mhz);
-        if clean
-            && self.pid == Some(pid)
-            && ticks > self.last_emitted
-            && ticks < DISCONTINUITY_THRESHOLD_27MHZ
-        {
-            self.history[self.next] = (ticks, self.since + 1);
-            self.next = (self.next + 1) % PCR_FILL_HISTORY;
-            self.len = (self.len + 1).min(PCR_FILL_HISTORY);
-        } else {
-            if clean && self.pid == Some(pid) && ticks <= self.last_emitted {
-                tracing::debug!(
-                    ticks,
-                    last_synthetic = self.last_emitted,
-                    "ts_pts_rewriter: a real PCR came at or before the last synthetic PCR"
-                );
-            }
-            self.len = 0;
-            self.next = 0;
-        }
-        self.pid = Some(pid);
-        self.last_real_27mhz = value;
-        self.since = 0;
-        self.last_emitted = 0;
-        self.plan = self.read_history();
-    }
-
-    /// An input packet went by that carried no real PCR on the PID.
-    fn packet(&mut self) {
-        self.since += 1;
-    }
-
-    fn read_history(&self) -> Option<PcrFillPlan> {
-        if self.len == 0 {
+    /// The median interval, once there are [`PCR_CADENCE_MIN`] of them.
+    fn median(&self) -> Option<u64> {
+        if self.len < PCR_CADENCE_MIN {
             return None;
         }
-        let held = &self.history[..self.len];
-        let (mut ticks, mut packets) = (0u64, 0u64);
-        for k in 0..self.len.min(PCR_FILL_RATE_INTERVALS) {
-            let (t, p) = self.history[(self.next + PCR_FILL_HISTORY - 1 - k) % PCR_FILL_HISTORY];
-            ticks += t;
-            packets += p;
-        }
-        let density = |&(t, p): &(u64, u64)| t as f64 / p as f64;
-        let densest = held.iter().map(density).fold(f64::INFINITY, f64::min);
-        let sparsest = held.iter().map(density).fold(0.0, f64::max);
-        let shortest = held.iter().map(|&(t, _)| t).min().unwrap_or(0);
-        let tolerance = (shortest / 10).max(27_000);
-        // A cadence that close to its tolerance (under 8 ms) fits anything.
-        let regular = tolerance * 8 <= shortest
-            && held.iter().all(|&(t, _)| {
-                let m = ((t + shortest / 2) / shortest).max(1);
-                t.abs_diff(m * shortest) <= m * tolerance
-            });
-        Some(PcrFillPlan {
-            ticks_per_packet: ticks as f64 / packets as f64,
-            floor_ticks_per_packet: densest * densest / sparsest / 1.02,
-            cadence: regular.then_some((shortest, tolerance)),
-            deep: self.len >= PCR_FILL_MIN_HISTORY,
-            steady: sparsest <= densest * 1.05,
-        })
-    }
-
-    /// The value of the synthetic PCR due ahead of the next input packet,
-    /// if one is, and take it as emitted. `None` while disarmed.
-    fn due(&mut self) -> Option<u64> {
-        let plan = self.plan?;
-        let slot = (self.since + 1) as f64;
-        let reached = slot * plan.ticks_per_packet;
-        if reached > DISCONTINUITY_THRESHOLD_27MHZ as f64 {
-            return None;
-        }
-        let surely = slot * plan.floor_ticks_per_packet;
-        let last = self.last_emitted as f64;
-        let spacing = PCR_FILL_SPACING_27MHZ as f64;
-        let value = match plan.cadence {
-            Some((cadence, tolerance)) => {
-                let (cadence, tolerance) = (cadence as f64, tolerance as f64);
-                // The source's next PCR that could still come: the first
-                // multiple of its cadence not surely passed by more than the
-                // tolerance, and past the first only on a deep history. One
-                // presumed lost that is only late (by up to a tolerance per
-                // multiple) still lies under the next multiple's cap, which a
-                // synthetic is held to, for the first six multiples: the
-                // tolerance is at most an eighth of the cadence.
-                let multiple =
-                    if plan.deep { ((surely - tolerance) / cadence).ceil().max(1.0) } else { 1.0 };
-                let next_real = multiple * cadence;
-                // Where the stream will be surely past it, and the first
-                // synthetic past it can go.
-                let past =
-                    (next_real + tolerance) * plan.ticks_per_packet / plan.floor_ticks_per_packet;
-                if plan.steady
-                    && reached >= next_real + tolerance
-                    && past + plan.ticks_per_packet - last > PCR_RR_MAX_27MHZ as f64
-                {
-                    // Overdue on a CBR source — lost, most likely, but not yet
-                    // surely past — and the step to the first synthetic past it
-                    // would be over 40 ms (deep into an outage, where the
-                    // "surely" margin has grown): close up to just short of it.
-                    next_real - tolerance
-                } else {
-                    if next_real - last <= PCR_RR_MAX_27MHZ as f64 {
-                        return None;
-                    }
-                    let needed = ((next_real - last) / spacing).ceil() - 1.0;
-                    if reached < next_real - needed * spacing {
-                        return None;
-                    }
-                    reached.min(next_real - tolerance)
-                }
-            }
-            // No cadence to plan by: one every `spacing`, and only on a
-            // steady packet rate, where "surely" is the estimate less 2 %. On
-            // a VBR one it lags so far that a synthetic would read well
-            // behind its position.
-            None => {
-                if !plan.deep || !plan.steady || reached - last < spacing {
-                    return None;
-                }
-                reached.min(surely)
-            }
-        };
-        if value < last + PCR_FILL_MIN_STEP_27MHZ as f64 {
-            return None;
-        }
-        self.last_emitted = value as u64;
-        Some(pcr_add_27mhz(self.last_real_27mhz, self.last_emitted as i64))
+        let mut intervals = self.intervals;
+        let held = &mut intervals[..self.len];
+        held.sort_unstable();
+        Some(held[self.len / 2])
     }
 }
 
@@ -580,11 +377,15 @@ pub struct TsPtsRewriter {
     last_pat_version: Option<u8>,
     /// Per-PMT-PID version-gate.
     last_pmt_versions: HashMap<u16, u8>,
-    /// Inline PCR_RR filler for the PCR PID (TR 101 290 §PCR_RR ≤ 40 ms).
-    pcr_fill: PcrFill,
-    /// Continuity counter last emitted per PCR_PID: a payload packet's,
-    /// else (no payload packet on the PID yet) an adaptation-field-only
-    /// one's. Synthetic AF-only packets carry it (CC doesn't advance on
+    /// Last emitted output PCR (27 MHz). Used to detect PCR_RR gaps
+    /// (TR 101 290 §PCR_RR ≤ 40 ms) and inject synthetic PCR-only
+    /// padding when the source PCR cadence is sparse.
+    last_emitted_out_pcr_27mhz: Option<u64>,
+    /// The source's own recent PCR intervals, which PCR_RR padding leaves
+    /// alone.
+    pcr_cadence: PcrCadence,
+    /// Last observed continuity counter per PCR_PID. Synthetic
+    /// AF-only packets inherit this value (CC doesn't advance on
     /// AF-only packets per H.222.0 §2.4.3.3 — keeping CC consistent
     /// with the last PES-bearing packet on the PID avoids CC errors
     /// at the receiver).
@@ -765,7 +566,8 @@ impl TsPtsRewriter {
             anchor: ClockAnchor::default(),
             last_pat_version: None,
             last_pmt_versions: HashMap::new(),
-            pcr_fill: PcrFill::default(),
+            last_emitted_out_pcr_27mhz: None,
+            pcr_cadence: PcrCadence::default(),
             last_cc_on_pcr_pid: HashMap::new(),
             cached_pat: None,
             cached_pmts: HashMap::new(),
@@ -881,7 +683,6 @@ impl TsPtsRewriter {
                 // Out-of-sync byte — pass through; upstream framing is
                 // probably wrong and we don't want to drop the packet.
                 out.extend_from_slice(pkt);
-                self.pcr_fill.packet();
                 continue;
             }
 
@@ -952,10 +753,6 @@ impl TsPtsRewriter {
                 self.maybe_inject_psi_padding(out);
             }
 
-            // TR 101 290 §PCR_RR: a synthetic PCR due at this position goes
-            // in here, ahead of this packet ([`PcrFill`]).
-            self.fill_pcr_ahead_of(pkt, pid, out);
-
             if pid == PAT_PID && ts_pusi(pkt) {
                 self.observe_pat(pkt);
                 self.note_psi_emitted();
@@ -990,7 +787,6 @@ impl TsPtsRewriter {
                     // An adaptation-field-only carrier goes with it — it
                     // advances no CC; a payload packet loses the field and
                     // keeps the rest.
-                    self.pcr_fill.disarm();
                     if !ts_has_payload(pkt) {
                         continue;
                     }
@@ -998,7 +794,6 @@ impl TsPtsRewriter {
                     clear_pcr(&mut buf);
                     rewritten = true;
                 } else if is_pcr_pid && self.clock_passthrough_unlearned {
-                    self.pcr_fill.disarm();
                     // Source clock through, unchanged apart from the one
                     // DI=1 that marks the switch away from the master
                     // timeline.
@@ -1009,10 +804,6 @@ impl TsPtsRewriter {
                     }
                 } else if is_pcr_pid {
                     buf.copy_from_slice(pkt);
-                    // An input transcode's own PCR step moves the PCR and
-                    // not the packets: no interval to learn a rate from.
-                    let upstream_step =
-                        self.upstream_pcr_steps.iter().any(|&(v, d)| v == src_pcr && d != 0);
                     let (new_pcr, set_di) = self.rewrite_pcr_value(src_pcr);
                     let set_di = set_di || std::mem::take(&mut self.pending_di);
                     if write_pcr_field_in_packet(&mut buf, new_pcr).is_some() {
@@ -1023,14 +814,44 @@ impl TsPtsRewriter {
                             // alarm on the clock jump.
                             set_discontinuity_indicator(&mut buf);
                         }
-                        // The PCR_RR filler counts from this PCR, and learns
-                        // the source's rate from its interval to the last
-                        // unless a discontinuity — the rewriter's DI or the
-                        // source's own — or a transcode's step lies between.
-                        let clean = !set_di && !ts_discontinuity_indicator(pkt) && !upstream_step;
-                        self.pcr_fill.real_pcr(pid, new_pcr, clean);
-                    } else {
-                        self.pcr_fill.disarm();
+
+                        // TR 101 290 §PCR_RR injection ONLY on steady-
+                        // state sparse-PCR sources. Skip on
+                        // discontinuities (set_di=true): filling a
+                        // forward jump with synthetics would emit dozens
+                        // of phantom PCRs at the boundary, confusing
+                        // receivers — the DI=1 + native source PCR is
+                        // the correct discontinuity signal.
+                        //
+                        // Synthetic AF-only packets use the PREVIOUS
+                        // source CC (CC MUST NOT advance on AF-only per
+                        // H.222.0 §2.4.3.3). Using the current source
+                        // CC would cause CC errors at the receiver (the
+                        // current source CC is already +1 from previous,
+                        // so synthetics with current-CC would duplicate
+                        // the upcoming source CC value).
+                        let cc = pkt[3] & 0x0F;
+                        if !set_di {
+                            let prev_cc = self
+                                .last_cc_on_pcr_pid
+                                .get(&pid)
+                                .copied()
+                                .unwrap_or(cc.wrapping_sub(1) & 0x0F);
+                            self.maybe_inject_pcr_rr_padding(pid, prev_cc, new_pcr, out);
+                        }
+                        self.last_emitted_out_pcr_27mhz = Some(new_pcr);
+                        // CC tracker update is consolidated at the
+                        // bottom of the loop so non-PCR payload
+                        // packets on this PID (PES continuation when
+                        // PCR_PID == video_PID — the typical broadcast
+                        // configuration) also advance the tracker.
+                        // Updating only here would leave
+                        // `last_cc_on_pcr_pid` pointing at the previous
+                        // *PCR-bearing* packet's CC, many ticks behind
+                        // the actual last-payload CC the receiver saw
+                        // — causing AF-only synthetics to emit at the
+                        // wrong CC and trip H.222.0 §2.4.3.3 at the
+                        // decoder.
                     }
                 }
             }
@@ -1200,19 +1021,13 @@ impl TsPtsRewriter {
             // *PCR*-bearing packet — those are typically separated by
             // many PES-continuation packets when PCR_PID == video_PID).
             // Uses the *emitted* CC (post any rewrite) so the tracker
-            // matches what the receiver sees. A PID that has carried no
-            // payload yet (a PCR PID of adaptation-field-only packets)
-            // takes its first AF-only packet's, which its later ones repeat.
+            // matches what the receiver sees.
             let afc = (if rewritten { buf[3] } else { pkt[3] } >> 4) & 0b11;
             let has_payload = afc == 0b01 || afc == 0b11;
             let on_pcr_pid = self.pcr_pids.is_empty() || self.pcr_pids.contains(&pid);
-            if on_pcr_pid {
+            if has_payload && on_pcr_pid {
                 let emitted_cc = if rewritten { buf[3] & 0x0F } else { pkt[3] & 0x0F };
-                if has_payload {
-                    self.last_cc_on_pcr_pid.insert(pid, emitted_cc);
-                } else {
-                    self.last_cc_on_pcr_pid.entry(pid).or_insert(emitted_cc);
-                }
+                self.last_cc_on_pcr_pid.insert(pid, emitted_cc);
             }
 
             if rewritten {
@@ -1458,35 +1273,68 @@ impl TsPtsRewriter {
         );
     }
 
-    /// Put the synthetic PCR [`PcrFill`] has due at this position into `out`,
-    /// ahead of `pkt`, and count `pkt` as gone by. Nothing ahead of a packet
-    /// carrying the PID's real PCR, which [`PcrFill::real_pcr`] then takes.
-    /// The filler is disarmed while the rewriter is not regenerating the
-    /// PID's PCR: a source-clock fallback, a clock-domain change owed to the
-    /// next PCR, or a PMT that no longer names the PID. A synthetic is an
-    /// adaptation-field-only packet carrying the CC last emitted on the PID
-    /// (H.222.0 §2.4.3.3: an AF-only packet does not advance it).
-    fn fill_pcr_ahead_of(&mut self, pkt: &[u8], pid: u16, out: &mut Vec<u8>) {
-        let Some(fill_pid) = self.pcr_fill.pid else {
-            return;
+    /// Inject synthetic PCR-only AF padding packets ahead of the
+    /// upcoming source PCR packet when the inter-PCR gap would exceed
+    /// `PCR_RR_MAX_27MHZ` (40 ms, TR 101 290 §PCR_RR) and is more than
+    /// 1.5 times the median of the source's recent intervals
+    /// ([`PcrCadence`]): PCR-bearing datagrams lost upstream, not the
+    /// source's own cadence. Synthetics carry PCR values spaced evenly
+    /// between the last emitted PCR and `next_out_pcr`, as few as leave
+    /// every interval at most 40 ms: `ceil(gap / 40 ms) - 1` of them. (It
+    /// was `floor(gap / 40 ms) - 1` at 40 ms steps, which left any gap
+    /// that is not a whole multiple of 40 ms with a last interval over
+    /// 40 ms: a 45 ms gap got none, and a 90 ms gap one, leaving 50 ms —
+    /// edge#214.) A gap of the source's own cadence gets none, however
+    /// long: they go out immediately ahead of the source PCR, which
+    /// `wire_emit` then paces by the first synthetic's value, so each
+    /// real PCR of a 24 fps source carrying one PCR a frame went out
+    /// about 21 ms early, every frame, while `pcr_trust` (which reads a
+    /// datagram's first PCR) saw nothing. AF-only
+    /// (`adaptation_field_control = 0b10`) keeps continuity_counter
+    /// pinned to the last source CC observed on this PID — receivers
+    /// tolerate this because the spec mandates AF-only packets do not
+    /// advance CC.
+    fn maybe_inject_pcr_rr_padding(
+        &mut self,
+        pid: u16,
+        cc: u8,
+        next_out_pcr_27mhz: u64,
+        out: &mut Vec<u8>,
+    ) {
+        let last = match self.last_emitted_out_pcr_27mhz {
+            Some(v) => v,
+            None => return, // first PCR — nothing to pad against
         };
-        if pid == fill_pid && extract_pcr(pkt).is_some() {
+        let gap = pcr_fwd_27mhz(next_out_pcr_27mhz, last);
+        // Only pad forward gaps within sane bounds. Backward / huge
+        // forward jumps already had `set_di` raised on the source
+        // packet; don't pad those (would emit absurd counts of padding).
+        if gap == 0 || gap >= PCR_MODULUS_27MHZ / 2 {
             return;
         }
-        if self.clock_passthrough_unlearned
-            || self.clock_passthrough_no_pcr
-            || self.pending_di
-            || !self.anchor.established
-            || !self.pcr_pids.contains(&fill_pid)
-        {
-            self.pcr_fill.disarm();
+        // Judged against the cadence before this gap joins it.
+        let typical = self.pcr_cadence.median();
+        self.pcr_cadence.push(gap);
+        if gap <= PCR_RR_MAX_27MHZ {
             return;
         }
-        if let Some(value) = self.pcr_fill.due() {
-            let cc = self.last_cc_on_pcr_pid.get(&fill_pid).copied().unwrap_or(0);
-            out.extend_from_slice(&build_synthetic_pcr_packet(fill_pid, cc, value));
+        match typical {
+            Some(typical) if gap * 2 > typical * 3 => {}
+            _ => return,
         }
-        self.pcr_fill.packet();
+        // `n_inject` synthetics cut the gap into `n_inject + 1` equal
+        // intervals, each at most PCR_RR_MAX_27MHZ (integer division puts
+        // them within a tick of each other, the longest still within the
+        // limit). Cap to protect against pathological source gaps (e.g.
+        // dropped seconds); a gap that long has a discontinuity raised on
+        // its source PCR and is never padded anyway.
+        let n_inject = (gap.div_ceil(PCR_RR_MAX_27MHZ) as usize - 1).min(PCR_RR_MAX_INJECTIONS);
+        let intervals = n_inject as u64 + 1;
+        for i in 1..=n_inject as u64 {
+            let synth_pcr = pcr_add_27mhz(last, (gap * i / intervals) as i64);
+            let synth = build_synthetic_pcr_packet(pid, cc, synth_pcr);
+            out.extend_from_slice(&synth);
+        }
     }
 
     /// Compute output PCR from input PCR using the shared anchor.
@@ -1862,7 +1710,7 @@ impl TsPtsRewriter {
                 // the switch back onto the master timeline.
                 self.clock_passthrough_unlearned = false;
                 self.anchor = ClockAnchor::default();
-                self.pcr_fill.disarm();
+                self.last_emitted_out_pcr_27mhz = None;
                 self.pending_di = true;
                 tracing::info!(
                     pmt_pid,
@@ -3200,400 +3048,216 @@ mod tests {
         );
     }
 
-    /// 188 bytes at 4 Mbit/s, in 27 MHz ticks: the packet spacing of the
-    /// PCR_RR filler tests' CBR streams.
-    const PKT_4M: u64 = 10_152;
-
-    /// A payload-only packet on `pid` with CC `cc`.
-    fn payload_packet(pid: u16, cc: u8) -> [u8; TS_PACKET_SIZE] {
-        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
-        pkt[0] = TS_SYNC_BYTE;
-        pkt[1] = ((pid >> 8) as u8) & 0x1F; // PUSI=0
-        pkt[2] = (pid & 0xFF) as u8;
-        pkt[3] = 0x10 | (cc & 0x0F); // AFC=01 (payload only)
-        pkt
-    }
-
-    /// A deterministic uniform draw in [0, 1) (xorshift64).
-    fn draw(state: &mut u64) -> f64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        (*state >> 11) as f64 / (1u64 << 53) as f64
-    }
-
-    /// A test stream whose packets have known source times (27 MHz): packet
-    /// `k` at `times[k]`, every fourth on audio PID 0x101 and the rest on the
-    /// PCR PID 0x100, each PID's CC counting on. A PCR rides the first 0x100
-    /// packet at or past each multiple of `cadence` (or each packet `pcr_at`
-    /// names, when given), valued at that packet's own time.
-    fn timed_stream(times: &[u64], cadence: u64, pcr_at: Option<&[bool]>) -> Vec<[u8; TS_PACKET_SIZE]> {
-        let mut next_pcr = times[0];
-        let mut cc = [0u8; 2];
-        let mut stream = Vec::with_capacity(times.len());
-        for (k, &t) in times.iter().enumerate() {
-            let pid: u16 = if k % 4 == 3 { 0x101 } else { 0x100 };
-            let is_pcr = match pcr_at {
-                Some(at) => at[k],
-                None => pid == 0x100 && t >= next_pcr,
-            };
-            while is_pcr && next_pcr <= t {
-                next_pcr += cadence;
+    /// A rewriter that has learned PCR_PID 0x100 and emitted eight source
+    /// PCRs `interval_ms` apart, enough to know the source's cadence, none
+    /// of them padded. Returns it, the last source PCR and its output
+    /// value.
+    fn with_pcr_cadence(interval_ms: f64) -> (TsPtsRewriter, u64, u64) {
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut buf);
+        let step = (interval_ms * 27_000.0) as u64;
+        let (mut src, mut out_pcr) = (1_000_000_000u64, 0);
+        for i in 0..8 {
+            if i > 0 {
+                src += step;
             }
-            let c = &mut cc[(pid - 0x100) as usize];
-            let mut pkt = if is_pcr { build_pcr_packet(pid, t) } else { payload_packet(pid, 0) };
-            pkt[3] = (pkt[3] & 0xF0) | *c;
-            *c = (*c + 1) & 0x0F;
-            stream.push(pkt);
+            let mut out = Vec::new();
+            r.process(&build_pcr_packet(0x100, src), &mut out);
+            assert_eq!(out.len(), TS_PACKET_SIZE, "{interval_ms} ms: the cadence is not padded");
+            out_pcr = extract_pcr(&out[..TS_PACKET_SIZE]).unwrap();
         }
-        stream
+        (r, src, out_pcr)
     }
 
-    /// Feed `stream` through a rewriter that has learned PCR PID 0x100, one
-    /// 7-packet datagram per call, leaving out the packets `lost` names (lost
-    /// upstream). Returns every PCR it emitted on 0x100, in order, as `(value,
-    /// synthetic, slot)`: the index of the input packet a real PCR rode on, or
-    /// that a synthetic went in just ahead of. Checks on the way that each
-    /// synthetic is an adaptation-field-only packet carrying the CC of the
-    /// last payload packet emitted on the PID.
-    fn feed_timed(
-        stream: &[[u8; TS_PACKET_SIZE]],
-        lost: impl Fn(usize) -> bool,
-    ) -> Vec<(u64, bool, usize)> {
-        // The master clock stands still: no PSI_RR re-send, and every source
-        // step under 500 ms continues the timeline.
-        let (_master, pacer) = step_pacer(5_000 * 27_000_000);
-        let mut r = TsPtsRewriter::new(pacer).without_start_marks();
-        let mut out = Vec::new();
-        r.process(&build_psi(0x100, 0x101), &mut out);
-        let mut pcrs = Vec::new();
-        let mut last_payload_cc = None;
-        for (d, datagram) in stream.chunks(7).enumerate() {
-            let slots: Vec<usize> = (d * 7..d * 7 + datagram.len()).filter(|&k| !lost(k)).collect();
-            if slots.is_empty() {
-                continue;
-            }
-            let input: Vec<u8> = slots.iter().flat_map(|&k| stream[k]).collect();
-            let mut o = Vec::new();
-            r.process(&input, &mut o);
-            let mut slot = slots.iter().copied();
-            let mut at = slot.next();
-            for p in o.chunks(TS_PACKET_SIZE) {
-                let pid = ts_pid(p);
-                if pid != 0x100 && pid != 0x101 {
-                    continue;
-                }
-                if pid == 0x100 && (p[3] >> 4) & 0b11 == 0b10 {
-                    let k = at.expect("a synthetic goes in ahead of an input packet");
-                    assert_eq!(Some(p[3] & 0x0F), last_payload_cc, "synthetic ahead of packet {k}: CC");
-                    pcrs.push((extract_pcr(p).expect("a synthetic carries a PCR"), true, k));
-                    continue;
-                }
-                let k = at.expect("every input packet comes out");
-                if pid == 0x100 {
-                    last_payload_cc = Some(p[3] & 0x0F);
-                    if let Some(v) = extract_pcr(p) {
-                        pcrs.push((v, false, k));
-                    }
-                }
-                at = slot.next();
-            }
+    /// PCR_RR injection: a gap left by PCRs lost upstream (200 ms on a
+    /// 20 ms cadence) is filled with synthetic PCR-only packets, so the
+    /// receiver sees TR 101 290-compliant inter-PCR intervals in value.
+    #[test]
+    fn pcr_rr_injects_padding_where_pcrs_were_lost() {
+        let (mut r, src_1, first_pcr) = with_pcr_cadence(20.0);
+
+        // A 200 ms gap (5× 40 ms) — 4 synthetics expected
+        let src_2: u64 = src_1 + 200 * 27_000;
+        let mut out2 = Vec::new();
+        r.process(&build_pcr_packet(0x100, src_2), &mut out2);
+        let n_pkts = out2.len() / TS_PACKET_SIZE;
+        assert_eq!(
+            n_pkts, 5,
+            "200 ms gap: 4 synthetic + 1 source = 5 packets emitted"
+        );
+
+        // Validate each synthetic carries a PCR + AF-only AFC + same CC
+        for i in 0..4 {
+            let p = &out2[i * TS_PACKET_SIZE..(i + 1) * TS_PACKET_SIZE];
+            assert_eq!(p[0], TS_SYNC_BYTE);
+            assert_eq!(ts_pid(p), 0x100);
+            assert_eq!((p[3] >> 4) & 0x03, 0b10, "AF-only AFC");
+            assert!(extract_pcr(p).is_some(), "synthetic packet carries PCR");
         }
-        pcrs
-    }
 
-    /// Asserts what the PCR_RR filler promises over `pcrs` (from
-    /// [`feed_timed`]): from the second real PCR on — before it the rate is
-    /// unknown — every step is forward and at most 40 ms, and every
-    /// synthetic's value is within `bound` of the time its position implies
-    /// (the source time of the packet it went in ahead of, on the output
-    /// timeline) less `early(slot)`, the time the filler cannot see: packets
-    /// lost upstream since the last real PCR. Returns the synthetic count.
-    fn check_fill(
-        times: &[u64],
-        pcrs: &[(u64, bool, usize)],
-        bound: u64,
-        early: impl Fn(usize) -> u64,
-    ) -> usize {
-        use crate::engine::ts_parse::pcr_fwd_27mhz;
-        let (first, _, k0) = pcrs[0];
-        let offset = pcr_fwd_27mhz(first, times[k0]);
-        let second = pcrs.iter().filter(|p| !p.1).nth(1).map(|p| p.2).expect("two real PCRs");
-        let from = pcrs.iter().position(|p| p.2 == second && !p.1).unwrap();
-        for w in pcrs[from..].windows(2) {
-            let step = pcr_fwd_27mhz(w[1].0, w[0].0);
-            assert!(
-                step > 0 && step <= PCR_RR_MAX_27MHZ,
-                "PCR step of {:.3} ms ahead of packet {} ({})",
-                step as f64 / 27_000.0,
-                w[1].2,
-                if w[1].1 { "synthetic" } else { "real" },
+        // The 4 synthetics' PCRs should be at 40, 80, 120, 160 ms past
+        // the last source PCR before the gap
+        for i in 0..4 {
+            let p = &out2[i * TS_PACKET_SIZE..(i + 1) * TS_PACKET_SIZE];
+            let synth_pcr = extract_pcr(p).unwrap();
+            let expected = first_pcr + (i as u64 + 1) * 40 * 27_000;
+            assert_eq!(
+                synth_pcr, expected,
+                "synthetic {i} PCR mismatch: expected {expected}, got {synth_pcr}"
             );
         }
-        let mut synthetics = 0;
-        for &(v, synthetic, k) in pcrs {
-            let implied = pcr_fwd_27mhz(times[k] + offset, early(k));
-            if !synthetic {
-                assert_eq!(v, (times[k] + offset) % PCR_MODULUS_27MHZ, "real PCR on packet {k}");
-                continue;
+    }
+
+    /// PCR_RR padding leaves no interval over 40 ms whatever the gap PCRs
+    /// lost upstream left (on a 15 ms cadence). It used to inject
+    /// `floor(gap / 40 ms) - 1` synthetics at 40 ms steps, so a 45 ms gap
+    /// (two lost datagrams of a 15 ms-PCR source) got none and a 90 ms gap
+    /// one, leaving 50 ms (edge#214). Now `ceil(gap / 40 ms) - 1`, evenly
+    /// spaced: 45 ms gets one at 22.5 ms, 90 ms two at 30 ms, 80 ms one at
+    /// 40 ms, 200 ms four at 40 ms, and a gap of exactly 40 ms none.
+    #[test]
+    fn pcr_rr_padding_leaves_no_interval_over_40_ms() {
+        for (gap_ms, synthetics) in
+            [(45.0f64, 1usize), (90.0, 2), (80.0, 1), (200.0, 4), (40.0, 0), (40.5, 1)]
+        {
+            let (mut r, src_1, first) = with_pcr_cadence(15.0);
+            let gap = (gap_ms * 27_000.0) as u64;
+            let mut out2 = Vec::new();
+            r.process(&build_pcr_packet(0x100, src_1 + gap), &mut out2);
+            assert_eq!(out2.len() / TS_PACKET_SIZE, synthetics + 1, "{gap_ms} ms gap");
+            let mut pcrs = vec![first];
+            pcrs.extend(out2.chunks(TS_PACKET_SIZE).map(|p| extract_pcr(p).unwrap()));
+            assert_eq!(pcrs.last().copied(), Some(first + gap), "{gap_ms} ms: the source PCR last");
+            let steps: Vec<u64> = pcrs.windows(2).map(|w| w[1] - w[0]).collect();
+            assert!(steps.iter().all(|&s| s <= PCR_RR_MAX_27MHZ), "{gap_ms} ms: {steps:?}");
+            let (lo, hi) = (steps.iter().min().unwrap(), steps.iter().max().unwrap());
+            assert!(hi - lo <= 1, "{gap_ms} ms: evenly spaced, {steps:?}");
+        }
+    }
+
+    /// A source's own PCR cadence is never padded, however far past 40 ms:
+    /// one PCR a frame at 23.976 fps (41.7 ms, what a VBR muxer that puts
+    /// PCR only on a video PES start writes) and a steady 100 ms. Padded,
+    /// every such PCR went out behind a synthetic in the same datagram,
+    /// which `wire_emit` paced by the synthetic's value. A PCR lost from
+    /// either is padded (83.4 ms on the 41.7 ms cadence: two synthetics),
+    /// and before the source has shown four intervals nothing is.
+    #[test]
+    fn pcr_rr_padding_leaves_the_sources_own_cadence_alone() {
+        let frame = 27_000_000.0 * 1001.0 / 24_000.0;
+        for (interval_ms, lost_one, synthetics) in [(frame / 27_000.0, 2 * frame as u64, 2usize), (100.0, 200 * 27_000, 4)] {
+            let step = (interval_ms * 27_000.0) as u64;
+            let (mut r, mut src, _) = with_pcr_cadence(interval_ms);
+            for _ in 0..20 {
+                src += step;
+                let mut out = Vec::new();
+                r.process(&build_pcr_packet(0x100, src), &mut out);
+                assert_eq!(out.len(), TS_PACKET_SIZE, "{interval_ms} ms cadence: no synthetic");
             }
-            synthetics += 1;
-            let err = pcr_fwd_27mhz(v, implied).min(pcr_fwd_27mhz(implied, v));
-            assert!(
-                err <= bound,
-                "synthetic ahead of packet {k}: {:.3} ms off the {:.3} ms its position implies",
-                err as f64 / 27_000.0,
-                pcr_fwd_27mhz(implied, times[0] + offset) as f64 / 27_000.0,
-            );
+            let mut out = Vec::new();
+            r.process(&build_pcr_packet(0x100, src + lost_one), &mut out);
+            assert_eq!(out.len() / TS_PACKET_SIZE, synthetics + 1, "{interval_ms} ms: one PCR lost");
         }
-        synthetics
-    }
 
-    /// A steady PCR cadence over 40 ms — one PCR a frame at 24 fps
-    /// (41.7 ms), or 80 ms — gets PCRs inside each interval, at the position
-    /// their values name: on a CBR stream, to the tick. One per 41.7 ms
-    /// interval (11.7 ms in), two per 80 ms one (20 and 50 ms in) — across the
-    /// source clock's 26.5 h wrap too. Up to 0.116.0 a 41.7 ms cadence got
-    /// none, and an 80 ms one a synthetic valued 40 ms in but sent just ahead
-    /// of the next real PCR.
-    #[test]
-    fn a_steady_long_pcr_cadence_gets_interior_pcrs_where_they_belong() {
-        let near_wrap = PCR_MODULUS_27MHZ - 5 * 27_000_000;
-        for (cadence, per_interval, start) in [
-            (27_000_000 * 1001 / 24_000, 1, 1_000_000_000),
-            (80 * 27_000, 2, 1_000_000_000),
-            (80 * 27_000, 2, near_wrap),
-        ] {
-            let times: Vec<u64> = (0..27_000u64).map(|k| start + k * PKT_4M).collect();
-            let stream = timed_stream(&times, cadence, None);
-            let pcrs = feed_timed(&stream, |_| false);
-            check_fill(&times, &pcrs, 27, |_| 0);
-            let real: Vec<usize> = pcrs.iter().filter(|p| !p.1).map(|p| p.2).collect();
-            for w in real[1..].windows(2) {
-                let n = pcrs.iter().filter(|p| p.1 && p.2 > w[0] && p.2 < w[1]).count();
-                assert_eq!(n, per_interval, "{cadence} ticks: synthetics between packets {} and {}", w[0], w[1]);
-            }
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        r.process(&build_psi(0x100, 0x101), &mut buf);
+        let mut src = 1_000_000_000u64;
+        for _ in 0..4 {
+            let mut out = Vec::new();
+            r.process(&build_pcr_packet(0x100, src), &mut out);
+            assert_eq!(out.len(), TS_PACKET_SIZE, "three intervals are no cadence yet");
+            src += 90 * 27_000;
         }
     }
 
-    /// A cadence within 40 ms is left as it came, without a synthetic: 15, 30
-    /// and 39 ms (whose intervals, a PCR on a packet boundary, run up to two
-    /// packets either side of it).
-    #[test]
-    fn a_pcr_cadence_within_40_ms_gets_no_synthetic() {
-        for ms in [15, 30, 39] {
-            let times: Vec<u64> = (0..20_000u64).map(|k| 1_000_000_000 + k * PKT_4M).collect();
-            let pcrs = feed_timed(&timed_stream(&times, ms * 27_000, None), |_| false);
-            assert!(pcrs.iter().all(|p| !p.1), "{ms} ms: no synthetic");
-        }
-    }
-
-    /// PCRs lost upstream — two PCR-bearing datagrams of a 15 ms source in a
-    /// row (a 45 ms gap), and four (75 ms) — are filled inside the gap at the
-    /// position the filler has reached: each synthetic's value is the time
-    /// its position implies, to the tick, less the time of the packets lost
-    /// before it since the last real PCR, which a packet count cannot see (two
-    /// 7-packet datagrams at 4 Mbit/s: 5.3 ms). It reads early by that, never
-    /// late, and no interval exceeds 40 ms. Up to 0.116.0 a 45 or 75 ms gap,
-    /// not a whole multiple of 40 ms, got no synthetic at all (edge#214), and a
-    /// gap that got one had it immediately ahead of the next real PCR with a
-    /// mid-gap value, up to a whole gap behind its position.
-    #[test]
-    fn pcrs_lost_upstream_are_filled_where_the_gap_is() {
-        let times: Vec<u64> = (0..27_000u64).map(|k| 1_000_000_000 + k * PKT_4M).collect();
-        let stream = timed_stream(&times, 15 * 27_000, None);
-        let pcr_datagrams: Vec<usize> = (0..stream.len())
-            .filter(|&k| extract_pcr(&stream[k]).is_some())
-            .map(|k| k / 7)
-            .collect();
-        // Two in a row twice, then four in a row.
-        let mut lost_datagrams = std::collections::HashSet::new();
-        for (first, count) in [(40, 2), (120, 2), (200, 4)] {
-            lost_datagrams.extend(pcr_datagrams[first..first + count].iter().copied());
-        }
-        let lost = |k: usize| lost_datagrams.contains(&(k / 7));
-        let pcrs = feed_timed(&stream, lost);
-        // Packets lost between packet `k` and the last real PCR delivered
-        // before it.
-        let delivered_pcr: Vec<usize> = pcrs.iter().filter(|p| !p.1).map(|p| p.2).collect();
-        let early = |k: usize| {
-            let from = delivered_pcr.iter().rev().find(|&&p| p < k).copied().unwrap_or(0);
-            (from..k).filter(|&j| lost(j)).count() as u64 * PKT_4M
-        };
-        let synthetics = check_fill(&times, &pcrs, 27, early);
-        // One across each 45 ms gap, two across the 75 ms one.
-        assert_eq!(synthetics, 4);
-        assert!(pcrs.iter().filter(|p| p.1).all(|p| early(p.2) > 0), "every synthetic follows a loss");
-    }
-
-    /// A VBR-ish stream — the packet rate swinging ±10 % over 4 s, each
-    /// packet's spacing ±30 % at random — on a steady 41.7 or 80 ms cadence:
-    /// every interval still gets its PCRs, and each lies within 2 ms (41.7 ms)
-    /// or 4 ms (80 ms) of where the source's actual timing puts its position.
-    /// The error is the rate's drift since the last four intervals and the
-    /// spacing's randomness, and grows with the distance from the last real
-    /// PCR, which is why the filler puts its first synthetic early.
-    #[test]
-    fn vbr_ish_packet_spacing_keeps_the_synthetics_near_their_position() {
-        for (cadence, bound_ms) in [(27_000_000 * 1001 / 24_000, 2), (80 * 27_000, 4)] {
-            let mut rng = 7u64;
-            let mut times = Vec::new();
-            let mut t = 1_000_000_000.0f64;
-            while times.len() < 60_000 {
-                times.push(t as u64);
-                let phase = 2.0 * std::f64::consts::PI * (t - 1e9) / (4.0 * 27e6);
-                t += PKT_4M as f64 * (1.0 + 0.1 * phase.sin()) * (1.0 + 0.3 * (2.0 * draw(&mut rng) - 1.0));
-            }
-            let pcrs = feed_timed(&timed_stream(&times, cadence, None), |_| false);
-            let synthetics = check_fill(&times, &pcrs, bound_ms * 27_000, |_| 0);
-            assert!(synthetics > 0, "{cadence} ticks: synthetics");
-        }
-    }
-
-    /// A bursty VBR source — one PCR a frame at 24 fps, frames between 32 and
-    /// 237 packets at random, each frame's packets spread evenly over its
-    /// 41.7 ms — never has its PCR stepped back, though a packet count is a
-    /// poor clock across frames that differ sevenfold: a synthetic is held
-    /// under the source's next PCR. Nearly every interval still gets one; an
-    /// interval it misses (a small frame after large ones: the count runs too
-    /// slow to reach the synthetic's place) keeps the source's 41.7 ms.
-    #[test]
-    fn a_bursty_vbr_source_never_has_its_pcr_stepped_back() {
-        use crate::engine::ts_parse::pcr_fwd_27mhz;
-        let cadence = 27_000_000 * 1001 / 24_000;
-        let mut rng = 11u64;
-        let (mut times, mut pcr_at) = (Vec::new(), Vec::new());
-        for frame in 0..1_500u64 {
-            let n = 32 + (draw(&mut rng) * 206.0) as u64;
-            for i in 0..n {
-                times.push(1_000_000_000 + frame * cadence + cadence * i / n);
-                pcr_at.push(i == 0);
-            }
-        }
-        // The PCR rides the frame's first packet; keep it off the audio PID.
-        let mut pcr_on = pcr_at.clone();
-        for k in 0..pcr_on.len() {
-            if pcr_on[k] && k % 4 == 3 {
-                pcr_on[k] = false;
-                pcr_on[k + 1] = true;
-            }
-        }
-        let pcrs = feed_timed(&timed_stream(&times, cadence, Some(&pcr_on)), |_| false);
-        let reals = pcrs.iter().filter(|p| !p.1).count();
-        let synthetics = pcrs.iter().filter(|p| p.1).count();
-        // The source's own longest interval (its PCR a packet late where the
-        // frame starts on the audio PID).
-        let on: Vec<usize> = (0..pcr_on.len()).filter(|&k| pcr_on[k]).collect();
-        let longest = on.windows(2).map(|w| times[w[1]] - times[w[0]]).max().unwrap();
-        for w in pcrs.windows(2) {
-            let step = pcr_fwd_27mhz(w[1].0, w[0].0);
-            assert!(step > 0 && step <= longest, "step of {step} ticks ahead of packet {}", w[1].2);
-        }
-        assert!(synthetics * 100 >= reals * 90, "{synthetics} synthetics over {reals} intervals");
-    }
-
-    /// No synthetic is extrapolated across what the filler cannot see through:
-    /// the interval after a PCR carrying a discontinuity indicator (until a
-    /// clean interval has given the rate again), nor more than 500 ms past the
-    /// last real PCR when the PCR stops while packets flow.
-    #[test]
-    fn no_synthetic_across_a_discontinuity_or_past_500_ms() {
-        use crate::engine::ts_parse::pcr_fwd_27mhz;
-        let cadence = 80 * 27_000;
-        let times: Vec<u64> = (0..27_000u64).map(|k| 1_000_000_000 + k * PKT_4M).collect();
-        let mut stream = timed_stream(&times, cadence, None);
-        let real: Vec<usize> = (0..stream.len()).filter(|&k| extract_pcr(&stream[k]).is_some()).collect();
-        // The 20th PCR carries a DI; PCRs 60..=63 never come (320 ms, the
-        // packets flowing on); after the 100th, none ever does.
-        stream[real[20]][5] |= 0x80;
-        for &k in real[60..64].iter().chain(&real[101..]) {
-            stream[k] = payload_packet(0x100, stream[k][3] & 0x0F);
-        }
-        let pcrs = feed_timed(&stream, |_| false);
-        let in_interval = |a: usize, b: usize| pcrs.iter().filter(|p| p.1 && p.2 > a && p.2 < b).count();
-        assert_eq!(in_interval(real[19], real[20]), 2, "a clean interval: two");
-        assert_eq!(in_interval(real[20], real[21]), 0, "after the DI: none");
-        assert_eq!(in_interval(real[21], real[22]), 2, "a clean interval since: two again");
-        // The 400 ms gap is filled throughout, every step at most 40 ms; the
-        // stop, only to 500 ms.
-        let steps_from = |k: usize| -> Vec<u64> {
-            let from = pcrs.iter().position(|p| !p.1 && p.2 == k).unwrap();
-            pcrs[from..].windows(2).map(|w| pcr_fwd_27mhz(w[1].0, w[0].0)).collect()
-        };
-        let gap = &steps_from(real[59])[..=in_interval(real[59], real[64])];
-        assert!(gap.len() >= 12 && gap.iter().all(|&d| d <= PCR_RR_MAX_27MHZ), "{gap:?}");
-        let tail = steps_from(real[100]);
-        assert!(tail.iter().all(|&d| d <= PCR_RR_MAX_27MHZ), "{tail:?}");
-        let reach: u64 = tail.iter().sum();
-        assert!(reach <= DISCONTINUITY_THRESHOLD_27MHZ && reach > DISCONTINUITY_THRESHOLD_27MHZ - PCR_RR_MAX_27MHZ, "{reach}");
-    }
-
-    /// A synthetic carries the CC of the last **payload** packet on the PCR
-    /// PID — not the last PCR-bearing packet's — wherever it goes in: when
-    /// PCR_PID == video_PID (the typical broadcast configuration) PES
-    /// continuation packets advance the CC between PCRs, and an AF-only packet
-    /// repeats the CC before it (H.222.0 §2.4.3.3). [`feed_timed`] checks it
-    /// for every synthetic; here on a PCR PID whose packets are all video
-    /// payload, so the CC moves on between every pair of synthetics.
+    /// PCR_RR synthetic AF-only packets must carry the **previous
+    /// payload** CC on the PCR_PID — not the previous *PCR-bearing*
+    /// packet's CC. When PCR_PID == video_PID (the typical broadcast
+    /// configuration), several PES-continuation payload packets land
+    /// between PCRs; each advances the receiver-side CC. The synthetic
+    /// must equal the most-recent of those continuation CCs per
+    /// H.222.0 §2.4.3.3, otherwise every injection emits a duplicate
+    /// or out-of-order CC that the decoder reports as a discontinuity.
     ///
-    /// Regression cover for the bug that produced ~20 CC errors / s on PID 256
-    /// over 120 s of media-player capture (2 492 unexpected discontinuities in
-    /// `tsanalyze --error`).
+    /// Regression cover for the bug that produced ~20 CC errors / s
+    /// on PID 256 over 120 s of media-player capture (2 492 unexpected
+    /// discontinuities in `tsanalyze --error`).
     #[test]
     fn pcr_rr_synthetic_cc_follows_last_payload_not_last_pcr() {
-        let times: Vec<u64> = (0..8_000u64).map(|k| 1_000_000_000 + k * PKT_4M).collect();
-        let mut stream = timed_stream(&times, 80 * 27_000, None);
-        // Every packet on 0x100 and its CC counting on: what feed_timed
-        // checks the synthetics against moves on at every packet.
-        for (k, pkt) in stream.iter_mut().enumerate() {
-            pkt[1] = (pkt[1] & 0xE0) | 0x01;
-            pkt[2] = 0x00;
-            pkt[3] = (pkt[3] & 0xF0) | (k as u8 & 0x0F);
+        fn build_payload_packet(pid: u16, cc: u8) -> [u8; TS_PACKET_SIZE] {
+            let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+            pkt[0] = TS_SYNC_BYTE;
+            pkt[1] = ((pid >> 8) as u8) & 0x1F; // PUSI=0
+            pkt[2] = (pid & 0xFF) as u8;
+            pkt[3] = 0x10 | (cc & 0x0F); // AFC=01 (payload only)
+            pkt
         }
-        let pcrs = feed_timed(&stream, |_| false);
-        assert!(pcrs.iter().filter(|p| p.1).count() > 50);
-    }
 
-    /// The filler's history reading: a ticks-per-packet rate from the last
-    /// four intervals, a floor under it slowed by the history's spread, and a
-    /// regular cadence only where every interval is a whole multiple of the
-    /// shortest and that is at least 8 ms.
-    #[test]
-    fn the_filler_reads_its_history() {
-        let mut f = PcrFill::default();
-        let mut value = 0u64;
-        f.real_pcr(0x100, value, true);
-        for (ticks, packets) in [(405_000, 40), (405_000, 40), (810_000, 80), (405_000, 30), (405_000, 40)] {
-            for _ in 1..packets {
-                f.packet();
+        let mut r = TsPtsRewriter::new(make_wallclock_pacer());
+        let mut buf = Vec::new();
+        // Learn PMT → PCR_PID = 0x100.
+        r.process(&build_psi(0x100, 0x101), &mut buf);
+
+        // PCRs on a 20 ms cadence establish the anchor and the source's
+        // cadence; CC=0 (build_pcr_packet's default). No injection: each
+        // gap is the source's own.
+        let mut src_1: u64 = 1_000_000_000;
+        for i in 0..6 {
+            if i > 0 {
+                src_1 += 20 * 27_000;
             }
-            value += ticks;
-            f.real_pcr(0x100, value, true);
+            let mut out1 = Vec::new();
+            r.process(&build_pcr_packet(0x100, src_1), &mut out1);
+            assert_eq!(out1.len(), TS_PACKET_SIZE, "the cadence: no injection");
+            assert_eq!(out1[3] & 0x0F, 0, "the PCR's CC unchanged");
         }
-        let plan = f.plan.unwrap();
-        // The last four: 2 025 000 ticks over 190 packets.
-        assert!((plan.ticks_per_packet - 2_025_000.0 / 190.0).abs() < 1e-9);
-        // Densest 10 125, sparsest 13 500.
-        assert!((plan.floor_ticks_per_packet - 10_125.0 * 10_125.0 / 13_500.0 / 1.02).abs() < 1e-6);
-        assert_eq!(plan.cadence, Some((405_000, 40_500)));
-        assert!(plan.deep && !plan.steady);
-        // A 4.68 ms shortest interval is no cadence.
-        f.real_pcr(0x100, value + 126_360, true);
-        assert_eq!(f.plan.unwrap().cadence, None);
-        // A DI, a step back, a step of 500 ms or a new PID forgets it all.
-        for (pid, step, clean) in [
-            (0x100, 405_000, false),
-            (0x100, -27_000, true),
-            (0x100, DISCONTINUITY_THRESHOLD_27MHZ as i64, true),
-            (0x101, 405_000, true),
-        ] {
-            value += 1_000_000_000;
-            f.real_pcr(0x100, value, false);
-            f.real_pcr(0x100, value + 405_000, true);
-            assert!(f.plan.is_some());
-            f.real_pcr(pid, pcr_add_27mhz(value + 405_000, step), clean);
-            assert!(f.plan.is_none(), "{pid:#x} {step} {clean}");
+
+        // 7 payload-bearing PES-continuation packets on the same PID,
+        // CCs 1..=7 — the typical pattern between consecutive PCRs in
+        // a video stream where PCR_PID == video_PID.
+        for cc in 1u8..=7 {
+            let mut out = Vec::new();
+            r.process(&build_payload_packet(0x100, cc), &mut out);
         }
+
+        // Second PCR with a gap of 200 ms (5× PCR_RR_MAX) — should
+        // inject 4 synthetics. Patch in CC=8 so the natural source
+        // continues monotonically after the continuation packets.
+        let mut pcr2 = build_pcr_packet(0x100, src_1 + 200 * 27_000);
+        pcr2[3] = 0x30 | 0x08; // AF+payload, CC=8
+        let mut out2 = Vec::new();
+        r.process(&pcr2, &mut out2);
+
+        let n_pkts = out2.len() / TS_PACKET_SIZE;
+        assert_eq!(
+            n_pkts, 5,
+            "200 ms gap should produce 4 synthetic + 1 source = 5 packets"
+        );
+
+        // Every synthetic AF-only packet must carry CC=7 (the last
+        // payload-bearing packet's CC on PID 0x100), NOT CC=0 (the
+        // previous PCR-bearing packet's CC, which is what the pre-fix
+        // implementation emitted).
+        for i in 0..4 {
+            let p = &out2[i * TS_PACKET_SIZE..(i + 1) * TS_PACKET_SIZE];
+            assert_eq!(ts_pid(p), 0x100, "synthetic {i}: PID");
+            assert_eq!((p[3] >> 4) & 0x03, 0b10, "synthetic {i}: AF-only AFC");
+            assert_eq!(
+                p[3] & 0x0F,
+                7,
+                "synthetic {i}: CC must equal last payload CC (=7), \
+                 not last PCR CC (=0)"
+            );
+        }
+        // And the source PCR packet's CC sails through unchanged (=8).
+        let source = &out2[4 * TS_PACKET_SIZE..5 * TS_PACKET_SIZE];
+        assert_eq!(
+            source[3] & 0x0F,
+            8,
+            "source PCR2 emitted with its natural CC"
+        );
     }
 
     /// PSI_RR injection: when no PSI flows for > 500 ms, the rewriter
