@@ -1037,15 +1037,24 @@ pass with the master-clock work in.
   as PES PTS/DTS: on every learned PCR_PID it recomputes the value with
   `rewrite_pcr_value`, patches the six adaptation-field bytes in place
   (`write_pcr_field_in_packet`), sets DI=1 whenever it re-anchors, and
-  injects synthetic PCR_RR carrier packets whenever the gap to the next
-  source PCR exceeds 40 ms (a sparse-PCR source, or PCR-bearing datagrams
-  lost upstream): `ceil(gap / 40 ms) - 1` of them, their values evenly
-  spaced so no interval exceeds 40 ms, sent immediately ahead of that
-  source PCR, and none across a DI'd discontinuity — see "PCR
-  discontinuity bridging" above. (Up to 0.116.0 it injected
-  `floor(gap / 40 ms) - 1` at 40 ms steps, so any gap not a whole multiple
-  of 40 ms kept one interval of 40–80 ms: two lost datagrams of a 15 ms-PCR
-  source left 45 ms, with no padding at all, edge#214.) Source PCR bytes reach the wire
+  injects synthetic PCR_RR carrier packets where PCR-bearing datagrams
+  were lost upstream: whenever the gap to the next source PCR exceeds
+  40 ms and is more than 1.5 times the median of the source's last 16 PCR
+  intervals (nothing is padded before it has shown four), `ceil(gap / 40
+  ms) - 1` of them, their values evenly spaced so no interval exceeds
+  40 ms, sent immediately ahead of that source PCR, and none across a DI'd
+  discontinuity — see "PCR discontinuity bridging" above. A gap of the
+  source's own cadence is never padded, however long: one PCR a frame at
+  24 fps (41.7 ms) or a steady 100 ms goes out as it came, its PCR_RR the
+  source's. `wire_emit` paces a datagram by its first PCR, so a synthetic
+  sitting ahead of a source PCR sends that PCR early by the synthetic's
+  lead, which padding a steady cadence did on every PCR — while
+  `pcr_trust`, which reads only a datagram's first PCR, saw nothing. (Up to
+  0.116.0 it injected `floor(gap / 40 ms) - 1` at 40 ms steps whatever the
+  cadence, so any gap not a whole multiple of 40 ms kept one interval of
+  40–80 ms — two lost datagrams of a 15 ms-PCR source left 45 ms, with no
+  padding at all, edge#214 — and a steady cadence of 80 ms or more was
+  padded on every PCR.) Source PCR bytes reach the wire
   untouched under per-input `passthrough_clock: true` or on a `bonded`
   input, where the rewriter is not in the path at all; opting out to keep
   them therefore also opts out of PES PTS/DTS regeneration. That is the
