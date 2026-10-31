@@ -7,14 +7,16 @@
 //! lock due to continuity counter (CC) jumps, PCR discontinuities, and
 //! delayed PAT/PMT. This module sits in the input forwarder path and:
 //!
-//! 1. **Before first switch**: zero overhead — packets pass through unchanged.
-//! 2. **On switch**: clears output-side CC state and injects the new input's
-//!    cached PAT/PMTs for fast receiver re-acquisition, with their
-//!    `version_number` rewritten from a per-fixer **monotonic counter**
+//! 1. **Outside a pending DI**: zero overhead — packets pass through
+//!    unchanged (PSI observed for the switch cache).
+//! 2. **On switch**: lets the new input's CCs through (one CC jump per
+//!    PID) and injects the new input's cached PAT/PMTs for fast receiver
+//!    re-acquisition, with their `version_number` rewritten from a
+//!    per-fixer **monotonic counter**
 //!    that advances on every switch (see [`TsContinuityFixer::on_switch`]
 //!    for the motivation — the alternative `cached_version + 1` stamping
 //!    was empirically broken for the `A → B → A` round-trip case). The
-//!    CC state reset produces a natural CC jump on all PIDs, which
+//!    new input's own CCs produce a natural CC jump on all PIDs, which
 //!    receivers (VLC, ffplay, hardware decoders) detect as "packet loss"
 //!    and handle via their standard recovery path (flush PES buffers,
 //!    resync on next PUSI). The fixer also arms a one-shot
@@ -27,18 +29,30 @@
 //!    ffplay) when inputs A and B carry different PTS/PCR epochs — the
 //!    common case for live-camera switching, test-pattern ↔ media-player,
 //!    or any per-input transcoder pipeline.
-//! 3. **After switch**: rewrites CC values within the new input's packet
-//!    sequence so that subsequent packets maintain continuity.
+//! 3. **After switch**: CC passes through untouched, so loss on the new
+//!    input still shows downstream and in the flow's TR 101 290
+//!    `cc_errors`. The fixer never rewrites a CC: the only bit it ever
+//!    changes in a media packet is the DI on the PCR that takes a pending
+//!    one. (It used to renumber every payload CC after the first switch or
+//!    source PCR jump, for the rest of the flow, which erased every later
+//!    gap — lost packets, legal duplicates, a source's own CC reset —
+//!    edge#214.)
 //!
 //! All packets — video, audio, data — are forwarded immediately after a
 //! switch. There is no keyframe gating: decoders handle the transition via
 //! the CC jump (PES buffer flush) and pick up the new stream at the next
 //! PES start. This keeps the fixer codec-agnostic and works unchanged for
 //! H.264, HEVC, JPEG XS, SMPTE 2110 uncompressed, or any future format.
+//! A non-TS payload (ST 2110-30/-31/-40, `rtp_audio`, MXL audio) goes
+//! through it too and is left unchanged, except that while a DI is pending
+//! (on any PID after a switch, on that PID after a source discontinuity) a
+//! 188-byte stride that happens to start 0x47 and parse as a PCR takes the
+//! DI bit.
 //!
-//! The fixer is shared (via `Arc<Mutex<..>>`) across all per-input forwarders
-//! within a single flow. Only the active forwarder calls [`process_packet`];
-//! passive forwarders call [`observe_passive`] to pre-warm the PSI cache.
+//! The fixer is owned by the per-flow fixer task (`flow::ts_fixer_task`),
+//! which every per-input forwarder of the flow feeds over a channel.
+//! Packets of the active input go through [`process_packet`]; those of
+//! passive inputs go to [`observe_passive`] to pre-warm the PSI cache.
 //! Dead-input periods — when the operator has switched to an input whose
 //! source isn't currently transmitting — are handled at the forwarder
 //! level (see `spawn_input_forwarder` in `flow.rs`), which emits 250 ms-
@@ -53,9 +67,11 @@ use super::ts_parse::*;
 
 /// Result of [`TsContinuityFixer::process_packet`].
 pub enum ProcessResult {
-    /// Forward the packet unchanged (hot path before first switch).
+    /// Forward the packet unchanged: every packet except one that carries
+    /// the PCR taking a pending DI.
     Unchanged,
-    /// Forward a rewritten version of the packet.
+    /// Forward this copy of the datagram instead: byte for byte the one
+    /// received, with the DI bit set on the PCR that took a pending one.
     Rewritten(Bytes),
 }
 
@@ -68,12 +84,14 @@ impl ProcessResult {
             Self::Unchanged => panic!("expected Rewritten, got Unchanged"),
         }
     }
-}
 
-/// Per-PID state tracked on the output (downstream) side.
-struct PidCcState {
-    /// Last CC value emitted downstream.
-    last_out_cc: u8,
+    /// The bytes the fixer task forwards for `pkt`.
+    fn forwarded(self, pkt: &RtpPacket) -> Bytes {
+        match self {
+            Self::Rewritten(b) => b,
+            Self::Unchanged => pkt.data.clone(),
+        }
+    }
 }
 
 /// Per-input PSI (PAT + PMTs) cache. Each input has its own cache so that
@@ -128,15 +146,12 @@ impl InputPsiCache {
     }
 }
 
-/// Tracks per-PID continuity counters and per-input PSI caches to ensure
-/// seamless transitions when the active input changes.
+/// Keeps per-input PSI caches and the pending discontinuity indicators that
+/// make transitions seamless when the active input changes. CC is never
+/// tracked or rewritten.
 pub struct TsContinuityFixer {
-    /// Per-PID CC state keyed by PID (output-side, shared across all inputs).
-    pid_state: HashMap<u16, PidCcState>,
     /// Per-input PSI cache, keyed by input ID.
     input_psi: HashMap<String, InputPsiCache>,
-    /// Zero-cost gate: skip all processing until the first switch occurs.
-    ever_switched: bool,
     /// Monotonic 5-bit PSI version counter used to stamp every phantom
     /// PAT/PMT emitted by [`on_switch`]. Each switch bumps this once so
     /// the version we hand to the receiver is **strictly different** from
@@ -152,16 +167,19 @@ pub struct TsContinuityFixer {
     /// One-shot flag: set by [`on_switch`], cleared the next time
     /// [`process_packet`] sees a PCR-bearing TS packet — at which point
     /// the `discontinuity_indicator` bit (AF flags 0x80) is OR'd into
-    /// that packet's adaptation field. Tells the receiver "the next PCR
-    /// is a fresh STC anchor, throw away your old timestamp tracking" —
-    /// without it, professional and prosumer decoders (VLC, ffplay,
-    /// Appear-style hardware) treat the post-switch PCR jump (which
-    /// happens whenever inputs A and B have different epochs — the
-    /// common case for live-camera switching, test-pattern ↔ media-
-    /// player, or any per-input transcoder pipeline) as a clock fault
-    /// and lock up. Set on every switch (including dead-input switches)
-    /// so the next real packet picks it up regardless of which input
-    /// finally produces data first.
+    /// that packet's adaptation field, the only change the fixer makes to
+    /// a media packet (its CC goes out as the source sent it). While it,
+    /// or an entry of `pending_di_pids`, is armed, `process_packet` reads
+    /// each packet's PCR; otherwise it reads nothing but PSI. Tells the
+    /// receiver "the next PCR is a fresh STC anchor, throw away your old
+    /// timestamp tracking" — without it, professional and prosumer
+    /// decoders (VLC, ffplay, Appear-style hardware) treat the post-switch
+    /// PCR jump (which happens whenever inputs A and B have different
+    /// epochs — the common case for live-camera switching, test-pattern ↔
+    /// media-player, or any per-input transcoder pipeline) as a clock
+    /// fault and lock up. Set on every switch (including dead-input
+    /// switches) so the next real packet picks it up regardless of which
+    /// input finally produces data first.
     pending_di_on_pcr: bool,
     /// PCR PIDs whose next PCR must carry DI — a source discontinuity the
     /// watcher saw on that PID's own clock. On an MPTS each program has its
@@ -173,9 +191,7 @@ pub struct TsContinuityFixer {
 impl TsContinuityFixer {
     pub fn new() -> Self {
         Self {
-            pid_state: HashMap::new(),
             input_psi: HashMap::new(),
-            ever_switched: false,
             // Start at 0; the first `on_switch` bumps this to 1 before
             // stamping, matching the long-standing "bumped from cached
             // version 0 to 1" behaviour on the first switch.
@@ -197,37 +213,37 @@ impl TsContinuityFixer {
     /// Kept apart from the operator-input-switch flag, so a switch
     /// happening concurrently with a source discontinuity loses neither.
     ///
-    /// Also flips `ever_switched` so the post-switch processing path
-    /// (which is what applies DI to packets) takes over even when
-    /// the operator never manually switched — a chronic source-loop
-    /// without any operator action still gets DI=1 on every jump.
+    /// It arms DI on that PID's next PCR and nothing else: CC goes out as
+    /// the source sent it. It used to switch on the post-switch path,
+    /// because only that path applied DI (c7014f8), and that renumbered CC
+    /// for the rest of the flow, hiding every later loss (edge#214).
     pub fn signal_source_discontinuity(&mut self, pcr_pid: u16) {
         if !self.pending_di_pids.contains(&pcr_pid) {
             self.pending_di_pids.push(pcr_pid);
         }
-        self.ever_switched = true;
     }
 
     /// Whether a PCR-bearing packet on `pid` takes a pending DI, and
-    /// consume it if so.
-    fn take_pending_di(&mut self, pid: u16) -> bool {
-        let targeted = match self.pending_di_pids.iter().position(|p| *p == pid) {
+    /// consume it if so: the switch's one-shot `on_pcr`, or `pid`'s own
+    /// entry in `pids`. An associated fn over the two fields, so
+    /// [`Self::process_packet`] can call it while it holds the input's PSI
+    /// cache.
+    fn take_pending_di(on_pcr: &mut bool, pids: &mut Vec<u16>, pid: u16) -> bool {
+        let targeted = match pids.iter().position(|p| *p == pid) {
             Some(i) => {
-                self.pending_di_pids.swap_remove(i);
+                pids.swap_remove(i);
                 true
             }
             None => false,
         };
-        std::mem::take(&mut self.pending_di_on_pcr) || targeted
+        std::mem::take(on_pcr) || targeted
     }
 
     /// Forget the per-input PSI cache for `input_id`.
     ///
     /// Called when an input is hot-removed from a flow so that a later
     /// hot-add of an input under the same id doesn't carry stale PAT/PMT
-    /// from a different source. The output-side `pid_state` map is NOT
-    /// touched — those continuity counters are output-PID-keyed and
-    /// shared across all inputs.
+    /// from a different source.
     ///
     /// Idempotent: dropping an unknown input id is a no-op.
     pub fn forget_input(&mut self, input_id: &str) {
@@ -318,11 +334,12 @@ impl TsContinuityFixer {
         }
     }
 
-    /// Called when the active input changes. Clears output-side CC state
-    /// so the new input's original CC values pass through, creating a
-    /// natural CC jump that signals receivers to flush and resync. Also
-    /// returns cached PSI packets (PAT + PMTs) from the *new* input for
-    /// fast receiver re-acquisition.
+    /// Called when the active input changes. The new input's packets go
+    /// out with their own CCs, so the cut shows as one CC jump per PID —
+    /// a natural jump that signals receivers to flush and resync — and
+    /// every later gap is real loss. Also returns cached PSI packets
+    /// (PAT + PMTs) from the *new* input for fast receiver
+    /// re-acquisition; they keep the CC they were cached with.
     ///
     /// Every phantom PAT/PMT packet returned here is stamped with a
     /// **monotonically advancing** `version_number` taken from
@@ -334,10 +351,12 @@ impl TsContinuityFixer {
     /// audio decoder pointed at the previous input's format and silently
     /// dropping audio from the returning input.
     ///
-    /// The CC jump from clearing `pid_state` is the other half of the
-    /// switch signal: receivers (VLC, ffplay, hardware decoders) detect it
-    /// as "packet loss," flush PES buffers, and resync on the next PES
-    /// start (PUSI=1).
+    /// The CC jump between the old input's CCs and the new input's is the
+    /// other half of the switch signal: receivers (VLC, ffplay, hardware
+    /// decoders) detect it as "packet loss," flush PES buffers, and resync
+    /// on the next PES start (PUSI=1). Nothing forces it: a PID whose new
+    /// CC happens to follow (or repeat) the old one shows no jump, a 1 in
+    /// 16 chance each.
     ///
     /// On top of the CC jump and the version-bumped phantom PSI, we also
     /// arm `pending_di_on_pcr` so the **first** PCR-bearing TS packet that
@@ -351,16 +370,7 @@ impl TsContinuityFixer {
     /// dead-source switches) so the next real packet picks it up whenever
     /// the new input eventually produces data.
     pub fn on_switch(&mut self, new_input_id: &str) -> Vec<RtpPacket> {
-        self.ever_switched = true;
         self.pending_di_on_pcr = true;
-
-        // Clear all output-side CC state. When the new input's packets
-        // arrive, process_packet() creates fresh entries using the new
-        // input's CC values. This produces a natural CC jump on all PIDs
-        // that the receiver detects and handles via its standard packet-
-        // loss recovery path (flush PES, wait for PUSI).
-        let old_pid_count = self.pid_state.len();
-        self.pid_state.clear();
 
         // Advance the monotonic counter unconditionally — even if we end
         // up emitting nothing this switch. Otherwise switching through a
@@ -391,7 +401,7 @@ impl TsContinuityFixer {
 
         tracing::info!(
             "TsContinuityFixer::on_switch('{new_input_id}'): injecting PAT={}, PMTs={}, \
-             version={stamp} (monotonic), cleared {old_pid_count} tracked PIDs",
+             version={stamp} (monotonic)",
             if cached_pat.is_some() { "yes" } else { "no" },
             cached_pmts.len(),
         );
@@ -434,155 +444,56 @@ impl TsContinuityFixer {
 
     /// Process a packet from the currently active input.
     ///
-    /// Returns [`ProcessResult::Unchanged`] on the hot path (before first
-    /// switch), [`ProcessResult::Rewritten`] when CC/DI was modified.
+    /// Returns [`ProcessResult::Unchanged`] for every datagram except one
+    /// holding the PCR that takes a pending DI (a switch's, or a source
+    /// discontinuity's on that PCR's PID), for which it returns
+    /// [`ProcessResult::Rewritten`]: a copy of the datagram with that one
+    /// bit set. CC is never rewritten, so every gap in the source — lost
+    /// packets, legal duplicates, the source's own CC reset — goes out as
+    /// it came (edge#214). PSI is observed on every packet for the switch
+    /// cache.
     pub fn process_packet(&mut self, input_id: &str, packet: &RtpPacket) -> ProcessResult {
-        if !self.ever_switched {
-            // Hot path: no switch has ever occurred. Just observe PSI for
-            // cache warmth and return None to forward unchanged.
-            let psi = match self.input_psi.get_mut(input_id) {
-                Some(psi) => psi,
-                None => {
-                    self.input_psi.insert(input_id.to_string(), InputPsiCache::new());
-                    self.input_psi.get_mut(input_id).unwrap()
-                }
-            };
-            let ts_data = strip_rtp_header(packet);
-            let mut offset = 0;
-            while offset + TS_PACKET_SIZE <= ts_data.len() {
-                let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
-                offset += TS_PACKET_SIZE;
-                if pkt[0] != TS_SYNC_BYTE {
-                    continue;
-                }
-                psi.observe_psi(pkt);
-                // Also seed CC state so we have accurate last_out_cc.
-                let pid = ts_pid(pkt);
-                if pid != NULL_PID && ts_has_payload(pkt) {
-                    let cc = ts_cc(pkt);
-                    self.pid_state.entry(pid).or_insert(PidCcState {
-                        last_out_cc: cc,
-                    }).last_out_cc = cc;
-                }
+        let Self { input_psi, pending_di_on_pcr, pending_di_pids, .. } = self;
+        let psi = match input_psi.get_mut(input_id) {
+            Some(psi) => psi,
+            None => {
+                input_psi.insert(input_id.to_string(), InputPsiCache::new());
+                input_psi.get_mut(input_id).unwrap()
             }
-            return ProcessResult::Unchanged;
-        }
-
-        // Post-switch: rewrite CC values for continuity.
-        let ts_data = strip_rtp_header(packet);
-        if ts_data.is_empty() {
-            return ProcessResult::Unchanged;
-        }
-
-        let rtp_header_len = if packet.is_raw_ts {
-            0
-        } else {
-            packet.data.len() - ts_data.len()
         };
-
-        let mut out = Vec::with_capacity(packet.data.len());
-        // Copy the RTP header unchanged if present.
-        if rtp_header_len > 0 {
-            out.extend_from_slice(&packet.data[..rtp_header_len]);
-        }
-
-        // Ensure this input has a PSI cache entry (allocates only on first
-        // packet from this input — subsequent packets use get_mut).
-        if !self.input_psi.contains_key(input_id) {
-            self.input_psi.insert(input_id.to_string(), InputPsiCache::new());
-        }
-
-        let mut modified = false;
+        let ts_data = strip_rtp_header(packet);
+        // The TS bytes are the datagram's tail.
+        let ts_start = packet.data.len() - ts_data.len();
+        let mut out: Option<Vec<u8>> = None;
         let mut offset = 0;
         while offset + TS_PACKET_SIZE <= ts_data.len() {
             let pkt = &ts_data[offset..offset + TS_PACKET_SIZE];
+            let at = ts_start + offset;
             offset += TS_PACKET_SIZE;
-
             if pkt[0] != TS_SYNC_BYTE {
-                out.extend_from_slice(pkt);
                 continue;
             }
-
+            psi.observe_psi(pkt);
+            // DI goes on the first PCR-bearing packet that takes a pending
+            // one. PCR may ride either a payload-bearing PUSI packet or an
+            // AF-only packet (common for software encoders that decouple
+            // PCR cadence from ES boundaries). Only a PCR consumes the
+            // flag, so a packet that cannot carry DI never burns it.
             let pid = ts_pid(pkt);
-            if pid == NULL_PID {
-                out.extend_from_slice(pkt);
-                continue;
+            if (*pending_di_on_pcr || !pending_di_pids.is_empty())
+                && pid != NULL_PID
+                && extract_pcr(pkt).is_some()
+                && Self::take_pending_di(pending_di_on_pcr, pending_di_pids, pid)
+            {
+                // One copy of the datagram, written in place: the RTP
+                // header and any trailing partial bytes stay byte-identical.
+                let buf = out.get_or_insert_with(|| packet.data.to_vec());
+                set_discontinuity_indicator(&mut buf[at..at + TS_PACKET_SIZE]);
             }
-
-            // Observe PSI for cache updates (routed to this input's cache).
-            // Borrow is scoped so it doesn't conflict with pid_state below.
-            self.input_psi.get_mut(input_id).unwrap().observe_psi(pkt);
-
-            // Set DI on the first PCR-bearing packet from the new input
-            // after a switch. PCR may ride either a payload-bearing PUSI
-            // packet or an AF-only packet (common for software encoders
-            // that decouple PCR cadence from ES boundaries) — check both
-            // paths. Only consume the flag when DI is actually applied,
-            // so an AF-only packet without PCR doesn't burn the one-shot.
-            let needs_di = extract_pcr(pkt).is_some() && self.take_pending_di(pid);
-
-            if !ts_has_payload(pkt) {
-                // Adaptation-only packets: CC MUST NOT increment per
-                // H.222.0 §2.4.3.3 — it must carry the same CC as the last
-                // PAYLOAD-bearing packet on this PID. While we re-stamp
-                // payload CC (post-switch / post-source-discontinuity), our
-                // emitted payload CC diverges from the source CC, so passing
-                // the source CC through here drifts by the count of
-                // dropped-and-not-recovered payload packets and trips a
-                // TR 101 290 continuity_count_error on every PCR-only packet.
-                // Pin to our own emitted last_out_cc (mirrors the AF-only
-                // handling in input_media_player::rewrite_cc / ts_assembler).
-                let mut ts_pkt = [0u8; TS_PACKET_SIZE];
-                ts_pkt.copy_from_slice(pkt);
-                if let Some(state) = self.pid_state.get(&pid) {
-                    let pinned = state.last_out_cc & 0x0F;
-                    if (ts_pkt[3] & 0x0F) != pinned {
-                        ts_pkt[3] = (ts_pkt[3] & 0xF0) | pinned;
-                        modified = true;
-                    }
-                }
-                if needs_di {
-                    set_discontinuity_indicator(&mut ts_pkt);
-                    modified = true;
-                }
-                out.extend_from_slice(&ts_pkt);
-                continue;
-            }
-
-            // Payload-bearing packet: rewrite CC to maintain continuity.
-            // After a switch, pid_state is empty (cleared by on_switch),
-            // so the first packet of each PID creates a fresh entry using
-            // the new input's CC. This produces a natural CC jump that
-            // receivers detect and handle via packet-loss recovery.
-            let mut ts_pkt = [0u8; TS_PACKET_SIZE];
-            ts_pkt.copy_from_slice(pkt);
-
-            let state = self.pid_state.entry(pid).or_insert(PidCcState {
-                last_out_cc: ts_cc(pkt).wrapping_sub(1) & 0x0F,
-            });
-
-            // Rewrite CC to continue from last emitted value.
-            let new_cc = state.last_out_cc.wrapping_add(1) & 0x0F;
-            ts_pkt[3] = (ts_pkt[3] & 0xF0) | new_cc;
-            state.last_out_cc = new_cc;
-            modified = true;
-
-            if needs_di {
-                set_discontinuity_indicator(&mut ts_pkt);
-            }
-
-            out.extend_from_slice(&ts_pkt);
         }
-
-        // Append any trailing bytes that don't form a complete TS packet.
-        if offset < ts_data.len() {
-            out.extend_from_slice(&ts_data[offset..]);
-        }
-
-        if modified {
-            ProcessResult::Rewritten(Bytes::from(out))
-        } else {
-            ProcessResult::Unchanged
+        match out {
+            Some(buf) => ProcessResult::Rewritten(Bytes::from(buf)),
+            None => ProcessResult::Unchanged,
         }
     }
 }
@@ -902,20 +813,20 @@ mod tests {
             fixer.process_packet("a", &make_rtp_packet(&ts));
         }
 
-        // Switch to input B — pid_state is cleared.
+        // Switch to input B.
         let _ = fixer.on_switch("b");
 
-        // Input B sends PID 0x100 with CC=0 (its own sequence).
-        // After pid_state clear, the first packet passes through with
-        // its original CC, creating a CC jump (7 → 0) that the receiver
-        // detects as packet loss and handles by flushing/resyncing.
-        let ts = build_ts_packet(0x100, 0);
-        let result = fixer.process_packet("b", &make_rtp_packet(&ts)).unwrap_rewritten();
+        // Input B sends PID 0x100 with CC=0 (its own sequence). It passes
+        // through with its original CC, creating a CC jump (7 → 0) that
+        // the receiver detects as packet loss and handles by
+        // flushing/resyncing.
+        let pkt = make_rtp_packet(&build_ts_packet(0x100, 0));
+        let result = fixer.process_packet("b", &pkt).forwarded(&pkt);
         assert_eq!(ts_cc(&result[0..TS_PACKET_SIZE]), 0);
 
         // Second packet maintains continuity within B's sequence.
-        let ts = build_ts_packet(0x100, 1);
-        let result = fixer.process_packet("b", &make_rtp_packet(&ts)).unwrap_rewritten();
+        let pkt = make_rtp_packet(&build_ts_packet(0x100, 1));
+        let result = fixer.process_packet("b", &pkt).forwarded(&pkt);
         assert_eq!(ts_cc(&result[0..TS_PACKET_SIZE]), 1);
     }
 
@@ -929,39 +840,44 @@ mod tests {
         let _ = fixer.on_switch("b");
 
         // Input B: CC wraps around within its own sequence.
-        let ts1 = build_ts_packet(0x100, 14);
-        let result1 = fixer.process_packet("b", &make_rtp_packet(&ts1)).unwrap_rewritten();
+        let pkt1 = make_rtp_packet(&build_ts_packet(0x100, 14));
+        let result1 = fixer.process_packet("b", &pkt1).forwarded(&pkt1);
         assert_eq!(ts_cc(&result1[..TS_PACKET_SIZE]), 14);
 
-        let ts2 = build_ts_packet(0x100, 15);
-        let result2 = fixer.process_packet("b", &make_rtp_packet(&ts2)).unwrap_rewritten();
+        let pkt2 = make_rtp_packet(&build_ts_packet(0x100, 15));
+        let result2 = fixer.process_packet("b", &pkt2).forwarded(&pkt2);
         assert_eq!(ts_cc(&result2[..TS_PACKET_SIZE]), 15);
 
-        let ts3 = build_ts_packet(0x100, 0);
-        let result3 = fixer.process_packet("b", &make_rtp_packet(&ts3)).unwrap_rewritten();
+        let pkt3 = make_rtp_packet(&build_ts_packet(0x100, 0));
+        let result3 = fixer.process_packet("b", &pkt3).forwarded(&pkt3);
         assert_eq!(ts_cc(&result3[..TS_PACKET_SIZE]), 0); // wraps
     }
 
+    /// A switch shows as one CC jump on every PID the two inputs share: the
+    /// new input's first packet on each goes out with its own CC.
     #[test]
-    fn pid_state_cleared_on_switch() {
+    fn a_switch_shows_as_one_cc_jump_per_pid() {
         let mut fixer = TsContinuityFixer::new();
 
         // Input A: two PIDs.
         fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 5)));
         fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x200, 10)));
-        assert_eq!(fixer.pid_state.len(), 2);
 
         let _ = fixer.on_switch("b");
 
-        // pid_state should be empty after switch.
-        assert!(fixer.pid_state.is_empty(), "pid_state should be cleared on switch");
+        // Input B starts both PIDs at 0: 5 → 0 and 10 → 0.
+        for pid in [0x100, 0x200] {
+            let pkt = make_rtp_packet(&build_ts_packet(pid, 0));
+            let out = fixer.process_packet("b", &pkt).forwarded(&pkt);
+            assert_eq!(ts_cc(&out[..TS_PACKET_SIZE]), 0, "PID {pid:#x}");
+        }
     }
 
     #[test]
     fn pat_pmt_cached_from_passive_input() {
         let mut fixer = TsContinuityFixer::new();
 
-        // Active input sends some data so we have CC state.
+        // Active input sends some data first.
         let ts = build_ts_packet(0x100, 0);
         fixer.process_packet("a", &make_rtp_packet(&ts));
 
@@ -1033,9 +949,6 @@ mod tests {
         // Switch to B — no PSI cached.
         let injected = fixer.on_switch("b");
         assert!(injected.is_empty(), "should inject nothing when no PSI cached for new input");
-
-        // pid_state should still be cleared.
-        assert!(fixer.pid_state.is_empty());
     }
 
     #[test]
@@ -1063,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_switches_reset_cc_each_time() {
+    fn multiple_switches_pass_each_inputs_cc_through() {
         let mut fixer = TsContinuityFixer::new();
 
         // Input A: PID 0x100, CC=0..4
@@ -1071,17 +984,20 @@ mod tests {
             fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, cc)));
         }
 
-        // Switch to B — pid_state cleared. B's CC passes through.
+        // Switch to B — B's CC passes through.
         let _ = fixer.on_switch("b");
-        let result = fixer.process_packet("b", &make_rtp_packet(&build_ts_packet(0x100, 10))).unwrap_rewritten();
+        let pkt = make_rtp_packet(&build_ts_packet(0x100, 10));
+        let result = fixer.process_packet("b", &pkt).forwarded(&pkt);
         assert_eq!(ts_cc(&result[..TS_PACKET_SIZE]), 10);
 
-        let result = fixer.process_packet("b", &make_rtp_packet(&build_ts_packet(0x100, 11))).unwrap_rewritten();
+        let pkt = make_rtp_packet(&build_ts_packet(0x100, 11));
+        let result = fixer.process_packet("b", &pkt).forwarded(&pkt);
         assert_eq!(ts_cc(&result[..TS_PACKET_SIZE]), 11);
 
-        // Switch back to A — pid_state cleared again. A's CC passes through.
+        // Switch back to A — A's CC passes through.
         let _ = fixer.on_switch("a");
-        let result = fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0))).unwrap_rewritten();
+        let pkt = make_rtp_packet(&build_ts_packet(0x100, 0));
+        let result = fixer.process_packet("a", &pkt).forwarded(&pkt);
         assert_eq!(ts_cc(&result[..TS_PACKET_SIZE]), 0);
     }
 
@@ -1096,7 +1012,6 @@ mod tests {
         }
         fixer.process_packet("a", &make_rtp_packet(&data));
 
-        // Switch — pid_state cleared.
         let _ = fixer.on_switch("b");
 
         // Input B: 3 packets in one datagram. CC passes through.
@@ -1104,7 +1019,8 @@ mod tests {
         for cc in 0..=2u8 {
             data_b.extend_from_slice(&build_ts_packet(0x100, cc));
         }
-        let result = fixer.process_packet("b", &make_rtp_packet(&data_b)).unwrap_rewritten();
+        let pkt_b = make_rtp_packet(&data_b);
+        let result = fixer.process_packet("b", &pkt_b).forwarded(&pkt_b);
 
         for (i, expected_cc) in [0u8, 1, 2].iter().enumerate() {
             let pkt = &result[i * TS_PACKET_SIZE..(i + 1) * TS_PACKET_SIZE];
@@ -1138,11 +1054,14 @@ mod tests {
 
         let _ = fixer.on_switch("b");
 
-        // New packet from input B, RTP-wrapped.
+        // New packet from input B, RTP-wrapped, carrying the PCR that takes
+        // the switch's DI: the bit is written at the RTP header's length
+        // plus the TS packet's offset.
         let mut rtp_data2 = vec![0u8; RTP_HEADER_MIN_SIZE];
         rtp_data2[0] = 0x80;
         rtp_data2[1] = 33;
-        let ts2 = build_ts_packet(0x100, 0);
+        rtp_data2[2..12].copy_from_slice(&[0x12, 0x34, 0, 0, 0x07, 0xD0, 0xDE, 0xAD, 0xBE, 0xEF]);
+        let ts2 = build_pcr_packet(0x100, 0, 27_000_000);
         rtp_data2.extend_from_slice(&ts2);
 
         let pkt2 = RtpPacket {
@@ -1157,12 +1076,17 @@ mod tests {
         };
 
         let result = fixer.process_packet("b", &pkt2).unwrap_rewritten();
-        // RTP header should be preserved.
-        assert_eq!(result[0], 0x80);
-        assert_eq!(result[1], 33);
-        // CC passes through from new input (pid_state was cleared).
+        // RTP header should be preserved byte for byte.
+        assert_eq!(&result[..RTP_HEADER_MIN_SIZE], &pkt2.data[..RTP_HEADER_MIN_SIZE]);
         let ts_start = RTP_HEADER_MIN_SIZE;
-        assert_eq!(ts_cc(&result[ts_start..ts_start + TS_PACKET_SIZE]), 0);
+        let ts_out = &result[ts_start..ts_start + TS_PACKET_SIZE];
+        assert!(ts_discontinuity_indicator(ts_out), "DI on the PCR");
+        // CC passes through from the new input.
+        assert_eq!(ts_cc(ts_out), 0);
+        // Nothing but the DI bit changed.
+        let mut expected = pkt2.data.to_vec();
+        expected[ts_start + 5] |= 0x80;
+        assert_eq!(&result[..], &expected[..]);
     }
 
     #[test]
@@ -1175,8 +1099,8 @@ mod tests {
         let _ = fixer.on_switch("b");
 
         // Input B has PID 0x200. CC passes through.
-        let ts = build_ts_packet(0x200, 7);
-        let result = fixer.process_packet("b", &make_rtp_packet(&ts)).unwrap_rewritten();
+        let pkt = make_rtp_packet(&build_ts_packet(0x200, 7));
+        let result = fixer.process_packet("b", &pkt).forwarded(&pkt);
         assert_eq!(ts_cc(&result[..TS_PACKET_SIZE]), 7);
     }
 
@@ -1198,13 +1122,13 @@ mod tests {
         let _ = fixer.on_switch("b");
 
         // Video packet passes through immediately — no keyframe wait.
-        let v = build_ts_packet(0x100, 0);
-        let result = fixer.process_packet("b", &make_rtp_packet(&v)).unwrap_rewritten();
+        let v = make_rtp_packet(&build_ts_packet(0x100, 0));
+        let result = fixer.process_packet("b", &v).forwarded(&v);
         assert_eq!(ts_pid(&result[..TS_PACKET_SIZE]), 0x100);
 
         // Audio packet also passes through immediately.
-        let a = build_ts_packet(0x101, 0);
-        let result = fixer.process_packet("b", &make_rtp_packet(&a)).unwrap_rewritten();
+        let a = make_rtp_packet(&build_ts_packet(0x101, 0));
+        let result = fixer.process_packet("b", &a).forwarded(&a);
         assert_eq!(ts_pid(&result[..TS_PACKET_SIZE]), 0x101);
     }
 
@@ -1298,7 +1222,7 @@ mod tests {
         fixer.observe_passive("a", &make_rtp_packet(&psi_data));
         fixer.observe_passive("b", &make_rtp_packet(&psi_data));
 
-        // Drive a packet so ever_switched can be set later.
+        // Drive a packet through the active input first.
         fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
 
         // First switch: a → b. Phantom PAT should carry version=1.
@@ -1450,8 +1374,8 @@ mod tests {
     fn first_pcr_after_switch_carries_discontinuity_indicator() {
         let mut fixer = TsContinuityFixer::new();
 
-        // Pre-switch: input "a" emits a PCR packet. ever_switched=false →
-        // unchanged path, no DI manipulation.
+        // Pre-switch: input "a" emits a PCR packet. No DI is pending, so
+        // it passes unchanged.
         let pre = build_pcr_packet(0x100, 0, 27_000_000);
         let result = fixer.process_packet("a", &make_rtp_packet(&pre));
         assert!(matches!(result, ProcessResult::Unchanged));
@@ -1471,10 +1395,8 @@ mod tests {
 
         // Subsequent PCR packets from the same input do NOT keep setting DI
         // — the flag is one-shot per switch.
-        let next = build_pcr_packet(0x100, 1, 100_009_000);
-        let bytes = fixer
-            .process_packet("b", &make_rtp_packet(&next))
-            .unwrap_rewritten();
+        let next = make_rtp_packet(&build_pcr_packet(0x100, 1, 100_009_000));
+        let bytes = fixer.process_packet("b", &next).forwarded(&next);
         assert!(
             !ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]),
             "subsequent PCR packets within the same input must not carry DI"
@@ -1539,14 +1461,14 @@ mod tests {
         let mut fixer = TsContinuityFixer::new();
         fixer.process_packet("a", &make_rtp_packet(&build_ts_packet(0x100, 0)));
         fixer.signal_source_discontinuity(0x200);
-        let other = build_pcr_packet(0x100, 1, 27_000_000);
-        let bytes = fixer.process_packet("a", &make_rtp_packet(&other)).unwrap_rewritten();
+        let other = make_rtp_packet(&build_pcr_packet(0x100, 1, 27_000_000));
+        let bytes = fixer.process_packet("a", &other).forwarded(&other);
         assert!(!ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]), "not another program's PCR");
         let own = build_pcr_packet(0x200, 0, 99_000_000);
         let bytes = fixer.process_packet("a", &make_rtp_packet(&own)).unwrap_rewritten();
         assert!(ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]), "the jumped PID's next PCR");
-        let again = build_pcr_packet(0x200, 1, 99_810_000);
-        let bytes = fixer.process_packet("a", &make_rtp_packet(&again)).unwrap_rewritten();
+        let again = make_rtp_packet(&build_pcr_packet(0x200, 1, 99_810_000));
+        let bytes = fixer.process_packet("a", &again).forwarded(&again);
         assert!(!ts_discontinuity_indicator(&bytes[..TS_PACKET_SIZE]), "one-shot");
     }
 
@@ -1575,14 +1497,142 @@ mod tests {
             );
 
             // The very next PCR within the same input must NOT carry DI.
-            let pkt2 = build_pcr_packet(0x100, 1, pcr.wrapping_add(40_000));
-            let bytes2 = fixer
-                .process_packet(target, &make_rtp_packet(&pkt2))
-                .unwrap_rewritten();
+            let pkt2 = make_rtp_packet(&build_pcr_packet(0x100, 1, pcr.wrapping_add(40_000)));
+            let bytes2 = fixer.process_packet(target, &pkt2).forwarded(&pkt2);
             assert!(
                 !ts_discontinuity_indicator(&bytes2[..TS_PACKET_SIZE]),
                 "subsequent PCR after switch to '{target}' must not carry DI"
             );
         }
+    }
+
+    // ── edge#214: CC passes through ─────────────────────────────────────
+
+    /// The CCs the fixer forwards for `pkts` (one TS packet per datagram)
+    /// from `input`.
+    fn forwarded_ccs(fixer: &mut TsContinuityFixer, input: &str, pkts: &[[u8; TS_PACKET_SIZE]]) -> Vec<u8> {
+        pkts.iter()
+            .map(|ts| {
+                let pkt = make_rtp_packet(ts);
+                ts_cc(&fixer.process_packet(input, &pkt).forwarded(&pkt)[..TS_PACKET_SIZE])
+            })
+            .collect()
+    }
+
+    /// Loss on the new input after a switch still shows downstream as a CC
+    /// gap. The fixer used to renumber every payload CC after the first
+    /// switch, so B's lost CC 3 and 4 went out as a continuous 0..4.
+    #[test]
+    fn upstream_loss_after_a_switch_still_shows_as_a_cc_gap() {
+        let mut fixer = TsContinuityFixer::new();
+        let a: Vec<_> = (5..=7u8).map(|cc| build_ts_packet(0x100, cc)).collect();
+        forwarded_ccs(&mut fixer, "a", &a);
+        let _ = fixer.on_switch("b");
+        let b: Vec<_> = [0u8, 1, 2, 5, 6].iter().map(|&cc| build_ts_packet(0x100, cc)).collect();
+        assert_eq!(forwarded_ccs(&mut fixer, "b", &b), vec![0, 1, 2, 5, 6]);
+    }
+
+    /// A source PCR jump arms a DI on that PID's next PCR and touches no
+    /// CC: the PCR goes out with DI and its own CC, and the packets after
+    /// it go out unchanged. The signal used to switch on CC renumbering
+    /// for the rest of the flow (CC 2 then 3, where the source sent 6).
+    #[test]
+    fn a_source_pcr_jump_arms_di_without_renumbering_cc() {
+        let mut fixer = TsContinuityFixer::new();
+        let pcr = make_rtp_packet(&build_pcr_packet(0x100, 0, 27_000_000));
+        assert!(matches!(fixer.process_packet("a", &pcr), ProcessResult::Unchanged));
+        let payload = make_rtp_packet(&build_ts_packet(0x100, 1));
+        assert!(matches!(fixer.process_packet("a", &payload), ProcessResult::Unchanged));
+        fixer.signal_source_discontinuity(0x100);
+
+        let jumped = make_rtp_packet(&build_pcr_packet(0x100, 2, 990_000_000));
+        let out = fixer.process_packet("a", &jumped).unwrap_rewritten();
+        assert!(ts_discontinuity_indicator(&out[..TS_PACKET_SIZE]), "DI on the jumped PCR");
+        assert_eq!(ts_cc(&out[..TS_PACKET_SIZE]), 2, "its own CC");
+
+        let after_loss = make_rtp_packet(&build_ts_packet(0x100, 6));
+        assert!(
+            matches!(fixer.process_packet("a", &after_loss), ProcessResult::Unchanged),
+            "a later packet goes out as the source sent it, gap and all",
+        );
+    }
+
+    /// A legal duplicate (the same CC twice) after a switch goes out as a
+    /// duplicate. Renumbered, it became CC + 1 and pushed every later
+    /// packet one on.
+    #[test]
+    fn a_duplicate_packet_after_a_switch_keeps_its_cc() {
+        let mut fixer = TsContinuityFixer::new();
+        forwarded_ccs(&mut fixer, "a", &[build_ts_packet(0x100, 9)]);
+        let _ = fixer.on_switch("b");
+        let b: Vec<_> = [3u8, 3, 4].iter().map(|&cc| build_ts_packet(0x100, cc)).collect();
+        assert_eq!(forwarded_ccs(&mut fixer, "b", &b), vec![3, 3, 4]);
+    }
+
+    /// An AF-only PCR packet after a loss carries the source's CC, which is
+    /// also the CC of the last payload packet emitted on its PID. The fixer
+    /// used to renumber the payload (4 → 2) and pin the AF-only packet to
+    /// the renumbered value.
+    #[test]
+    fn a_pcr_only_packet_after_a_loss_carries_the_source_cc() {
+        let mut fixer = TsContinuityFixer::new();
+        forwarded_ccs(&mut fixer, "a", &[build_ts_packet(0x100, 12)]);
+        let _ = fixer.on_switch("b");
+        let b: Vec<_> = [0u8, 1, 4].iter().map(|&cc| build_ts_packet(0x100, cc)).collect();
+        assert_eq!(forwarded_ccs(&mut fixer, "b", &b), vec![0, 1, 4]);
+        let af_only = make_rtp_packet(&build_pcr_only_packet(0x100, 4, 27_000_000));
+        let out = fixer.process_packet("b", &af_only).unwrap_rewritten();
+        assert_eq!(ts_cc(&out[..TS_PACKET_SIZE]), 4, "the source's CC");
+        assert!(ts_discontinuity_indicator(&out[..TS_PACKET_SIZE]), "and the switch's DI");
+    }
+
+    /// Once the switch's DI has landed, the fixer is back to zero
+    /// overhead: every later datagram, PCR-bearing or not, comes back
+    /// `Unchanged`. It used to rewrite every datagram after the first
+    /// switch, for the life of the flow.
+    #[test]
+    fn packets_after_the_switch_di_go_out_unchanged() {
+        let mut fixer = TsContinuityFixer::new();
+        forwarded_ccs(&mut fixer, "a", &[build_ts_packet(0x100, 3)]);
+        let _ = fixer.on_switch("b");
+        let first = make_rtp_packet(&build_pcr_packet(0x100, 0, 27_000_000));
+        let out = fixer.process_packet("b", &first).unwrap_rewritten();
+        assert!(ts_discontinuity_indicator(&out[..TS_PACKET_SIZE]));
+        let payload = make_rtp_packet(&build_ts_packet(0x100, 1));
+        assert!(matches!(fixer.process_packet("b", &payload), ProcessResult::Unchanged));
+        let pcr = make_rtp_packet(&build_pcr_packet(0x100, 2, 27_540_000));
+        assert!(matches!(fixer.process_packet("b", &pcr), ProcessResult::Unchanged));
+    }
+
+    /// A → B → A: each input's CCs pass through, and a gap on A after the
+    /// return passes through with them.
+    #[test]
+    fn a_b_a_round_trip_passes_each_inputs_own_cc() {
+        let mut fixer = TsContinuityFixer::new();
+        let a1: Vec<_> = (0..=3u8).map(|cc| build_ts_packet(0x100, cc)).collect();
+        assert_eq!(forwarded_ccs(&mut fixer, "a", &a1), vec![0, 1, 2, 3]);
+        let _ = fixer.on_switch("b");
+        let b: Vec<_> = (10..=12u8).map(|cc| build_ts_packet(0x100, cc)).collect();
+        assert_eq!(forwarded_ccs(&mut fixer, "b", &b), vec![10, 11, 12]);
+        let _ = fixer.on_switch("a");
+        let a2: Vec<_> = [7u8, 8, 11, 12].iter().map(|&cc| build_ts_packet(0x100, cc)).collect();
+        assert_eq!(forwarded_ccs(&mut fixer, "a", &a2), vec![7, 8, 11, 12]);
+    }
+
+    /// A pending DI for a PID the input never carries keeps the PCR check
+    /// engaged but rewrites nothing: no PCR takes it, so every datagram
+    /// comes back `Unchanged`. The signal used to switch on renumbering,
+    /// so every datagram came back rewritten.
+    #[test]
+    fn a_stale_pending_di_does_not_rewrite_anything() {
+        let mut fixer = TsContinuityFixer::new();
+        fixer.signal_source_discontinuity(0x300);
+        for cc in 0..4u8 {
+            let plain = make_rtp_packet(&build_ts_packet(0x100, cc));
+            assert!(matches!(fixer.process_packet("a", &plain), ProcessResult::Unchanged));
+            let pcr = make_rtp_packet(&build_pcr_packet(0x100, cc, 27_000_000 + cc as u64 * 1_080_000));
+            assert!(matches!(fixer.process_packet("a", &pcr), ProcessResult::Unchanged));
+        }
+        assert_eq!(fixer.pending_di_pids, vec![0x300], "still pending for its own PID");
     }
 }

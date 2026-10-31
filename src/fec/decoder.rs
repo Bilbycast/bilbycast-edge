@@ -25,8 +25,10 @@
 //! - The bilbycast FEC header carries no `TS Recovery` value (it is zeroed
 //!   by the encoder). Recovered packets reuse the most recent media
 //!   timestamp as a best-effort value.
-//! - Recovery is disabled while the matrix is uninitialised, so the first
-//!   cycle after startup can drop losses without repair.
+//! - FEC received before the first media packet is discarded, and the
+//!   first cycle after startup can drop losses without repair. A parity
+//!   that arrives before any media covers only packets sent before this
+//!   receiver started, so it can only be applied to the wrong matrix.
 //! - The header names a column or row in 3 bits, so a parity packet is
 //!   filed under its index modulo 8. The encoder sends none for columns or
 //!   rows from 8 up ([`super::encoder::FEC_INDEXED_GROUPS`]); one from an
@@ -224,11 +226,15 @@ impl FecDecoder {
         };
         let payload = &data[body_start + FEC_HEADER_LEN..];
 
-        // If we have never seen media yet, buffer the FEC payload but skip
-        // any recovery attempt — there is no template RTP header to
-        // reconstruct around.
+        // Before the first media packet, discard the parity. The encoder
+        // sends each one right after the last cell it covers (a column's at
+        // its last row, the rows' at the matrix's last cell — see
+        // `FecEncoder::process`), so one received before any media covers
+        // only packets sent before this receiver started. Kept, it would be
+        // applied to the first matrix the receiver opens and rebuild
+        // packets with bytes never sent, or a real packet a second time
+        // (edge#214).
         if !self.initialized {
-            self.store_fec(&hdr, payload);
             return result;
         }
 
@@ -569,16 +575,25 @@ mod tests {
         assert!(dec.recovered_count() >= 1);
     }
 
+    /// FEC that arrives before any media covers packets sent before the
+    /// receiver started, so it is discarded. Kept, it was applied to the
+    /// first matrix the receiver opened: media seq 4 opened a matrix at 4,
+    /// and the stored column-0 parity "rebuilt" seq 6 from 0xAA bytes
+    /// never sent under it (edge#214).
     #[test]
-    fn fec_with_no_prior_media_is_buffered_not_panicking() {
+    fn fec_before_any_media_is_discarded() {
         let mut dec = FecDecoder::new(2, 2);
-        // Build a synthetic FEC packet (column 0) with arbitrary payload.
+        // A column-0 FEC packet, SNBase 0, payload 0xAA...
         let mut pkt = Vec::new();
         pkt.extend_from_slice(&FEC_MAGIC);
         pkt.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0x40, 2]);
         pkt.extend_from_slice(&[0xAA; 4]);
-        let out = dec.process_fec(&pkt);
-        assert!(out.is_empty());
+        assert!(dec.process_fec(&pkt).is_empty());
+        let media = make_rtp_packet(4, 0, &[0x01, 0x02, 0x03, 0x04]);
+        let out = dec.process_media(4, 0, &media);
+        assert_eq!(out.len(), 1, "only the received packet");
+        assert_eq!(out[0].sequence_number, 4);
+        assert_eq!(dec.recovered_count(), 0);
     }
 
     #[test]
@@ -628,6 +643,22 @@ mod tests {
         lost: &[u16],
         drop_fec: impl Fn(usize) -> bool,
     ) -> Vec<u16> {
+        receive_from(l, d, wire, 0, lost, drop_fec)
+    }
+
+    /// [`receive`] by a receiver that starts at `wire[start]`: what was
+    /// sent before it never reaches the decoder. The packets sent are read
+    /// off the whole wire, so a correct rebuild of one sent before the
+    /// start is accepted; `drop_fec` still counts the FEC from the wire's
+    /// beginning.
+    fn receive_from(
+        l: u8,
+        d: u8,
+        wire: &[Wire],
+        start: usize,
+        lost: &[u16],
+        drop_fec: impl Fn(usize) -> bool,
+    ) -> Vec<u16> {
         let sent: std::collections::HashMap<u16, &Bytes> = wire
             .iter()
             .filter_map(|w| match w {
@@ -638,7 +669,13 @@ mod tests {
         let mut dec = FecDecoder::new(l, d);
         let mut rebuilt = Vec::new();
         let mut fec_index = 0;
-        for w in wire {
+        for (i, w) in wire.iter().enumerate() {
+            if i < start {
+                if let Wire::Fec(_) = w {
+                    fec_index += 1;
+                }
+                continue;
+            }
             let out = match w {
                 Wire::Media(seq, data) => {
                     if lost.contains(seq) {
@@ -670,6 +707,86 @@ mod tests {
             }
         }
         rebuilt
+    }
+
+    /// A receiver that starts while its sender is already running (a node
+    /// or flow restart, an upgrade, `add_input`), at every point of the
+    /// wire and with no loss: everything it rebuilds is byte for byte what
+    /// was sent under that number, and none of it is a packet it received.
+    /// A parity received before the first media packet used to be applied
+    /// to the first matrix the receiver opened, rebuilding packets from
+    /// bytes never sent (edge#214).
+    #[test]
+    fn a_receiver_started_mid_stream_rebuilds_only_what_was_sent() {
+        for (l, d) in [(4u8, 4u8), (5, 5), (8, 8), (10, 10)] {
+            let base = 7_000u16;
+            let n = 3 * l as u16 * d as u16;
+            let seqs: Vec<u16> = (0..n).map(|i| base.wrapping_add(i)).collect();
+            let wire = send(l, d, &seqs, |_| 20);
+            for start in 0..wire.len() {
+                let received: Vec<u16> = wire[start..]
+                    .iter()
+                    .filter_map(|w| match w {
+                        Wire::Media(s, _) => Some(*s),
+                        Wire::Fec(_) => None,
+                    })
+                    .collect();
+                for seq in receive_from(l, d, &wire, start, &[], |_| false) {
+                    assert!(
+                        !received.contains(&seq),
+                        "{l}x{d} from wire[{start}]: seq {seq} rebuilt a second time",
+                    );
+                }
+            }
+        }
+    }
+
+    /// A receiver that starts at media seq 5 of the first matrix (4x4) and
+    /// loses seq 13 still rebuilds it, from the parities sent after it
+    /// started. No FEC precedes its first media packet here (the first
+    /// parity follows seq 12), so this pins only that the first matrix's
+    /// later parities are kept, not repair after a discard: that is
+    /// `a_receiver_started_at_a_parity_repairs_the_next_matrix`.
+    #[test]
+    fn a_receiver_started_mid_matrix_still_repairs_its_last_row() {
+        let base = 9_000u16;
+        let seqs: Vec<u16> = (0..48).map(|i| base + i).collect();
+        let wire = send(4, 4, &seqs, |_| 20);
+        let start = wire
+            .iter()
+            .position(|w| matches!(w, Wire::Media(s, _) if *s == base + 5))
+            .expect("seq 5 was sent");
+        let got = receive_from(4, 4, &wire, start, &[base + 13], |_| false);
+        assert!(got.contains(&(base + 13)), "{got:?}");
+    }
+
+    /// The discard keeps repairing: a receiver whose first datagram is a
+    /// parity (any of the first matrix's column or row FEC, so the decoder
+    /// discards it and every parity up to the next media packet) still
+    /// rebuilds a packet lost in the next matrix's last row from that
+    /// matrix's column FEC.
+    #[test]
+    fn a_receiver_started_at_a_parity_repairs_the_next_matrix() {
+        for (l, d) in [(4u8, 4u8), (5, 5)] {
+            let base = 11_000u16;
+            let m = l as u16 * d as u16;
+            let seqs: Vec<u16> = (0..3 * m).map(|i| base + i).collect();
+            let wire = send(l, d, &seqs, |_| 20);
+            let next_matrix = wire
+                .iter()
+                .position(|w| matches!(w, Wire::Media(s, _) if *s == base + m))
+                .expect("the second matrix was sent");
+            // The second matrix's last row, column 1.
+            let lost = base + m + (d as u16 - 1) * l as u16 + 1;
+            let starts: Vec<usize> = (0..next_matrix)
+                .filter(|&i| matches!(wire[i], Wire::Fec(_)))
+                .collect();
+            assert_eq!(starts.len(), l as usize + d as usize, "{l}x{d}: every column and row FEC");
+            for start in starts {
+                let got = receive_from(l, d, &wire, start, &[lost], |_| false);
+                assert!(got.contains(&lost), "{l}x{d} from wire[{start}]: {got:?}");
+            }
+        }
     }
 
     /// Sequence numbers with an upstream gap of 3 inside the second

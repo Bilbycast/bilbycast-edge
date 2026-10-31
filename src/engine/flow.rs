@@ -817,10 +817,10 @@ impl FlowRuntime {
             );
         }
 
-        // TS continuity fixer for seamless input switching. Ensures CC
-        // counters are continuous and discontinuity_indicator is set when
-        // switching between inputs, preventing external decoders from
-        // losing lock.
+        // TS continuity fixer for seamless input switching. Injects cached
+        // PAT/PMT and sets discontinuity_indicator at a switch, preventing
+        // external decoders from losing lock; CC passes through, so the cut
+        // shows as one jump and later loss stays visible.
         //
         // The fixer is owned by a single dedicated task (`ts_fixer_task`)
         // so the per-input forwarders can hand off work via a bounded mpsc
@@ -2182,8 +2182,8 @@ impl FlowRuntime {
 
         // No-op when the requested input is already the active one. Re-sending
         // on the `active_input_tx` watch channel would re-run the full switch
-        // cascade in the forwarder (TsContinuityFixer PSI version bump + output
-        // CC reset → downstream receivers resync), glitching the output for no
+        // cascade in the forwarder (TsContinuityFixer PSI version bump + DI on
+        // the next PCR → downstream receivers resync), glitching the output for no
         // reason. The manager re-asserts the active input on every flow-config
         // save (`applyFlow` → `activate-input`), so a metadata-only edit (e.g.
         // changing the thumbnail cadence) must not disturb the running flow.
@@ -4713,9 +4713,9 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
 ///
 /// Fixer commands are dispatched to a dedicated [`ts_fixer_task`] via
 /// `fixer_tx`. That task owns the [`TsContinuityFixer`] single-threaded —
-/// no locks on the packet hot path — and is responsible for seamless
-/// continuity counter progression and cached PAT/PMT injection at the
-/// switch boundary so external decoders re-acquire quickly.
+/// no locks on the packet hot path — and is responsible for cached PAT/PMT
+/// injection and the DI at the switch boundary so external decoders
+/// re-acquire quickly. CC passes through as each input sent it.
 ///
 /// `force_idr` is this input's one-shot IDR request flag. The forwarder sets
 /// it to `true` on a passive → active transition so that any ingress video
@@ -4774,14 +4774,15 @@ fn null_ts_packet() -> RtpPacket {
 /// Forwarders never touch the `TsContinuityFixer` directly — they enqueue
 /// one of these variants and let the fixer task own the state uncontended.
 pub(crate) enum FixerCommand {
-    /// The active input just produced a media packet. The fixer must apply
-    /// CC rewriting and forward it to the flow's broadcast channel.
+    /// The active input just produced a media packet. The fixer stamps a
+    /// pending DI on its PCR and forwards it to the flow's broadcast
+    /// channel (its CC as the source sent it).
     ActivePacket { input_id: String, pkt: RtpPacket },
     /// A passive input produced a packet. The fixer uses it to pre-warm its
     /// per-input PSI cache so the next switch can inject a fresh PAT/PMT.
     PassivePacket { input_id: String, pkt: RtpPacket },
     /// The active input changed. The fixer emits any cached PSI packets for
-    /// the newly-active input and resets its CC state appropriately.
+    /// the newly-active input and arms DI on the first PCR.
     Switch { input_id: String },
     /// Emit a keepalive NULL datagram to keep downstream sockets alive
     /// during a silent active input.
@@ -4827,16 +4828,13 @@ async fn ts_fixer_task(
                 Some(FixerCommand::ActivePacket { input_id, pkt }) => {
                     match fixer.process_packet(&input_id, &pkt) {
                         ProcessResult::Rewritten(fixed_data) => {
-                            if out_tx.send(RtpPacket {
-                                data: fixed_data,
-                                sequence_number: pkt.sequence_number,
-                                rtp_timestamp: pkt.rtp_timestamp,
-                                recv_time_us: pkt.recv_time_us,
-                                is_raw_ts: pkt.is_raw_ts,
-                                upstream_seq: None,
-                                upstream_leg_id: None,
-                                sender_timestamp_us: None,
-                            }).is_err() {
+                            // The same datagram with one DI bit set: it
+                            // keeps every field it arrived with. The PLL
+                            // sampler reads `sender_timestamp_us` off this
+                            // broadcast, and a datagram without it would
+                            // feed its PCR into the srctime-domain PLL and
+                            // re-anchor it twice per DI (edge#214).
+                            if out_tx.send(RtpPacket { data: fixed_data, ..pkt }).is_err() {
                                 FIXER_OUT_NO_RECEIVERS.fetch_add(1, Ordering::Relaxed);
                             }
                         }
@@ -8421,5 +8419,130 @@ mod egress_pacing_resolution_tests {
             case(Some(EgressPacingMode::Servo), true),
             (Some(EgressPacingMode::Servo), Some("servo".into()), Some(EgressPacingMode::Servo)),
         );
+    }
+}
+
+#[cfg(test)]
+mod fixer_task_tests {
+    use super::*;
+    use crate::engine::ts_parse::{TS_PACKET_SIZE, ts_cc, ts_discontinuity_indicator};
+    use crate::engine::ts_test_fixtures::payload_packet;
+    use std::time::Duration;
+
+    fn raw(ts: &[u8]) -> RtpPacket {
+        RtpPacket {
+            data: Bytes::copy_from_slice(ts),
+            sequence_number: 0,
+            rtp_timestamp: 0,
+            recv_time_us: 0,
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        }
+    }
+
+    fn active(input: &str, cc: u8) -> FixerCommand {
+        FixerCommand::ActivePacket { input_id: input.to_string(), pkt: raw(&payload_packet(0x100, cc)) }
+    }
+
+    /// A payload-bearing packet on `pid` carrying a PCR, DI clear.
+    fn pcr_packet(pid: u16, cc: u8, pcr_27mhz: u64) -> [u8; TS_PACKET_SIZE] {
+        let mut pkt = [0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = 0x47;
+        pkt[1] = 0x40 | ((pid >> 8) as u8 & 0x1F);
+        pkt[2] = pid as u8;
+        pkt[3] = 0x30 | (cc & 0x0F);
+        pkt[4] = 7;
+        pkt[5] = 0x10;
+        let base = (pcr_27mhz / 300) & 0x1_FFFF_FFFF;
+        let ext = pcr_27mhz % 300;
+        pkt[6] = (base >> 25) as u8;
+        pkt[7] = (base >> 17) as u8;
+        pkt[8] = (base >> 9) as u8;
+        pkt[9] = (base >> 1) as u8;
+        pkt[10] = ((base & 1) << 7) as u8 | 0x7E | (ext >> 8) as u8;
+        pkt[11] = ext as u8;
+        pkt
+    }
+
+    /// Run `cmds` through a fixer task into a flow broadcast that a TR 101
+    /// 290 analyzer reads, wait for it to analyze `packets` TS packets, and
+    /// return its `cc_errors`.
+    async fn cc_errors_through_the_fixer(cmds: Vec<FixerCommand>, packets: u64) -> u64 {
+        let (tx, _) = broadcast::channel(256);
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let acc = Arc::new(Tr101290Accumulator::new());
+        let _analyzer = spawn_tr101290_analyzer(&tx, acc.clone(), cancel.clone(), None);
+        let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(ts_fixer_task(fixer_rx, tx.clone(), cancel.clone()));
+        for cmd in cmds {
+            fixer_tx.send(cmd).await.expect("the fixer task runs");
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while acc.ts_packets_analyzed.load(Ordering::Relaxed) < packets {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the analyzer sees every packet");
+        assert_eq!(acc.ts_packets_analyzed.load(Ordering::Relaxed), packets);
+        acc.cc_errors.load(Ordering::Relaxed)
+    }
+
+    /// The flow's TR 101 290 analyzer reads the fixer's output, so it is
+    /// where a renumbering fixer hid loss: after a switch, B's lost CC 5
+    /// and 6 counted nothing, and after a source PCR jump neither did a
+    /// later gap on the one input (edge#214). With CC passed through, the
+    /// switch counts its one jump and each gap its own error.
+    #[tokio::test]
+    async fn tr101290_counts_upstream_loss_through_the_fixer() {
+        let mut cmds: Vec<_> = (0..10).map(|cc| active("a", cc)).collect();
+        cmds.push(FixerCommand::Switch { input_id: "b".to_string() });
+        cmds.extend([0u8, 1, 2, 3, 4, 7, 8, 9].map(|cc| active("b", cc)));
+        assert_eq!(cc_errors_through_the_fixer(cmds, 18).await, 2, "the switch jump plus the gap");
+
+        let mut cmds: Vec<_> = (0..5).map(|cc| active("a", cc)).collect();
+        cmds.push(FixerCommand::SignalSourceDiscontinuity { pcr_pid: 0x100 });
+        cmds.extend([7u8, 8, 9].map(|cc| active("a", cc)));
+        assert_eq!(cc_errors_through_the_fixer(cmds, 8).await, 1, "the gap after a source PCR jump");
+    }
+
+    /// A datagram the fixer stamps with a DI is the datagram it received
+    /// with one bit set, so it keeps its upstream metadata. The fixer task
+    /// used to forward every datagram it rewrote with `sender_timestamp_us`,
+    /// `upstream_seq` and `upstream_leg_id` cleared; from the first switch
+    /// or source PCR jump that was every datagram holding a non-null
+    /// packet, so the PLL of a `passthrough_clock: true` SRT input lost its
+    /// sender-timestamp reference for the rest of the flow (edge#214).
+    #[tokio::test]
+    async fn a_di_stamped_datagram_keeps_its_upstream_metadata() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(ts_fixer_task(fixer_rx, tx.clone(), cancel.clone()));
+        fixer_tx.send(FixerCommand::Switch { input_id: "b".to_string() }).await.expect("the fixer task runs");
+        let mut pkt = raw(&pcr_packet(0x100, 3, 27_000_000));
+        pkt.sequence_number = 41;
+        pkt.recv_time_us = 123_456;
+        pkt.sender_timestamp_us = Some(1_700_000_000_000_000);
+        pkt.upstream_seq = Some(7);
+        pkt.upstream_leg_id = Some(1);
+        fixer_tx
+            .send(FixerCommand::ActivePacket { input_id: "b".to_string(), pkt })
+            .await
+            .expect("the fixer task runs");
+        let out = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the fixer forwards it")
+            .expect("on the flow broadcast");
+        assert!(ts_discontinuity_indicator(&out.data[..TS_PACKET_SIZE]), "the switch's DI");
+        assert_eq!(ts_cc(&out.data[..TS_PACKET_SIZE]), 3, "its own CC");
+        assert_eq!(out.sender_timestamp_us, Some(1_700_000_000_000_000));
+        assert_eq!(out.upstream_seq, Some(7));
+        assert_eq!(out.upstream_leg_id, Some(1));
+        assert_eq!((out.sequence_number, out.recv_time_us), (41, 123_456));
     }
 }
