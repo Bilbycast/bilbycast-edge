@@ -33,7 +33,7 @@ use super::cmaf::param_sets::{ParamSetCollector, ParamSets};
 use super::cmaf::timeline::{CmafTimeline, Track};
 use super::packet::RtpPacket;
 use super::rtmp::client::{RtmpClient, RtmpConnectError, RtmpFailureKind};
-use super::transcode_engage::{AudioTrackWatch, aac_output_can_publish, emit_audio_codec_unpublishable};
+use super::transcode_engage::{AudioTrackWatch, aac_output_can_publish, aac_output_demuxer, emit_audio_codec_unpublishable};
 use super::ts_demux::{DemuxedFrame, TsDemuxer};
 use super::ts_video_replace::VideoEncodeStats;
 
@@ -374,13 +374,10 @@ async fn publish_loop(
     audio_watch: &mut AudioTrackWatch,
 ) -> anyhow::Result<()> {
     // The audio track `audio_encode.source_audio_pid` names, when it is one
-    // this output can publish; the first such track otherwise, or the first
-    // audio track when there is none (`audio_watch` says so).
-    let mut demuxer = TsDemuxer::with_audio_pid(
-        config.program_number,
-        config.audio_encode.as_ref().and_then(|a| a.source_audio_pid),
-        aac_output_can_publish,
-    );
+    // this output can publish; the first it publishes as configured
+    // otherwise, then the first it could publish, or the first audio track
+    // when there is none (`audio_watch` says so).
+    let mut demuxer = aac_output_demuxer(config.program_number, config.audio_encode.as_ref());
     let mut passthrough = PassthroughVideo::default();
     let mut sent_audio_header = false;
     // Every FLV timestamp, audio and video, on one continuous timeline per

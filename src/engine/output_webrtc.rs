@@ -562,21 +562,37 @@ fn webrtc_can_publish_audio(stream_type: u8) -> bool {
     matches!(stream_type, 0x06 | 0x0F)
 }
 
+/// Whether a WebRTC output publishes audio its demuxer routes as
+/// `stream_type` without `audio_encode`: Opus-in-TS (0x06), which it passes
+/// through. Everything else [`webrtc_can_publish_audio`] accepts it
+/// publishes only re-encoded.
+#[cfg(feature = "webrtc")]
+fn webrtc_passes_audio_through(stream_type: u8) -> bool {
+    stream_type == 0x06
+}
+
 /// The demuxer each WebRTC loop reads its source through — the WHEP server
 /// loop's, each viewer's, each WHIP connection's — so that all of them are
 /// on the same audio track: the one `audio_encode.source_audio_pid` pins
-/// when WebRTC can publish it, else the program's first track WebRTC can
-/// publish, else its first audio track (`TsDemuxer::with_audio_pid`).
+/// when WebRTC can publish it, else the program's first track WebRTC
+/// publishes as configured (without `audio_encode`, Opus it passes
+/// through), then the first it could publish through `audio_encode`, else
+/// its first audio track (`TsDemuxer::with_audio_pid`,
+/// `TsDemuxer::preferring`).
 #[cfg(feature = "webrtc")]
 fn webrtc_demuxer(
     program_number: Option<u16>,
     audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
 ) -> super::ts_demux::TsDemuxer {
-    super::ts_demux::TsDemuxer::with_audio_pid(
+    let demuxer = super::ts_demux::TsDemuxer::with_audio_pid(
         program_number,
         audio_encode.and_then(|a| a.source_audio_pid),
         webrtc_can_publish_audio,
-    )
+    );
+    match audio_encode {
+        Some(_) => demuxer,
+        None => demuxer.preferring(webrtc_passes_audio_through),
+    }
 }
 
 /// What WebRTC publishes, for `audio_codec_unpublishable`
@@ -3618,6 +3634,29 @@ mod needs_encode_tests {
             assert!(webrtc_can_publish_audio(st), "stream_type {st:#04x}");
         }
         assert!(!webrtc_can_publish_audio(crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4));
+    }
+
+    /// Without `audio_encode` a WebRTC output takes the Opus it passes
+    /// through over an AAC first track it would drop with
+    /// `codec_needs_encode`; with the block it takes the first track it can
+    /// publish, as before.
+    #[test]
+    fn webrtc_without_audio_encode_takes_the_opus_it_passes_through() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        const OPUS: &[u8] = &[0x05, 0x04, b'O', b'p', b'u', b's'];
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x301, &[]), (0x06, 0x302, OPUS)]);
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+
+        let mut demux = webrtc_demuxer(None, None);
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x302, 0x06)), "no audio_encode: the Opus");
+
+        let ae: crate::config::models::AudioEncodeConfig =
+            serde_json::from_value(serde_json::json!({ "codec": "opus" })).unwrap();
+        let mut demux = webrtc_demuxer(None, Some(&ae));
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x301, 0x0F)), "audio_encode: the first it can publish");
     }
 
     fn webrtc_config(extra: serde_json::Value) -> WebrtcOutputConfig {

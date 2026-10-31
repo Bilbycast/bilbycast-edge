@@ -447,6 +447,39 @@ pub fn aac_output_can_publish(stream_type: u8) -> bool {
     stream_type == 0x0F
 }
 
+/// Whether an output that publishes AAC — RTMP, CMAF — publishes audio its
+/// demuxer routes as `stream_type` without `audio_encode`: AAC in ADTS
+/// (0x0F), which it passes through. Everything else
+/// [`aac_output_can_publish`] accepts it publishes only re-encoded, and
+/// without the block drops with `codec_needs_encode`.
+pub fn aac_output_passes_through(stream_type: u8) -> bool {
+    stream_type == 0x0F
+}
+
+/// The demuxer RTMP and CMAF read their source through: on the audio track
+/// `audio_encode.source_audio_pid` pins when it is one the output can
+/// publish ([`aac_output_can_publish`]); else on the program's first track
+/// it publishes as configured — without `audio_encode`, AAC it passes
+/// through ([`aac_output_passes_through`]) — then the first it could
+/// publish through `audio_encode`, then the first of all
+/// (`TsDemuxer::with_audio_pid`, `TsDemuxer::preferring`). Without the
+/// preference an RTMP output with no `audio_encode` on an AC-3 + AAC
+/// program took the AC-3, dropped it and published no audio.
+pub fn aac_output_demuxer(
+    program_number: Option<u16>,
+    audio_encode: Option<&crate::config::models::AudioEncodeConfig>,
+) -> crate::engine::ts_demux::TsDemuxer {
+    let demuxer = crate::engine::ts_demux::TsDemuxer::with_audio_pid(
+        program_number,
+        audio_encode.and_then(|a| a.source_audio_pid),
+        aac_output_can_publish,
+    );
+    match audio_encode {
+        Some(_) => demuxer,
+        None => demuxer.preferring(aac_output_passes_through),
+    }
+}
+
 /// What an output that picks its audio track through
 /// `TsDemuxer::with_audio_pid` — RTMP, CMAF, WebRTC — owes the operator about
 /// that track: `audio_source_pid_not_found` for a pin it could not take
@@ -728,6 +761,36 @@ mod tests {
         }
         assert!(!aac_output_can_publish(0x06), "Opus");
         assert!(!aac_output_can_publish(crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4));
+    }
+
+    /// PAT + PMT for program 1: H.264 on 0x100, ATSC AC-3 on 0x301, then
+    /// AAC on 0x302 — the bench's AC-3-first program.
+    fn ac3_then_aac_psi() -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x81, 0x301, &[]), (0x0F, 0x302, &[])]);
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        ts
+    }
+
+    /// Without `audio_encode` an RTMP / CMAF output takes the AAC it passes
+    /// through over an AC-3 first track it would drop with
+    /// `codec_needs_encode` (it took the AC-3 and published no audio); with
+    /// the block it takes the first track it can publish, as before.
+    #[test]
+    fn an_aac_output_without_audio_encode_takes_the_aac_it_passes_through() {
+        let ts = ac3_then_aac_psi();
+        let mut demux = aac_output_demuxer(None, None);
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x302, 0x0F)), "no audio_encode: the AAC");
+
+        let ae: crate::config::models::AudioEncodeConfig =
+            serde_json::from_value(serde_json::json!({ "codec": "aac_lc" })).unwrap();
+        let mut demux = aac_output_demuxer(None, Some(&ae));
+        demux.demux(&ts);
+        let first = if cfg!(feature = "media-codecs") { (0x301, 0x81) } else { (0x302, 0x0F) };
+        assert_eq!(demux.audio_track(), Some(first), "audio_encode: the first it can publish");
+        assert!(aac_output_passes_through(0x0F) && !aac_output_passes_through(0x81));
     }
 
     /// The `error_code` of every event raised so far.

@@ -1625,13 +1625,17 @@ async fn run(
     let mut filter_scratch: Vec<u8> = Vec::new();
 
     // The audio track `audio_encode.source_audio_pid` names, when it is one
-    // this output can publish; the first such track otherwise, or the first
-    // audio track when there is none. `audio_watch` reports a missed pin and
-    // a track it cannot publish.
+    // this output can publish; the first it publishes as configured
+    // otherwise, then the first it could publish, or the first audio track
+    // when there is none. `audio_watch` reports a missed pin and a track it
+    // cannot publish.
     let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
-    let can_publish = crate::engine::transcode_engage::aac_output_can_publish;
-    let mut demuxer = TsDemuxer::with_audio_pid(config.program_number, pinned_audio, can_publish);
-    let mut audio_watch = crate::engine::transcode_engage::AudioTrackWatch::new(pinned_audio, can_publish);
+    let mut demuxer =
+        crate::engine::transcode_engage::aac_output_demuxer(config.program_number, config.audio_encode.as_ref());
+    let mut audio_watch = crate::engine::transcode_engage::AudioTrackWatch::new(
+        pinned_audio,
+        crate::engine::transcode_engage::aac_output_can_publish,
+    );
     let mut state = CmafState::new();
     // One media timeline for every CMAF output of the flow: they share
     // the flow's wall-clock epoch (`FlowClock`), so a jump one absorbs

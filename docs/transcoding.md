@@ -227,7 +227,11 @@ unpinned, whatever the pin said:
   `TsDemuxer::with_audio_pid`): unpinned, the program's **first audio
   stream the output can publish** (below), as the replacer locks only onto
   audio it can decode, and the first audio stream of all only when the
-  program has none it can publish. Releases up to 0.116.0 took the first
+  program has none it can publish. Without `audio_encode` the first stream
+  it passes through comes first (AAC on RTMP and CMAF, Opus-in-TS on
+  WebRTC), so an RTMP output on an ATSC program carrying AC-3 then AAC
+  publishes the AAC; a program with none falls to the first stream it
+  could publish through the block, and `codec_needs_encode` names it. Releases up to 0.116.0 took the first
   audio stream whatever its codec, so an MPTS whose first audio track is
   AC-4 published silence. A pin is taken when it is a track the output can
   publish; otherwise — absent, not audio, or a codec the output cannot

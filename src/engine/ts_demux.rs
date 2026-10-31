@@ -424,6 +424,12 @@ pub struct TsDemuxer {
     /// prefers these, so the consumer is not left on a track it would have
     /// to drop while the program carries one it can publish.
     audio_usable: fn(u8) -> bool,
+    /// Which of the `audio_usable` tracks the consumer publishes as it is
+    /// configured ([`Self::preferring`]; every track otherwise). Selection
+    /// takes the first of these ahead of a track it could publish only with
+    /// another block — an RTMP output without `audio_encode` passes AAC
+    /// through and drops anything it would have to re-encode.
+    audio_preferred: fn(u8) -> bool,
     /// PMT PID we're locked onto (set after the first PAT is parsed).
     selected_pmt_pid: Option<u16>,
     /// Video PID (H.264 or H.265) discovered from the selected PMT.
@@ -506,6 +512,7 @@ impl TsDemuxer {
             audio_track_index: None,
             audio_pid_pin: None,
             audio_usable: |_| true,
+            audio_preferred: |_| true,
             selected_pmt_pid: None,
             video_pid: None,
             video_stream_type: 0,
@@ -545,6 +552,7 @@ impl TsDemuxer {
             audio_track_index,
             audio_pid_pin: None,
             audio_usable: |_| true,
+            audio_preferred: |_| true,
             selected_pmt_pid: None,
             video_pid: None,
             video_stream_type: 0,
@@ -598,6 +606,17 @@ impl TsDemuxer {
             audio_usable: usable,
             ..Self::new(target_program)
         }
+    }
+
+    /// Prefer, among the audio tracks the consumer can publish, those
+    /// `preferred` accepts — what it publishes as configured — when it
+    /// takes a track other than its pin: an RTMP output without
+    /// `audio_encode` on an AC-3 + AAC program takes the AAC it passes
+    /// through, not the AC-3 it would drop with `codec_needs_encode`. With
+    /// none of them in the program, the first track it can publish (so that
+    /// Warning names the block to add), then the first of all.
+    pub fn preferring(self, preferred: fn(u8) -> bool) -> Self {
+        Self { audio_preferred: preferred, ..self }
     }
 
     /// Get the cached SPS NALU (for SDP or late-joiner keyframe injection).
@@ -1082,10 +1101,18 @@ impl TsDemuxer {
 
         // Select the audio track: the pinned PID when it is audio the
         // consumer can use; by audio_track_index when one was asked for;
-        // else the first track the consumer can use, else the first.
+        // else the first track the consumer uses as configured, else the
+        // first it can use, else the first.
         if !audio_tracks.is_empty() {
             let usable = self.audio_usable;
-            let first_usable = || audio_tracks.iter().position(|&(_, st)| usable(st)).unwrap_or(0);
+            let preferred = self.audio_preferred;
+            let first_usable = || {
+                audio_tracks
+                    .iter()
+                    .position(|&(_, st)| usable(st) && preferred(st))
+                    .or_else(|| audio_tracks.iter().position(|&(_, st)| usable(st)))
+                    .unwrap_or(0)
+            };
             let idx = match (self.audio_pid_pin, self.audio_track_index) {
                 (Some(pin), _) => audio_tracks
                     .iter()
@@ -2515,6 +2542,32 @@ mod tests {
 
         demux.demux(&pinned_audio_psi(1, &[(0x06, 0x300, AC4), (0x0F, 0x303, &[])]));
         assert_eq!(demux.audio_track(), Some((0x303, 0x0F)), "a PMT update brings AAC");
+    }
+
+    /// A consumer that publishes some tracks only through a block it lacks
+    /// (an RTMP output without `audio_encode`: AAC passes through, AC-3
+    /// would need a re-encode) takes the first track it publishes as
+    /// configured — the AAC behind an ATSC AC-3 first track, which it used
+    /// to skip for the AC-3 and publish nothing — then the first it could
+    /// publish with that block, then the first of all.
+    #[test]
+    fn a_track_published_as_configured_is_preferred_to_one_needing_another_block() {
+        let aac_only = |st: u8| st == 0x0F;
+        let mut demux = TsDemuxer::with_audio_pid(None, None, not_ac4_or_opus).preferring(aac_only);
+        demux.demux(&pinned_audio_psi(0, &[(0x81, 0x301, &[]), (0x0F, 0x302, &[])]));
+        assert_eq!(demux.audio_track(), Some((0x302, 0x0F)), "the AAC behind the AC-3");
+
+        let mut demux = TsDemuxer::with_audio_pid(None, None, not_ac4_or_opus).preferring(aac_only);
+        demux.demux(&pinned_audio_psi(0, &[(0x06, 0x300, AC4), (0x81, 0x301, &[]), (0x87, 0x302, &[])]));
+        assert_eq!(demux.audio_track(), Some((0x301, 0x81)), "no AAC: the first it could re-encode");
+
+        let mut demux = TsDemuxer::with_audio_pid(None, None, not_ac4_or_opus).preferring(aac_only);
+        demux.demux(&pinned_audio_psi(0, &[(0x06, 0x300, AC4), (0x06, 0x302, AC4)]));
+        assert_eq!(demux.audio_track(), Some((0x300, SYNTHETIC_STREAM_TYPE_AC4)), "nothing usable");
+
+        let mut demux = TsDemuxer::with_audio_pid(None, None, not_ac4_or_opus);
+        demux.demux(&pinned_audio_psi(0, &[(0x81, 0x301, &[]), (0x0F, 0x302, &[])]));
+        assert_eq!(demux.audio_track(), Some((0x301, 0x81)), "no preference: the first usable, as before");
     }
 
     /// The constructors that are told nothing about what the consumer can

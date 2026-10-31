@@ -5016,22 +5016,21 @@ impl FlowStatsAccumulator {
     }
 
     /// The buffered 2022-7 merger the input snapshot shows: the active
-    /// input's (`active_key`), or on an assembled flow, which plays from
-    /// several inputs at once and leaves the active input unused, that of the
-    /// first input in id order that it plays from ([`OnAirInputs`]). Never
-    /// the merger of an input off air.
+    /// input's (`active_key`), the input every other field of that block
+    /// describes — on an assembled flow, which plays from several inputs at
+    /// once and may leave the active input unused, only while the assembly
+    /// plays from it ([`OnAirInputs`]). Never the merger of an input off
+    /// air, nor another input's under the active input's name: the block
+    /// carries no input id, so a slot input's merger shown there read as the
+    /// active input's legs.
     fn on_air_buffered_hitless(
         &self,
         active_key: &str,
     ) -> Option<crate::stats::models::BufferedHitlessSnapshot> {
-        if self.on_air.assembled.load().is_none() {
-            return self.buffered_hitless_stats.get(active_key).map(|h| h.snapshot());
+        if self.on_air.assembled.load().is_some() && !self.on_air.contains(active_key) {
+            return None;
         }
-        self.buffered_hitless_stats
-            .iter()
-            .filter(|e| self.on_air.contains(e.key()))
-            .min_by(|a, b| a.key().cmp(b.key()))
-            .map(|e| e.value().snapshot())
+        self.buffered_hitless_stats.get(active_key).map(|h| h.snapshot())
     }
 
     /// Latency and RTT of the SRT input that dropped the most while on air,
@@ -7202,12 +7201,13 @@ mod buffered_hitless_publication_tests {
         assert!(flow.snapshot().input.buffered_hitless.is_none(), "gone with its loop");
     }
 
-    /// A PID-bus assembled flow leaves its active input unused and plays from
-    /// its slots' inputs at once: the snapshot shows the merger of an input
-    /// it plays from, never one it does not, and none once it plays from no
-    /// input with one.
+    /// A PID-bus assembled flow plays from its slots' inputs at once and may
+    /// leave its active input unused. The input block describes the active
+    /// input, so it shows that input's merger while the assembly plays from
+    /// it, none while it does not, and never a slot input's under the active
+    /// input's name.
     #[test]
-    fn an_assembled_flow_shows_the_merger_of_an_input_it_plays_from() {
+    fn an_assembled_flow_shows_the_active_inputs_merger_only_while_it_plays_from_it() {
         let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "rtp".into()));
         let _off = BufferedHitlessPublication::new(&flow, "a-spare", merger(100).stats_handle());
         let _on = BufferedHitlessPublication::new(&flow, "b-slot", merger(300).stats_handle());
@@ -7215,15 +7215,14 @@ mod buffered_hitless_publication_tests {
             inputs: BTreeSet::from(["b-slot".to_string(), "c-audio".to_string()]),
             hitless: Vec::new(),
         });
-        let snap = flow.snapshot().input.buffered_hitless.expect("the slot input's merger");
+        flow.set_active_input_id("b-slot");
+        let snap = flow.snapshot().input.buffered_hitless.expect("the active input, played from");
         assert_eq!(snap.max_path_diff_ms, 300);
 
-        // The flow's active input does not decide what an assembly plays.
+        flow.set_active_input_id("c-audio");
+        assert!(flow.snapshot().input.buffered_hitless.is_none(), "not b-slot's under c-audio's name");
+
         flow.set_active_input_id("a-spare");
-        flow.on_air.set_assembled(AssembledOnAir {
-            inputs: BTreeSet::from(["c-audio".to_string()]),
-            hitless: Vec::new(),
-        });
         assert!(flow.snapshot().input.buffered_hitless.is_none(), "a-spare is not played from");
     }
 

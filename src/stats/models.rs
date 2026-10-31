@@ -2570,9 +2570,11 @@ pub struct BufferedHitlessSnapshot {
     /// Currently-observed path differential between the two legs in
     /// microseconds (last sample). Useful as a live debug widget.
     pub current_path_diff_us: u64,
-    /// Largest path differential observed since flow start. Operators
-    /// use this to size `path_differential_ms` — set it ≥ this value
-    /// with headroom.
+    /// Largest path differential observed since flow start, between two
+    /// copies of a packet that met within the hold — so it never reads
+    /// above `max_path_diff_ms`. A reading near the hold says the hold is
+    /// too small to measure the skew, not that it fits: raise
+    /// `path_differential_ms` until this settles well below it.
     pub max_observed_path_diff_us: u64,
     /// Total packets emitted by the merger.
     pub packets_emitted: u64,
