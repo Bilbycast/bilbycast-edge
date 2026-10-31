@@ -379,7 +379,7 @@ meant to complement the live stats pane.
 | warning | bonded {input\|output} path '{name}' (#{id}) socket rebuilt: {reason} | The interface watcher re-created, re-pinned, and swapped a UDP leg's socket in place. `reason` is one of `interface_changed` (ifindex churn — USB dongle re-plug / NIC re-enumeration), `interface_restored` (pinned NIC or source address came back), `send_errors` (a run of consecutive ENODEV / EADDRNOTAVAIL / ENETUNREACH / EHOSTUNREACH on send). Gateway-mode legs additionally get their policy route re-programmed. Counted per path on `BondPathLegStats.rebuilds` | `{ error_code: "bond_path_rebuilt", reason, path_id, path_name, scope }` |
 | warning | bonded {input\|output} path '{name}' (#{id}) interface lost — pinned NIC or source address disappeared | The pinned interface (or bound source address) vanished under a UDP leg. Emitted once per disappearance; a later `PathDead` (keepalive timeout) and an eventual `socket rebuilt: interface_restored` follow independently | `{ error_code: "bond_interface_lost", path_id, path_name, scope }` |
 | warning | bonded output '{id}': payload N B exceeds the per-datagram budget M B and is not 188-byte-aligned TS | Oversized **TS** payloads are re-chunked at 188-byte packet boundaries to fit the configured `path_mtu` (default 1500) and never trigger this. The warning fires only for a payload that is **not 188-aligned** (non-TS essence) and therefore cannot be re-chunked — it is sent whole (never dropped) and will IP-fragment on a leg whose MTU it exceeds. Budget = `path_mtu` − IP/UDP (28 IPv4 / 48 for IPv6 literals or hostnames) − relay tunnel framing (16/44 B on relay legs) − RIST/RTP framing (12 B on RIST legs) − bond header (12 v1 / 16 v2) − AEAD envelope (29 B when `encryption_key` is set) − FEC repair headroom (when FEC is configured). Emitted **once per output**, with the running count on `BondLegStats.oversize_payloads` | `{ error_code: "bond_payload_exceeds_mtu", output_id, payload_bytes, budget_bytes }` |
-| critical | bonded output '{id}': gateway route for path '{name}' (via {gw}) is gone and re-programming failed | The 5 s route-integrity re-assert (`BondRouteManager::is_intact`) found the leg's policy route missing (kernel flushes the private table on link-down / device-destroy without any watcher-visible signal) and `program()` failed — usually because the device is still absent (USB re-enumeration). Emitted once per failing streak; the re-assert keeps retrying every 5 s and logs a warn on the eventual repair. Until repaired the leg rides the main default route (cosmetic bond) | `{ error_code: "bond_gateway_route_lost", output_id, path_id, path_name, gateway }` |
+| critical | bonded output '{id}': gateway route for path '{name}' (via {gw}) is gone and re-programming failed | **Category `media`**, though it is listed here with the rest of the bond's path telemetry. The 5 s route-integrity re-assert (`BondRouteManager::is_intact`) found the leg's policy route missing (kernel flushes the private table on link-down / device-destroy without any watcher-visible signal) and `program()` failed — usually because the device is still absent (USB re-enumeration). Emitted once per failing streak; the re-assert keeps retrying every 5 s and logs a warn on the eventual repair. Until repaired the leg rides the main default route (cosmetic bond) | `{ error_code: "bond_gateway_route_lost", output_id, path_id, path_name, gateway }` |
 | warning | bonded {input\|output} path '{name}' reconnecting: {reason} | The leg's link dropped or is failing to (re)establish and the transport is re-dialing in the background (QUIC self-redial). Carries the **specific** cause so the operator sees *why* a leg won't come up — beyond the generic keepalive-timeout `PathDead`. Emitted once per down-episode by the transport (not flap-deduped here) | `{ error_code: "bond_leg_reconnecting", reason }` |
 | info / warning | bonded output '{id}' leg '{name}' (#{id}) diagnosis: {headline} | Per-leg self-diagnosis of a degraded / dead leg. **Info** when the leg is healthy again, **Warning** otherwise. Carries a plain-English headline, a suggested fix, and the per-check detail (RTT / loss / egress-interface findings) | `{ error_code: "bond_leg_diagnosis", path_id, path_name, headline, suggested_fix, checks, chosen_egress_interface, flow_id }` |
 | warning | bonded output '{id}' leg '{name}': bond protocol version mismatch — peer reports v{v}, this end equalization-stamps v2 | The peer bonded input reports bond-protocol v1 but this output equalization-stamps v2 — the peer can't parse the v2 header, so the leg stays on v1 (no equalization). Enable equalization (auto/on) on **both** ends to clear it | `{ error_code: "bond_protocol_version_mismatch", component, output_id, path_id, path_name, peer_version, local_version, flow_id }` |
@@ -388,7 +388,8 @@ meant to complement the live stats pane.
 Three further bond-related alarms are emitted **under a different category**
 than `bond`, so a `category:bond` filter alone will not surface them — the
 shared-leg capacity broker's two events ride category **`bonding`**, and the
-unencrypted-legs warning rides category **`media`**:
+unencrypted-legs warning rides category **`media`** (as does the gateway-route
+loss above):
 
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
@@ -538,6 +539,7 @@ are the exception and do carry it.
 | warning | CMAF output '{id}': segment upload failed: {error} | HTTP PUT of a completed segment to the origin failed. |
 | warning | CMAF output '{id}': init upload failed: {error} | `init.mp4` PUT failed. **Latched** by `init_upload_failing` — one event per failing episode, not one per frame, because init is re-pushed continuously while the origin is unreachable. |
 | warning | CMAF output '{id}': LL PUT failed: {error} | The low-latency chunked PUT returned an error on the segment's final response. |
+| warning | CMAF output '{id}': the origin closed an LL PUT (seg {n}) | The origin closed the low-latency chunked PUT before the segment's last chunk went. Latched with `LL PUT failed` (one event per failing episode); the next publish probes the origin again. |
 | warning | CMAF output '{id}': LL chunk enqueue full (seg {n}) — aborting | The LL chunk queue to the origin filled. The in-flight segment is aborted and its samples discarded; the output waits for the next IDR to open a fresh one. |
 | warning | CMAF output '{id}': LL mpd upload failed: {error} | Low-latency DASH manifest PUT failed. |
 | warning | CMAF output '{id}': LL m3u8 upload failed: {error} | Low-latency HLS playlist PUT failed. |
@@ -803,9 +805,9 @@ ingress transcode). Counters on the `transcode_pcr` stats block.
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
 | info | RTP input listening on {addr} | Socket successfully bound | `{ bind_addr }` |
-| critical | RTP input bind failed: {error} | UDP socket bind failed (port in use, permission denied) | `{ bind_addr, error }` |
+| info | RTP input leg {n} listening on {addr} | A leg of a SMPTE 2022-7 RTP input bound its socket, each leg its own | `{ bind_addr, leg }` |
 
-For redundant RTP inputs, each leg emits its own bind event with a `leg` field in details.
+A failed bind is not on this category: it raises `port_conflict` (address in use) or `bind_failed` (anything else) with `component` `RTP input`, `RTP input leg 1` or `RTP input leg 2` — see [Unified bind-failure events](#unified-bind-failure-events-port_conflict--bind_failed). This table used to list an `RTP input bind failed` event under `rtp`, which nothing raises.
 
 **Source**: `src/engine/input_rtp.rs`
 
@@ -816,7 +818,8 @@ For redundant RTP inputs, each leg emits its own bind event with a `leg` field i
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
 | info | UDP input listening on {addr} | Socket successfully bound | `{ bind_addr }` |
-| critical | UDP input bind failed: {error} | UDP socket bind failed (port in use, permission denied) | `{ bind_addr, error }` |
+
+A failed bind raises `port_conflict` or `bind_failed` with `component` `UDP input`, not an event under `udp` (this table used to list one).
 
 **Source**: `src/engine/input_udp.rs`
 
@@ -1037,6 +1040,7 @@ Debounced so a flapping link doesn't spam the feed. See
 **Source**: `src/engine/resource_monitor.rs`
 
 | warning | Flow '{id}' creation blocked: system resources critical | Flow creation rejected because `critical_action` is `"gate_flows"` and a metric is in critical state | `{ flow_id }` |
+| warning | Hot-add of input '{input_id}' to flow '{flow_id}' blocked: system resources critical | An `add_input` (WS, or the `update_flow` / `update_config` diff) to a running flow while flow starts are gated as above | `{ error_code: "input_resource_critical", flow_id, input_id }` |
 | warning | Update of input '{input_id}' blocked: it restarts flow '{flow_id}', and flow starts are gated while system resources are critical | The `update_input` WS command (or `PUT /api/v1/inputs/{input_id}`) edited an input of a running flow while starts are gated as above. Applying it means restarting the flow, and the gate would refuse that restart and the rollback alike, leaving the flow down — so the flow is not touched, the edit is not persisted, and the command fails with `command_ack.error_code: "input_resource_critical"` (HTTP 409 on REST), the code a gated hot-add (`add_input`) already refuses with. Source: `src/manager/client.rs` (`restart_flow_for_input_update`) | `{ error_code: "input_resource_critical", flow_id, input_id }` |
 
 **Source**: `src/engine/resource_monitor.rs`, `src/engine/manager.rs`
@@ -1172,31 +1176,31 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 |----------|-------|-------------|
 | `flow` | unaudited | Flow lifecycle (start/stop/fail, output add/remove, input/output CRUD including update, media-player start/source-failed/playlist-exhausted/pacer-lagging/pacer-recovered) + source PCR/PTS/DTS discontinuity + PID-bus PID cap reached (`pid_bus_pid_cap_reached`) + AC-4 on a display output (`display_audio_ac4_undecodable` — category is `flow`, not `display`) + multiviewer wall stopped / tile self-reference / tile source missing (`multiviewer` builds) + config-only output detach (`output_detached_without_runtime_removal`) + the two config-diff restart failures (message-only, no `error_code`) + the two `update_input` restart outcomes (`input_update_flow_restart_failed`, `input_update_rollback_failed`) |
 | `bandwidth` | 4 | Per-flow bandwidth monitoring (alarm, block, recovery) |
-| `srt` | 17 | SRT input and output connection state (now with structured details), including each SMPTE 2022-7 leg attaching, a leg slow to connect and a listener leg's stale accept, on inputs and outputs, a 2022-7 output caller leg that cannot reach its peer, and an input re-settling its payload format (`srt_payload_format_changed`) |
+| `srt` | 20 | SRT input and output connection state (now with structured details), including each SMPTE 2022-7 leg attaching, a leg slow to connect and a listener leg's stale accept, on inputs and outputs, a 2022-7 output caller leg that cannot reach its peer, an input re-settling its payload format (`srt_payload_format_changed`), and a socket-group bond's members (`srt_bond_member_down`, `srt_bond_member_restored`, `srt_bond_source_not_applied`) |
 | `redundancy` | 9 | SMPTE 2022-7 dual-leg status + raw-TS active-leg failover (`redundancy_failover_mode`) + leg SSRC mismatch (`redundancy_ssrc_mismatch`) + an RTP input's buffered-merger leg health (`redundancy_leg_dropped`, `redundancy_leg_recovered`, `redundancy_both_legs_down`) + a 2022-7 SRT output's lost leg (`redundancy_output_leg_lost`, output-scoped) |
 | `rtmp` | 3 + 9 | RTMP publisher connections (input) + output connection lifecycle, `codec_needs_encode`, `audio_codec_unpublishable` and `aac_channel_layout_missing` (all output-scoped) |
 | `rtsp` | 2 | RTSP input state (now with structured details) |
 | `hls` | 2 | HLS output failures |
 | `webrtc` | 21 | WHIP/WHEP session lifecycle + `codec_needs_encode` (output-scoped from edge 0.113.0; HEVC and audio cases added) + `webrtc_negotiation_panic` + `opus_layout_unsupported` + `webrtc_no_h264` + `webrtc_setup_timeout` + `audio_codec_unpublishable` and `aac_channel_layout_missing` (output-scoped) + `whep_answer_unusable` |
-| `audio_encode` | 10 | Audio encoder lifecycle — ffmpeg sidecar (RTMP/HLS/WebRTC) + in-process TsAudioReplacer (SRT/RIST/RTP/UDP) |
+| `audio_encode` | 11 | Audio encoder lifecycle — ffmpeg sidecar (RTMP/HLS/WebRTC) + in-process TsAudioReplacer (SRT/RIST/RTP/UDP) |
 | `video_encode` | unaudited | Video transcoder lifecycle (started / failed) on the TS, RTMP, WebRTC and CMAF re-encoders, plus `video_encode_interlace_unavailable` (TS outputs and inputs; RTMP / CMAF from edge 0.113.0) and `video_encode_fps_mismatch` (TS outputs and inputs, a WS event from edge 0.113.0) |
 | `tunnel` | 12 | Tunnel connection state (now with structured details) + AEAD decrypt failure (`tunnel_decrypt_failure`) + direct-listener register refusal (`tunnel_register_refused`) + carrier-socket kernel receive drops on a native-UDP tunnel (`tunnel_kernel_rx_drops`) |
-| `manager` | 3 | Manager WebSocket connection |
-| `config` | 2 | Configuration changes |
+| `manager` | 13 | Manager WebSocket connection: connected, the nine `Manager connection lost` kinds, authentication refused, a secret rotated, credentials not saved |
+| `config` | 6 | Configuration changes, the three stale-environment-variable kinds (`deprecated_env_var`) and `tuning_requires_restart` |
 | `master_clock` | 2 | Source-PCR PLL lock-state transitions (fallback to wallclock, recovery) |
-| `system_resources` | 9 | CPU/RAM threshold monitoring + flow creation gating + the gated refusals of an input hot-add and of an input update that would restart a flow (both `input_resource_critical`) + HW encoder/decoder oversubscription (`hw_encoder_oversubscribed` / `hw_decoder_oversubscribed`) |
-| `rtp` | 2 | RTP input bind and lifecycle |
-| `udp` | 2 | UDP input bind and lifecycle |
-| `rist` | 4 | RIST Simple Profile connection lifecycle |
-| `bond` | 14 | Bonded input/output — per-path alive/dead, bond-aggregate degraded/down/recovered, session reset (`bond_session_reset`), socket rebuild (`bond_path_rebuilt`), interface lost (`bond_interface_lost`), MTU-budget exceedance (`bond_payload_exceeds_mtu`), gateway route lost (`bond_gateway_route_lost`), leg reconnecting (`bond_leg_reconnecting`), per-leg diagnosis (`bond_leg_diagnosis`), protocol-version mismatch (`bond_protocol_version_mismatch`), ingress-dejitter ignored (`bond_ingress_dejitter_ignored`). **Note:** the shared-leg broker's `bond_leg_oversubscribed` / `_cleared` + `bond_leg_admission_pressure` ride category `bonding`, and `bond_legs_unencrypted` rides category `media` — see the Bonding section |
+| `system_resources` | 11 | CPU/RAM threshold monitoring + flow creation gating + the gated refusals of an input hot-add and of an input update that would restart a flow (both `input_resource_critical`) + HW encoder/decoder oversubscription (`hw_encoder_oversubscribed` / `hw_decoder_oversubscribed`) |
+| `rtp` | 3 | RTP input listening, single-leg and each leg of a 2022-7 input (a failed bind rides `port_conflict` / `bind_failed`) |
+| `udp` | 1 | UDP input listening (a failed bind rides `port_conflict` / `bind_failed`) |
+| `rist` | 5 | RIST Simple Profile connection lifecycle: an input listening (single or 2022-7) or lost, an output connected or exited with an error. Message-only, and listed in no table here; its `interface_binding` refusals are under [Per-NIC Interface Binding](#per-nic-interface-binding) |
+| `bond` | 13 | Bonded input/output — per-path alive/dead, bond-aggregate degraded/down/recovered, session reset (`bond_session_reset`), socket rebuild (`bond_path_rebuilt`), interface lost (`bond_interface_lost`), MTU-budget exceedance (`bond_payload_exceeds_mtu`), leg reconnecting (`bond_leg_reconnecting`), per-leg diagnosis (`bond_leg_diagnosis`), protocol-version mismatch (`bond_protocol_version_mismatch`), ingress-dejitter ignored (`bond_ingress_dejitter_ignored`). **Note:** the shared-leg broker's `bond_leg_oversubscribed` / `_cleared` + `bond_leg_admission_pressure` ride category `bonding`, and `bond_legs_unencrypted` and `bond_gateway_route_lost` ride category `media` — see the Bonding section |
 | `ptp` | — | SMPTE ST 2110 PTP slave clock state changes (Phase 1) |
 | `network_leg` | 4 | SMPTE 2022-7 Red/Blue leg-up + active-leg switch. Leg **loss / recovery** is not here — it rides `redundancy` |
 | `nmos` | — | NMOS IS-04 / IS-05 / IS-08 controller activity (Phase 1) |
 | `nmos_registry` | 4 | IS-04 registration client lifecycle (registered, heartbeat lost, registration failed, registry unreachable) |
 | `scte104` | — | SCTE-104 splice events parsed from ST 2110-40 ANC (Phase 1) |
 | `sdi` | 28 | Native SDI (DeckLink) capture **and** playout lifecycle — signal lost/restored, raster or chroma the mode cannot carry, device open refused / lost, a card that stops draining scheduled frames, audio that stops scheduling. `sdi-decklink` feature. See the [SDI section](#sdi-sdi-sdi-decklink-feature) |
-| `cmaf` | 15 | CMAF / CMAF-LL output lifecycle + origin upload failures + CENC init + scrub-thumbnail capture + `audio_codec_unpublishable`, `aac_channel_layout_missing` and `aac_config_changed` (output-scoped). See the [CMAF section](#cmaf--cmaf-ll-output-cmaf) |
-| `media` | 10 | Bonded input/output spawn + socket-rebuild failures (Critical), bond start/stop (Info) and the unencrypted-legs warning (`bond_legs_unencrypted`) — `src/engine/{input,output}_bonded.rs`. Kept distinct from `bond`, which carries the per-path telemetry; see the Bonding section |
+| `cmaf` | 22 | CMAF / CMAF-LL output lifecycle + origin upload failures + CENC init + scrub-thumbnail capture + `audio_codec_unpublishable`, `aac_channel_layout_missing` and `aac_config_changed` (output-scoped). See the [CMAF section](#cmaf--cmaf-ll-output-cmaf) |
+| `media` | 10 | Bonded input/output spawn + socket-rebuild failures (Critical), the gateway route lost and not re-programmed (`bond_gateway_route_lost`), bond start/stop (Info) and the unencrypted-legs warning (`bond_legs_unencrypted`) — `src/engine/{input,output}_bonded.rs`. Kept distinct from `bond`, which carries the per-path telemetry; see the Bonding section |
 | `flow_group` | 3 | Flow-group start rollback / started / stopped. See the [Flow groups section](#flow-groups-flow_group) |
 | `standby` | 1 | Standby listener post-bind failure. See the [Standby listeners section](#standby-listeners-standby) |
 | `port_conflict` | — | EADDRINUSE at a runtime bind site, or an internal collision between two configured entities. See [Unified bind-failure events](#unified-bind-failure-events-port_conflict--bind_failed) |
@@ -1204,21 +1208,39 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `display` | — | Local-display (HDMI / DisplayPort + ALSA) output lifecycle and runtime health. See [Display-output events](#display-output-events-display) |
 | `replay` | — | Replay-server recording + playback lifecycle, disk pressure, crash recovery, filmstrip. See [Replay-server events](#replay-server-events) |
 | `upgrade` | 7 | Remote binary upgrade lifecycle. See the [Remote upgrade section](#remote-upgrade-upgrade) — the failure codes there are `command_ack`-only, not events |
-| `cellular` | — | Cellular uplink telemetry (modem / RutOS). See [Cellular uplink events](#cellular-uplink-events-cellular) |
-| `starlink` | — | Starlink dish telemetry. See [Starlink dish events](#starlink-dish-events-starlink) |
-| **Total** | **118** | |
+| `cellular` | 6 | Cellular uplink telemetry (modem / RutOS). See [Cellular uplink events](#cellular-uplink-events-cellular) |
+| `starlink` | 6 | Starlink dish telemetry. See [Starlink dish events](#starlink-dish-events-starlink) |
+| **Total** | **238** | The numbered rows above; `flow`, `video_encode` and the rows marked — are not in it |
 
-**The numbers in the Count column are not audited, and the row list has drifted
-too.** `src/manager/events.rs::category` declares 36 constants; this table long
-carried 25 rows, and the eleven at the bottom were added back by hand — so
-treat it as a directory, not as a generated index. The numbers are
-hand-maintained, they have drifted, and the column does not sum to the
-**Total** row. `flow` is the clearest case and is why it now reads
-*unaudited*: its emitters are a mix of
-structured `error_code` events and message-only lifecycle events, so "how many
-`flow` events exist" has no single answer until somebody counts `category::FLOW`
-across the tree. Read the Description column as the authoritative part of each
-row and the number as indicative only.
+**What the Count column counts.** Each number was recounted against the code
+on 2026-10-31: the events this document's tables list for that category (a
+message raised at two severities is one row; one a table splits per leg is a
+row per leg), or, for `rist`, `media` and `network_leg`, which no table lists
+row by row, the distinct events the code raises. **Total** sums the numbered
+rows. `flow` and `video_encode` are still *unaudited* — `flow`'s emitters mix
+structured `error_code` events and message-only lifecycle events across the
+tree — and the rows marked — are not counted either. `src/manager/events.rs::category`
+declares 36 constants, and the broker's `bonding` is raised as a plain string,
+so read the table as a directory, not as a generated index, and the
+Description column as the authoritative part of each row.
+
+The code also raises events no table here lists, and the counts leave them out:
+the SRT bonded input and output lifecycle (`SRT bonded input connected
+(caller)` / `(listener)`, `accept failed`, `connection failed`, `disconnected,
+reconnecting`, and the output's `connected` / `disconnected`) and the SRT
+input's `ingress_delay_ms`-over-latency warning (`srt`); `Tunnel failed over
+to backup relay {addr}`, `Tunnel failing back to primary relay {addr}` and the
+bare `Tunnel disconnected from relay` (`tunnel`);
+the flow-group and essence-flow persistence events (`config`); `manager binary
+frame too short` (`manager`); the RTMP and WebRTC `audio_encode` lifecycle
+messages beyond the rows above (`audio_encode`); and the local display's decode
+fallbacks (`display_hw_decode_*`, `display_*_prime_export_failed`,
+`display_unsupported_pixfmt`), which ride `system_resources` and are listed in
+the [Display section](#display-output-events-display), whose opening says its
+events are category `display` (only the two PRIME-export rows say otherwise).
+Until 2026-10-31 the Total read 118, a figure the column had long stopped
+summing to; `rtp` and `udp` also counted a bind-failure row that nothing raises
+under them, and `bond` counted `bond_gateway_route_lost`, which rides `media`.
 
 ### Phase 1 ST 2110 categories
 
