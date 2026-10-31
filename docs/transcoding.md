@@ -964,8 +964,17 @@ the sample:
     the replacer has sent is now dropped instead (`ClockFill::keep_frame`;
     `D` already covers the others, being never less than a frame's lateness
     plus 40 ms), with an info log line naming the seam and the count. The
-    cost is the last up to ~65 ms of audio before such a pause, which on
-    its old timeline could only be late. A source
+    cost is what the pipeline held of the audio before such a pause, which
+    on its old timeline could only be late: the 2 ms crossfade tail, the
+    stage's queue, the encoder's part-filled frame (under one output frame)
+    and the pipeline's declared latency (the AAC-LC encoder's 2048 samples,
+    plus a decoder's own delay, such as an HE-AAC source's SBR delay) — at
+    most 66 ms of audio for an AAC-LC target at 48 kHz with no stage and a
+    decoder adding none. The count in the log line is of output frames, and
+    the run-out pushes the held audio through with silence enough to clear
+    all of that plus a frame (`run_out`), so those frames carry silence
+    too: in that case 3 to 5 AAC-LC frames, 64 to 107 ms of output (the
+    bench saw 3 and 4). A source
     that resets its clock back (an encoder restart, an ffmpeg
     `-stream_loop` wrap) takes its PCR and its video back with it, and the
     transcode chain's PCR stage drops re-encoded PES left on the old
