@@ -442,7 +442,7 @@ Create a new flow. The flow is validated, persisted to the config file, and (if 
 
 **Request body:**
 
-A `FlowConfig` JSON object. The flow references **already-existing** top-level inputs and outputs by ID via `input_ids` / `output_ids` — create those first with `POST /api/v1/inputs` and `POST /api/v1/outputs`. Dangling references are rejected at create time.
+A `FlowConfig` JSON object. The flow references **already-existing** top-level inputs and outputs by ID via `input_ids` / `output_ids` — create those first with `POST /api/v1/inputs` and `POST /api/v1/outputs`. Dangling references are rejected at create time. An enabled flow naming an input another enabled flow already holds is refused 400 ("input '…' is already assigned to another flow ('…')", as a whole config is), on this route and on `PUT /api/v1/flows/{flow_id}`, before anything starts or is saved; until 2026-10-31 both saved it, and the next load refused the config.
 
 ```json
 {

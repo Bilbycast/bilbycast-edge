@@ -4558,10 +4558,41 @@ pub(crate) fn validate_add_input_assignment(
     config: &crate::config::models::AppConfig,
 ) -> Result<()> {
     let enabled = config.flows.iter().find(|f| f.id == flow_id).is_none_or(|f| f.enabled);
+    if enabled {
+        refuse_input_held_elsewhere(flow_id, input_id, config)?;
+    }
+    Ok(())
+}
+
+/// [`validate_add_input_assignment`] for every input of `flow`, created or
+/// replacing the flow of its id (a targeted `create_flow` / `update_flow`,
+/// REST or WS, or a WS `start_flow` that enables it): an enabled flow may
+/// not take an input another enabled flow holds. Those routes validated the
+/// flow alone, so each could save one input in two enabled flows — a config
+/// the next load refused.
+pub(crate) fn validate_flow_input_assignment(
+    flow: &FlowConfig,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
+    if flow.enabled {
+        for input_id in &flow.input_ids {
+            refuse_input_held_elsewhere(&flow.id, input_id, config)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `input_id` to enabled flow `flow_id` when another enabled flow
+/// holds it, in [`validate_config`]'s words.
+fn refuse_input_held_elsewhere(
+    flow_id: &str,
+    input_id: &str,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
     let holder = config.flows.iter().find(|f| {
         f.id != flow_id && f.enabled && f.input_ids.iter().any(|id| id == input_id)
     });
-    if let (true, Some(holder)) = (enabled, holder) {
+    if let Some(holder) = holder {
         bail!(
             "Flow '{flow_id}': input '{input_id}' is already assigned to another flow ('{}')",
             holder.id
