@@ -1590,6 +1590,22 @@ loop, each playlist transition — continues one wire timeline:
   from the file's first 512 KiB (2 MiB with `program_number`); when its PMT
   lies further in, the gate starts at the PMT only if no video has gone out
   yet.
+- Every other elementary stream drops the continuation packets a file cut
+  mid-PES opens with too: payload packets of a PID before its first PES
+  start, which nothing can decode without the header the file lacks (a
+  packet that carries a PCR stays adaptation-field-only). Passed on, they
+  joined the previous file's truncated last PES at the splice — its PES
+  length said bytes were still owed and the CC ran on — and every decoder
+  took them for that frame's tail: a capture whose last E-AC-3 frame is
+  349 of its 512 bytes, and whose first packets on that PID continue
+  another frame, put a 14 ms burst of up to full scale into every
+  re-encoding output at every loop. Now the next file's first PES opens
+  inside the frame the truncated one claims, with a header of its own,
+  and the edge's audio framer discards the truncated frame. The PIDs come
+  from the PMTs in the same head (a PMT further in gates only PIDs nothing
+  has gone out on yet). A passthrough output still carries the truncated
+  last PES to its receiver, as it is in the file. A PID that starts no PES
+  in its first 1 024 packets is passed through from there.
 - The next file's timeline starts past the previous file's last video
   decode time, not only its last audio and PCR — a capture leads its PCR by
   more video at its end than at its start, which stepped video DTS back at

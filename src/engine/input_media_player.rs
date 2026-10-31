@@ -1828,6 +1828,7 @@ async fn play_ts_file(
         target_pts_90k = (target_pts_90k + delta) & 0x1_FFFF_FFFF;
     }
     let mut splice = TsFileSplice::new(target_pts_90k, head_info.video);
+    splice.gate_es_heads(&head_info.es_pids);
     // Packets held until the first anchor PCR (7a) and replayed through the
     // offset path once it arrives. The hold covers 100 ms — the longest
     // MPEG-TS lets a PCR go unrepeated, so the most any legal file can put
@@ -2504,6 +2505,9 @@ struct TsFileSplice {
     audio_fmt: Vec<(u16, crate::engine::audio_au::AuFormat)>,
     audio_au: Vec<(u16, u32, u32)>,
     gate: VideoRapGate,
+    /// Every other ES's leading continuation packets dropped
+    /// ([`EsHeadGate`]).
+    es_gate: EsHeadGate,
     /// Highest emitted video DTS (output domain) and the last DTS step —
     /// the next file's video term (7b).
     max_video_dts_90k: Option<u64>,
@@ -2533,11 +2537,23 @@ impl TsFileSplice {
             audio_fmt: Vec::new(),
             audio_au: Vec::new(),
             gate: VideoRapGate::new(video),
+            es_gate: EsHeadGate::default(),
             max_video_dts_90k: None,
             video_dts_step_90k: None,
             last_video_dts_90k: None,
             gated: Vec::with_capacity(RAP_GATE_HOLD_MAX + 1),
             seen_pids: Box::new([false; 8192]),
+        }
+    }
+
+    /// Gate the heads of the ES PIDs the file's head names
+    /// ([`EsHeadGate`]), all but the video the [`VideoRapGate`] already
+    /// gates.
+    fn gate_es_heads(&mut self, pids: &[u16]) {
+        for &pid in pids {
+            if Some(pid) != self.gate.pid {
+                self.es_gate.arm(pid);
+            }
         }
     }
 
@@ -2590,6 +2606,9 @@ impl TsFileSplice {
                 }
             }
         }
+        let Some(packet) = self.es_gate.feed(packet) else {
+            return;
+        };
         self.seen_pids[(pkt_pid & 0x1FFF) as usize] = true;
         self.push_gated(packet, anchor_pcr_pid, cont, out);
     }
@@ -2618,6 +2637,7 @@ impl TsFileSplice {
                 self.es_kinds.push((pid, video));
             }
         }
+
         for e in &view.es {
             if let Some(fmt) = au_format_of(e.stream_type, view.es_info(e))
                 && !self.audio_fmt.iter().any(|(p, _)| *p == e.pid)
@@ -2634,6 +2654,13 @@ impl TsFileSplice {
             && !self.seen_pids[(e.pid & 0x1FFF) as usize]
         {
             self.gate.set_video(e.pid, e.stream_type);
+        }
+        // Every other ES the head did not show: its head is gated from here
+        // only if nothing of it has gone out yet, as the video's.
+        for e in &view.es {
+            if !self.seen_pids[(e.pid & 0x1FFF) as usize] && Some(e.pid) != self.gate.pid {
+                self.es_gate.arm(e.pid);
+            }
         }
     }
 
@@ -3046,6 +3073,79 @@ impl VideoRapGate {
     }
 }
 
+/// Most payload packets [`EsHeadGate`] drops on one PID before it takes
+/// that PID for one that never starts a PES or section (none ever does
+/// legally) and passes it from there.
+const ES_HEAD_GATE_GIVE_UP_PACKETS: u32 = 1_024;
+
+/// Drops the continuation packets a file cut mid-PES opens with on every ES
+/// but the video (whose [`VideoRapGate`] does the same, and more): payload
+/// packets of a PID before its first PES start (`PUSI`). Their PES header is
+/// not in the file, so nothing can use them — and passed on at a loop or a
+/// playlist splice they were appended to the previous file's truncated last
+/// PES: the PES length it declared said bytes were still owed, the
+/// continuity counter ran on (`rewrite_cc`), so every decoder took them for
+/// that access unit's tail. A capture whose last E-AC-3 frame on a PID is
+/// 349 of its 512 bytes, and whose first packets on it continue another
+/// frame, decoded a 14 ms burst of up to full scale at every loop on every
+/// output that re-encodes that track. Dropped here, the next file's first
+/// PES starts with its own header inside the frame the truncated one
+/// claims, which the shared framer (`audio_au::AuCutter`) takes as a frame
+/// cut short upstream and discards. A packet carrying a PCR or a DI leaves
+/// adaptation-field-only, as the video gate's do.
+#[derive(Debug, Default)]
+struct EsHeadGate {
+    /// PIDs still waiting for their first PES start, with the payload
+    /// packets each has dropped.
+    waiting: Vec<(u16, u32)>,
+    /// PIDs whose head is settled for this file.
+    settled: Vec<u16>,
+}
+
+impl EsHeadGate {
+    /// Gate `pid`'s head, unless it is gated or settled already.
+    fn arm(&mut self, pid: u16) {
+        if !self.settled.contains(&pid) && !self.waiting.iter().any(|(p, _)| *p == pid) {
+            self.waiting.push((pid, 0));
+        }
+    }
+
+    /// Run one packet through the gate: `None` when it is dropped.
+    fn feed(&mut self, mut pkt: [u8; TS_PACKET]) -> Option<[u8; TS_PACKET]> {
+        if self.waiting.is_empty() {
+            return Some(pkt);
+        }
+        let pid = ((pkt[1] as u16 & 0x1F) << 8) | pkt[2] as u16;
+        let Some(i) = self.waiting.iter().position(|(p, _)| *p == pid) else {
+            return Some(pkt);
+        };
+        if pkt[1] & 0x40 != 0 || !crate::engine::ts_parse::ts_has_payload(&pkt) {
+            if pkt[1] & 0x40 != 0 {
+                self.waiting.swap_remove(i);
+                self.settled.push(pid);
+            }
+            return Some(pkt);
+        }
+        let dropped = &mut self.waiting[i].1;
+        *dropped += 1;
+        if *dropped > ES_HEAD_GATE_GIVE_UP_PACKETS {
+            tracing::warn!(
+                "media-player: PID 0x{pid:04X} started no PES in its first \
+                 {ES_HEAD_GATE_GIVE_UP_PACKETS} packets — passing it through from here"
+            );
+            self.waiting.swap_remove(i);
+            self.settled.push(pid);
+            return Some(pkt);
+        }
+        if *dropped == 1 {
+            tracing::debug!("media-player: dropping the leading continuation packets of PID 0x{pid:04X}");
+        }
+        let keep = crate::engine::ts_parse::extract_pcr(&pkt).is_some()
+            || crate::engine::ts_parse::ts_discontinuity_indicator(&pkt);
+        (keep && crate::engine::ts_parse::strip_to_af_only(&mut pkt)).then_some(pkt)
+    }
+}
+
 /// What the file head says before streaming starts: the video ES of the
 /// anchor PCR's program, the first PCR (the anchor-PID rule: the first
 /// PCR-bearing packet), the DTS of the random-access point the gate will
@@ -3062,6 +3162,8 @@ pub(super) struct TsHeadInfo {
     /// Every audio ES whose first access unit the head shows: its duration,
     /// `(PID, samples, sample rate)`.
     pub(super) audio_au: Vec<(u16, u32, u32)>,
+    /// Every ES PID the head's PMTs name, for [`EsHeadGate`].
+    pub(super) es_pids: Vec<u16>,
 }
 
 /// The access-unit framing of an audio ES (a DVB `0x06` one by its
@@ -3229,6 +3331,9 @@ pub(super) fn scan_ts_head(head: &[u8], stride: usize, program: Option<u16>) -> 
                         .map(|e| (e.pid, e.stream_type));
                     programs.push((pid, v.pcr_pid, video));
                     for e in &v.es {
+                        if !info.es_pids.contains(&e.pid) {
+                            info.es_pids.push(e.pid);
+                        }
                         if let Some(fmt) = au_format_of(e.stream_type, v.es_info(e))
                             && !audio.iter().any(|(p, _)| *p == e.pid)
                         {
@@ -6680,6 +6785,94 @@ mod tests {
         assert_eq!(splice.len(), 1, "one splice: {steps:?}");
         assert!(splice[0] > 1_800, "{splice:?}");
         assert_eq!(splice[0] % 2_160, 0, "step {} ticks", splice[0]);
+    }
+
+    /// A 384-byte AC-3 syncframe (48 kHz, 96 kbit/s) whose body is `fill`.
+    fn ac3_frame(fill: u8) -> Vec<u8> {
+        let mut f = vec![fill; 384];
+        f[..6].copy_from_slice(&[0x0B, 0x77, 0, 0, 12, 8 << 3]);
+        f
+    }
+
+    /// A one-second file cut out of a broadcast capture the way
+    /// `tnt-paris-uhf-24.ts` is: its AC-3 track (0x101) opens with two
+    /// packets continuing a frame whose start is not in the file, and its
+    /// last PES carries only the first packet of its frame. Video and PCR
+    /// as [`loop_fixture`]. Frame `k` is filled with byte `k + 1`, the
+    /// leading continuation with 0x55.
+    fn loop_fixture_cut_ac3() -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, payload_packet, pes_packets, pmt_section};
+        const T0: u64 = 10_000; // ms
+        let mut ev: Vec<(u64, u8, [u8; TS_PACKET])> = Vec::new();
+        ev.push((0, 0, pat_packet(&[(1, 0x1000)], 0, 0)));
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x81, 0x101, &[])]);
+        ev.push((0, 1, packetize_sections(0x1000, &[&pmt], 0)[0]));
+        for _ in 0..2 {
+            let mut p = payload_packet(0x101, 0);
+            p[4..].fill(0x55);
+            ev.push((0, 2, p));
+        }
+        for k in 0..50u64 {
+            let t = k * 20;
+            let pcr = crate::engine::ts_parse::pcr_only_packet(0x100, 0, (T0 + t) * 27_000, false);
+            ev.push((t, 3, pcr));
+        }
+        for k in 0..31u64 {
+            let t = k * 32;
+            let mut cc = 0;
+            let ts = pes_packets(0x101, 0xBD, &ac3_frame(k as u8 + 1), (T0 + t + 50) * 90, &mut cc);
+            let packets: Vec<[u8; TS_PACKET]> =
+                ts.chunks(TS_PACKET).map(|c| c.try_into().unwrap()).collect();
+            // The last frame is cut after its first packet.
+            let keep = if k == 30 { 1 } else { packets.len() };
+            for p in &packets[..keep] {
+                ev.push((t, 4, *p));
+            }
+        }
+        for k in 0..25u64 {
+            let t = k * 40;
+            let ts = (T0 + t + 100) * 90;
+            let es = if k == 0 { SPS } else { P_SLICE };
+            let order = if k == 0 { 2 } else { 5 };
+            ev.push((t, order, video_pes(0x100, 0, ts, Some(ts), es)));
+        }
+        ev.sort_by_key(|(t, o, _)| (*t, *o));
+        ev.iter().flat_map(|(_, _, p)| p.iter().copied()).collect()
+    }
+
+    /// The leading continuation packets of a file cut mid-PES are dropped
+    /// on its audio as on its video, so at the loop the shared framer sees
+    /// the truncated last frame cut short by the next file's first PES and
+    /// discards it — every access unit it cuts is a whole frame of the
+    /// file. They used to be appended to the truncated frame (its PES still
+    /// owed the bytes, the CC ran on), and the frame they made decoded a
+    /// burst of up to full scale at every loop on every re-encoding output.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loop_never_glues_a_files_leading_continuation_onto_its_truncated_last_frame() {
+        use crate::engine::audio_au::{AuCutter, AuFormat};
+        let ts = loop_fixture_cut_ac3();
+        assert_eq!(scan_ts_head(&ts, TS_PACKET, None).es_pids, vec![0x100, 0x101]);
+        let trace = loop_ts_twice("cut-ac3.ts", &ts).await;
+        let audio: Vec<&[u8]> = trace
+            .iter()
+            .flat_map(|(_, b)| b.chunks(TS_PACKET))
+            .filter(|p| ((p[1] as u16 & 0x1F) << 8 | p[2] as u16) == 0x101)
+            .collect();
+        assert!(
+            !audio.iter().any(|p| p[4..].iter().all(|&b| b == 0x55)),
+            "no leading continuation packet goes out"
+        );
+        let mut cutter = AuCutter::new(AuFormat::Ac3);
+        let mut aus = Vec::new();
+        for p in &audio {
+            cutter.push_packet(p);
+            aus.extend(std::iter::from_fn(|| cutter.next(false)));
+        }
+        aus.extend(std::iter::from_fn(|| cutter.next(true)));
+        let fills: Vec<u8> = aus.iter().map(|a| a.data[100]).collect();
+        assert!(aus.iter().all(|a| a.data == ac3_frame(a.data[100])), "every access unit a whole frame: {fills:?}");
+        assert_eq!(aus.len(), 60, "both loops' 30 whole frames: {fills:?}");
+        assert_eq!(cutter.take_discarded(), 2 * 170, "each loop's truncated frame, and nothing else");
     }
 
     /// An audio PID's carry is the longest of its recent PES steps — but a
