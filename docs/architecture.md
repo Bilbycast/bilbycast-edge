@@ -281,7 +281,11 @@ broadcast IRDs) do not lose lock during a switch:
    exists purely to keep sockets and decoder state alive during dead-
    input periods. Without it, a 3 s+ silence on the output triggers
    time-out / EOF behaviour in several downstream receivers that cannot
-   be recovered by later data resuming.
+   be recovered by later data resuming. The keepalive is raw TS whatever
+   the input's framing; an SRT output keeps each packet's framing, so it
+   sends the keepalive only once its media has gone out raw TS
+   (`output_srt::KeepaliveGate`), and an SRT input never settles its
+   payload format on one.
 
 With mechanisms 1–6 combined, the visible switch latency at the receiver is
 one to two frames regardless of whether the target input is passthrough or
