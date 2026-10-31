@@ -1154,7 +1154,7 @@ fn submit_source_audio(
     match input.place_forward_only(at, fill_gaps) {
         Placement::Skip => return,
         Placement::Submit { reanchor: true } => {
-            encoder.reanchor_pts();
+            encoder.reanchor_through(stage);
             input.anchor(at, rate);
         }
         Placement::FillThenSubmit { samples } => {
@@ -1216,6 +1216,7 @@ fn submit_source_audio(
 /// PTS stood above 0 — on a video-only source always.
 fn lay_silence(
     encoder: &mut AudioEncoder,
+    stage: &mut super::audio_transcode::EncoderStage,
     sg: &mut SilenceGenerator,
     input: &mut EncoderInputClock,
     timeline: &mut FlvTimeline,
@@ -1237,7 +1238,7 @@ fn lay_silence(
         Some(video) => {
             let target = input.silence_target(video);
             if input.silence_start_within(target, rate, FLV_LONE_GAP_90K) {
-                encoder.reanchor_pts();
+                encoder.reanchor_through(stage);
             }
             let end = input.position().map_or(target, |at| target.min(at.saturating_add(SILENCE_PER_TICK_90K)));
             while let Some(at) = input.next_silence(chunk, end) {
@@ -1256,7 +1257,7 @@ fn lay_silence(
                 return;
             };
             if input.silence_start(start, rate) {
-                encoder.reanchor_pts();
+                encoder.reanchor_through(stage);
             }
             let Some(at) = input.position() else {
                 return;
@@ -3038,6 +3039,7 @@ async fn emit_silence_if_needed(
         encoder,
         silence: Some(sg),
         input,
+        stage,
         ..
     } = encoder_state
     else {
@@ -3050,7 +3052,7 @@ async fn emit_silence_if_needed(
         crate::timed_block_in_place!(
             "output_rtmp.audio_silence_encode",
             crate::engine::perf::TRANSCODE_BLOCK_WARN_MS,
-            { lay_silence(encoder, sg, input, timeline, &config.id) }
+            { lay_silence(encoder, stage, sg, input, timeline, &config.id) }
         );
     }
     send_encoded_audio(client, encoder, timeline, sent_audio_header, stats, None).await
@@ -4664,7 +4666,7 @@ mod flv_timestamp_tests {
     #[test]
     fn silence_on_a_video_only_source_starts_at_the_picture_not_at_zero() {
         let mut st = silent_fallback_state();
-        let EncoderState::Active { encoder, silence: Some(sg), input, .. } = &mut st else {
+        let EncoderState::Active { encoder, silence: Some(sg), input, stage, .. } = &mut st else {
             panic!("silent fallback builds eagerly");
         };
         const P0: u64 = 4_000_000_000;
@@ -4673,13 +4675,13 @@ mod flv_timestamp_tests {
             tl.video(P0 + k * STEP_25FPS, None, true);
         }
         let p = tl.newest_picture().unwrap();
-        lay_silence(encoder, sg, input, &mut tl, "o");
+        lay_silence(encoder, stage, sg, input, &mut tl, "o");
         assert!(encoder.drain().is_empty(), "nothing to lay yet");
         assert_eq!(input.position(), Some(p), "the silence starts at the picture");
         for k in 25..50 {
             tl.video(P0 + k * STEP_25FPS, None, true);
         }
-        lay_silence(encoder, sg, input, &mut tl, "o");
+        lay_silence(encoder, stage, sg, input, &mut tl, "o");
         let frames = encoder.drain();
         assert_eq!(frames.len(), 46, "46 chunks of 1 920 ticks fit in the second");
         let delay = p - frames[0].pts;
@@ -4699,7 +4701,7 @@ mod flv_timestamp_tests {
     #[test]
     fn silence_stays_with_a_video_only_source_across_a_pause() {
         let mut st = silent_fallback_state();
-        let EncoderState::Active { encoder, silence: Some(sg), input, .. } = &mut st else {
+        let EncoderState::Active { encoder, silence: Some(sg), input, stage, .. } = &mut st else {
             panic!("silent fallback builds eagerly");
         };
         let mut tl = FlvTimeline::new("o");
@@ -4708,13 +4710,13 @@ mod flv_timestamp_tests {
         for k in 0..100u64 {
             let pause = if k >= 50 { 3 * 90_000 } else { 0 };
             tl.video(T0 + k * STEP_25FPS + pause, None, true);
-            lay_silence(encoder, sg, input, &mut tl, "o");
+            lay_silence(encoder, stage, sg, input, &mut tl, "o");
             start = start.or(input.position());
             stamps.extend(encoder.drain().into_iter().map(|f| f.pts));
             if k == 49 {
                 // The pause: the picture stands still, and so does the silence.
                 let before = input.position();
-                lay_silence(encoder, sg, input, &mut tl, "o");
+                lay_silence(encoder, stage, sg, input, &mut tl, "o");
                 assert_eq!(input.position(), before);
             }
         }
@@ -4757,12 +4759,12 @@ mod flv_timestamp_tests {
         let real = stamps.len();
         assert!(real > 40);
         // The audio stops; past the grace, a second more of pictures.
-        lay_silence(encoder, sg, input, &mut tl, "o");
+        lay_silence(encoder, stage, sg, input, &mut tl, "o");
         assert!(encoder.drain().is_empty(), "inside the grace");
         std::thread::sleep(std::time::Duration::from_millis(600));
         for k in 0..25 {
             tl.video(T0 + 90_000 + k * STEP_25FPS, None, true);
-            lay_silence(encoder, sg, input, &mut tl, "o");
+            lay_silence(encoder, stage, sg, input, &mut tl, "o");
             stamps.extend(sent(encoder, &mut tl));
         }
         assert!(stamps.len() > real + 40, "a second of silence");
@@ -4811,11 +4813,11 @@ mod flv_timestamp_tests {
     /// `ticks` silence ticks, `lay_silence` on each.
     #[cfg(feature = "fdk-aac")]
     fn tick_silence(st: &mut EncoderState, tl: &mut FlvTimeline, ticks: usize) {
-        let EncoderState::Active { encoder, silence: Some(sg), input, .. } = st else {
+        let EncoderState::Active { encoder, silence: Some(sg), input, stage, .. } = st else {
             panic!("silent fallback builds eagerly");
         };
         for _ in 0..ticks {
-            lay_silence(encoder, sg, input, tl, "o");
+            lay_silence(encoder, stage, sg, input, tl, "o");
         }
     }
 
@@ -6420,8 +6422,11 @@ pub(super) mod flv_wire_tests {
     /// (1 920 ms). The encoder anchored once and counted samples, so it ran
     /// 107 ms further from the video every lap; it is now re-anchored at each
     /// seam, where the video continues: the audio's first frame of lap L is
-    /// L × 1 920 ms after its first. The seam is the only place the audio
-    /// steps by more than a frame.
+    /// L × 1 920 ms after its first (and one frame, 21 ms, more: a lap's
+    /// first frame is its first PTS less one frame, the codec delay less
+    /// the first frame of zeros the re-anchor drops). The seam is the only
+    /// place the audio steps by more than a frame — the lap's last 2 048
+    /// samples go out before it, on their own timeline.
     ///
     /// The source's audio starting just past the video's second picture, the
     /// encoder's first frame — stamped its codec delay before that — falls
@@ -6451,7 +6456,10 @@ pub(super) mod flv_wire_tests {
             if a0 == T0 + 3 * F {
                 assert!((70..120).contains(&audio[0]), "the first frame, its codec delay early: {}", audio[0]);
                 for (l, &i) in seams.iter().enumerate() {
-                    let lap = (l as i64 + 1) * 1_920;
+                    // Less one frame of the codec delay: the re-anchor
+                    // drops the first frame of the zeros its run-out of
+                    // the old lap left in the delay line.
+                    let lap = (l as i64 + 1) * 1_920 + 21;
                     let got = i64::from(audio[i]) - i64::from(audio[0]);
                     assert!((got - lap).abs() <= 1, "lap {}: {got} ms after the first, not {lap}", l + 1);
                 }

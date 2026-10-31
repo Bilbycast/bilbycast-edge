@@ -1162,10 +1162,19 @@ mod reencoder_tests {
             r.mark_real_audio(pts, Some(pts + 27_000));
             out.extend(r.encode_planar(&pcm, pts, 48_000, 2).unwrap());
         }
+        // The re-anchor first runs out what the encoder still held of the
+        // silence, on the silence's timeline, then the real audio follows
+        // from its PTS less the codec delay — less the first frame of the
+        // zeros that run-out left in the delay line, which is not sent.
+        let (flushed, out): (Vec<_>, Vec<_>) = out.into_iter().partition(|(_, p)| *p < real - delay);
+        let last_silent = more[more.len() - 1].1;
+        assert!(!flushed.is_empty() && flushed[0].1 == last_silent + frame, "the silence runs out on its timeline");
+        assert!(flushed.windows(2).all(|w| w[1].1 == w[0].1 + frame));
         assert!(!out.is_empty());
         assert!(
-            out[0].1.abs_diff(real - delay) <= 1,
-            "the first real frame must sit at the source's PTS minus codec delay, got {} for {real}",
+            out[0].1.abs_diff(real - delay + frame) <= 1,
+            "the first real frame must sit at the source's PTS minus codec delay, plus the frame not sent, \
+             got {} for {real}",
             out[0].1
         );
         for (k, (_, pts)) in out.iter().enumerate() {
@@ -1184,7 +1193,7 @@ mod reencoder_tests {
         assert!(!laid.is_empty(), "the grace has elapsed");
         let at = r.input_position().unwrap();
         assert!(video_now - 27_000 - at < frame, "stopped short by the lead: {at} vs {}", video_now - 27_000);
-        assert_eq!(laid[0].1, out[0].1 + 6 * frame, "the silence continues the real audio exactly");
+        assert_eq!(laid[0].1, out[0].1 + 5 * frame, "the silence continues the real audio exactly");
 
         // Real audio returns right where the silence ends: contiguous, no
         // re-anchor, no hole.

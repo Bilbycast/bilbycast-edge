@@ -507,7 +507,20 @@ tracks where the encoder's input is on the source's timeline and
 re-anchors the encoder when a real frame is more than a frame past it (a
 splice, a lost PES, a gap), holds a frame back that is behind it
 (silence overshot the return by the part of the lead the estimate
-missed), and otherwise continues. The eager silent-fallback encoder is
+missed), and otherwise continues. A re-anchor first runs out what the
+encoder still holds of the old timeline under the old anchor
+(`AudioEncoder::reanchor_pts`): the partial frame in its accumulator,
+what its own resampler has queued and the codec's delay line (AAC-LC
+2048 samples, libavcodec its `initial_padding`), pushed through with
+zeros in whole frames, each frame stamped by the content it carries.
+The zeros then fill the delay line, and of the frames after the new
+anchor that carry nothing else all but the last are dropped, so an
+AAC-LC re-anchor's first frame is one frame (21.3 ms at 48 kHz) before
+the new PTS. Up to 0.116.0 the delay line came out first under the new
+anchor: the old programme's last 42.7 ms presented late by the whole
+jump, +320 ms at each loop of a file whose audio ends 320 ms before its
+picture, and the partial frame was dropped. HLS's re-encode chain
+re-anchors the same way. The eager silent-fallback encoder is
 built at the declared rate and rebuilt, with a resampler, on the first
 real frame whose rate or channel count differs — a 44.1 kHz source
 through a 48 kHz encoder used to run 8.8 % slow. On RTMP (since
@@ -717,14 +730,21 @@ the sample:
     silence, inserted at the source rate ahead of the PES's audio and
     passed through the rate / channel stage; on a `media_player` input the
     output PTS step over the gap instead, because its file splices step PTS
-    over audio that is continuous — at the PES that shows the step, since a
-    file's timestamps carry no jitter to wait out (waiting 150 ms presented
-    that much audio early by the step at every loop);
+    over audio that is continuous — found at the PES that shows the step,
+    since a file's timestamps carry no jitter to wait out (waiting 150 ms
+    presented that much audio early by the step at every loop), and taken
+    on the first output frame whose content is mostly past it: what the
+    decoder, the stage and the encoder still hold when that PES arrives
+    (AAC-LC's delay line alone is 2048 samples) is audio from before the
+    step and keeps the old stamps. Up to 0.116.0 the step went on the next
+    frame out, presenting that audio late by the whole step;
   - an **overlap**, by the same rules: that much audio dropped from the
     head of what follows (the count of placed content may go below the
     anchor: a PES stamped 150 ms behind one AU after an anchor drops
     exactly 150 ms);
-  - a step over 500 ms, **either way**: re-anchor at the new PTS. A source
+  - a step over 500 ms, **either way**: re-anchor at the new PTS (the
+    content still in the pipeline goes out just ahead of it, on the new
+    timeline). A source
     that resets its clock back (an encoder restart, an ffmpeg
     `-stream_loop` wrap) takes its PCR and its video back with it, and the
     transcode chain's PCR stage drops re-encoded PES left on the old
@@ -1079,7 +1099,13 @@ output takes it off its stamps:
   declares the stage's delay as it stands first: a stage built after the
   encoder (a silent fallback's, on the first real frame) or rebuilt for
   another source format gains its resampler late, and declared once at
-  build time (as 0) its delay stayed on every stamp.
+  build time (as 0) its delay stayed on every stamp. A re-anchor goes
+  through `AudioEncoder::reanchor_through`, which runs the stage's queue
+  and delay line (up to ~8 ms) out under the old anchor and restarts its
+  resampler, so the new anchor's declared delay is what the stage holds:
+  left in the stage, that tail came out after the new anchor, late by the
+  jump, and the input it still had queued (under one 256-frame chunk) put
+  every stamp after the anchor that much late. HLS does the same.
 - HLS: one re-encode chain runs across the output's segments
   (`output_hls::HlsAudioChain`) — the AU cutter, the decoder, the stage and
   the same `AudioEncoder` RTMP and WebRTC use, so its delay comes off the

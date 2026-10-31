@@ -440,6 +440,13 @@ struct PcmResampler {
     chunk: usize,
     pending: Vec<Vec<f32>>,
     out: Vec<Vec<f32>>,
+    /// Output frames per input frame.
+    ratio: f64,
+    /// Input frames converted and output frames produced since the last
+    /// [`Self::reset`]: where the content the filter still holds ends
+    /// ([`Self::flush_into`]).
+    consumed: u64,
+    produced: u64,
 }
 
 impl PcmResampler {
@@ -470,6 +477,9 @@ impl PcmResampler {
             chunk,
             pending: vec![Vec::with_capacity(chunk * 2); channels],
             out: (0..channels).map(|_| vec![0.0f32; max_out]).collect(),
+            ratio,
+            consumed: 0,
+            produced: 0,
         })
     }
 
@@ -493,6 +503,38 @@ impl PcmResampler {
             ch.clear();
         }
         self.inner.reset();
+        self.consumed = 0;
+        self.produced = 0;
+    }
+
+    /// Convert what is still queued, and run out what the filter still
+    /// holds of it, appending to `sink` exactly the output frames that
+    /// carry that content — not the zeros fed to push it out — then start
+    /// afresh ([`Self::reset`]). Returns how many frames were appended.
+    ///
+    /// What an encoder's re-anchor hands on under its old anchor
+    /// ([`AudioEncoder::reanchor_pts`]); reset alone, it was dropped.
+    fn flush_into(&mut self, sink: &mut [Vec<f32>]) -> Result<usize, String> {
+        let queued = self.pending.first().map_or(0, Vec::len) as u64;
+        let end = ((self.consumed + queued) as f64 * self.ratio).round() as u64 + self.delay() as u64;
+        let want = end.saturating_sub(self.produced) as usize;
+        let mut tail: Vec<Vec<f32>> = vec![Vec::new(); self.pending.len()];
+        // Each round completes a chunk of zeros, which outruns the filter's
+        // delay (about 32 frames) many times over: two rounds at most.
+        for _ in 0..4 {
+            if tail.first().map_or(0, Vec::len) >= want {
+                break;
+            }
+            let fill = self.chunk - self.pending.first().map_or(0, Vec::len) % self.chunk;
+            let zeros = vec![vec![0.0f32; fill]; self.pending.len()];
+            self.push(&zeros, &mut tail)?;
+        }
+        let n = want.min(tail.first().map_or(0, Vec::len));
+        for (dst, src) in sink.iter_mut().zip(tail.iter()) {
+            dst.extend_from_slice(&src[..n]);
+        }
+        self.reset();
+        Ok(n)
     }
 
     /// Queue `planar` and append whatever whole chunks it completes, converted,
@@ -525,8 +567,108 @@ impl PcmResampler {
                 sink[ch].extend_from_slice(&buf[..produced]);
             }
             appended += produced;
+            self.consumed += self.chunk as u64;
+            self.produced += produced as u64;
         }
         Ok(appended)
+    }
+}
+
+/// An in-process backend's accumulator and output timeline, borrowed from
+/// its fields for one pass of encoding ([`encode_fdk_frames`],
+/// [`encode_libav_frames`]): each frame is stamped from the anchor plus the
+/// samples emitted since, as [`EncoderBackend::InProcess`] says.
+#[cfg(any(feature = "fdk-aac", feature = "media-codecs"))]
+struct FrameSink<'a> {
+    accumulator: &'a mut [Vec<f32>],
+    accumulated_samples: &'a mut usize,
+    output_queue: &'a mut std::collections::VecDeque<EncodedFrame>,
+    pts_90k: u64,
+    samples_since_anchor: &'a mut u64,
+    skip_frames: &'a mut usize,
+    stats: &'a EncodeStats,
+}
+
+#[cfg(any(feature = "fdk-aac", feature = "media-codecs"))]
+impl FrameSink<'_> {
+    /// The next whole frame of `frame_size` samples off the accumulator.
+    fn take_frame(&mut self, frame_size: usize) -> Option<Vec<Vec<f32>>> {
+        if frame_size == 0 || *self.accumulated_samples < frame_size {
+            return None;
+        }
+        *self.accumulated_samples -= frame_size;
+        Some(self.accumulator.iter_mut().map(|ch| ch.drain(..frame_size).collect()).collect())
+    }
+
+    /// Queue an encoded frame of `samples` at `rate`, at its place on the
+    /// timeline — unless it is one of the frames a re-anchor's flush left
+    /// nothing but zeros in, which is counted and dropped.
+    fn emit(&mut self, data: Bytes, samples: u64, rate: u32) {
+        let pts = self
+            .pts_90k
+            .saturating_add(*self.samples_since_anchor * 90_000 / u64::from(rate.max(1)));
+        *self.samples_since_anchor += samples;
+        if *self.skip_frames > 0 {
+            *self.skip_frames -= 1;
+            return;
+        }
+        self.output_queue.push_back(EncodedFrame { data, pts });
+        self.stats.inc_submitted();
+    }
+
+    /// Ready the old timeline's last content to be encoded under its own
+    /// anchor ([`AudioEncoder::reanchor_pts`]): what `resampler` still holds
+    /// of it, then zeros in whole frames of `frame_size` until all of it is
+    /// through the codec's `delay`-sample delay line.
+    fn run_out(&mut self, resampler: Option<&mut PcmResampler>, frame_size: usize, delay: usize) {
+        if let Some(r) = resampler {
+            match r.flush_into(self.accumulator) {
+                Ok(n) => *self.accumulated_samples += n,
+                Err(e) => tracing::debug!("audio encoder: resampler flush at a re-anchor failed: {e}"),
+            }
+        }
+        let held = *self.accumulated_samples;
+        let frame_size = frame_size.max(1);
+        let zeros = (delay + held).div_ceil(frame_size) * frame_size - held;
+        for ch in self.accumulator.iter_mut() {
+            ch.resize(ch.len() + zeros, 0.0);
+        }
+        *self.accumulated_samples += zeros;
+    }
+}
+
+/// Encode every whole frame `sink` holds through the fdk encoder.
+#[cfg(feature = "fdk-aac")]
+fn encode_fdk_frames(encoder: &mut aac_audio::AacEncoder, sink: &mut FrameSink<'_>, rate: u32) {
+    let frame_size = encoder.frame_size() as usize;
+    while let Some(frame) = sink.take_frame(frame_size) {
+        match encoder.encode_frame(&frame) {
+            Ok(encoded) => sink.emit(Bytes::from(encoded.bytes), u64::from(encoded.num_samples), rate),
+            Err(e) => {
+                tracing::warn!("fdk-aac encode error: {e}");
+                sink.stats.inc_dropped();
+            }
+        }
+    }
+}
+
+/// Encode every whole frame `sink` holds through the libavcodec encoder.
+#[cfg(feature = "media-codecs")]
+fn encode_libav_frames(encoder: &mut video_engine::AudioEncoder, sink: &mut FrameSink<'_>) {
+    let frame_size = encoder.frame_size();
+    let rate = encoder.sample_rate();
+    while let Some(frame) = sink.take_frame(frame_size) {
+        match encoder.encode_frame(&frame) {
+            Ok(encoded) => {
+                for ef in encoded {
+                    sink.emit(ef.data, ef.num_samples as u64, rate);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("libavcodec audio encode error: {e}");
+                sink.stats.inc_dropped();
+            }
+        }
     }
 }
 
@@ -562,6 +704,11 @@ enum EncoderBackend {
         pts_90k: u64,
         samples_since_anchor: u64,
         pts_anchor_set: bool,
+        /// Frames still to come out after a re-anchor that carry nothing
+        /// but the zeros its flush left in the codec's delay line
+        /// ([`AudioEncoder::reanchor_pts`]): counted on the new anchor's
+        /// timeline and dropped.
+        skip_frames: usize,
         cancel: CancellationToken,
         /// Rate conversion when the input PCM rate differs from the target's.
         /// The fdk encoder is opened at the target rate and consumed whatever
@@ -581,6 +728,7 @@ enum EncoderBackend {
         pts_90k: u64,
         samples_since_anchor: u64,
         pts_anchor_set: bool,
+        skip_frames: usize,
         cancel: CancellationToken,
         /// Optional sample rate converter when the input PCM rate differs
         /// from the encoder's target rate (e.g. 44.1 kHz AAC → 48 kHz Opus).
@@ -793,6 +941,7 @@ impl AudioEncoder {
                 pts_90k: 0,
                 samples_since_anchor: 0,
                 pts_anchor_set: false,
+                skip_frames: 0,
                 cancel,
                 resampler,
             },
@@ -889,6 +1038,7 @@ impl AudioEncoder {
                 pts_90k: 0,
                 samples_since_anchor: 0,
                 pts_anchor_set: false,
+                skip_frames: 0,
                 cancel,
                 resampler,
             },
@@ -975,6 +1125,7 @@ impl AudioEncoder {
                 pts_90k,
                 samples_since_anchor,
                 pts_anchor_set,
+                skip_frames,
                 resampler,
                 ..
             } => {
@@ -1001,8 +1152,6 @@ impl AudioEncoder {
                     *pts_anchor_set = true;
                 }
 
-                let frame_size = encoder.frame_size() as usize;
-
                 // Append incoming samples to the accumulator, converted to
                 // the target rate first if the input is not at it.
                 if let Some(r) = resampler {
@@ -1022,35 +1171,16 @@ impl AudioEncoder {
                 }
 
                 // Encode complete frames
-                while *accumulated_samples >= frame_size {
-                    // Extract one frame's worth of samples per channel
-                    let frame_planar: Vec<Vec<f32>> = accumulator
-                        .iter_mut()
-                        .map(|ch_buf| {
-                            let frame: Vec<f32> = ch_buf.drain(..frame_size).collect();
-                            frame
-                        })
-                        .collect();
-                    *accumulated_samples -= frame_size;
-
-                    match encoder.encode_frame(&frame_planar) {
-                        Ok(encoded) => {
-                            let sr = self.params.target_sample_rate.max(1) as u64;
-                            let current_pts =
-                                pts_90k.saturating_add(*samples_since_anchor * 90_000 / sr);
-                            *samples_since_anchor += encoded.num_samples as u64;
-                            output_queue.push_back(EncodedFrame {
-                                data: Bytes::from(encoded.bytes),
-                                pts: current_pts,
-                            });
-                            self.encode_stats.inc_submitted();
-                        }
-                        Err(e) => {
-                            tracing::warn!("fdk-aac encode error: {e}");
-                            self.encode_stats.inc_dropped();
-                        }
-                    }
-                }
+                let mut sink = FrameSink {
+                    accumulator,
+                    accumulated_samples,
+                    output_queue,
+                    pts_90k: *pts_90k,
+                    samples_since_anchor,
+                    skip_frames,
+                    stats: &self.encode_stats,
+                };
+                encode_fdk_frames(encoder, &mut sink, self.params.target_sample_rate);
 
                 true
             }
@@ -1063,6 +1193,7 @@ impl AudioEncoder {
                 pts_90k,
                 samples_since_anchor,
                 pts_anchor_set,
+                skip_frames,
                 resampler,
                 ..
             } => {
@@ -1081,8 +1212,6 @@ impl AudioEncoder {
                     *samples_since_anchor = 0;
                     *pts_anchor_set = true;
                 }
-
-                let frame_size = encoder.frame_size();
 
                 // If a resampler is active, convert the input PCM to the
                 // target sample rate before accumulation. Otherwise pass
@@ -1103,33 +1232,16 @@ impl AudioEncoder {
                     *accumulated_samples += frames;
                 }
 
-                while *accumulated_samples >= frame_size {
-                    let frame_planar: Vec<Vec<f32>> = accumulator
-                        .iter_mut()
-                        .map(|ch_buf| ch_buf.drain(..frame_size).collect())
-                        .collect();
-                    *accumulated_samples -= frame_size;
-
-                    match encoder.encode_frame(&frame_planar) {
-                        Ok(encoded_frames) => {
-                            for ef in encoded_frames {
-                                let sr = (encoder.sample_rate() as u64).max(1);
-                                let current_pts = pts_90k
-                                    .saturating_add(*samples_since_anchor * 90_000 / sr);
-                                *samples_since_anchor += ef.num_samples as u64;
-                                output_queue.push_back(EncodedFrame {
-                                    data: ef.data,
-                                    pts: current_pts,
-                                });
-                                self.encode_stats.inc_submitted();
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("libavcodec audio encode error: {e}");
-                            self.encode_stats.inc_dropped();
-                        }
-                    }
-                }
+                let mut sink = FrameSink {
+                    accumulator,
+                    accumulated_samples,
+                    output_queue,
+                    pts_90k: *pts_90k,
+                    samples_since_anchor,
+                    skip_frames,
+                    stats: &self.encode_stats,
+                };
+                encode_libav_frames(encoder, &mut sink);
 
                 true
             }
@@ -1192,13 +1304,24 @@ impl AudioEncoder {
     /// also means a source whose PTS jumps, a splice or a silence gap, is
     /// followed by nothing: the audio runs on the old timeline while the
     /// video moves, for the life of the flow. A caller that has seen the
-    /// jump calls this; the partial frame in the accumulator belongs to the
-    /// old timeline and is dropped with it. What is not dropped is the
-    /// codec's own delay line — fdk AAC-LC holds 2048 samples (42.7 ms at
-    /// 48 kHz), libavcodec its `initial_padding`, of the previous programme,
-    /// which come out first under the new anchor; after a silence burst
-    /// that is 42.7 ms of silence, after a splice the tail of what preceded
-    /// it.
+    /// jump calls this.
+    ///
+    /// What the encoder still holds of the old timeline goes out under the
+    /// old anchor first: the partial frame in the accumulator, what its own
+    /// resampler has queued, and the codec's delay line — fdk AAC-LC 2048
+    /// samples (42.7 ms at 48 kHz), libavcodec its `initial_padding` — run
+    /// out with zeros, in whole frames, each frame stamped by the content
+    /// it carries. Those frames used to come out first under the new anchor:
+    /// the old programme's last 42.7 ms presented late by the whole jump
+    /// (+320 ms at each loop of a file whose audio ends 320 ms before its
+    /// picture), and the accumulator's partial frame was lost. The zeros
+    /// then fill the delay line instead; the frames after the new anchor
+    /// that carry nothing else are dropped, all but the last, whose window
+    /// overlaps the new content's first frame — so an AAC-LC re-anchor's
+    /// first frame is stamped one frame before the new PTS, and a
+    /// libavcodec one (whose delay is under a frame) its delay before it.
+    /// A caller feeding the encoder through a rate stage re-anchors with
+    /// [`Self::reanchor_through`], which runs the stage out first.
     ///
     /// The ffmpeg subprocess backend cannot be re-anchored: it discards the
     /// PTS on every chunk and stamps from a framer anchored at zero, so its
@@ -1209,13 +1332,33 @@ impl AudioEncoder {
             EncoderBackend::Ffmpeg { .. } => {}
             #[cfg(feature = "fdk-aac")]
             EncoderBackend::InProcess {
+                encoder,
                 accumulator,
                 accumulated_samples,
+                output_queue,
+                pts_90k,
                 samples_since_anchor,
                 pts_anchor_set,
+                skip_frames,
                 resampler,
                 ..
             } => {
+                if *pts_anchor_set {
+                    let frame = encoder.frame_size() as usize;
+                    let delay = encoder.codec_delay_samples() as usize;
+                    let mut sink = FrameSink {
+                        accumulator,
+                        accumulated_samples,
+                        output_queue,
+                        pts_90k: *pts_90k,
+                        samples_since_anchor,
+                        skip_frames,
+                        stats: &self.encode_stats,
+                    };
+                    sink.run_out(resampler.as_mut(), frame, delay);
+                    encode_fdk_frames(encoder, &mut sink, self.params.target_sample_rate);
+                    *skip_frames = (delay / frame.max(1)).saturating_sub(1);
+                }
                 for ch in accumulator.iter_mut() {
                     ch.clear();
                 }
@@ -1228,13 +1371,33 @@ impl AudioEncoder {
             }
             #[cfg(feature = "media-codecs")]
             EncoderBackend::InProcessLibav {
+                encoder,
                 accumulator,
                 accumulated_samples,
+                output_queue,
+                pts_90k,
                 samples_since_anchor,
                 pts_anchor_set,
+                skip_frames,
                 resampler,
                 ..
             } => {
+                if *pts_anchor_set {
+                    let frame = encoder.frame_size();
+                    let delay = encoder.initial_padding();
+                    let mut sink = FrameSink {
+                        accumulator,
+                        accumulated_samples,
+                        output_queue,
+                        pts_90k: *pts_90k,
+                        samples_since_anchor,
+                        skip_frames,
+                        stats: &self.encode_stats,
+                    };
+                    sink.run_out(resampler.as_mut(), frame, delay);
+                    encode_libav_frames(encoder, &mut sink);
+                    *skip_frames = (delay / frame.max(1)).saturating_sub(1);
+                }
                 for ch in accumulator.iter_mut() {
                     ch.clear();
                 }
@@ -1245,6 +1408,39 @@ impl AudioEncoder {
                 *samples_since_anchor = 0;
                 *pts_anchor_set = false;
             }
+        }
+    }
+
+    /// [`Self::reanchor_pts`] for an encoder fed through `stage`
+    /// ([`Self::submit_through`]): what the stage's resampler still holds of
+    /// the old timeline — its queue and its delay line, up to ~8 ms — goes
+    /// into the encoder first, under the old anchor, and the stage starts
+    /// afresh, so the delay the new anchor takes off its stamps is exactly
+    /// what the stage now holds. Without it that tail came out after the new
+    /// anchor, presented late by the jump, and the queue it held — up to a
+    /// chunk — put every stamp after it that much late.
+    pub fn reanchor_through(&mut self, stage: &mut crate::engine::audio_transcode::EncoderStage) {
+        match stage.flush() {
+            Ok(tail) if self.anchored() && tail.first().is_some_and(|c| !c.is_empty()) => {
+                // Anchored, so the PTS is not read.
+                self.submit_planar(&tail, 0);
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!("audio encoder: stage flush at a re-anchor failed: {e}"),
+        }
+        self.reanchor_pts();
+    }
+
+    /// Whether the output timeline is anchored: a submit has been taken
+    /// since the encoder was built or last re-anchored. The ffmpeg backend
+    /// never is.
+    fn anchored(&self) -> bool {
+        match &self.backend {
+            EncoderBackend::Ffmpeg { .. } => false,
+            #[cfg(feature = "fdk-aac")]
+            EncoderBackend::InProcess { pts_anchor_set, .. } => *pts_anchor_set,
+            #[cfg(feature = "media-codecs")]
+            EncoderBackend::InProcessLibav { pts_anchor_set, .. } => *pts_anchor_set,
         }
     }
 
@@ -3378,9 +3574,13 @@ mod tests {
         // Per-frame truncation would have been 0.8 tick a frame behind.
         assert!(exact - last as u128 <= 1, "the old drift would read {}", k * 8 / 10);
 
-        // A re-anchor lands the next frame where the caller says, less the
-        // codec delay, and counts from there.
+        // A re-anchor runs the old timeline out on it, then lands the next
+        // frame where the caller says, less the codec delay (the first frame
+        // of the zeros it left there dropped), and counts from there.
         enc.reanchor_pts();
+        let flushed = enc.drain();
+        let next = (first as u128 + (k + 1) * 1024 * 90_000 / 44_100) as u64;
+        assert_eq!(flushed.first().map(|f| f.pts), Some(next), "continuing the old timeline");
         for _ in 0..8 {
             assert!(enc.submit_planar(&silence, 50_000_000));
         }
@@ -3390,7 +3590,7 @@ mod tests {
             EncoderBackend::InProcess { encoder, .. } => encoder.codec_delay_samples() as u64,
             _ => unreachable!(),
         };
-        assert_eq!(after[0].pts, 50_000_000 - delay * 90_000 / 44_100);
+        assert_eq!(after[0].pts, 50_000_000 - delay * 90_000 / 44_100 + 1024 * 90_000 / 44_100);
     }
 
     /// The libavcodec backend (WebRTC Opus, RTMP / CMAF MP2 / AC-3) anchors
@@ -3612,4 +3812,216 @@ mod tests {
         // presents it 128 early.
         assert!((e + 128.0).abs() <= 2.0, "{e:.1}");
     }
+
+    /// A 10 ms Hann-windowed tone burst at `rate`, of frequency `hz`.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn tone_burst(rate: u32, hz: f32) -> Vec<f32> {
+        let n = (rate / 100) as usize;
+        (0..n)
+            .map(|k| {
+                let w = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * k as f32 / (n - 1) as f32).cos();
+                0.5 * w * (2.0 * std::f32::consts::PI * hz * k as f32 / rate as f32).sin()
+            })
+            .collect()
+    }
+
+    /// Decode `frames` with a reference decoder: every decoded sample of
+    /// channel 0, each timed from its own frame's stamp at `rate`.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn decode_timed(codec: AudioCodec, frames: &[EncodedFrame], rate: u32) -> (Vec<f64>, Vec<f32>) {
+        let mut times = Vec::new();
+        let mut pcm = Vec::new();
+        let mut put = |pts: u64, p: &[f32]| {
+            times.extend((0..p.len()).map(|i| pts as f64 + i as f64 * 90_000.0 / rate as f64));
+            pcm.extend_from_slice(p);
+        };
+        match codec {
+            AudioCodec::AacLc => {
+                let mut d = aac_audio::AacDecoder::open_adts().unwrap();
+                for f in frames {
+                    put(f.pts, &d.decode_frame(&f.data).unwrap().planar[0]);
+                }
+            }
+            codec => {
+                let c = match codec {
+                    AudioCodec::Mp2 => video_codec::AudioDecoderCodec::Mp2,
+                    _ => video_codec::AudioDecoderCodec::Ac3,
+                };
+                let mut d = video_engine::AudioDecoder::open(c).unwrap();
+                for f in frames {
+                    d.send_packet(&f.data, 0).unwrap();
+                    while let Ok(o) = d.receive_frame() {
+                        put(f.pts, &o.planar[0]);
+                    }
+                }
+            }
+        }
+        (times, pcm)
+    }
+
+    /// Where `burst` is presented in a decoded, timed stream, searched within
+    /// 50 ms of `expected`, as an error in samples at `rate`.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn burst_error_near(times: &[f64], pcm: &[f32], burst: &[f32], expected: f64, rate: u32) -> f64 {
+        let radius = 50.0 * 90.0;
+        let best = (0..pcm.len().saturating_sub(burst.len()))
+            .filter(|&k| (times[k] - expected).abs() <= radius)
+            .max_by(|&x, &y| {
+                let s = |k: usize| -> f32 { burst.iter().zip(&pcm[k..]).map(|(p, q)| p * q).sum() };
+                s(x).total_cmp(&s(y))
+            });
+        match best {
+            Some(k) => (times[k] - expected) * rate as f64 / 90_000.0,
+            None => f64::INFINITY,
+        }
+    }
+
+    /// One seam: an old programme at `P0` whose last samples carry two
+    /// bursts — one in what the codec's delay line holds at the seam, one in
+    /// the accumulator's partial frame — then a 320 ms jump in the source
+    /// PTS (a `media_player` loop whose audio ends before its picture),
+    /// re-anchored on as `EncoderInputClock::place` says, and a new
+    /// programme with a third burst, each burst a tone of its own. Returns each burst's error
+    /// in output samples, and the stamps.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    fn seam_errors(
+        enc: &mut AudioEncoder,
+        mut stage: Option<&mut crate::engine::audio_transcode::EncoderStage>,
+        in_rate: u32,
+    ) -> ([f64; 3], Vec<u64>) {
+        const P0: u64 = 900_000;
+        const GAP: u64 = 320 * 90;
+        let out_rate = enc.params().target_sample_rate;
+        let frame = match &enc.backend {
+            EncoderBackend::InProcess { encoder, .. } => encoder.frame_size() as usize,
+            EncoderBackend::InProcessLibav { encoder, .. } => encoder.frame_size(),
+            EncoderBackend::Ffmpeg { .. } => unreachable!(),
+        };
+        // The old programme ends a sample short of a whole frame: the
+        // accumulator holds the most it can at the seam.
+        let old_len = (2 * in_rate as usize / frame + 1) * frame - 1;
+        // A tone of its own for each burst, so none is found for another.
+        let tones = [1_000.0, 2_000.0, 3_000.0];
+        let len = tone_burst(in_rate, tones[0]).len();
+        // Not right at the end: fdk places a burst ending on the last sample
+        // before digital silence 24 samples early at 44.1 -> 48 kHz, seam or
+        // none.
+        let at = [old_len - len - 1_500, old_len - len - 50];
+        let mut old = vec![0.0f32; old_len];
+        for (&a, &hz) in at.iter().zip(&tones) {
+            old[a..a + len].copy_from_slice(&tone_burst(in_rate, hz));
+        }
+        let new_burst = tone_burst(in_rate, tones[2]);
+        let new_at = 333usize;
+        let mut new = vec![0.0f32; in_rate as usize];
+        new[new_at..new_at + new_burst.len()].copy_from_slice(&new_burst);
+        let p1 = P0 + old_len as u64 * 90_000 / in_rate as u64 + GAP;
+
+        let submit = |enc: &mut AudioEncoder,
+                      stage: &mut Option<&mut crate::engine::audio_transcode::EncoderStage>,
+                      pcm: &[f32],
+                      base: u64| {
+            let mut fed = 0u64;
+            for chunk in pcm.chunks(1_000) {
+                let pts = base + fed * 90_000 / in_rate as u64;
+                let planar = [chunk.to_vec(), chunk.to_vec()];
+                match stage.as_deref_mut() {
+                    Some(st) => assert!(enc.submit_through(st, &planar, in_rate, pts).unwrap()),
+                    None => assert!(enc.submit_planar(&planar, pts)),
+                }
+                fed += chunk.len() as u64;
+            }
+        };
+        let mut frames = Vec::new();
+        submit(enc, &mut stage, &old, P0);
+        frames.extend(enc.drain());
+        match stage.as_deref_mut() {
+            Some(st) => enc.reanchor_through(st),
+            None => enc.reanchor_pts(),
+        }
+        submit(enc, &mut stage, &new, p1);
+        frames.extend(enc.drain());
+
+        let (times, pcm) = decode_timed(enc.params().codec, &frames, out_rate);
+        let src = |base: u64, j: usize| base as f64 + j as f64 * 90_000.0 / in_rate as f64;
+        let found = |k: usize, expected: f64| {
+            burst_error_near(&times, &pcm, &tone_burst(out_rate, tones[k]), expected, out_rate)
+        };
+        let errors = [found(0, src(P0, at[0])), found(1, src(P0, at[1])), found(2, src(p1, new_at))];
+        (errors, frames.iter().map(|f| f.pts).collect())
+    }
+
+    /// At a re-anchor the old programme's last samples — those the codec's
+    /// delay line holds (fdk AAC-LC 2048, libavcodec its `initial_padding`)
+    /// and the accumulator's partial frame, and with a resampler in front
+    /// what it has queued — go out under the old anchor, each frame stamped
+    /// by the content it carries, and the new programme lands on its own
+    /// PTS. The delay line used to come out first under the new anchor,
+    /// presented late by the whole jump (+320 ms at each loop of a file
+    /// whose audio ends 320 ms before its picture, on RTMP, CMAF and HLS),
+    /// and the partial frame and the resampler's queue were dropped.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn a_reanchor_keeps_the_old_programmes_last_samples_on_its_timeline() {
+        for (codec, in_rate, out_rate) in [
+            (AudioCodec::AacLc, 48_000, 48_000),
+            (AudioCodec::AacLc, 44_100, 48_000),
+            (AudioCodec::Mp2, 48_000, 48_000),
+            (AudioCodec::Ac3, 48_000, 48_000),
+            (AudioCodec::Ac3, 44_100, 48_000),
+        ] {
+            let mut enc = resampling_encoder(codec, in_rate, out_rate);
+            let (errors, stamps) = seam_errors(&mut enc, None, in_rate);
+            for (which, e) in ["in the delay line", "in the partial frame", "after the seam"].iter().zip(errors) {
+                assert!(e.abs() <= 2.0, "{codec:?} {in_rate} -> {out_rate}: the burst {which} is {e:.1} samples off");
+            }
+            assert!(stamps.windows(2).all(|w| w[1] > w[0]), "{codec:?}: the stamps never step back");
+        }
+    }
+
+    /// The same through a rate stage in front of the encoder (RTMP, HLS):
+    /// `reanchor_through` runs the stage's queue and delay line out under
+    /// the old anchor too, and restarts it, so the delay the new anchor
+    /// takes off is what the stage holds.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn a_reanchor_through_a_rate_stage_keeps_what_the_stage_held_on_the_old_timeline() {
+        for codec in [AudioCodec::AacLc, AudioCodec::Mp2] {
+            let mut enc = resampling_encoder(codec, 48_000, 48_000);
+            let mut stage = crate::engine::audio_transcode::EncoderStage::new(None, Some(48_000), None);
+            let (errors, stamps) = seam_errors(&mut enc, Some(&mut stage), 44_100);
+            for (which, e) in ["in the delay line", "in the partial frame", "after the seam"].iter().zip(errors) {
+                assert!(e.abs() <= 2.0, "{codec:?}: the burst {which} is {e:.1} samples off");
+            }
+            assert!(stamps.windows(2).all(|w| w[1] > w[0]), "{codec:?}: the stamps never step back");
+        }
+    }
+
+    /// A re-anchor's flush leaves zeros in the codec's delay line: of the
+    /// frames that carry nothing else, all but the last are dropped, so an
+    /// AAC-LC re-anchor's first frame is one frame before the new PTS.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn after_a_reanchor_only_the_last_frame_of_flush_zeros_goes_out() {
+        let mut enc = resampling_encoder(AudioCodec::AacLc, 48_000, 48_000);
+        let pcm = vec![vec![0.1f32; 1_000]; 2];
+        for k in 0..20u64 {
+            assert!(enc.submit_planar(&pcm, 900_000 + k * 1_875));
+        }
+        let before = enc.drain();
+        enc.reanchor_pts();
+        let flushed = enc.drain();
+        // 20 000 samples in, 19 frames out: the 544 in the accumulator and
+        // the 2048 in the delay line take three more, on the old timeline.
+        assert_eq!((before.len(), flushed.len()), (19, 3));
+        assert_eq!(flushed[0].pts, before[18].pts + 1_920);
+        assert!(flushed.windows(2).all(|w| w[1].pts - w[0].pts == 1_920));
+        for _ in 0..4 {
+            assert!(enc.submit_planar(&pcm, 50_000_000));
+        }
+        let after = enc.drain();
+        assert_eq!(after[0].pts, 50_000_000 - 1_920, "one frame before the new PTS");
+        assert!(after.windows(2).all(|w| w[1].pts - w[0].pts == 1_920));
+    }
 }
+

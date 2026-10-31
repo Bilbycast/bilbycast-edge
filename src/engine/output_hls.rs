@@ -1246,7 +1246,7 @@ impl HlsAudioChain {
                      ({expected:?}); re-anchoring",
                     self.ctx.output_id, frame.pts,
                 );
-                enc.reanchor_pts();
+                enc.reanchor_through(&mut self.stage);
             }
             self.in_anchor = Some(frame.pts);
             self.in_samples = 0;

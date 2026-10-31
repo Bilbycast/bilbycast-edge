@@ -145,6 +145,47 @@ pub enum GapFill {
     Relabel,
 }
 
+/// A [`GapFill::Relabel`] step waiting for the output frame it belongs on.
+///
+/// The step is found at the PES that shows it, and what the pipeline still
+/// holds then — the decoder's and the stage's delay, the encoder's
+/// accumulator and its delay line (AAC-LC 2048 samples) — is content from
+/// before it. Applied to the next frame out, as it was, that content was
+/// stamped the whole step late: the last 42.7 ms of each loop of a file
+/// whose audio ends 320 ms before its picture went out 320 ms late. It goes
+/// on the first frame whose content is mostly past the step, so at most
+/// half a frame of either side is stamped on the other's timeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingRelabel {
+    /// Where the content before the step ends, on the source timeline.
+    from_90k: u64,
+    /// The step.
+    off_90k: u64,
+}
+
+/// Take `pending` into `out_pts_90k` if the frame at model position
+/// `model_90k` — its content starting at `model_90k - latency_90k` and
+/// lasting `frame_90k` — is mostly past the step, and return that frame's
+/// model position after it.
+fn take_due_relabel(
+    pending: &mut Option<PendingRelabel>,
+    out_pts_90k: &mut u64,
+    model_90k: u64,
+    latency_90k: u64,
+    frame_90k: u64,
+) -> u64 {
+    let Some(r) = *pending else {
+        return model_90k;
+    };
+    let content = model_90k.wrapping_sub(latency_90k).wrapping_add(frame_90k / 2) & PTS_MASK;
+    if pts_diff(content, r.from_90k) < 0 {
+        return model_90k;
+    }
+    *pending = None;
+    *out_pts_90k = out_pts_90k.wrapping_add(r.off_90k) & PTS_MASK;
+    model_90k.wrapping_add(r.off_90k) & PTS_MASK
+}
+
 /// 33-bit PTS arithmetic.
 const PTS_MASK: u64 = 0x1_FFFF_FFFF;
 /// A source-timeline offset beyond this, either way, re-anchors the output
@@ -630,6 +671,10 @@ pub struct TsAudioReplacer {
     out_pts_90k: u64,
     /// Output samples emitted since the current anchor was set.
     samples_since_anchor: u64,
+    /// A [`GapFill::Relabel`] step not yet applied to `out_pts_90k`: the
+    /// output frames still to come whose content is from before the step
+    /// keep the old stamps ([`PendingRelabel`]).
+    pending_relabel: Option<PendingRelabel>,
 
     /// The source audio timeline the output is held to.
     timeline: Timeline,
@@ -811,6 +856,7 @@ impl TsAudioReplacer {
             pmt_version: OutVersion::new(),
             out_pts_90k: 0,
             samples_since_anchor: 0,
+            pending_relabel: None,
             timeline: Timeline::default(),
             gap_fill: GapFill::default(),
             pcr_pid: None,
@@ -1501,6 +1547,7 @@ impl TsAudioReplacer {
         self.clock_fill = ClockFill::default();
         self.pending_drop = 0;
         self.pending_fill_90k = 0;
+        self.pending_relabel = None;
         self.av_skew_from_90k = None;
         #[cfg(feature = "fdk-aac")]
         {
@@ -1875,6 +1922,7 @@ impl TsAudioReplacer {
         let at = pts as i128 - self.pending_out_90k() as i128 - self.stage_offset_90k() as i128;
         self.out_pts_90k = at.rem_euclid(PTS_MASK as i128 + 1) as u64;
         self.samples_since_anchor = 0;
+        self.pending_relabel = None;
         let rate = self.timeline.rate;
         self.timeline = Timeline {
             anchored: true,
@@ -1910,7 +1958,15 @@ impl TsAudioReplacer {
                     gap_90k = off,
                     "ts_audio_replace: source timeline gap stepped over (timestamp relabel)"
                 );
-                self.out_pts_90k = self.out_pts_90k.wrapping_add(off as u64) & PTS_MASK;
+                // One step still waiting for its frame (two within a few
+                // frames of each other) is taken now.
+                if let Some(r) = self.pending_relabel.take() {
+                    self.out_pts_90k = self.out_pts_90k.wrapping_add(r.off_90k) & PTS_MASK;
+                }
+                // The step lands on the first output frame whose content is
+                // mostly past it: the decoder, the stage and the encoder
+                // still hold the content before it.
+                self.pending_relabel = Some(PendingRelabel { from_90k: self.timeline.end_90k(), off_90k: off as u64 });
                 self.timeline.base_90k = self.timeline.base_90k.wrapping_add(off as u64) & PTS_MASK;
             }
         }
@@ -2392,9 +2448,12 @@ impl TsAudioReplacer {
         }
         // Model position of this PES's first sample (still to be pushed), as
         // the stamps assume the stage places it…
+        // A relabel step still waiting for its frame is this PES's: its audio
+        // is past the step.
         let at = (self.next_output_pts_90k(self.resolved_sample_rate) as i128
             + self.pending_out_90k() as i128
-            + self.stage_offset_90k() as i128)
+            + self.stage_offset_90k() as i128
+            + self.pending_relabel.map_or(0, |r| r.off_90k) as i128)
             .rem_euclid(PTS_MASK as i128 + 1) as u64;
         // …which is the first sample after any overlap still to be dropped.
         let first = pts.wrapping_add(self.pending_drop * 90_000 / self.timeline.rate as u64) & PTS_MASK;
@@ -2517,6 +2576,13 @@ impl TsAudioReplacer {
                                         / sr as u64,
                                 )
                             };
+                            let model = take_due_relabel(
+                                &mut self.pending_relabel,
+                                &mut self.out_pts_90k,
+                                model,
+                                self.latency.applied_90k,
+                                (frame_size as u64 * 90_000).checked_div(u64::from(sr)).unwrap_or(0),
+                            );
                             let pts_for_pes =
                                 model.wrapping_sub(self.latency.applied_90k) & PTS_MASK;
                             let pes = build_audio_pes(
@@ -2566,6 +2632,13 @@ impl TsAudioReplacer {
                                             / sr as u64,
                                     )
                                 };
+                                let model = take_due_relabel(
+                                    &mut self.pending_relabel,
+                                    &mut self.out_pts_90k,
+                                    model,
+                                    self.latency.applied_90k,
+                                    (ef.num_samples as u64 * 90_000).checked_div(u64::from(sr)).unwrap_or(0),
+                                );
                                 let pts_for_pes =
                                     model.wrapping_sub(self.latency.applied_90k) & PTS_MASK;
                                 let pes = build_audio_pes(
@@ -5264,6 +5337,46 @@ mod tests {
         assert_eq!(r.stats_handle().timeline_corrections.load(Ordering::Relaxed), 1);
         let e = err_samples("aac_lc", &out, src_time(at) + 6_840.0, 48_000);
         assert!(e.abs() <= 3.0, "{e}");
+    }
+
+    /// **AT-3.** The audio *before* a `media_player` splice step keeps its
+    /// own timeline: what the pipeline still holds when the PES showing the
+    /// step arrives — the decoder's and the encoder's delay lines (AAC-LC
+    /// 2048 samples) and the accumulator — goes out before the step, which
+    /// lands on the first frame whose content is mostly past it. The step
+    /// used to apply to the next frame out, presenting that content late by
+    /// the whole step (320 ms at each loop of a file whose audio ends 320 ms
+    /// before its picture). The audio after the step is still on time.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn relabel_keeps_the_audio_before_the_step_on_its_timeline() {
+        use e2e::*;
+        // The source AU 40 carries content from sample 40 * 1024 - 2048 on
+        // (its encoder's priming), and the step is taken at its PES: a
+        // burst ending 200 samples before that is the old programme's tail,
+        // and one 250 ms later the new programme's (further apart than the
+        // search for either looks).
+        let before = 40 * 1024 - 2048 - 480 - 200;
+        let after = 40 * 1024 + 12_000;
+        let mut pcm = content(before, 48_000 * 2);
+        pcm[after..after + 480].copy_from_slice(&burst(RATE));
+        let mut aus = encode_source(Src::Aac, &pcm);
+        for au in aus.iter_mut().skip(40) {
+            au.1 += 6_840;
+        }
+        let ts = mux(0x0F, &pack(&aus, 1));
+        for target in ["aac_lc", "mp2"] {
+            let mut r = replacer(target, None, None);
+            r.set_gap_fill(GapFill::Relabel);
+            let out = run(&mut r, &ts);
+            assert_eq!(r.stats_handle().timeline_corrections.load(Ordering::Relaxed), 1);
+            let e = err_samples(target, &out, src_time(before), 48_000);
+            assert!(e.abs() <= 3.0, "{target}: the audio before the step is {e} samples off");
+            let e = err_samples(target, &out, src_time(after) + 6_840.0, 48_000);
+            assert!(e.abs() <= 3.0, "{target}: the audio after the step is {e} samples off");
+            let steps: Vec<i64> = audio_pes(&out).windows(2).map(|w| pts_diff(w[1].0, w[0].0)).collect();
+            assert!(steps.iter().all(|&d| d > 0), "{target}: the stamps never step back");
+        }
     }
 
     /// **AT-3.** A step of more than 500 ms re-anchors, forward or back:
