@@ -332,6 +332,8 @@ is the last-resort default). Absent only on older edges. Fields:
 | `configured_kind` | What the operator / auto-policy configured (e.g. `"auto"`, `"source_pcr_pll"`). Set when a fallback has fired so the UI can render "PCR PLL → Wallclock (fallback)". `None` in normal operation. |
 | `fallback_active` | `true` when the PLL fallback watcher has activated a degraded rung. |
 | `fallback_reason` | `"no_pcr_observed"` / `"insufficient_samples"` / `"jitter_too_high"`. Set only when `fallback_active`. |
+| `active_input_id` | The input whose stream the clock takes its rate from: the active input for a source-PCR PLL, the designated `assembly.pcr_source` on an assembled flow. Absent for `ptp` and bare `wallclock`. |
+| `rate_source` | What last fed the source-PCR PLL a rate sample, while the PLL is the clock in use: `"sender_timestamp"` (the SRT sender's per-packet timestamp, libsrt's `srctime`), `"pcr"` (an MPEG-TS PCR read from the bytes) or `"none"` (no sample yet). Absent on every other kind and on a fallback rung. A flow pinned to `master_clock.kind: "sender_timestamp"` reads `"pcr"` whenever its packets reach the PLL without the sender timestamp — on default settings the muxer-mode clock rewriter drops it at ingress, so only an SRT input with `passthrough_clock: true` and no `program_number`, `pid_overrides`, `pid_map` or ingress transcode feeds it; RIST and every other transport always read `"pcr"`. Until 2026-10 the telemetry computed this and the copy into the stats dropped it. |
 
 The fallback transitions also surface as discrete `master_clock` events —
 see [`events-and-alarms.md`](events-and-alarms.md#master-clock-master_clock).

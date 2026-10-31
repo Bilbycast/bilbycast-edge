@@ -245,6 +245,18 @@ pub struct MasterClockStats {
     /// Additive — older managers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_input_id: Option<String>,
+    /// What last fed the source-PCR PLL a rate sample, while the PLL is the
+    /// clock in use: `"sender_timestamp"` (the SRT / RIST sender's
+    /// per-packet timestamp, libsrt's `srctime`), `"pcr"` (an MPEG-TS PCR
+    /// read from the bytes) or `"none"` (no sample yet). Absent on every
+    /// other kind and rung (`ptp`, `wallclock`, `passthrough`, a fallback
+    /// rung). Lets the manager tell a `sender_timestamp` flow that really
+    /// runs on the sender's clock from one that fell back to PCR — the
+    /// muxer-mode clock rewriter drops the sender timestamp at ingress, so
+    /// on default settings it reads `"pcr"`. Additive — older managers
+    /// ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_source: Option<String>,
 }
 
 #[inline]

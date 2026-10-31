@@ -86,9 +86,14 @@ on the wire, `MasterClockKindConfig` in `src/config/models.rs`):
   from the bytes. Useful for internet-contribution paths where SRT's
   latency buffer makes PCR-from-bytes look jittery to the PLL but the
   underlying libsrt `srctime` reflects the sender's clock cleanly.
-  **Framework only today** — the srctime extraction is wired through in a
-  follow-up. Config validation rejects this kind on a non-SRT / non-RIST
-  input.
+  The PLL takes the sender timestamp only from a packet that still carries
+  it, and falls back to PCR per packet otherwise: on default settings the
+  muxer-mode clock rewriter drops it at ingress, so only an SRT input with
+  `passthrough_clock: true` and no `program_number`, `pid_overrides`,
+  `pid_map` or ingress transcode delivers it (RIST carries none). The
+  flow's `master_clock.rate_source` says which fed the last sample
+  ([Telemetry](#telemetry)). Config validation rejects this kind on a
+  non-SRT / non-RIST input.
 
 **Why the cascade tries the PLL first then PTP, not wallclock.** The
 PLL often won't lock on contribution sources that carry per-source-restart
@@ -757,9 +762,9 @@ one holding a non-null packet, also went out without `sender_timestamp_us`,
 so the PLL of an SRT input with `passthrough_clock: true` and no
 `program_number`, `pid_overrides`, `pid_map` or ingress transcode lost its
 sender-timestamp reference for the rest of the flow: it ran on PCR
-(an internal choice no stats field names), or, on a CBR-padded source whose
-all-null datagrams kept the field, switched between the two and
-re-anchored. On any other SRT input one of those stages, or the muxer-mode
+(which no stats field named until `master_clock.rate_source`, see
+[Telemetry](#telemetry)), or, on a CBR-padded source whose all-null
+datagrams kept the field, switched between the two and re-anchored. On any other SRT input one of those stages, or the muxer-mode
 rewriter that `passthrough_clock: true` turns off, already drops that field
 at ingress, so its PLL runs on PCR either way.
 Now the fixer rewrites only a datagram that takes a DI, and that datagram
@@ -914,7 +919,8 @@ Every running flow surfaces a `master_clock` block on `FlowStats`:
     "locked": true,
     "rate_offset_ppm": -2.34,
     "jitter_us": 18,
-    "lipsync_offset_90k": 0
+    "lipsync_offset_90k": 0,
+    "rate_source": "pcr"
   }
 }
 ```
@@ -922,6 +928,17 @@ Every running flow surfaces a `master_clock` block on `FlowStats`:
 The 1 Hz background task in `FlowRuntime::start` mirrors the master's
 `telemetry()` snapshot into the stats accumulator. Manager UI renders
 the kind label, lock chip, rate offset, p99 jitter, and the trim knob.
+
+`rate_source` names what last fed the source-PCR PLL a rate sample, while
+the PLL is the clock in use: `sender_timestamp` (the SRT sender's
+per-packet `srctime`), `pcr` (a PCR read from the bytes) or `none` (no
+sample yet). It is absent on every other kind and on a fallback rung
+(`ptp`, `wallclock`, `passthrough`). A flow configured for
+`sender_timestamp` that reads `pcr` is running on PCR because its packets
+reach the PLL without the sender timestamp (see the `sender_timestamp` kind
+above). The telemetry computed it from the start, but the copy into
+`FlowStats` dropped it until 2026-10. Full field list:
+[metrics.md](metrics.md#master-clock-telemetry-flowstatsmaster_clock).
 
 ## Capability gating
 

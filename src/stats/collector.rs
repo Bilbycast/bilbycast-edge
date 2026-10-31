@@ -4610,6 +4610,7 @@ impl FlowStatsAccumulator {
             fallback_active: telemetry.fallback_active,
             fallback_reason: telemetry.fallback_reason,
             active_input_id: telemetry.active_input_id,
+            rate_source: telemetry.rate_source,
         };
         if let Ok(mut g) = self.master_clock_state.write() {
             *g = Some(stats);
@@ -7165,6 +7166,44 @@ mod input_audio_replacer_stats_tests {
         flow.remove_av_skew_reporter("in-1");
         let e = flow.snapshot().input.audio_encode_stats.expect("the encode handle stays");
         assert_eq!(e.timeline_corrections, 0);
+    }
+}
+
+#[cfg(test)]
+mod master_clock_stats_tests {
+    use super::*;
+    use crate::engine::master_clock::MasterClockHandle;
+
+    /// What last fed the PLL reaches the flow's `master_clock` block: the
+    /// telemetry computed it, and the copy into the stats dropped it, so no
+    /// stats field said whether a `sender_timestamp` flow ran on the
+    /// sender's clock or on PCR.
+    #[test]
+    fn the_master_clock_block_names_what_fed_the_pll() {
+        let flow = FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into());
+        let (handle, pll) = MasterClockHandle::source_pcr_pll("in-1");
+
+        flow.set_master_clock_telemetry(handle.telemetry());
+        let mc = flow.snapshot().master_clock.expect("a master clock block");
+        assert_eq!(mc.rate_source.as_deref(), Some("none"), "before the first sample");
+
+        pll.record_sample_at(27_000_000, 1_000_000);
+        flow.set_master_clock_telemetry(handle.telemetry());
+        let mc = flow.snapshot().master_clock.expect("a master clock block");
+        assert_eq!(mc.rate_source.as_deref(), Some("pcr"));
+
+        pll.record_sender_timestamp(1_793_429_395_917_554, 1_040_000);
+        flow.set_master_clock_telemetry(handle.telemetry());
+        let mc = flow.snapshot().master_clock.expect("a master clock block");
+        assert_eq!(mc.rate_source.as_deref(), Some("sender_timestamp"));
+        let wire = serde_json::to_value(&mc).unwrap();
+        assert_eq!(wire["rate_source"], "sender_timestamp");
+
+        // A clock no sample feeds names none, and the key is left out.
+        flow.set_master_clock_telemetry(MasterClockHandle::wallclock().telemetry());
+        let mc = flow.snapshot().master_clock.expect("a master clock block");
+        assert_eq!(mc.rate_source, None);
+        assert!(serde_json::to_value(&mc).unwrap().get("rate_source").is_none());
     }
 }
 
