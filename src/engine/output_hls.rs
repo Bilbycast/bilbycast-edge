@@ -1141,7 +1141,8 @@ impl HlsAudioChain {
                 for (au, au_pts) in aus {
                     let pts = next_pts(*au_pts, &mut self.running_pts);
                     match decoder.decode_frame(au) {
-                        Ok(decoded) => {
+                        Ok(mut decoded) => {
+                            crate::engine::audio_decode::seven_one_by_element(decoder, &mut decoded.planar);
                             let sr = decoder.sample_rate().unwrap_or(48_000);
                             if let Some(p) = pts {
                                 if sr > 0 {

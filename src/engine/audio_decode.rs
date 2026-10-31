@@ -855,6 +855,34 @@ impl PidAudioDecoder {
 // fdk-aac backend (default)
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// A 7.1 frame `decoder` (fdk-aac) just decoded from channel configuration 7,
+/// put in the order every other decoder here hands out: each channel element
+/// in the slot its position in the stream means.
+///
+/// ISO/IEC 14496-3 names configuration 7 7.1(wide) — centre, a front-centre
+/// pair, the front pair, a surround pair, LFE — and fdk-aac decodes it so,
+/// in WAVE order: the second pair as L / R, the third as the first surround
+/// pair, the first as the front-centre pair in the last two slots. No
+/// encoder in use writes that: ADTS cannot carry 7.1's own configuration
+/// (12), so ffmpeg's `aac` and Nero write their 7.1 (centre, front, side,
+/// back pairs) as 7, and libavcodec and FAAD decode 7 that way by default
+/// (`-strict 1` for the letter). Taken at fdk's word, the channel stage and
+/// fdk's 7.1 encoder (`MODE_7_1_BACK`, whose WAVE input puts the side pair
+/// last) carried the source's front pair as its side pair and its side
+/// pair in front, and the AC-3 5.1 mixdown folded the front pair into the
+/// surrounds. Swapped here to L, R, C, LFE, back pair, side pair — what
+/// libavcodec hands out for the same stream, and for an explicit 7.1
+/// program_config_element fdk itself. A no-op for any other configuration;
+/// a PCE naming three front elements (a 7.1(wide) stated outright) is left
+/// as fdk decodes it.
+#[cfg(feature = "fdk-aac")]
+pub fn seven_one_by_element(decoder: &aac_audio::AacDecoder, planar: &mut [Vec<f32>]) {
+    if planar.len() == 8 && decoder.stream_info().is_some_and(|i| i.channel_config == 7) {
+        planar.swap(0, 6);
+        planar.swap(1, 7);
+    }
+}
+
 #[cfg(feature = "fdk-aac")]
 pub struct AacDecoder {
     inner: aac_audio::AacDecoder,
@@ -982,7 +1010,7 @@ impl AacDecoder {
     pub fn decode_frame(&mut self, frame_bytes: &[u8]) -> Result<Vec<Vec<f32>>, AacDecodeError> {
         self.next_ts = self.next_ts.saturating_add(1024);
 
-        let decoded = self.inner.decode_frame(frame_bytes)
+        let mut decoded = self.inner.decode_frame(frame_bytes)
             .map_err(AacDecodeError::FdkAac)?;
 
         // Update cached values from actual decoded stream info
@@ -990,6 +1018,7 @@ impl AacDecoder {
             self.sample_rate = info.sample_rate;
             self.channels = info.channels;
         }
+        seven_one_by_element(&self.inner, &mut decoded.planar);
 
         Ok(decoded.planar)
     }
@@ -1220,9 +1249,228 @@ where
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+/// A 7.1 AAC source as encoders write one into ADTS, for the tests that
+/// follow each channel through a decoder, the channel stage and an encoder.
+#[cfg(all(test, feature = "fdk-aac"))]
+pub(crate) mod seven_one_fixture {
+    /// Rate of the fixture.
+    pub const RATE: u32 = 48_000;
+
+    /// The tone channel `k` carries, `k` in the order every decoder here
+    /// hands a 7.1 frame out — L, R, C, LFE, back pair, side pair: 300 +
+    /// 150·k Hz. (The LFE's is above what an LFE element carries, so it
+    /// is not identified.)
+    pub fn tone_hz(k: usize) -> f64 {
+        300.0 + 150.0 * k as f64
+    }
+
+    /// The channels whose tone survives the codec: all but the LFE.
+    pub const FULL_RANGE: [usize; 7] = [0, 1, 2, 4, 5, 6, 7];
+
+    /// `frames` ADTS frames (AAC-LC, 48 kHz) of channel configuration 7,
+    /// channel `k` a steady [`tone_hz`]`(k)` tone. Encoded by fdk's 7.1 mode,
+    /// whose raw data blocks hold the centre, then the front, side and back
+    /// pairs, then the LFE — the elements ffmpeg's `aac` writes for 7.1 —
+    /// with the header's channel configuration (fdk's 12, which ADTS masks
+    /// to 4) set to 7, as ffmpeg's ADTS muxer writes it.
+    pub fn adts_frames(frames: usize) -> Vec<Vec<u8>> {
+        let mut e = aac_audio::AacEncoder::open(&aac_codec::EncoderConfig {
+            profile: aac_codec::AacProfile::AacLc,
+            sample_rate: RATE,
+            channels: 8,
+            bitrate: 448_000,
+            afterburner: true,
+            sbr_signaling: aac_codec::SbrSignaling::default(),
+            transport: aac_codec::TransportType::Adts,
+        })
+        .unwrap();
+        let fs = e.frame_size() as usize;
+        let mut out = Vec::with_capacity(frames);
+        let mut at = 0usize;
+        while out.len() < frames {
+            let planar: Vec<Vec<f32>> = (0..8)
+                .map(|k| {
+                    (at..at + fs)
+                        .map(|n| {
+                            let w = 2.0 * std::f64::consts::PI * tone_hz(k) * n as f64 / f64::from(RATE);
+                            (0.2 * w.sin()) as f32
+                        })
+                        .collect()
+                })
+                .collect();
+            at += fs;
+            let mut f = e.encode_frame(&planar).unwrap().bytes;
+            if f.is_empty() {
+                continue;
+            }
+            // channel_configuration 7: the low bit of byte 2, the top two
+            // of byte 3.
+            f[2] |= 0x01;
+            f[3] |= 0xC0;
+            out.push(f);
+        }
+        out
+    }
+
+    /// Goertzel power of `hz` in `pcm` at `rate`.
+    pub fn tone_power(pcm: &[f32], hz: f64, rate: u32) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * hz / f64::from(rate);
+        let c = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &x in pcm {
+            let s = f64::from(x) + c * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        s1 * s1 + s2 * s2 - c * s1 * s2
+    }
+
+    /// Which of the full-range tones `pcm` carries most of.
+    pub fn dominant_tone(pcm: &[f32], rate: u32) -> usize {
+        FULL_RANGE
+            .into_iter()
+            .max_by(|&a, &b| tone_power(pcm, tone_hz(a), rate).total_cmp(&tone_power(pcm, tone_hz(b), rate)))
+            .unwrap()
+    }
+
+    /// For each channel of `planar` (decoded PCM, a priming second or so
+    /// already skipped), the tone it carries most of.
+    pub fn dominant_tones(planar: &[Vec<f32>], rate: u32) -> Vec<usize> {
+        planar.iter().map(|c| dominant_tone(c, rate)).collect()
+    }
+
+    /// Append `frame` to `acc`, channel by channel.
+    pub fn append(acc: &mut Vec<Vec<f32>>, frame: &[Vec<f32>]) {
+        if acc.is_empty() {
+            acc.resize(frame.len(), Vec::new());
+        }
+        for (a, f) in acc.iter_mut().zip(frame) {
+            a.extend_from_slice(f);
+        }
+    }
+
+    /// `adts` (one ADTS frame of AAC-LC, no CRC) as a LOAS frame carrying a
+    /// StreamMuxConfig whose AudioSpecificConfig names channel
+    /// configuration `ch_cfg` — AAC-LATM, which the edge decodes through
+    /// libavcodec.
+    pub fn loas_frame(adts: &[u8], ch_cfg: u8) -> Vec<u8> {
+        #[derive(Default)]
+        struct W {
+            out: Vec<u8>,
+            bits: usize,
+        }
+        impl W {
+            fn put(&mut self, n: u32, v: u32) {
+                for i in (0..n).rev() {
+                    if self.bits.is_multiple_of(8) {
+                        self.out.push(0);
+                    }
+                    if (v >> i) & 1 != 0 {
+                        let last = self.out.len() - 1;
+                        self.out[last] |= 0x80 >> (self.bits % 8);
+                    }
+                    self.bits += 1;
+                }
+            }
+        }
+        let sr_idx = u32::from((adts[2] >> 2) & 0x0F);
+        let au = &adts[7..];
+        let mut w = W::default();
+        // AudioMuxElement(1) with a StreamMuxConfig: version 0, one program
+        // of one layer, all streams on one time framing.
+        w.put(1, 0); // useSameStreamMux
+        w.put(1, 0); // audioMuxVersion
+        w.put(1, 1); // allStreamsSameTimeFraming
+        w.put(6, 0); // numSubFrames
+        w.put(4, 0); // numProgram
+        w.put(3, 0); // numLayer
+        w.put(5, 2); // audioObjectType: AAC-LC
+        w.put(4, sr_idx);
+        w.put(4, u32::from(ch_cfg));
+        w.put(3, 0); // frameLengthFlag, dependsOnCoreCoder, extensionFlag
+        w.put(3, 0); // frameLengthType
+        w.put(8, 0xFF); // latmBufferFullness
+        w.put(1, 0); // otherDataPresent
+        w.put(1, 0); // crcCheckPresent
+        // PayloadLengthInfo, then the access unit.
+        let mut n = au.len();
+        while n >= 255 {
+            w.put(8, 255);
+            n -= 255;
+        }
+        w.put(8, n as u32);
+        for &b in au {
+            w.put(8, u32::from(b));
+        }
+        let body = w.out;
+        let mut frame = vec![0x56, 0xE0 | ((body.len() >> 8) as u8 & 0x1F), body.len() as u8];
+        frame.extend_from_slice(&body);
+        frame
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N1: a 7.1 source in channel configuration 7 — what ffmpeg's `aac` and
+    /// Nero write for 7.1 — comes out of every decoder here with each
+    /// channel element in its own slot: L, R, C, LFE, back pair, side pair.
+    /// fdk-aac decodes configuration 7 by the letter (7.1(wide): the first
+    /// pair a front-centre pair, the second the front), which put the front
+    /// pair in the side slots and the side pair in front, and every 7.1
+    /// re-encode swapped them. libavcodec (here through LATM, the path the
+    /// edge decodes it on) reads configuration 7 as the encoders mean it,
+    /// so the two now agree.
+    #[cfg(all(feature = "fdk-aac", feature = "media-codecs"))]
+    #[test]
+    fn a_7_1_source_in_channel_configuration_7_decodes_each_element_to_its_slot() {
+        use seven_one_fixture::*;
+        let frames = adts_frames(150);
+        let want: Vec<usize> = (0..8).collect();
+        let check = |what: &str, planar: &[Vec<f32>]| {
+            assert_eq!(planar.len(), 8, "{what}: eight channels");
+            let got = dominant_tones(planar, RATE);
+            for k in FULL_RANGE {
+                assert_eq!(got[k], want[k], "{what}: slot {k} carries {} Hz: {got:?}", tone_hz(got[k]));
+            }
+        };
+        let skip = 40;
+        // The decoder RTMP / CMAF / WebRTC / SDI / the meters build.
+        let mut d = AacDecoder::from_adts_config(1, 3, 7).unwrap();
+        let mut acc = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let pcm = d.decode_frame(&f[7..]).unwrap();
+            if i >= skip {
+                seven_one_fixture::append(&mut acc, &pcm);
+            }
+        }
+        check("AacDecoder", &acc);
+        // The TS replacer's and HLS's ADTS decoder.
+        let mut d = aac_audio::AacDecoder::open_adts().unwrap();
+        d.set_max_output_channels(None).unwrap();
+        let mut acc = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            let mut pcm = d.decode_frame(f).unwrap().planar;
+            seven_one_by_element(&d, &mut pcm);
+            if i >= skip {
+                seven_one_fixture::append(&mut acc, &pcm);
+            }
+        }
+        check("fdk ADTS", &acc);
+        // libavcodec, on the same access units in LATM.
+        let mut d = open_ff_decoder(video_codec::AudioDecoderCodec::AacLatm).unwrap();
+        let mut acc = Vec::new();
+        for (i, f) in frames.iter().enumerate() {
+            d.send_packet(&loas_frame(f, 7), 0).unwrap();
+            while let Ok(frame) = d.receive_frame() {
+                if i >= skip {
+                    seven_one_fixture::append(&mut acc, &frame.planar);
+                }
+            }
+        }
+        check("libavcodec", &acc);
+    }
 
     /// `codec_needs_encode` names `audio_encode` only for a source the
     /// re-encode can decode: never AC-4, DTS, an unknown type or Opus.
