@@ -659,13 +659,13 @@ async fn rtp_output_loop(
                     );
                 }
 
-                // Extract TS payload: strip RTP header if forced-raw and
-                // the input was RTP-wrapped; otherwise use packet.data as-is.
+                // Extract TS payload: strip RTP header (CSRCs and extension
+                // included) if forced-raw and the input was RTP-wrapped;
+                // otherwise use packet.data as-is.
                 let ts_input: &[u8] = if !packet.is_raw_ts && force_raw_ts {
-                    if packet.data.len() > RTP_HEADER_SIZE {
-                        &packet.data[RTP_HEADER_SIZE..]
-                    } else {
-                        continue;
+                    match crate::engine::ts_parse::strip_rtp_header(packet) {
+                        [] => continue,
+                        ts => ts,
                     }
                 } else {
                     &packet.data[..]
@@ -764,12 +764,10 @@ async fn rtp_output_loop(
                 // Already-RTP-wrapped data: strip the upstream header,
                 // wrap with our local SSRC + seq so receivers see a
                 // coherent stream from us regardless of upstream
-                // synthesis quirks.
-                let inner_ts = if packet.data.len() > crate::engine::ts_parse::RTP_HEADER_MIN_SIZE {
-                    &packet.data[crate::engine::ts_parse::RTP_HEADER_MIN_SIZE..]
-                } else {
-                    &[][..]
-                };
+                // synthesis quirks. The header goes whole, CSRCs and
+                // extension included: a fixed 12-byte strip put them
+                // ahead of the TS, misaligning every packet.
+                let inner_ts = crate::engine::ts_parse::strip_rtp_header(packet);
                 let header = rtp_wrap.build_header(packet.rtp_timestamp);
                 let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + inner_ts.len());
                 buf.extend_from_slice(&header);
@@ -1126,12 +1124,9 @@ async fn rtp_output_redundant_loop(
                 // space, so a receiver sees one stream; forwarded with its
                 // upstream header, an RTP-framed flow went out as two SSRC
                 // and sequence spaces interleaved. FEC follows the numbers
-                // this sends.
-                let inner_ts = if packet.data.len() > crate::engine::ts_parse::RTP_HEADER_MIN_SIZE {
-                    &packet.data[crate::engine::ts_parse::RTP_HEADER_MIN_SIZE..]
-                } else {
-                    &[][..]
-                };
+                // this sends. The upstream header goes whole, CSRCs and
+                // extension included, so the TS stays aligned.
+                let inner_ts = crate::engine::ts_parse::strip_rtp_header(packet);
                 let header = rtp_wrap.build_header(packet.rtp_timestamp);
                 let mut buf = Vec::with_capacity(RTP_HEADER_SIZE + inner_ts.len());
                 buf.extend_from_slice(&header);
@@ -1598,6 +1593,39 @@ mod tests {
         assert!(media.iter().all(|dg| &dg[8..12] == ssrc), "one SSRC, keepalive included");
         assert!(media[24][RTP_HEADER_SIZE..].chunks(TS_PACKET_SIZE).all(|p| p[1] == 0x1F && p[2] == 0xFF));
         check_contiguous(&legs[0], 4, 4, 3);
+    }
+
+    /// RTP in whose header carries a CSRC and an extension, single-leg and
+    /// 2022-7: each datagram goes out as the output's 12-byte header and
+    /// the TS alone, aligned. The 2022-7 path, newly re-wrapping RTP,
+    /// stripped a fixed 12 bytes and put the CSRC and extension ahead of
+    /// the TS, so a receiver decoded nothing; the single-leg path always
+    /// had.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rtp_with_csrcs_and_an_extension_is_rewrapped_aligned() {
+        let full = TS_PACKETS_PER_DATAGRAM * TS_PACKET_SIZE;
+        let ts = ts_stream(48 * TS_PACKETS_PER_DATAGRAM);
+        let items = || -> Vec<RtpPacket> {
+            (0..48u16)
+                .map(|i| {
+                    let mut dg = vec![0x91, 33, 0x9C, i as u8, 0, 0, 0x10, 0, 0xDE, 0xAD, 0xBE, 0xEF];
+                    dg.extend_from_slice(&[0xC5, 0xC5, 0xC5, 0xC5]); // one CSRC
+                    dg.extend_from_slice(&[0xBE, 0xDE, 0, 1, 0x10, 0xAA, 0, 0]); // a one-word extension
+                    dg.extend_from_slice(&ts[i as usize * full..(i as usize + 1) * full]);
+                    item(dg, 0x9C00 + i, false)
+                })
+                .collect()
+        };
+        for dual in [false, true] {
+            let legs = capture(4, 4, dual, items(), 48).await;
+            let media: Vec<&Vec<u8>> = legs[0].iter().filter(|dg| !is_fec_packet(dg)).collect();
+            assert_eq!(media.len(), 48);
+            for (i, dg) in media.iter().enumerate() {
+                assert_eq!(dg[0], 0x80, "the output's own header: no CSRC, no extension");
+                assert_eq!(&dg[RTP_HEADER_SIZE..], &ts[i * full..(i + 1) * full], "dual {dual}: the TS alone");
+            }
+            check_contiguous(&legs[0], 4, 4, 3);
+        }
     }
 
     /// L=1: column FEC only, so a receiver publishes each datagram once.

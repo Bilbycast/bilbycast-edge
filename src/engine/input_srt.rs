@@ -1221,14 +1221,18 @@ async fn srt_input_redundant_loop(
             }
             _ = tokio::time::sleep_until(judge_at.unwrap_or_else(tokio::time::Instant::now)), if judge_at.is_some() => {
                 let now = tokio::time::Instant::now();
+                // A leg dropped as stale is down like a lost one: the merger
+                // follows a moved stream a second on, not the legs' lag on.
                 if judge1.as_mut().is_some_and(|j| j.stale(now, sock2.is_some())) {
                     let waited = judge1.take().map(|j| j.waited(now)).unwrap_or_default();
                     drop_stale_input_leg(&ctx, 1, waited, &mut sock1, &mut poller1).await;
+                    pair.size_stale_time(false, &config, redundancy);
                     acquire1 = Some(arm_input_leg(&ctx, 1, listener1.take(), Duration::ZERO, false));
                 }
                 if judge2.as_mut().is_some_and(|j| j.stale(now, sock1.is_some())) {
                     let waited = judge2.take().map(|j| j.waited(now)).unwrap_or_default();
                     drop_stale_input_leg(&ctx, 2, waited, &mut sock2, &mut poller2).await;
+                    pair.size_stale_time(false, &config, redundancy);
                     acquire2 = Some(arm_input_leg(&ctx, 2, listener2.take(), Duration::ZERO, false));
                 }
             }
@@ -1240,13 +1244,16 @@ async fn srt_input_redundant_loop(
                         acquire1 = Some(arm_input_leg(&ctx, 1, listener, Duration::ZERO, false));
                     }
                     LegAcquired::Connected(socket, listener) => {
+                        // One stats round trip for the judge's window and the
+                        // merger's stale time: neither leg's recv is polled
+                        // while it is in flight.
+                        let latency_ms = negotiated_latency_ms(&socket).await;
                         if listener.is_some() {
-                            judge1 = Some(LegJudge::new(&socket, input_leg_latency(&ctx, 1)).await);
+                            judge1 = Some(LegJudge::new(input_leg_latency(&ctx, 1), latency_ms));
                         }
                         listener1 = listener;
                         connect_failures.store(0, Ordering::Relaxed);
                         poller1 = Some(attach_input_leg(&ctx, 1, &socket, srt));
-                        let latency_ms = negotiated_latency_ms(&socket).await;
                         pair.leg_connected(1, latency_ms, sock2.is_some(), &config, redundancy);
                         sock1 = Some(socket);
                     }
@@ -1270,12 +1277,12 @@ async fn srt_input_redundant_loop(
                         acquire2 = Some(arm_input_leg(&ctx, 2, listener, Duration::ZERO, false));
                     }
                     LegAcquired::Connected(socket, listener) => {
+                        let latency_ms = negotiated_latency_ms(&socket).await;
                         if listener.is_some() {
-                            judge2 = Some(LegJudge::new(&socket, input_leg_latency(&ctx, 2)).await);
+                            judge2 = Some(LegJudge::new(input_leg_latency(&ctx, 2), latency_ms));
                         }
                         listener2 = listener;
                         poller2 = Some(attach_input_leg(&ctx, 2, &socket, srt));
-                        let latency_ms = negotiated_latency_ms(&socket).await;
                         pair.leg_connected(2, latency_ms, sock1.is_some(), &config, redundancy);
                         sock2 = Some(socket);
                     }
@@ -1882,12 +1889,14 @@ struct LegJudge {
 }
 
 impl LegJudge {
-    /// A judgement of `socket`, just accepted, whose configured receive
-    /// latency is `latency`: its window takes in the larger of that and the
-    /// TSBPD delay libsrt negotiated, which a sender asking for more raises.
-    async fn new(socket: &SrtSocket, latency: Duration) -> Self {
-        let negotiated = u64::try_from(socket.stats().await.ms_rcv_tsbpd_delay).unwrap_or(0);
-        Self::with_window(LEG_FIRST_DELIVERY_WINDOW + latency.max(Duration::from_millis(negotiated)))
+    /// A judgement of a leg just accepted, whose configured receive latency
+    /// is `latency` and whose TSBPD delay libsrt negotiated `negotiated_ms`
+    /// ([`negotiated_latency_ms`], read once for this and the merger's
+    /// stale time): its window takes in the larger, which a sender asking
+    /// for more raises.
+    fn new(latency: Duration, negotiated_ms: Option<u64>) -> Self {
+        let negotiated = Duration::from_millis(negotiated_ms.unwrap_or(0));
+        Self::with_window(LEG_FIRST_DELIVERY_WINDOW + latency.max(negotiated))
     }
 
     fn with_window(window: Duration) -> Self {
@@ -3253,6 +3262,9 @@ mod tests {
         /// How many seqs the pump sent to at least one leg. A seq is used
         /// only once it is, so the seqs sent are exactly `0..sent`.
         sent: Arc<std::sync::atomic::AtomicU64>,
+        /// How far back the pump's next seq steps, once: a source
+        /// restarting on numbers behind the old ones ([`Self::restart_source`]).
+        step_back: Arc<std::sync::atomic::AtomicU16>,
         pump: CancellationToken,
         cancel: CancellationToken,
         _rx: broadcast::Receiver<RtpPacket>,
@@ -3295,8 +3307,10 @@ mod tests {
             );
             let legs: Arc<std::sync::Mutex<[Option<Arc<SrtSocket>>; 2]>> = Arc::default();
             let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let step_back = Arc::new(std::sync::atomic::AtomicU16::new(0));
             let pump = cancel.child_token();
             let (to, count, stop) = (legs.clone(), sent.clone(), pump.clone());
+            let back = step_back.clone();
             tokio::spawn(async move {
                 let mut seq: u16 = 0;
                 let mut tick = tokio::time::interval(Duration::from_millis(2));
@@ -3304,6 +3318,7 @@ mod tests {
                     tokio::select! {
                         _ = stop.cancelled() => break,
                         _ = tick.tick() => {
+                            seq = seq.wrapping_sub(back.swap(0, Ordering::Relaxed));
                             let peers: Vec<Arc<SrtSocket>> =
                                 to.lock().unwrap().iter().flatten().cloned().collect();
                             let datagram = rtp_datagram(seq);
@@ -3326,10 +3341,16 @@ mod tests {
                 ports,
                 legs,
                 sent,
+                step_back,
                 pump,
                 cancel,
                 _rx: rx,
             }
+        }
+
+        /// Restart the source: the pump's next seq is `by` behind the last.
+        fn restart_source(&self, by: u16) {
+            self.step_back.store(by, Ordering::Relaxed);
         }
 
         /// A caller to leg `leg`'s listener, added to the pump.
@@ -3997,7 +4018,10 @@ mod tests {
     /// disagreed for a second past the hold, and raises the RTP input's
     /// Warning once for it; legs back on one new SSRC after both were lost
     /// count nothing more. An SRT pair used to check no SSRC, so its
-    /// `ssrc_mismatch` read 0 whatever the legs carried.
+    /// `ssrc_mismatch` read 0 whatever the legs carried. (The legs here
+    /// alternate packet by packet, so this pins no more of the restart than
+    /// that; that it forgets the legs' SSRCs is pinned on the merger,
+    /// `a_restart_forgets_the_legs_ssrcs_and_keeps_the_count`.)
     #[test]
     fn a_buffered_pair_reports_legs_carrying_different_ssrcs() {
         let mut bench = PairBench::new(serde_json::json!({ "path_differential_ms": 20 }));
@@ -4078,6 +4102,67 @@ mod tests {
         assert_eq!(judge.deadline(), None);
         judge.other_delivered(at(10_000));
         assert_eq!(judge.deadline(), Some(at(13_200)));
+    }
+
+    /// A judgement's window is 3 s past the larger of the leg's configured
+    /// receive latency and the one it negotiated, read once on the accept
+    /// for this and the merger's stale time.
+    #[test]
+    fn a_leg_judges_window_takes_the_larger_latency() {
+        let ms = Duration::from_millis;
+        assert_eq!(LegJudge::new(ms(120), Some(200)).window, ms(3_200));
+        assert_eq!(LegJudge::new(ms(1_500), Some(200)).window, ms(4_500));
+        assert_eq!(LegJudge::new(ms(120), None).window, ms(3_120), "libsrt said nothing");
+    }
+
+    /// A listener leg dropped as a stale accept is down like a lost one: the
+    /// other leg alone carrying the pair, a source restarting on numbers
+    /// behind the old ones is followed a second after the last packet
+    /// accepted, not the legs' lag and a second later. Legs at 120 ms and
+    /// 1 500 ms, each caller asking 200 ms, negotiate 200 and 1 500 ms, so
+    /// the stale leg's accept sized the merger to 2.3 s; the drop used to
+    /// leave it there until the leg's next accept, and the restart went
+    /// dark for 2.3 s.
+    #[tokio::test]
+    async fn a_leg_dropped_as_stale_leaves_the_merger_sized_for_one_leg() {
+        // The merger's clock: `now_us` reads 0 until the epoch is set.
+        crate::util::time::init_epoch();
+        let ports = (free_port(), free_port());
+        let mut h = InputPairHarness::start(
+            serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.0),
+                "latency_ms": 120,
+                "redundancy": {
+                    "mode": "listener", "local_addr": format!("127.0.0.1:{}", ports.1),
+                    "latency_ms": 1_500
+                }
+            }),
+            ports,
+        );
+        let _leg1 = h.connect(1).await;
+        h.wait_until("leg 1 to deliver", |h| h.forwarded() > 0).await;
+        let _silent = h.connect_silent(2).await;
+        h.wait_until("leg 2's stale verdict", |h| !h.stale(2).is_empty()).await;
+        h.settle().await;
+
+        let before = h.forwarded();
+        h.restart_source(20_000);
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        let (mut changed_at, mut seen) = (std::time::Instant::now(), before);
+        let mut longest = Duration::ZERO;
+        while seen < before + 400 {
+            assert!(std::time::Instant::now() < deadline, "the restarted stream is followed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let now = std::time::Instant::now();
+            if h.forwarded() != seen {
+                longest = longest.max(now - changed_at);
+                (changed_at, seen) = (now, h.forwarded());
+            }
+        }
+        assert!(
+            longest >= Duration::from_millis(800) && longest < Duration::from_millis(1_700),
+            "dark for {longest:?}: a second, not the 2.3 s of both legs' lag"
+        );
     }
 
     /// A 2022-7 input's listener leg that delivers nothing while the other

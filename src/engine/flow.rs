@@ -4836,7 +4836,8 @@ pub(crate) enum FixerCommand {
     SignalSourceDiscontinuity { pcr_pid: u16 },
     /// An input has been hot-removed from the flow. Drop its cached
     /// PAT/PMT so a later hot-add of an input under the same id doesn't
-    /// re-inject stale PSI on the next switch.
+    /// re-inject stale PSI on the next switch, and let the flow's framing
+    /// settle again if no input left carries it (`FlowFraming::forget`).
     ///
     /// Enqueued by the future `FlowRuntime::remove_input` path before
     /// the per-input cancel token fires. Idempotent on the fixer side —
@@ -4875,17 +4876,18 @@ async fn ts_fixer_task(
             cmd = rx.recv() => match cmd {
                 Some(FixerCommand::ActivePacket { input_id, pkt }) => {
                     active_ts = true;
-                    framing.observe(&pkt);
+                    framing.observe(&input_id, &pkt);
                     framing.conform(fix_active_packet(&mut fixer, &input_id, pkt), publish);
                 }
                 Some(FixerCommand::PassivePacket { input_id, pkt }) => {
+                    framing.note(&input_id, &pkt);
                     fixer.observe_passive(&input_id, &pkt);
                 }
                 Some(FixerCommand::Switch { input_id, pkt }) => {
                     active_ts = true;
                     // The flow takes its framing from the input's datagram,
                     // never from the PSI injected ahead of it.
-                    framing.observe(&pkt);
+                    framing.observe(&input_id, &pkt);
                     let injected = fixer.on_switch(&input_id);
                     // Framed like the datagram it precedes when that goes
                     // out as it came; otherwise left raw for `conform` to
@@ -4920,8 +4922,11 @@ async fn ts_fixer_task(
                 Some(FixerCommand::DropInputPsi { input_id }) => {
                     // An input was hot-removed. Drop its cached PAT/PMT
                     // so a later hot-add under the same id doesn't
-                    // re-inject stale PSI on the next switch. Idempotent.
+                    // re-inject stale PSI on the next switch, and let the
+                    // flow's framing settle again when no input left
+                    // carries it. Idempotent.
                     fixer.forget_input(&input_id);
+                    framing.forget(&input_id);
                 }
                 None => return,
             }
@@ -8726,9 +8731,10 @@ mod fixer_task_tests {
     /// A flow switching between an RTP-framed input and a raw-TS one keeps
     /// the framing it started with: the raw-TS input — and the PSI injected
     /// ahead of it — goes out wrapped in the flow's own RTP header, one
-    /// SSRC, numbered on, six TS packets to a datagram; the RTP input back
-    /// on air goes out as it came. A flow that started raw strips the RTP
-    /// input's header instead.
+    /// SSRC, numbered on, one datagram for each item of up to seven TS
+    /// packets (1328 bytes, as an RTP output wraps raw TS); the RTP input
+    /// back on air goes out as it came. A flow that started raw strips the
+    /// RTP input's header instead.
     #[tokio::test]
     async fn a_flow_keeps_the_framing_it_started_with_across_takes() {
         let seven: Vec<u8> = (0..7).flat_map(|cc| payload_packet(0x100, cc)).collect();
@@ -8739,11 +8745,11 @@ mod fixer_task_tests {
                 FixerCommand::Switch { input_id: "b".into(), pkt: raw(&seven) },
                 FixerCommand::Switch { input_id: "a".into(), pkt: rtp(0xA, 140, &payload_packet(0x100, 1)) },
             ],
-            5,
+            4,
         )
         .await;
         assert!(out.iter().all(|p| !p.is_raw_ts));
-        let wrapped = &out[1..4];
+        let wrapped = &out[1..3];
         let ssrc = ssrc_of(&wrapped[0]);
         assert_ne!(ssrc, 0xA, "the flow's own SSRC");
         for (i, p) in wrapped.iter().enumerate() {
@@ -8753,10 +8759,9 @@ mod fixer_task_tests {
         let injected: Vec<u16> =
             wrapped[0].data[12..].chunks(TS_PACKET_SIZE).map(crate::engine::ts_parse::ts_pid).collect();
         assert_eq!(injected, [0, 0x1000], "the PAT and PMT ahead of the input, in one datagram");
-        assert_eq!(wrapped[1].data.len(), 12 + 6 * TS_PACKET_SIZE);
-        assert_eq!(&wrapped[1].data[12..], &seven[..6 * TS_PACKET_SIZE]);
-        assert_eq!(&wrapped[2].data[12..], &seven[6 * TS_PACKET_SIZE..]);
-        assert_eq!((ssrc_of(&out[4]), seq_of(&out[4])), (0xA, 140), "the RTP input as it came");
+        assert_eq!(wrapped[1].data.len(), 12 + 7 * TS_PACKET_SIZE, "the item in one datagram");
+        assert_eq!(&wrapped[1].data[12..], &seven[..]);
+        assert_eq!((ssrc_of(&out[3]), seq_of(&out[3])), (0xA, 140), "the RTP input as it came");
 
         let out = published(
             vec![
@@ -8768,6 +8773,30 @@ mod fixer_task_tests {
         .await;
         assert!(out.iter().all(|p| p.is_raw_ts));
         assert_eq!(&out[1].data[..], &payload_packet(0x100, 2)[..], "stripped of its header");
+    }
+
+    /// An RTP input replaced in place by a raw-TS one — the new input added
+    /// and switched to, then the RTP input removed — leaves the flow with
+    /// no input carrying RTP, so the replacement goes out raw TS from its
+    /// next datagram rather than wrapped in the flow's RTP header for the
+    /// rest of the flow, as it did when the framing held for the fixer
+    /// task's life.
+    #[tokio::test]
+    async fn an_input_replaced_in_place_goes_out_in_its_own_framing() {
+        let seven: Vec<u8> = (0..7).flat_map(|cc| payload_packet(0x100, cc)).collect();
+        let out = published(
+            vec![
+                FixerCommand::ActivePacket { input_id: "a".into(), pkt: rtp(0xA, 100, &payload_packet(0x100, 0)) },
+                FixerCommand::Switch { input_id: "b".into(), pkt: raw(&seven) },
+                FixerCommand::DropInputPsi { input_id: "a".into() },
+                FixerCommand::ActivePacket { input_id: "b".into(), pkt: raw(&seven) },
+            ],
+            3,
+        )
+        .await;
+        assert!(!out[1].is_raw_ts, "wrapped while the RTP input is still on the flow");
+        assert!(out[2].is_raw_ts, "raw TS once it has gone");
+        assert_eq!(&out[2].data[..], &seven[..]);
     }
 
     /// `input`'s forwarder, reading `input_tx`, with its liveness counters.

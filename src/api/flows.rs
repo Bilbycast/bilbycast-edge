@@ -141,7 +141,8 @@ pub async fn create_flow(
     let mut config = state.config.write().await;
     crate::config::validation::validate_flow_hitless_legs(&flow, &config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    crate::config::validation::validate_flow_input_assignment(&flow, &config)
+    let running = |id: &str| state.flow_manager.is_running(id);
+    crate::config::validation::validate_flow_input_assignment(&flow, flow.enabled, &config, running)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     if config.flows.iter().any(|f| f.id == flow.id) {
@@ -201,7 +202,8 @@ pub async fn update_flow(
     let mut config = state.config.write().await;
     crate::config::validation::validate_flow_hitless_legs(&flow, &config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    crate::config::validation::validate_flow_input_assignment(&flow, &config)
+    let running = |id: &str| state.flow_manager.is_running(id);
+    crate::config::validation::validate_flow_input_assignment(&flow, flow.enabled, &config, running)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let idx = config
@@ -282,6 +284,8 @@ pub async fn delete_flow(
 ///
 /// - [`ApiError::Conflict`] (409) if the flow is already running.
 /// - [`ApiError::NotFound`] (404) if no flow with the given `flow_id` exists in the config.
+/// - [`ApiError::BadRequest`] (400) if another enabled or running flow holds one of
+///   its inputs: a disabled flow is started all the same, so it is judged as running.
 /// - [`ApiError::Internal`] (500) if the engine fails to start the flow.
 pub async fn start_flow(
     _admin: RequireAdmin,
@@ -299,6 +303,9 @@ pub async fn start_flow(
         .find(|f| f.id == flow_id)
         .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?
         .clone();
+    let running = |id: &str| state.flow_manager.is_running(id);
+    crate::config::validation::validate_flow_input_assignment(&flow, true, &config, running)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let resolved = resolve_flow(&config, &flow)?;
 
     drop(config); // release read lock before async engine call
@@ -1211,6 +1218,48 @@ mod whole_config_tests {
         assert!(!config.flows[1].enabled && config.flows[1].input_ids == ["b"]);
         assert!(!state.config_path.exists(), "nothing written");
         assert!(state.flow_manager.get_runtime("f").is_none() && state.flow_manager.get_runtime("h").is_none());
+    }
+
+    /// `POST /api/v1/flows/{id}/start` starts a disabled flow too, so it is
+    /// judged as running: refused 400 while another flow runs one of its
+    /// inputs — an enabled one, or a disabled one it started — and nothing
+    /// starts. It checked nothing, and started a second runtime of the input.
+    #[tokio::test]
+    async fn start_refuses_an_input_another_flow_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let flow = |id: &str, enabled: bool, inputs: &[&str]| -> FlowConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "enabled": enabled, "input_ids": inputs, "output_ids": []
+            }))
+            .expect("flow fixture")
+        };
+        {
+            let mut config = state.config.write().await;
+            config.inputs = serde_json::from_value(serde_json::json!([
+                { "id": "a", "name": "a", "type": "udp", "bind_addr": "127.0.0.1:29902" },
+                { "id": "b", "name": "b", "type": "udp", "bind_addr": "127.0.0.1:29903" }
+            ]))
+            .expect("inputs fixture");
+            config.flows = vec![
+                flow("g", true, &["a"]),
+                flow("parked", false, &["a"]),
+                flow("p1", false, &["b"]),
+                flow("p2", false, &["b"]),
+            ];
+        }
+        let start = |id: &str| start_flow(RequireAdmin, State(state.clone()), Path(id.to_string()));
+
+        let started = start("parked").await;
+        assert!(matches!(started, Err(ApiError::BadRequest(_))), "400");
+        assert!(refusal(started).contains("already assigned to another flow ('g')"));
+        assert!(state.flow_manager.get_runtime("parked").is_none(), "nothing started");
+
+        assert!(start("p1").await.is_ok(), "no other flow runs b");
+        let started = start("p2").await;
+        assert!(refusal(started).contains("already assigned to another flow ('p1')"), "p1 runs b, saved disabled");
+        assert!(state.flow_manager.get_runtime("p2").is_none(), "nothing started");
+        let _ = state.flow_manager.destroy_flow("p1").await;
     }
 
     /// What a refused request answered.
