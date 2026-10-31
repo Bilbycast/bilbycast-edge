@@ -759,10 +759,24 @@ fn whep_release(
 }
 
 /// How long a track a WebRTC session negotiated may carry nothing while the
-/// other track runs before it leaves the TS's layout: 1 s, as an RTMP
-/// publish's audio runs alone before the publish is taken for audio-only.
+/// other track runs before it leaves the TS's layout: before its first frame
+/// and after its last alike. 3 s: a server that sends a viewer video only
+/// from the source's next IDR (the edge's own WHEP output, re-encoding)
+/// sends its first picture up to a source GOP after the audio, and 2 s is
+/// the common GOP, so a merely late first picture neither leaves the PMT
+/// and comes back with a second version bump and PCR move at session start
+/// (it did at 1 s), nor does a screen share whose static picture repeats
+/// once a second leave between repeats. The cost is the wait: while a
+/// listed video carries nothing the PCR_PID names it and no PCR goes out.
 #[cfg(feature = "webrtc")]
-const TRACK_ABSENT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+const TRACK_ABSENT_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// A gap this long in the frames of the track that runs is a pause of the
+/// whole session (a network outage), not the other track gone: the other's
+/// absence clock starts again at the running track's next frame, so the
+/// pause counts nothing against it.
+#[cfg(feature = "webrtc")]
+const SESSION_PAUSE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Which tracks a WHIP publish or a WHEP pull carries on its TS: the tracks
 /// the session negotiated, then those the peer actually sends.
@@ -775,14 +789,17 @@ const TRACK_ABSENT_AFTER: std::time::Duration = std::time::Duration::from_secs(1
 /// it has anything to send on it — the edge's own WHEP output accepts H.264
 /// on a flow with no video, and Opus with no Opus to send (no
 /// `audio_encode`, and a source whose audio is not Opus) — and a publisher
-/// may offer a camera it never sends. So a listed track that has carried no
-/// frame once the other has run [`TRACK_ABSENT_AFTER`] leaves the PMT (a
-/// version bump; the video leaving moves the PCR onto the audio PID), and
-/// its first frame brings it back ([`Self::frame`]). A track that has
-/// carried a frame stays, as an RTMP publish's video does. Laid out from
+/// may offer a camera it never sends. Nor need a track that has been sent
+/// go on: a server's source may turn audio-only, a publisher may drop its
+/// camera. So a listed track that carries no frame while the other runs
+/// [`TRACK_ABSENT_AFTER`], before its first frame or since its last, leaves
+/// the PMT (a version bump; the video leaving moves the PCR onto the audio
+/// PID), and its next frame brings it back ([`Self::frame`]). Laid out from
 /// the negotiation alone, a session sending audio named a silent video PID
 /// as PCR_PID and carried no PCR, and one sending video listed an Opus
-/// stream nothing was sent on.
+/// stream nothing was sent on; and a track kept once it had carried a
+/// frame, as an RTMP publish's video is, left a video that stopped named as
+/// PCR_PID with no PCR on any PID for the rest of the session.
 #[cfg(feature = "webrtc")]
 #[derive(Debug)]
 struct WhipLayout {
@@ -793,11 +810,13 @@ struct WhipLayout {
     negotiated: [bool; 2],
     /// Listed in the muxer's PMT.
     listed: [bool; 2],
-    /// Has carried a frame.
-    seen: [bool; 2],
-    /// When the first frame of the other track arrived since the track was
-    /// listed, while it has carried none: its absence clock.
+    /// When the first frame of the other track arrived since the track's own
+    /// last frame (or, before its first, since it was listed): its absence
+    /// clock. Cleared by each of its own frames, so it runs only while the
+    /// other track does.
     absent_since: [Option<std::time::Instant>; 2],
+    /// When the track's last frame arrived.
+    last_frame: [Option<std::time::Instant>; 2],
 }
 
 #[cfg(feature = "webrtc")]
@@ -808,8 +827,8 @@ impl WhipLayout {
             applied: false,
             negotiated: [false; 2],
             listed: [false; 2],
-            seen: [false; 2],
             absent_since: [None; 2],
+            last_frame: [None; 2],
         }
     }
 
@@ -881,8 +900,12 @@ impl WhipLayout {
 
     /// A frame with a payload of the video (`video`) or the audio track,
     /// arrived at `arrival`, about to be muxed: its track back into the PMT
-    /// if it had left, and the other one out once it has been listed for
-    /// [`TRACK_ABSENT_AFTER`] of this one without a frame.
+    /// if it had left, and the other one out once this one has run
+    /// [`TRACK_ABSENT_AFTER`] without a frame of it — before its first or
+    /// since its last. The clock starts at this track's first frame after
+    /// the other's last, and again at its first after a pause of its own
+    /// ([`SESSION_PAUSE`]), so a pause of both (a network outage) does not
+    /// count.
     fn frame(
         &mut self,
         muxer: &mut crate::engine::rtmp::ts_mux::TsMuxer,
@@ -891,7 +914,11 @@ impl WhipLayout {
         flow_id: &str,
     ) {
         let (this, other) = if video { (0, 1) } else { (1, 0) };
-        self.seen[this] = true;
+        self.absent_since[this] = None;
+        if self.last_frame[this].is_some_and(|last| arrival.saturating_duration_since(last) >= SESSION_PAUSE) {
+            self.absent_since[other] = None;
+        }
+        self.last_frame[this] = Some(arrival);
         if self.list(muxer, this, true) {
             tracing::info!(
                 flow_id,
@@ -900,7 +927,7 @@ impl WhipLayout {
                 TRACK_NAMES[this]
             );
         }
-        if self.seen[other] || !self.listed[other] {
+        if !self.listed[other] {
             return;
         }
         let since = *self.absent_since[other].get_or_insert(arrival);
@@ -1206,17 +1233,24 @@ mod tests {
 
     /// A WHEP pull is laid out from the answer's tracks, then from what the
     /// server sends: a track the answer accepted that carries nothing while
-    /// the other runs a second leaves the PMT — the video taking the PCR
-    /// with it onto the Opus — and its first frame brings it back. The
-    /// edge's own WHEP output accepts both tracks whatever its flow carries,
-    /// so laid out from the answer alone a pull of its audio named a silent
-    /// video PID as PCR_PID and carried no PCR, and a pull of its video
-    /// alone listed an Opus stream nothing was sent on.
+    /// the other runs 3 s — before its first frame or since its last —
+    /// leaves the PMT, the video taking the PCR with it onto the Opus, and
+    /// its next frame brings it back. The edge's own WHEP output accepts both
+    /// tracks whatever its flow carries, so laid out from the answer alone a
+    /// pull of its audio named a silent video PID as PCR_PID and carried no
+    /// PCR, and a pull of its video alone listed an Opus stream nothing was
+    /// sent on. A video that stopped once it had sent a frame used to stay,
+    /// named as PCR_PID with no PCR on any PID; and with a 1 s window a first
+    /// picture merely late (a server that sends from the source's next IDR,
+    /// a 2 s GOP) left the PMT and came back, two version bumps and two PCR
+    /// moves at session start.
     #[cfg(feature = "webrtc")]
     #[test]
     fn a_whep_pulls_layout_follows_what_the_server_sends() {
         use std::time::{Duration, Instant};
         const BOTH: [(u8, u16); 2] = [(0x1B, 0x0100), (0x06, 0x0101)];
+        let window = super::TRACK_ABSENT_AFTER.as_millis() as u64;
+        assert_eq!(window, 3_000);
 
         /// A pull whose answer accepted video and audio, fed frames as its
         /// receive loop feeds them.
@@ -1248,41 +1282,67 @@ mod tests {
                 };
                 self.ts.extend(self.mux.frame(video, data, rtp, rate, at).unwrap().0);
             }
+
+            /// Audio every 20 ms and, where `video` says so, video every
+            /// 40 ms, over `from_ms..to_ms`.
+            fn run(&mut self, from_ms: u64, to_ms: u64, video: impl Fn(u64) -> bool) {
+                for at in (from_ms..to_ms).step_by(20) {
+                    self.frame(false, at);
+                    if at % 40 == 0 && video(at) {
+                        self.frame(true, at);
+                    }
+                }
+            }
         }
 
-        // Audio alone: the video leaves a second in, the Opus taking the
-        // PCR, and comes back with its first frame, the PCR with it.
+        // Audio alone: the video leaves 3 s in, the Opus taking the PCR,
+        // and comes back with its first frame, the PCR with it.
         let mut pull = Pull::new();
-        for k in 0..75 {
-            pull.frame(false, k * 20);
-        }
-        pull.frame(true, 1_500);
+        pull.run(0, window + 500, |_| false);
+        pull.frame(true, window + 500);
         assert_eq!(
             pmts_of(&pull.ts),
             vec![(0, 0x0100, BOTH.to_vec()), (1, 0x0101, vec![BOTH[1]]), (2, 0x0100, BOTH.to_vec())],
         );
         assert_eq!(pcr_pids_of(&pull.ts), vec![0x0101, 0x0100]);
 
-        // Video alone: the Opus leaves the PMT a second in.
+        // Video alone: the Opus leaves the PMT 3 s in.
         let mut pull = Pull::new();
-        for k in 0..30 {
-            pull.frame(true, k * 40);
+        for at in (0..window + 200).step_by(40) {
+            pull.frame(true, at);
         }
         assert_eq!(pmts_of(&pull.ts), vec![(0, 0x0100, BOTH.to_vec()), (1, 0x0100, vec![BOTH[0]])]);
         assert_eq!(pcr_pids_of(&pull.ts), vec![0x0100]);
 
-        // Both, the video's first frame 900 ms behind the audio's: nothing
-        // leaves, nothing moves.
+        // Both, the video's first frame 2.5 s behind the audio's (a source
+        // GOP of 2 s and an encoder's latency): nothing leaves, nothing
+        // moves.
         let mut pull = Pull::new();
-        for k in 0..75 {
-            pull.frame(false, k * 20);
-            if k >= 45 && k % 2 == 1 {
-                pull.frame(true, k * 20);
-            }
-        }
+        pull.run(0, window + 500, |at| at >= 2_500);
         assert_eq!(pmts_of(&pull.ts), vec![(0, 0x0100, BOTH.to_vec())]);
         assert_eq!(pcr_pids_of(&pull.ts), vec![0x0100]);
         assert!(carries_opus(&pull.ts));
+
+        // Both, then the video stops a second in while the audio runs on:
+        // the video leaves 3 s after its last frame, the PCR moving onto the
+        // Opus, and comes back with its next frame.
+        let mut pull = Pull::new();
+        pull.run(0, 1_000, |_| true);
+        pull.run(1_000, 1_000 + window + 500, |_| false);
+        pull.frame(true, 1_000 + window + 500);
+        assert_eq!(
+            pmts_of(&pull.ts),
+            vec![(0, 0x0100, BOTH.to_vec()), (1, 0x0101, vec![BOTH[1]]), (2, 0x0100, BOTH.to_vec())],
+        );
+        assert_eq!(pcr_pids_of(&pull.ts), vec![0x0100, 0x0101, 0x0100]);
+
+        // Both pause together for longer than the window (a network outage)
+        // and come back: neither ran alone, so nothing leaves.
+        let mut pull = Pull::new();
+        pull.run(0, 1_000, |_| true);
+        pull.run(1_000 + window + 2_000, 2 * window + 4_000, |_| true);
+        assert_eq!(pmts_of(&pull.ts), vec![(0, 0x0100, BOTH.to_vec())]);
+        assert_eq!(pcr_pids_of(&pull.ts), vec![0x0100]);
     }
 
     /// An audio-only WHIP publish: the PMT lists the Opus alone and names it
@@ -1343,7 +1403,7 @@ mod tests {
 
     /// A publisher that negotiates H.264 and Opus and then sends only its
     /// Opus — a camera offered and never sent — is laid out audio-only once
-    /// its audio has run a second alone: the PMT lists the Opus alone as
+    /// its audio has run 3 s alone: the PMT lists the Opus alone as
     /// PCR_PID, and the Opus carries the PCR. Laid out from the negotiation
     /// alone, PCR_PID named the silent video PID and no packet carried a PCR.
     #[cfg(feature = "webrtc")]
@@ -1393,9 +1453,10 @@ mod tests {
         .await;
         assert!(connected.is_ok(), "the publisher never connected");
 
-        // A second and a half of Opus (20 ms frames, TOC 0xFC), and no video.
+        // Three and a half seconds of Opus (20 ms frames, TOC 0xFC), and no
+        // video.
         let mut ts = Vec::new();
-        for k in 0..75u64 {
+        for k in 0..175u64 {
             let at = str0m::media::MediaTime::new(k * 960, str0m::media::Frequency::FORTY_EIGHT_KHZ);
             publisher.write_media(audio_mid, audio_pt, Instant::now(), at, &[0xFC; 80]).unwrap();
             publisher.drain_outputs().await;
@@ -2052,8 +2113,8 @@ mod tests {
     #[cfg(feature = "webrtc")]
     #[tokio::test]
     async fn a_whep_pull_of_audio_alone_publishes_the_audio() {
-        let server = serve_whep(|a| a, (false, true), 3_000).await;
-        let (ts, _) = pull_whep(server.addr, 4_000).await;
+        let server = serve_whep(|a| a, (false, true), 4_000).await;
+        let (ts, _) = pull_whep(server.addr, 5_000).await;
         server.task.abort();
         assert!(carries_opus(&ts), "no Opus was published ({} packets)", ts.len());
         let (_, pcr_pid, es) = pmts_of(&ts).pop().expect("a PMT");
@@ -2084,8 +2145,8 @@ mod tests {
             .map(|f| f.data.to_vec())
             .collect();
         assert!(packets.len() >= 100);
-        let server = serve_whep_sending(|a| a, (false, true), 3_000, Some(Arc::new(packets))).await;
-        let (ts, _) = pull_whep_with(server.addr, 4_000, serde_json::json!({ "audio_encode": { "codec": "aac_lc" } })).await;
+        let server = serve_whep_sending(|a| a, (false, true), 4_000, Some(Arc::new(packets))).await;
+        let (ts, _) = pull_whep_with(server.addr, 5_000, serde_json::json!({ "audio_encode": { "codec": "aac_lc" } })).await;
         server.task.abort();
         let (_, _, es) = pmts_of(&ts).pop().expect("a PMT");
         assert_eq!(es, vec![(0x0F, 0x0101)], "AAC on the audio PID");

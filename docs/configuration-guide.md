@@ -1446,9 +1446,9 @@ counted, naming as PCR_PID a PID nothing was sent on, with no PCR at all). The m
 used to assume video and no audio: the Opus of an A/V publish never reached
 the PMT, and an audio-only publish named an absent video PID as PCR_PID and
 carried no PCR. A track the publish negotiated and does not send — a camera offered and
-never sent — leaves the PMT once the other track has run 1 s without it, as
+never sent, or one the publisher stops sending — leaves the PMT once the other track has run 3 s without it, as
 on a WHEP pull ([below](#whep-input)), the PCR moving to the Opus, and comes
-back with its first frame (since 2026-10: PCR_PID used to name the silent
+back with its next frame (since 2026-10: PCR_PID used to name the silent
 video PID, with no PCR at all). A track negotiated after the media began
 joins the PMT with a version bump; audio used to join without one, so a
 receiver holding the PMT by its version never saw it. Each track's RTP timestamps start at a random base of the
@@ -1530,13 +1530,22 @@ the Opus as PCR_PID and the Opus carries the PCR. It then follows what the
 server sends, because an answer accepts a track whether or not anything
 will be sent on it: an edge's own WHEP output accepts H.264 from a flow
 with no video, and Opus when it has no Opus to send (no `audio_encode`, and
-a source whose audio is not Opus). A track that has sent no frame by the
-time the other has run **1 s** leaves the PMT, with a version bump; when
-that is the video, PCR_PID and the PCR move to the Opus. The track's first
-frame brings it back, with another bump, and a track that has sent a frame
-stays. So a pull of a server sending audio alone carries no PCR for its
-first second, and a pull of video alone lists the Opus for its first
-second. An answer that accepts neither track is not connected over, and
+a source whose audio is not Opus). Nor need a track that has been sent go
+on: a server's source may turn audio-only. A track that sends no frame
+while the other runs **3 s** — before its first frame or since its last —
+leaves the PMT, with a version bump; when that is the video, PCR_PID and
+the PCR move to the Opus. The track's next frame brings it back, with
+another bump. A pause of both tracks (a network outage) does not count: a
+gap of 1 s or more in the running track's own frames starts the 3 s again.
+So a pull of a server sending audio alone carries no PCR for its first
+3 s, a pull of video alone lists the Opus for its first 3 s, and a video
+that stops leaves the TS without a PCR for 3 s before the Opus takes it.
+The window is 3 s so that a first picture that is merely late does not
+leave and come back, two version bumps and two PCR moves at the start of
+the pull: a server that sends a viewer video only from the source's next
+IDR (an edge's WHEP output with `video_encode`) sends its first picture up
+to a source GOP after the audio, and a source GOP longer than about 2.5 s
+can still do it. An answer that accepts neither track is not connected over, and
 one the WebRTC stack cannot apply fails the pull: either raises a Warning
 `whep_answer_unusable` once per episode (until a pull connects), and the
 pull is tried again after the backoff. However a pull ends — the session
