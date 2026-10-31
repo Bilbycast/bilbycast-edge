@@ -4739,7 +4739,8 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
 /// natural keyframe before they can display the switched feed.
 /// Idle-keepalive period. When the active input's forwarder has gone
 /// this long without receiving a natural packet, it injects a single
-/// NULL-PID (0x1FFF) TS packet into the output so downstream receivers
+/// NULL-PID (0x1FFF) TS packet into the output — on an input that carries
+/// TS; a PCM or ANC input's forwarder sends none — so downstream receivers
 /// (ffplay, VLC, hardware decoders) see a live stream instead of socket
 /// silence. Without this, a 3 s+ gap on the output — which happens
 /// whenever the operator switches to an input that has no source feeding
@@ -4936,7 +4937,8 @@ fn fix_active_packet(fixer: &mut TsContinuityFixer, input_id: &str, pkt: RtpPack
 /// `ts_carrier` is whether the input produces MPEG-TS
 /// (`InputConfig::is_ts_carrier`); one that does not hands its active
 /// datagrams over as `FixerCommand::OpaquePacket` and its passive ones not
-/// at all, since there is no PSI in them to cache.
+/// at all, since there is no PSI in them to cache, and sends no keepalive
+/// while silent.
 fn spawn_input_forwarder(
     input_id: String,
     mut rx: broadcast::Receiver<RtpPacket>,
@@ -5002,6 +5004,13 @@ fn spawn_input_forwarder(
                             };
                             if fixer_tx.try_send(cmd).is_err() {
                                 full.fetch_add(1, Ordering::Relaxed);
+                                // A switch the full queue refused goes with
+                                // the input's next packet: the packet is lost
+                                // either way, as an `ActivePacket` would have
+                                // been, but the PSI and DI are not.
+                                if became_active {
+                                    was_active = false;
+                                }
                             }
                             keepalive.reset();
                         } else if ts_carrier
@@ -5024,8 +5033,13 @@ fn spawn_input_forwarder(
                 _ = keepalive.tick() => {
                     // Only emit keepalive when *this* input is the active
                     // one. Otherwise every passive forwarder would spam
-                    // null packets into the broadcast channel.
-                    if *active_input_rx.borrow() == input_id
+                    // null packets into the broadcast channel. Never for an
+                    // input that carries no TS: a datagram of TS NULL
+                    // packets in a PCM or ANC stream is no keepalive, and
+                    // its outputs (ST 2110, `rtp_audio`) were handed one
+                    // every 250 ms the input was silent.
+                    if ts_carrier
+                        && *active_input_rx.borrow() == input_id
                         && fixer_tx.try_send(FixerCommand::Keepalive).is_err() {
                             FIXER_TS_KEEPALIVE_FULL.fetch_add(1, Ordering::Relaxed);
                         }
@@ -8738,6 +8752,103 @@ mod fixer_task_tests {
         assert_eq!(&out[1].data[..], &payload_packet(0x100, 2)[..], "stripped of its header");
     }
 
+    /// `input`'s forwarder, reading `input_tx`, with its liveness counters.
+    fn forwarder(
+        input: &str,
+        ts_carrier: bool,
+        input_tx: &broadcast::Sender<RtpPacket>,
+        active_rx: watch::Receiver<String>,
+        fixer_tx: &tokio::sync::mpsc::Sender<FixerCommand>,
+        cancel: &CancellationToken,
+    ) -> (JoinHandle<()>, Arc<crate::stats::collector::PerInputCounters>) {
+        let meta = crate::stats::collector::InputConfigMeta {
+            mode: None,
+            local_addr: None,
+            remote_addr: None,
+            listen_addr: None,
+            bind_addr: None,
+            rtsp_url: None,
+            whep_url: None,
+        };
+        let counters = Arc::new(crate::stats::collector::PerInputCounters::new("test".into(), meta));
+        let handle = spawn_input_forwarder(
+            input.into(),
+            input_tx.subscribe(),
+            active_rx,
+            cancel.clone(),
+            fixer_tx.clone(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            counters.clone(),
+            ts_carrier,
+        );
+        (handle, counters)
+    }
+
+    /// A silent active input that carries no TS sends no keepalive: a
+    /// datagram of TS NULL packets is nothing a PCM or ANC output can take,
+    /// and its forwarder sent one every 250 ms. A TS input's still does.
+    #[tokio::test]
+    async fn a_silent_non_ts_input_sends_no_keepalive() {
+        for ts_carrier in [false, true] {
+            let (flow_tx, mut flow_rx) = broadcast::channel(64);
+            let (input_tx, _) = broadcast::channel(64);
+            let cancel = CancellationToken::new();
+            let _stop = cancel.clone().drop_guard();
+            let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(64);
+            tokio::spawn(ts_fixer_task(fixer_rx, flow_tx.clone(), cancel.clone()));
+            let (_active_tx, active_rx) = watch::channel("in".to_string());
+            let _fwd = forwarder("in", ts_carrier, &input_tx, active_rx, &fixer_tx, &cancel);
+            let got = tokio::time::timeout(Duration::from_millis(700), flow_rx.recv()).await;
+            if ts_carrier {
+                let pkt = got.expect("a keepalive within 700 ms").expect("on the flow broadcast");
+                assert!(crate::engine::ts_parse::is_null_ts_only(&pkt.data));
+            } else {
+                assert!(got.is_err(), "no keepalive from an input that carries no TS");
+            }
+        }
+    }
+
+    /// A switch the fixer's full queue refuses goes with the input's next
+    /// packet, so the switch's DI still lands. It went with the first packet
+    /// alone, and both were lost: the switch's PSI and DI never came.
+    #[tokio::test]
+    async fn a_switch_refused_by_a_full_queue_goes_with_the_next_packet() {
+        let (flow_tx, mut flow_rx) = broadcast::channel(64);
+        let (input_tx, _) = broadcast::channel(64);
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(1);
+        fixer_tx.try_send(FixerCommand::Keepalive).expect("room for one");
+        let (active_tx, active_rx) = watch::channel("a".to_string());
+        let (_fwd, counters) = forwarder("b", true, &input_tx, active_rx, &fixer_tx, &cancel);
+        // Let the forwarder start while "a" is on air, then take "b".
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        active_tx.send("b".to_string()).expect("the forwarder watches");
+        let published = |cc: u8| {
+            input_tx.send(raw(&pcr_packet(0x100, cc, 27_000_000 + cc as u64 * 1_080_000))).expect("subscribed");
+        };
+        published(0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while counters.packets.load(Ordering::Relaxed) < 1 {
+            assert!(std::time::Instant::now() < deadline, "the forwarder reads it");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // The queue drains; the next packet carries the switch.
+        tokio::spawn(ts_fixer_task(fixer_rx, flow_tx.clone(), cancel.clone()));
+        published(1);
+        let out = loop {
+            let pkt = tokio::time::timeout(Duration::from_secs(5), flow_rx.recv())
+                .await
+                .expect("published")
+                .expect("on the flow broadcast");
+            if !crate::engine::ts_parse::is_null_ts_only(&pkt.data) {
+                break pkt;
+            }
+        };
+        assert_eq!(ts_cc(&out.data[..TS_PACKET_SIZE]), 1, "the next packet");
+        assert!(ts_discontinuity_indicator(&out.data[..TS_PACKET_SIZE]), "with the switch's DI");
+    }
+
     /// An input that carries no MPEG-TS reaches the flow as it came: a
     /// 188-byte stride of its PCM that starts 0x47 and reads as a PCR on a
     /// PID with a pending DI takes no DI bit, and a source discontinuity
@@ -8753,26 +8864,7 @@ mod fixer_task_tests {
         let (fixer_tx, fixer_rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(ts_fixer_task(fixer_rx, flow_tx.clone(), cancel.clone()));
         let (_active_tx, active_rx) = watch::channel("pcm".to_string());
-        let meta = crate::stats::collector::InputConfigMeta {
-            mode: None,
-            local_addr: None,
-            remote_addr: None,
-            listen_addr: None,
-            bind_addr: None,
-            rtsp_url: None,
-            whep_url: None,
-        };
-        let counters = Arc::new(crate::stats::collector::PerInputCounters::new("st2110_30".into(), meta));
-        let _fwd = spawn_input_forwarder(
-            "pcm".into(),
-            input_tx.subscribe(),
-            active_rx,
-            cancel.clone(),
-            fixer_tx.clone(),
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            counters,
-            false,
-        );
+        let (_fwd, _) = forwarder("pcm", false, &input_tx, active_rx, &fixer_tx, &cancel);
         // A DI armed for PID 0x100 while a TS input was on air.
         fixer_tx
             .send(FixerCommand::SignalSourceDiscontinuity { pcr_pid: 0x100 })

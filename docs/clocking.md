@@ -754,7 +754,11 @@ fixer's on a switch's first PCR, or the source's own — so one new time base
 takes one DI. Until 2026-10 it armed one regardless, and a second DI landed
 one PCR late after every source jump in muxer mode and every Take between
 `passthrough_clock` or bonded inputs on different epochs, against gate
-10's one event per DI (`a_jump_already_carrying_a_di_arms_no_second`). The
+10's one event per DI (`a_jump_already_carrying_a_di_arms_no_second`). A
+Take leaves the watch nothing to add on an MPTS either: the fixer's switch
+DI goes on the first PCR of every PCR PID the new input's PMTs name, where
+it used to go on the first PCR of any one program only
+(`a_switch_to_an_mpts_marks_every_programs_first_pcr`). The
 watch runs only on a flow with an input that carries TS, and the fixer
 ignores a report made while an input that does not is on air. The watch
 arms that DI and nothing else: CC is untouched. Until edge#214 its first signal also switched the

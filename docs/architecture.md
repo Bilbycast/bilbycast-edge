@@ -254,6 +254,13 @@ broadcast IRDs) do not lose lock during a switch:
    gets a fresh stamp. Wraps at 32; each consecutive switch is still
    different from the previous.
 
+   The switch also arms the `discontinuity_indicator` for the new input's
+   first PCR and for the first PCR on every PCR PID its cached PMTs name, so
+   each program of an MPTS marks its new clock (until 2026-10 only the first
+   PCR of any program did, and the source-discontinuity watch added the
+   others' a PCR late). A switch the fixer's full queue refuses goes with
+   the input's next packet rather than being lost with the first.
+
 4. **Immediate forwarding** — All packets (video, audio, data) are forwarded
    immediately after a switch. The CC jump signals receivers to flush and
    resync on the next PES start. **Fully format-agnostic**: inputs can use
@@ -285,7 +292,10 @@ broadcast IRDs) do not lose lock during a switch:
    is never interleaved with an input's. Outputs that pass framing through
    (SRT) therefore carry one framing for the flow's life; outputs that strip
    (UDP, RIST, bonded) or re-wrap (RTP, single-leg and 2022-7) never cared.
-   A flow whose inputs share a framing converts nothing.
+   A flow whose inputs share a framing converts nothing. An SRT output still
+   has to fit each datagram to one 1316-byte live message: from the first
+   RTP datagram that does not fit, it numbers the stream itself, six TS
+   packets to a datagram (`KeepaliveGate::fit`).
 
 5. **Force IDR on the newly-active ingress re-encoder** — When the incoming
    input has an `video_encode` stage (ingress transcoding), the forwarder
@@ -307,7 +317,8 @@ broadcast IRDs) do not lose lock during a switch:
    flushes it immediately rather than letting it sit in the buffer.
    Receivers are required by spec to drop NULL packets; the keepalive
    exists purely to keep sockets and decoder state alive during dead-
-   input periods. Without it, a 3 s+ silence on the output triggers
+   input periods. Only an input that carries TS gets it: a PCM or ANC
+   input's forwarder sends none (it used to). Without it, a 3 s+ silence on the output triggers
    time-out / EOF behaviour in several downstream receivers that cannot
    be recovered by later data resuming. The keepalive is raw TS whatever
    the input's framing; an SRT output keeps each packet's framing, so it

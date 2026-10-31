@@ -21,7 +21,9 @@
 //!    and handle via their standard recovery path (flush PES buffers,
 //!    resync on next PUSI). The fixer also arms a one-shot
 //!    `pending_di_on_pcr` flag — the next PCR-bearing TS packet from the
-//!    new input has `discontinuity_indicator` (AF flags 0x80) set, so
+//!    new input has `discontinuity_indicator` (AF flags 0x80) set, as has
+//!    the first PCR on every other PCR PID its cached PMTs name (each
+//!    program of an MPTS has a clock of its own), so
 //!    receivers see the spec-defined "next PCR is a fresh STC anchor"
 //!    signal instead of treating the post-switch PCR-epoch jump as a
 //!    clock fault. CC alone is empirically not enough for receivers that
@@ -170,7 +172,10 @@ pub struct TsContinuityFixer {
     /// consecutive switch still produces a *different* value (N vs N+1).
     next_psi_version: u8,
     /// One-shot flag: set by [`on_switch`], cleared the next time
-    /// [`process_packet`] sees a PCR-bearing TS packet — at which point
+    /// [`process_packet`] sees a PCR-bearing TS packet, on any PID (the
+    /// switch also arms every PCR PID the new input's cached PMTs name in
+    /// `pending_di_pids`, so on an MPTS each program's first PCR after the
+    /// cut takes one) — at which point
     /// the `discontinuity_indicator` bit (AF flags 0x80) is OR'd into
     /// that packet's adaptation field, the only change the fixer makes to
     /// a media packet (its CC goes out as the source sent it). While it,
@@ -187,9 +192,10 @@ pub struct TsContinuityFixer {
     /// input finally produces data first.
     pending_di_on_pcr: bool,
     /// PCR PIDs whose next PCR must carry DI — a source discontinuity the
-    /// watcher saw on that PID's own clock. On an MPTS each program has its
-    /// own PCR, so the DI belongs on the program that jumped, not on
-    /// whichever PCR happens to come next.
+    /// watcher saw on that PID's own clock, or a switch to an input whose
+    /// cached PMTs name that PID as a PCR_PID. On an MPTS each program has
+    /// its own PCR, so the DI belongs on each program whose clock moved,
+    /// not on whichever PCR happens to come next.
     pending_di_pids: Vec<u16>,
 }
 
@@ -255,66 +261,6 @@ impl TsContinuityFixer {
         self.input_psi.remove(input_id);
     }
 
-    /// Return cached PAT + PMT packets suitable for a keepalive tick when
-    /// the active input has no live data flowing. Preference order:
-    ///
-    /// 1. the active input's own cache (if it has one — typical when
-    ///    the input has been live and just paused briefly);
-    /// 2. any other input's cache (fallback when the active input is a
-    ///    dead source — e.g. an RTP bind with nothing feeding it after
-    ///    an operator flipped the switch to it).
-    ///
-    /// Stamped with the **current** monotonic version (not advanced), so
-    /// the keepalive PSI doesn't force receivers to re-parse on every
-    /// tick — it just reiterates the last-known-good structure so the
-    /// decoder doesn't decide the stream has lost its PMT. The caller is
-    /// expected to send these periodically when no natural packet has
-    /// arrived recently.
-    #[allow(dead_code)]
-    pub fn keepalive_psi(&self, active_input_id: &str) -> Vec<RtpPacket> {
-        let mut out = Vec::new();
-        // First try the active input, then any other cached input.
-        let source = self
-            .input_psi
-            .get(active_input_id)
-            .filter(|c| c.cached_pat.is_some())
-            .or_else(|| self.input_psi.values().find(|c| c.cached_pat.is_some()));
-        let Some(cache) = source else {
-            return out;
-        };
-        let stamp = self.next_psi_version;
-        if let Some(mut pat) = cache.cached_pat {
-            set_psi_version(&mut pat, stamp);
-            out.push(RtpPacket {
-                data: Bytes::copy_from_slice(&pat),
-                sequence_number: 0,
-                rtp_timestamp: 0,
-                recv_time_us: 0,
-                is_raw_ts: true,
-                upstream_seq: None,
-                upstream_leg_id: None,
-                sender_timestamp_us: None,
-            });
-        }
-        for pmt in cache
-            .cached_pmts
-            .values()
-            .flat_map(|unit| super::ts_pmt_edit::restamp_pmt_unit(unit, stamp))
-        {
-            out.push(RtpPacket {
-                data: Bytes::copy_from_slice(&pmt),
-                sequence_number: 0,
-                rtp_timestamp: 0,
-                recv_time_us: 0,
-                is_raw_ts: true,
-                upstream_seq: None,
-                upstream_leg_id: None,
-                sender_timestamp_us: None,
-            });
-        }
-        out
-    }
-
     /// Observe a packet from a passive (non-active) input to pre-warm the
     /// PAT/PMT cache. Called by passive forwarders so that when a switch
     /// occurs, the cached PSI is already available for injection.
@@ -365,7 +311,9 @@ impl TsContinuityFixer {
     ///
     /// On top of the CC jump and the version-bumped phantom PSI, we also
     /// arm `pending_di_on_pcr` so the **first** PCR-bearing TS packet that
-    /// flows from the new input has its `discontinuity_indicator` bit set.
+    /// flows from the new input has its `discontinuity_indicator` bit set,
+    /// and arm every PCR_PID the input's cached PMTs name, so on an MPTS
+    /// the first PCR of each program after the cut carries it too.
     /// CC alone is empirically not enough on the passthrough output path —
     /// receivers strictly tracking PCR continuity (the broadcast-grade
     /// case) interpret the post-switch PCR-epoch jump as a clock fault
@@ -410,6 +358,17 @@ impl TsContinuityFixer {
             if cached_pat.is_some() { "yes" } else { "no" },
             cached_pmts.len(),
         );
+
+        // Every program's clock changes at the cut, not only the one whose
+        // PCR comes first: on an MPTS each PCR PID's first PCR after it
+        // takes a DI. With only the one-shot flag, the other programs'
+        // first PCRs went out without one, and the source-discontinuity
+        // watch then stamped theirs a PCR late.
+        for pid in pcr_pids(&cached_pmts) {
+            if !self.pending_di_pids.contains(&pid) {
+                self.pending_di_pids.push(pid);
+            }
+        }
 
         // Inject PAT from the new input's cache with the monotonic
         // version stamp.
@@ -509,7 +468,7 @@ impl TsContinuityFixer {
 /// a raw-TS datagram: the 12-byte RTP header and seven packets come to 1328
 /// bytes, past the 1316-byte live message an SRT output sends each item in,
 /// which would split the datagram and leave its tail without a header.
-const EDGE_RTP_TS_PACKETS: usize = 6;
+pub(crate) const EDGE_RTP_TS_PACKETS: usize = 6;
 
 /// One RTP datagram of `ts` under the header fields given, as the flow
 /// broadcast carries it, received with `template` and carrying
@@ -685,6 +644,27 @@ impl FlowFraming {
             _ => emit(pkt),
         }
     }
+}
+
+/// The PCR_PID each valid PMT in `units` names (NULL PID — no PCR —
+/// left out): the programs whose clock a switch to the input they were
+/// cached from moves.
+fn pcr_pids(units: &[Vec<[u8; TS_PACKET_SIZE]>]) -> Vec<u16> {
+    let mut pids = Vec::new();
+    for unit in units {
+        let mut asm = SectionAssembler::new();
+        for pkt in unit {
+            for sec in asm.push_packet(pkt) {
+                if sec.first() == Some(&0x02) && sec.len() >= 16 && mpeg2_crc32(sec) == 0 {
+                    let pid = u16::from_be_bytes([sec[8], sec[9]]) & 0x1FFF;
+                    if pid != NULL_PID && !pids.contains(&pid) {
+                        pids.push(pid);
+                    }
+                }
+            }
+        }
+    }
+    pids
 }
 
 /// Back-compat wrapper: bump the `version_number` by 1 modulo 32 and fix
@@ -1823,6 +1803,33 @@ mod tests {
             assert!(matches!(fixer.process_packet("a", &pcr), ProcessResult::Unchanged));
         }
         assert_eq!(fixer.pending_di_pids, vec![0x300], "still pending for its own PID");
+    }
+
+    /// A switch to an MPTS gives every program's first PCR after the cut a
+    /// DI, not only the first PCR of any program: each program's clock
+    /// moves. Before, the second program's first PCR went out without one,
+    /// and the source-discontinuity watch stamped its DI a PCR late.
+    #[test]
+    fn a_switch_to_an_mpts_marks_every_programs_first_pcr() {
+        let mut fixer = TsContinuityFixer::new();
+        let psi = [
+            build_pat(&[(1, 0x1000), (2, 0x1100)], 0),
+            build_pmt(0x1000, &[(0x1B, 0x100)], 0),
+            build_pmt(0x1100, &[(0x1B, 0x200)], 0),
+        ];
+        for pkt in &psi {
+            fixer.observe_passive("b", &make_rtp_packet(pkt));
+        }
+        let _ = fixer.on_switch("b");
+        let di = |fixer: &mut TsContinuityFixer, pid: u16, cc: u8| {
+            let pkt = make_rtp_packet(&build_pcr_packet(pid, cc, 27_000_000 + cc as u64 * 1_080_000));
+            ts_discontinuity_indicator(&fixer.process_packet("b", &pkt).forwarded(&pkt)[..TS_PACKET_SIZE])
+        };
+        assert!(di(&mut fixer, 0x100, 0), "program 1's first PCR");
+        assert!(di(&mut fixer, 0x200, 0), "program 2's first PCR");
+        assert!(!di(&mut fixer, 0x100, 1), "one DI per program");
+        assert!(!di(&mut fixer, 0x200, 1));
+        assert!(fixer.pending_di_pids.is_empty() && !fixer.pending_di_on_pcr, "nothing left pending");
     }
 
     /// An RTP datagram under `ssrc` numbered `seq` carrying `ts`, with a CSRC

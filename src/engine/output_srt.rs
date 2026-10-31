@@ -34,7 +34,7 @@ use super::audio_302m::{S302mOutputPipeline, SRT_TS_DATAGRAM_BYTES};
 use super::audio_transcode::InputFormat;
 use super::delay_buffer::resolve_output_delay;
 use super::packet::RtpPacket;
-use super::ts_parse::is_null_ts_only;
+use super::ts_parse::{is_null_ts_only, TS_PACKET_SIZE};
 use super::ts_pid_overrides_rewriter::TsPidOverridesRewriter;
 use super::ts_pid_remapper::TsPidRemapper;
 use super::ts_program_filter::TsProgramFilter;
@@ -50,8 +50,11 @@ use super::ts_program_filter::TsProgramFilter;
 /// chunked to ≤1316 bytes (= 7 × 188-byte MPEG-TS packets — the libsrt
 /// recommended live-mode default).
 ///
-/// UDP/RTP-sourced broadcast packets are typically already 1316 bytes and
-/// pass through unchanged. RTMP/RTSP-sourced packets can be much larger (a
+/// Raw-TS broadcast packets are typically already 1316 bytes and pass
+/// through unchanged. An RTP datagram cannot be cut here — its tail would
+/// leave without a header — so an RTP-framed stream is fitted to this size
+/// before it reaches the send path (`KeepaliveGate::fit`): an RTP/UDP
+/// sender's seven-packet datagram is 1328 bytes. RTMP/RTSP-sourced packets can be much larger (a
 /// TsMuxer-bundled I-frame can be tens of KB) and need to be split before
 /// they hit the SRT socket. Nothing here joins *small* items: a source that
 /// publishes fewer than seven TS packets per item leaves as that many small
@@ -707,7 +710,14 @@ async fn srt_output_listener_loop(
                                 continue;
                             }
                             window.offer(tokio::time::Instant::now());
-                            match srt_send_chunked(&socket, &packet.data).await {
+                            let mut sends = Ok(0);
+                            for (data, _) in keepalive_gate.fit(vec![(packet.data, 0)]) {
+                                sends = srt_send_chunked(&socket, &data).await;
+                                if sends.is_err() {
+                                    break;
+                                }
+                            }
+                            match sends {
                                 Ok(_) => {
                                     sent += 1;
                                     // After sending some packets, check for ACKs periodically
@@ -1128,11 +1138,18 @@ fn build_transcode_chain_for_srt(
 /// no decoder, so a receiver loses nothing it could use. A raw-TS stream
 /// still carries them through an input gap, for demuxers that give up on
 /// silence; an RTP-framed one never does.
+///
+/// It also fits an RTP-framed stream to SRT's live message ([`Self::fit`]),
+/// so it lives as long as the stream's numbering: per connection, and for
+/// the output's life on a 2022-7 output, whose legs share it.
 #[derive(Default)]
 struct KeepaliveGate {
     /// Whether the last media datagram sent went out raw TS; `None` before
     /// the first.
     raw_ts: Option<bool>,
+    /// This stream's own RTP header, from the first RTP datagram too large
+    /// for one live message on ([`Self::fit`]).
+    rewrap: Option<super::output_rtp::RtpWrapState>,
 }
 
 impl KeepaliveGate {
@@ -1144,6 +1161,61 @@ impl KeepaliveGate {
         }
         self.raw_ts = Some(raw_ts);
         true
+    }
+
+    /// `payloads`, about to go out on an RTP-framed stream, each fitted to
+    /// one SRT live message ([`SRT_LIVE_MAX_MSG_BYTES`]).
+    ///
+    /// The send path cuts anything longer into 1316-byte chunks, which
+    /// suits raw TS (seven whole packets a chunk) but split an RTP datagram
+    /// of seven TS packets — 1328 bytes, what an RTP/UDP SMPTE 2022-2
+    /// sender sends — into 1316 bytes and a 12-byte tail with no header.
+    /// So from the first RTP datagram that does not fit, the stream is
+    /// numbered by this output: every RTP datagram after it, of whatever
+    /// size, is cut on TS-packet boundaries into datagrams of up to
+    /// `EDGE_RTP_TS_PACKETS` (six) packets under this output's own SSRC
+    /// and contiguous sequence numbers, the payload type MP2T and the
+    /// source's timestamp. Re-numbering only the datagrams that did not fit
+    /// would interleave two sequence spaces; this changes the stream's SSRC
+    /// once, as a switch between two RTP inputs does. Until then datagrams
+    /// that fit go out as they came, upstream header and all, so an
+    /// RTP-over-SRT stream of six-packet datagrams is relayed with its own
+    /// numbers. Raw TS, and anything else not shaped as RTP, passes.
+    fn fit(&mut self, payloads: Vec<(Bytes, u64)>) -> Vec<(Bytes, u64)> {
+        let fits = |p: &Bytes| p.len() <= SRT_LIVE_MAX_MSG_BYTES;
+        if self.raw_ts != Some(false)
+            || (self.rewrap.is_none() && payloads.iter().all(|(p, _)| fits(p)))
+        {
+            return payloads;
+        }
+        let mut out = Vec::with_capacity(payloads.len() + 1);
+        for (payload, recv_time_us) in payloads {
+            let header_len = super::input_transcode::rtp_header_length(&payload)
+                .filter(|_| crate::util::rtp_parse::is_likely_rtp(&payload));
+            let Some(header_len) = header_len.filter(|_| self.rewrap.is_some() || !fits(&payload))
+            else {
+                out.push((payload, recv_time_us));
+                continue;
+            };
+            let wrap = self.rewrap.get_or_insert_with(|| {
+                tracing::info!(
+                    "SRT output: an RTP datagram of {} bytes does not fit one live message; \
+                     re-numbering the stream under this output's own SSRC",
+                    payload.len()
+                );
+                super::output_rtp::RtpWrapState::new()
+            });
+            let timestamp = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            let chunk = super::ts_continuity_fixer::EDGE_RTP_TS_PACKETS * TS_PACKET_SIZE;
+            for ts in payload[header_len..].chunks(chunk) {
+                let header = wrap.build_header(timestamp);
+                let mut datagram = Vec::with_capacity(header.len() + ts.len());
+                datagram.extend_from_slice(&header);
+                datagram.extend_from_slice(ts);
+                out.push((Bytes::from(datagram), recv_time_us));
+            }
+        }
+        out
     }
 }
 
@@ -1671,8 +1743,9 @@ async fn srt_output_forward_loop(
             }
         }
 
-        // Send all collected payloads to the SRT send task.
-        for (payload, recv_time_us) in payloads_to_send {
+        // Send all collected payloads to the SRT send task, an RTP-framed
+        // stream fitted to the live message first (`KeepaliveGate::fit`).
+        for (payload, recv_time_us) in keepalive_gate.fit(payloads_to_send) {
             match send_tx.try_send((payload, recv_time_us)) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -2344,6 +2417,8 @@ async fn srt_output_redundant_loop(
         // its socket instead: a send to a leg libsrt has given up fails, which
         // is how the keepalives found a leg lost while the input was silent.
         let held = held_keepalive.then_some(None);
+        // Fitted once, ahead of both legs, so they carry the same numbers.
+        let payloads_to_send = keepalive_gate.fit(payloads_to_send);
         for item in payloads_to_send.into_iter().map(Some).chain(held) {
             if tx1.is_none() && tx2.is_none() {
                 // No leg attached: discard, counting nothing. Counted as
@@ -4046,6 +4121,109 @@ mod tests {
         }
         let more = tokio::time::timeout(Duration::from_millis(500), peer.recv()).await;
         assert!(more.is_err(), "nothing else is sent");
+    }
+
+    /// `n` TS packets on PID 0x100, each with its own CC.
+    fn ts_packets(n: u8) -> Vec<u8> {
+        (0..n).flat_map(|cc| crate::engine::ts_test_fixtures::payload_packet(0x100, cc)).collect()
+    }
+
+    fn header_of(d: &[u8]) -> (u16, u32) {
+        (u16::from_be_bytes([d[2], d[3]]), u32::from_be_bytes([d[8], d[9], d[10], d[11]]))
+    }
+
+    /// RTP datagrams that fit one live message go out as they came; from
+    /// the first that does not, every RTP datagram is cut on TS-packet
+    /// boundaries into six-packet datagrams under the stream's own SSRC and
+    /// contiguous numbers, its CSRCs dropped and its timestamp kept. Raw TS
+    /// and payloads of a raw-TS stream are left alone.
+    #[test]
+    fn an_rtp_stream_is_fitted_to_the_live_message() {
+        let mut gate = KeepaliveGate::default();
+        assert!(gate.admit(&published(rtp_datagram(0), false), false));
+        let six = rtp_carrying(10, &ts_packets(6));
+        let mut seven = vec![0x81, 33, 0, 11, 0, 0, 0x30, 0x39, 0, 0, 0, 1, 0xCC, 0xCC, 0xCC, 0xCC];
+        seven.extend_from_slice(&ts_packets(7));
+        let item = |d: &[u8]| (Bytes::copy_from_slice(d), 7u64);
+        assert_eq!(gate.fit(vec![item(&six)]), vec![item(&six)], "fits: as it came");
+        let out = gate.fit(vec![item(&seven), item(&six)]);
+        assert_eq!(out.len(), 3, "six and one, then six");
+        let (seq0, ssrc) = header_of(&out[0].0);
+        assert_ne!(ssrc, 1, "the stream's own SSRC");
+        for (i, (d, recv)) in out.iter().enumerate() {
+            assert!(d.len() <= SRT_LIVE_MAX_MSG_BYTES);
+            assert_eq!((d[0], d[1], *recv), (0x80, 33, 7));
+            assert_eq!(header_of(d), (seq0.wrapping_add(i as u16), ssrc), "contiguous, one SSRC");
+        }
+        assert_eq!(u32::from_be_bytes([out[0].0[4], out[0].0[5], out[0].0[6], out[0].0[7]]), 12_345);
+        let ts: Vec<u8> = out.iter().flat_map(|(d, _)| d[12..].to_vec()).collect();
+        let want: Vec<u8> = [ts_packets(7), ts_packets(6)].concat();
+        assert_eq!(ts, want, "the TS packets in order, none split");
+        let raw = item(&ts_packets(7));
+        assert_eq!(gate.fit(vec![raw.clone()]), vec![raw.clone()], "raw TS passes");
+
+        let mut raw_stream = KeepaliveGate::default();
+        assert!(raw_stream.admit(&published(ts_packets(7), true), true));
+        assert_eq!(raw_stream.fit(vec![item(&seven)]), vec![item(&seven)], "not an RTP stream");
+    }
+
+    /// An RTP/UDP input's seven-packet datagrams (1328 bytes) reach an SRT
+    /// receiver as whole RTP datagrams: each fits one live message, under
+    /// one SSRC with contiguous numbers. They used to arrive cut into 1316
+    /// bytes and a 12-byte tail with no RTP header.
+    #[tokio::test]
+    async fn an_srt_output_carries_seven_packet_rtp_datagrams_whole() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let peer_config: crate::config::models::SrtInputConfig =
+            serde_json::from_value(serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+            .expect("SRT listener fixture");
+        let mut listener = crate::srt::connection::bind_srt_listener_for_input(&peer_config)
+            .await
+            .expect("the far end binds");
+        let config: SrtOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o1", "name": "o1", "mode": "caller",
+            "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }))
+        .expect("SRT output fixture");
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        let (tx, _events_rx) = spawn_output_alone(config, &cancel);
+        let peer = tokio::time::timeout(
+            Duration::from_secs(10),
+            accept_srt_connection(&mut listener, &cancel),
+        )
+        .await
+        .expect("the output dials in time")
+        .expect("the far end accepts it");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tx.receiver_count() == 0 {
+            assert!(Instant::now() < deadline, "timed out waiting for the output to subscribe");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for seq in 0..3u16 {
+            tx.send(published(rtp_carrying(seq, &ts_packets(7)), false)).expect("subscribed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut got = Vec::new();
+        for i in 0..6 {
+            let d = tokio::time::timeout(Duration::from_secs(5), peer.recv())
+                .await
+                .unwrap_or_else(|_| panic!("datagram {i} arrives"))
+                .expect("the connection stays up");
+            got.push(d.data.to_vec());
+        }
+        let more = tokio::time::timeout(Duration::from_millis(500), peer.recv()).await;
+        assert!(more.is_err(), "nothing else is sent");
+        let (seq0, ssrc) = header_of(&got[0]);
+        for (i, d) in got.iter().enumerate() {
+            assert_eq!(d[0] >> 6, 2, "datagram {i} is RTP");
+            assert_eq!(header_of(d), (seq0.wrapping_add(i as u16), ssrc), "datagram {i}");
+            assert_eq!(d.len(), 12 + if i % 2 == 0 { 6 } else { 1 } * TS_PACKET_SIZE);
+        }
+        let ts: Vec<u8> = got.iter().flat_map(|d| d[12..].to_vec()).collect();
+        assert_eq!(ts, [ts_packets(7), ts_packets(7), ts_packets(7)].concat());
     }
 
     /// A listener output whose input never delivers holds the caller: its
