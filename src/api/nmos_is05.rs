@@ -683,31 +683,33 @@ async fn patch_receiver_staged(
                     && let Some(existing) = cfg.inputs.iter_mut().find(|i| &i.id == id) {
                         existing.config = new_input.clone();
                     }
-                // Resolve+restart the flow under the write lock's snapshot.
-                let flow_cfg = cfg.flows.iter().find(|f| f.id == receiver_flow_id).cloned();
-                let resolved = flow_cfg
-                    .and_then(|f| cfg.resolve_flow(&f).ok());
                 drop(cfg);
 
-                let _ = state.flow_manager.destroy_flow(&receiver_flow_id).await;
-                if let Some(r) = resolved
-                    && let Err(e) = state.flow_manager.create_flow(r).await {
-                        if let Some(ref tx) = state.event_sender {
-                            tx.emit_flow_with_details(
-                                EventSeverity::Critical,
-                                category::NMOS,
-                                format!("IS-05 receiver activation failed to restart flow: {e}"),
-                                &receiver_flow_id,
-                                serde_json::json!({
-                                    "subsystem": "is-05",
-                                    "action": "receiver_activation_failed",
-                                    "receiver_id": uuid.to_string(),
-                                    "error": e.to_string(),
-                                }),
-                            );
-                        }
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                // Stopped, then started from the config as it stands once
+                // the old run has gone (`FlowManager::restart_from_config`):
+                // resolved under the write lock and started after the stop,
+                // a plan swap saved in between ran on neither.
+                if let Err(e) = state
+                    .flow_manager
+                    .restart_from_config(&state.config, &receiver_flow_id)
+                    .await
+                {
+                    if let Some(ref tx) = state.event_sender {
+                        tx.emit_flow_with_details(
+                            EventSeverity::Critical,
+                            category::NMOS,
+                            format!("IS-05 receiver activation failed to restart flow: {e}"),
+                            &receiver_flow_id,
+                            serde_json::json!({
+                                "subsystem": "is-05",
+                                "action": "receiver_activation_failed",
+                                "receiver_id": uuid.to_string(),
+                                "error": e.to_string(),
+                            }),
+                        );
                     }
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
                 let cfg_snapshot = state.config.read().await.clone();
                 let cfg_path = state.config_path.clone();
                 let secrets_path = state.secrets_path.clone();

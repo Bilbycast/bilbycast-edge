@@ -4546,6 +4546,61 @@ pub(crate) fn validate_flow_hitless_legs(
     })
 }
 
+/// Refuse to hot-add input `input_id` to flow `flow_id` (`add_input`) while
+/// another flow holds it: the assignment uniqueness [`validate_config`]
+/// enforces, judged the same way — only between enabled flows, since a
+/// disabled flow spawns no input — and with its message. Unrefused, the
+/// input was saved in both flows' `input_ids`, and the config failed
+/// validation at the next load.
+pub(crate) fn validate_add_input_assignment(
+    flow_id: &str,
+    input_id: &str,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
+    let enabled = config.flows.iter().find(|f| f.id == flow_id).is_none_or(|f| f.enabled);
+    if enabled {
+        refuse_input_held_elsewhere(flow_id, input_id, config)?;
+    }
+    Ok(())
+}
+
+/// [`validate_add_input_assignment`] for every input of `flow`, created or
+/// replacing the flow of its id (a targeted `create_flow` / `update_flow`,
+/// REST or WS, or a WS `start_flow` that enables it): an enabled flow may
+/// not take an input another enabled flow holds. Those routes validated the
+/// flow alone, so each could save one input in two enabled flows — a config
+/// the next load refused.
+pub(crate) fn validate_flow_input_assignment(
+    flow: &FlowConfig,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
+    if flow.enabled {
+        for input_id in &flow.input_ids {
+            refuse_input_held_elsewhere(&flow.id, input_id, config)?;
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `input_id` to enabled flow `flow_id` when another enabled flow
+/// holds it, in [`validate_config`]'s words.
+fn refuse_input_held_elsewhere(
+    flow_id: &str,
+    input_id: &str,
+    config: &crate::config::models::AppConfig,
+) -> Result<()> {
+    let holder = config.flows.iter().find(|f| {
+        f.id != flow_id && f.enabled && f.input_ids.iter().any(|id| id == input_id)
+    });
+    if let Some(holder) = holder {
+        bail!(
+            "Flow '{flow_id}': input '{input_id}' is already assigned to another flow ('{}')",
+            holder.id
+        );
+    }
+    Ok(())
+}
+
 /// [`validate_hitless_seq_aware_legs`] for `input` hot-added to flow
 /// `flow_id` (`add_input`): its definition in `config` in place of the input
 /// of its id, and that flow its owner. Only the legs on `input` are judged.

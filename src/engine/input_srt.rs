@@ -998,11 +998,30 @@ async fn srt_input_recv_loop(
 /// for. TSBPD delivers each packet its leg's latency after it was sent, so
 /// the later leg lags the other by that difference whatever the networks do
 /// — 1.38 s for legs at 120 ms and 1 500 ms. A sender asking for more
-/// latency than a leg does moves that leg later still.
+/// latency than a leg does moves that leg later still, which the config
+/// cannot show: once a leg connects its negotiated latency takes the place
+/// of the one it asked for ([`pair_leg_lag_negotiated`]).
 fn pair_leg_lag(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> Duration {
-    let latency1 = leg1.recv_latency_ms.unwrap_or(leg1.latency_ms);
-    let latency2 = leg2.recv_latency_ms.unwrap_or(leg2.latency_ms);
+    pair_leg_lag_negotiated(leg1, leg2, [None, None])
+}
+
+/// [`pair_leg_lag`], with each leg's receive latency as libsrt negotiated it
+/// (`msRcvTsbPdDelay`, the larger of what the leg asked for and what its
+/// sender did) where `negotiated` has it, and as configured where not.
+fn pair_leg_lag_negotiated(
+    leg1: &SrtInputConfig,
+    leg2: &SrtRedundancyConfig,
+    negotiated: [Option<u64>; 2],
+) -> Duration {
+    let latency1 = negotiated[0].unwrap_or(leg1.recv_latency_ms.unwrap_or(leg1.latency_ms));
+    let latency2 = negotiated[1].unwrap_or(leg2.recv_latency_ms.unwrap_or(leg2.latency_ms));
     Duration::from_millis(latency1.abs_diff(latency2))
+}
+
+/// The receive latency `socket` negotiated with its sender, read once it has
+/// connected: `None` when libsrt does not say.
+async fn negotiated_latency_ms(socket: &SrtSocket) -> Option<u64> {
+    u64::try_from(socket.stats().await.ms_rcv_tsbpd_delay).ok().filter(|&ms| ms > 0)
 }
 
 /// The stale time of a 2022-7 pair's unbuffered merger
@@ -1227,6 +1246,8 @@ async fn srt_input_redundant_loop(
                         listener1 = listener;
                         connect_failures.store(0, Ordering::Relaxed);
                         poller1 = Some(attach_input_leg(&ctx, 1, &socket, srt));
+                        let latency_ms = negotiated_latency_ms(&socket).await;
+                        pair.leg_connected(1, latency_ms, sock2.is_some(), &config, redundancy);
                         sock1 = Some(socket);
                     }
                     // Produced only once `cancel` has fired; the cancel arm
@@ -1254,6 +1275,8 @@ async fn srt_input_redundant_loop(
                         }
                         listener2 = listener;
                         poller2 = Some(attach_input_leg(&ctx, 2, &socket, srt));
+                        let latency_ms = negotiated_latency_ms(&socket).await;
+                        pair.leg_connected(2, latency_ms, sock1.is_some(), &config, redundancy);
                         sock2 = Some(socket);
                     }
                     LegAcquired::Cancelled => {}
@@ -1288,9 +1311,10 @@ async fn srt_input_redundant_loop(
                     Err(_) => {
                         judge1 = None;
                         lose_input_leg(&ctx, 1, &mut sock1, &mut poller1, &sock2).await;
+                        pair.size_stale_time(false, &config, redundancy);
                         acquire1 = Some(arm_input_leg(&ctx, 1, listener1.take(), LEG_REACQUIRE_DELAY, false));
                         if sock2.is_none() {
-                            both_input_legs_lost(events, flow_id, &mut pair);
+                            both_input_legs_lost(events, flow_id, &mut pair, srt);
                         }
                     }
                 }
@@ -1317,9 +1341,10 @@ async fn srt_input_redundant_loop(
                     Err(_) => {
                         judge2 = None;
                         lose_input_leg(&ctx, 2, &mut sock2, &mut poller2, &sock1).await;
+                        pair.size_stale_time(false, &config, redundancy);
                         acquire2 = Some(arm_input_leg(&ctx, 2, listener2.take(), LEG_REACQUIRE_DELAY, false));
                         if sock1.is_none() {
-                            both_input_legs_lost(events, flow_id, &mut pair);
+                            both_input_legs_lost(events, flow_id, &mut pair, srt);
                         }
                     }
                 }
@@ -1357,6 +1382,13 @@ async fn srt_input_redundant_loop(
 struct RedundantPair {
     merger: PairMerger,
     merger_handoff: crate::stats::collector::MergerHandoff,
+    /// Each leg's receive latency as last negotiated, once it has connected:
+    /// what its merger's stale time is sized to in place of the configured
+    /// one ([`Self::leg_connected`]).
+    negotiated_ms: [Option<u64>; 2],
+    /// The lag the merger's stale time is sized to now
+    /// ([`Self::size_stale_time`]).
+    leg_lag: Duration,
     /// A buffered merger's stats on the flow as this input's, while the legs
     /// carry RTP ([`Self::settle_format`]).
     buffered_stats: Option<crate::stats::collector::BufferedHitlessPublication>,
@@ -1377,6 +1409,8 @@ impl RedundantPair {
         Self {
             merger,
             merger_handoff: crate::stats::collector::MergerHandoff::default(),
+            negotiated_ms: [None; 2],
+            leg_lag: Duration::MAX,
             buffered_stats: None,
             failover: RawTsFailover::new(),
             prev_active_leg: ActiveLeg::None,
@@ -1422,6 +1456,73 @@ impl RedundantPair {
         self.prev_active_leg = ActiveLeg::None;
         self.format = SrtPayloadFormat::Unknown;
         (self.raw_ts_seq_leg1, self.raw_ts_seq_leg2, self.raw_ts_timestamp) = (0, 0, 0);
+    }
+
+    /// Leg `leg` (1 or 2) connected, with receive latency `latency_ms` as
+    /// negotiated; `other_up` says whether the other leg is connected. The
+    /// merger's stale time is sized to the legs' lag as negotiated, so a
+    /// sender that asked for more latency than the leg did — which the
+    /// config cannot show — no longer lets the later leg be taken for a moved
+    /// stream. A leg's last negotiated latency stands while it is down.
+    fn leg_connected(
+        &mut self,
+        leg: u8,
+        latency_ms: Option<u64>,
+        other_up: bool,
+        config: &SrtInputConfig,
+        redundancy: &SrtRedundancyConfig,
+    ) {
+        let i = usize::from(leg == 2);
+        if latency_ms.is_some() {
+            self.negotiated_ms[i] = latency_ms;
+        }
+        self.size_stale_time(other_up, config, redundancy);
+    }
+
+    /// Size the merger's stale time to how far the legs lag: by their
+    /// latencies as negotiated (or configured, before a leg has connected)
+    /// while both are connected, and not at all while one is down.
+    ///
+    /// The lag is there for a later leg still delivering the old stream once
+    /// the earlier one shows it moved; a leg whose socket is gone delivers
+    /// nothing, and comes back on a connection carrying only what its sender
+    /// sends from then on. So with one leg down a moved stream is followed a
+    /// second after the last packet accepted, not the legs' lag and a second
+    /// later: 2.38 s of blackout for legs at 120 and 1 500 ms. Back with the
+    /// other leg, the lag counts again before any packet of its arrives.
+    fn size_stale_time(
+        &mut self,
+        both_up: bool,
+        config: &SrtInputConfig,
+        redundancy: &SrtRedundancyConfig,
+    ) {
+        let lag = if both_up {
+            pair_leg_lag_negotiated(config, redundancy, self.negotiated_ms)
+        } else {
+            Duration::ZERO
+        };
+        if lag == self.leg_lag {
+            return;
+        }
+        let configured = pair_leg_lag(config, redundancy);
+        if both_up && lag != configured {
+            tracing::info!(
+                "SRT input (2022-7): legs lag {} ms as negotiated, not the {} ms their \
+                 receive latencies ask for — the merger's stale time follows",
+                lag.as_millis(),
+                configured.as_millis(),
+            );
+        }
+        self.leg_lag = lag;
+        self.merger.set_leg_lag(lag);
+    }
+
+    /// Hand `srt`'s pair what the merger has counted since the last hand-off.
+    fn hand_off(&mut self, srt: &SrtInputStats) {
+        match &self.merger {
+            PairMerger::Bare(merger) => srt.pair.hand_off(merger, &mut self.merger_handoff),
+            PairMerger::Buffered(merger) => srt.pair.hand_off(&**merger, &mut self.merger_handoff),
+        }
     }
 }
 
@@ -1470,6 +1571,26 @@ impl PairMerger {
         match self {
             Self::Bare(merger) => merger.restart(),
             Self::Buffered(merger) => merger.restart(),
+        }
+    }
+
+    /// One leg now reaches the merger `lag` behind the other: its stale time
+    /// becomes a second past that — and the hold, buffered.
+    fn set_leg_lag(&mut self, lag: Duration) {
+        match self {
+            Self::Bare(merger) => {
+                merger.set_stale_after_us(crate::redundancy::merger::stale_after_lag_us(lag));
+            }
+            Self::Buffered(merger) => merger.set_leg_lag(lag),
+        }
+    }
+
+    /// The merger's stale time, in microseconds.
+    #[cfg(test)]
+    fn stale_after_us(&self) -> u64 {
+        match self {
+            Self::Bare(merger) => merger.stale_after_us(),
+            Self::Buffered(merger) => merger.stale_after_us(),
         }
     }
 
@@ -1842,11 +1963,22 @@ async fn drop_stale_input_leg(
 
 /// A loss has left neither leg connected: raise the Critical and start the
 /// pair afresh ([`RedundantPair::restart`]). Both legs are being
-/// re-acquired.
-fn both_input_legs_lost(events: &EventSender, flow_id: &str, pair: &mut RedundantPair) {
+/// re-acquired. What the merger then counts of the stream it forgets — the
+/// seqs its window still waited for — and whatever of the pair's loss waits
+/// for the legs' polls are counted now ([`SrtInputStats::settle_pair_loss`]):
+/// no poll may come again, and until 2026-10-31 a source that never returned
+/// left that loss unpublished.
+fn both_input_legs_lost(
+    events: &EventSender,
+    flow_id: &str,
+    pair: &mut RedundantPair,
+    srt: &SrtInputStats,
+) {
     tracing::warn!("SRT input (redundant) both legs lost, re-acquiring each");
     events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
     pair.restart();
+    pair.hand_off(srt);
+    srt.settle_pair_loss();
 }
 
 /// Leg `leg`'s listener can never accept again (see
@@ -3666,6 +3798,45 @@ mod tests {
         assert_eq!(once.len(), sent.len(), "nothing is forwarded twice");
     }
 
+    /// A sender can ask for more latency than a leg does, and libsrt then
+    /// negotiates the larger: the pair's merger sizes its stale time to the
+    /// legs' lag as negotiated while both are connected. Legs asking 120 ms
+    /// and 1 500 ms lag 1.38 s by the config; leg 1's sender asking 1 500 ms
+    /// too makes it none, and leg 2's 1 800 ms 300 ms — a second past that,
+    /// and the hold when buffered. Sized from the config alone, a leg moved
+    /// later by its sender could lag past the stale time and step the output
+    /// back. With one leg down there is no lag to wait out: a second.
+    #[test]
+    fn a_pairs_merger_follows_the_latency_its_legs_negotiate() {
+        for (hold_us, path_differential) in [(0, None), (200_000, Some(200))] {
+            let config: SrtInputConfig = serde_json::from_value(serde_json::json!({
+                "mode": "listener", "local_addr": "127.0.0.1:9000", "latency_ms": 120,
+                "redundancy": {
+                    "mode": "listener", "local_addr": "127.0.0.1:9002",
+                    "latency_ms": 1_500, "path_differential_ms": path_differential
+                }
+            }))
+            .expect("SRT config fixture");
+            let redundancy = config.redundancy.as_ref().unwrap();
+            let mut pair = RedundantPair::new(PairMerger::new(&config, redundancy));
+            let stale = |pair: &RedundantPair| pair.merger.stale_after_us() - hold_us;
+            assert_eq!(stale(&pair), 2_380_000, "by the config");
+            pair.leg_connected(1, Some(1_500), false, &config, redundancy);
+            assert_eq!(stale(&pair), 1_000_000, "leg 1 alone");
+            pair.leg_connected(2, Some(1_500), true, &config, redundancy);
+            assert_eq!(stale(&pair), 1_000_000, "both at 1 500");
+            pair.size_stale_time(false, &config, redundancy);
+            pair.leg_connected(2, Some(1_800), true, &config, redundancy);
+            assert_eq!(stale(&pair), 1_300_000, "leg 2 back at 1 800");
+            pair.size_stale_time(false, &config, redundancy);
+            assert_eq!(stale(&pair), 1_000_000, "leg 1 lost");
+            pair.leg_connected(1, None, true, &config, redundancy);
+            assert_eq!(stale(&pair), 1_300_000, "back, its latency unread: the last it negotiated");
+            pair.restart();
+            assert_eq!(stale(&pair), 1_300_000, "across a restart");
+        }
+    }
+
     /// A 2022-7 pair's receive path without sockets: each leg's packets
     /// handed to it as its recv arm would, published into a broadcast the
     /// test reads, and the drain arm run when the merger's next release is
@@ -4045,18 +4216,18 @@ mod tests {
         assert!(card(&bench).is_none(), "raw TS");
 
         let (events, _events_rx) = crate::manager::events::event_channel();
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         for seq in 0..10u16 {
             bench.deliver(ActiveLeg::Leg1, seq);
         }
         assert_eq!(card(&bench).expect("RTP").leg1_packets_received, 10);
 
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         assert!(card(&bench).is_none(), "both legs lost");
         bench.deliver_raw_ts(ActiveLeg::Leg2);
         assert!(card(&bench).is_none(), "back with raw TS");
 
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         bench.deliver(ActiveLeg::Leg2, 500);
         let held = card(&bench).expect("back with RTP");
         assert_eq!((held.leg1_packets_received, held.leg2_packets_received), (10, 1));
@@ -4074,7 +4245,7 @@ mod tests {
             bench.deliver(ActiveLeg::Leg2, seq);
         }
         let (events, _events_rx) = crate::manager::events::event_channel();
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         bench.deliver_raw_ts(ActiveLeg::Leg2);
         let published: Vec<(u16, bool)> = std::iter::from_fn(|| bench.rx.try_recv().ok())
             .map(|packet| (packet.sequence_number, packet.is_raw_ts))
@@ -4101,7 +4272,7 @@ mod tests {
             bench.deliver(ActiveLeg::Leg2, seq);
         }
         let (events, mut events_rx) = crate::manager::events::event_channel();
-        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        both_input_legs_lost(&events, "f1", &mut bench.pair, &bench.srt);
         let critical = events_rx.try_recv().expect("the Critical");
         assert_eq!(critical.message, "Both redundant legs lost");
         assert_eq!(critical.severity, EventSeverity::Critical);

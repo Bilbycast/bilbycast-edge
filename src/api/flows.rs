@@ -141,6 +141,8 @@ pub async fn create_flow(
     let mut config = state.config.write().await;
     crate::config::validation::validate_flow_hitless_legs(&flow, &config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    crate::config::validation::validate_flow_input_assignment(&flow, &config)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     if config.flows.iter().any(|f| f.id == flow.id) {
         return Err(ApiError::Conflict(format!(
@@ -198,6 +200,8 @@ pub async fn update_flow(
 
     let mut config = state.config.write().await;
     crate::config::validation::validate_flow_hitless_legs(&flow, &config)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    crate::config::validation::validate_flow_input_assignment(&flow, &config)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let idx = config
@@ -478,25 +482,24 @@ pub async fn restart_flow(
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    let config = state.config.read().await;
-    let flow = config
-        .flows
-        .iter()
-        .find(|f| f.id == flow_id)
-        .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?
-        .clone();
-    let resolved = resolve_flow(&config, &flow)?;
-    drop(config);
-
-    // Stop if running
-    if state.flow_manager.is_running(&flow_id) {
-        let _ = state.flow_manager.destroy_flow(&flow_id).await;
+    // Refused before anything stops: a flow the config lacks, or one that
+    // does not resolve.
+    {
+        let config = state.config.read().await;
+        let flow = config
+            .flows
+            .iter()
+            .find(|f| f.id == flow_id)
+            .ok_or_else(|| ApiError::NotFound(format!("Flow '{flow_id}' not found")))?;
+        resolve_flow(&config, flow)?;
     }
 
-    // Start
+    // Stop, then start from the config as it stands once the old run has
+    // gone, so a plan swap saved meanwhile is the plan the flow restarts on
+    // (`FlowManager::restart_from_config`).
     let runtime = state
         .flow_manager
-        .create_flow(resolved)
+        .restart_from_config(&state.config, &flow_id)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to restart flow '{flow_id}': {e}")))?;
 
@@ -1154,6 +1157,52 @@ mod whole_config_tests {
             .clone(),
         );
         serde_json::from_value(config).expect("config fixture")
+    }
+
+    /// `POST /api/v1/flows` and `PUT /api/v1/flows/{id}` refuse an enabled
+    /// flow an input another enabled flow holds — 400, the whole-config
+    /// message, nothing started or saved. They validated the flow alone and
+    /// saved one input in two enabled flows, a config the next load refused.
+    #[tokio::test]
+    async fn create_and_update_refuse_an_input_another_flow_holds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let flow = |id: &str, enabled: bool, inputs: &[&str]| -> FlowConfig {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": id, "enabled": enabled, "input_ids": inputs, "output_ids": []
+            }))
+            .expect("flow fixture")
+        };
+        {
+            let mut config = state.config.write().await;
+            config.inputs = serde_json::from_value(serde_json::json!([
+                { "id": "a", "name": "a", "type": "udp", "bind_addr": "127.0.0.1:29900" },
+                { "id": "b", "name": "b", "type": "udp", "bind_addr": "127.0.0.1:29901" }
+            ]))
+            .expect("inputs fixture");
+            config.flows = vec![flow("g", true, &["a"]), flow("h", false, &["b"])];
+        }
+        let held = |message: String| {
+            assert!(message.contains("already assigned to another flow ('g')"), "{message}");
+        };
+
+        let created = create_flow(RequireAdmin, State(state.clone()), Json(flow("f", true, &["a"]))).await;
+        assert!(matches!(created, Err(ApiError::BadRequest(_))), "400");
+        held(refusal(created));
+        let updated = update_flow(
+            RequireAdmin,
+            State(state.clone()),
+            Path("h".to_string()),
+            Json(flow("h", true, &["a", "b"])),
+        )
+        .await;
+        assert!(matches!(updated, Err(ApiError::BadRequest(_))), "400");
+        held(refusal(updated));
+        let config = state.config.read().await.clone();
+        assert_eq!(config.flows.len(), 2, "nothing saved");
+        assert!(!config.flows[1].enabled && config.flows[1].input_ids == ["b"]);
+        assert!(!state.config_path.exists(), "nothing written");
+        assert!(state.flow_manager.get_runtime("f").is_none() && state.flow_manager.get_runtime("h").is_none());
     }
 
     /// What a refused request answered.

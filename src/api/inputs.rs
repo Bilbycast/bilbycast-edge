@@ -83,6 +83,11 @@ pub async fn create_input(
     // otherwise silently drop the colliding entity and mask the real error.
     validate_port_conflicts_with_input(&config, &input)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // A seq-aware slot may already name this id — a targeted flow create
+    // accepts a leg not yet defined — and the input created under it must
+    // carry the sequence that slot merges on.
+    crate::config::validation::validate_input_hitless_legs(&input, &config)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     config.inputs.push(input.clone());
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
@@ -356,6 +361,53 @@ mod update_input_tests {
         assert!(!state.config.read().await.inputs.iter().any(|i| i.id == "hitless:cam1"));
         let created = post("cam1").await.unwrap_or_else(|_| panic!("any other id is created"));
         assert_eq!(created.0.data.map(|i| i.id).as_deref(), Some("cam1"));
+        let _ = state.flow_manager.destroy_flow("f1").await;
+    }
+
+    /// `POST /api/v1/inputs` refuses an input a seq-aware Hitless slot
+    /// already names as a leg — a targeted flow create accepts a leg not yet
+    /// defined — when it would reach the bus without the sequence the slot
+    /// merges on, and creates one that carries it. It created any such
+    /// input, and only the merger's fallback to primary preference caught
+    /// the unsequenced leg at run time.
+    #[tokio::test]
+    async fn post_refuses_an_unsequenced_leg_a_seq_aware_slot_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = running_flow(dir.path(), vec![udp_input("a", 41879)]).await;
+        let pid = |input_id: &str| {
+            serde_json::json!({ "type": "pid", "input_id": input_id, "source_pid": 256 })
+        };
+        let slot_flow: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f2", "name": "f2", "input_ids": [], "output_ids": [],
+            "assembly": {
+                "kind": "spts",
+                "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": [{
+                    "source": {
+                        "type": "hitless", "mode": "seq_aware",
+                        "primary": pid("leg-p"), "backup": pid("leg-b")
+                    },
+                    "out_pid": 256, "stream_type": 27
+                }] }]
+            }
+        }))
+        .expect("flow fixture");
+        state.config.write().await.flows.push(slot_flow);
+        let post = |def: InputDefinition| create_input(State(state.clone()), RequireAdmin, Json(def));
+
+        let srt = input(serde_json::json!({
+            "id": "leg-b", "name": "leg-b", "type": "srt", "mode": "listener",
+            "local_addr": "127.0.0.1:41880"
+        }));
+        let refused = post(srt).await;
+        assert!(
+            matches!(&refused, Err(ApiError::BadRequest(m)) if m.contains("hitless_seq_aware_leg_unsequenced")),
+            "an SRT leg carries no sequence to merge on"
+        );
+        assert!(!state.config.read().await.inputs.iter().any(|i| i.id == "leg-b"));
+        let rtp = input(serde_json::json!({
+            "id": "leg-b", "name": "leg-b", "type": "rtp", "bind_addr": "127.0.0.1:41881"
+        }));
+        assert!(post(rtp).await.is_ok(), "an RTP leg does");
         let _ = state.flow_manager.destroy_flow("f1").await;
     }
 
