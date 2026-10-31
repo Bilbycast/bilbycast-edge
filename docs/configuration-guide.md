@@ -1445,8 +1445,8 @@ limitation). Every IDR carries an SPS and PPS
 — the last ones the stream sent — when the sender did not repeat them (only
 libwebrtc does so reliably), and IDRs are marked keyframes (PAT/PMT ahead of
 each, the random-access flag set): the frame was read as a NAL from the
-start code's first byte, so none was. The WHEP input does the same for its
-video. The Opus rides the Opus-in-TS carriage with the control header
+start code's first byte, so none was. The WHEP input does the same. The
+Opus rides the Opus-in-TS carriage with the control header
 ffmpeg writes and parses (`0x7F 0xE0`, prefix `0x3FF`); it was written as
 `0xFF 0xE0`, which every standard demuxer took for a raw Opus packet and
 failed on — no WHIP publish's audio decoded outside the edge (the edge's own
@@ -1456,7 +1456,7 @@ padding-only packets (Chromium's bandwidth probes, three every 5 s on the
 audio SSRC) arrive as empty media, and each went out as a zero-length Opus
 access unit — 33 of 2964 on the rig, every one failed by ffmpeg ("Error
 parsing the packet header"). An Opus packet is at least one byte (RFC 6716
-§3.4). The WHEP input drops a payload-less video frame the same way.
+§3.4). The WHEP input drops a payload-less frame of either track the same way.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
@@ -1495,6 +1495,30 @@ A pull that fails or ends — signaling, the ICE / DTLS handshake, or a session
 the server closes — is tried again after a backoff: 1 s, doubling to 30 s,
 starting over only after a session that lasted 10 s. Until 2026-10 a
 handshake that failed, or a session that ended, was retried at once.
+
+The pull's H.264 and Opus are remuxed into an SPTS (program 1) the way a
+WHIP publish's are ([above](#webrtcwhip-input)): both tracks on one
+timeline, each anchored at its first frame's arrival, the SPS and PPS ahead
+of every IDR, and the Opus in the Opus-in-TS carriage ffmpeg reads. The
+layout starts from the tracks the server's answer accepted: video and Opus,
+video alone (`video_only`, which offers no audio, or a server that refuses
+Opus), or **Opus alone** (a server that refuses H.264), when the PMT names
+the Opus as PCR_PID and the Opus carries the PCR. It then follows what the
+server sends, because an answer accepts a track whether or not anything
+will be sent on it: an edge's own WHEP output accepts H.264 from a flow
+with no video, and Opus when it has no Opus to send (no `audio_encode`, and
+a source whose audio is not Opus). A track that has sent no frame by the
+time the other has run **1 s** leaves the PMT, with a version bump; when
+that is the video, PCR_PID and the PCR move to the Opus. The track's first
+frame brings it back, with another bump, and a track that has sent a frame
+stays. So a pull of a server sending audio alone carries no PCR for its
+first second, and a pull of video alone lists the Opus for its first
+second. An answer that accepts neither track is not connected over: a
+Warning names it, and the pull is tried again after the backoff. Until
+2026-10 the input muxed the video alone, on its raw RTP timestamps: an A/V
+pull lost its audio, and a pull from a server sending no video — another
+edge's WHEP output on an audio-only flow — published nothing, its flow
+sending NULL keepalives and reporting the input stalled.
 
 ### Media Player Input
 

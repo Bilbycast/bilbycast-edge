@@ -391,6 +391,23 @@ impl TsMuxer {
         self.has_audio = has;
     }
 
+    /// [`Self::change_has_video`] for the audio: once muxing has begun, the
+    /// PMT stops listing the audio, or lists it again — a WHEP pull whose
+    /// server accepted Opus and sends none, then some. A change after PAT/PMT
+    /// went out bumps the PMT version and makes the next mux call re-emit
+    /// them at once. Returns whether anything changed.
+    pub fn change_has_audio(&mut self, has: bool) -> bool {
+        if self.has_audio == has {
+            return false;
+        }
+        self.has_audio = has;
+        if self.pat_pmt_sent {
+            self.pmt_version = (self.pmt_version + 1) & 0x1F;
+            self.psi_due = true;
+        }
+        true
+    }
+
     /// Set the video stream type for PMT (default: H.264 = 0x1B).
     /// Use `0x24` for H.265/HEVC.
     pub fn set_video_stream_type(&mut self, stream_type: u8) {
@@ -2046,5 +2063,36 @@ mod tests {
         assert!(muxer.change_has_video(true));
         let ts = muxer.mux_video(&[0, 0, 0, 1, 0x41, 0x9A], 5760, 5760, false);
         assert_eq!(pmt_of(&ts), Some((2, VIDEO_PID)), "re-issued on a non-keyframe too");
+    }
+
+    /// The audio leaving the layout, and coming back, after PAT/PMT went out
+    /// bumps the PMT version and re-emits PAT/PMT on the next mux call, the
+    /// audio's entry gone and back.
+    #[test]
+    fn change_has_audio_reissues_the_pmt() {
+        fn pmt_of(ts: &[Bytes]) -> Option<(u8, Vec<u16>)> {
+            ts.iter().find(|p| ts_pid(p) == DEFAULT_PMT_PID).map(|p| {
+                let len = (((p[6] & 0x0F) as usize) << 8) | p[7] as usize;
+                let mut pids = Vec::new();
+                let mut pos = 17;
+                while pos + 5 <= 8 + len - 4 {
+                    pids.push(((p[pos + 1] as u16 & 0x1F) << 8) | p[pos + 2] as u16);
+                    pos += 5 + ((((p[pos + 3] & 0x0F) as usize) << 8) | p[pos + 4] as usize);
+                }
+                ((p[10] >> 1) & 0x1F, pids)
+            })
+        }
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_audio(true);
+        let au = [0, 0, 0, 1, 0x41, 0x9A];
+        let ts = muxer.mux_video(&au, 0, 0, true);
+        assert_eq!(pmt_of(&ts), Some((0, vec![VIDEO_PID, AUDIO_PID])));
+        assert!(!muxer.change_has_audio(true), "no change, nothing re-issued");
+        assert!(muxer.change_has_audio(false));
+        let ts = muxer.mux_video(&au, 3600, 3600, false);
+        assert_eq!(pmt_of(&ts), Some((1, vec![VIDEO_PID])));
+        assert!(muxer.change_has_audio(true));
+        let ts = muxer.mux_audio(&[0x21; 300], 7200, 3, 2);
+        assert_eq!(pmt_of(&ts), Some((2, vec![VIDEO_PID, AUDIO_PID])));
     }
 }

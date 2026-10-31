@@ -236,21 +236,10 @@ async fn whip_input_loop(
         let child_cancel = cancel.child_token();
         let _ = msg.reply.send(Ok((answer, session_id.clone(), child_cancel.clone())));
 
-        // Create TS muxer for converting H.264 NALUs and Opus audio to
-        // MPEG-TS. WebRTC audio is always Opus; we carry it per the
-        // FFmpeg-compatible Opus-in-MPEG-TS convention (stream_type 0x06
-        // + "Opus" registration descriptor in the PMT, per-AU control
-        // header in the private PES).
-        let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-        if let Some(po) = config.pid_overrides.as_ref()
-            && let Some(entry) = po.get(&1) {
-                ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
-            }
-        ts_muxer.set_audio_stream(0x06, Some(*b"Opus"));
         // The tracks' frames onto one TS (`WhipMux`): one timeline for
-        // both, the parameter sets ahead of every IDR, no payload-less
-        // frame.
-        let mut whip = WhipMux::new(ts_muxer);
+        // both, the parameter sets ahead of every IDR, the Opus in the
+        // FFmpeg-compatible carriage, no payload-less frame.
+        let mut whip = WhipMux::new(opus_ts_muxer(config.pid_overrides.as_ref()));
         let mut seq_num: u16 = 0;
         // The publish's layout — which of video and audio its offer carried
         // — is settled from the session's tracks on the first media
@@ -258,7 +247,7 @@ async fn whip_input_loop(
         // audio-only publish named an absent video PID as PCR_PID and
         // carried no PCR at all, and an A/V publish's Opus never reached the
         // PMT.
-        let mut layout = WhipLayout::default();
+        let mut layout = WhipLayout::new("WHIP publish");
         // Until it connects, the publisher is held to `setup_deadline`.
         let setup_by = tokio::time::Instant::now() + setup_deadline;
         let mut connected = false;
@@ -311,30 +300,7 @@ async fn whip_input_loop(
                     ) else {
                         continue;
                     };
-                    // Seven TS packets to an item, not one (edge#166).
-                    for ts_data in crate::engine::packet::bundle_ts_packets(ts_chunks) {
-                        let pkt = RtpPacket {
-                            data: ts_data,
-                            sequence_number: seq_num,
-                            rtp_timestamp: pts_90khz as u32,
-                            recv_time_us: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_micros() as u64,
-                            is_raw_ts: true,
-                            upstream_seq: None,
-                            upstream_leg_id: None,
-                            sender_timestamp_us: None,
-                        };
-                        seq_num = seq_num.wrapping_add(1);
-                        stats.input_packets.fetch_add(1, Ordering::Relaxed);
-                        stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                        if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                            publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
-                        } else {
-                            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
+                    publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
                 }
                 SessionEvent::MediaAdded { .. } => {
                     // A track negotiated after media began: the layout
@@ -357,6 +323,62 @@ async fn whip_input_loop(
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+/// The TS muxer a WebRTC input's H.264 and Opus go onto: program 1 on
+/// `pid_overrides`' PIDs, and the Opus in the FFmpeg-compatible Opus-in-TS
+/// carriage (stream_type 0x06 with the "Opus" registration descriptor in the
+/// PMT, a control header per access unit in the private PES). WebRTC audio
+/// is always Opus. Shared by the WHIP and WHEP inputs.
+#[cfg(feature = "webrtc")]
+fn opus_ts_muxer(
+    pid_overrides: Option<&crate::config::models::TsPidOverridesMap>,
+) -> crate::engine::rtmp::ts_mux::TsMuxer {
+    let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
+    if let Some(entry) = pid_overrides.and_then(|po| po.get(&1)) {
+        ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
+    }
+    ts_muxer.set_audio_stream(0x06, Some(*b"Opus"));
+    ts_muxer
+}
+
+/// Publish one frame's TS packets, stamped `pts_90khz`, onto the flow —
+/// seven to an item, not one (edge#166) — through the ingress transcode and
+/// post-process, counted on the input's stats. Shared by the WHIP and WHEP
+/// inputs.
+#[cfg(feature = "webrtc")]
+fn publish_frame(
+    ts_chunks: Vec<bytes::Bytes>,
+    pts_90khz: u64,
+    seq_num: &mut u16,
+    stats: &FlowStatsAccumulator,
+    broadcast_tx: &broadcast::Sender<RtpPacket>,
+    transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
+) {
+    for ts_data in crate::engine::packet::bundle_ts_packets(ts_chunks) {
+        let pkt = RtpPacket {
+            data: ts_data,
+            sequence_number: *seq_num,
+            rtp_timestamp: pts_90khz as u32,
+            recv_time_us: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros() as u64,
+            is_raw_ts: true,
+            upstream_seq: None,
+            upstream_leg_id: None,
+            sender_timestamp_us: None,
+        };
+        *seq_num = seq_num.wrapping_add(1);
+        stats.input_packets.fetch_add(1, Ordering::Relaxed);
+        stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
+        if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+            publish_input_packet_with_post(transcoder, post, broadcast_tx, pkt);
+        } else {
+            stats.input_filtered.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -516,6 +538,26 @@ async fn whep_input_loop(
             continue;
         }
 
+        // The tracks the answer accepted: H.264 video, Opus audio (unless
+        // `video_only`, which offers none), or both. A server that took
+        // neither would connect and send nothing this input reads, the flow
+        // stalled on NULL keepalives for as long as the session lasted.
+        let (video_pt, audio_pt) = session.answered_pts(&answer_sdp);
+        let tracks = (
+            session.video_mid.is_some() && video_pt.is_some(),
+            session.audio_mid.is_some() && audio_pt.is_some(),
+        );
+        if tracks == (false, false) {
+            let msg = "WHEP server's answer accepted no H.264 video and no Opus audio, \
+                       the only media this input takes";
+            tracing::warn!("{msg} ({}); retrying after the backoff", config.whep_url);
+            events.emit_flow(EventSeverity::Warning, category::WEBRTC, msg, flow_id);
+            if !whep_back_off(&mut backoff_secs, &cancel).await {
+                return;
+            }
+            continue;
+        }
+
         tracing::info!("WHEP connected to {}", config.whep_url);
         events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP connected", flow_id);
 
@@ -555,50 +597,42 @@ async fn whep_input_loop(
         // events so video_mid is populated before media starts arriving.
         session.drain_pending_events();
 
-        let mut ts_muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-        if let Some(po) = config.pid_overrides.as_ref()
-            && let Some(entry) = po.get(&1) {
-                ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
-            }
+        // Both tracks onto one TS as the WHIP input muxes a publish
+        // (`WhipMux`, `WhipLayout`), the layout then following what the
+        // server actually sends (`WhepTracks`). Only the video was muxed: the
+        // Opus was dropped, and a pull of a server sending no video
+        // published nothing at all.
+        let mut whep = WhipMux::new(opus_ts_muxer(config.pid_overrides.as_ref()));
+        let mut layout = WhipLayout::new("WHEP pull");
+        let mut sent = WhepTracks::default();
         let mut seq_num: u16 = 0;
-        let mut param_sets = H264ParamSets::default();
 
         // Receive loop
         loop {
             let event = session.poll_event(&cancel).await;
             match event {
-                SessionEvent::MediaData { mid, data, rtp_time, .. } => {
-                    // A payload-less frame (RTP padding, a sender's
-                    // bandwidth probe) is no access unit (see `WhipMux`).
-                    if session.video_mid == Some(mid) && !data.is_empty() {
-                        let pts_90khz = rtp_time.numer();
-                        let (annex_b, is_keyframe) = param_sets.access_unit(&data);
-                        let ts_chunks = ts_muxer.mux_video(&annex_b, pts_90khz, pts_90khz, is_keyframe);
-
-                        for ts_data in crate::engine::packet::bundle_ts_packets(ts_chunks) {
-                            let pkt = RtpPacket {
-                                data: ts_data,
-                                sequence_number: seq_num,
-                                rtp_timestamp: pts_90khz as u32,
-                                recv_time_us: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_micros() as u64,
-                                is_raw_ts: true,
-                                upstream_seq: None,
-                                upstream_leg_id: None,
-                                sender_timestamp_us: None,
-                            };
-                            seq_num = seq_num.wrapping_add(1);
-                            stats.input_packets.fetch_add(1, Ordering::Relaxed);
-                            stats.input_bytes.fetch_add(pkt.data.len() as u64, Ordering::Relaxed);
-                            if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                publish_input_packet_with_post(transcoder, post, &broadcast_tx, pkt);
-                            } else {
-                                stats.input_filtered.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
+                SessionEvent::MediaData { mid, data, rtp_time, network_time, .. } => {
+                    let video = session.video_mid == Some(mid);
+                    if !video && session.audio_mid != Some(mid) {
+                        continue;
                     }
+                    layout.apply(&mut whep.muxer, tracks.0, tracks.1, flow_id);
+                    // A payload-less frame (RTP padding, a sender's
+                    // bandwidth probe) is no access unit (see `WhipMux`),
+                    // nor evidence that its track is sent.
+                    if !data.is_empty() {
+                        sent.frame(&mut whep.muxer, video, network_time, flow_id);
+                    }
+                    let Some((ts_chunks, pts_90khz)) = whep.frame(
+                        video,
+                        &data,
+                        rtp_time.numer(),
+                        rtp_time.denom() as u64,
+                        network_time,
+                    ) else {
+                        continue;
+                    };
+                    publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
                 }
                 SessionEvent::Disconnected => {
                     tracing::warn!("WHEP disconnected, reconnecting...");
@@ -635,17 +669,24 @@ async fn whep_back_off(backoff_secs: &mut u64, cancel: &CancellationToken) -> bo
     true
 }
 
-/// Which tracks a WHIP publish carries, applied to its TS muxer once, on the
-/// first media — by then the offer's tracks have all been added
-/// (`SessionEvent::MediaAdded` comes out of the answer, before ICE).
+/// Which tracks a WHIP publish — or a WHEP pull — carries, applied to its TS
+/// muxer once, on the first media: by then the session's tracks have all
+/// been added (a publish's `SessionEvent::MediaAdded` comes out of the
+/// answer, before ICE; a pull's tracks are its own offer's).
 #[cfg(feature = "webrtc")]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WhipLayout {
+    /// What the layout is of, for the log: `"WHIP publish"`, `"WHEP pull"`.
+    session: &'static str,
     applied: bool,
 }
 
 #[cfg(feature = "webrtc")]
 impl WhipLayout {
+    fn new(session: &'static str) -> Self {
+        Self { session, applied: false }
+    }
+
     /// Set the muxer's layout from the session's tracks, once. With no video
     /// the PMT lists the Opus alone, names it as PCR_PID, and it carries the
     /// PCR (`TsMuxer::audio_pcr`).
@@ -666,7 +707,8 @@ impl WhipLayout {
             flow_id,
             has_video,
             has_audio,
-            "WHIP: publish carries {}",
+            "{} carries {}",
+            self.session,
             match (has_video, has_audio) {
                 (true, true) => "video and audio",
                 (true, false) => "video only",
@@ -693,14 +735,82 @@ impl WhipLayout {
             muxer.set_has_audio(true);
         }
         if muxer.change_has_video(has_video) {
-            tracing::info!(flow_id, has_video, "WHIP: the publish renegotiated its video track");
+            tracing::info!(flow_id, has_video, "{}: renegotiated its video track", self.session);
         }
     }
 }
 
-/// A WHIP publish's depayloaded frames onto its TS: one timeline for both
-/// tracks ([`WhipClock`]), the parameter sets ahead of every IDR
-/// ([`H264ParamSets`]), Opus in the FFmpeg-compatible carriage.
+/// How long a WHEP pull's track may carry nothing while the other track runs
+/// before it leaves the TS's layout: 1 s, as an RTMP publish's audio runs
+/// alone before the publish is taken for audio-only.
+#[cfg(feature = "webrtc")]
+const WHEP_TRACK_ABSENT_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Which of a WHEP pull's tracks the server actually sends.
+///
+/// A WHEP server's answer accepts a track whether or not it has anything to
+/// send on it: the edge's own WHEP output accepts H.264 on a flow with no
+/// video, and Opus with no Opus to send (no `audio_encode`, and a source
+/// whose audio is not Opus). So the answer only starts the pull's layout
+/// ([`WhipLayout`]). A track the answer accepted that has carried no frame
+/// once the other has run [`WHEP_TRACK_ABSENT_AFTER`] leaves the PMT (a
+/// version bump; the video leaving moves the PCR onto the audio PID), and
+/// its first frame brings it back. A track that has carried a frame stays,
+/// as an RTMP publish's video does. Laid out from the answer alone, a pull
+/// of audio named a silent video PID as PCR_PID and carried no PCR, and a
+/// pull of video listed an Opus stream nothing was sent on.
+#[cfg(feature = "webrtc")]
+#[derive(Debug, Default)]
+struct WhepTracks {
+    /// When the pull's first frame of either track arrived.
+    first_at: Option<std::time::Instant>,
+    video_seen: bool,
+    audio_seen: bool,
+}
+
+#[cfg(feature = "webrtc")]
+impl WhepTracks {
+    /// A frame with a payload of the video (`video`) or the audio track,
+    /// arrived at `arrival`, about to be muxed: its track into the layout if
+    /// it had left, and the other one out if it has not been sent.
+    fn frame(
+        &mut self,
+        muxer: &mut crate::engine::rtmp::ts_mux::TsMuxer,
+        video: bool,
+        arrival: std::time::Instant,
+        flow_id: &str,
+    ) {
+        let first = *self.first_at.get_or_insert(arrival);
+        let other_seen = if video {
+            self.video_seen = true;
+            self.audio_seen
+        } else {
+            self.audio_seen = true;
+            self.video_seen
+        };
+        let (this, other) = if video { ("video", "audio") } else { ("audio", "video") };
+        let joined = if video { muxer.change_has_video(true) } else { muxer.change_has_audio(true) };
+        if joined {
+            tracing::info!(flow_id, "WHEP pull: the server sends {this} again; the PMT lists it");
+        }
+        if other_seen || arrival.saturating_duration_since(first) < WHEP_TRACK_ABSENT_AFTER {
+            return;
+        }
+        let left = if video { muxer.change_has_audio(false) } else { muxer.change_has_video(false) };
+        if left {
+            tracing::info!(
+                flow_id,
+                "WHEP pull: the server sends no {other} ({} s of {this} without it); the PMT drops it{}",
+                WHEP_TRACK_ABSENT_AFTER.as_secs(),
+                if video { "" } else { " and names the audio PID as PCR_PID" },
+            );
+        }
+    }
+}
+
+/// A WHIP publish's — or a WHEP pull's — depayloaded frames onto its TS:
+/// one timeline for both tracks ([`WhipClock`]), the parameter sets ahead of
+/// every IDR ([`H264ParamSets`]), Opus in the FFmpeg-compatible carriage.
 ///
 /// A frame with no payload is no access unit and goes nowhere. A browser
 /// publisher's RTP padding-only packets — Chromium sends three every 5 s as
@@ -765,7 +875,8 @@ impl WhipMux {
     }
 }
 
-/// One 90 kHz timeline for a WHIP publish's video and audio.
+/// One 90 kHz timeline for a WHIP publish's (or a WHEP pull's) video and
+/// audio.
 ///
 /// Each track's RTP timestamps start at a random base of the sender's
 /// choosing (RFC 3550 §5.1; libwebrtc picks one per SSRC), so the video's
@@ -882,6 +993,8 @@ impl H264ParamSets {
 #[cfg(test)]
 mod tests {
     use super::H264ParamSets;
+    #[cfg(feature = "webrtc")]
+    use std::sync::{Arc, atomic::AtomicUsize};
 
     /// A WHIP publish's tracks share one timeline, set by when each track's
     /// first frame arrived: the RTP bases (random per SSRC) drop out. The
@@ -912,8 +1025,15 @@ mod tests {
     /// whose packets carry a PCR.
     #[cfg(feature = "webrtc")]
     fn layout_of(ts: &[bytes::Bytes]) -> ((u16, Vec<(u8, u16)>), Vec<u16>) {
-        use crate::engine::ts_parse::{extract_pcr, ts_pid};
+        use crate::engine::ts_parse::ts_pid;
         let pmt = ts.iter().find(|p| ts_pid(p) == 0x1000).expect("a PMT");
+        let (_, pcr_pid, es) = pmt_layout(pmt);
+        ((pcr_pid, es), pcr_pids_of(ts))
+    }
+
+    /// A PMT packet as `(version, PCR_PID, [(stream_type, PID)])`.
+    #[cfg(feature = "webrtc")]
+    fn pmt_layout(pmt: &[u8]) -> (u8, u16, Vec<(u8, u16)>) {
         let sec = &pmt[5..];
         let len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
         let mut es = Vec::new();
@@ -923,9 +1043,124 @@ mod tests {
             pos += 5 + ((((sec[pos + 3] & 0x0F) as usize) << 8) | sec[pos + 4] as usize);
         }
         let pcr_pid = (((sec[8] & 0x1F) as u16) << 8) | sec[9] as u16;
+        ((sec[5] >> 1) & 0x1F, pcr_pid, es)
+    }
+
+    /// Each PMT layout `ts` went through, in turn (`pmt_layout`).
+    #[cfg(feature = "webrtc")]
+    fn pmts_of(ts: &[bytes::Bytes]) -> Vec<(u8, u16, Vec<(u8, u16)>)> {
+        let mut pmts = Vec::new();
+        for p in ts.iter().filter(|p| crate::engine::ts_parse::ts_pid(p) == 0x1000) {
+            let pmt = pmt_layout(p);
+            if pmts.last() != Some(&pmt) {
+                pmts.push(pmt);
+            }
+        }
+        pmts
+    }
+
+    /// The PIDs whose packets carry a PCR, in turn.
+    #[cfg(feature = "webrtc")]
+    fn pcr_pids_of(ts: &[bytes::Bytes]) -> Vec<u16> {
+        use crate::engine::ts_parse::{extract_pcr, ts_pid};
         let mut pcr_pids: Vec<u16> = ts.iter().filter(|p| extract_pcr(p).is_some()).map(|p| ts_pid(p)).collect();
         pcr_pids.dedup();
-        ((pcr_pid, es), pcr_pids)
+        pcr_pids
+    }
+
+    /// Whether `ts` carries an Opus access unit in the Opus-in-TS carriage —
+    /// a PES on the audio PID opening with the control header `0x7F 0xE0`.
+    #[cfg(feature = "webrtc")]
+    fn carries_opus(ts: &[bytes::Bytes]) -> bool {
+        ts.iter().any(|p| {
+            (p[1] & 0x40) != 0
+                && crate::engine::ts_parse::ts_pid(p) == 0x0101
+                && crate::engine::ts_parse::pes_payload_offset(p)
+                    .is_some_and(|es| p[es..].starts_with(&[0x7F, 0xE0]))
+        })
+    }
+
+    /// A WHEP pull is laid out from the answer's tracks, then from what the
+    /// server sends: a track the answer accepted that carries nothing while
+    /// the other runs a second leaves the PMT — the video taking the PCR
+    /// with it onto the Opus — and its first frame brings it back. The
+    /// edge's own WHEP output accepts both tracks whatever its flow carries,
+    /// so laid out from the answer alone a pull of its audio named a silent
+    /// video PID as PCR_PID and carried no PCR, and a pull of its video
+    /// alone listed an Opus stream nothing was sent on.
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn a_whep_pulls_layout_follows_what_the_server_sends() {
+        use std::time::{Duration, Instant};
+        const BOTH: [(u8, u16); 2] = [(0x1B, 0x0100), (0x06, 0x0101)];
+
+        /// A pull whose answer accepted video and audio, fed frames as its
+        /// receive loop feeds them.
+        struct Pull {
+            mux: super::WhipMux,
+            layout: super::WhipLayout,
+            sent: super::WhepTracks,
+            t0: Instant,
+            ts: Vec<bytes::Bytes>,
+        }
+        impl Pull {
+            fn new() -> Self {
+                Self {
+                    mux: super::WhipMux::new(super::opus_ts_muxer(None)),
+                    layout: super::WhipLayout::new("WHEP pull"),
+                    sent: super::WhepTracks::default(),
+                    t0: Instant::now(),
+                    ts: Vec::new(),
+                }
+            }
+
+            /// A frame of the video (`video`) or the audio, `at_ms` in.
+            fn frame(&mut self, video: bool, at_ms: u64) {
+                self.layout.apply(&mut self.mux.muxer, true, true, "f");
+                let at = self.t0 + Duration::from_millis(at_ms);
+                self.sent.frame(&mut self.mux.muxer, video, at, "f");
+                let (data, rtp, rate): (&[u8], _, _) = if video {
+                    (&[0, 0, 0, 1, 0x65, 0x88], at_ms * 90, 90_000)
+                } else {
+                    (&[0xFC; 80], at_ms * 48, 48_000)
+                };
+                self.ts.extend(self.mux.frame(video, data, rtp, rate, at).unwrap().0);
+            }
+        }
+
+        // Audio alone: the video leaves a second in, the Opus taking the
+        // PCR, and comes back with its first frame, the PCR with it.
+        let mut pull = Pull::new();
+        for k in 0..75 {
+            pull.frame(false, k * 20);
+        }
+        pull.frame(true, 1_500);
+        assert_eq!(
+            pmts_of(&pull.ts),
+            vec![(0, 0x0100, BOTH.to_vec()), (1, 0x0101, vec![BOTH[1]]), (2, 0x0100, BOTH.to_vec())],
+        );
+        assert_eq!(pcr_pids_of(&pull.ts), vec![0x0101, 0x0100]);
+
+        // Video alone: the Opus leaves the PMT a second in.
+        let mut pull = Pull::new();
+        for k in 0..30 {
+            pull.frame(true, k * 40);
+        }
+        assert_eq!(pmts_of(&pull.ts), vec![(0, 0x0100, BOTH.to_vec()), (1, 0x0100, vec![BOTH[0]])]);
+        assert_eq!(pcr_pids_of(&pull.ts), vec![0x0100]);
+
+        // Both, the video's first frame 900 ms behind the audio's: nothing
+        // leaves, nothing moves.
+        let mut pull = Pull::new();
+        for k in 0..75 {
+            pull.frame(false, k * 20);
+            if k >= 45 && k % 2 == 1 {
+                pull.frame(true, k * 20);
+            }
+        }
+        assert_eq!(pmts_of(&pull.ts), vec![(0, 0x0100, BOTH.to_vec())]);
+        assert_eq!(pcr_pids_of(&pull.ts), vec![0x0100]);
+        assert!(carries_opus(&pull.ts));
     }
 
     /// An audio-only WHIP publish: the PMT lists the Opus alone and names it
@@ -938,7 +1173,7 @@ mod tests {
     fn a_whip_publishs_layout_follows_its_tracks() {
         let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
         mux.set_audio_stream(0x06, Some(*b"Opus"));
-        let mut layout = super::WhipLayout::default();
+        let mut layout = super::WhipLayout::new("WHIP publish");
         layout.apply(&mut mux, false, true, "f");
         let mut ts = Vec::new();
         for k in 0..5u64 {
@@ -948,7 +1183,7 @@ mod tests {
 
         let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
         mux.set_audio_stream(0x06, Some(*b"Opus"));
-        let mut layout = super::WhipLayout::default();
+        let mut layout = super::WhipLayout::new("WHIP publish");
         layout.apply(&mut mux, true, true, "f");
         let mut ts = mux.mux_video(&[0, 0, 0, 1, 0x65, 0x88], 90_000, 90_000, true);
         ts.extend(mux.mux_audio_opus(&[0xFC; 80], 90_000));
@@ -1391,5 +1626,192 @@ mod tests {
             lost += usize::from(ev.message == "WHEP disconnected");
         }
         assert!(lost >= 1, "no pull was closed after it connected");
+    }
+
+    /// A local WHEP server answering each pull as an edge's WHEP output does
+    /// (the answer passed through `edit`), then sending what `send` asks — an
+    /// H.264 IDR every 40 ms and / or a 20 ms Opus frame every 20 ms — for
+    /// `for_ms`. Its address, and how many pulls it has had.
+    #[cfg(feature = "webrtc")]
+    async fn serve_whep(
+        edit: fn(String) -> String,
+        send: (bool, bool),
+        for_ms: u64,
+    ) -> (std::net::SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+        use axum::http::{StatusCode, header};
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+        use str0m::media::{Frequency, MediaTime};
+        use tokio_util::sync::CancellationToken;
+        const IDR: &[u8] = &[
+            0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1F, 0xDA, 0, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80, 0, 0, 0, 1,
+            0x65, 0x88, 0x84, 0x00, 0x33,
+        ];
+
+        // What `main` installs before any TLS client is built.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/whep",
+            axum::routing::post({
+                let posts = posts.clone();
+                move |offer: String| async move {
+                    let n = posts.fetch_add(1, Ordering::SeqCst);
+                    let config = SessionConfig {
+                        bind_addr: "127.0.0.1:0".parse().unwrap(),
+                        public_ip: None,
+                        ice_lite: true,
+                    };
+                    let mut server = WebrtcSession::new(&config).await.unwrap();
+                    let answer = edit(server.accept_offer(&offer).unwrap());
+                    tokio::spawn(async move {
+                        let cancel = CancellationToken::new();
+                        let connected = tokio::time::timeout(Duration::from_secs(10), async {
+                            loop {
+                                match server.poll_event(&cancel).await {
+                                    SessionEvent::Connected => break true,
+                                    SessionEvent::Disconnected => break false,
+                                    _ => {}
+                                }
+                            }
+                        })
+                        .await;
+                        if connected != Ok(true) {
+                            return;
+                        }
+                        server.drain_pending_events();
+                        let video = server.video_mid.and_then(|mid| Some((mid, server.get_pt(mid)?)));
+                        let audio = server.audio_mid.and_then(|mid| Some((mid, server.get_pt(mid)?)));
+                        for k in 0..for_ms / 20 {
+                            if let (true, Some((mid, pt))) = (send.1, audio) {
+                                let at = MediaTime::new(k * 960, Frequency::FORTY_EIGHT_KHZ);
+                                let _ = server.write_media(mid, pt, Instant::now(), at, &[0xFC; 80]);
+                                server.drain_outputs().await;
+                            }
+                            if let (true, 0, Some((mid, pt))) = (send.0, k % 2, video) {
+                                let at = MediaTime::new(k / 2 * 3_600, Frequency::NINETY_KHZ);
+                                let _ = server.write_media(mid, pt, Instant::now(), at, IDR);
+                                server.drain_outputs().await;
+                            }
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            let _ = server.drive_udp_io().await;
+                        }
+                    });
+                    (
+                        StatusCode::CREATED,
+                        [
+                            (header::LOCATION, format!("/whep/res-{n}")),
+                            (header::CONTENT_TYPE, "application/sdp".to_string()),
+                        ],
+                        answer,
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, posts, server)
+    }
+
+    /// Run the WHEP input against `addr` for `run_ms`: what it published, as
+    /// TS packets, and the events it raised.
+    #[cfg(feature = "webrtc")]
+    async fn pull_whep(
+        addr: std::net::SocketAddr,
+        run_ms: u64,
+    ) -> (Vec<bytes::Bytes>, Vec<crate::manager::events::Event>) {
+        use std::time::Duration;
+        use tokio_util::sync::CancellationToken;
+
+        let config: crate::config::models::WhepInputConfig =
+            serde_json::from_value(serde_json::json!({ "whep_url": format!("http://{addr}/whep") }))
+                .unwrap();
+        let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(16_384);
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHEP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = CancellationToken::new();
+        let (events, mut raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whep_input_loop(
+                    config, broadcast_tx, stats, cancel, &events, "flow-w", &mut transcoder, &mut post,
+                )
+                .await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(run_ms)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let mut ts = Vec::new();
+        while let Ok(pkt) = published.try_recv() {
+            ts.extend(pkt.data.chunks(188).map(bytes::Bytes::copy_from_slice));
+        }
+        let mut raised_events = Vec::new();
+        while let Ok(ev) = raised.try_recv() {
+            raised_events.push(ev);
+        }
+        (ts, raised_events)
+    }
+
+    /// An edge-to-edge pull of a WHEP output that sends audio alone — the
+    /// output answers H.264 too, whatever its flow carries — publishes the
+    /// audio: by the end the PMT lists the Opus alone and names it as
+    /// PCR_PID, and the Opus carries the PCR. The input muxed only the video
+    /// track: it published nothing, and its flow sent NULL keepalives and
+    /// reported the input stalled.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whep_pull_of_audio_alone_publishes_the_audio() {
+        let (addr, _posts, server) = serve_whep(|a| a, (false, true), 3_000).await;
+        let (ts, _) = pull_whep(addr, 4_000).await;
+        server.abort();
+        assert!(carries_opus(&ts), "no Opus was published ({} packets)", ts.len());
+        let (_, pcr_pid, es) = pmts_of(&ts).pop().expect("a PMT");
+        assert_eq!((pcr_pid, es), (0x0101, vec![(0x06, 0x0101)]));
+        assert_eq!(pcr_pids_of(&ts), vec![0x0101]);
+    }
+
+    /// An A/V pull publishes both tracks: the PMT lists the H.264 and the
+    /// Opus, the PCR on the video, and the Opus is carried. The input muxed
+    /// only the video: the PMT listed it alone and the audio went nowhere.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whep_pull_of_video_and_audio_publishes_both() {
+        let (addr, _posts, server) = serve_whep(|a| a, (true, true), 1_500).await;
+        let (ts, _) = pull_whep(addr, 2_500).await;
+        server.abort();
+        assert!(carries_opus(&ts), "no Opus was published ({} packets)", ts.len());
+        let both = vec![(0x1B, 0x0100), (0x06, 0x0101)];
+        assert_eq!(pmts_of(&ts), vec![(0, 0x0100, both)]);
+        assert_eq!(pcr_pids_of(&ts), vec![0x0100]);
+    }
+
+    /// A WHEP server whose answer names no codec this input offered — VP8
+    /// and G.711 on the offer's payload types — leaves it no track to read:
+    /// it is not connected over, a Warning names it, and the input pulls
+    /// again after its backoff. It used to connect and publish nothing for
+    /// as long as the session lasted. (An answer refusing both m-lines is
+    /// refused by str0m itself, `apply_answer`, with the same backoff.)
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whep_answer_with_nothing_this_input_takes_is_not_waited_on() {
+        let off_offer =
+            |a: String| a.replace("H264/90000", "VP8/90000").replace("opus/48000/2", "PCMU/8000");
+        let (addr, posts, server) = serve_whep(off_offer, (true, true), 1_000).await;
+        let (ts, raised) = pull_whep(addr, 1_500).await;
+        server.abort();
+        assert!(ts.is_empty(), "{} packets published", ts.len());
+        let refused: Vec<_> =
+            raised.iter().filter(|e| e.message.contains("no H.264 video and no Opus audio")).collect();
+        assert!(!refused.is_empty(), "{:?}", raised.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert_eq!(refused[0].severity, crate::manager::events::EventSeverity::Warning);
+        assert_eq!(posts.load(std::sync::atomic::Ordering::SeqCst), 2, "pulled at 0 and 1 s");
     }
 }
