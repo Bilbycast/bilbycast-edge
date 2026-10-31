@@ -4105,8 +4105,11 @@ async fn execute_command(
             // accepted rather than being refused for them, as at load: the
             // manager may be replaying what it cached before the upgrade.
             let hitless_repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
+            // So are the AAC channel counts validation began refusing.
+            let aac_repairs = crate::config::validation::repair_aac_channel_counts(&mut new_config);
             validate_config(&new_config).map_err(|e| CommandError::from_validation("Invalid config", e))?;
             hitless_repairs.report(flow_manager.event_sender());
+            aac_repairs.report(flow_manager.event_sender());
             tracing::info!("Manager command: update_config (diff-based)");
 
             tracing::info!("Config diff: old={} flows/{} tunnels, new={} flows/{} tunnels",

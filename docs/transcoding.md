@@ -691,7 +691,14 @@ has for them (ISO/IEC 14496-3 §4.4.1.1). Shared code:
   header need. ffmpeg decodes it as 7.1 with each input channel (WAV order:
   FL FR FC LFE BL BR SL SR) on its own output channel. `audio_encode.channels`
   (or a `transcode` block's) of 7 is refused for AAC: fdk-aac has no 6.1
-  mode, and the count used to pass validation and fail at the first frame.
+  mode, and the count used to pass validation and fail at the first frame
+  (a `transcode` block's 9-16, or other than 2 beside `he_aac_v2`, too).
+  That refusal is for the edits that name an input or output; a whole
+  config already holding such a count — the load, the reload,
+  `PUT /api/v1/config`, a manager `update_config` — is repaired to 6
+  (from 7), 8 (from 9-16) or 2 (HE-AAC v2) and a Warning `config` event
+  (`aac_channels_repaired`) names it, since refusing it at load would stop
+  the node (`config::validation::repair_aac_channel_counts`).
 - **7.1 sources.** The edge's AAC decoders (the re-encoding outputs' — RTMP,
   CMAF, WebRTC and HLS — the TS audio replacer's, the display's, the
   meters') hand out every channel a 7.1 stream carries. fdk-aac mixes

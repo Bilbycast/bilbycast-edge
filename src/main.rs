@@ -560,6 +560,10 @@ async fn real_main() -> anyhow::Result<()> {
     // over). Every route that takes a whole config repairs these; reported
     // below, once the event sender exists.
     let hitless_repairs = config::validation::repair_hitless_slots(&mut app_config);
+    // And for the AAC channel counts validation began refusing (7, 9-16,
+    // HE-AAC v2 other than stereo): such an output carried no audio, and
+    // refusing it here took every flow on the node down with it.
+    let aac_repairs = config::validation::repair_aac_channel_counts(&mut app_config);
 
     // Validate config
     if let Err(e) = validate_config(&app_config) {
@@ -577,7 +581,7 @@ async fn real_main() -> anyhow::Result<()> {
     // A repair is written back at once, so config.json says what runs from
     // the boot that reported it, rather than changing under the next
     // unrelated save. A failed write leaves the node running on the repair.
-    let repaired = !hitless_repairs.is_empty();
+    let repaired = !hitless_repairs.is_empty() || !aac_repairs.is_empty();
     #[cfg(feature = "multiviewer")]
     let repaired = repaired || !repaired_mosaic_codecs.is_empty();
     if repaired && let Err(e) = save_config_split(&cli.config, &secrets_path, &app_config) {
@@ -774,8 +778,9 @@ async fn real_main() -> anyhow::Result<()> {
     // and a manager event for the fleet operator who never logs in. The
     // event queue flushes on the first manager auth, so this reaches the
     // Events page even though it is raised before the WS connects.
-    // The repaired Hitless slots too.
+    // The repaired Hitless slots and AAC channel counts too.
     hitless_repairs.report(&event_sender);
+    aac_repairs.report(&event_sender);
     for stale in &stale_env {
         tracing::warn!("{}", stale.message());
         event_sender.send(manager::events::Event {
