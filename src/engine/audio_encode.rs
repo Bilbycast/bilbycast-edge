@@ -2770,11 +2770,11 @@ mod tests {
     /// hold — every 7.1 AAC frame went out saying 4 (4.0), with no PCE. Each
     /// frame now says 0 and opens with the PCE fdk writes for that layout
     /// (centre, front pair, surround pair, rear pair, LFE), so its
-    /// configuration names eight channels and the frames decode. fdk's own
-    /// decoder downmixes anything wider than six channels by default, so it
-    /// hands out 5.1 here; ffmpeg decodes these frames as 7.1, each input on
-    /// its own channel in WAV order (checked by hand, not here: no ADTS
-    /// decoder but fdk is linked into the edge).
+    /// configuration names eight channels, and the frames decode as eight,
+    /// each input's tone on a channel of its own (the LFE input's 900 Hz is
+    /// filtered out by the encoder's LFE band limit, so that input is the
+    /// one not told apart). ffmpeg decodes them as 7.1 too, each input on its
+    /// own channel in WAV order (checked by hand).
     #[cfg(feature = "fdk-aac")]
     #[test]
     fn a_7_1_aac_frame_carries_its_layout() {
@@ -2809,6 +2809,8 @@ mod tests {
         let frames: Vec<EncodedFrame> = enc.drain().into_iter().filter(|f| !f.data.is_empty()).collect();
         assert!(frames.len() >= 20, "{} frames", frames.len());
         let mut dec = aac_audio::AacDecoder::open_adts().expect("an ADTS decoder");
+        dec.set_max_output_channels(None).expect("no downmix");
+        let mut power = [[0.0f64; 8]; 8];
         for (i, f) in frames.iter().enumerate() {
             let (au, (profile, sr_idx, ch_cfg)) =
                 crate::engine::audio_au::adts_access_unit(&f.data).expect("one whole ADTS frame");
@@ -2817,8 +2819,30 @@ mod tests {
                 .unwrap_or_else(|| panic!("frame {i}: its raw_data_block opens with the PCE"));
             assert_eq!(cfg.channels(), 8, "frame {i}: the PCE names eight channels");
             let pcm = dec.decode_frame(&f.data).unwrap_or_else(|e| panic!("frame {i}: {e}"));
-            assert_eq!(pcm.planar.len(), 6, "frame {i}: fdk's default downmix of 7.1");
+            assert_eq!(pcm.planar.len(), 8, "frame {i}: eight channels");
+            if i < 4 {
+                continue;
+            }
+            // Goertzel power of each input's tone on each output channel.
+            for (out, samples) in pcm.planar.iter().enumerate() {
+                for (input, p) in power[out].iter_mut().enumerate() {
+                    let c = 2.0 * (2.0 * std::f64::consts::PI * (300.0 + 200.0 * input as f64) / 48_000.0).cos();
+                    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+                    for &x in samples {
+                        let s0 = f64::from(x) + c * s1 - s2;
+                        s2 = s1;
+                        s1 = s0;
+                    }
+                    *p += s1 * s1 + s2 * s2 - c * s1 * s2;
+                }
+            }
         }
+        let loudest: Vec<usize> =
+            power.iter().map(|p| (0..8).max_by(|&a, &b| p[a].total_cmp(&p[b])).unwrap()).collect();
+        let mut heard: Vec<usize> = loudest.iter().copied().filter(|&input| input != 3).collect();
+        heard.sort_unstable();
+        heard.dedup();
+        assert_eq!(heard, [0, 1, 2, 4, 5, 6, 7], "each input but the LFE on its own channel: {loudest:?}");
     }
 
     #[test]

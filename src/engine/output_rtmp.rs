@@ -386,7 +386,11 @@ async fn publish_loop(
     // when there is none (`audio_watch` says so).
     let mut demuxer = aac_output_demuxer(config.program_number, config.audio_encode.as_ref());
     let mut passthrough = PassthroughVideo::default();
-    let mut sent_audio_header = false;
+    // What the last AAC sequence header announced on this connection:
+    // `None` until one has gone out. A frame of another configuration — the
+    // source's after a switch, passed through; the encoder's, re-encoded —
+    // re-announces it ahead of itself, as FLV publishers do.
+    let mut audio_header: Option<AacConfig> = None;
     // Every FLV timestamp, audio and video, on one continuous timeline per
     // connection (edge#211).
     let mut timeline = FlvTimeline::new(&config.id);
@@ -454,7 +458,7 @@ async fn publish_loop(
                     config,
                     client,
                     &mut encoder_state,
-                    &mut sent_audio_header,
+                    &mut audio_header,
                     stats,
                     &mut timeline,
                 )
@@ -587,12 +591,8 @@ async fn publish_loop(
                     // signalled implicitly, as in the ADTS it arrived in —
                     // and a PCE-signalled source's program_config_element.
                     // A re-encode's comes from its encoder's first frame
-                    // (`send_encoded_audio`). Only wanted until it is sent.
-                    let header_format = if sent_audio_header {
-                        None
-                    } else {
-                        aac_sequence_header_format(&encoder_state, demuxer.cached_aac_specific_config())
-                    };
+                    // (`send_encoded_audio`).
+                    let header_format = aac_sequence_header_format(&encoder_state, demuxer.cached_aac_specific_config());
 
                     match &mut encoder_state {
                         EncoderState::Disabled | EncoderState::Transparent => {
@@ -602,20 +602,27 @@ async fn publish_loop(
                             // (a loop's overlap) is dropped. Frames of a
                             // PCE-signalled source go out as they came, with
                             // or without a PCE of their own: the header
-                            // carries the layout.
-                            if !sent_audio_header && header_format.is_none() {
+                            // carries the layout. A source whose
+                            // configuration changes (a switch to another
+                            // feed) is re-announced ahead of its first frame;
+                            // the header used to be sent once a connection.
+                            if audio_header.is_none() && header_format.is_none() {
                                 continue;
                             }
                             let Some(ts_ms) = timeline.audio_tag_ms(at) else {
                                 continue;
                             };
-                            if !sent_audio_header
-                                && let Some(source) = header_format.as_ref()
+                            if let Some(source) = header_format
+                                && audio_header.as_ref() != Some(&source)
                             {
                                 let header = build_aac_sequence_header(&source.audio_specific_config());
                                 client.send_audio(&header, ts_ms).await?;
-                                sent_audio_header = true;
-                                tracing::debug!("RTMP output '{}': sent AAC sequence header", config.id);
+                                tracing::debug!(
+                                    "RTMP output '{}': sent AAC sequence header{}",
+                                    config.id,
+                                    if audio_header.is_some() { " (the source's configuration changed)" } else { "" }
+                                );
+                                audio_header = Some(source);
                             }
                             let tag = build_aac_raw_tag(&data);
                             let tag_len = tag.len();
@@ -632,13 +639,25 @@ async fn publish_loop(
                             silence,
                             input,
                         } => {
-                            // Silent-fallback mode: lazily build the decoder
-                            // against the source's real AAC config on the
-                            // first real frame (the stage, pinned to the
-                            // encoder's format, converts whatever it is).
-                            if decoder.is_none()
-                                && let Some(source) = demuxer.cached_aac_specific_config()
+                            // The decoder for the source's configuration:
+                            // built lazily on the first real frame in
+                            // silent-fallback mode, and again whenever the
+                            // source's configuration changes (a switch to
+                            // another feed), which a decoder set up for the
+                            // old one misdecodes or refuses. The stage,
+                            // pinned to the encoder's format, converts
+                            // whatever it decodes to, so the encoder and its
+                            // header stay as they are.
+                            if let Some(source) = demuxer.cached_aac_specific_config()
+                                && decoder.as_ref().is_none_or(|d| d.config() != &source)
                             {
+                                if decoder.is_some() {
+                                    tracing::info!(
+                                        "RTMP output '{}': the source's AAC configuration changed; rebuilding its decoder",
+                                        config.id
+                                    );
+                                }
+                                *decoder = None;
                                 lazy_build_decoder(decoder, &source, &config.id);
                             }
                             // Reset the drop watchdog: real audio is
@@ -682,7 +701,7 @@ async fn publish_loop(
                                 client,
                                 encoder,
                                 &mut timeline,
-                                &mut sent_audio_header,
+                                &mut audio_header,
                                 stats,
                                 Some(recv_time_us),
                             )
@@ -783,7 +802,7 @@ async fn publish_loop(
                         client,
                         encoder,
                         &mut timeline,
-                        &mut sent_audio_header,
+                        &mut audio_header,
                         stats,
                         Some(recv_time_us),
                     )
@@ -1311,20 +1330,20 @@ async fn send_encoded_audio(
     client: &mut RtmpClient,
     encoder: &mut AudioEncoder,
     timeline: &mut FlvTimeline,
-    sent_audio_header: &mut bool,
+    audio_header: &mut Option<AacConfig>,
     stats: &OutputStatsAccumulator,
     recv_time_us: Option<u64>,
 ) -> anyhow::Result<()> {
     // The encoder's stamps are already on the timeline: it was anchored on
     // mapped times.
     for frame in encoder.drain() {
-        let Some((ts_ms, au, header)) = encoded_aac_tag(&frame, !*sent_audio_header, timeline) else {
+        let Some((ts_ms, au, header)) = encoded_aac_tag(&frame, audio_header.as_ref(), timeline) else {
             continue;
         };
         if let Some(format) = header {
             client.send_audio(&build_aac_sequence_header(&format.audio_specific_config()), ts_ms).await?;
-            *sent_audio_header = true;
             tracing::debug!("RTMP output '{}': sent AAC sequence header (re-encoded)", timeline.output_id);
+            *audio_header = Some(format);
         }
         let tag = build_aac_raw_tag(au);
         let tag_len = tag.len();
@@ -1340,16 +1359,18 @@ async fn send_encoded_audio(
 
 /// What [`send_encoded_audio`] sends of one encoded frame: its FLV ms on the
 /// connection's timeline, the raw access unit its ADTS frame carries
-/// ([`adts_access_unit`]) and, when `need_header`, the configuration that
-/// ADTS header (and, for channel configuration 0, the PCE the frame opens
-/// with) names, for the sequence header — or `None` to send nothing. A frame
-/// FLV cannot carry, or that cannot open the stream (channel configuration 0
-/// without its PCE), is turned away before the timeline sees it: past
-/// [`FlvTimeline::audio_tag_ms`] it would take the place of the frame after
-/// it, which would then go as at or behind one already sent.
+/// ([`adts_access_unit`]) and, when it differs from `announced` (what the
+/// last sequence header said, `None` before the first), the configuration
+/// that ADTS header (and, for channel configuration 0, the PCE the frame
+/// opens with) names, for a sequence header ahead of it — or `None` to send
+/// nothing. A frame FLV cannot carry, or that cannot open the stream
+/// (channel configuration 0 without its PCE, before any header), is turned
+/// away before the timeline sees it: past [`FlvTimeline::audio_tag_ms`] it
+/// would take the place of the frame after it, which would then go as at or
+/// behind one already sent.
 fn encoded_aac_tag<'a>(
     frame: &'a EncodedFrame,
-    need_header: bool,
+    announced: Option<&AacConfig>,
     timeline: &mut FlvTimeline,
 ) -> Option<(u32, &'a [u8], Option<AacConfig>)> {
     // fdk may hand back an empty frame while it primes: nothing to send.
@@ -1369,11 +1390,15 @@ fn encoded_aac_tag<'a>(
         }
         return None;
     };
-    let header = if need_header {
-        let (profile, sr_idx, ch_cfg) = asc;
-        Some(AacConfig::from_adts(profile, sr_idx, ch_cfg, au)?)
-    } else {
-        None
+    let (profile, sr_idx, ch_cfg) = asc;
+    let header = match (announced, AacConfig::from_adts(profile, sr_idx, ch_cfg, au)) {
+        // Nothing announced and nothing this frame can announce.
+        (None, None) => return None,
+        (None, Some(format)) => Some(format),
+        (Some(was), Some(format)) if *was != format => Some(format),
+        // The configuration announced, or a frame of channel configuration
+        // 0 without a PCE of its own, which the header's carries.
+        _ => None,
     };
     Some((timeline.audio_tag_ms(frame.pts)?, au, header))
 }
@@ -2748,7 +2773,7 @@ fn build_encoder_state(
         return EncoderState::Failed;
     }
 
-    let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() else {
+    let Some((profile, sr_idx, _)) = demuxer.cached_aac_config() else {
         tracing::warn!(
             "RTMP output '{}': audio_encode requested but demuxer has no cached AAC config yet; deferring",
             config.id
@@ -2784,25 +2809,15 @@ fn build_encoder_state(
     // configuration with it, once one has arrived (the caller holds the
     // frames back meanwhile, `hold_for_layout`). It used to be refused here
     // with only a log line.
+    //
+    // A source wider than stereo (5.1, 7.1) is decoded whole and goes
+    // through the channel stage like an MP2 / AC-3 / E-AC-3 one: kept at its
+    // layout, or converted to `audio_encode.channels` / the `transcode`
+    // block's. It used to be refused (log line only), a restriction from a
+    // decoder that took mono and stereo alone.
     let Some(source) = demuxer.cached_aac_specific_config() else {
         return EncoderState::Lazy;
     };
-    if source.channels() > 2 {
-        let msg = format!(
-            "RTMP output '{}': audio_encode requires mono or stereo AAC input, got {} channels \
-             (channel_config={ch_cfg}); audio will be dropped",
-            config.id,
-            source.channels()
-        );
-        tracing::error!("{msg}");
-        event_sender.emit_flow(
-            EventSeverity::Warning,
-            crate::manager::events::category::AUDIO_ENCODE,
-            msg,
-            flow_id,
-        );
-        return EncoderState::Failed;
-    }
 
     let Some(codec) = AudioCodec::parse(&enc_cfg.codec) else {
         tracing::error!(
@@ -3108,7 +3123,7 @@ async fn emit_silence_if_needed(
     config: &RtmpOutputConfig,
     client: &mut RtmpClient,
     encoder_state: &mut EncoderState,
-    sent_audio_header: &mut bool,
+    audio_header: &mut Option<AacConfig>,
     stats: &Arc<OutputStatsAccumulator>,
     timeline: &mut FlvTimeline,
 ) -> anyhow::Result<()> {
@@ -3131,7 +3146,7 @@ async fn emit_silence_if_needed(
             { lay_silence(encoder, sg, input, timeline, &config.id) }
         );
     }
-    send_encoded_audio(client, encoder, timeline, sent_audio_header, stats, None).await
+    send_encoded_audio(client, encoder, timeline, audio_header, stats, None).await
 }
 
 /// Eager encoder construction for `silent_fallback = true`.
@@ -4704,7 +4719,7 @@ mod flv_timestamp_tests {
     /// (`send_encoded_audio` without the client: its [`encoded_aac_tag`]).
     #[cfg(feature = "fdk-aac")]
     fn sent(encoder: &mut AudioEncoder, tl: &mut FlvTimeline) -> Vec<u64> {
-        encoder.drain().into_iter().filter(|f| encoded_aac_tag(f, false, tl).is_some()).map(|f| f.pts).collect()
+        encoder.drain().into_iter().filter(|f| encoded_aac_tag(f, None, tl).is_some()).map(|f| f.pts).collect()
     }
 
     /// edge#210: what an encoder hands back that FLV cannot carry — an empty
@@ -4723,26 +4738,34 @@ mod flv_timestamp_tests {
         let at = tl.video(P0, None, true).expect("a picture").pts + 1_920;
         let frame = |data: &[u8]| EncodedFrame { data: bytes::Bytes::copy_from_slice(data), pts: at };
         for junk in [&[][..], &whole[..7], &whole[7..]] {
-            assert!(encoded_aac_tag(&frame(junk), true, &mut tl).is_none(), "{} bytes sent", junk.len());
+            assert!(encoded_aac_tag(&frame(junk), None, &mut tl).is_none(), "{} bytes sent", junk.len());
         }
         let mut clean = FlvTimeline::new("o");
         clean.video(P0, None, true);
         let want = clean.audio_tag_ms(at).expect("a frame after the picture goes");
         assert!(want > 0);
         let real = frame(whole);
-        let (ts_ms, au, header) = encoded_aac_tag(&real, true, &mut tl).expect("the whole frame goes");
-        assert_eq!((ts_ms, au, header), (want, &whole[7..], AacConfig::new(1, 3, 2)), "at its time, less its header");
-        assert!(encoded_aac_tag(&real, false, &mut tl).is_none(), "a second at that time is at or behind it");
+        let (ts_ms, au, header) = encoded_aac_tag(&real, None, &mut tl).expect("the whole frame goes");
+        let lc = AacConfig::new(1, 3, 2).unwrap();
+        assert_eq!((ts_ms, au, header), (want, &whole[7..], Some(lc.clone())), "at its time, less its header");
+        assert!(encoded_aac_tag(&real, Some(&lc), &mut tl).is_none(), "a second at that time is at or behind it");
         // A frame of channel configuration 0 that does not open with its
         // PCE cannot open the stream: turned away while a header is owed,
-        // before the timeline sees it.
+        // before the timeline sees it; after one, it goes under it.
         let mut cfg0 = whole.to_vec();
         cfg0[2] &= !0x01;
         cfg0[3] &= 0x3F;
         let later = EncodedFrame { data: bytes::Bytes::from(cfg0), pts: at + 1_920 };
-        assert!(encoded_aac_tag(&later, true, &mut tl).is_none(), "no header without the layout");
-        let (_, _, header) = encoded_aac_tag(&later, false, &mut tl).expect("once a header is out, it goes");
+        assert!(encoded_aac_tag(&later, None, &mut tl).is_none(), "no header without the layout");
+        let (_, _, header) = encoded_aac_tag(&later, Some(&lc), &mut tl).expect("once a header is out, it goes");
         assert_eq!(header, None);
+        // A frame of another configuration than the one announced is
+        // announced again, ahead of itself.
+        let mut mono = whole.to_vec();
+        mono[3] = (mono[3] & 0x3F) | 0x40;
+        let next = EncodedFrame { data: bytes::Bytes::from(mono), pts: at + 3_840 };
+        let (_, _, header) = encoded_aac_tag(&next, Some(&lc), &mut tl).expect("it goes");
+        assert_eq!(header, AacConfig::new(1, 3, 1), "re-announced");
     }
 
     /// A video-only source (the case `silent_fallback` exists for) whose PTS
@@ -6712,29 +6735,23 @@ pub(super) mod flv_wire_tests {
         }
     }
 
-    /// The ADTS frames of `adts`, split.
-    fn split_adts(adts: &[u8]) -> Vec<&[u8]> {
-        let mut frames = Vec::new();
-        let mut off = 0;
-        while off + 7 <= adts.len() {
-            let len = (usize::from(adts[off + 3] & 0x03) << 11)
-                | (usize::from(adts[off + 4]) << 3)
-                | (usize::from(adts[off + 5]) >> 5);
-            frames.push(&adts[off..off + len]);
-            off += len;
-        }
-        frames
-    }
+    use crate::engine::ts_test_fixtures::split_adts;
 
     /// A programme of [`LAP_PICTURES`] H.264 pictures with `frames` (whole
     /// ADTS frames), one a PES, `step` ticks apart from three pictures in,
     /// each muxed ahead of the first picture decoding after it.
     fn programme_of(frames: &[&[u8]], step: u64) -> Vec<Bytes> {
+        let timed: Vec<(u64, &[u8])> = frames.iter().enumerate().map(|(j, f)| (3 * F + j as u64 * step, *f)).collect();
+        programme_timed(&timed)
+    }
+
+    /// [`programme_of`] with each frame at its own time, from `T0`.
+    fn programme_timed(frames: &[(u64, &[u8])]) -> Vec<Bytes> {
         let pics = ibbp(LAP_PICTURES, |k| T0 + k * F);
         let mut mux = TsMuxer::new();
         mux.set_has_audio(true);
         let mut ts = Vec::new();
-        let mut next = frames.iter().enumerate().map(|(j, f)| (T0 + 3 * F + j as u64 * step, *f)).peekable();
+        let mut next = frames.iter().map(|&(at, f)| (T0 + at, f)).peekable();
         for (k, &(pts, dts)) in pics.iter().enumerate() {
             let decode = dts.unwrap_or(pts);
             while let Some((at, f)) = next.next_if(|&(at, _)| at <= decode) {
@@ -6883,7 +6900,7 @@ pub(super) mod flv_wire_tests {
         let (mut client, media_rx, cancel) = loopback().await;
         let mut st = silent_fallback_state();
         let mut tl = FlvTimeline::new("o");
-        let mut sent = false;
+        let mut sent = None;
         // A second of pictures lays nothing (the silence starts at the
         // picture), the next second about 46 frames.
         for pictures in [0..25, 25..50] {
@@ -6922,6 +6939,89 @@ pub(super) mod flv_wire_tests {
         let n = frames.len();
         let run = (0..n).find(|&i0| bodies.iter().enumerate().all(|(i, b)| *b == &frames[(i0 + i) % n][7..]));
         assert!(run.is_some(), "the tags are not a run of the source's frames less their header");
+    }
+
+    /// [`crate::engine::ts_test_fixtures::rate_switch_frames`], 40 frames
+    /// after the switch, timed from `T0` for [`programme_timed`].
+    #[cfg(feature = "fdk-aac")]
+    fn rate_switch() -> (Vec<(u64, Vec<u8>)>, usize) {
+        let (frames, first) = crate::engine::ts_test_fixtures::rate_switch_frames(40);
+        (frames.into_iter().map(|(pts, f)| (pts - 90_000 + 3 * F, f)).collect(), first)
+    }
+
+    /// A passed-through source whose AAC configuration changes mid-connection
+    /// (48 kHz to 44.1 kHz here) is re-announced: a second sequence header,
+    /// naming the new configuration, goes out with the first frame of it, and
+    /// every frame goes out as it came. The header used to be sent once a
+    /// connection, so a receiver went on decoding the 44.1 kHz frames as
+    /// 48 kHz, 9 % fast.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn a_passed_through_source_changing_configuration_is_re_announced() {
+        let (frames, first) = rate_switch();
+        let refs: Vec<(u64, &[u8])> = frames.iter().map(|(at, f)| (*at, f.as_slice())).collect();
+        let tags = publish(programme_timed(&refs), passthrough_output()).await;
+        let audio: Vec<&WireTag> = tags.iter().filter(|t| !t.video).collect();
+        let headers: Vec<usize> = (0..audio.len()).filter(|&i| audio[i].data[..2] == [0xAF, 0x00]).collect();
+        assert_eq!(headers.len(), 2, "the first header and one for the new configuration");
+        assert_eq!(&audio[headers[0]].data[2..], [0x11, 0x90], "AAC-LC, 48 kHz, stereo");
+        assert_eq!(&audio[headers[1]].data[2..], [0x12, 0x10], "AAC-LC, 44.1 kHz, stereo");
+        assert_eq!(audio[headers[1]].ts, audio[headers[1] + 1].ts, "at the first 44.1 kHz frame's time");
+        let bodies = |r: std::ops::Range<usize>| -> Vec<&[u8]> { audio[r].iter().map(|t| &t.data[2..]).collect() };
+        let before = bodies(1..headers[1]);
+        let after = bodies(headers[1] + 1..audio.len());
+        assert_eq!(before.len(), first, "every 48 kHz frame, under the first header");
+        assert!(before.iter().zip(&frames).all(|(b, (_, f))| *b == &f[7..]));
+        assert_eq!(after.len(), frames.len() - first, "every 44.1 kHz frame, under the second");
+        assert!(after.iter().zip(&frames[first..]).all(|(b, (_, f))| *b == &f[7..]));
+    }
+
+    /// The same switch on a re-encode: the decoder is rebuilt for the new
+    /// configuration, so the 44.1 kHz frames are decoded at their rate and
+    /// re-encoded at 48 kHz under the encoder's one header — the 300 Hz tone
+    /// after the switch comes out at 300 Hz. The decoder set up for the
+    /// first configuration used to be kept for the life of the connection,
+    /// and decoded them as 48 kHz: the tone at 326 Hz, the audio 9 % fast.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn a_re_encoded_source_changing_configuration_gets_a_decoder_of_its_own() {
+        use crate::engine::ts_test_fixtures::tone_power;
+        let (frames, _) = rate_switch();
+        let refs: Vec<(u64, &[u8])> = frames.iter().map(|(at, f)| (*at, f.as_slice())).collect();
+        let output = serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 96 }
+        });
+        let tags = publish(programme_timed(&refs), output).await;
+        let n = assert_raw_aac(&tags, (2, 3, 2), 1_024);
+        assert!(n >= 80, "{n} AAC frames");
+        // The left channel of the last 24 frames, decoded: the tone after the
+        // switch, its codec and resampler transients well behind.
+        let mut dec = aac_audio::AacDecoder::open_raw(&[0x11, 0x90]).expect("decoder");
+        let left: Vec<f32> = tags
+            .iter()
+            .filter(|t| !t.video && t.data[..2] == [0xAF, 0x01])
+            .flat_map(|t| dec.decode_frame(&t.data[2..]).expect("decodes").planar.swap_remove(0))
+            .collect();
+        let tail = &left[left.len() - 24 * 1_024..];
+        let (at_300, at_326) = (tone_power(tail, 300.0, 48_000), tone_power(tail, 300.0 * 48_000.0 / 44_100.0, 48_000));
+        assert!(at_300 > 10.0 * at_326, "300 Hz {at_300:.0}, 326 Hz {at_326:.0}: decoded at the wrong rate");
+    }
+
+    /// A 5.1 AAC source re-encoded with `channels: 2` is decoded whole and
+    /// mixed down by the channel stage, as an AC-3 5.1 source is. It used to
+    /// be refused for having more than two channels, with a log line, and no
+    /// audio went out.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn a_5_1_aac_source_is_mixed_down_on_a_re_encode() {
+        let src = crate::engine::ts_test_fixtures::aac_lc_adts(48_000, 6, 85);
+        let output = serde_json::json!({
+            "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc", "channels": 2 }
+        });
+        let n = assert_raw_aac(&publish(programme_of(&split_adts(&src), 1_920), output).await, (2, 3, 2), 1_024);
+        assert!(n >= 60, "{n} AAC frames");
     }
 
     // ── edge#210 bench: an MPTS whose first audio track is AC-4 ───────────

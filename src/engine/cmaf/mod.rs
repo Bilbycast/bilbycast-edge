@@ -788,6 +788,13 @@ struct CmafState {
     /// nor its decoder can be built without it — so the wait is said once
     /// (`aac_channel_layout_missing`).
     layout_wait: crate::engine::aac_config::LayoutWait,
+    /// The source configuration a passed-through AAC track was built from,
+    /// and the one a change away from it was last reported for
+    /// (`aac_config_changed`): the init describes the first for the life of
+    /// the output, so a change is said once, and again only after the
+    /// source has come back to it.
+    passthrough_aac: Option<crate::engine::aac_config::AacConfig>,
+    aac_change_said: Option<crate::engine::aac_config::AacConfig>,
     /// Estimated video bitrate in bps (EWMA over emitted segments).
     video_bps_ewma: u64,
     /// Estimated audio bitrate in bps.
@@ -1360,6 +1367,8 @@ impl CmafState {
             video_ready_at: None,
             late_audio_warned: false,
             layout_wait: crate::engine::aac_config::LayoutWait::default(),
+            passthrough_aac: None,
+            aac_change_said: None,
             video_bps_ewma: 0,
             audio_bps_ewma: 0,
             availability_start_unix: 0,
@@ -2871,11 +2880,13 @@ fn handle_audio_frame(
         state.audio_seg =
                             Some(AudioSegmenter::new_from_seq(track, config.segment_duration_secs, state.resume_seq));
         state.audio_ready = true;
+        state.passthrough_aac = Some(source);
         tracing::info!(
             "CMAF output '{}': audio track detected AAC sr={} ch={}",
             config.id, sample_rate, channels,
         );
     }
+    note_passthrough_aac_change(state, demuxer, config, event_sender, flow_id);
 
     // Phase 3: audio_encode hook — pump the source AAC frame through
     // the AudioReencoder and substitute the re-encoded frame(s).
@@ -2930,6 +2941,59 @@ fn handle_audio_frame(
     };
 
     buffer_audio_frames(state, config, frames_to_buffer);
+}
+
+/// A passed-through AAC source whose configuration (rate, channels, object
+/// type, layout) has changed since its track was built: Warning
+/// `aac_config_changed`, once per change. The track list is committed at the
+/// first `init.mp4`, the audio sample entry with it, and a new init
+/// generation opens only at a video IDR — audio of the new configuration
+/// buffered before that IDR would still go out under the old init — so the
+/// frames keep going under the init that describes the first configuration,
+/// as they always did, and the operator is told: a restart builds the track
+/// from the new one (and, over a restored window, opens a new generation).
+/// It used to change silently.
+fn note_passthrough_aac_change(
+    state: &mut CmafState,
+    demuxer: &TsDemuxer,
+    config: &CmafOutputConfig,
+    event_sender: &EventSender,
+    flow_id: &str,
+) {
+    let Some(track_cfg) = state.passthrough_aac.as_ref() else {
+        return;
+    };
+    let Some(now) = demuxer.cached_aac_specific_config() else {
+        return;
+    };
+    if &now == track_cfg {
+        state.aac_change_said = None;
+        return;
+    }
+    if state.aac_change_said.as_ref() == Some(&now) {
+        return;
+    }
+    let message = format!(
+        "CMAF output '{}': the source's AAC configuration changed ({} -> {}); the init still \
+         describes the first, so players may not decode the audio until the output is restarted",
+        config.id,
+        track_cfg.describe(),
+        now.describe(),
+    );
+    tracing::warn!(error_code = "aac_config_changed", "{message}");
+    event_sender.emit_output_with_details(
+        EventSeverity::Warning,
+        category::CMAF,
+        message,
+        &config.id,
+        serde_json::json!({
+            "error_code": "aac_config_changed",
+            "from": track_cfg.describe(),
+            "to": now.describe(),
+            "flow_id": flow_id,
+        }),
+    );
+    state.aac_change_said = Some(now);
 }
 
 /// Encrypt `samples` in place and re-build the video segment with

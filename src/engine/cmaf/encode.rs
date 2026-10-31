@@ -569,8 +569,20 @@ impl AudioReencoder {
     /// demuxer so the lazy AacDecoder construction can succeed — for a
     /// PCE-signalled source (channel configuration 0) the configuration
     /// with its program_config_element, which the decoder reads the layout
-    /// from.
+    /// from. A configuration other than the running decoder's (a switch to
+    /// another feed) retires that decoder, and the next frame builds one for
+    /// it: a decoder set up for the old configuration misdecodes or refuses
+    /// the new one's frames, and it used to be kept for the life of the
+    /// output. The encoder, and so the track, stay as they are: the source
+    /// is converted to them.
     pub fn set_source_config(&mut self, source: AacConfig) {
+        if self.decoder.as_ref().is_some_and(|d| d.config() != &source) {
+            tracing::info!(
+                "CMAF output '{}': the source's AAC configuration changed; rebuilding its decoder",
+                self.output_id
+            );
+            self.decoder = None;
+        }
         self.lazy_init_params.source_config = Some(source);
     }
 

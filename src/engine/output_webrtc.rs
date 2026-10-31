@@ -18,6 +18,8 @@ use crate::manager::events::{EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
 #[cfg(feature = "webrtc")]
+use super::aac_config::LayoutWait;
+#[cfg(feature = "webrtc")]
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 #[cfg(feature = "webrtc")]
 use super::audio_encode::{AudioCodec, AudioEncoder, AudioEncoderError, EncoderParams};
@@ -1260,6 +1262,9 @@ async fn whep_server_loop(
     let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
     let mut source = webrtc_demuxer(config.program_number, config.audio_encode.as_ref());
     let mut audio_watch = super::transcode_engage::AudioTrackWatch::new(pinned_audio, webrtc_can_publish_audio);
+    // Whether `aac_channel_layout_missing` has been said for the output: each
+    // viewer counts its own wait, the output says it once.
+    let layout_said = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     loop {
         // Wait for a viewer to connect via WHEP
@@ -1380,6 +1385,7 @@ async fn whep_server_loop(
         let viewer_transcode = config.transcode.clone();
         let viewer_compressed = compressed_audio_input;
         let viewer_video_encode = config.video_encode.clone();
+        let viewer_layout_said = layout_said.clone();
 
         tokio::spawn(async move {
             whep_viewer_loop(
@@ -1399,6 +1405,7 @@ async fn whep_server_loop(
                     compressed_audio_input: viewer_compressed,
                     video_encode: viewer_video_encode,
                     setup_deadline,
+                    layout_said: viewer_layout_said,
                 },
             )
             .await;
@@ -1425,6 +1432,9 @@ struct WhepViewerCfg<'a> {
     video_encode: Option<VideoEncodeConfig>,
     /// How long the viewer has to connect (`WHEP_SETUP_DEADLINE`).
     setup_deadline: std::time::Duration,
+    /// The output's `aac_channel_layout_missing` latch, shared by its
+    /// viewers ([`webrtc_hold_for_layout`]).
+    layout_said: Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn whep_viewer_loop(
@@ -1447,6 +1457,7 @@ async fn whep_viewer_loop(
         compressed_audio_input,
         video_encode,
         setup_deadline,
+        layout_said,
     } = params;
 
     use super::ts_parse::strip_rtp_header;
@@ -1617,6 +1628,7 @@ async fn whep_viewer_loop(
     let mut video_encoder_state: WebrtcVideoEncoderState =
         init_webrtc_video_encoder_state(video_encode.as_ref());
     let mut needs_encode = NeedsEncodeWarned::default();
+    let mut layout_wait = LayoutWait::default();
 
     // Send loop: demux TS → packetize H.264 → send via str0m.
     // Also processes incoming RTCP/STUN via drive_udp_io() to keep
@@ -1799,6 +1811,11 @@ async fn whep_viewer_loop(
                                             events,
                                         );
                                     }
+                                    if !matches!(encoder_state, WebrtcEncoderState::Disabled | WebrtcEncoderState::Failed)
+                                        && webrtc_hold_for_layout(&demuxer, &mut layout_wait, &layout_said, output_id, flow_id, events)
+                                    {
+                                        continue;
+                                    }
                                     if let (
                                         WebrtcEncoderState::Active {
                                             decoder,
@@ -1811,10 +1828,12 @@ async fn whep_viewer_loop(
                                         Some(audio_pt),
                                     ) = (&mut encoder_state, audio_mid, audio_pt)
                                     {
-                                        if decoder.is_none()
-                                            && let Some(c) = demuxer.cached_aac_config() {
-                                                webrtc_lazy_build_decoder(decoder, c, output_id);
-                                            }
+                                        if let Some(source) = demuxer.cached_aac_specific_config()
+                                            && decoder.as_ref().is_none_or(|d| d.config() != &source)
+                                        {
+                                            *decoder = None;
+                                            webrtc_lazy_build_decoder(decoder, &source, output_id);
+                                        }
                                         if let Some(sg) = silence.as_mut() {
                                             sg.mark_real_audio(pts);
                                         }
@@ -2063,6 +2082,9 @@ async fn whip_client_loop(
     // connection.
     let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
     let mut audio_watch = super::transcode_engage::AudioTrackWatch::new(pinned_audio, webrtc_can_publish_audio);
+    // `aac_channel_layout_missing` is said once for the output, not per
+    // connection; each connection counts its own wait.
+    let layout_said = std::sync::atomic::AtomicBool::new(false);
 
     'outer: loop {
         // Create session
@@ -2274,6 +2296,7 @@ async fn whip_client_loop(
         let mut video_encoder_state: WebrtcVideoEncoderState =
             init_webrtc_video_encoder_state(config.video_encode.as_ref());
         let mut needs_encode = NeedsEncodeWarned::default();
+        let mut layout_wait = LayoutWait::default();
 
         // Send loop: demux TS → packetize H.264 → send via str0m.
         //
@@ -2468,6 +2491,11 @@ async fn whip_client_loop(
                                                 events,
                                             );
                                         }
+                                        if !matches!(encoder_state, WebrtcEncoderState::Disabled | WebrtcEncoderState::Failed)
+                                            && webrtc_hold_for_layout(&demuxer, &mut layout_wait, &layout_said, &config.id, flow_id, events)
+                                        {
+                                            continue;
+                                        }
                                         if let (
                                             WebrtcEncoderState::Active {
                                                 decoder,
@@ -2480,10 +2508,12 @@ async fn whip_client_loop(
                                             Some(audio_pt),
                                         ) = (&mut encoder_state, audio_mid, audio_pt)
                                         {
-                                            if decoder.is_none()
-                                                && let Some(c) = demuxer.cached_aac_config() {
-                                                    webrtc_lazy_build_decoder(decoder, c, &config.id);
-                                                }
+                                            if let Some(source) = demuxer.cached_aac_specific_config()
+                                                && decoder.as_ref().is_none_or(|d| d.config() != &source)
+                                            {
+                                                *decoder = None;
+                                                webrtc_lazy_build_decoder(decoder, &source, &config.id);
+                                            }
                                             if let Some(sg) = silence.as_mut() {
                                                 sg.mark_real_audio(pts);
                                             }
@@ -2689,7 +2719,7 @@ fn build_webrtc_encoder_state(
         return WebrtcEncoderState::Failed;
     }
 
-    let Some((profile, sr_idx, ch_cfg)) = demuxer.cached_aac_config() else {
+    let Some((profile, sr_idx, _)) = demuxer.cached_aac_config() else {
         return WebrtcEncoderState::Lazy;
     };
 
@@ -2710,36 +2740,36 @@ fn build_webrtc_encoder_state(
     }
 
     if sample_rate_from_index(sr_idx).is_none() {
-        tracing::error!(
-            "WebRTC output '{}': audio_encode rejected unsupported AAC sample_rate_index={sr_idx}",
-            output_id
+        refuse_aac_source(
+            &format!("an AAC sampling-frequency index ({sr_idx}) no AAC rate is"),
+            output_id,
+            flow_id,
+            events,
         );
         return WebrtcEncoderState::Failed;
     }
-    if ch_cfg == 0 || ch_cfg > 2 {
-        tracing::error!(
-            "WebRTC output '{}': audio_encode rejected unsupported AAC channel_config={ch_cfg}",
-            output_id
-        );
-        return WebrtcEncoderState::Failed;
-    }
+    // Channel configuration 0 (ISDB-T 1seg) names its layout in a
+    // program_config_element some frames carry: the decoder is built from the
+    // configuration with it once one has arrived (the caller holds the frames
+    // back meanwhile, `webrtc_hold_for_layout`). A source wider than stereo
+    // is decoded whole and mixed down to the Opus stream's stereo by the
+    // channel stage (`build_webrtc_encoder_for_format`). Both used to be
+    // refused with only a log line.
+    let Some(source) = demuxer.cached_aac_specific_config() else {
+        return WebrtcEncoderState::Lazy;
+    };
     // What the decoder really hands out — see the RTMP output's
     // `build_encoder_state`: an HE-AAC header gives the core's rate and
     // v2's mono core, which SBR and PS double.
-    let Some((input_sr, input_ch)) = first_frame
-        .zip(super::aac_config::AacConfig::new(profile, sr_idx, ch_cfg))
-        .and_then(|(f, source)| super::audio_decode::aac_decoded_format(&source, f))
+    let Some((input_sr, input_ch)) = first_frame.and_then(|f| super::audio_decode::aac_decoded_format(&source, f))
     else {
         return WebrtcEncoderState::Lazy;
     };
 
-    let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+    let decoder = match AacDecoder::from_config(&source) {
         Ok(d) => d,
         Err(e) => {
-            tracing::error!(
-                "WebRTC output '{}': audio_encode AacDecoder build failed: {e}",
-                output_id
-            );
+            refuse_aac_source(&format!("an AAC configuration its decoder refuses ({e})"), output_id, flow_id, events);
             return WebrtcEncoderState::Failed;
         }
     };
@@ -2806,10 +2836,15 @@ fn build_webrtc_encoder_for_format(
     // block, audio_encode.channels used to open the encoder at a channel
     // count the decoded PCM did not have, and every frame was dropped.
     // Opus on the wire is always 48 kHz regardless of either block.
+    //
+    // The Opus stream WebRTC negotiates is mono or stereo, so a source wider
+    // than stereo with no channel count asked for is mixed down to stereo
+    // (BS.775): kept at its layout, it opened a multichannel Opus encoder no
+    // WebRTC peer reads.
     let mut stage = super::audio_transcode::EncoderStage::new(
         transcode.cloned(),
         enc_cfg.sample_rate,
-        enc_cfg.channels,
+        enc_cfg.channels.or((input_ch > 2).then_some(2)),
     );
     let (enc_in_sr, target_ch) = match stage.prepare(input_sr, input_ch) {
         Ok(out) => out,
@@ -3184,18 +3219,18 @@ async fn emit_webrtc_silence_if_needed(
 #[cfg(feature = "webrtc")]
 fn webrtc_lazy_build_decoder(
     decoder: &mut Option<AacDecoder>,
-    cached_aac: (u8, u8, u8),
+    source: &super::aac_config::AacConfig,
     output_id: &str,
 ) {
-    let (profile, sr_idx, ch_cfg) = cached_aac;
-    if profile != 1 {
+    if source.profile != 1 {
         tracing::warn!(
-            "WebRTC output '{}': silent-fallback ignoring non-AAC-LC source frame (profile={profile})",
-            output_id
+            "WebRTC output '{}': silent-fallback ignoring non-AAC-LC source frame (profile={})",
+            output_id,
+            source.profile
         );
         return;
     }
-    match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+    match AacDecoder::from_config(source) {
         Ok(d) => *decoder = Some(d),
         Err(e) => {
             tracing::warn!(
@@ -3204,6 +3239,44 @@ fn webrtc_lazy_build_decoder(
             );
         }
     }
+}
+
+/// Raise the `audio_encode` Warning for an AAC source the WebRTC re-encode
+/// refuses (`what` it is): its audio is dropped for the rest of the
+/// session. These used to be log lines alone.
+#[cfg(feature = "webrtc")]
+fn refuse_aac_source(what: &str, output_id: &str, flow_id: &str, events: &EventSender) {
+    let msg = format!("WebRTC output '{output_id}': audio_encode cannot decode the source: {what}; audio will be dropped");
+    tracing::error!("{msg}");
+    events.emit_flow(EventSeverity::Warning, crate::manager::events::category::AUDIO_ENCODE, msg, flow_id);
+}
+
+/// Whether to hold this AAC frame back for want of its layout — a
+/// PCE-signalled source (channel configuration 0) whose
+/// program_config_element no frame has carried yet, from which no decoder
+/// can be built — as the RTMP output's `hold_for_layout`. `wait` counts this
+/// viewer's or connection's wait; `said` is the output's, so
+/// `aac_channel_layout_missing` (category `webrtc`) goes out once for the
+/// output, not once per viewer, and is re-armed once a PCE arrives.
+#[cfg(feature = "webrtc")]
+fn webrtc_hold_for_layout(
+    demuxer: &super::ts_demux::TsDemuxer,
+    wait: &mut LayoutWait,
+    said: &std::sync::atomic::AtomicBool,
+    output_id: &str,
+    flow_id: &str,
+    events: &EventSender,
+) -> bool {
+    let Some(sr_idx) = demuxer.aac_layout_pending() else {
+        wait.clear();
+        said.store(false, Ordering::Relaxed);
+        return false;
+    };
+    let rate = sample_rate_from_index(sr_idx).unwrap_or(48_000);
+    if wait.hold(rate) && !said.swap(true, Ordering::Relaxed) {
+        super::aac_config::emit_layout_missing(events, category::WEBRTC, "WebRTC", output_id, flow_id, wait.held_secs(rate));
+    }
+    true
 }
 
 #[cfg(all(test, feature = "webrtc", feature = "fdk-aac"))]
@@ -3292,6 +3365,103 @@ mod stage_tests {
         };
         assert_eq!((encoder.params().sample_rate, encoder.params().channels), (48_000, 2));
         assert_eq!(stage.output(), Some((48_000, 2)));
+    }
+
+    /// The encoder state `build_webrtc_encoder_state` builds for an Opus
+    /// target on the AAC `adts`, at each AAC frame the demuxer hands out —
+    /// the first that leaves it other than `Lazy`, and the frame index.
+    fn first_built(adts: &[u8]) -> (usize, WebrtcEncoderState) {
+        let enc: crate::config::models::AudioEncodeConfig =
+            serde_json::from_value(serde_json::json!({ "codec": "opus" })).unwrap();
+        let (events, _rx) = crate::manager::events::event_channel();
+        let stats = Arc::new(OutputStatsAccumulator::new("w1".into(), "w1".into(), "webrtc".into()));
+        let mut demux = super::super::ts_demux::TsDemuxer::new(None);
+        let mut n = 0;
+        for pkt in crate::engine::ts_test_fixtures::aac_program_ts(adts).chunks(188) {
+            for f in demux.demux(pkt) {
+                let super::super::ts_demux::DemuxedFrame::Aac { data, .. } = f else {
+                    continue;
+                };
+                let st = build_webrtc_encoder_state(
+                    Some(&enc),
+                    None,
+                    &demux,
+                    Some(&data),
+                    true,
+                    &CancellationToken::new(),
+                    &stats,
+                    "f",
+                    "w1",
+                    &events,
+                );
+                if !matches!(st, WebrtcEncoderState::Lazy) {
+                    return (n, st);
+                }
+                n += 1;
+            }
+        }
+        panic!("never built");
+    }
+
+    /// edge#210: a PCE-signalled source (channel configuration 0) waits for
+    /// the first frame carrying its program_config_element and is then
+    /// decoded from the configuration with it. It used to be refused for
+    /// channel configuration 0 with only a log line.
+    #[test]
+    fn a_pce_signalled_source_is_decoded_once_its_layout_arrives() {
+        use crate::engine::ts_test_fixtures::{pce_signalled_adts, sine_aac_lc_frames};
+        let (at, st) = first_built(&pce_signalled_adts(&sine_aac_lc_frames(), 5, 12));
+        assert_eq!(at, 5, "held until the first PCE");
+        let WebrtcEncoderState::Active { decoder: Some(decoder), encoder, .. } = st else {
+            panic!("the session must re-encode");
+        };
+        assert_eq!(decoder.config().ch_cfg, 0);
+        assert_eq!(encoder.params().target_channels, 2);
+    }
+
+    /// A PCE-signalled source no frame of which carries its PCE is held
+    /// back, and `aac_channel_layout_missing` said once for the output
+    /// however many viewers wait (each counts its own wait), and again only
+    /// once a PCE has come and gone.
+    #[test]
+    fn the_layout_wait_is_said_once_for_the_output() {
+        use crate::engine::ts_test_fixtures::{aac_program_ts, pce_signalled_adts, sine_aac_lc_frames};
+        let sine = sine_aac_lc_frames();
+        let adts = pce_signalled_adts(&sine, usize::MAX, 1);
+        let mut demux = super::super::ts_demux::TsDemuxer::new(None);
+        demux.demux(&aac_program_ts(&adts));
+        let (events, mut rx) = crate::manager::events::event_channel();
+        let said = std::sync::atomic::AtomicBool::new(false);
+        let (mut viewer_a, mut viewer_b) = (LayoutWait::default(), LayoutWait::default());
+        // Six seconds of 48 kHz frames, for each viewer.
+        for _ in 0..282 {
+            assert!(webrtc_hold_for_layout(&demux, &mut viewer_a, &said, "w1", "f", &events));
+            assert!(webrtc_hold_for_layout(&demux, &mut viewer_b, &said, "w1", "f", &events));
+        }
+        let codes: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+            .map(|e| e.details.unwrap()["error_code"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(codes, ["aac_channel_layout_missing"]);
+        // The layout arrives: nothing held, and the latch re-armed.
+        let mut demux = super::super::ts_demux::TsDemuxer::new(None);
+        demux.demux(&aac_program_ts(&pce_signalled_adts(&sine, 0, 1)));
+        assert!(!webrtc_hold_for_layout(&demux, &mut viewer_a, &said, "w1", "f", &events));
+        assert!(!said.load(Ordering::Relaxed));
+    }
+
+    /// A 5.1 AAC source is decoded whole and mixed down to stereo for the
+    /// Opus stream WebRTC carries. It used to be refused (log line only) for
+    /// having more than two channels.
+    #[test]
+    fn a_5_1_aac_source_is_mixed_down_to_stereo() {
+        let (at, st) = first_built(&crate::engine::ts_test_fixtures::aac_lc_adts(48_000, 6, 10));
+        assert_eq!(at, 0);
+        let WebrtcEncoderState::Active { encoder, mut stage, .. } = st else {
+            panic!("the session must re-encode");
+        };
+        assert_eq!((encoder.params().channels, encoder.params().target_channels), (2, 2));
+        let pcm = stage.process(&vec![vec![0.1f32; 1024]; 6], 48_000).unwrap();
+        assert_eq!(pcm.len(), 2, "the stage mixes 5.1 to stereo");
     }
 
     /// The silent-fallback Opus encoder takes the transcode block's channel

@@ -339,6 +339,15 @@ impl AacConfig {
     pub fn sample_rate(&self) -> Option<u32> {
         super::audio_decode::sample_rate_from_index(self.sr_idx)
     }
+
+    /// The configuration in words, for an operator: `AOT 2, 48000 Hz, 2 ch`,
+    /// with `, channel_configuration 0 (PCE)` after it for a PCE-signalled
+    /// one. The rate is the core's, which an HE-AAC stream doubles.
+    pub fn describe(&self) -> String {
+        let rate = self.sample_rate().unwrap_or(0);
+        let pce = if self.pce.is_some() { ", channel_configuration 0 (PCE)" } else { "" };
+        format!("AOT {}, {rate} Hz, {} ch{pce}", self.profile + 1, self.channels())
+    }
 }
 
 /// How long a writer has held a PCE-signalled stream back for want of a frame

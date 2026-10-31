@@ -722,9 +722,15 @@ fallback, which cannot span two inits.
 
 What it does not cover:
 
-- **The audio track.** An AAC configuration change under a running output
-  (sample rate, channels, object type) is still described by the original
-  init. The track list is committed at the first init and never widened.
+- **The audio track.** An AAC configuration change under a running
+  passthrough output (sample rate, channels, object type, layout) is still
+  described by the original init: the track list is committed at the first
+  init and never widened, and a generation opens only at a video IDR, so
+  audio of the new configuration buffered ahead of it would still go out
+  under the old init. The output says so, once per change: Warning
+  `aac_config_changed`, naming both configurations; a restart builds the
+  track from the new one. A re-encode (`audio_encode`) follows the change:
+  its decoder is rebuilt and its track, the encoder's, stays valid.
 - **A codec-family change.** H.264 ↔ HEVC is a new sample entry, not new
   parameter sets, and MSE needs `changeType()` for it, which no playlist
   tag asks for. The comparison refuses to rotate across one: the new

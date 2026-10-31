@@ -279,10 +279,8 @@ pub fn pes_packets(pid: u16, stream_id: u8, es: &[u8], pts: u64, cc: &mut u8) ->
 /// carrying the ADTS frames of `adts`, one PES per frame — enough for a
 /// demuxer to lock the audio PID and cache its AAC config.
 pub fn aac_program_ts(adts: &[u8]) -> Vec<u8> {
-    let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
-    let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
-    ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
-    let (mut off, mut cc, mut pts) = (0usize, 0u8, 90_000u64);
+    let mut frames = Vec::new();
+    let (mut off, mut pts) = (0usize, 90_000u64);
     while off + 7 <= adts.len() {
         let len = (((adts[off + 3] as usize) & 0x03) << 11)
             | ((adts[off + 4] as usize) << 3)
@@ -290,11 +288,74 @@ pub fn aac_program_ts(adts: &[u8]) -> Vec<u8> {
         if len < 7 || off + len > adts.len() {
             break;
         }
-        ts.extend(pes_packets(0x101, 0xC0, &adts[off..off + len], pts, &mut cc));
+        frames.push((pts, &adts[off..off + len]));
         off += len;
         pts += 1920;
     }
+    aac_program_ts_timed(&frames)
+}
+
+/// [`aac_program_ts`] with each ADTS frame at its own PTS: one PES per
+/// `(pts, frame)`.
+pub fn aac_program_ts_timed(frames: &[(u64, &[u8])]) -> Vec<u8> {
+    let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x0F, 0x101, &[])]);
+    let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+    ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+    let mut cc = 0u8;
+    for &(pts, frame) in frames {
+        ts.extend(pes_packets(0x101, 0xC0, frame, pts, &mut cc));
+    }
     ts
+}
+
+/// The whole ADTS frames of `adts`, split.
+pub fn split_adts(adts: &[u8]) -> Vec<&[u8]> {
+    let mut frames = Vec::new();
+    let mut off = 0;
+    while off + 7 <= adts.len() {
+        let len = (usize::from(adts[off + 3] & 0x03) << 11) | (usize::from(adts[off + 4]) << 3) | (usize::from(adts[off + 5]) >> 5);
+        if len < 7 || off + len > adts.len() {
+            break;
+        }
+        frames.push(&adts[off..off + len]);
+        off += len;
+    }
+    frames
+}
+
+/// The sine fixture's 25 frames twice (AAC-LC 48 kHz stereo, a 1 kHz tone
+/// on the left), then `frames` AAC-LC frames at 44.1 kHz stereo (a 300 Hz
+/// tone on the left, [`aac_lc_adts`]), each at its own PTS from 90 000: a
+/// source whose AAC configuration changes mid-stream, as a switch to another
+/// feed does. The PTS of every frame and the index of the first at 44.1 kHz.
+#[cfg(feature = "fdk-aac")]
+pub fn rate_switch_frames(frames: usize) -> (Vec<(u64, Vec<u8>)>, usize) {
+    let sine = sine_aac_lc_frames();
+    let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut pts = 90_000u64;
+    for f in sine.iter().chain(sine.iter()) {
+        out.push((pts, f.to_vec()));
+        pts += 1_920;
+    }
+    let first = out.len();
+    let other = aac_lc_adts(44_100, 2, frames);
+    for (j, f) in split_adts(&other).into_iter().enumerate() {
+        out.push((pts + j as u64 * 1024 * 90_000 / 44_100, f.to_vec()));
+    }
+    (out, first)
+}
+
+/// Goertzel power of `hz` in `samples` at `rate` — over the whole buffer, so
+/// a long one tells close frequencies apart.
+pub fn tone_power(samples: &[f32], hz: f64, rate: u32) -> f64 {
+    let c = 2.0 * (2.0 * std::f64::consts::PI * hz / f64::from(rate)).cos();
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    for &x in samples {
+        let s0 = f64::from(x) + c * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    s1 * s1 + s2 * s2 - c * s1 * s2
 }
 
 /// One second of a 1 kHz tone (and 440 Hz on the right) as HE-AAC ADTS
@@ -361,6 +422,39 @@ pub fn pce_signalled_adts(frames: &[&[u8]], first: usize, every: usize) -> Vec<u
             Vec::new()
         };
         out.extend(adts_with_pce(frame, &pce).expect("a whole ADTS frame"));
+    }
+    out
+}
+
+/// `frames` AAC-LC frames of `channels` channels at `sample_rate` as ADTS,
+/// from the fdk encoder, a distinct tone on each channel — one encoder
+/// configuration the sine fixture is not (mono, 5.1, another rate).
+#[cfg(feature = "fdk-aac")]
+pub fn aac_lc_adts(sample_rate: u32, channels: u8, frames: usize) -> Vec<u8> {
+    let mut enc = aac_audio::AacEncoder::open(&aac_codec::EncoderConfig {
+        profile: aac_codec::AacProfile::AacLc,
+        sample_rate,
+        channels,
+        bitrate: 64_000 * u32::from(channels),
+        afterburner: true,
+        sbr_signaling: aac_codec::SbrSignaling::default(),
+        transport: aac_codec::TransportType::Adts,
+    })
+    .expect("fdk AAC-LC encoder");
+    let n = enc.frame_size() as usize;
+    let mut out = Vec::new();
+    let mut k = 0;
+    while split_adts(&out).len() < frames {
+        let planar: Vec<Vec<f32>> = (0..channels)
+            .map(|ch| {
+                let f = 300.0 + 200.0 * f32::from(ch);
+                (0..n)
+                    .map(|i| 0.3 * (2.0 * std::f32::consts::PI * f * (k * n + i) as f32 / sample_rate as f32).sin())
+                    .collect()
+            })
+            .collect();
+        out.extend(enc.encode_frame(&planar).expect("encode").bytes);
+        k += 1;
     }
     out
 }

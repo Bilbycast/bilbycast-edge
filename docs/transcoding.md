@@ -634,25 +634,33 @@ has for them (ISO/IEC 14496-3 §4.4.1.1). Shared code:
   rear pair, LFE: `pce_7_1_back`), nine bytes a frame; CMAF and RTMP carry
   that PCE in the AudioSpecificConfig, as their sample entry and sequence
   header need. ffmpeg decodes it as 7.1 with each input channel (WAV order:
-  FL FR FC LFE BL BR SL SR) on its own output channel. The in-process fdk-aac
-  decoder downmixes anything wider than six channels by default, so an
-  edge-side decode of a 7.1 AAC stream hands out 5.1.
+  FL FR FC LFE BL BR SL SR) on its own output channel. `audio_encode.channels`
+  (or a `transcode` block's) of 7 is refused for AAC: fdk-aac has no 6.1
+  mode, and the count used to pass validation and fail at the first frame.
+- **7.1 sources.** The edge's AAC decoders (the re-encoding outputs', the TS
+  audio replacer's, the display's, the meters') hand out every channel a 7.1
+  stream carries. fdk-aac mixes anything wider than six channels down to 5.1
+  by default, which no decoder here changed, so a 7.1 AAC source decoded as
+  six channels while `AacDecoder::channels()` said eight until the first
+  frame. The channel stage converts the eight to what each output carries,
+  as it does for E-AC-3 7.1.
 - **PCE-signalled sources** (channel configuration 0 — ISDB-T 1seg, e.g.
   NHK's HE-AAC at a 24 kHz core with two single channel elements). The
   layout is in a PCE that only some frames open with (on NHK about one in
   twelve, and not the first frames of a capture). RTMP and CMAF passthrough
   and the replay MP4 export copy it, bit for bit as FFmpeg's `aac_adtstoasc`
   does, into the AudioSpecificConfig, and a re-encode (`audio_encode`) on RTMP
-  or CMAF builds its decoder from that configuration. RTMP and CMAF hold the
-  audio back until a frame carrying the PCE has arrived; from then on every
+  or CMAF, and an Opus re-encode on WebRTC, builds its decoder from that
+  configuration. RTMP, CMAF and WebRTC hold the audio back until a frame
+  carrying the PCE has arrived; from then on every
   frame goes, as it came, PCE or not. If none arrives within five seconds of
   the source's audio the output raises Warning `aac_channel_layout_missing`
   (once per wait) and keeps holding: a header without the PCE is one no
   decoder opens (ffmpeg: "decode_pce: Input buffer exhausted before END
   element found"), which is what RTMP used to publish, CMAF used to put in its
   init and the MP4 export used to write. With `audio_encode`, RTMP refused
-  channel configuration 0 with only a log line and CMAF raised an
-  `audio_encode` error on every frame. A window none of whose frames carries
+  channel configuration 0 with only a log line, as did WebRTC, and CMAF
+  raised an `audio_encode` error on every frame. A window none of whose frames carries
   the PCE is refused by the MP4 export (`replay_export_format_unsupported`;
   the TS export carries the stream as it came).
 
@@ -684,6 +692,41 @@ through as it came.
   its core's rate, or stereo from a mono core) and re-encoded as the AAC-LC
   the block asks for. It used to be passed through as HE-AAC. The CMAF, HLS
   and TS re-encoders have no such shortcut.
+- **Sources wider than stereo on RTMP and WebRTC.** An AAC source of more
+  than two channels is decoded whole and goes through the channel stage like
+  an MP2 / AC-3 / E-AC-3 one: on RTMP kept at its layout, or converted to
+  `audio_encode.channels` / the `transcode` block's; on WebRTC mixed down to
+  the stereo its Opus stream carries unless a count is asked for (an MP2 /
+  AC-3 / E-AC-3 source too, which opened a multichannel Opus encoder no peer
+  reads). Both outputs used to refuse such a source with only a log line.
+  What the WebRTC re-encode still refuses (a reserved sampling-frequency
+  index, a configuration its decoder will not open) raises a Warning
+  `audio_encode` event.
+
+### An AAC source that changes configuration
+
+A switch to another feed can change the source's AAC configuration (rate,
+channels, object type, layout) under a running output.
+
+- **RTMP passthrough** sends a new sequence header, naming the new
+  configuration, with its first frame, as FLV publishers do; a re-encode
+  whose encoder's configuration changed would too. The header used to be
+  sent once a connection, so a receiver went on decoding the new frames by
+  the old configuration (44.1 kHz frames as 48 kHz, 9 % fast).
+- **RTMP, CMAF and WebRTC re-encodes** rebuild their decoder for the new
+  configuration; the encoder, its header and the CMAF track stay as they
+  were, the channel stage converting the source to them. The decoder built
+  for the first configuration used to be kept for the life of the
+  connection or output.
+- **CMAF passthrough** cannot follow it: the audio sample entry is committed
+  with the track list at the first `init.mp4`, and a new init generation
+  opens only at a video IDR, so audio of the new configuration buffered
+  before that IDR would still go out under the old init. The frames keep
+  going under the init that describes the first configuration, as before,
+  and the output raises Warning `aac_config_changed` (category `cmaf`,
+  output-scoped, once per change), naming both. A restart builds the track
+  from the new configuration (over a restored DVR window, as a new init
+  generation). Set `audio_encode` where the source's configuration changes.
 
 ### Audio timing in the TS audio replacer
 

@@ -193,3 +193,53 @@ fn an_he_aac_source_re_encoded_carries_raw_access_units() {
     assert_eq!(asc, [0x13, 0x10], "HE-AAC v1: AAC-LC at the 24 kHz core, stereo");
     assert_decodes(&asc, &bodies, 2, 2_048);
 }
+
+/// [`crate::engine::ts_test_fixtures::rate_switch_frames`] as a TS: a
+/// source switching from 48 kHz to 44.1 kHz AAC-LC under a running output.
+#[cfg(feature = "fdk-aac")]
+fn rate_switch_ts() -> Vec<u8> {
+    let (frames, _) = crate::engine::ts_test_fixtures::rate_switch_frames(40);
+    let refs: Vec<(u64, &[u8])> = frames.iter().map(|(pts, f)| (*pts, f.as_slice())).collect();
+    crate::engine::ts_test_fixtures::aac_program_ts_timed(&refs)
+}
+
+/// A re-encode follows a change of the source's AAC configuration: its
+/// decoder is rebuilt for the new one — the 300 Hz tone after the switch
+/// comes out at 300 Hz, not the 326 Hz a 44.1 kHz frame decoded as 48 kHz
+/// gives — and the encoder, and so the track, stay as they were, with no
+/// error raised. The decoder set up for the first configuration used to be
+/// kept for the life of the output.
+#[cfg(feature = "fdk-aac")]
+#[test]
+fn a_re_encode_follows_a_change_of_the_sources_configuration() {
+    use crate::engine::ts_test_fixtures::tone_power;
+    let (mut state, _, raised) = run(&rate_switch_ts(), &config(Some(serde_json::json!({ "codec": "aac_lc" }))));
+    assert!(raised.is_empty(), "{:?}", errors_raised(&raised));
+    let (asc, _, bodies) = track_and_samples(&mut state);
+    assert_eq!(asc, [0x11, 0x90], "the encoder's configuration throughout");
+    let n = assert_decodes(&asc, &bodies, 2, 1_024);
+    assert!(n >= 80, "{n} frames re-encoded");
+    let mut dec = aac_audio::AacDecoder::open_raw(&asc).expect("decoder");
+    let left: Vec<f32> = bodies.iter().flat_map(|b| dec.decode_frame(b).expect("decodes").planar.swap_remove(0)).collect();
+    let tail = &left[left.len() - 24 * 1_024..];
+    let (at_300, at_326) = (tone_power(tail, 300.0, 48_000), tone_power(tail, 300.0 * 48_000.0 / 44_100.0, 48_000));
+    assert!(at_300 > 10.0 * at_326, "300 Hz {at_300:.0}, 326 Hz {at_326:.0}: decoded at the wrong rate");
+}
+
+/// Passed through, the same change cannot be followed — the init describes
+/// the first configuration for the life of the output, and audio of the new
+/// one buffered before the next IDR would go out under it — so it is said,
+/// once: Warning `aac_config_changed`, naming both configurations. It used
+/// to change silently.
+#[cfg(feature = "fdk-aac")]
+#[test]
+fn a_passed_through_change_of_configuration_is_reported_once() {
+    let (mut state, _, raised) = run(&rate_switch_ts(), &config(None));
+    let codes: Vec<&serde_json::Value> = raised.iter().filter_map(|e| e.details.as_ref()).map(|d| &d["error_code"]).collect();
+    assert_eq!(codes, ["aac_config_changed"], "said once: {:?}", errors_raised(&raised));
+    let d = raised[0].details.as_ref().unwrap();
+    assert_eq!((d["from"].as_str(), d["to"].as_str()), (Some("AOT 2, 48000 Hz, 2 ch"), Some("AOT 2, 44100 Hz, 2 ch")));
+    assert_eq!(raised[0].output_id.as_deref(), Some("o"));
+    let (asc, _, _) = track_and_samples(&mut state);
+    assert_eq!(asc, [0x11, 0x90], "the track the init describes");
+}

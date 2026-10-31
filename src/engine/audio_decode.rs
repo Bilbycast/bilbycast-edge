@@ -861,6 +861,8 @@ pub struct AacDecoder {
     sample_rate: u32,
     channels: u8,
     next_ts: u64,
+    /// The configuration it was built from ([`Self::config`]).
+    config: crate::engine::aac_config::AacConfig,
 }
 
 #[cfg(feature = "fdk-aac")]
@@ -928,18 +930,32 @@ impl AacDecoder {
             return Err(AacDecodeError::UnsupportedChannelConfig(config.ch_cfg));
         }
 
-        let inner = aac_audio::AacDecoder::open_raw(&config.audio_specific_config())
+        let mut inner = aac_audio::AacDecoder::open_raw(&config.audio_specific_config())
             .map_err(AacDecodeError::FdkAac)?;
+        // fdk-aac mixes anything wider than six channels down to 5.1 unless
+        // told otherwise, so a 7.1 stream decoded as six channels while
+        // `channels()` said eight until the first frame. Every channel the
+        // stream carries is handed out; the re-encoding outputs' channel
+        // stage converts to what they carry, as for E-AC-3 7.1.
+        inner.set_max_output_channels(None).map_err(AacDecodeError::FdkAac)?;
 
         // Channel count from the configuration (7 is 7.1; a PCE's its
-        // elements') — fdk-aac will confirm after the first decode, but
-        // pre-decode callers need it.
+        // elements') — fdk-aac confirms it after the first decode (an
+        // HE-AAC v2 decoder widens a mono core to stereo), but pre-decode
+        // callers need it.
         Ok(Self {
             inner,
             sample_rate,
             channels: config.channels(),
             next_ts: 0,
+            config: config.clone(),
         })
+    }
+
+    /// The configuration this decoder was built from: a source whose
+    /// configuration has changed since needs a decoder of its own.
+    pub fn config(&self) -> &crate::engine::aac_config::AacConfig {
+        &self.config
     }
 
     /// Sample rate of the decoded PCM, in Hz.
@@ -1017,6 +1033,8 @@ pub struct AacDecoder {
     sample_rate: u32,
     channels: u8,
     next_ts: u64,
+    /// The configuration it was built from ([`Self::config`]).
+    config: crate::engine::aac_config::AacConfig,
 }
 
 #[cfg(not(feature = "fdk-aac"))]
@@ -1078,7 +1096,14 @@ impl AacDecoder {
             sample_rate,
             channels,
             next_ts: 0,
+            config: crate::engine::aac_config::AacConfig::new(profile, sample_rate_index, channel_config)
+                .ok_or(AacDecodeError::UnsupportedChannelConfig(channel_config))?,
         })
+    }
+
+    /// The configuration this decoder was built from.
+    pub fn config(&self) -> &crate::engine::aac_config::AacConfig {
+        &self.config
     }
 
     /// [`Self::from_adts_config`] for a whole configuration. Symphonia
@@ -1514,6 +1539,57 @@ mod tests {
             let pcm = dec.decode_frame(frame).unwrap_or_else(|e| panic!("frame {i}: {e}"));
             assert_eq!((pcm.len(), pcm[0].len(), dec.sample_rate()), (2, 1024, 48_000), "frame {i}");
         }
+    }
+
+    /// A 7.1 AAC stream decodes as eight channels, and `channels()` says so
+    /// before the first frame and after it. fdk-aac mixes anything wider than
+    /// six channels down to 5.1 by default, so it decoded as six while
+    /// `channels()` said eight until the first frame.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn a_7_1_stream_decodes_to_eight_channels() {
+        let mut enc = crate::engine::audio_encode::AudioEncoder::spawn(
+            crate::engine::audio_encode::EncoderParams {
+                codec: crate::engine::audio_encode::AudioCodec::AacLc,
+                sample_rate: 48_000,
+                channels: 8,
+                target_bitrate_kbps: 448,
+                target_sample_rate: 48_000,
+                target_channels: 8,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            "f".into(),
+            "o".into(),
+            std::sync::Arc::new(crate::stats::collector::OutputStatsAccumulator::new("o".into(), "o".into(), "ts".into())),
+            None,
+        )
+        .expect("an 8-channel encoder");
+        for k in 0..12u64 {
+            enc.submit_planar(&vec![vec![0.1f32; 1024]; 8], k * 1_920);
+        }
+        let adts: Vec<u8> = enc.drain().into_iter().flat_map(|f| f.data.to_vec()).collect();
+        let mut demux = crate::engine::ts_demux::TsDemuxer::new(None);
+        let raw: Vec<Vec<u8>> = demux
+            .demux(&crate::engine::ts_test_fixtures::aac_program_ts(&adts))
+            .into_iter()
+            .filter_map(|f| match f {
+                crate::engine::ts_demux::DemuxedFrame::Aac { data, .. } => Some(data),
+                _ => None,
+            })
+            .collect();
+        assert!(raw.len() >= 8, "{} frames", raw.len());
+        let cfg = demux.cached_aac_specific_config().expect("the 7.1 PCE");
+        let mut dec = AacDecoder::from_config(&cfg).expect("a decoder");
+        assert_eq!(dec.channels(), 8, "before the first frame");
+        for (i, frame) in raw.iter().enumerate() {
+            let pcm = dec.decode_frame(frame).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert_eq!(pcm.len(), 8, "frame {i}");
+        }
+        assert_eq!(dec.channels(), 8, "after it");
     }
 
     #[test]
