@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{SrtInputConfig, SrtMode, SrtRedundancyConfig};
 use crate::manager::events::{EventSender, EventSeverity, category};
-use crate::redundancy::merger::{ActiveLeg, HitlessMerger};
+use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HitlessMerger};
 use crate::srt::bond_supervisor::{
     BondEventScope, BondEvents, BondHealthTracker, BondLatch, BondSupervisor, degrade_after,
     final_member_report, member_sources_json, plan_bond_members,
@@ -838,21 +838,25 @@ async fn srt_input_recv_loop(
 // Dual-leg SRT input with SMPTE 2022-7 hitless protection switching
 // ---------------------------------------------------------------------------
 
-/// The stale time of a 2022-7 pair's merger
-/// ([`HitlessMerger::with_stale_after_us`]): a second past the difference
-/// between the receive latencies the legs ask for. TSBPD delivers each
-/// packet its leg's latency after it was sent, so the later leg lags the
-/// other by that difference whatever the networks do — 1.38 s for legs at
-/// 120 ms and 1 500 ms — and a stream that moves is followed cleanly only
-/// while the stale time exceeds it. A sender asking for more latency than
-/// a leg does moves that leg later still.
-fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64 {
+/// How far the later of a 2022-7 pair's legs lags the other by
+/// configuration: the difference between the receive latencies the legs ask
+/// for. TSBPD delivers each packet its leg's latency after it was sent, so
+/// the later leg lags the other by that difference whatever the networks do
+/// — 1.38 s for legs at 120 ms and 1 500 ms. A sender asking for more
+/// latency than a leg does moves that leg later still.
+fn pair_leg_lag(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> Duration {
     let latency1 = leg1.recv_latency_ms.unwrap_or(leg1.latency_ms);
     let latency2 = leg2.recv_latency_ms.unwrap_or(leg2.latency_ms);
-    latency1
-        .abs_diff(latency2)
-        .saturating_mul(1_000)
-        .saturating_add(crate::redundancy::merger::DEFAULT_STALE_AFTER_US)
+    Duration::from_millis(latency1.abs_diff(latency2))
+}
+
+/// The stale time of a 2022-7 pair's unbuffered merger
+/// ([`HitlessMerger::with_stale_after_us`]): a second past
+/// [`pair_leg_lag`], since a stream that moves is followed cleanly only while
+/// the stale time exceeds the legs' lag. A buffered merger adds its hold
+/// ([`BufferedHitlessMerger::with_leg_lag`]).
+fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64 {
+    crate::redundancy::merger::stale_after_lag_us(pair_leg_lag(leg1, leg2))
 }
 
 /// Dual-leg SRT input with SMPTE 2022-7 hitless merge.
@@ -876,14 +880,20 @@ fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64
 /// Critical and is not re-armed, and the task ends only once both legs have
 /// failed so.
 ///
-/// A leg returning *ahead* of the leg that carries (a shorter path, or a
-/// lower receive latency) is not hitless. The merger forwards its first
-/// packet at once and the slots it skipped are then filled from the trailing
-/// leg, so for about the lead the output interleaves two stream positions;
-/// a lead of a whole merger window or more is skipped instead. Neither
-/// reaches `packets_lost`: the interleaved seqs are each forwarded once, and
-/// the pair's stats count a skip only as far as the legs' drops confirm it,
-/// which a leg just back has none of.
+/// Without `path_differential_ms` the merger forwards each seq as it first
+/// arrives, so a leg running *ahead* of the leg that carries with a hole in
+/// it — returning on a shorter path or a lower receive latency, or just
+/// re-attached and skipping packets its first retransmissions could not
+/// save in time — is not hitless: the merger forwards past the hole at once
+/// and the trailing leg's fills follow newer packets, so for about the lead
+/// the output interleaves two stream positions; a lead of a whole merger
+/// window or more is skipped instead. Neither reaches `packets_lost`: the
+/// interleaved seqs are each forwarded once, and the pair's stats count a
+/// skip only as far as the legs' drops confirm it, which a leg just back has
+/// none of. With `path_differential_ms` the pair's merger holds each packet
+/// that long from its first arrival and releases in seq order
+/// ([`PairMerger::Buffered`]), which closes both while the lead and the
+/// fills' lateness stay inside the hold and the merger's window.
 ///
 /// Each leg's socket has its own stats poller, into `srt.leg` and
 /// `srt.leg2`, from each attach until that leg is lost. What reaches `srt`'s
@@ -990,10 +1000,16 @@ async fn srt_input_redundant_loop(
     // A leg whose listener has failed for good.
     let (mut dead1, mut dead2) = (false, false);
 
-    let stale_after_us = pair_stale_after_us(&config, redundancy);
-    let mut pair = RedundantPair::new(stale_after_us);
+    let mut pair = RedundantPair::new(PairMerger::new(&config, redundancy));
+    // A buffered merger's stats, on the flow's stats as this input's for as
+    // long as the loop runs. The pair keeps its merger across both legs
+    // being lost, so they carry on with it.
+    let _buffered_stats = pair.merger.publish_stats(&stats, input_id);
 
     let outcome = loop {
+        // When a buffered merger next has a packet to release; never for an
+        // unbuffered one.
+        let drain_at = pair.merger.next_deadline().map(tokio::time::Instant::from_std);
         // A leg's recv future polls only while the leg has a socket.
         // `std::future::pending()` never resolves, so the branch stays
         // dormant until the leg attaches.
@@ -1014,6 +1030,9 @@ async fn srt_input_redundant_loop(
             _ = cancel.cancelled() => {
                 tracing::info!("SRT input (redundant) stopping (cancelled)");
                 break Ok(());
+            }
+            _ = tokio::time::sleep_until(drain_at.unwrap_or_else(tokio::time::Instant::now)), if drain_at.is_some() => {
+                drain_redundant_pair(&mut pair, &stats, &publisher, transcoder, post);
             }
             acquired = async { acquire1.as_mut().expect("armed").await }, if acquire1.is_some() => {
                 acquire1 = None;
@@ -1065,7 +1084,7 @@ async fn srt_input_redundant_loop(
                                 continue;
                             };
                             pair.format = detected;
-                            log_detected_format_redundant(pair.format, events, flow_id);
+                            log_detected_format_redundant(pair.format, events, flow_id, redundancy.path_differential_ms);
                             srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
                         }
                         process_redundant_packet(data, srctime_us, ActiveLeg::Leg1, pair.format, RedundantPacketState { raw_ts_seq: &mut pair.raw_ts_seq_leg1, raw_ts_timestamp: &mut pair.raw_ts_timestamp, merger: &mut pair.merger, merger_handoff: &mut pair.merger_handoff, failover: &mut pair.failover, prev_active_leg: &mut pair.prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
@@ -1074,7 +1093,7 @@ async fn srt_input_redundant_loop(
                         lose_input_leg(&ctx, 1, &mut sock1, &mut poller1, &sock2).await;
                         acquire1 = Some(arm_input_leg(&ctx, 1, listener1.take(), LEG_REACQUIRE_DELAY, false));
                         if sock2.is_none() {
-                            pair = both_input_legs_lost(events, flow_id, stale_after_us);
+                            both_input_legs_lost(events, flow_id, &mut pair);
                         }
                     }
                 }
@@ -1090,7 +1109,7 @@ async fn srt_input_redundant_loop(
                                 continue;
                             };
                             pair.format = detected;
-                            log_detected_format_redundant(pair.format, events, flow_id);
+                            log_detected_format_redundant(pair.format, events, flow_id, redundancy.path_differential_ms);
                             srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
                         }
                         process_redundant_packet(data, srctime_us, ActiveLeg::Leg2, pair.format, RedundantPacketState { raw_ts_seq: &mut pair.raw_ts_seq_leg2, raw_ts_timestamp: &mut pair.raw_ts_timestamp, merger: &mut pair.merger, merger_handoff: &mut pair.merger_handoff, failover: &mut pair.failover, prev_active_leg: &mut pair.prev_active_leg, stats: &stats, srt, publisher: &publisher, transcoder, post });
@@ -1099,7 +1118,7 @@ async fn srt_input_redundant_loop(
                         lose_input_leg(&ctx, 2, &mut sock2, &mut poller2, &sock1).await;
                         acquire2 = Some(arm_input_leg(&ctx, 2, listener2.take(), LEG_REACQUIRE_DELAY, false));
                         if sock1.is_none() {
-                            pair = both_input_legs_lost(events, flow_id, stale_after_us);
+                            both_input_legs_lost(events, flow_id, &mut pair);
                         }
                     }
                 }
@@ -1133,9 +1152,9 @@ async fn srt_input_redundant_loop(
 /// What a 2022-7 input's two legs share while either is up: the merger and
 /// the raw-TS failover, what of the merger's counts the pair's stats have
 /// been told, the payload format and the raw-TS counters. Started afresh
-/// only when a loss leaves neither leg connected.
+/// only when a loss leaves neither leg connected ([`Self::restart`]).
 struct RedundantPair {
-    merger: HitlessMerger,
+    merger: PairMerger,
     merger_handoff: crate::stats::collector::MergerHandoff,
     failover: RawTsFailover,
     prev_active_leg: ActiveLeg,
@@ -1146,9 +1165,9 @@ struct RedundantPair {
 }
 
 impl RedundantPair {
-    fn new(stale_after_us: u64) -> Self {
+    fn new(merger: PairMerger) -> Self {
         Self {
-            merger: HitlessMerger::new().with_stale_after_us(stale_after_us),
+            merger,
             merger_handoff: crate::stats::collector::MergerHandoff::default(),
             failover: RawTsFailover::new(),
             prev_active_leg: ActiveLeg::None,
@@ -1156,6 +1175,90 @@ impl RedundantPair {
             raw_ts_seq_leg1: 0,
             raw_ts_seq_leg2: 0,
             raw_ts_timestamp: 0,
+        }
+    }
+
+    /// Start afresh, as each connect cycle used to: the merger on whatever
+    /// stream the legs bring back ([`PairMerger::restart`]), the failover and
+    /// the format detection. The merger's counts carry on, and so does what
+    /// of them `srt.pair` has been handed.
+    fn restart(&mut self) {
+        self.merger.restart();
+        self.failover = RawTsFailover::new();
+        self.prev_active_leg = ActiveLeg::None;
+        self.format = SrtPayloadFormat::Unknown;
+        (self.raw_ts_seq_leg1, self.raw_ts_seq_leg2, self.raw_ts_timestamp) = (0, 0, 0);
+    }
+}
+
+/// The merger of a 2022-7 pair whose legs carry RTP, chosen once from the
+/// input's config.
+enum PairMerger {
+    /// No `path_differential_ms`: each seq is forwarded as it first arrives.
+    Bare(HitlessMerger),
+    /// Each seq is held `path_differential_ms` from its first arrival and
+    /// released in seq order, so a leg that runs ahead with a hole leaves the
+    /// hole to the other leg rather than putting its fills out after newer
+    /// packets. Boxed: it is several times the size of the bare merger.
+    Buffered(Box<BufferedHitlessMerger<RtpPacket>>),
+}
+
+impl PairMerger {
+    /// Its stale time takes in the legs' latency difference
+    /// ([`pair_leg_lag`]), the buffered merger's its hold as well.
+    fn new(config: &SrtInputConfig, redundancy: &SrtRedundancyConfig) -> Self {
+        match redundancy.path_differential_ms {
+            Some(ms) => {
+                tracing::info!(
+                    "SRT input (2022-7): buffered merger enabled (path_differential = {ms} ms)"
+                );
+                Self::Buffered(Box::new(BufferedHitlessMerger::with_leg_lag(
+                    Duration::from_millis(ms.into()),
+                    crate::redundancy::merger::REORDER_WINDOW,
+                    pair_leg_lag(config, redundancy),
+                )))
+            }
+            None => Self::Bare(
+                HitlessMerger::new().with_stale_after_us(pair_stale_after_us(config, redundancy)),
+            ),
+        }
+    }
+
+    /// Neither leg is connected: forget the stream, keeping the counts. A
+    /// buffered merger releases what it holds at its own release times —
+    /// packets the legs delivered before the loss, which dropping would lose
+    /// and releasing at once would burst onto the flow, and which go out
+    /// ahead of anything a leg brings back, as that arrives later and is held
+    /// as long.
+    fn restart(&mut self) {
+        match self {
+            Self::Bare(merger) => merger.restart(),
+            Self::Buffered(merger) => merger.restart(),
+        }
+    }
+
+    /// When the merger next has a packet to release: never for the bare one.
+    fn next_deadline(&self) -> Option<std::time::Instant> {
+        match self {
+            Self::Bare(_) => None,
+            Self::Buffered(merger) => merger.next_deadline(),
+        }
+    }
+
+    /// Publish a buffered merger's stats on the flow's as `input_id`'s,
+    /// until what this returns drops; the bare merger has none.
+    fn publish_stats(
+        &self,
+        flow: &Arc<FlowStatsAccumulator>,
+        input_id: &str,
+    ) -> Option<crate::stats::collector::BufferedHitlessPublication> {
+        match self {
+            Self::Bare(_) => None,
+            Self::Buffered(merger) => Some(crate::stats::collector::BufferedHitlessPublication::new(
+                flow,
+                input_id,
+                merger.stats_handle(),
+            )),
         }
     }
 }
@@ -1342,13 +1445,13 @@ async fn lose_input_leg(
     );
 }
 
-/// A loss has left neither leg connected: raise the Critical and hand back
-/// a fresh pair, as each connect cycle used to start one. Both legs are
-/// being re-acquired.
-fn both_input_legs_lost(events: &EventSender, flow_id: &str, stale_after_us: u64) -> RedundantPair {
+/// A loss has left neither leg connected: raise the Critical and start the
+/// pair afresh ([`RedundantPair::restart`]). Both legs are being
+/// re-acquired.
+fn both_input_legs_lost(events: &EventSender, flow_id: &str, pair: &mut RedundantPair) {
     tracing::warn!("SRT input (redundant) both legs lost, re-acquiring each");
     events.emit_flow(EventSeverity::Critical, category::REDUNDANCY, "Both redundant legs lost", flow_id);
-    RedundantPair::new(stale_after_us)
+    pair.restart();
 }
 
 /// Leg `leg`'s listener can never accept again (see
@@ -1396,11 +1499,14 @@ fn log_detected_format(format: SrtPayloadFormat) {
 /// TS lands on a 2022-7-configured input, real hitless dedup is impossible
 /// (no shared transport-layer seq across legs) — the runtime falls back to
 /// active-leg protection-switching. Emit a Warning event so operators
-/// understand what mode they're actually getting.
+/// understand what mode they're actually getting. A `path_differential_ms`
+/// the input sets has nothing to hold on either, which the event says too:
+/// the message stays the same, so filters on it keep matching.
 fn log_detected_format_redundant(
     format: SrtPayloadFormat,
     events: &EventSender,
     flow_id: &str,
+    path_differential_ms: Option<u32>,
 ) {
     log_detected_format(format);
     if matches!(format, SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown) {
@@ -1408,16 +1514,28 @@ fn log_detected_format_redundant(
             "SRT redundant input: raw TS has no shared cross-leg seq — running active-leg failover, NOT hitless dedup. \
              Configure the publisher to send RTP/TS (SMPTE ST 2022-2) for true 2022-7 hitless behaviour."
         );
+        let mut details = serde_json::json!({
+            "error_code": "redundancy_failover_mode",
+            "format": "raw_ts",
+            "fix_hint": "Configure the publisher to send RTP/TS for true SMPTE 2022-7 hitless behaviour",
+        });
+        if let Some(ms) = path_differential_ms {
+            tracing::warn!(
+                "SRT redundant input: path_differential_ms ({ms} ms) does not apply to raw TS, \
+                 which has no sequence number to hold and order on"
+            );
+            details["path_differential_ms"] = ms.into();
+            details["fix_hint"] = "Configure the publisher to send RTP/TS for true SMPTE 2022-7 \
+                hitless behaviour; path_differential_ms holds and orders RTP/TS only, so it does \
+                nothing on raw TS"
+                .into();
+        }
         events.emit_flow_with_details(
             EventSeverity::Warning,
             category::REDUNDANCY,
             "SRT redundancy on raw TS: running active-leg failover, not hitless dedup",
             flow_id,
-            serde_json::json!({
-                "error_code": "redundancy_failover_mode",
-                "format": "raw_ts",
-                "fix_hint": "Configure the publisher to send RTP/TS for true SMPTE 2022-7 hitless behaviour",
-            }),
+            details,
         );
     }
 }
@@ -1498,21 +1616,13 @@ impl RawTsFailover {
     }
 }
 
-/// Process a single packet from a redundancy leg.
-///
-/// Dispatches by detected payload format:
-/// - **RTP/TS**: feeds the real RTP sequence number through
-///   [`HitlessMerger`] for true SMPTE 2022-7 dedup + gap-fill.
-/// - **Raw TS / Unknown**: routes through [`RawTsFailover`] for
-///   active-leg protection-switching. Real dedup is impossible without a
-///   shared seq across legs.
 /// The dual-leg receive path's mutable state: sequence/timestamp counters,
 /// the hitless merger and failover, the pair's stats and the downstream
 /// publish chain.
 struct RedundantPacketState<'a> {
     raw_ts_seq: &'a mut u16,
     raw_ts_timestamp: &'a mut u32,
-    merger: &'a mut HitlessMerger,
+    merger: &'a mut PairMerger,
     /// What of the merger's counts has been handed to `srt.pair`.
     merger_handoff: &'a mut crate::stats::collector::MergerHandoff,
     failover: &'a mut RawTsFailover,
@@ -1524,6 +1634,16 @@ struct RedundantPacketState<'a> {
     post: &'a mut Option<InputPostProcess>,
 }
 
+/// Process a single packet from a redundancy leg.
+///
+/// Dispatches by detected payload format:
+/// - **RTP/TS**: feeds the real RTP sequence number through the pair's
+///   merger ([`PairMerger`]) for true SMPTE 2022-7 dedup + gap-fill:
+///   forwarded at once, or held for `path_differential_ms` and released in
+///   seq order.
+/// - **Raw TS / Unknown**: routes through [`RawTsFailover`] for
+///   active-leg protection-switching. Real dedup is impossible without a
+///   shared seq across legs.
 fn process_redundant_packet(
     data: Bytes,
     srctime_us: Option<i64>,
@@ -1549,23 +1669,51 @@ fn process_redundant_packet(
     // The arrival time stamped on the packet, read once: it is also the
     // merger's clock for telling a moved stream from a lagging leg.
     let recv_time_us = now_us();
-    let (seq, ts, is_raw, accepted_leg) = match format {
+    match format {
         SrtPayloadFormat::RtpTs => {
             if !is_likely_rtp(&data) {
                 return;
             }
             let seq = parse_rtp_sequence_number(&data).unwrap_or(0);
             let ts = parse_rtp_timestamp(&data).unwrap_or(0);
-            let chosen = merger.try_merge(seq, leg, recv_time_us);
-            // A seq leaving the window unfilled, or a re-anchor, is rare: two
-            // compares per packet, an atomic add only when one happened.
-            srt.pair.hand_off(merger, merger_handoff);
-            match chosen {
-                Some(chosen_leg) => (seq, ts, false, chosen_leg),
-                None => return,
+            let packet = RtpPacket {
+                data,
+                sequence_number: seq,
+                rtp_timestamp: ts,
+                recv_time_us,
+                is_raw_ts: false,
+                upstream_seq: None,
+                upstream_leg_id: None,
+                sender_timestamp_us: srctime_us,
+            };
+            match merger {
+                PairMerger::Bare(merger) => {
+                    let chosen = merger.try_merge(seq, leg, recv_time_us);
+                    // A seq leaving the window unfilled, or a re-anchor, is
+                    // rare: two compares per packet, an atomic add only when
+                    // one happened.
+                    srt.pair.hand_off(merger, merger_handoff);
+                    if let Some(chosen_leg) = chosen {
+                        publish_redundant_packet(packet, chosen_leg, prev_active_leg, stats, publisher, transcoder, post);
+                    }
+                }
+                PairMerger::Buffered(merger) => {
+                    let now = std::time::Instant::now();
+                    for (chosen_leg, packet) in merger.ingest(seq, leg, packet, now) {
+                        publish_redundant_packet(packet, chosen_leg, prev_active_leg, stats, publisher, transcoder, post);
+                    }
+                    srt.pair.hand_off(&**merger, merger_handoff);
+                }
             }
         }
         SrtPayloadFormat::RawTs | SrtPayloadFormat::Unknown => {
+            // What a buffered merger still holds of RTP from before both legs
+            // were lost is older than anything the legs bring back: out first.
+            if let PairMerger::Buffered(merger) = merger {
+                for (held_leg, packet) in merger.release_all() {
+                    publish_redundant_packet(packet, held_leg, prev_active_leg, stats, publisher, transcoder, post);
+                }
+            }
             if !failover.admit(leg) {
                 return;
             }
@@ -1585,27 +1733,49 @@ fn process_redundant_packet(
             if let Some(pcr_27mhz) = scan_first_pcr_in_datagram(&data) {
                 *raw_ts_timestamp = (pcr_27mhz / 300) as u32;
             }
-            (seq, *raw_ts_timestamp, true, leg)
+            let packet = RtpPacket {
+                data,
+                sequence_number: seq,
+                rtp_timestamp: *raw_ts_timestamp,
+                recv_time_us,
+                is_raw_ts: true,
+                upstream_seq: None,
+                upstream_leg_id: None,
+                sender_timestamp_us: srctime_us,
+            };
+            publish_redundant_packet(packet, leg, prev_active_leg, stats, publisher, transcoder, post);
         }
-    };
+    }
+}
 
-    if *prev_active_leg != ActiveLeg::None && accepted_leg != *prev_active_leg {
+/// Publish a packet the pair forwards from `leg`: count a switch of leg, the
+/// input's packets and bytes, then the bandwidth gate and the publish chain.
+fn publish_redundant_packet(
+    packet: RtpPacket,
+    leg: ActiveLeg,
+    prev_active_leg: &mut ActiveLeg,
+    stats: &FlowStatsAccumulator,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
+    transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
+) {
+    if *prev_active_leg != ActiveLeg::None && leg != *prev_active_leg {
         stats
             .redundancy_switches
             .fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
             "SRT input redundancy switch: {:?} -> {:?} at seq {}",
             prev_active_leg,
-            accepted_leg,
-            seq
+            leg,
+            packet.sequence_number
         );
     }
-    *prev_active_leg = accepted_leg;
+    *prev_active_leg = leg;
 
     stats.input_packets.fetch_add(1, Ordering::Relaxed);
     stats
         .input_bytes
-        .fetch_add(data.len() as u64, Ordering::Relaxed);
+        .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
 
     // Bandwidth limit enforcement: drop packet if flow is blocked
     if stats.bandwidth_blocked.load(Ordering::Relaxed) {
@@ -1613,18 +1783,26 @@ fn process_redundant_packet(
         return;
     }
 
-    let packet = RtpPacket {
-        data,
-        sequence_number: seq,
-        rtp_timestamp: ts,
-        recv_time_us,
-        is_raw_ts: is_raw,
-        upstream_seq: None,
-        upstream_leg_id: None,
-        sender_timestamp_us: srctime_us,
-    };
-
     crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, publisher, packet);
+}
+
+/// Release what a buffered pair merger holds past its release time. Nothing
+/// for an unbuffered merger, which holds nothing. The flow's stats read the
+/// merger's counters where it writes them ([`PairMerger::publish_stats`]), so
+/// a drain takes no lock to refresh a copy.
+fn drain_redundant_pair(
+    pair: &mut RedundantPair,
+    stats: &FlowStatsAccumulator,
+    publisher: &crate::engine::ingress_publisher::IngressPublisher,
+    transcoder: &mut Option<InputTranscoder>,
+    post: &mut Option<InputPostProcess>,
+) {
+    let PairMerger::Buffered(merger) = &mut pair.merger else {
+        return;
+    };
+    for (leg, packet) in merger.drain_expired(std::time::Instant::now()) {
+        publish_redundant_packet(packet, leg, &mut pair.prev_active_leg, stats, publisher, transcoder, post);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2899,6 +3077,241 @@ mod tests {
         once.sort_unstable();
         once.dedup();
         assert_eq!(once.len(), sent.len(), "nothing is forwarded twice");
+    }
+
+    /// A 2022-7 pair's receive path without sockets: each leg's packets
+    /// handed to it as its recv arm would, published into a broadcast the
+    /// test reads, and the drain arm run when the merger's next release is
+    /// due.
+    struct PairBench {
+        flow: Arc<FlowStatsAccumulator>,
+        srt: Arc<SrtInputStats>,
+        publisher: crate::engine::ingress_publisher::IngressPublisher,
+        rx: broadcast::Receiver<RtpPacket>,
+        pair: RedundantPair,
+        transcoder: Option<InputTranscoder>,
+        post: Option<InputPostProcess>,
+        /// The buffered merger's stats on the flow, as the loop holds them.
+        _published: Option<crate::stats::collector::BufferedHitlessPublication>,
+    }
+
+    impl PairBench {
+        /// Legs 1 and 2 listening, leg 2's block extended by `extra`.
+        fn new(extra: serde_json::Value) -> Self {
+            let mut redundancy =
+                serde_json::json!({ "mode": "listener", "local_addr": "127.0.0.1:9002" });
+            for (key, value) in extra.as_object().expect("an object") {
+                redundancy[key] = value.clone();
+            }
+            let config = srt_config(serde_json::json!({
+                "mode": "listener", "local_addr": "127.0.0.1:9000", "redundancy": redundancy
+            }));
+            let flow =
+                Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+            flow.set_active_input_id("pair");
+            let srt = flow.register_srt_input_stats("pair");
+            let (tx, rx) = broadcast::channel(4096);
+            let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+                Default::default(),
+                tx,
+                "pair",
+                CancellationToken::new(),
+                flow.clone(),
+            );
+            let merger = PairMerger::new(&config, config.redundancy.as_ref().unwrap());
+            let _published = merger.publish_stats(&flow, "pair");
+            Self {
+                flow,
+                srt,
+                publisher,
+                rx,
+                pair: RedundantPair::new(merger),
+                transcoder: None,
+                post: None,
+                _published,
+            }
+        }
+
+        /// Leg `leg`'s recv delivered RTP seq `seq`.
+        fn deliver(&mut self, leg: ActiveLeg, seq: u16) {
+            let data = Bytes::from(rtp_datagram(seq));
+            let pair = &mut self.pair;
+            if pair.format == SrtPayloadFormat::Unknown
+                && let Some(detected) = detect_format(&data)
+            {
+                pair.format = detected;
+                self.srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
+            }
+            let raw_ts_seq =
+                if leg == ActiveLeg::Leg1 { &mut pair.raw_ts_seq_leg1 } else { &mut pair.raw_ts_seq_leg2 };
+            process_redundant_packet(data, None, leg, pair.format, RedundantPacketState {
+                raw_ts_seq,
+                raw_ts_timestamp: &mut pair.raw_ts_timestamp,
+                merger: &mut pair.merger,
+                merger_handoff: &mut pair.merger_handoff,
+                failover: &mut pair.failover,
+                prev_active_leg: &mut pair.prev_active_leg,
+                stats: &self.flow,
+                srt: &self.srt,
+                publisher: &self.publisher,
+                transcoder: &mut self.transcoder,
+                post: &mut self.post,
+            });
+        }
+
+        /// Run the drain arm at each release the merger holds, until it holds
+        /// nothing.
+        fn drain_when_due(&mut self) {
+            while let Some(due) = self.pair.merger.next_deadline() {
+                std::thread::sleep(due.saturating_duration_since(std::time::Instant::now()));
+                drain_redundant_pair(&mut self.pair, &self.flow, &self.publisher, &mut self.transcoder, &mut self.post);
+            }
+        }
+
+        /// The seqs published since the last call, in order.
+        fn published(&mut self) -> Vec<u16> {
+            let mut seqs = Vec::new();
+            while let Ok(packet) = self.rx.try_recv() {
+                seqs.push(packet.sequence_number);
+            }
+            seqs
+        }
+
+        /// What the merger has counted of the seqs it never forwarded.
+        fn lost(&self) -> u64 {
+            use crate::redundancy::merger::LossCounts;
+            match &self.pair.merger {
+                PairMerger::Bare(merger) => LossCounts::lost(merger),
+                PairMerger::Buffered(merger) => LossCounts::lost(&**merger),
+            }
+        }
+    }
+
+    /// The bench's re-attach case, in the order the legs' recv arms hand it
+    /// over, a seq a tick: leg 2 carries, five ticks behind, and leg 1 comes
+    /// back ahead of it at seq 100 and skips 150..=160 (too late on its
+    /// fresh connection), so leg 2's copies of what leg 1 is ahead of arrive
+    /// after leg 1's newer packets.
+    fn back_ahead_with_a_hole() -> Vec<(ActiveLeg, u16)> {
+        let mut arrivals = Vec::new();
+        for tick in 0..305u16 {
+            if tick >= 5 {
+                arrivals.push((ActiveLeg::Leg2, tick - 5));
+            }
+            if (100..300).contains(&tick) && !(150..=160).contains(&tick) {
+                arrivals.push((ActiveLeg::Leg1, tick));
+            }
+        }
+        arrivals
+    }
+
+    /// With `path_differential_ms` the pair releases a leg back ahead of the
+    /// carrying leg, with a hole, as one stream: nothing before its hold
+    /// expires, then every seq once and in order, nothing counted lost, and
+    /// the buffered merger's stats on the flow for the manager's card.
+    #[test]
+    fn a_buffered_pair_releases_a_leg_back_ahead_with_a_hole_in_order() {
+        let mut bench = PairBench::new(serde_json::json!({ "path_differential_ms": 1000 }));
+        for (leg, seq) in back_ahead_with_a_hole() {
+            bench.deliver(leg, seq);
+        }
+        assert!(bench.published().is_empty(), "held for path_differential_ms");
+        bench.drain_when_due();
+        assert_eq!(bench.published(), (0..300).collect::<Vec<_>>());
+        assert_eq!(bench.lost(), 0);
+        assert_eq!(bench.flow.input_packets.load(Ordering::Relaxed), 300);
+        let snap = bench.flow.snapshot();
+        let held = snap.input.buffered_hitless.expect("the buffered merger's stats");
+        assert_eq!((held.max_path_diff_ms, held.packets_emitted, held.gap_lost), (1000, 300, 0));
+    }
+
+    /// Without `path_differential_ms` the pair forwards as it always did:
+    /// each seq at once and once, leg 2's fills after leg 1's newer packets,
+    /// and no buffered stats.
+    #[test]
+    fn an_unbuffered_pair_forwards_at_once_as_before() {
+        let mut bench = PairBench::new(serde_json::json!({}));
+        let mut forwarded = Vec::new();
+        for (leg, seq) in back_ahead_with_a_hole() {
+            bench.deliver(leg, seq);
+            forwarded.extend(bench.published());
+        }
+        assert!(bench.pair.merger.next_deadline().is_none(), "nothing held");
+        let mut once = forwarded.clone();
+        once.sort_unstable();
+        assert_eq!(once, (0..300).collect::<Vec<_>>(), "each seq once");
+        let at = |seq: u16| forwarded.iter().position(|&s| s == seq).unwrap();
+        assert!(at(100) < at(96) && at(161) < at(157), "interleaved: {forwarded:?}");
+        assert!(bench.flow.snapshot().input.buffered_hitless.is_none());
+    }
+
+    /// A buffered pair's stats are its own input's: a passive pair's merger
+    /// shows nothing under the flow's active input (a UDP one, say), and
+    /// what the pair counted shows once it is active, with no drain having
+    /// run. They go when the pair's loop does.
+    #[test]
+    fn a_passive_buffered_pairs_stats_stay_its_own() {
+        let mut bench = PairBench::new(serde_json::json!({ "path_differential_ms": 200 }));
+        bench.flow.set_active_input_id("udp");
+        for seq in 0..10u16 {
+            bench.deliver(ActiveLeg::Leg1, seq);
+        }
+        assert!(bench.flow.snapshot().input.buffered_hitless.is_none(), "not under the UDP input");
+        bench.flow.set_active_input_id("pair");
+        let held = bench.flow.snapshot().input.buffered_hitless.expect("its own, once active");
+        assert_eq!((held.leg1_packets_received, held.current_buffer_depth), (10, 10));
+        bench._published = None;
+        assert!(bench.flow.snapshot().input.buffered_hitless.is_none(), "gone with the loop");
+    }
+
+    /// Both legs lost with packets held: the Critical, a fresh format
+    /// detection, and what was held released at its own time, ahead of the
+    /// stream the legs bring back on a new ISN far behind the old — a packet
+    /// behind that stream's first included — with no gap counted between.
+    #[test]
+    fn a_buffered_pair_restarting_releases_what_it_held_first() {
+        let mut bench = PairBench::new(serde_json::json!({ "path_differential_ms": 300 }));
+        for seq in 40_000..40_100u16 {
+            bench.deliver(ActiveLeg::Leg1, seq);
+            bench.deliver(ActiveLeg::Leg2, seq);
+        }
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        both_input_legs_lost(&events, "f1", &mut bench.pair);
+        let critical = events_rx.try_recv().expect("the Critical");
+        assert_eq!(critical.message, "Both redundant legs lost");
+        assert_eq!(critical.severity, EventSeverity::Critical);
+        assert_eq!(bench.pair.format, SrtPayloadFormat::Unknown, "detected afresh");
+        assert!(bench.published().is_empty(), "what is held waits for its release time");
+
+        for seq in 7..60u16 {
+            bench.deliver(ActiveLeg::Leg2, seq);
+        }
+        for seq in 5..60u16 {
+            bench.deliver(ActiveLeg::Leg1, seq);
+        }
+        bench.drain_when_due();
+        let expected: Vec<u16> = (40_000..40_100).chain(5..60).collect();
+        assert_eq!(bench.published(), expected);
+        assert_eq!(bench.lost(), 0);
+        let held = bench.flow.snapshot().input.buffered_hitless.expect("the buffered stats");
+        assert_eq!((held.packets_emitted, held.gap_lost), (155, 0));
+    }
+
+    /// A raw-TS payload on a pair with `path_differential_ms`: the failover
+    /// Warning keeps its message and says the hold does not apply.
+    #[test]
+    fn raw_ts_failover_warning_says_the_hold_does_not_apply() {
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        log_detected_format_redundant(SrtPayloadFormat::RawTs, &events, "f1", Some(200));
+        log_detected_format_redundant(SrtPayloadFormat::RawTs, &events, "f1", None);
+        let held = events_rx.try_recv().expect("the Warning");
+        let plain = events_rx.try_recv().expect("the Warning");
+        assert_eq!(held.message, plain.message);
+        let details = held.details.as_ref().unwrap();
+        assert_eq!(details["error_code"], "redundancy_failover_mode");
+        assert_eq!(details["path_differential_ms"], 200);
+        assert!(details["fix_hint"].as_str().unwrap().contains("path_differential_ms"));
+        assert!(plain.details.as_ref().unwrap().get("path_differential_ms").is_none());
     }
 
     #[test]

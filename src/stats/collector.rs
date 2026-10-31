@@ -3683,16 +3683,18 @@ pub enum SrtInputSocket {
 /// they count the packets the pair lost rather than its legs' drops. A packet
 /// one leg drops is no loss while the other leg delivers it.
 ///
-/// When the legs merge ([`HitlessMerger`]), the pair's loss is what the
-/// merger counts, and the pollers name each lost packet's cause from the
+/// When the legs merge ([`HitlessMerger`], or with `path_differential_ms` a
+/// [`BufferedHitlessMerger`] holding each packet), the pair's loss is what
+/// the merger counts, and the pollers name each lost packet's cause from the
 /// legs' own too-late drops (`PairLedger`). Two kinds:
 ///
 /// - seqs that left the merger's window with neither leg delivering them
-///   ([`HitlessMerger::lost`]): loss whatever caused it. The part both legs'
-///   libsrt drop counters explain is SRT's, counted as drops
-///   (`srt_recv_dropped`, whose remedy is more latency); the rest was
-///   missing upstream of SRT on both legs, counted as sequence-gap loss (the
-///   generic `packet_loss`);
+///   ([`HitlessMerger::lost`]), and behind a hold the seqs a leg delivered
+///   only once the hold had released past them: loss whatever caused it.
+///   The part both legs' libsrt drop counters explain is SRT's, counted as
+///   drops (`srt_recv_dropped`, whose remedy is more latency); the rest was
+///   missing upstream of SRT on both legs, or came too late for the hold,
+///   counted as sequence-gap loss (the generic `packet_loss`);
 /// - seqs a re-anchor of the window jumped over ([`HitlessMerger::skipped`]):
 ///   a burst both legs lost, or nothing at all when the source restarted on
 ///   a new ISN, which the sequence numbers alone cannot tell apart. Counted
@@ -3700,6 +3702,7 @@ pub enum SrtInputSocket {
 ///   loss.
 ///
 /// [`HitlessMerger`]: crate::redundancy::merger::HitlessMerger
+/// [`BufferedHitlessMerger`]: crate::redundancy::merger::BufferedHitlessMerger
 /// [`HitlessMerger::lost`]: crate::redundancy::merger::HitlessMerger::lost
 /// [`HitlessMerger::skipped`]: crate::redundancy::merger::HitlessMerger::skipped
 #[derive(Default)]
@@ -3725,10 +3728,8 @@ pub struct SrtPair {
     ledger: Mutex<PairLedger>,
 }
 
-/// What of a [`HitlessMerger`]'s counts a receive loop has handed its
-/// [`SrtPair`] (see [`SrtPair::hand_off`]).
-///
-/// [`HitlessMerger`]: crate::redundancy::merger::HitlessMerger
+/// What of a merger's counts a receive loop has handed its [`SrtPair`] (see
+/// [`SrtPair::hand_off`]).
 #[derive(Default)]
 pub struct MergerHandoff {
     lost: u64,
@@ -3743,13 +3744,14 @@ impl SrtPair {
     }
 
     /// Hand the pair what `merger` counted since the previous call: seqs that
-    /// left its window unfilled, seqs re-anchors skipped, and the re-anchors.
+    /// left its window unfilled (and, behind a hold, seqs it could not
+    /// release in order), seqs re-anchors skipped, and the re-anchors.
     /// Called per merged packet: three compares, and an atomic add only when
     /// a count moved, which is rare.
     #[inline]
     pub fn hand_off(
         &self,
-        merger: &crate::redundancy::merger::HitlessMerger,
+        merger: &impl crate::redundancy::merger::LossCounts,
         handed: &mut MergerHandoff,
     ) {
         let lost = merger.lost();
@@ -4201,6 +4203,38 @@ impl SrtInputStats {
     }
 }
 
+/// An input's buffered 2022-7 merger stats, published on its flow's stats
+/// under the input's id while this is held, and withdrawn when it drops: a
+/// receive loop holds it for as long as it runs, so an input stopped,
+/// removed or swapped in place for one without the merger takes its card
+/// with it. A successor published under the same id first keeps its own.
+pub struct BufferedHitlessPublication {
+    flow: Arc<FlowStatsAccumulator>,
+    input_id: String,
+    stats: Arc<crate::redundancy::merger::BufferedHitlessStats>,
+}
+
+impl BufferedHitlessPublication {
+    /// Publish `stats` as `input_id`'s on `flow`.
+    pub fn new(
+        flow: &Arc<FlowStatsAccumulator>,
+        input_id: &str,
+        stats: Arc<crate::redundancy::merger::BufferedHitlessStats>,
+    ) -> Self {
+        flow.buffered_hitless_stats
+            .insert(input_id.to_string(), stats.clone());
+        Self { flow: flow.clone(), input_id: input_id.to_string(), stats }
+    }
+}
+
+impl Drop for BufferedHitlessPublication {
+    fn drop(&mut self) {
+        self.flow
+            .buffered_hitless_stats
+            .remove_if(&self.input_id, |_, published| Arc::ptr_eq(published, &self.stats));
+    }
+}
+
 /// Per-flow atomic counters for a single media flow (one input, N outputs).
 ///
 /// Holds input-side counters (`input_packets`, `input_bytes`, `input_loss`,
@@ -4234,12 +4268,16 @@ pub struct FlowStatsAccumulator {
     /// UI's flow card can show "12 source discontinuities since
     /// start" alongside the recent-events panel.
     pub source_discontinuities: AtomicU64,
-    /// Latest snapshot of the buffered SMPTE 2022-7 merger, when the
-    /// input runs in industry-standard buffered mode. The redundant
-    /// RTP listener publishes to this from the data-path task at the
-    /// natural drain cadence; the snapshot path just clones it.
-    pub buffered_hitless_snapshot:
-        std::sync::RwLock<Option<crate::stats::models::BufferedHitlessSnapshot>>,
+    /// The stats of each input's buffered SMPTE 2022-7 merger, keyed by
+    /// `input_id`: an RTP or SRT 2022-7 input with `path_differential_ms`
+    /// publishes its merger's for as long as its receive loop runs
+    /// ([`BufferedHitlessPublication`]). The snapshot reads the **active**
+    /// input's through an `active_key` lookup, as it does
+    /// `ingress_dejitter_stats`: one flow-wide slot showed a passive input's
+    /// merger under whichever input was active, and kept a removed input's
+    /// last values for the life of the flow.
+    pub buffered_hitless_stats:
+        DashMap<String, Arc<crate::redundancy::merger::BufferedHitlessStats>>,
     /// Ingress de-jitter telemetry, keyed by `input_id` (one entry per
     /// de-jittered raw UDP / RTP input). The snapshot surfaces the **active**
     /// input's `shed` + `depth` on its `InputStats` via an `active_key`
@@ -4507,7 +4545,7 @@ impl FlowStatsAccumulator {
             fec_recovered: AtomicU64::new(0),
             redundancy_switches: AtomicU64::new(0),
             source_discontinuities: AtomicU64::new(0),
-            buffered_hitless_snapshot: std::sync::RwLock::new(None),
+            buffered_hitless_stats: DashMap::new(),
             ingress_dejitter_stats: DashMap::new(),
             sdi_capture_stats: DashMap::new(),
             media_player_stats: DashMap::new(),
@@ -5622,10 +5660,9 @@ impl FlowStatsAccumulator {
                     redundancy_switches: self.redundancy_switches.load(Ordering::Relaxed),
                     source_discontinuities: self.source_discontinuities.load(Ordering::Relaxed),
                     buffered_hitless: self
-                        .buffered_hitless_snapshot
-                        .read()
-                        .ok()
-                        .and_then(|g| g.clone()),
+                        .buffered_hitless_stats
+                        .get(active_key)
+                        .map(|h| h.snapshot()),
                     ingress_dejitter_shed: self
                         .ingress_dejitter_stats
                         .get(active_key)
@@ -7117,6 +7154,53 @@ mod input_audio_replacer_stats_tests {
 }
 
 #[cfg(test)]
+mod buffered_hitless_publication_tests {
+    use super::*;
+    use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger};
+    use std::time::Duration;
+
+    fn merger(hold_ms: u64) -> BufferedHitlessMerger<u16> {
+        BufferedHitlessMerger::new(Duration::from_millis(hold_ms))
+    }
+
+    /// A buffered merger's stats show on the input snapshot only while its
+    /// input is the active one, read live from what the merger writes, and
+    /// go when its receive loop lets them go. A passive 2022-7 input's
+    /// merger used to show under whichever input was active, and a removed
+    /// one's last values stayed for the life of the flow.
+    #[test]
+    fn the_snapshot_shows_the_active_inputs_merger_while_it_runs() {
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+        let mut held = merger(200);
+        let published = BufferedHitlessPublication::new(&flow, "pair", held.stats_handle());
+
+        flow.set_active_input_id("udp");
+        assert!(flow.snapshot().input.buffered_hitless.is_none(), "not the active input's");
+
+        flow.set_active_input_id("pair");
+        let _ = held.ingest(7, ActiveLeg::Leg1, 7, std::time::Instant::now());
+        let snap = flow.snapshot().input.buffered_hitless.expect("the active input's merger");
+        assert_eq!((snap.max_path_diff_ms, snap.leg1_packets_received), (200, 1));
+
+        drop(published);
+        assert!(flow.snapshot().input.buffered_hitless.is_none(), "gone with its loop");
+    }
+
+    /// An input swapped in place publishes before the old loop has wound
+    /// down: the old loop letting go leaves the successor's stats in place.
+    #[test]
+    fn a_predecessor_letting_go_keeps_its_successors_stats() {
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "rtp".into()));
+        flow.set_active_input_id("in-1");
+        let old = BufferedHitlessPublication::new(&flow, "in-1", merger(100).stats_handle());
+        let _new = BufferedHitlessPublication::new(&flow, "in-1", merger(300).stats_handle());
+        drop(old);
+        let snap = flow.snapshot().input.buffered_hitless.expect("the successor's");
+        assert_eq!(snap.max_path_diff_ms, 300);
+    }
+}
+
+#[cfg(test)]
 mod srt_input_stats_tests {
     use super::*;
 
@@ -7532,6 +7616,32 @@ mod srt_input_stats_tests {
         assert!(reason.contains("4 packets"), "{reason}");
         // The hint is the slower of the two legs.
         assert!(reason.contains("RTT 90 ms"), "{reason}");
+    }
+
+    /// Behind a hold, a seq a leg delivered only once the hold had released
+    /// past it is the pair's loss, handed off as the merger drops it. No
+    /// leg's drops explain it, so it counts as a sequence gap. A restart
+    /// after both legs are lost hands nothing off again: the buffered
+    /// merger's counts carry on, and so does the hand-off.
+    #[test]
+    fn a_buffered_mergers_late_fill_is_the_pairs_loss_once() {
+        use crate::redundancy::merger::BufferedHitlessMerger;
+        use std::time::{Duration, Instant};
+        let mut pair = MergedPair::new();
+        let mut merger = BufferedHitlessMerger::<u16>::new(Duration::from_millis(50));
+        let t0 = Instant::now();
+        let _ = merger.ingest(101, ActiveLeg::Leg1, 101, t0);
+        let _ = merger.drain_expired(t0 + Duration::from_millis(60));
+        let _ = merger.ingest(100, ActiveLeg::Leg2, 100, t0 + Duration::from_millis(80));
+        pair.srt.pair.hand_off(&merger, &mut pair.handed);
+        merger.restart();
+        let _ = merger.ingest(7, ActiveLeg::Leg1, 7, t0 + Duration::from_secs(2));
+        pair.srt.pair.hand_off(&merger, &mut pair.handed);
+        for delivered in 2..=4 {
+            pair.poll(SrtInputSocket::Leg1, 0, delivered);
+            pair.poll(SrtInputSocket::Leg2, 0, delivered);
+        }
+        assert_eq!(pair.lost(), (1, 0));
     }
 
     /// A burst of a whole merger window or more that both legs dropped

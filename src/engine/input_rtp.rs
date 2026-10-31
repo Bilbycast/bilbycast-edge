@@ -820,6 +820,14 @@ async fn rtp_input_redundant_loop(
             out: Vec::with_capacity(1),
         },
     };
+    // The buffered merger's stats, on the flow's stats as this input's for
+    // as long as the loop runs.
+    let _buffered_stats = match &merger {
+        RedundantMerger::Buffered(m) => Some(
+            crate::stats::collector::BufferedHitlessPublication::new(&stats, input_id, m.stats_handle()),
+        ),
+        RedundantMerger::Bare { .. } => None,
+    };
 
     let mut buf1 = vec![0u8; MAX_RTP_PACKET_SIZE + 100];
     let mut buf2 = vec![0u8; MAX_RTP_PACKET_SIZE + 100];
@@ -852,7 +860,6 @@ async fn rtp_input_redundant_loop(
                         chosen, pkt, &publisher, &stats, transcoder, post,
                     );
                 }
-                refresh_buffered_hitless_snapshot(&merger, &stats);
                 // Health-transition + SSRC-mismatch events. Fired only
                 // on edge transitions so the manager UI gets one event
                 // per state change rather than a per-tick storm.
@@ -970,22 +977,6 @@ fn emit_leg_health_event(
             "leg2_health": format!("{:?}", overall[1]),
         }),
     );
-}
-
-/// Refresh the per-flow `buffered_hitless` stats slot. Called on every
-/// drain firing — cheap (single write-lock + atomic snapshot) and gives
-/// the manager UI a 1-Hz-fresh view of path differential + per-leg
-/// health without polling.
-fn refresh_buffered_hitless_snapshot(
-    merger: &RedundantMerger,
-    stats: &FlowStatsAccumulator,
-) {
-    if let RedundantMerger::Buffered(m) = merger {
-        let snap = m.snapshot();
-        if let Ok(mut g) = stats.buffered_hitless_snapshot.write() {
-            *g = Some(snap);
-        }
-    }
 }
 
 /// Publish a packet emitted by the merger — handles bandwidth gating
