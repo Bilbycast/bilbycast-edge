@@ -1177,6 +1177,26 @@ impl TsDemuxer {
                 // path needs the AAC config to remain available for the
                 // frames it captured before the switch.
             }
+        } else if let Some(old) = self.audio_pid.take() {
+            // The program no longer carries audio this demuxer surfaces: let
+            // go of the track it was on, or `audio_track` goes on naming a
+            // PID the PMT has dropped (a consumer reports and expects that
+            // track) and its framer waits for bytes that never come. A later
+            // PMT bringing audio back is a new track (`audio_pid_changed`
+            // above). Its assembler goes too, unless the PID now carries the
+            // video, whose assembler took its place in the map above.
+            // `cached_aac_config` is kept for the export path, as on a codec
+            // change: no `Aac` frame leaves before its own ADTS header has
+            // refreshed it, so a returning track never runs on the old one.
+            tracing::info!(
+                "TS demux: audio PID 0x{:04X} is gone from the PMT; no audio track selected",
+                old
+            );
+            self.audio_au = None;
+            self.opus_channel_config = None;
+            if Some(old) != self.video_pid {
+                self.pes_assemblers.remove(&old);
+            }
         }
     }
 
@@ -2336,6 +2356,87 @@ mod tests {
         let encoded = [b0, b1, b2, b3, b4];
         let decoded = parse_pts(&encoded);
         assert_eq!(decoded, 90000);
+    }
+
+    // ── Audio removed from the PMT ──
+
+    /// The program's PMT at `version` on PID 0x100, PCR on the video PID
+    /// 0x200, carrying `es` (`(stream_type, pid)`).
+    fn pmt_packets(version: u8, es: &[(u8, u16)]) -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pmt_section};
+        let es: Vec<(u8, u16, &[u8])> = es.iter().map(|&(st, pid)| (st, pid, &[][..])).collect();
+        let sec = pmt_section(1, version, 0x200, &[], &es);
+        packetize_sections(0x100, &[&sec], version).concat()
+    }
+
+    /// Every `Aac` frame `ts` demuxes to, as `(pts, ES bytes)`.
+    fn aac_frames(demux: &mut TsDemuxer, ts: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        ts.chunks(TS_PACKET_SIZE)
+            .flat_map(|p| demux.demux(p))
+            .filter_map(|f| match f {
+                DemuxedFrame::Aac { data, pts } => Some((pts, data)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A PMT update that drops the program's audio lets go of the track:
+    /// the demuxer names no audio track, demuxes nothing more off the old
+    /// PID and holds none of its bytes, and a later PMT bringing audio back
+    /// is picked up afresh. It kept the old PID, its framer and its
+    /// assembler, so a consumer went on reporting and expecting a track the
+    /// PMT no longer carried, and the stale PID's packets were still
+    /// demuxed as that track.
+    #[test]
+    fn a_pmt_that_drops_the_audio_lets_go_of_the_track() {
+        const P0: u64 = 900_000;
+        let mut demux = TsDemuxer::new(None);
+        let mut cc = 0;
+        let mut ts = build_pat(0x100).to_vec();
+        ts.extend(pmt_packets(0, &[(0x1B, 0x200), (0x0F, 0x300)]));
+        ts.extend(audio_pes_packets(&adts(300, 0x11), P0, &mut cc));
+        assert_eq!(aac_frames(&mut demux, &ts).len(), 1);
+        assert_eq!(demux.audio_track(), Some((0x300, 0x0F)));
+
+        // The head of a frame is in the framer when the audio goes.
+        let head = audio_pes_packets(&adts(300, 0x22), P0 + 1920, &mut cc);
+        assert!(aac_frames(&mut demux, &head[..TS_PACKET_SIZE]).is_empty());
+        let frames = aac_frames(&mut demux, &pmt_packets(1, &[(0x1B, 0x200)]));
+        assert!(frames.is_empty());
+        assert_eq!(demux.audio_track(), None, "no audio track once the PMT drops it");
+        assert_eq!(demux.audio_pid(), None);
+        assert!(demux.audio_au.is_none(), "no framer held for the old PID");
+        assert!(!demux.pes_assemblers.contains_key(&0x300), "nor its assembler");
+
+        // Whatever still comes on the old PID is no audio track's.
+        let mut stale = head[TS_PACKET_SIZE..].to_vec();
+        stale.extend(audio_pes_packets(&adts(300, 0x33), P0 + 2 * 1920, &mut cc));
+        assert!(aac_frames(&mut demux, &stale).is_empty(), "nothing demuxed off the dropped PID");
+
+        // Audio back on the same PID: a new track, its first frame whole,
+        // nothing of the old one glued on.
+        let mut back = pmt_packets(2, &[(0x1B, 0x200), (0x0F, 0x300)]);
+        let tail = audio_pes_packets(&adts(300, 0x44), P0 + 3 * 1920, &mut cc);
+        back.extend_from_slice(&tail[TS_PACKET_SIZE..]);
+        back.extend(audio_pes_packets(&adts(320, 0x55), P0 + 4 * 1920, &mut cc));
+        let frames = aac_frames(&mut demux, &back);
+        assert_eq!(demux.audio_track(), Some((0x300, 0x0F)), "the returning audio is picked up");
+        assert_eq!(frames.len(), 1, "a PES's tail without its head is no frame: {frames:?}");
+        assert_eq!(frames[0], (P0 + 4 * 1920, adts(320, 0x55)[7..].to_vec()));
+    }
+
+    /// Audio dropped from a PMT that moves the video onto the old audio PID:
+    /// the video keeps the assembler it took the PID with.
+    #[test]
+    fn dropping_the_audio_keeps_a_video_moved_onto_its_pid() {
+        let mut demux = TsDemuxer::new(None);
+        let mut ts = build_pat(0x100).to_vec();
+        ts.extend(pmt_packets(0, &[(0x1B, 0x200), (0x0F, 0x300)]));
+        ts.extend(pmt_packets(1, &[(0x24, 0x300)]));
+        let _ = demux.demux(&ts);
+        assert_eq!(demux.audio_track(), None);
+        assert_eq!(demux.video_pid(), Some(0x300));
+        assert_eq!(demux.pes_assemblers.get(&0x300).map(|a| a.stream_type), Some(0x24));
     }
 
     // ── Audio AUs across PES boundaries ──

@@ -236,7 +236,12 @@ unpinned, whatever the pin said:
   AC-4 published silence. A pin is taken when it is a track the output can
   publish; otherwise — absent, not audio, or a codec the output cannot
   publish — the output takes the track it would take unpinned. A later PMT
-  that carries the pin moves the output back onto it.
+  that carries the pin moves the output back onto it. A PMT update that
+  drops every audio stream leaves the output on none: it stops demuxing
+  the old PID and holds nothing of it, and a later PMT bringing audio back
+  is selected afresh by the same rule. Until 2026-10 the shared demuxer
+  stayed on the dropped PID, so the output went on reporting and expecting
+  that track and demuxing whatever still came on the PID.
 - **HLS** (`audio_encode` remux): unpinned, the **last** audio stream it
   can decode, as before. A pin is taken when it is one it can decode;
   otherwise (absent, or AC-4 / DTS) the output falls back to that last
