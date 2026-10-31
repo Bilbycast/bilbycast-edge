@@ -1040,15 +1040,8 @@ pass with the master-clock work in.
   as PES PTS/DTS: on every learned PCR_PID it recomputes the value with
   `rewrite_pcr_value`, patches the six adaptation-field bytes in place
   (`write_pcr_field_in_packet`), sets DI=1 whenever it re-anchors, and
-  injects synthetic PCR_RR carrier packets whenever the gap to the next
-  source PCR exceeds 40 ms (a sparse-PCR source, or PCR-bearing datagrams
-  lost upstream): `ceil(gap / 40 ms) - 1` of them, their values evenly
-  spaced so no interval exceeds 40 ms, sent immediately ahead of that
-  source PCR, and none across a DI'd discontinuity — see "PCR
-  discontinuity bridging" above. (Up to 0.116.0 it injected
-  `floor(gap / 40 ms) - 1` at 40 ms steps, so any gap not a whole multiple
-  of 40 ms kept one interval of 40–80 ms: two lost datagrams of a 15 ms-PCR
-  source left 45 ms, with no padding at all, edge#214.) Source PCR bytes reach the wire
+  injects synthetic PCR_RR carrier packets on sparse-PCR sources — see
+  "PCR discontinuity bridging" above. Source PCR bytes reach the wire
   untouched under per-input `passthrough_clock: true` or on a `bonded`
   input, where the rewriter is not in the path at all; opting out to keep
   them therefore also opts out of PES PTS/DTS regeneration. That is the
