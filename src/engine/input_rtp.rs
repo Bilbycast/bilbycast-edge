@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::models::RtpInputConfig;
 use crate::fec::decoder::{is_fec_packet, FecDecoder};
 use crate::manager::events::{EventSender, EventSeverity, category};
-use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HitlessMerger};
+use crate::redundancy::merger::{ActiveLeg, BufferedHitlessMerger, HitlessMerger, LossCounts};
 
 /// Merger strategy for the 2022-7 redundant RTP path. The legacy bare
 /// path is kept as the default for backwards compatibility — operators
@@ -89,6 +89,22 @@ impl RedundantMerger {
     fn observe_ssrc(&mut self, leg: ActiveLeg, ssrc: u32, now: std::time::Instant) {
         if let Self::Buffered(m) = self {
             m.observe_ssrc(leg, ssrc, now);
+        }
+    }
+
+    /// Packets the pair lost since the merger was created
+    /// ([`LossCounts::lost`]): sequence numbers that left the gap-fill
+    /// window with neither leg having delivered them (both legs lost them),
+    /// counted as they leave it, the old window's unfilled ones at once when
+    /// the stream moves; and behind a hold, one a leg delivered only after
+    /// the hold had released past it, counted as it arrives. A jump of a
+    /// whole window or more is not counted: from the sequence numbers alone a
+    /// burst both legs lost cannot be told from a source restarting on a new
+    /// sequence, as a single-leg input does not count a gap of 1000 or more.
+    fn lost(&self) -> u64 {
+        match self {
+            Self::Bare { merger, .. } => LossCounts::lost(merger),
+            Self::Buffered(m) => LossCounts::lost(m),
         }
     }
 }
@@ -852,8 +868,20 @@ async fn rtp_input_redundant_loop(
         crate::redundancy::merger::LegHealth::Unknown,
     ];
     let mut prev_ssrc_mismatch: u64 = 0;
+    // What the pair lost is the input's sequence-gap loss (`packets_lost`),
+    // as a single-leg input's gaps are; a leg's own gaps are no loss while
+    // the other leg delivers, and no leg's are counted. Handed on by
+    // difference, once per wake-up: a compare, and an add only when the
+    // count moved. Until 2026-11 nothing was, so `packets_lost` read 0
+    // whatever the pair lost.
+    let mut handed_lost: u64 = 0;
 
     loop {
+        let lost = merger.lost();
+        if lost != handed_lost {
+            stats.input_loss.fetch_add(lost - handed_lost, Ordering::Relaxed);
+            handed_lost = lost;
+        }
         let drain_at = merger.next_deadline().unwrap_or(far_future);
         tokio::select! {
             biased;
@@ -1388,5 +1416,90 @@ mod tests {
         let seqs: Vec<u16> = published.iter().map(|(s, _)| *s).collect();
         assert_eq!(seqs, (1000..1016).collect::<Vec<_>>());
         assert_eq!(recovered, 1);
+    }
+
+    // ── SMPTE 2022-7: what the pair lost ────────────────────────────────
+
+    /// One RTP datagram of seq `seq` carrying a NULL packet.
+    fn null_datagram(seq: u16) -> Vec<u8> {
+        let mut dg = vec![0x80, 33, (seq >> 8) as u8, seq as u8, 0, 0, 0x10, 0, 0x5E, 0xED, 0x00, 0x07];
+        dg.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+        dg.resize(12 + 188, 0xFF);
+        dg
+    }
+
+    /// A 2022-7 RTP input, bare and with a hold, over loopback: a packet
+    /// both legs lost reaches `packets_lost` once, a packet one leg lost
+    /// counts nothing, and with a hold the count is the merger's `gap_lost`,
+    /// a gap fill that came after the hold had released past it included
+    /// (the bare merger forwards that one late). It read 0 whatever the pair
+    /// lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redundant_input_counts_what_the_pair_lost() {
+        for hold in [None, Some(20u32)] {
+            let port = || std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+            let (leg1, leg2) = (port(), port());
+            let mut redundancy = serde_json::json!({ "bind_addr": leg2.to_string() });
+            if let Some(ms) = hold {
+                redundancy["path_differential_ms"] = ms.into();
+            }
+            let config: RtpInputConfig = serde_json::from_value(serde_json::json!({
+                "bind_addr": leg1.to_string(),
+                "redundancy": redundancy,
+            }))
+            .unwrap();
+            let (tx, _rx) = broadcast::channel(4096);
+            let stats = Arc::new(FlowStatsAccumulator::new("f".into(), "flow".into(), "rtp".into()));
+            let cancel = CancellationToken::new();
+            let (events, _events_rx) = crate::manager::events::event_channel();
+            let task = spawn_rtp_input(
+                config,
+                tx,
+                stats.clone(),
+                cancel.clone(),
+                events,
+                "f".into(),
+                "in".into(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // Past 102, more than the merger's 1024-seq window, so the seqs
+            // both legs lost have left it.
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            for seq in 0..1300u16 {
+                let dg = null_datagram(seq);
+                if ![100, 101, 102, 200, 400].contains(&seq) {
+                    sender.send_to(&dg, leg1).unwrap();
+                }
+                if ![100, 101, 102, 300, 400].contains(&seq) {
+                    sender.send_to(&dg, leg2).unwrap();
+                }
+                if seq == 450 {
+                    // 400 on leg 2 alone, well past the hold, within the
+                    // window.
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    sender.send_to(&null_datagram(400), leg2).unwrap();
+                }
+                if seq % 10 == 9 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+            let (lost, published) = if hold.is_some() { (4, 1296) } else { (3, 1297) };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while stats.input_loss.load(Ordering::Relaxed) < lost && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert_eq!(stats.input_loss.load(Ordering::Relaxed), lost, "hold {hold:?}: 100-102 once, 200 and 300 not");
+            assert_eq!(stats.input_packets.load(Ordering::Relaxed), published, "hold {hold:?}");
+            if hold.is_some() {
+                let held = stats.buffered_hitless_stats.get("in").expect("the merger's stats").clone();
+                assert_eq!(held.gap_lost.load(Ordering::Relaxed), lost, "the merger's own count");
+            }
+            cancel.cancel();
+            let _ = task.await;
+        }
     }
 }
