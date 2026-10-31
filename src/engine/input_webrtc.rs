@@ -1882,6 +1882,18 @@ mod tests {
     /// 20 ms Opus frame every 20 ms — for `for_ms`.
     #[cfg(feature = "webrtc")]
     async fn serve_whep(edit: fn(String) -> String, send: (bool, bool), for_ms: u64) -> WhepServer {
+        serve_whep_sending(edit, send, for_ms, None).await
+    }
+
+    /// [`serve_whep`] sending `opus` (real Opus packets, in turn) as its
+    /// audio, where the placeholder is a TOC 0xFC and 79 bytes of it.
+    #[cfg(feature = "webrtc")]
+    async fn serve_whep_sending(
+        edit: fn(String) -> String,
+        send: (bool, bool),
+        for_ms: u64,
+        opus: Option<Arc<Vec<Vec<u8>>>>,
+    ) -> WhepServer {
         use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
         use axum::http::{StatusCode, header};
         use std::sync::atomic::Ordering;
@@ -1920,6 +1932,7 @@ mod tests {
                     };
                     let mut server = WebrtcSession::new(&config).await.unwrap();
                     let answer = edit(server.accept_offer(&offer).unwrap());
+                    let opus = opus.clone();
                     tokio::spawn(async move {
                         let cancel = CancellationToken::new();
                         let connected = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1941,7 +1954,8 @@ mod tests {
                         for k in 0..for_ms / 20 {
                             if let (true, Some((mid, pt))) = (send.1, audio) {
                                 let at = MediaTime::new(k * 960, Frequency::FORTY_EIGHT_KHZ);
-                                let _ = server.write_media(mid, pt, Instant::now(), at, &[0xFC; 80]);
+                                let packet = opus.as_ref().map(|p| &p[k as usize % p.len()][..]);
+                                let _ = server.write_media(mid, pt, Instant::now(), at, packet.unwrap_or(&[0xFC; 80]));
                                 server.drain_outputs().await;
                             }
                             if let (true, 0, Some((mid, pt))) = (send.0, k % 2, video) {
@@ -1977,11 +1991,25 @@ mod tests {
         addr: std::net::SocketAddr,
         run_ms: u64,
     ) -> (Vec<bytes::Bytes>, Vec<crate::manager::events::Event>) {
+        pull_whep_with(addr, run_ms, serde_json::json!({})).await
+    }
+
+    /// [`pull_whep`] with more of the input's configuration (`extra`), its
+    /// ingress transcode built from it as `spawn_whep_input` builds it.
+    #[cfg(feature = "webrtc")]
+    async fn pull_whep_with(
+        addr: std::net::SocketAddr,
+        run_ms: u64,
+        extra: serde_json::Value,
+    ) -> (Vec<bytes::Bytes>, Vec<crate::manager::events::Event>) {
         use std::time::Duration;
         use tokio_util::sync::CancellationToken;
 
-        let config: crate::config::models::WhepInputConfig =
-            serde_json::from_value(serde_json::json!({ "whep_url": format!("http://{addr}/whep") }))
+        let mut json = serde_json::json!({ "whep_url": format!("http://{addr}/whep") });
+        json.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
+        let config: crate::config::models::WhepInputConfig = serde_json::from_value(json).unwrap();
+        let transcoder =
+            super::InputTranscoder::new(config.audio_encode.as_ref(), config.transcode.as_ref(), None, None)
                 .unwrap();
         let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(16_384);
         let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
@@ -1994,7 +2022,7 @@ mod tests {
         let task = tokio::spawn({
             let cancel = cancel.clone();
             async move {
-                let (mut transcoder, mut post) = (None, None);
+                let (mut transcoder, mut post) = (transcoder, None);
                 super::whep_input_loop(
                     config, broadcast_tx, stats, cancel, &events, "flow-w", &mut transcoder, &mut post,
                 )
@@ -2031,6 +2059,44 @@ mod tests {
         let (_, pcr_pid, es) = pmts_of(&ts).pop().expect("a PMT");
         assert_eq!((pcr_pid, es), (0x0101, vec![(0x06, 0x0101)]));
         assert_eq!(pcr_pids_of(&ts), vec![0x0101]);
+    }
+
+    /// The whole chain: a WHEP pull of Opus through an ingress
+    /// `audio_encode` (AAC-LC) publishes AAC — the PMT names it on the
+    /// audio PID, no longer the Opus, and the audio PES carry ADTS. The TS
+    /// audio replacer refused Opus as a source, so a WebRTC input's
+    /// `audio_encode` re-encoded nothing and its Opus passed through, the
+    /// engage watchdog saying `codec_not_replaceable`.
+    #[cfg(all(feature = "webrtc", feature = "media-codecs", feature = "fdk-aac"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_whep_pull_of_opus_is_re_encoded_by_an_ingress_audio_encode() {
+        // Real Opus (the input passes it to libavcodec): a second of a tone.
+        let mut enc = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
+            codec: video_codec::AudioCodecType::Opus,
+            sample_rate: 48_000,
+            channels: 2,
+            bitrate_kbps: 96,
+        })
+        .unwrap();
+        let tone: Vec<f32> = (0..960).map(|k| 0.3 * (k as f32 * 0.13).sin()).collect();
+        let packets: Vec<Vec<u8>> = (0..150)
+            .flat_map(|_| enc.encode_frame(&[tone.clone(), tone.clone()]).unwrap())
+            .map(|f| f.data.to_vec())
+            .collect();
+        assert!(packets.len() >= 100);
+        let server = serve_whep_sending(|a| a, (false, true), 3_000, Some(Arc::new(packets))).await;
+        let (ts, _) = pull_whep_with(server.addr, 4_000, serde_json::json!({ "audio_encode": { "codec": "aac_lc" } })).await;
+        server.task.abort();
+        let (_, _, es) = pmts_of(&ts).pop().expect("a PMT");
+        assert_eq!(es, vec![(0x0F, 0x0101)], "AAC on the audio PID");
+        let adts = ts.iter().any(|p| {
+            (p[1] & 0x40) != 0
+                && crate::engine::ts_parse::ts_pid(p) == 0x0101
+                && crate::engine::ts_parse::pes_payload_offset(p)
+                    .is_some_and(|es| p[es] == 0xFF && p[es + 1] & 0xF6 == 0xF0)
+        });
+        assert!(adts, "no ADTS on the audio PID ({} packets)", ts.len());
+        assert!(!carries_opus(&ts), "the Opus passed through");
     }
 
     /// An A/V pull publishes both tracks: the PMT lists the H.264 and the

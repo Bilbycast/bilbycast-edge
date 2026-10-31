@@ -62,6 +62,12 @@ pub enum AuFormat {
     Mpa,
     /// AC-3 (0x80 / 0x81 / 0xC1) and E-AC-3 (0x87 / 0xC2).
     Ac3,
+    /// Opus in MPEG-TS (stream_type 0x06 with the "Opus" registration
+    /// descriptor): each access unit opens with the Opus-in-TS control
+    /// header. Not reached through [`Self::for_stream_type`] — a raw 0x06 is
+    /// any private stream (teletext, subtitles, AC-3 the descriptors did not
+    /// resolve) — but by a caller that read the registration descriptor.
+    Opus,
 }
 
 impl AuFormat {
@@ -114,7 +120,98 @@ pub fn parse_header(fmt: AuFormat, buf: &[u8]) -> Head {
         AuFormat::Loas => loas_header(buf),
         AuFormat::Mpa => mpa_header(buf),
         AuFormat::Ac3 => ac3_header(buf),
+        AuFormat::Opus => opus_header(buf),
     }
+}
+
+/// Opus-in-MPEG-TS access unit: the control header — an 11-bit prefix
+/// `0x3FF` (the bytes `0x7F 0b111…`; an edge's own muxer wrote `0xFF` there
+/// until 2026-09, which `audio_decode::split_opus_frames` takes too), the
+/// `start_trim` / `end_trim` / `control_extension` flags and two reserved
+/// zero bits, the extensible `au_size`, then the optional fields the flags
+/// announce, outside `au_size` — and the Opus packet. Every AU of a stream
+/// shares one key: an Opus encoder switches mode, bandwidth and frame size
+/// packet to packet, and none of it makes the next AU another stream's. The
+/// duration comes from the packet's TOC (RFC 6716 §3.1), at the 48 kHz Opus
+/// always decodes to.
+fn opus_header(buf: &[u8]) -> Head {
+    if let Some(&b0) = buf.first()
+        && !matches!(b0, 0x7F | 0xFF)
+    {
+        return Head::Invalid;
+    }
+    if let Some(&b1) = buf.get(1)
+        && (b1 & 0xE3) != 0xE0
+    {
+        return Head::Invalid;
+    }
+    if buf.len() < 3 {
+        return Head::NeedMore;
+    }
+    let flags = buf[1];
+    let mut pos = 2;
+    let mut au_size = 0usize;
+    loop {
+        let Some(&b) = buf.get(pos) else {
+            return Head::NeedMore;
+        };
+        pos += 1;
+        au_size += b as usize;
+        if b != 0xFF {
+            break;
+        }
+        if au_size > MAX_BUFFERED {
+            return Head::Invalid;
+        }
+    }
+    if flags & 0x10 != 0 {
+        pos += 2;
+    }
+    if flags & 0x08 != 0 {
+        pos += 2;
+    }
+    if flags & 0x04 != 0 {
+        let Some(&ext_len) = buf.get(pos) else {
+            return Head::NeedMore;
+        };
+        pos += 1 + ext_len as usize;
+    }
+    if au_size == 0 {
+        return Head::Invalid;
+    }
+    // The TOC, and a code-3 packet's frame count after it.
+    let Some(toc) = buf.get(pos..pos + au_size.min(2)) else {
+        return Head::NeedMore;
+    };
+    let Some(samples) = opus_packet_samples(toc) else {
+        return Head::Invalid;
+    };
+    Head::Valid(AuHeader { len: pos + au_size, key: 0, samples, sample_rate: 48_000 })
+}
+
+/// The duration of an Opus packet in 48 kHz samples, from its TOC byte
+/// (RFC 6716 §3.1) and, for a code-3 packet, its frame-count byte
+/// (§3.2.5). `None` for a packet that has no duration: empty, a code-3
+/// packet without its count byte or with no frames, or longer than the
+/// 120 ms a packet may hold.
+pub fn opus_packet_samples(packet: &[u8]) -> Option<u32> {
+    let toc = *packet.first()?;
+    let config = toc >> 3;
+    let frame: u32 = match config {
+        // SILK-only: 10 / 20 / 40 / 60 ms.
+        0..=11 => [480, 960, 1920, 2880][usize::from(config & 3)],
+        // Hybrid: 10 / 20 ms.
+        12..=15 => [480, 960][usize::from(config & 1)],
+        // CELT-only: 2.5 / 5 / 10 / 20 ms.
+        _ => [120, 240, 480, 960][usize::from(config & 3)],
+    };
+    let frames: u32 = match toc & 3 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => u32::from(*packet.get(1)? & 0x3F),
+    };
+    let samples = frame * frames;
+    (frames > 0 && samples <= 5_760).then_some(samples)
 }
 
 /// ADTS (ISO/IEC 14496-3 §1.A.2.2): 12-bit sync, layer `00`.
@@ -824,6 +921,73 @@ mod tests {
         assert!(matches!(parse_header(AuFormat::Ac3, &dep), Head::Valid(h) if h.len == 768 && h.samples == 0));
         let loas = [0x56, 0xE0 | 0x01, 0x00];
         assert!(matches!(parse_header(AuFormat::Loas, &loas), Head::Valid(h) if h.len == 3 + 256));
+    }
+
+    /// An Opus-in-TS access unit: the control header with its optional
+    /// fields (outside `au_size`), and the packet's duration from its TOC.
+    #[test]
+    fn parses_opus_access_units() {
+        // 20 ms CELT FB (TOC 0xFC), 80 bytes: header 0x7F 0xE0, au_size 80.
+        let mut au = vec![0x7F, 0xE0, 80];
+        au.extend_from_slice(&[0xFC; 80]);
+        assert_eq!(
+            parse_header(AuFormat::Opus, &au),
+            Head::Valid(AuHeader { len: 83, key: 0, samples: 960, sample_rate: 48_000 })
+        );
+        // The older edge muxer's prefix, 0xFF 0xE0, is taken too.
+        au[0] = 0xFF;
+        assert!(matches!(parse_header(AuFormat::Opus, &au), Head::Valid(h) if h.len == 83));
+        // start_trim + end_trim + a 1-byte control extension, then a
+        // 300-byte code-3 packet of three 20 ms frames (au_size 255 + 45).
+        let mut au = vec![0x7F, 0xE0 | 0x10 | 0x08 | 0x04, 0xFF, 45, 0x01, 0x38, 0, 0, 1, 0xAA];
+        au.extend_from_slice(&[0xFF, 0x03]);
+        au.extend_from_slice(&[0x55; 298]);
+        assert_eq!(
+            parse_header(AuFormat::Opus, &au),
+            Head::Valid(AuHeader { len: 10 + 300, key: 0, samples: 2_880, sample_rate: 48_000 })
+        );
+        assert_eq!(parse_header(AuFormat::Opus, &au[..8]), Head::NeedMore, "the extension length");
+        assert_eq!(parse_header(AuFormat::Opus, &au[..11]), Head::NeedMore, "the frame count");
+        // Not a control header: another prefix, a reserved bit set, an
+        // empty packet, a code-3 packet with no frames.
+        assert_eq!(parse_header(AuFormat::Opus, &[0x7E, 0xE0, 1, 0xFC]), Head::Invalid);
+        assert_eq!(parse_header(AuFormat::Opus, &[0x7F, 0xE1, 1, 0xFC]), Head::Invalid);
+        assert_eq!(parse_header(AuFormat::Opus, &[0x7F, 0xE0, 0]), Head::Invalid);
+        assert_eq!(parse_header(AuFormat::Opus, &[0x7F, 0xE0, 2, 0xFF, 0x00]), Head::Invalid);
+    }
+
+    /// Opus access units are cut whole across PES boundaries, each with its
+    /// duration, a PES's PTS going to the first AU that commences in it —
+    /// several to a PES (ffmpeg packs up to 120 ms) or one (an edge's own
+    /// muxer).
+    #[test]
+    fn opus_access_units_are_cut_across_pes() {
+        let au = |fill: u8, len: usize| {
+            let mut a = vec![0x7F, 0xE0, len as u8];
+            a.push(0xFC);
+            a.extend(std::iter::repeat_n(fill, len - 1));
+            a
+        };
+        let aus: Vec<Vec<u8>> = (0..6u8).map(|k| au(k, 100 + k as usize * 20)).collect();
+        // Three to a PES, the third AU's tail in the next PES.
+        let first: Vec<u8> = aus[..3].concat();
+        let second: Vec<u8> = aus[3..].concat();
+        let cut = first.len() - 30;
+        let (a, tail) = first.split_at(cut);
+        let mut c = AuCutter::new(AuFormat::Opus);
+        let mut out = feed(&mut c, &pes(a, Some(90_000)));
+        out.extend(feed(&mut c, &pes(&[tail, &second[..]].concat(), Some(90_000 + 3 * 1_800))));
+        out.extend(std::iter::from_fn(|| c.next(true)));
+        let got: Vec<(&[u8], bool, Option<u64>, u32)> =
+            out.iter().map(|a| (&a.data[..], a.pes_start, a.pts, a.header.samples)).collect();
+        assert_eq!(got.len(), 6, "{got:?}");
+        for (k, (data, _, _, samples)) in got.iter().enumerate() {
+            assert_eq!(*data, &aus[k][..], "AU {k}");
+            assert_eq!(*samples, 960);
+        }
+        assert_eq!((got[0].1, got[0].2), (true, Some(90_000)));
+        assert_eq!((got[3].1, got[3].2), (true, Some(90_000 + 3 * 1_800)), "the next PES's first AU");
+        assert!(!got[1].1 && !got[2].1 && !got[4].1);
     }
 
     /// `frame` with its ADTS frame_length set to `len`.

@@ -51,30 +51,9 @@ pub fn describe(channel_config_code: u8) -> String {
     }
 }
 
-/// The duration of an Opus packet in 48 kHz samples, from its TOC byte
-/// (RFC 6716 §3.1) and, for a code-3 packet, its frame-count byte
-/// (§3.2.5). `None` for a packet that has no duration: empty, a code-3
-/// packet without its count byte or with no frames, or longer than the
-/// 120 ms a packet may hold.
-pub fn packet_samples(packet: &[u8]) -> Option<u32> {
-    let toc = *packet.first()?;
-    let config = toc >> 3;
-    let frame: u32 = match config {
-        // SILK-only: 10 / 20 / 40 / 60 ms.
-        0..=11 => [480, 960, 1920, 2880][usize::from(config & 3)],
-        // Hybrid: 10 / 20 ms.
-        12..=15 => [480, 960][usize::from(config & 1)],
-        // CELT-only: 2.5 / 5 / 10 / 20 ms.
-        _ => [120, 240, 480, 960][usize::from(config & 3)],
-    };
-    let frames: u32 = match toc & 3 {
-        0 => 1,
-        1 | 2 => 2,
-        _ => u32::from(*packet.get(1)? & 0x3F),
-    };
-    let samples = frame * frames;
-    (frames > 0 && samples <= 5_760).then_some(samples)
-}
+/// The duration of an Opus packet in 48 kHz samples, from its TOC — shared
+/// with the TS audio replacer's Opus access-unit cutter (`audio_au`).
+pub use crate::engine::audio_au::opus_packet_samples as packet_samples;
 
 /// The 48 kHz RTP timeline of one WebRTC session's Opus passthrough.
 ///

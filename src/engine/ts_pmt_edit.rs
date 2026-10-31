@@ -286,7 +286,9 @@ const DVB_AC3_DESCRIPTOR: [u8; 3] = [0x6A, 0x01, 0x00];
 /// the rewriter and the classifier cannot drift: 0x03, 0x6A, 0x7A, 0x7B,
 /// 0x7C, 0x7F ext {0x0E DTS-HD, 0x0F DTS Neural, 0x15 AC-4, 0x21 DTS-UHD},
 /// ATSC 0x81 / 0xCC / 0xAC (unless a private_data_specifier governs them),
-/// and any 0x05 registration whose identifier is not the target's.
+/// and any 0x05 registration whose identifier is not the target's — plus,
+/// beside an "Opus" registration, the Opus extension descriptor (0x7F ext
+/// 0x80, its `channel_config_code`), which describes only that Opus.
 /// Per target: AAC normalises a 0x7C to `7C 01 FE` (never adds one); MP2
 /// keeps a 0x03 rewritten to `03 01 67` (`03 01 27` for LSF); AC-3 always
 /// carries the "AC-3" registration and, DVB-flavoured, `6A 01 00`.
@@ -294,6 +296,7 @@ fn audio_descriptors(src: &[u8], target: AudioTarget, with_additions: bool) -> V
     let mut out = Vec::with_capacity(src.len() + 9);
     let mut pds = false;
     let mut has_ac3_reg = false;
+    let opus = descriptors(src).any(|(tag, body)| tag == 0x05 && body.starts_with(b"Opus"));
     for (tag, body) in descriptors(src) {
         match tag {
             0x5F => {
@@ -312,6 +315,7 @@ fn audio_descriptors(src: &[u8], target: AudioTarget, with_additions: bool) -> V
                 }
             }
             0x7F if body.first().is_some_and(|e| matches!(e, 0x0E | 0x0F | 0x15 | 0x21)) => {}
+            0x7F if opus && body.first() == Some(&0x80) => {}
             0x05 => {
                 if matches!(target, AudioTarget::Ac3 { .. }) && body.starts_with(b"AC-3") {
                     has_ac3_reg = true;
