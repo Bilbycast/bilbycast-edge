@@ -6717,6 +6717,36 @@ pub(super) mod flv_wire_tests {
         let run = (0..n).find(|&i0| bodies.iter().enumerate().all(|(i, b)| *b == &frames[(i0 + i) % n][7..]));
         assert!(run.is_some(), "the tags are not a run of the source's frames less their header");
     }
+
+    // ── edge#210 bench: an MPTS whose first audio track is AC-4 ───────────
+
+    /// A program whose first audio track is AC-4 and second AAC (the shape
+    /// of the TNT program 2305 bench capture: AC-4, then E-AC-3), with no
+    /// pin: the publish carries the AAC, each tag a source frame less its
+    /// ADTS header. It used to take the AC-4, which RTMP cannot carry, and
+    /// publish no audio at all.
+    #[tokio::test]
+    async fn unpinned_an_ac4_first_track_publishes_the_aac_behind_it() {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pes_packets, pmt_section};
+        let ac4: &[u8] = &[0xAC, 0x03, 0x00, 0x00, 0x00];
+        let pmt = pmt_section(1, 0, 0x100, &[], &[(0x1B, 0x100, &[]), (0x06, 0x300, ac4), (0x0F, 0x301, &[])]);
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], 0)[0]);
+        let frames = adts_frames();
+        let (mut ac4_cc, mut aac_cc) = (0u8, 0u8);
+        for (j, frame) in frames.iter().take(20).enumerate() {
+            let pts = T0 + j as u64 * 1_920;
+            ts.extend(pes_packets(0x300, 0xBD, &[0xAC, 0x40, 0x00, 0x10], pts, &mut ac4_cc));
+            ts.extend(pes_packets(0x301, 0xC0, frame, pts, &mut aac_cc));
+        }
+        let tags = publish(ts.chunks(188).map(Bytes::copy_from_slice).collect(), passthrough_output()).await;
+        let audio: Vec<&WireTag> = tags.iter().filter(|t| !t.video).collect();
+        assert!(!audio.is_empty(), "no audio published");
+        assert_eq!(audio[0].data[..], [0xAF, 0x00, 0x11, 0x90], "AAC-LC, 48 kHz, stereo");
+        let bodies: Vec<&[u8]> = audio[1..].iter().map(|t| &t.data[2..]).collect();
+        assert!(bodies.len() >= 19, "{} AAC frames", bodies.len());
+        assert!(bodies.iter().zip(&frames).all(|(b, f)| *b == &f[7..]), "the AAC track's frames, in order");
+    }
 }
 
 #[cfg(test)]
@@ -7444,10 +7474,11 @@ pub(crate) mod tests {
     const AC4: &[u8] = &[0xAC, 0x03, 0x00, 0x00, 0x00];
 
     /// An MPTS whose first audio track is AC-4 used to publish no audio and
-    /// say nothing. The output now raises `audio_codec_unpublishable`, naming
-    /// the PID and codec, once per episode: not again while it stays there,
-    /// and again after a PMT update has put it on audio it can publish and
-    /// another has taken it back.
+    /// say nothing. Unpinned, the output now takes the first track it can
+    /// publish behind it; on a program with none, it raises
+    /// `audio_codec_unpublishable`, naming the PID and codec, once per
+    /// episode: not again while it stays there, and again after a PMT update
+    /// has put it on audio it can publish and another has taken it back.
     #[test]
     fn an_unpublishable_audio_track_is_reported_once_per_episode() {
         let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
@@ -7462,6 +7493,11 @@ pub(crate) mod tests {
         assert!(raised(&mut rx).is_empty(), "no PMT yet");
 
         demux.demux(&audio_psi(0, &[(0x06, 0x300, AC4), (0x0F, 0x301, &[])]));
+        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
+        assert_eq!(demux.audio_track(), Some((0x301, 0x0F)), "the AAC behind the AC-4");
+        assert!(raised(&mut rx).is_empty(), "AAC publishes");
+
+        demux.demux(&audio_psi(1, &[(0x06, 0x300, AC4)]));
         poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         let ev = rx.try_recv().expect("one Warning");
         assert_eq!(ev.severity, EventSeverity::Warning);
@@ -7480,16 +7516,16 @@ pub(crate) mod tests {
         }
         assert!(raised(&mut rx).is_empty(), "once per episode");
 
-        demux.demux(&audio_psi(1, &[(0x0F, 0x301, &[])]));
+        demux.demux(&audio_psi(2, &[(0x06, 0x300, AC4), (0x0F, 0x301, &[])]));
         poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         assert!(raised(&mut rx).is_empty(), "AAC publishes");
 
-        demux.demux(&audio_psi(2, &[(0x06, 0x300, AC4), (0x0F, 0x301, &[])]));
+        demux.demux(&audio_psi(3, &[(0x06, 0x300, AC4)]));
         poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         assert_eq!(raised(&mut rx), ["audio_codec_unpublishable"], "a new episode");
 
         // Opus-in-TS: no decode path on RTMP, whatever `audio_encode` says.
-        demux.demux(&audio_psi(3, &[(0x06, 0x302, &[0x05, 0x04, b'O', b'p', b'u', b's'])]));
+        demux.demux(&audio_psi(4, &[(0x06, 0x302, &[0x05, 0x04, b'O', b'p', b'u', b's'])]));
         poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
         assert_eq!(raised(&mut rx), ["audio_codec_unpublishable"], "Opus");
     }
@@ -7526,8 +7562,10 @@ pub(crate) mod tests {
     }
 
     /// A pin on a program with nothing RTMP can publish (AC-4 and Opus)
-    /// falls back to the first audio track and says both things: the pin
-    /// was not taken, and the track it is on publishes no audio.
+    /// lands where it would unpinned, on the first audio track. When that
+    /// is not the pin, the output says both things: the pin was not taken,
+    /// and the track it is on publishes no audio. When it is the pin, the
+    /// output is on its pin and says only the second.
     #[test]
     fn a_pin_on_a_program_rtmp_cannot_publish_says_both() {
         let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
@@ -7535,13 +7573,23 @@ pub(crate) mod tests {
         }))
         .unwrap();
         let opus: &[u8] = &[0x05, 0x04, b'O', b'p', b'u', b's'];
+        let psi = audio_psi(0, &[(0x06, 0x300, AC4), (0x06, 0x302, opus)]);
         let (events, mut rx) = crate::manager::events::event_channel();
-        let mut watch = AudioTrackWatch::new(Some(0x302), aac_output_can_publish);
-        let mut demux = TsDemuxer::with_audio_pid(None, Some(0x302), aac_output_can_publish);
-        demux.demux(&audio_psi(0, &[(0x06, 0x300, AC4), (0x06, 0x302, opus)]));
-        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
-        poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
-        assert_eq!(demux.audio_track(), Some((0x300, crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4)));
-        assert_eq!(raised(&mut rx), ["audio_source_pid_not_found", "audio_codec_unpublishable"]);
+        for (pin, expected) in [
+            (0x302, &["audio_source_pid_not_found", "audio_codec_unpublishable"][..]),
+            (0x300, &["audio_codec_unpublishable"][..]),
+        ] {
+            let mut watch = AudioTrackWatch::new(Some(pin), aac_output_can_publish);
+            let mut demux = TsDemuxer::with_audio_pid(None, Some(pin), aac_output_can_publish);
+            demux.demux(&psi);
+            poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
+            poll_audio_track(&mut watch, &demux, &cfg, "f", &events);
+            assert_eq!(
+                demux.audio_track(),
+                Some((0x300, crate::engine::ts_demux::SYNTHETIC_STREAM_TYPE_AC4)),
+                "pin {pin:#05x}"
+            );
+            assert_eq!(raised(&mut rx), expected, "pin {pin:#05x}");
+        }
     }
 }

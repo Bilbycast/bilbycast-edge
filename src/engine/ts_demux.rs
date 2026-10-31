@@ -419,8 +419,10 @@ pub struct TsDemuxer {
     /// `audio_track_index`.
     audio_pid_pin: Option<u16>,
     /// Which audio tracks, by the stream type [`Self::audio_track`] reports,
-    /// the consumer can publish. Consulted only under `audio_pid_pin`, so a
-    /// pin never lands the consumer on a track it would have to drop.
+    /// the consumer can publish ([`Self::with_audio_pid`]; every track for
+    /// the other constructors). Selection without an `audio_track_index`
+    /// prefers these, so the consumer is not left on a track it would have
+    /// to drop while the program carries one it can publish.
     audio_usable: fn(u8) -> bool,
     /// PMT PID we're locked onto (set after the first PAT is parsed).
     selected_pmt_pid: Option<u16>,
@@ -572,16 +574,19 @@ impl TsDemuxer {
     /// says which audio stream types (as [`Self::audio_track`] reports them)
     /// the output can publish.
     ///
-    /// - `None` — the first audio track, as [`Self::new`], whatever its
-    ///   codec; `usable` is not consulted.
+    /// - `None` — the first audio track `usable` accepts, and the first
+    ///   audio track when it accepts none (where [`Self::new`] takes the
+    ///   first audio track whatever its codec). That is the replacers'
+    ///   unpinned rule — `ts_audio_replace::select_audio_es` locks only onto
+    ///   audio it can decode — so an MPTS whose first audio track is AC-4
+    ///   publishes the E-AC-3 behind it rather than silence.
     /// - `Some(pid)` — the track on `pid` when the program's PMT carries it
     ///   as audio `usable` accepts. Otherwise (the PID is missing, is not
-    ///   audio, or is a codec the output cannot publish) the first audio
-    ///   track `usable` accepts, and the first audio track when it accepts
-    ///   none. That is how `ts_audio_replace::select_audio_es` treats a pin,
-    ///   so an output never trades a track it could publish for one it
-    ///   cannot. The consumer compares [`Self::audio_track`] with its pin to
-    ///   tell the operator (`audio_source_pid_not_found`). A later PMT that
+    ///   audio, or is a codec the output cannot publish) the track `None`
+    ///   would take. That is how `select_audio_es` treats a pin, so an
+    ///   output never trades a track it could publish for one it cannot.
+    ///   The consumer compares [`Self::audio_track`] with its pin to tell
+    ///   the operator (`audio_source_pid_not_found`). A later PMT that
     ///   carries the pin moves back onto it.
     pub fn with_audio_pid(
         target_program: Option<u16>,
@@ -1075,21 +1080,19 @@ impl TsDemuxer {
             pos += 5 + es_info_length;
         }
 
-        // Select the audio track: under a pin, the pinned PID when it is
-        // audio the consumer can use, else the first it can use, else the
-        // first; unpinned, by audio_track_index.
+        // Select the audio track: the pinned PID when it is audio the
+        // consumer can use; by audio_track_index when one was asked for;
+        // else the first track the consumer can use, else the first.
         if !audio_tracks.is_empty() {
             let usable = self.audio_usable;
-            let idx = match self.audio_pid_pin {
-                Some(pin) => audio_tracks
+            let first_usable = || audio_tracks.iter().position(|&(_, st)| usable(st)).unwrap_or(0);
+            let idx = match (self.audio_pid_pin, self.audio_track_index) {
+                (Some(pin), _) => audio_tracks
                     .iter()
                     .position(|&(pid, st)| pid == pin && usable(st))
-                    .or_else(|| audio_tracks.iter().position(|&(_, st)| usable(st)))
-                    .unwrap_or(0),
-                None => self
-                    .audio_track_index
-                    .map(|i| (i as usize).min(audio_tracks.len() - 1))
-                    .unwrap_or(0),
+                    .unwrap_or_else(first_usable),
+                (None, Some(i)) => (i as usize).min(audio_tracks.len() - 1),
+                (None, None) => first_usable(),
             };
             let (selected_pid, selected_type) = audio_tracks[idx];
             let opus_code = opus_codes
@@ -2474,20 +2477,12 @@ mod tests {
         !matches!(stream_type, SYNTHETIC_STREAM_TYPE_AC4 | STREAM_TYPE_PRIVATE)
     }
 
-    /// An MPTS-style program whose first audio track is AC-4: unpinned, the
-    /// demuxer takes the AC-4; pinned (`audio_encode.source_audio_pid`), it
-    /// takes the pinned E-AC-3 instead, wherever it sits in the PMT.
+    /// A pinned audio PID (`audio_encode.source_audio_pid`) is taken
+    /// wherever it sits in the PMT, over the track the demuxer would take
+    /// unpinned.
     #[test]
     fn a_pinned_audio_pid_is_taken_over_the_first_track() {
         let ts = pinned_audio_psi(0, &[(0x06, 0x300, AC4), (0x87, 0x301, &[]), (0x0F, 0x302, &[])]);
-
-        let mut demux = TsDemuxer::new(None);
-        demux.demux(&ts);
-        assert_eq!(demux.audio_track(), Some((0x300, SYNTHETIC_STREAM_TYPE_AC4)));
-
-        let mut demux = TsDemuxer::with_audio_pid(None, None, not_ac4_or_opus);
-        demux.demux(&ts);
-        assert_eq!(demux.audio_track(), Some((0x300, SYNTHETIC_STREAM_TYPE_AC4)), "unpinned: as new()");
 
         let mut demux = TsDemuxer::with_audio_pid(None, Some(0x301), not_ac4_or_opus);
         demux.demux(&ts);
@@ -2496,6 +2491,50 @@ mod tests {
         let mut demux = TsDemuxer::with_audio_pid(None, Some(0x302), not_ac4_or_opus);
         demux.demux(&ts);
         assert_eq!(demux.audio_track(), Some((0x302, 0x0F)));
+    }
+
+    /// Unpinned, a consumer that says what it can publish gets the first
+    /// such track — an MPTS whose first audio track is AC-4 (the TNT
+    /// program 2305 bench capture: AC-4, then E-AC-3) is published from its
+    /// E-AC-3, where the demuxer used to take the AC-4 and publish silence —
+    /// and the first audio track only when it can publish none. A PMT update
+    /// that brings a track it can publish moves it there.
+    #[test]
+    fn unpinned_the_first_track_the_consumer_can_publish_is_taken() {
+        let mut demux = TsDemuxer::with_audio_pid(None, None, not_ac4_or_opus);
+        demux.demux(&pinned_audio_psi(0, &[(0x06, 0x300, AC4), (0x87, 0x301, &[]), (0x0F, 0x302, &[])]));
+        assert_eq!(demux.audio_track(), Some((0x301, 0x87)), "the E-AC-3 behind the AC-4");
+
+        let mut demux = TsDemuxer::with_audio_pid(None, None, not_ac4_or_opus);
+        demux.demux(&pinned_audio_psi(0, &[(0x06, 0x300, AC4), (0x06, 0x302, AC4)]));
+        assert_eq!(
+            demux.audio_track(),
+            Some((0x300, SYNTHETIC_STREAM_TYPE_AC4)),
+            "nothing usable: the first audio track"
+        );
+
+        demux.demux(&pinned_audio_psi(1, &[(0x06, 0x300, AC4), (0x0F, 0x303, &[])]));
+        assert_eq!(demux.audio_track(), Some((0x303, 0x0F)), "a PMT update brings AAC");
+    }
+
+    /// The constructors that are told nothing about what the consumer can
+    /// publish select as they always did: the first audio track whatever
+    /// its codec, or the requested index.
+    #[test]
+    fn the_other_constructors_take_the_first_or_requested_track_whatever_its_codec() {
+        let ts = pinned_audio_psi(0, &[(0x06, 0x300, AC4), (0x87, 0x301, &[]), (0x0F, 0x302, &[])]);
+
+        let mut demux = TsDemuxer::new(None);
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x300, SYNTHETIC_STREAM_TYPE_AC4)), "new");
+
+        let mut demux = TsDemuxer::with_audio_track(None, None);
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x300, SYNTHETIC_STREAM_TYPE_AC4)), "no index");
+
+        let mut demux = TsDemuxer::with_audio_track(None, Some(2));
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x302, 0x0F)), "index 2");
     }
 
     /// A pin the PMT does not carry as audio — absent, or the video PID —
