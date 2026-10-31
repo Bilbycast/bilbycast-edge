@@ -286,13 +286,18 @@ broadcast IRDs) do not lose lock during a switch:
    RTP-framed input and a raw-TS one converts the input in the other
    framing, once, for every output — an RTP datagram on a raw-TS flow loses
    its header; a raw-TS datagram on an RTP-framed flow is wrapped in the
-   flow's own RTP header (its own SSRC and sequence numbers, six TS packets
-   to a datagram, so an SRT output carries each in one 1316-byte message).
-   That SSRC changes at the Take like any switch between two RTP inputs and
-   is never interleaved with an input's. Outputs that pass framing through
-   (SRT) therefore carry one framing for the flow's life; outputs that strip
-   (UDP, RIST, bonded) or re-wrap (RTP, single-leg and 2022-7) never cared.
-   A flow whose inputs share a framing converts nothing. An SRT output still
+   flow's own RTP header (its own SSRC and sequence numbers, one datagram
+   to each item of up to seven TS packets, the 1328-byte datagram an RTP
+   output builds from raw TS). That SSRC changes at the Take like any
+   switch between two RTP inputs and is never interleaved with an input's.
+   Outputs that pass framing through (SRT) therefore carry one framing
+   while the flow's inputs do; outputs that strip (UDP, RIST, bonded) never
+   cared, and outputs that re-wrap (RTP, single-leg and 2022-7) re-wrap each
+   datagram as it comes, so a raw-TS input of seven-packet items reaches
+   them as uniform datagrams. A flow whose inputs share a framing converts
+   nothing. The framing settles again when an input's removal leaves no
+   input of the flow in it (`FlowFraming::forget`), so an RTP input
+   replaced in place by a raw-TS one goes out raw TS. An SRT output still
    has to fit each datagram to one 1316-byte live message: from the first
    RTP datagram that does not fit, it numbers the stream itself, six TS
    packets to a datagram (`KeepaliveGate::fit`).

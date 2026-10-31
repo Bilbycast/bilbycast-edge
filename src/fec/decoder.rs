@@ -32,7 +32,10 @@
 //! for the old SNBase. Only a packet with a payload fills a cell, once; a
 //! matrix that fills is closed and takes nothing more until a new SNBase is
 //! established; and only a filed packet sets the header template rebuilt
-//! packets reuse.
+//! packets reuse. A media packet under another SSRC than the decoder
+//! follows is a sender that restarted, and starts a new matrix at its own
+//! number, keeping no cell, FEC or template of the old stream's
+//! ([`FecDecoder::is_new_sender`]).
 //!
 //! ## Limitations
 //!
@@ -43,6 +46,11 @@
 //!   first cycle after startup can drop losses without repair. A parity
 //!   that arrives before any media covers only packets sent before this
 //!   receiver started, so it can only be applied to the wrong matrix.
+//! - A FEC packet carries no SSRC. One the old stream sent that reaches
+//!   the decoder after the restarted sender's first media packet (the link
+//!   reordered it across the restart, which takes the sender far longer
+//!   than a reorder lasts) is applied to the new matrix like the new
+//!   sender's own.
 //! - The header names a column or row in 3 bits, so a parity packet is
 //!   filed under its index modulo 8. The encoder sends none for columns or
 //!   rows from 8 up ([`super::encoder::FEC_INDEXED_GROUPS`]); one from an
@@ -97,6 +105,12 @@ pub struct FecDecoder {
     /// against it: the encoder never moves back, so judged against the
     /// moved SNBase the decoder could keep a matrix the encoder has left.
     opened_at: u16,
+    /// The SSRC of the sender the decoder follows, from the first media
+    /// packet that names one. A packet under another SSRC is a sender that
+    /// restarted (an RTP output picks a new random SSRC each time it
+    /// starts): its numbers and bytes have nothing to do with the matrix's,
+    /// so the decoder starts afresh on it ([`Self::is_new_sender`]).
+    ssrc: Option<u32>,
     /// Last seen media RTP header template. Used to synthesise RTP headers
     /// around recovered payloads. `None` before any media has arrived.
     last_rtp_header: Option<[u8; RTP_HEADER_LEN]>,
@@ -159,6 +173,7 @@ impl FecDecoder {
             base_settled: false,
             closed: false,
             opened_at: 0,
+            ssrc: None,
             last_rtp_header: None,
             last_rtp_timestamp: 0,
             col_fec: vec![None; columns as usize],
@@ -179,12 +194,27 @@ impl FecDecoder {
     /// [`Self::process_media`], which files the datagram by the same rule
     /// (a datagram outside the window, past it or behind it, is never held).
     pub fn holds_payload(&self, seq: u16, data: &[u8]) -> bool {
-        if !self.initialized || data.len() <= RTP_HEADER_LEN {
+        if !self.initialized || data.len() <= RTP_HEADER_LEN || self.is_new_sender(data) {
             return false;
         }
         let diff = seq.wrapping_sub(self.base_seq);
         diff < self.matrix_size
             && self.matrix.cell(diff as usize) == Some(&data[RTP_HEADER_LEN..])
+    }
+
+    /// Whether the media datagram `data` comes from another sender than
+    /// the one the decoder follows: its RTP header names another SSRC.
+    ///
+    /// A sender that restarts picks a new random sequence number as well as
+    /// a new SSRC, and runs a new FEC encoder from it. Landing near the
+    /// open matrix, its numbers fall into cells the old stream filled,
+    /// where the restarted sender's FEC, realigning the matrix, would be
+    /// XORed with the old stream's bytes and rebuild a packet that was
+    /// never sent. So [`Self::process_media`] starts afresh on such a
+    /// packet: a new matrix at its number, with no cell, FEC or header
+    /// template of the old stream's.
+    pub fn is_new_sender(&self, data: &[u8]) -> bool {
+        matches!((self.ssrc, rtp_ssrc(data)), (Some(ours), Some(theirs)) if ours != theirs)
     }
 
     /// Process an incoming RTP media packet.
@@ -201,8 +231,21 @@ impl FecDecoder {
     /// otherwise returned but filed nowhere. It used to start a new matrix,
     /// dropping the open one's cells and pending FEC, so a reorder across a
     /// matrix boundary cost the next matrix its repairs (edge#214).
+    ///
+    /// A packet from another sender ([`Self::is_new_sender`]) starts a new
+    /// matrix at its own number, wherever it lands: until 2026-10 a restart
+    /// a few numbers either side of the open matrix kept the old stream's
+    /// cells, and the restarted sender's FEC rebuilt packets from them.
     pub fn process_media(&mut self, seq: u16, ts: u32, data: &Bytes) -> Vec<RtpPacket> {
-        let position = if !self.initialized {
+        let new_sender = self.is_new_sender(data);
+        if let Some(ssrc) = rtp_ssrc(data) {
+            self.ssrc = Some(ssrc);
+        }
+        let position = if !self.initialized || new_sender {
+            if new_sender {
+                // A rebuilt packet must never wear the old stream's header.
+                self.last_rtp_header = None;
+            }
             self.start_matrix(seq, None);
             Some(0)
         } else {
@@ -569,6 +612,12 @@ impl FecDecoder {
         self.col_fec.fill(None);
         self.row_fec.fill(None);
     }
+}
+
+/// The SSRC an RTP datagram's header names, or `None` for a datagram too
+/// short to carry one.
+fn rtp_ssrc(data: &[u8]) -> Option<u32> {
+    data.get(8..RTP_HEADER_LEN).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 fn xor_with_slice(target: &mut Vec<u8>, source: &[u8]) {
@@ -1108,7 +1157,8 @@ mod tests {
 
     /// The sender steps back a little, into the open matrix, with new bytes
     /// under numbers it already sent (L=2 D=4: 100..=105, then 102..=111
-    /// changed) -- an upstream restart a 2022-7 output forwards unchanged.
+    /// changed) under the same SSRC -- an upstream restart forwarded with
+    /// its numbers, as a 2022-7 output did until it numbered what it sends.
     /// A receiver holds whichever copy of such a number reached it, so the
     /// encoder sends no FEC over those cells: whatever two datagrams the
     /// link loses, nothing rebuilt differs from a datagram sent under its
@@ -1128,18 +1178,22 @@ mod tests {
         assert_eq!(rebuilt_without(2, 4, &sent, &[2, 10]), vec![106]);
     }
 
-    /// A sender restarting a few numbers back with other bytes, from where
-    /// the decoder's matrix cannot follow it exactly. Numbers then sent
-    /// again with other bytes:
-    /// - L=2 D=4, behind the open matrix, where its first packets are late
-    ///   (edge#214): from the second matrix, behind where the first ended
-    ///   (100..=111, then 105..=116); from the first, where the decoder's
-    ///   SNBase can move back onto 99 though the encoder's stays at 100
-    ///   (100..=105, then 97..=110); and from the second matrix after its
-    ///   column 0 FEC has gone out (100..=115, then 104..=120) -- a
-    ///   receiver that lost two of that column holds the FEC, and would
-    ///   rebuild the second from it and the other's second copy, but drops
-    ///   it at the first late packet.
+    /// A sender restarting a few numbers back with other bytes under the
+    /// same SSRC (one under a new SSRC starts a new matrix:
+    /// `a_sender_restarted_under_a_new_ssrc_is_never_rebuilt_from_the_old_stream`),
+    /// from where the decoder's matrix cannot follow it exactly. Numbers
+    /// then sent again with other bytes:
+    /// - Behind the open matrix, where its first packets are late
+    ///   (edge#214): L=2 D=4 from the second matrix, behind where the first
+    ///   ended (100..=111, then 105..=116); from the first, L=2 D=4, where
+    ///   no late packet can move SNBase back (a move needs it fewer than
+    ///   L - 1 behind) and 97..=99 are left out (100..=105, then 97..=110),
+    ///   and L=3 D=4, where the decoder's SNBase moves back onto 99 though
+    ///   the encoder's stays at 100 (the same numbers); and L=2 D=4 from the
+    ///   second matrix after its column 0 FEC has gone out (100..=115, then
+    ///   104..=120) -- a receiver that lost two of that column holds the
+    ///   FEC, and would rebuild the second from it and the other's second
+    ///   copy, but drops it at the first late packet.
     /// - Into a matrix the decoder has completed and closed, L=2 D=4
     ///   (100..=107, then 106..=113) and L=3 D=4 (100..=111, then
     ///   109..=120): the closed matrix used to file the second copies and
@@ -1163,6 +1217,7 @@ mod tests {
         let restarts = [
             (2u8, 4u8, resent(100..112, 105..117)),
             (2, 4, resent(100..106, 97..111)),
+            (3, 4, resent(100..106, 97..111)),
             (2, 4, resent(100..116, 104..121)),
             (2, 4, resent(100..108, 106..114)),
             (3, 4, resent(100..112, 109..121)),
@@ -1314,8 +1369,23 @@ mod tests {
         assert!(handed_at(&out, 29) < handed_at(&out, 30), "{out:?}");
     }
 
-    /// Reordering, on the link or upstream of the encoder (a 2022-7 output
-    /// forwards RTP in the order it came), never rebuilds bytes that were
+    /// A late packet moves SNBase back only by fewer than L - 1, so never
+    /// with two columns: after 100..=105, a late 99 is filed at L=3 and
+    /// L=4, and left out at L=2, where the matrix stays at 100.
+    #[test]
+    fn a_late_packet_moves_snbase_back_only_with_three_columns_or_more() {
+        for (l, moves) in [(2u8, false), (3, true), (4, true)] {
+            let mut dec = FecDecoder::new(l, 4);
+            for seq in 100u16..106 {
+                dec.process_media(seq, 0, &make_rtp_packet(seq, 0, &body(seq, 16)));
+            }
+            dec.process_media(99, 0, &make_rtp_packet(99, 0, &body(99, 16)));
+            assert_eq!(dec.base_seq == 99, moves, "L={l}");
+        }
+    }
+
+    /// Reordering, on the link or upstream of an encoder that forwards
+    /// upstream numbers (as a 2022-7 output did), never rebuilds bytes that were
     /// not sent: every packet of four matrices, delayed by 1, 2, L, L*D-1,
     /// L*D and L*D+1 datagrams, with and without a loss, across the
     /// sequence-number wrap.
@@ -1346,6 +1416,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── A sender that restarts under a new SSRC ─────────────────────────
+
+    /// An RTP datagram under `ssrc`.
+    fn datagram_from(ssrc: u32, seq: u16, payload: &[u8]) -> Bytes {
+        let mut data = make_rtp_packet(seq, 0, payload).to_vec();
+        data[8..RTP_HEADER_LEN].copy_from_slice(&ssrc.to_be_bytes());
+        Bytes::from(data)
+    }
+
+    /// What one run of a sender sends under `ssrc` for `seqs`, through an
+    /// FEC encoder of its own: each media datagram, then the FEC it
+    /// completes. `salt` sets its payloads apart from another run's under
+    /// the same numbers.
+    fn sent_by(ssrc: u32, l: u8, d: u8, seqs: impl IntoIterator<Item = u16>, salt: u16) -> Vec<Wire> {
+        let mut enc = FecEncoder::new(l, d, Arc::new(AtomicU64::new(0)));
+        let mut wire = Vec::new();
+        for seq in seqs {
+            let p = body(seq ^ salt, 20);
+            let fec = enc.process(seq, &p);
+            wire.push(Wire::Media(seq, datagram_from(ssrc, seq, &p)));
+            wire.extend(fec.into_iter().map(Wire::Fec));
+        }
+        wire
+    }
+
+    /// `wire` through one decoder with the media datagrams at the indices
+    /// `lost` names left out. Asserts every packet the decoder rebuilds is
+    /// byte for byte the datagram sent under its number by the sender its
+    /// header names, and returns the numbers rebuilt.
+    fn rebuilt_across_a_restart(l: u8, d: u8, wire: &[Wire], lost: &[usize]) -> Vec<u16> {
+        let sent: std::collections::HashMap<(u32, u16), &Bytes> = wire
+            .iter()
+            .filter_map(|w| match w {
+                Wire::Media(s, b) => Some(((rtp_ssrc(b).unwrap(), *s), b)),
+                Wire::Fec(_) => None,
+            })
+            .collect();
+        let mut dec = FecDecoder::new(l, d);
+        let mut rebuilt = Vec::new();
+        for (i, w) in wire.iter().enumerate() {
+            let out = match w {
+                Wire::Media(_, _) if lost.contains(&i) => continue,
+                Wire::Media(seq, data) => dec.process_media(*seq, 0, data).split_off(1),
+                Wire::Fec(f) => dec.process_fec(f),
+            };
+            for p in out {
+                let key = (rtp_ssrc(&p.data).unwrap(), p.sequence_number);
+                let original = sent.get(&key).unwrap_or_else(|| {
+                    panic!("{l}x{d}: seq {} rebuilt under SSRC {:#x}, which never sent it", key.1, key.0)
+                });
+                assert_eq!(
+                    &p.data[..],
+                    &original[..],
+                    "{l}x{d}: seq {} rebuilt with bytes its sender never sent (lost {lost:?})",
+                    p.sequence_number,
+                );
+                rebuilt.push(p.sequence_number);
+            }
+        }
+        rebuilt
+    }
+
+    /// A sender restarting under a new SSRC and a new FEC encoder, its new
+    /// random sequence number landing within a matrix behind or ahead of
+    /// the receiver's open matrix, which keeps running. Whatever single
+    /// media datagram of the restarted stream the link loses, nothing is
+    /// rebuilt from the old stream's bytes: every packet rebuilt is the one
+    /// its sender sent under that number. The decoder used to keep the old
+    /// stream's cells, under a late restart (one behind, since edge#214 took
+    /// a packet less than a matrix behind for a reorder) and under one
+    /// inside the window (always), and the restarted sender's FEC realigned
+    /// the matrix onto them: 4x4, the old stream 1000..=1008 and a restart
+    /// at 993 losing 1008 rebuilt 993, 996, 997 and "1008" from bytes never
+    /// sent. A loss in the restarted stream's second matrix's last row is
+    /// still rebuilt.
+    #[test]
+    fn a_sender_restarted_under_a_new_ssrc_is_never_rebuilt_from_the_old_stream() {
+        for (l, d, every_loss, step) in [(4u8, 4u8, true, 1u16), (5, 5, true, 1), (10, 10, false, 1), (20, 20, false, 23)] {
+            let m = l as u16 * d as u16;
+            let base = 1000u16;
+            for old_len in [m / 2 + 1, m + 1, 2 * m - 1] {
+                let old = sent_by(0xA0A0_0001, l, d, base..base + old_len, 0);
+                let open = base + (old_len - 1) / m * m;
+                let starts = (1..m)
+                    .step_by(step as usize)
+                    .map(|k| open - k)
+                    .chain((0..m).step_by(step as usize).map(|k| open + k));
+                for first in starts {
+                    let new = sent_by(0xB0B0_0002, l, d, first..first + 3 * m, 0x5A5A);
+                    let wire: Vec<Wire> = old.iter().chain(&new).map(|w| match w {
+                        Wire::Media(s, b) => Wire::Media(*s, b.clone()),
+                        Wire::Fec(f) => Wire::Fec(f.clone()),
+                    }).collect();
+                    let index_of = |seq: u16| {
+                        let at = wire[old.len()..]
+                            .iter()
+                            .position(|w| matches!(w, Wire::Media(s, _) if *s == seq));
+                        old.len() + at.expect("the restarted stream sent seq")
+                    };
+                    let losses: Vec<u16> = if every_loss {
+                        (first..first + 2 * m).collect()
+                    } else {
+                        [base + old_len, first + 1, first + (d as u16 - 1) * l as u16]
+                            .into_iter()
+                            .filter(|s| s.wrapping_sub(first) < 3 * m)
+                            .collect()
+                    };
+                    assert!(rebuilt_across_a_restart(l, d, &wire, &[]).is_empty(), "no loss, no rebuild");
+                    for lost in losses {
+                        rebuilt_across_a_restart(l, d, &wire, &[index_of(lost)]);
+                    }
+                    let last_row = first + m + (d as u16 - 1) * l as u16 + 1;
+                    assert_eq!(
+                        rebuilt_across_a_restart(l, d, &wire, &[index_of(last_row)]),
+                        vec![last_row],
+                        "{l}x{d}: old {base}..{} restart at {first}",
+                        base + old_len,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The old stream's datagrams are not what a restarted sender's are
+    /// told against: `holds_payload` holds nothing of another SSRC, even
+    /// under the same number with the same bytes.
+    #[test]
+    fn holds_payload_holds_nothing_of_another_sender() {
+        let mut dec = FecDecoder::new(2, 4);
+        let a = datagram_from(1, 10, &[1, 2, 3, 4]);
+        dec.process_media(10, 0, &a);
+        assert!(dec.holds_payload(10, &a));
+        assert!(!dec.holds_payload(10, &datagram_from(2, 10, &[1, 2, 3, 4])));
+        assert!(dec.is_new_sender(&datagram_from(2, 11, &[0; 4])));
+        assert!(!dec.is_new_sender(&a[..8]), "too short to name an SSRC");
     }
 
     /// `holds_payload` tells a datagram the matrix already holds -- received

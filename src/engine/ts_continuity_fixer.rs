@@ -195,9 +195,23 @@ pub struct TsContinuityFixer {
     /// watcher saw on that PID's own clock, or a switch to an input whose
     /// cached PMTs name that PID as a PCR_PID. On an MPTS each program has
     /// its own PCR, so the DI belongs on each program whose clock moved,
-    /// not on whichever PCR happens to come next.
-    pending_di_pids: Vec<u16>,
+    /// not on whichever PCR happens to come next. Each carries the
+    /// [`now_us`](crate::util::time::now_us) instant it lapses at, set by
+    /// the first packet processed after it was armed
+    /// ([`PENDING_DI_TIMEOUT_US`]); `None` until then.
+    pending_di_pids: Vec<(u16, Option<u64>)>,
 }
+
+/// How long a PCR PID armed for a DI waits for its PCR, from the first
+/// packet the fixer processes after arming it. A program's PCR comes at
+/// least every 100 ms (ISO/IEC 13818-1), so a PID that has carried none for
+/// ten times that carries no clock now — an off-air service an MPTS's PMT
+/// still names, or a PCR_PID naming a PID that is not there — and is
+/// dropped. Kept, it made the fixer read every packet's PCR for the rest of
+/// the flow, and stamped a DI on that PID's first PCR whenever one came,
+/// hours later and with nothing switched or jumped (which also excused a
+/// real CC break on that packet from TR 101 290's `cc_errors`).
+const PENDING_DI_TIMEOUT_US: u64 = 1_000_000;
 
 impl TsContinuityFixer {
     pub fn new() -> Self {
@@ -229,8 +243,15 @@ impl TsContinuityFixer {
     /// because only that path applied DI (c7014f8), and that renumbered CC
     /// for the rest of the flow, hiding every later loss (edge#214).
     pub fn signal_source_discontinuity(&mut self, pcr_pid: u16) {
-        if !self.pending_di_pids.contains(&pcr_pid) {
-            self.pending_di_pids.push(pcr_pid);
+        self.arm_pid(pcr_pid);
+    }
+
+    /// Arm a DI on `pid`'s next PCR, with a fresh timeout if it was armed
+    /// already.
+    fn arm_pid(&mut self, pid: u16) {
+        match self.pending_di_pids.iter_mut().find(|(p, _)| *p == pid) {
+            Some((_, lapses)) => *lapses = None,
+            None => self.pending_di_pids.push((pid, None)),
         }
     }
 
@@ -239,8 +260,8 @@ impl TsContinuityFixer {
     /// entry in `pids`. An associated fn over the two fields, so
     /// [`Self::process_packet`] can call it while it holds the input's PSI
     /// cache.
-    fn take_pending_di(on_pcr: &mut bool, pids: &mut Vec<u16>, pid: u16) -> bool {
-        let targeted = match pids.iter().position(|p| *p == pid) {
+    fn take_pending_di(on_pcr: &mut bool, pids: &mut Vec<(u16, Option<u64>)>, pid: u16) -> bool {
+        let targeted = match pids.iter().position(|(p, _)| *p == pid) {
             Some(i) => {
                 pids.swap_remove(i);
                 true
@@ -365,9 +386,7 @@ impl TsContinuityFixer {
         // first PCRs went out without one, and the source-discontinuity
         // watch then stamped theirs a PCR late.
         for pid in pcr_pids(&cached_pmts) {
-            if !self.pending_di_pids.contains(&pid) {
-                self.pending_di_pids.push(pid);
-            }
+            self.arm_pid(pid);
         }
 
         // Inject PAT from the new input's cache with the monotonic
@@ -415,9 +434,24 @@ impl TsContinuityFixer {
     /// bit set. CC is never rewritten, so every gap in the source — lost
     /// packets, legal duplicates, the source's own CC reset — goes out as
     /// it came (edge#214). PSI is observed on every packet for the switch
-    /// cache.
+    /// cache. A PCR PID armed for a DI that has carried no PCR
+    /// [`PENDING_DI_TIMEOUT_US`] after the first packet processed since is
+    /// dropped, so the fixer goes back to reading nothing but PSI.
     pub fn process_packet(&mut self, input_id: &str, packet: &RtpPacket) -> ProcessResult {
+        // The clock is read only while a PID is armed.
+        let now = if self.pending_di_pids.is_empty() { 0 } else { crate::util::time::now_us() };
+        self.process_packet_at(input_id, packet, now)
+    }
+
+    /// [`Self::process_packet`] at `now_us`.
+    fn process_packet_at(&mut self, input_id: &str, packet: &RtpPacket, now_us: u64) -> ProcessResult {
         let Self { input_psi, pending_di_on_pcr, pending_di_pids, .. } = self;
+        if !pending_di_pids.is_empty() {
+            for (_, lapses) in pending_di_pids.iter_mut() {
+                lapses.get_or_insert(now_us + PENDING_DI_TIMEOUT_US);
+            }
+            pending_di_pids.retain(|(_, lapses)| lapses.is_none_or(|at| now_us < at));
+        }
         let psi = match input_psi.get_mut(input_id) {
             Some(psi) => psi,
             None => {
@@ -462,12 +496,14 @@ impl TsContinuityFixer {
     }
 }
 
-/// TS packets in an RTP datagram the edge builds itself: a switch's PSI on
-/// an RTP-framed input ([`frame_switch_psi`]), and a raw-TS input's
-/// datagrams on an RTP-framed flow ([`FlowFraming`]). Six, not the seven of
-/// a raw-TS datagram: the 12-byte RTP header and seven packets come to 1328
-/// bytes, past the 1316-byte live message an SRT output sends each item in,
-/// which would split the datagram and leave its tail without a header.
+/// TS packets in an RTP datagram the edge builds to fit one SRT live
+/// message: a switch's PSI on an RTP-framed input ([`frame_switch_psi`]),
+/// and the datagrams an SRT output cuts an oversize RTP stream into
+/// (`output_srt::KeepaliveGate::fit`). Six, not the seven of a raw-TS
+/// datagram: the 12-byte RTP header and seven packets come to 1328 bytes,
+/// past the 1316-byte live message an SRT output sends each item in. The
+/// switch's PSI keeps to it so it never sets an SRT output re-numbering a
+/// stream of six-packet datagrams it could relay as they came.
 pub(crate) const EDGE_RTP_TS_PACKETS: usize = 6;
 
 /// One RTP datagram of `ts` under the header fields given, as the flow
@@ -547,8 +583,8 @@ pub fn frame_switch_psi(injected: Vec<RtpPacket>, first: &RtpPacket) -> Vec<RtpP
 /// packet) as raw-TS items of up to seven packets, under `first`'s
 /// timestamp and receive time: for a flow whose framing `first`, the
 /// datagram it goes out ahead of, is not in, where [`FlowFraming::conform`]
-/// puts the PSI in the flow's framing with `first` — wrapped six packets to
-/// a datagram rather than one, or passed.
+/// puts the PSI in the flow's framing with `first` — wrapped up to seven
+/// packets to a datagram rather than one, or passed.
 pub fn bundle_switch_psi(injected: Vec<RtpPacket>, first: &RtpPacket) -> Vec<RtpPacket> {
     super::packet::bundle_ts_packets(injected.into_iter().map(|p| p.data).collect())
         .into_iter()
@@ -575,10 +611,19 @@ pub fn bundle_switch_psi(injected: Vec<RtpPacket>, first: &RtpPacket) -> Vec<Rtp
 /// other framing is converted here, once, for every output: an RTP
 /// datagram on a raw-TS flow loses its RTP header, and a raw-TS datagram on
 /// an RTP-framed flow is wrapped in the flow's own RTP header — its own
-/// SSRC and sequence numbers, [`EDGE_RTP_TS_PACKETS`] packets to a
-/// datagram. That SSRC changes at the Take like any switch between two RTP
-/// inputs; it is never interleaved with an input's. A flow whose inputs
-/// all share one framing never converts anything.
+/// SSRC and sequence numbers, one datagram for each raw-TS item of up to
+/// [`TS_PACKETS_PER_ITEM`](super::packet::TS_PACKETS_PER_ITEM) (seven)
+/// packets, the 1328-byte datagram an RTP output builds from raw TS. That
+/// SSRC changes at the Take like any switch between two RTP inputs; it is
+/// never interleaved with an input's. A flow whose inputs all share one
+/// framing never converts anything.
+///
+/// The framing holds while any input of the flow carries it. An input's
+/// removal that leaves none in it ([`Self::forget`]) — an RTP input
+/// replaced by a raw-TS one in place, which adds the new input before it
+/// removes the old, so the flow keeps running — lets the next media
+/// datagram settle it again, so the flow goes out as its inputs now frame
+/// it.
 ///
 /// The idle keepalive (`flow::null_ts_packet`) is not conformed: it is raw
 /// TS on every flow, which an SRT output holds back from an RTP-framed
@@ -587,6 +632,9 @@ pub struct FlowFraming {
     /// Whether the flow carries raw TS; `None` before its first media
     /// datagram.
     raw_ts: Option<bool>,
+    /// Whether each input's last media datagram, active or passive, came
+    /// raw TS: what an input's removal is told against.
+    inputs: HashMap<String, bool>,
     /// The flow's own RTP header, for raw-TS datagrams on an RTP-framed
     /// flow.
     wrap: super::output_rtp::RtpWrapState,
@@ -594,16 +642,43 @@ pub struct FlowFraming {
 
 impl FlowFraming {
     pub fn new() -> Self {
-        Self { raw_ts: None, wrap: super::output_rtp::RtpWrapState::new() }
+        Self { raw_ts: None, inputs: HashMap::new(), wrap: super::output_rtp::RtpWrapState::new() }
     }
 
-    /// Take `pkt`'s framing for the flow's if it has none yet: an active
-    /// input's datagram, before it — and anything a switch injects ahead
-    /// of it — is conformed. NULL packets alone settle nothing: a raw-TS
-    /// datagram of them says nothing of how the input frames its media.
-    pub fn observe(&mut self, pkt: &RtpPacket) {
+    /// Note the framing of `input_id`'s datagram `pkt`, active or passive.
+    /// NULL packets alone say nothing: a raw-TS datagram of them says
+    /// nothing of how the input frames its media.
+    pub fn note(&mut self, input_id: &str, pkt: &RtpPacket) {
+        if !(pkt.is_raw_ts && is_null_ts_only(&pkt.data))
+            && self.inputs.get(input_id) != Some(&pkt.is_raw_ts)
+        {
+            self.inputs.insert(input_id.to_string(), pkt.is_raw_ts);
+        }
+    }
+
+    /// Note an active input's datagram, and take its framing for the
+    /// flow's if the flow has none yet: `pkt`, and anything a switch
+    /// injects ahead of it, is conformed. NULL packets alone settle
+    /// nothing.
+    pub fn observe(&mut self, input_id: &str, pkt: &RtpPacket) {
+        self.note(input_id, pkt);
         if self.raw_ts.is_none() && !(pkt.is_raw_ts && is_null_ts_only(&pkt.data)) {
             self.raw_ts = Some(pkt.is_raw_ts);
+        }
+    }
+
+    /// `input_id` has left the flow. When no input left carries the flow's
+    /// framing, the next media datagram settles it again. Until 2026-10-31
+    /// the framing held for the fixer task's life, which an in-place input
+    /// replacement does not end: an RTP input replaced by a raw-TS SRT one
+    /// went on going out wrapped in the flow's RTP header, which a raw-TS
+    /// receiver set up for the new source cannot read.
+    pub fn forget(&mut self, input_id: &str) {
+        self.inputs.remove(input_id);
+        if let Some(raw) = self.raw_ts
+            && !self.inputs.values().any(|&r| r == raw)
+        {
+            self.raw_ts = None;
         }
     }
 
@@ -624,8 +699,19 @@ impl FlowFraming {
                 }
             }
             Some(false) if pkt.is_raw_ts => {
+                // One datagram for an item of up to seven packets, as an RTP
+                // output wraps raw TS: every item an SRT input delivers
+                // fits one, so its sender timestamp, the sampler's clock
+                // sample for the whole item, stays with every PCR in it.
+                // Cut six and one, the seventh packet's PCR went to the PLL
+                // as a PCR sample beside the sender timestamps, and an RTP
+                // output re-wrapping datagram for datagram sent the two
+                // sizes alternately, which left its FEC groups unprotected.
+                // A longer item (UDP can carry one) is cut into sevens; no
+                // input gives such an item a sender timestamp.
                 let mut sender_timestamp_us = pkt.sender_timestamp_us;
-                for chunk in pkt.data.chunks(EDGE_RTP_TS_PACKETS * TS_PACKET_SIZE) {
+                let item = super::packet::TS_PACKETS_PER_ITEM * TS_PACKET_SIZE;
+                for chunk in pkt.data.chunks(item) {
                     let header = self.wrap.build_header(pkt.rtp_timestamp);
                     let seq = u16::from_be_bytes([header[2], header[3]]);
                     let timestamp = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
@@ -1802,7 +1888,11 @@ mod tests {
             let pcr = make_rtp_packet(&build_pcr_packet(0x100, cc, 27_000_000 + cc as u64 * 1_080_000));
             assert!(matches!(fixer.process_packet("a", &pcr), ProcessResult::Unchanged));
         }
-        assert_eq!(fixer.pending_di_pids, vec![0x300], "still pending for its own PID");
+        assert_eq!(
+            fixer.pending_di_pids.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec![0x300],
+            "still pending for its own PID"
+        );
     }
 
     /// A switch to an MPTS gives every program's first PCR after the cut a
@@ -1830,6 +1920,56 @@ mod tests {
         assert!(!di(&mut fixer, 0x100, 1), "one DI per program");
         assert!(!di(&mut fixer, 0x200, 1));
         assert!(fixer.pending_di_pids.is_empty() && !fixer.pending_di_on_pcr, "nothing left pending");
+    }
+
+    /// A PCR PID a switch arms that carries no PCR (an off-air service the
+    /// MPTS's PMT still names) is dropped a second after the new input's
+    /// first packet: the fixer stops reading PCRs, and a PCR on that PID
+    /// long after, with nothing switched or jumped, takes no DI. It used to
+    /// stay armed for the flow's life. A PCR within the second still takes
+    /// its DI, and a PID armed again gets a fresh second.
+    #[test]
+    fn a_pcr_pid_that_carries_no_pcr_is_not_armed_for_ever() {
+        let mpts = || {
+            let mut fixer = TsContinuityFixer::new();
+            let psi = [
+                build_pat(&[(1, 0x1000), (2, 0x1100)], 0),
+                build_pmt(0x1000, &[(0x1B, 0x100)], 0),
+                build_pmt(0x1100, &[(0x1B, 0x200)], 0),
+            ];
+            for pkt in &psi {
+                fixer.observe_passive("b", &make_rtp_packet(pkt));
+            }
+            let _ = fixer.on_switch("b");
+            fixer
+        };
+        let di = |fixer: &mut TsContinuityFixer, pid: u16, cc: u8, now: u64| {
+            let pkt = make_rtp_packet(&build_pcr_packet(pid, cc, 27_000_000 + cc as u64 * 1_080_000));
+            let out = fixer.process_packet_at("b", &pkt, now).forwarded(&pkt);
+            ts_discontinuity_indicator(&out[..TS_PACKET_SIZE])
+        };
+        let pending = |fixer: &TsContinuityFixer| -> Vec<u16> {
+            fixer.pending_di_pids.iter().map(|(p, _)| *p).collect()
+        };
+        let t0 = 5_000_000u64;
+
+        let mut fixer = mpts();
+        assert!(di(&mut fixer, 0x100, 0, t0), "program 1's first PCR");
+        assert!(!di(&mut fixer, 0x100, 1, t0 + 999_999));
+        assert_eq!(pending(&fixer), vec![0x200], "program 2 still pending within the second");
+        assert!(!di(&mut fixer, 0x100, 2, t0 + 1_000_000));
+        assert!(pending(&fixer).is_empty(), "dropped a second after the first packet");
+        assert!(!di(&mut fixer, 0x200, 0, t0 + 3_600_000_000), "an hour later: no DI");
+
+        let mut fixer = mpts();
+        assert!(di(&mut fixer, 0x100, 0, t0));
+        assert!(di(&mut fixer, 0x200, 0, t0 + 900_000), "program 2's first PCR within the second");
+
+        let mut fixer = mpts();
+        assert!(di(&mut fixer, 0x100, 0, t0));
+        fixer.signal_source_discontinuity(0x200);
+        assert!(!di(&mut fixer, 0x100, 1, t0 + 999_999));
+        assert!(di(&mut fixer, 0x200, 0, t0 + 1_500_000), "armed again: a fresh second");
     }
 
     /// An RTP datagram under `ssrc` numbered `seq` carrying `ts`, with a CSRC
@@ -1896,20 +2036,25 @@ mod tests {
 
     /// The flow's framing is its first media datagram's; NULL packets alone
     /// settle nothing. On an RTP-framed flow raw TS is wrapped in the flow's
-    /// own header — one SSRC, consecutive numbers, the item's timestamp and
-    /// receive time kept, its sender timestamp on the first datagram only —
-    /// six packets to a datagram; RTP passes as it came. On a raw-TS flow
-    /// RTP loses its header, CSRCs included.
+    /// own header — one SSRC, consecutive numbers, the item's timestamp,
+    /// receive time and sender timestamp kept — one datagram for an item of
+    /// up to seven packets, the 1328-byte datagram an RTP output builds from
+    /// raw TS, and sevens for a longer one, its sender timestamp on the
+    /// first only; RTP passes as it came. On a raw-TS flow RTP loses its
+    /// header, CSRCs included. A seven-packet item used to go out as six
+    /// packets and one, the second datagram without the item's sender
+    /// timestamp, and an RTP output re-wrapping datagram for datagram sent
+    /// the two sizes alternately.
     #[test]
     fn a_flow_keeps_its_first_datagrams_framing() {
         let seven: Vec<u8> = (0..7u8).flat_map(|cc| build_ts_packet(0x100, cc)).collect();
         let null7: Vec<u8> = (0..7).flat_map(|_| build_ts_packet(NULL_PID, 0)).collect();
 
         let mut rtp_flow = FlowFraming::new();
-        rtp_flow.observe(&make_rtp_packet(&null7));
+        rtp_flow.observe("a", &make_rtp_packet(&null7));
         assert!(rtp_flow.passes(&make_rtp_packet(&seven)), "NULL packets settled nothing");
         let first = rtp_with_csrc(0xA, 9, &build_ts_packet(0x100, 0));
-        rtp_flow.observe(&first);
+        rtp_flow.observe("a", &first);
         assert_eq!(conformed(&mut rtp_flow, first.clone())[0].data, first.data, "as it came");
         let mut raw_item = make_rtp_packet(&seven);
         raw_item.rtp_timestamp = 777;
@@ -1917,28 +2062,70 @@ mod tests {
         raw_item.sender_timestamp_us = Some(5);
         assert!(!rtp_flow.passes(&raw_item));
         let wrapped = conformed(&mut rtp_flow, raw_item.clone());
-        assert_eq!(wrapped.len(), 2);
+        assert_eq!(wrapped.len(), 1, "one datagram for the item");
         let (_, pt, seq0, ts, ssrc) = header_fields(&wrapped[0]);
         assert_eq!((pt, ts), (33, 777));
         assert_ne!(ssrc, 0xA);
+        assert!(!wrapped[0].is_raw_ts);
+        assert_eq!(wrapped[0].data.len(), 1328);
+        assert_eq!(&wrapped[0].data[RTP_HEADER_MIN_SIZE..], &seven[..]);
+        assert_eq!((wrapped[0].recv_time_us, wrapped[0].sender_timestamp_us), (42, Some(5)));
+        let next = conformed(&mut rtp_flow, raw_item.clone());
+        assert_eq!(header_fields(&next[0]).2, seq0.wrapping_add(1), "the numbers carry on");
+
+        let ten: Vec<u8> = (0..10u8).flat_map(|cc| build_ts_packet(0x100, cc)).collect();
+        let long_item = RtpPacket { data: Bytes::from(ten.clone()), ..raw_item };
+        let wrapped = conformed(&mut rtp_flow, long_item);
+        assert_eq!(wrapped.len(), 2, "a longer item in sevens");
         for (i, p) in wrapped.iter().enumerate() {
-            assert!(!p.is_raw_ts);
             assert_eq!(header_fields(p).4, ssrc, "one SSRC");
-            assert_eq!(header_fields(p).2, seq0.wrapping_add(i as u16), "numbered on");
+            assert_eq!(header_fields(p).2, seq0.wrapping_add(2 + i as u16), "numbered on");
             let sender_timestamp = if i == 0 { Some(5) } else { None };
             assert_eq!((p.recv_time_us, p.sender_timestamp_us), (42, sender_timestamp), "one sample");
         }
-        assert_eq!(&wrapped[0].data[RTP_HEADER_MIN_SIZE..], &seven[..6 * TS_PACKET_SIZE]);
-        assert_eq!(&wrapped[1].data[RTP_HEADER_MIN_SIZE..], &seven[6 * TS_PACKET_SIZE..]);
-        let next = conformed(&mut rtp_flow, raw_item);
-        assert_eq!(header_fields(&next[0]).2, seq0.wrapping_add(2), "the numbers carry on");
+        assert_eq!(&wrapped[0].data[RTP_HEADER_MIN_SIZE..], &ten[..7 * TS_PACKET_SIZE]);
+        assert_eq!(&wrapped[1].data[RTP_HEADER_MIN_SIZE..], &ten[7 * TS_PACKET_SIZE..]);
 
         let mut raw_flow = FlowFraming::new();
-        raw_flow.observe(&make_rtp_packet(&seven));
+        raw_flow.observe("a", &make_rtp_packet(&seven));
         let stripped = conformed(&mut raw_flow, rtp_with_csrc(0xA, 9, &build_ts_packet(0x100, 3)));
         assert_eq!(stripped.len(), 1);
         assert!(stripped[0].is_raw_ts);
         assert_eq!(&stripped[0].data[..], &build_ts_packet(0x100, 3)[..]);
         assert!(conformed(&mut raw_flow, rtp_with_csrc(0xA, 10, &[])).is_empty(), "a header alone");
+    }
+
+    /// An input's removal that leaves no input in the flow's framing lets
+    /// the next media datagram settle it again: an RTP input replaced in
+    /// place by a raw-TS one (the new input added and switched to, then the
+    /// RTP input removed) goes out raw TS from then on. While an input in
+    /// the framing remains, passive included, the framing holds; NULL
+    /// packets alone mark no input as carrying one. The framing used to
+    /// hold for the flow's life, so the replacement went on out wrapped in
+    /// the flow's RTP header.
+    #[test]
+    fn a_flow_settles_its_framing_again_when_no_input_carries_it() {
+        let seven: Vec<u8> = (0..7u8).flat_map(|cc| build_ts_packet(0x100, cc)).collect();
+        let null7: Vec<u8> = (0..7).flat_map(|_| build_ts_packet(NULL_PID, 0)).collect();
+        let raw = make_rtp_packet(&seven);
+        let rtp = rtp_with_csrc(0xA, 9, &build_ts_packet(0x100, 0));
+
+        let mut framing = FlowFraming::new();
+        framing.observe("rtp", &rtp);
+        framing.note("standby", &rtp);
+        framing.note("idle", &make_rtp_packet(&null7));
+        framing.observe("raw", &raw);
+        assert!(!conformed(&mut framing, raw.clone())[0].is_raw_ts, "wrapped on the RTP flow");
+        framing.forget("rtp");
+        framing.forget("idle");
+        assert!(!framing.passes(&raw), "the standby input still carries RTP");
+        framing.forget("standby");
+        assert!(framing.passes(&raw), "no input carries RTP any more");
+        assert_eq!(conformed(&mut framing, raw.clone())[0].data, raw.data, "raw TS as it came");
+        framing.observe("raw", &raw);
+        let stripped = conformed(&mut framing, rtp.clone());
+        assert!(stripped[0].is_raw_ts, "settled raw TS: an RTP input added now is stripped");
+        framing.forget("gone");
+        assert!(stripped[0].is_raw_ts && !framing.passes(&rtp), "the raw input still carries raw TS");
     }
 }

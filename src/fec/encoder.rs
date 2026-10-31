@@ -115,13 +115,16 @@ impl FecEncoder {
     /// Where a packet goes is the placement rule the decoder shares
     /// ([`FecMatrix::place`]). A packet past the window, or a whole matrix
     /// or more behind SNBase, starts the next matrix at its own number. One
-    /// less than a matrix behind SNBase is late (an upstream that reordered
-    /// it, forwarded unchanged by a 2022-7 output, or one that restarted a
-    /// few numbers back): it goes out unprotected and changes nothing. It
-    /// used to start a new matrix, which left the open one's groups without
-    /// FEC. It never moves SNBase back, as the decoder's may: a restart's
-    /// first packet would then complete groups of the copies sent first
-    /// just before the restart sends them again with other bytes.
+    /// less than a matrix behind SNBase is late: it goes out unprotected and
+    /// changes nothing. No output of this edge sends one, since every RTP
+    /// output numbers its datagrams itself in the order it sends them; the
+    /// rule is the placement the decoder shares, for a sender that forwards
+    /// upstream numbers (an upstream that reordered a packet, or restarted
+    /// a few numbers back). It used to start a new matrix, which left the
+    /// open one's groups without FEC. It never moves SNBase back, as the
+    /// decoder's may: a restart's first packet would then complete groups
+    /// of the copies sent first just before the restart sends them again
+    /// with other bytes.
     pub fn process(&mut self, seq: u16, payload: &[u8]) -> Vec<Bytes> {
         let position = match self.initialized.then(|| self.matrix.place(self.base_seq, seq)) {
             Some(Placement::Cell(position)) => position,

@@ -407,7 +407,10 @@ impl RepairOrder {
 /// under that number is published). A duplicate never reaches the decoder,
 /// which learns nothing from it: the late original of a closed matrix's
 /// repair used to start a new matrix there, discarding the open one's cells
-/// and FEC (edge#214). Returns the number of rebuilt packets published.
+/// and FEC (edge#214). A datagram from a sender that restarted under a new
+/// SSRC ([`FecDecoder::is_new_sender`]) starts the order afresh with the
+/// decoder's matrix: the old stream's numbers say nothing of where the new
+/// one's repairs fall. Returns the number of rebuilt packets published.
 fn publish_fec_media(
     decoder: &mut FecDecoder,
     order: &mut RepairOrder,
@@ -416,6 +419,9 @@ fn publish_fec_media(
     data: &Bytes,
     mut publish: impl FnMut(RtpPacket),
 ) -> u64 {
+    if decoder.is_new_sender(data) {
+        *order = RepairOrder::new(order.window);
+    }
     if decoder.holds_payload(seq, data) || order.already_repaired(seq, data) {
         return 0;
     }
@@ -1288,6 +1294,42 @@ mod tests {
         assert!(order.already_repaired(1029, &datagram(1029, 0)));
         assert!(!order.already_repaired(1029, &datagram(1029, 1)));
         assert!(!order.already_repaired(1029, &datagram(1029, 0).slice(..12)), "header only");
+    }
+
+    /// A sender restarts under a new SSRC and a new FEC encoder (4x4: the
+    /// old stream 1000..=1031, the new one from 1016, behind the newest
+    /// published by less than a matrix) and the link loses the new 1029.
+    /// Its column FEC rebuilds it before 1030, in order within the new
+    /// stream: published, with the new stream's bytes, and every datagram
+    /// published is one its sender sent. The order used to keep the old
+    /// stream's newest number, 1031, and withhold the repair as late.
+    #[test]
+    fn a_sender_restarted_under_a_new_ssrc_has_its_repairs_published() {
+        let from = |ssrc: u8, seqs: std::ops::Range<u16>, content: usize| {
+            let mut enc = FecEncoder::new(4, 4, Arc::new(AtomicU64::new(0)));
+            let mut wire = Vec::new();
+            for seq in seqs {
+                let mut dg = datagram(seq, content).to_vec();
+                dg[11] = ssrc;
+                let fec = enc.process(seq, &dg[12..]);
+                wire.push((Some(seq), Bytes::from(dg)));
+                wire.extend(fec.into_iter().map(|f| (None, f)));
+            }
+            wire
+        };
+        let old = from(7, 1000..1032, 0);
+        let new = from(8, 1016..1048, 1);
+        let wire: Vec<_> = old.iter().cloned().chain(lose(&new, 1029)).collect();
+        let (published, recovered) = single_leg(4, 4, &wire);
+        assert_eq!(recovered, 1, "1029 is rebuilt in order in the new stream");
+        let seqs: Vec<u16> = published.iter().map(|(s, _)| *s).collect();
+        assert_eq!(seqs, (1000..1032).chain(1016..1048).collect::<Vec<_>>());
+        // A rebuilt header takes its timestamp from the input, not the wire.
+        let as_sent = |a: &Bytes, b: &Bytes| a[8..12] == b[8..12] && a[12..] == b[12..];
+        for (i, (seq, data)) in published.iter().enumerate() {
+            let sent = if i < 32 { &old } else { &new };
+            assert!(sent.iter().any(|(s, d)| *s == Some(*seq) && as_sent(d, data)), "{seq} as sent");
+        }
     }
 
     /// `wire` with the media datagram `seq` moved to just after `after`;
