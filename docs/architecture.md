@@ -218,6 +218,9 @@ broadcast IRDs) do not lose lock during a switch:
    later gap downstream (and in the flow's TR 101 290 `cc_errors`) is real
    loss. Until edge#214 it renumbered every payload CC after the first switch
    or source PCR jump, for the rest of the flow, which erased that loss.
+   One exception sits upstream of the fixer: under the default muxer-mode
+   clock (`passthrough_clock` off) the per-input clock rewriter numbers PAT
+   and PMT itself (`stamp_psi_cc`), so loss on those two PIDs never shows.
 
 2. **Per-input PSI caching** — Each input has its own PAT/PMT cache (not
    shared). Passive inputs observe PSI tables while running warm. On switch,

@@ -757,7 +757,7 @@ one holding a non-null packet, also went out without `sender_timestamp_us`,
 so the PLL of an SRT input with `passthrough_clock: true` and no
 `program_number`, `pid_overrides`, `pid_map` or ingress transcode lost its
 sender-timestamp reference for the rest of the flow: it ran on PCR
-(`master_clock.rate_source` read `pcr`), or, on a CBR-padded source whose
+(an internal choice no stats field names), or, on a CBR-padded source whose
 all-null datagrams kept the field, switched between the two and
 re-anchored. On any other SRT input one of those stages, or the muxer-mode
 rewriter that `passthrough_clock: true` turns off, already drops that field
