@@ -1428,7 +1428,13 @@ publishes an Opus-alone SPTS (since 2026-10; the refused video used to be
 counted, naming as PCR_PID a PID nothing was sent on, with no PCR at all). The muxer
 used to assume video and no audio: the Opus of an A/V publish never reached
 the PMT, and an audio-only publish named an absent video PID as PCR_PID and
-carried no PCR. Each track's RTP timestamps start at a random base of the
+carried no PCR. A track the publish negotiated and does not send — a camera offered and
+never sent — leaves the PMT once the other track has run 1 s without it, as
+on a WHEP pull ([below](#whep-input)), the PCR moving to the Opus, and comes
+back with its first frame (since 2026-10: PCR_PID used to name the silent
+video PID, with no PCR at all). A track negotiated after the media began
+joins the PMT with a version bump; audio used to join without one, so a
+receiver holding the PMT by its version never saw it. Each track's RTP timestamps start at a random base of the
 sender's (RFC 3550 §5.1; libwebrtc picks one per SSRC), so muxed as they
 came — the video's raw 90 kHz, the Opus's scaled to 90 kHz — the two were an
 arbitrary distance apart, up to hours, and an A/V publish carried its audio
@@ -1513,8 +1519,14 @@ that is the video, PCR_PID and the PCR move to the Opus. The track's first
 frame brings it back, with another bump, and a track that has sent a frame
 stays. So a pull of a server sending audio alone carries no PCR for its
 first second, and a pull of video alone lists the Opus for its first
-second. An answer that accepts neither track is not connected over: a
-Warning names it, and the pull is tried again after the backoff. Until
+second. An answer that accepts neither track is not connected over, and
+one the WebRTC stack cannot apply fails the pull: either raises a Warning
+`whep_answer_unusable` once per episode (until a pull connects), and the
+pull is tried again after the backoff. However a pull ends — the session
+closes, its handshake or answer fails, the input stops — its resource on the
+server is released with a `DELETE` to the answer's `Location`, in the
+background and bounded to 10 s, so it never holds up the retry; the input
+used to leave every resource to the server's own timeout. Until
 2026-10 the input muxed the video alone, on its raw RTP timestamps: an A/V
 pull lost its audio, and a pull from a server sending no video — another
 edge's WHEP output on an audio-only flow — published nothing, its flow
