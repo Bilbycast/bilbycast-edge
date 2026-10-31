@@ -37,6 +37,7 @@ use crate::util::time::now_us;
 use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
 use super::input_transcode::InputTranscoder;
 use super::packet::RtpPacket;
+use super::ts_parse::is_null_ts_only;
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -51,7 +52,7 @@ const TS_PACKET_SIZE: usize = 188;
 /// Detected payload format inside SRT datagrams.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SrtPayloadFormat {
-    /// Not yet detected — waiting for first packet.
+    /// Not yet detected — waiting for the first packet that can tell.
     Unknown,
     /// RTP/TS per SMPTE ST 2022-2: RTP header (12+ bytes) + TS packets.
     RtpTs,
@@ -61,8 +62,9 @@ enum SrtPayloadFormat {
 }
 
 /// What an SRT input's receive loop carries across reconnects: the payload
-/// format detected on the first packet and the sequence it numbers packets
-/// with, so a reconnect neither re-detects nor restarts the gap check.
+/// format detected on the first packet that can tell and the sequence it
+/// numbers packets with, so a reconnect neither re-detects nor restarts the
+/// gap check.
 struct SrtRecvState {
     format: SrtPayloadFormat,
     last_seq: Option<u16>,
@@ -84,24 +86,52 @@ impl SrtRecvState {
 /// Detect the payload format of an SRT datagram.
 ///
 /// Checks whether the first bytes look like an RTP header (version 2) or
-/// a raw TS sync byte (0x47). If the data starts with 0x47 and its length
-/// is a multiple of 188, it's almost certainly raw TS.
-fn detect_format(data: &[u8]) -> SrtPayloadFormat {
+/// a raw TS sync byte (0x47). If the data starts with 0x47 and is at least
+/// one 188-byte packet long, it's almost certainly raw TS.
+///
+/// `None` for a datagram of NULL packets alone, which decides nothing: a
+/// sender's idle keepalive — a bilbycast flow sends one at its start and
+/// whenever its input falls silent — is raw TS whatever framing its media
+/// takes, so an RTP stream settled by one would publish every later
+/// datagram with its RTP header inside the TS. While the format is
+/// undecided a receive loop drops such a datagram uncounted and waits for
+/// one that can decide it.
+fn detect_format(data: &[u8]) -> Option<SrtPayloadFormat> {
+    if is_null_ts_only(data) {
+        return None;
+    }
     if data.len() < 12 {
-        return SrtPayloadFormat::Unknown;
+        return Some(SrtPayloadFormat::Unknown);
     }
 
     // Check for RTP version 2 header
     if is_likely_rtp(data) {
-        return SrtPayloadFormat::RtpTs;
+        return Some(SrtPayloadFormat::RtpTs);
     }
 
-    // Check for raw TS: starts with sync byte and length is multiple of 188
+    // Check for raw TS: starts with sync byte and holds a whole packet
     if data[0] == TS_SYNC_BYTE && data.len() >= TS_PACKET_SIZE {
-        return SrtPayloadFormat::RawTs;
+        return Some(SrtPayloadFormat::RawTs);
     }
 
-    SrtPayloadFormat::Unknown
+    Some(SrtPayloadFormat::Unknown)
+}
+
+/// Settle a single-socket receive loop's payload format from `data`, a
+/// datagram that arrived while it was still unknown, and log it. Data that
+/// is neither RTP nor raw TS is taken for raw TS. Returns `false`, leaving
+/// the format unknown, for a datagram that cannot decide it
+/// ([`detect_format`]), which the loop then drops.
+fn settle_format(format: &mut SrtPayloadFormat, data: &[u8]) -> bool {
+    let Some(detected) = detect_format(data) else {
+        return false;
+    };
+    log_detected_format(detected);
+    *format = match detected {
+        SrtPayloadFormat::Unknown => SrtPayloadFormat::RawTs,
+        settled => settled,
+    };
+    true
 }
 
 /// Scan a raw-TS or RTP-payload datagram for the first PCR-bearing TS
@@ -714,20 +744,11 @@ async fn srt_input_recv_loop(
                         // emitted RtpPacket below.
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
-                        // Auto-detect format on first packet
+                        // Auto-detect format on the first packet that can
+                        // tell: NULL packets alone are dropped until one does.
                         if *format == SrtPayloadFormat::Unknown {
-                            *format = detect_format(&data);
-                            match *format {
-                                SrtPayloadFormat::RtpTs => {
-                                    tracing::info!("SRT input: detected RTP/TS format (SMPTE ST 2022-2)");
-                                }
-                                SrtPayloadFormat::RawTs => {
-                                    tracing::info!("SRT input: detected raw TS format (OBS/Haivision/srt-live-transmit compatible)");
-                                }
-                                SrtPayloadFormat::Unknown => {
-                                    tracing::warn!("SRT input: unrecognized payload format, treating as raw data");
-                                    *format = SrtPayloadFormat::RawTs;
-                                }
+                            if !settle_format(format, &data) {
+                                continue;
                             }
                             // libsrt's too-late drops then also leave RTP
                             // sequence gaps, which the stats must not count
@@ -840,7 +861,8 @@ fn pair_stale_after_us(leg1: &SrtInputConfig, leg2: &SrtRedundancyConfig) -> u64
 /// For **raw TS** streams there is no sequence number the legs share, so the
 /// input fails over between them ([`RawTsFailover`]), forwarding one leg at a
 /// time, rather than merging. The format is detected once per pair, from the
-/// first packet either leg delivers, and both legs must send it.
+/// first packet either leg delivers that is not NULL packets alone
+/// ([`detect_format`]), and both legs must send it.
 ///
 /// Each leg is accepted or dialled on its own ([`acquire_redundant_leg`]),
 /// both from the start, so either leg alone carries the input. Listener-mode
@@ -1038,7 +1060,11 @@ async fn srt_input_redundant_loop(
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
                         if pair.format == SrtPayloadFormat::Unknown {
-                            pair.format = detect_format(&data);
+                            // NULL packets alone decide nothing (`detect_format`).
+                            let Some(detected) = detect_format(&data) else {
+                                continue;
+                            };
+                            pair.format = detected;
                             log_detected_format_redundant(pair.format, events, flow_id);
                             srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
                         }
@@ -1059,7 +1085,11 @@ async fn srt_input_redundant_loop(
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
                         if pair.format == SrtPayloadFormat::Unknown {
-                            pair.format = detect_format(&data);
+                            // NULL packets alone decide nothing (`detect_format`).
+                            let Some(detected) = detect_format(&data) else {
+                                continue;
+                            };
+                            pair.format = detected;
                             log_detected_format_redundant(pair.format, events, flow_id);
                             srt.pair.set_merged(pair.format == SrtPayloadFormat::RtpTs);
                         }
@@ -1354,10 +1384,10 @@ fn log_detected_format(format: SrtPayloadFormat) {
             tracing::info!("SRT input: detected RTP/TS format (SMPTE ST 2022-2)");
         }
         SrtPayloadFormat::RawTs => {
-            tracing::info!("SRT input: detected raw TS format (OBS/Haivision compatible)");
+            tracing::info!("SRT input: detected raw TS format (OBS/Haivision/srt-live-transmit compatible)");
         }
         SrtPayloadFormat::Unknown => {
-            tracing::warn!("SRT input: unrecognized format, treating as raw data");
+            tracing::warn!("SRT input: unrecognized payload format, treating as raw data");
         }
     }
 }
@@ -1930,9 +1960,8 @@ async fn srt_bonded_group_recv_loop(
                         let srctime_us = pkt.sender_timestamp_us;
                         let data = pkt.data;
                         if *format == SrtPayloadFormat::Unknown {
-                            *format = detect_format(&data);
-                            if *format == SrtPayloadFormat::Unknown {
-                                *format = SrtPayloadFormat::RawTs;
+                            if !settle_format(format, &data) {
+                                continue;
                             }
                             // As in `srt_input_recv_loop`: an RTP payload's
                             // drops are sequence gaps too.
@@ -2126,6 +2155,212 @@ mod tests {
 
     fn free_port() -> u16 {
         std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    /// Seven raw TS packets on PID 0x100: a raw-TS sender's datagram.
+    fn raw_ts_datagram() -> Vec<u8> {
+        let mut d = Vec::with_capacity(7 * TS_PACKET_SIZE);
+        for _ in 0..7 {
+            d.extend_from_slice(&[0x47, 0x01, 0x00, 0x10]);
+            d.extend_from_slice(&[0xFF; 184]);
+        }
+        d
+    }
+
+    /// The flow's idle keepalive, as an SRT output sends it.
+    fn keepalive() -> Vec<u8> {
+        crate::engine::flow::null_ts_packet().data.to_vec()
+    }
+
+    /// NULL packets alone settle no format: the datagram after them does,
+    /// RTP or raw TS, and data that is neither still falls back to raw TS.
+    #[test]
+    fn null_packets_alone_settle_no_format() {
+        assert_eq!(detect_format(&keepalive()), None);
+        assert_eq!(detect_format(&keepalive()[..TS_PACKET_SIZE]), None, "one NULL packet");
+        assert_eq!(detect_format(&rtp_datagram(0)), Some(SrtPayloadFormat::RtpTs));
+        assert_eq!(detect_format(&raw_ts_datagram()), Some(SrtPayloadFormat::RawTs));
+        assert_eq!(detect_format(&[0u8; 64]), Some(SrtPayloadFormat::Unknown));
+
+        for (then, settles) in [
+            (rtp_datagram(0), SrtPayloadFormat::RtpTs),
+            (raw_ts_datagram(), SrtPayloadFormat::RawTs),
+            (vec![0u8; 64], SrtPayloadFormat::RawTs),
+        ] {
+            let mut format = SrtPayloadFormat::Unknown;
+            assert!(!settle_format(&mut format, &keepalive()), "dropped");
+            assert!(!settle_format(&mut format, &keepalive()));
+            assert_eq!(format, SrtPayloadFormat::Unknown);
+            assert!(settle_format(&mut format, &then));
+            assert_eq!(format, settles);
+        }
+    }
+
+    /// A single-socket SRT listener input fed `datagrams` in order by a
+    /// caller, and what it published once `expect` packets were (or 5 s
+    /// passed), plus half a second more to show nothing else comes.
+    async fn published_by_single_input(
+        datagrams: &[Vec<u8>],
+        expect: usize,
+    ) -> (Vec<RtpPacket>, Arc<FlowStatsAccumulator>) {
+        let port = free_port();
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+        flow.set_active_input_id("in");
+        let (tx, mut rx) = broadcast::channel(4096);
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        spawn_srt_input(
+            srt_config(serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            })),
+            tx,
+            flow.clone(),
+            cancel.child_token(),
+            events,
+            "f1".into(),
+            "in".into(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let caller = srt_config(serde_json::json!({
+            "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+        }));
+        let sender = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::srt::connection::connect_srt_input(&caller, &cancel),
+        )
+        .await
+        .expect("caller connects in time")
+        .expect("caller connects");
+        for d in datagrams {
+            sender.send(d).await.expect("caller sends");
+        }
+        let mut published = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while published.len() < expect {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(packet)) => published.push(packet),
+                _ => break,
+            }
+        }
+        while let Ok(Ok(packet)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            published.push(packet);
+        }
+        (published, flow)
+    }
+
+    /// The flow's keepalive reaching an input ahead of an RTP sender's first
+    /// datagram settles nothing: the RTP after it is published as RTP, with
+    /// its header, and no keepalive is published or counted. A keepalive
+    /// once the format is RTP is dropped as before. The input used to settle
+    /// raw TS on it and publish every RTP header inside the TS.
+    #[tokio::test]
+    async fn a_keepalive_ahead_of_rtp_leaves_the_rtp_to_settle_the_format() {
+        let mut datagrams = vec![keepalive(), keepalive()];
+        datagrams.extend((0..5).map(rtp_datagram));
+        datagrams.push(keepalive());
+        datagrams.extend((5..10).map(rtp_datagram));
+        let (published, flow) = published_by_single_input(&datagrams, 10).await;
+        assert_eq!(published.len(), 10, "each RTP datagram, nothing else");
+        for (seq, packet) in published.iter().enumerate() {
+            assert!(!packet.is_raw_ts, "published as RTP");
+            assert_eq!(packet.sequence_number, seq as u16);
+            assert_eq!(&packet.data[..], &rtp_datagram(seq as u16)[..]);
+        }
+        assert_eq!(flow.input_packets.load(Ordering::Relaxed), 10, "keepalives uncounted");
+        assert_eq!(flow.input_loss.load(Ordering::Relaxed), 0);
+    }
+
+    /// The same keepalive ahead of a raw-TS sender's first datagram: the raw
+    /// TS settles the format, and once it has a keepalive is published like
+    /// any raw TS.
+    #[tokio::test]
+    async fn a_keepalive_ahead_of_raw_ts_leaves_the_raw_ts_to_settle_the_format() {
+        let datagrams = [keepalive(), raw_ts_datagram(), keepalive(), raw_ts_datagram()];
+        let (published, flow) = published_by_single_input(&datagrams, 3).await;
+        let got: Vec<&[u8]> = published.iter().map(|p| &p.data[..]).collect();
+        let raw = raw_ts_datagram();
+        let ka = keepalive();
+        assert_eq!(got, [&raw[..], &ka[..], &raw[..]]);
+        assert!(published.iter().all(|p| p.is_raw_ts));
+        assert_eq!(flow.input_packets.load(Ordering::Relaxed), 3);
+    }
+
+    /// A 2022-7 pair whose first datagram is the flow's keepalive, on leg 1,
+    /// settles on the RTP both legs send after it: each seq is published
+    /// once as RTP and no raw-TS failover Warning is raised. It used to
+    /// settle raw TS there, run active-leg failover and publish every RTP
+    /// header inside the TS until both legs dropped.
+    #[tokio::test]
+    async fn a_keepalive_first_on_a_2022_7_pair_leaves_the_rtp_to_settle_the_format() {
+        let (port1, port2) = (free_port(), free_port());
+        let flow = Arc::new(FlowStatsAccumulator::new("f1".into(), "flow-1".into(), "srt".into()));
+        flow.set_active_input_id("pair");
+        let (tx, mut rx) = broadcast::channel(4096);
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let _stop = cancel.clone().drop_guard();
+        spawn_srt_input(
+            srt_config(serde_json::json!({
+                "mode": "listener", "local_addr": format!("127.0.0.1:{port1}"), "latency_ms": 200,
+                "redundancy": {
+                    "mode": "listener", "local_addr": format!("127.0.0.1:{port2}"),
+                    "latency_ms": 200
+                }
+            })),
+            tx,
+            flow.clone(),
+            cancel.child_token(),
+            events,
+            "f1".into(),
+            "pair".into(),
+            Arc::new(AtomicBool::new(false)),
+            None,
+        );
+        let caller = |port: u16| {
+            srt_config(serde_json::json!({
+                "mode": "caller", "remote_addr": format!("127.0.0.1:{port}"), "latency_ms": 200
+            }))
+        };
+        let leg1 = crate::srt::connection::connect_srt_input(&caller(port1), &cancel)
+            .await
+            .expect("leg 1 connects");
+        let leg2 = crate::srt::connection::connect_srt_input(&caller(port2), &cancel)
+            .await
+            .expect("leg 2 connects");
+
+        leg1.send(&keepalive()).await.expect("leg 1 sends");
+        // Delivered a latency after it is sent, well ahead of the RTP.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for seq in 0..20u16 {
+            leg1.send(&rtp_datagram(seq)).await.expect("leg 1 sends");
+            leg2.send(&rtp_datagram(seq)).await.expect("leg 2 sends");
+        }
+
+        let mut published = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while published.len() < 20 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Ok(packet)) => published.push(packet),
+                _ => break,
+            }
+        }
+        while let Ok(Ok(packet)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            published.push(packet);
+        }
+        assert_eq!(published.len(), 20, "each seq once, nothing else");
+        for (seq, packet) in published.iter().enumerate() {
+            assert!(!packet.is_raw_ts, "published as RTP");
+            assert_eq!(&packet.data[..], &rtp_datagram(seq as u16)[..]);
+        }
+        let mut codes = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            if let Some(code) = event.details.as_ref().and_then(|d| d["error_code"].as_str()) {
+                codes.push(code.to_string());
+            }
+        }
+        assert!(!codes.iter().any(|c| c == "redundancy_failover_mode"), "{codes:?}");
     }
 
     fn srt_config(value: serde_json::Value) -> SrtInputConfig {

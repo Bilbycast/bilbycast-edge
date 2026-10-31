@@ -4742,8 +4742,10 @@ const KEEPALIVE_INTERVAL_MS: u64 = 250;
 /// aligner's buffer until a real datagram's worth of bytes accumulated,
 /// which defeats the whole point of a keepalive. Receivers drop NULL
 /// packets per spec; all the keepalive does is keep UDP datagrams
-/// flowing so sockets / decoders don't time out.
-fn null_ts_packet() -> RtpPacket {
+/// flowing so sockets / decoders don't time out. It is raw TS whatever the
+/// active input's framing, so an SRT output sends it only into a raw-TS
+/// stream (`output_srt::KeepaliveGate`).
+pub(crate) fn null_ts_packet() -> RtpPacket {
     const PACKETS: usize = 7;
     const ONE: [u8; 188] = {
         let mut pkt = [0xFFu8; 188];

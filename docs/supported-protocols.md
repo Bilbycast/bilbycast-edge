@@ -40,6 +40,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   - Retransmission bandwidth capping (Token Bucket shaper via `max_rexmit_bw`)
   - SMPTE 2022-7 hitless redundancy merge (dual-leg input)
   - Automatic reconnection
+  - **Payload format auto-detection** — RTP/TS (SMPTE ST 2022-2, an RTP version 2 header) or raw TS (at least 188 bytes starting with the 0x47 sync byte), settled once, on the first datagram that can tell, and kept across reconnects (a 2022-7 pair settles once per pair, afresh only after both legs are lost). A datagram made only of NULL-PID (0x1FFF) packets cannot tell — it is a sender's idle keepalive, raw TS whatever framing the media takes — so until the format is settled such datagrams are dropped, uncounted, and the next datagram decides. Data that is neither is taken for raw TS (on a 2022-7 pair it is forwarded through the raw-TS failover and the next datagram is looked at again). Once settled, an RTP/TS input drops any datagram that is not RTP. Until 2026-10 a keepalive arriving first settled raw TS, and every RTP datagram after it was published with its RTP header inside the TS
   - **`transport_mode: "audio_302m"`** (deferred — see [audio-gateway.md](audio-gateway.md#limitations-and-deferred-items)): demux SMPTE 302M LPCM-in-MPEG-TS from `ffmpeg -c:a s302m`, `srt-live-transmit`, or hardware encoders, and republish as RTP audio packets onto the broadcast channel
 
 ### RIST Simple Profile (VSF TR-06-1:2020)
@@ -183,6 +184,7 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
   - SMPTE 2022-7 hitless redundancy duplication (dual-leg output)
   - Non-blocking mpsc bridge prevents TCP backpressure from affecting other outputs
   - Automatic reconnection
+  - Sends each packet in the framing it reached the flow in (an RTP input's with its RTP header, raw TS as raw TS; raw TS whenever the output transcodes, except during a listener-mode output's liveness probe, which sends what the flow publishes untranscoded). The flow's idle keepalive — seven NULL-PID packets, raw TS, sent while the active input is silent — goes out only once the last media datagram this output sent was raw TS: never into an RTP-framed stream, and not before the first media datagram, when the framing is still unknown (per connection; for the life of the output on a 2022-7 output). SRT keeps the connection up with its own transport keepalive meanwhile. Until 2026-10 the keepalive went out whatever the framing, and a receiver that settles its format on the first datagram could take a keepalive arriving first for the stream's framing
   - **MPTS passthrough** (default) or optional MPTS→SPTS program filter via `program_number`
   - **`transport_mode: "audio_302m"`**: when the upstream input is an
     audio essence, run the per-output transcode (force 48 kHz, even

@@ -88,6 +88,20 @@ pub fn set_discontinuity_indicator(pkt: &mut [u8]) -> bool {
     true
 }
 
+/// Whether `data` is raw TS made of NULL-PID (0x1FFF) packets and nothing
+/// else: one or more whole 188-byte packets, each starting with the sync
+/// byte. Such a datagram carries nothing — it is the flow's idle keepalive
+/// (`flow::null_ts_packet`) or a padder's stuffing — so it says nothing
+/// about how the stream is framed. It is never an RTP datagram: 0x47 reads
+/// as RTP version 1.
+pub fn is_null_ts_only(data: &[u8]) -> bool {
+    !data.is_empty()
+        && data.len().is_multiple_of(TS_PACKET_SIZE)
+        && data
+            .chunks_exact(TS_PACKET_SIZE)
+            .all(|pkt| pkt[0] == TS_SYNC_BYTE && ts_pid(pkt) == NULL_PID)
+}
+
 /// Scan a raw TS buffer (one or more aligned 188-byte packets) and return
 /// the PCR carried by the **first** PCR-bearing packet, in 27 MHz ticks.
 ///
@@ -2054,6 +2068,37 @@ mod tests {
         let d = [0x6A, 0x40, 0x00];
         assert_eq!(descriptor_audio_kind(&d), None);
         assert!(!descriptors_indicate_text_service(&[0x56, 0x40, 0x00]));
+    }
+
+    /// The flow's keepalive and a lone NULL packet are NULL-only; one other
+    /// PID, a broken sync byte, a partial packet or an RTP header is not.
+    #[test]
+    fn null_ts_only_is_whole_null_packets_and_nothing_else() {
+        let null = |pid: u16| {
+            let mut p = [0xFFu8; TS_PACKET_SIZE];
+            p[0] = TS_SYNC_BYTE;
+            p[1] = (pid >> 8) as u8 & 0x1F;
+            p[2] = pid as u8;
+            p[3] = 0x10;
+            p
+        };
+        let keepalive = crate::engine::flow::null_ts_packet();
+        assert!(keepalive.is_raw_ts);
+        assert!(is_null_ts_only(&keepalive.data), "the flow's keepalive");
+        assert!(is_null_ts_only(&null(NULL_PID)));
+
+        let mut mixed = null(NULL_PID).to_vec();
+        mixed.extend_from_slice(&null(0x100));
+        assert!(!is_null_ts_only(&mixed), "a media packet among the nulls");
+        let mut unsynced = null(NULL_PID);
+        unsynced[0] = 0x00;
+        assert!(!is_null_ts_only(&unsynced));
+        assert!(!is_null_ts_only(&null(NULL_PID)[..100]), "a partial packet");
+        assert!(!is_null_ts_only(&[]));
+        // An RTP datagram whose payload is NULL packets is RTP-framed.
+        let mut rtp = vec![0x80, 33, 0, 1, 0, 0, 0, 90, 0, 0, 0, 1];
+        rtp.extend_from_slice(&null(NULL_PID));
+        assert!(!is_null_ts_only(&rtp));
     }
 }
 
