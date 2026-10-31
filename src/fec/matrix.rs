@@ -11,6 +11,36 @@
 //!
 //! Column FEC covers D packets in the same column (stride L).
 //! Row FEC covers L packets in the same row (stride 1).
+//!
+//! Which matrix a packet belongs to, and where in it, is decided by
+//! [`FecMatrix::place`], the one placement rule the encoder and the decoder
+//! share.
+
+/// Where the placement rule shared by [`super::encoder::FecEncoder`] and
+/// [`super::decoder::FecDecoder`] puts a media packet, relative to the open
+/// matrix. Both ends run it on the packets they see, so with nothing lost or
+/// reordered between them they hold the same matrices; what the link
+/// changes, the SNBase in each FEC header reconciles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// Inside the window: the cell at `seq - SNBase`.
+    Cell(usize),
+    /// Behind SNBase by fewer cells than the matrix holds (the field): a
+    /// packet reordered on its way, or the first of a sender's restart a
+    /// few numbers back. It never starts a new matrix, which would drop the
+    /// open one's cells and the FEC still to come for them (edge#214). The
+    /// encoder sends it unprotected; the decoder may move SNBase back onto
+    /// it ([`FecMatrix::can_move_back`]) and otherwise hands it back unfiled.
+    Late(u16),
+    /// Past the window: starts the next matrix at its own number. The
+    /// window it leaves ends where the next matrix's late packets stop.
+    Past,
+    /// A whole matrix or more behind SNBase: a stream that moved (a sender
+    /// restarted on an earlier number). Starts the next matrix at its own
+    /// number, with nothing behind it to tell a late packet by.
+    Moved,
+}
+
 /// L x D matrix for FEC computation.
 ///
 /// Stores media packet payloads in a flat `Vec<Option<Vec<u8>>>` indexed by
@@ -96,6 +126,40 @@ impl FecMatrix {
         let col = (position % self.columns as usize) as u8;
         let row = (position / self.columns as usize) as u8;
         (col, row)
+    }
+
+    /// Where `seq` goes relative to this matrix when its SNBase is `base`
+    /// (see [`Placement`]).
+    pub fn place(&self, base: u16, seq: u16) -> Placement {
+        let size = self.size() as u16;
+        let ahead = seq.wrapping_sub(base);
+        if ahead < size {
+            return Placement::Cell(ahead as usize);
+        }
+        if ahead < 0x8000 {
+            return Placement::Past;
+        }
+        let behind = base.wrapping_sub(seq);
+        if behind < size { Placement::Late(behind) } else { Placement::Moved }
+    }
+
+    /// Whether the decoder's SNBase can move back onto a late packet `seq`,
+    /// `behind` cells before it, as far as the matrix goes (the decoder
+    /// adds its own conditions, in `FecDecoder::take_late`):
+    ///
+    /// - `seq` is not behind `floor`, where the previous matrix's window
+    ///   ended when the open matrix followed it: a packet behind that is a
+    ///   straggler from the previous matrix, not this one's first.
+    /// - Every packet the matrix holds stays inside the window, and the
+    ///   last cell stays empty, so the move never fills the matrix (closing
+    ///   it before its FEC has come) nor puts the next packet past it.
+    pub fn can_move_back(&self, seq: u16, behind: u16, floor: Option<u16>) -> bool {
+        floor.is_none_or(|f| seq.wrapping_sub(f) < 0x8000)
+            && self
+                .cells
+                .iter()
+                .rposition(Option::is_some)
+                .is_none_or(|last| last + behind as usize + 1 < self.size())
     }
 
     /// Clear the matrix for the next cycle.

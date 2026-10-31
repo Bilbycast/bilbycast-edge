@@ -404,8 +404,10 @@ impl RepairOrder {
 /// duplicate of something already published or deliberately withheld, and
 /// is dropped; so is the late original of a repair published from a matrix
 /// the decoder has since closed (matched on its bytes too, so new content
-/// under that number is published). Returns the number of rebuilt packets
-/// published.
+/// under that number is published). A duplicate never reaches the decoder,
+/// which learns nothing from it: the late original of a closed matrix's
+/// repair used to start a new matrix there, discarding the open one's cells
+/// and FEC (edge#214). Returns the number of rebuilt packets published.
 fn publish_fec_media(
     decoder: &mut FecDecoder,
     order: &mut RepairOrder,
@@ -414,11 +416,11 @@ fn publish_fec_media(
     data: &Bytes,
     mut publish: impl FnMut(RtpPacket),
 ) -> u64 {
-    let duplicate = decoder.holds_payload(seq, data) || order.already_repaired(seq, data);
+    if decoder.holds_payload(seq, data) || order.already_repaired(seq, data) {
+        return 0;
+    }
     let mut packets = decoder.process_media(seq, ts, data).into_iter();
-    if let Some(received) = packets.next()
-        && !duplicate
-    {
+    if let Some(received) = packets.next() {
         order.received(seq);
         publish(received);
     }
@@ -1277,6 +1279,49 @@ mod tests {
         assert!(order.already_repaired(1029, &datagram(1029, 0)));
         assert!(!order.already_repaired(1029, &datagram(1029, 1)));
         assert!(!order.already_repaired(1029, &datagram(1029, 0).slice(..12)), "header only");
+    }
+
+    /// `wire` with the media datagram `seq` moved to just after `after`;
+    /// every FEC datagram stays where it was sent.
+    fn delay(wire: &mut Vec<(Option<u16>, Bytes)>, seq: u16, after: u16) {
+        let late = wire.remove(wire.iter().position(|(s, _)| *s == Some(seq)).unwrap());
+        let at = wire.iter().position(|(s, _)| *s == Some(after)).unwrap();
+        wire.insert(at + 1, late);
+    }
+
+    /// edge#214's reproductions, 4x4 with 28 (the second matrix's last
+    /// row) lost: 13 arriving after 17, and 15 after 16. FEC rebuilds the
+    /// late packet in order before it arrives; its original, a duplicate,
+    /// is dropped without reaching the decoder, and in any case is behind
+    /// where its matrix ended, so the open matrix keeps 16 and 17 and
+    /// column 0's FEC rebuilds 28 in order. The late original used to
+    /// start a new matrix at itself, and 28 went unpublished.
+    #[test]
+    fn a_late_original_leaves_the_next_matrix_alone() {
+        for (late, after) in [(13u16, 17u16), (15, 16)] {
+            let mut wire = lose(&sent(4, 4, 0..48), 28);
+            delay(&mut wire, late, after);
+            let (published, recovered) = single_leg(4, 4, &wire);
+            let seqs: Vec<u16> = published.iter().map(|(s, _)| *s).collect();
+            assert_eq!(seqs, (0..48).collect::<Vec<_>>(), "{late} after {after}");
+            assert_eq!(recovered, 2, "{late} and 28");
+        }
+    }
+
+    /// A matrix's own first packet arriving after its second (16 after 17,
+    /// with 28 and 29 lost) is published as it comes and moves the
+    /// matrix's SNBase back onto itself, so both last-row losses are
+    /// rebuilt in order. It used to start a new matrix, dropping 17, and
+    /// 29 went unpublished.
+    #[test]
+    fn a_late_first_packet_keeps_its_matrix_repairing() {
+        let mut wire = lose(&lose(&sent(4, 4, 0..48), 28), 29);
+        delay(&mut wire, 16, 17);
+        let (published, recovered) = single_leg(4, 4, &wire);
+        let seqs: Vec<u16> = published.iter().map(|(s, _)| *s).collect();
+        let expect: Vec<u16> = (0..16).chain([17, 16]).chain(18..48).collect();
+        assert_eq!(seqs, expect);
+        assert_eq!(recovered, 2);
     }
 
     /// The network swaps a last-row datagram and the column FEC right after
