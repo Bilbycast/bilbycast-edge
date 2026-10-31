@@ -605,6 +605,28 @@ impl std::fmt::Debug for AudioEncoder {
     }
 }
 
+/// One fdk-aac 7.1 ADTS frame, its layout made explicit. fdk's 7.1 mode
+/// (`MODE_7_1_BACK`) is channel configuration 12, which the 3-bit ADTS field
+/// cannot hold: fdk writes it masked, as 4 (4.0), and no
+/// program_config_element (it writes one only for channel configuration 0),
+/// so every 7.1 AAC target — the TS replacer, HLS, CMAF, RTMP — told its
+/// receivers 4.0 over five channel elements. The frame is rewritten to
+/// channel configuration 0 with the PCE fdk itself writes for that mode
+/// where it writes one (`aac_config::pce_7_1_back`: centre, front pair,
+/// surround pair, rear pair, LFE — the element tags its raw_data_block
+/// carries), in every frame: ADTS has no other place for the layout, and a
+/// decoder joining mid-stream needs it at once. Nine bytes a frame. A frame
+/// of another shape (a CRC) is left as it was.
+#[cfg(feature = "fdk-aac")]
+fn with_7_1_layout(frame: Vec<u8>) -> Vec<u8> {
+    if frame.len() < 7 {
+        return frame;
+    }
+    let (profile, sr_idx) = (frame[2] >> 6, (frame[2] >> 2) & 0x0F);
+    let pce = crate::engine::aac_config::pce_7_1_back(profile, sr_idx);
+    crate::engine::aac_config::adts_with_pce(&frame, &pce).unwrap_or(frame)
+}
+
 impl AudioEncoder {
     /// Spawn the encoder. For AAC codecs with the `fdk-aac` feature enabled,
     /// uses an in-process fdk-aac encoder (no subprocess, no ffmpeg required).
@@ -1039,8 +1061,13 @@ impl AudioEncoder {
                             let current_pts =
                                 pts_90k.saturating_add(*samples_since_anchor * 90_000 / sr);
                             *samples_since_anchor += encoded.num_samples as u64;
+                            let data = if self.params.target_channels == 8 {
+                                with_7_1_layout(encoded.bytes)
+                            } else {
+                                encoded.bytes
+                            };
                             output_queue.push_back(EncodedFrame {
-                                data: Bytes::from(encoded.bytes),
+                                data: Bytes::from(data),
                                 pts: current_pts,
                             });
                             self.encode_stats.inc_submitted();
@@ -2738,6 +2765,61 @@ mod input_clock_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// edge#210: fdk's 7.1 is channel configuration 12, which ADTS cannot
+    /// hold — every 7.1 AAC frame went out saying 4 (4.0), with no PCE. Each
+    /// frame now says 0 and opens with the PCE fdk writes for that layout
+    /// (centre, front pair, surround pair, rear pair, LFE), so its
+    /// configuration names eight channels and the frames decode. fdk's own
+    /// decoder downmixes anything wider than six channels by default, so it
+    /// hands out 5.1 here; ffmpeg decodes these frames as 7.1, each input on
+    /// its own channel in WAV order (checked by hand, not here: no ADTS
+    /// decoder but fdk is linked into the edge).
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn a_7_1_aac_frame_carries_its_layout() {
+        let mut enc = AudioEncoder::spawn(
+            EncoderParams {
+                codec: AudioCodec::AacLc,
+                sample_rate: 48_000,
+                channels: 8,
+                target_bitrate_kbps: 448,
+                target_sample_rate: 48_000,
+                target_channels: 8,
+                opus_vbr_mode: None,
+                opus_fec: false,
+                opus_dtx: false,
+                opus_frame_duration_ms: None,
+            },
+            CancellationToken::new(),
+            "f".into(),
+            "o".into(),
+            Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "ts".into())),
+            None,
+        )
+        .expect("an 8-channel fdk encoder");
+        let tone = |ch: usize, k: usize| -> Vec<f32> {
+            let f = 300.0 + 200.0 * ch as f32;
+            (0..1024).map(|i| 0.2 * (2.0 * std::f32::consts::PI * f * (k * 1024 + i) as f32 / 48_000.0).sin()).collect()
+        };
+        for k in 0..24 {
+            let planar: Vec<Vec<f32>> = (0..8).map(|ch| tone(ch, k)).collect();
+            assert!(enc.submit_planar(&planar, k as u64 * 1_920));
+        }
+        let frames: Vec<EncodedFrame> = enc.drain().into_iter().filter(|f| !f.data.is_empty()).collect();
+        assert!(frames.len() >= 20, "{} frames", frames.len());
+        let mut dec = aac_audio::AacDecoder::open_adts().expect("an ADTS decoder");
+        for (i, f) in frames.iter().enumerate() {
+            let (au, (profile, sr_idx, ch_cfg)) =
+                crate::engine::audio_au::adts_access_unit(&f.data).expect("one whole ADTS frame");
+            assert_eq!(ch_cfg, 0, "frame {i}: channel configuration 0, not 12 masked to 4");
+            let cfg = crate::engine::aac_config::AacConfig::from_adts(profile, sr_idx, ch_cfg, au)
+                .unwrap_or_else(|| panic!("frame {i}: its raw_data_block opens with the PCE"));
+            assert_eq!(cfg.channels(), 8, "frame {i}: the PCE names eight channels");
+            let pcm = dec.decode_frame(&f.data).unwrap_or_else(|e| panic!("frame {i}: {e}"));
+            assert_eq!(pcm.planar.len(), 6, "frame {i}: fdk's default downmix of 7.1");
+        }
+    }
 
     #[test]
     fn parse_codec_round_trip() {

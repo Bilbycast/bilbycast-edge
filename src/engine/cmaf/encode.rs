@@ -38,6 +38,8 @@ use anyhow::{Result, bail};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::models::{AudioEncodeConfig, VideoEncodeConfig};
+use crate::engine::aac_config::{AacConfig, ProgramConfig, pce_7_1_back};
+use crate::engine::audio_au::adts_access_unit;
 use crate::engine::audio_decode::AacDecoder;
 use crate::engine::audio_encode::{
     AudioCodec, AudioEncoder, EncoderInputClock, EncoderParams, Placement, SOURCE_PTS_SLACK_TICKS,
@@ -84,12 +86,18 @@ pub struct AudioReencoder {
     /// picture's lead over the audio silence stops short by — the placement
     /// rule the RTMP output shares (`audio_encode::EncoderInputClock`).
     input: EncoderInputClock,
+    /// What the encoder emits, read off its first frame's ADTS header
+    /// ([`Self::encoder_track`]): for HE-AAC the core rate, SBR / PS
+    /// implicit; for 7.1 the program_config_element. `None` until a frame
+    /// is out.
+    emitted: Option<AacConfig>,
 }
 
 struct LazyAudioInit {
-    /// ADTS config tuple cached by the demuxer. `None` until first
-    /// AAC frame observed.
-    adts_config: Option<(u8, u8, u8)>,
+    /// The source's configuration as the demuxer caches it — a
+    /// PCE-signalled source's with its program_config_element. `None` until
+    /// the first AAC frame (and, for such a source, its layout) observed.
+    source_config: Option<AacConfig>,
 }
 
 impl AudioReencoder {
@@ -172,13 +180,14 @@ impl AudioReencoder {
             }),
             layout: None,
             layout_in: (0, 0),
-            lazy_init_params: LazyAudioInit { adts_config: None },
+            lazy_init_params: LazyAudioInit { source_config: None },
             flow_id: flow_id.to_string(),
             output_id: output_id.to_string(),
             cancel: cancel.clone(),
             out_stats,
             silence,
             input: EncoderInputClock::default(),
+            emitted: None,
         })
     }
 
@@ -196,28 +205,29 @@ impl AudioReencoder {
         self.silence.as_ref().map(|sg| sg.chunk_duration())
     }
 
-    /// AudioSpecificConfig tuple `(profile, sr_index, ch_cfg)` describing
-    /// what the encoder emits, once it exists: its target rate and layout,
-    /// which a source at any other rate or layout is converted to. `None`
-    /// before the first frame has built it, or for a target rate with no
-    /// ADTS index.
-    pub fn encoder_track(&self) -> Option<(u8, u8, u8)> {
-        let p = self.encoder.as_ref()?.params();
-        let sr_idx = crate::engine::audio_decode::sr_index_from_hz(p.target_sample_rate)?;
-        Some((1, sr_idx, p.target_channels))
+    /// The configuration of what the encoder emits — its target rate and
+    /// layout, which a source at any other rate or layout is converted to —
+    /// as its first frame's ADTS header names it: for HE-AAC the core (24
+    /// kHz for a 48 kHz target, v2's mono), SBR / PS signalled implicitly,
+    /// as a passed-through HE-AAC source's track says; for 7.1, channel
+    /// configuration 0 and the program_config_element. `None` until a frame
+    /// is out. It used to be the target rate and channels under AAC-LC, so
+    /// an HE-AAC track's init announced 48 kHz LC over SBR frames.
+    pub fn encoder_track(&self) -> Option<AacConfig> {
+        self.emitted.clone()
     }
 
-    /// AudioSpecificConfig tuple `(profile, sr_index, ch_cfg)` for the
-    /// silent-fallback track, so the caller can eagerly build the
-    /// CMAF `AudioSegmenter` before any source audio arrives. `None`
-    /// unless `silent_fallback` is active OR the declared sample_rate
-    /// isn't a standard ADTS-indexed rate.
-    pub fn silent_fallback_track(&self) -> Option<(u8, u8, u8)> {
-        let sr = self.target_sample_rate.unwrap_or(48_000);
-        let ch = self.target_channels.unwrap_or(2);
-        let sr_idx = crate::engine::audio_decode::sr_index_from_hz(sr)?;
+    /// The configuration of the silent-fallback track, so the caller can
+    /// build the CMAF `AudioSegmenter` before any source audio — or any
+    /// encoded frame — exists: what the eager encoder will emit
+    /// ([`expected_adts_config`] of its codec, rate and layout). Its rate and
+    /// layout are the encoder's own, which the declared ones are clamped to
+    /// (stereo at most), and every later rebuild keeps them. `None` unless
+    /// `silent_fallback` is active, or for a rate with no ADTS index.
+    pub fn silent_fallback_track(&self) -> Option<AacConfig> {
         self.silence.as_ref()?;
-        Some((1, sr_idx, ch))
+        let p = self.encoder.as_ref()?.params();
+        expected_adts_config(p.codec, p.target_sample_rate, p.target_channels)
     }
 
     /// Where on the source's timeline the encoder's next input sample
@@ -304,9 +314,7 @@ impl AudioReencoder {
                 break;
             }
             self.input.mark_silence();
-            while let Some(f) = enc.try_recv() {
-                out.push((f.data.to_vec(), f.pts));
-            }
+            take_encoded(enc, &mut self.emitted, &self.output_id, &mut out);
         }
         Ok(out)
     }
@@ -347,9 +355,7 @@ impl AudioReencoder {
                     } else {
                         self.input.refused();
                     }
-                    while let Some(f) = enc.try_recv() {
-                        out.push((f.data.to_vec(), f.pts));
-                    }
+                    take_encoded(enc, &mut self.emitted, &self.output_id, out);
                 }
             }
             Placement::Submit { reanchor: false } | Placement::Skip => {}
@@ -506,14 +512,15 @@ impl AudioReencoder {
     pub fn encode_aac_frame(&mut self, frame: &[u8], pts: u64) -> Result<Vec<(Vec<u8>, u64)>> {
         // Lazy decoder / encoder construction — we can't initialise
         // either until we know the source sample rate + channels, which
-        // come from the demuxer-cached ADTS config. The caller passes
-        // the tuple via `set_adts_config` before the first frame.
+        // come from the demuxer-cached configuration. The caller passes it
+        // via `set_source_config` before the first frame.
         if self.decoder.is_none() {
-            let (profile, sr_idx, ch_cfg) = self
+            let source = self
                 .lazy_init_params
-                .adts_config
-                .ok_or_else(|| anyhow::anyhow!("audio re-encoder: ADTS config not set"))?;
-            let dec = AacDecoder::from_adts_config(profile, sr_idx, ch_cfg)
+                .source_config
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("audio re-encoder: AAC config not set"))?;
+            let dec = AacDecoder::from_config(source)
                 .map_err(|e| anyhow::anyhow!("AacDecoder open failed: {e}"))?;
             self.decoder = Some(dec);
         }
@@ -554,16 +561,17 @@ impl AudioReencoder {
         } else {
             self.input.refused();
         }
-        while let Some(frame) = enc.try_recv() {
-            out.push((frame.data.to_vec(), frame.pts));
-        }
+        take_encoded(enc, &mut self.emitted, &self.output_id, &mut out);
         Ok(out)
     }
 
-    /// Tell the re-encoder the ADTS parameters observed by the demuxer
-    /// so the lazy AacDecoder construction can succeed.
-    pub fn set_adts_config(&mut self, profile: u8, sr_idx: u8, ch_cfg: u8) {
-        self.lazy_init_params.adts_config = Some((profile, sr_idx, ch_cfg));
+    /// Tell the re-encoder the source configuration observed by the
+    /// demuxer so the lazy AacDecoder construction can succeed — for a
+    /// PCE-signalled source (channel configuration 0) the configuration
+    /// with its program_config_element, which the decoder reads the layout
+    /// from.
+    pub fn set_source_config(&mut self, source: AacConfig) {
+        self.lazy_init_params.source_config = Some(source);
     }
 
     /// Encode a planar f32 PCM frame that the caller has already decoded
@@ -586,6 +594,61 @@ impl AudioReencoder {
         }
         self.ensure_encoder_for(source_sr, source_ch, pts)?;
         self.submit_real(planar, pts)
+    }
+}
+
+/// Move what `enc` has encoded into `out` as `(access unit, pts)`: each
+/// frame's raw access unit, its ADTS header taken off
+/// ([`adts_access_unit`]), as an MP4 sample carries it, and the first
+/// frame's configuration recorded in `emitted` ([`AudioReencoder::encoder_track`]).
+/// Each sample used to keep the encoder's ADTS header inside the `mdat`,
+/// which a decoder configured from the `esds` reads as the start of the raw
+/// data block — the RTMP output's edge#210 defect, on CMAF. A frame that is
+/// not one whole ADTS frame has no access unit to carry and is dropped, as
+/// the RTMP output drops it (said once: a property of the build's encoder).
+fn take_encoded(enc: &mut AudioEncoder, emitted: &mut Option<AacConfig>, output_id: &str, out: &mut Vec<(Vec<u8>, u64)>) {
+    while let Some(frame) = enc.try_recv() {
+        // fdk may hand back an empty frame while it primes: nothing to carry.
+        if frame.data.is_empty() {
+            continue;
+        }
+        let Some((au, (profile, sr_idx, ch_cfg))) = adts_access_unit(&frame.data) else {
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!("CMAF output '{output_id}': an encoded AAC frame is not one whole ADTS frame, dropped");
+            }
+            continue;
+        };
+        if emitted.is_none() {
+            // A 7.1 frame opens with its PCE (`audio_encode` puts it there),
+            // so the first frame names the whole configuration.
+            *emitted = AacConfig::from_adts(profile, sr_idx, ch_cfg, au);
+        }
+        out.push((au.to_vec(), frame.pts));
+    }
+}
+
+/// The configuration an in-process AAC encoder of `codec` at `sample_rate`
+/// and `channels` writes in its ADTS headers, before it has written any —
+/// what a track built ahead of the first frame must announce. ADTS signals
+/// SBR / PS implicitly, so HE-AAC names AAC-LC at its core, half the rate
+/// (fdk runs SBR dual-rate), and v2 its mono core; 7.1 is channel
+/// configuration 0 with the program_config_element `audio_encode` puts in
+/// each frame (`aac_config::pce_7_1_back`). `None` for a codec that is not
+/// AAC or a rate or layout ADTS cannot name. Pinned to fdk's own headers by
+/// a test.
+pub fn expected_adts_config(codec: AudioCodec, sample_rate: u32, channels: u8) -> Option<AacConfig> {
+    let (core_rate, core_channels) = match codec {
+        AudioCodec::AacLc => (sample_rate, channels),
+        AudioCodec::HeAacV1 => (sample_rate / 2, channels),
+        AudioCodec::HeAacV2 => (sample_rate / 2, 1),
+        _ => return None,
+    };
+    let sr_idx = crate::engine::audio_decode::sr_index_from_hz(core_rate)?;
+    match core_channels {
+        1..=6 => AacConfig::new(1, sr_idx, core_channels),
+        8 => ProgramConfig::from_raw_data_block(&pce_7_1_back(1, sr_idx)).map(|pce| AacConfig::with_pce(1, sr_idx, pce)),
+        _ => None,
     }
 }
 
@@ -1075,6 +1138,82 @@ mod reencoder_tests {
         }
     }
 
+    /// What an in-process AAC encoder writes in its ADTS headers is what a
+    /// track built before its first frame announces
+    /// ([`expected_adts_config`], the silent-fallback track's source): for
+    /// HE-AAC the core, half the rate, v2's mono core; 7.1 as channel
+    /// configuration 0 with its PCE. Read off fdk's own first frame, for
+    /// each codec at the rates and layouts it opens at.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn the_expected_adts_config_is_what_the_encoder_writes() {
+        use crate::stats::collector::OutputStatsAccumulator;
+        let cases: [(AudioCodec, &[u32], &[u8]); 3] = [
+            (AudioCodec::AacLc, &[48_000, 44_100, 32_000, 24_000, 16_000], &[1, 2, 6, 8]),
+            (AudioCodec::HeAacV1, &[48_000, 44_100, 32_000], &[1, 2]),
+            (AudioCodec::HeAacV2, &[48_000, 44_100, 32_000], &[2]),
+        ];
+        for (codec, rates, layouts) in cases {
+            for &rate in rates {
+                for &channels in layouts {
+                    let what = format!("{} {rate} Hz {channels} ch", codec.as_str());
+                    let mut enc = AudioEncoder::spawn(
+                        EncoderParams {
+                            codec,
+                            sample_rate: rate,
+                            channels,
+                            target_bitrate_kbps: codec.default_bitrate_kbps() * u32::from(channels.max(2)) / 2,
+                            target_sample_rate: rate,
+                            target_channels: channels,
+                            opus_vbr_mode: None,
+                            opus_fec: false,
+                            opus_dtx: false,
+                            opus_frame_duration_ms: None,
+                        },
+                        CancellationToken::new(),
+                        "f".into(),
+                        "o".into(),
+                        Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "cmaf".into())),
+                        None,
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+                    let silence = vec![vec![0.0f32; 1024]; channels as usize];
+                    let mut first = None;
+                    for k in 0..16u64 {
+                        enc.submit_planar(&silence, k * 1_920);
+                        if let Some(f) = std::iter::from_fn(|| enc.try_recv()).find(|f| !f.data.is_empty()) {
+                            first = Some(f);
+                            break;
+                        }
+                    }
+                    let frame = first.unwrap_or_else(|| panic!("{what}: no frame"));
+                    let (au, (profile, sr_idx, ch_cfg)) = adts_access_unit(&frame.data).expect("one whole ADTS frame");
+                    assert_eq!(
+                        AacConfig::from_adts(profile, sr_idx, ch_cfg, au),
+                        expected_adts_config(codec, rate, channels),
+                        "{what}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The silent-fallback track is the eager encoder's format, which the
+    /// declared one is clamped to (stereo at most): a declared 5.1 used to
+    /// build a six-channel track over the stereo the encoder emits. HE-AAC
+    /// announces its core.
+    #[test]
+    #[cfg(feature = "fdk-aac")]
+    fn the_silent_fallback_track_is_the_eager_encoders_format() {
+        let cancel = CancellationToken::new();
+        let mut six = ae("aac_lc", true);
+        six.channels = Some(6);
+        let r = AudioReencoder::new(&six, None, &cancel, "o", "f").expect("eager encoder");
+        assert_eq!(r.silent_fallback_track(), AacConfig::new(1, 3, 2), "stereo, as the encoder");
+        let r = AudioReencoder::new(&ae("he_aac_v1", true), None, &cancel, "o", "f").expect("eager encoder");
+        assert_eq!(r.silent_fallback_track(), AacConfig::new(1, 6, 2), "HE-AAC: the 24 kHz core");
+    }
+
     #[test]
     fn silent_fallback_off_defers_encoder() {
         let cancel = CancellationToken::new();
@@ -1112,7 +1251,7 @@ mod reencoder_tests {
         );
         let track = r.silent_fallback_track().expect("default sr has ADTS index");
         // profile=1 (AAC-LC), sr_idx=3 (48000 Hz), ch_cfg=2.
-        assert_eq!(track, (1, 3, 2));
+        assert_eq!(track, AacConfig::new(1, 3, 2).unwrap());
     }
 
     /// Silence is laid down to where the audio would be — the picture less

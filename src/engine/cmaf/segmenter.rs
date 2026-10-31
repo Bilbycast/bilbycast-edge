@@ -1397,7 +1397,7 @@ mod tests {
     /// itself it must be retained — the muxed fragment is built from it.
     #[test]
     fn audio_segmenter_sheds_only_after_the_buffer_cap() {
-        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
+        let a = AudioTrack::aac(vec![0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         let data = vec![0xFF; 200];
         let mut seg = None;
@@ -1425,7 +1425,7 @@ mod tests {
     /// segment closes and the muxed fragment drains it.
     #[test]
     fn audio_survives_until_the_video_boundary_drains_it() {
-        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
+        let a = AudioTrack::aac(vec![0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         // 2 s of AAC at 48 kHz: 1024 samples per frame, 1920 ticks of 90 kHz.
         // 98 frames is 2.09 s — the video segment closes on the first IDR at
@@ -1454,7 +1454,7 @@ mod tests {
     /// draining past the boundary gives the last sample a zero duration.
     #[test]
     fn audio_split_anchors_on_its_own_first_sample() {
-        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
+        let a = AudioTrack::aac(vec![0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         // 10 frames on the 1024-sample grid: DTS 0, 1024, ... 9216.
         for i in 0..10u64 {
@@ -1499,7 +1499,7 @@ mod tests {
     /// deliberately off the audio grid — that misalignment is the whole point.
     #[test]
     fn consecutive_audio_fragments_leave_no_seam() {
-        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
+        let a = AudioTrack::aac(vec![0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         for i in 0..120u64 {
             s.push(&[0xFF; 200], i * 1920); // 1024 samples @48k == 1920 ticks @90k
@@ -1543,7 +1543,7 @@ mod tests {
     #[test]
     fn a_last_frame_with_no_successor_runs_one_frame() {
         for (rate, samples_per_frame) in [(48_000u32, 1024u64), (44_100, 1024)] {
-            let a = AudioTrack::aac([0x11, 0x90], rate, 2, 128_000);
+            let a = AudioTrack::aac(vec![0x11, 0x90], rate, 2, 128_000);
             let mut s = AudioSegmenter::new(a, 2.0);
             let ticks_per_frame = samples_per_frame * 90_000 / rate as u64;
             for i in 0..10u64 {
@@ -1569,7 +1569,7 @@ mod tests {
     /// A gap before the last frame is not copied onto it as its duration.
     #[test]
     fn a_source_gap_does_not_stretch_the_last_frame() {
-        let a = AudioTrack::aac([0x11, 0x90], 48_000, 2, 128_000);
+        let a = AudioTrack::aac(vec![0x11, 0x90], 48_000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         for i in 0..5u64 {
             s.push(&[0xFF; 200], i * 1920);
@@ -1584,7 +1584,7 @@ mod tests {
 
     #[test]
     fn audio_take_pending_for_muxing() {
-        let a = AudioTrack::aac([0x11, 0x90], 48000, 2, 128_000);
+        let a = AudioTrack::aac(vec![0x11, 0x90], 48000, 2, 128_000);
         let mut s = AudioSegmenter::new(a, 2.0);
         for i in 0..10 {
             s.push(&[0xFF; 100], (i * 1920) as u64);

@@ -325,3 +325,42 @@ pub fn he_aac_adts(v2: bool) -> Vec<u8> {
     }
     out
 }
+
+/// The 25 frames of the AAC-LC 48 kHz stereo sine fixture.
+pub fn sine_aac_lc_frames() -> Vec<&'static [u8]> {
+    const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off + 7 <= ADTS.len() {
+        let len = (usize::from(ADTS[off + 3] & 0x03) << 11) | (usize::from(ADTS[off + 4]) << 3) | (usize::from(ADTS[off + 5]) >> 5);
+        out.push(&ADTS[off..off + len]);
+        off += len;
+    }
+    out
+}
+
+/// `frames` (whole ADTS frames of a stereo stream, no CRC — the sine
+/// fixture's) re-signalled the way ISDB-T 1seg signals its layout: every
+/// header says channel_configuration 0, and only frame `first` and every
+/// `every`th after it opens its raw_data_block with a program_config_element
+/// (one front channel pair, tag 0 — the element the stereo frames carry).
+/// The frames before `first` carry none, like the start of an NHK capture.
+pub fn pce_signalled_adts(frames: &[&[u8]], first: usize, every: usize) -> Vec<u8> {
+    use crate::engine::aac_config::{PceElement, PceLayout, adts_with_pce, raw_block_pce};
+    let mut out = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let carries = i >= first && (i - first).is_multiple_of(every);
+        let pce = if carries {
+            let (profile, sr_idx) = (frame[2] >> 6, (frame[2] >> 2) & 0x0F);
+            raw_block_pce(
+                profile,
+                sr_idx,
+                &PceLayout { front: &[PceElement { is_cpe: true, tag: 0 }], side: &[], back: &[], lfe: &[] },
+            )
+        } else {
+            Vec::new()
+        };
+        out.extend(adts_with_pce(frame, &pce).expect("a whole ADTS frame"));
+    }
+    out
+}

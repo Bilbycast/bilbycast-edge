@@ -288,6 +288,11 @@ pub mod audio_decode;
 /// whole AUs as soon as they are complete, across PES boundaries.
 pub mod audio_au;
 
+/// The AudioSpecificConfig FLV and MP4 need for an AAC stream that arrived
+/// in ADTS, the program_config_element of a channel_configuration-0 stream
+/// included, and the PCE the encoder's 7.1 frames need.
+pub mod aac_config;
+
 /// Lock-free counters for the video-decode stage. Shared between
 /// [`ts_video_replace::TsVideoReplacer`] (paired with `VideoEncodeStats` for
 /// a true transcode) and [`output_display`] (decode-only). Surfaced on

@@ -2727,7 +2727,8 @@ fn build_webrtc_encoder_state(
     // `build_encoder_state`: an HE-AAC header gives the core's rate and
     // v2's mono core, which SBR and PS double.
     let Some((input_sr, input_ch)) = first_frame
-        .and_then(|f| super::audio_decode::aac_decoded_format(profile, sr_idx, ch_cfg, f))
+        .zip(super::aac_config::AacConfig::new(profile, sr_idx, ch_cfg))
+        .and_then(|(f, source)| super::audio_decode::aac_decoded_format(&source, f))
     else {
         return WebrtcEncoderState::Lazy;
     };

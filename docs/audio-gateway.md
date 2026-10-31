@@ -886,7 +886,7 @@ affected codecs fall back to an ffmpeg subprocess. Outputs without
 | `hls` | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | HLS-TS supports MP2 (stream type 0x04) and AC-3 (private_stream_1) so long as the consumer's player does. |
 | `webrtc` | `opus` | `opus` | WebRTC realistically only does Opus. Validation also rejects `audio_encode` + `video_only=true` (an audio MID must be negotiated in SDP). |
 | `srt`, `udp`, `rtp`, `rist` (TS) | `aac_lc`, `he_aac_v1`, `he_aac_v2`, `mp2`, `ac3` | `aac_lc` | `opus` is rejected — MPEG-TS has no standard Opus mapping. Incompatible with `transport_mode: "audio_302m"`, SMPTE 2022-7 redundancy, and SMPTE 2022-1 / SRT FEC (validation rejects at load time). |
-| `cmaf` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | fMP4 audio sample entry is `mp4a` / `enca` (MPEG-4 AAC family). MP2 / AC-3 / Opus are rejected by validation — they are not part of the CMAF media profile. Compatible with `transcode` (channel shuffle / SRC) and with `encryption` (CENC ClearKey) on the same output. |
+| `cmaf` | `aac_lc`, `he_aac_v1`, `he_aac_v2` | `aac_lc` | fMP4 audio sample entry is `mp4a` / `enca` (MPEG-4 AAC family). MP2 / AC-3 / Opus are rejected by validation — they are not part of the CMAF media profile. Compatible with `transcode` (channel shuffle / SRC) and with `encryption` (CENC ClearKey) on the same output. Each sample is the raw access unit and the `esds` names what the encoder's ADTS header does — for HE-AAC its core, SBR / PS implicit (edge#210: every sample kept its ADTS header, and the track named the output rate under AAC-LC). |
 
 The validator enforces this matrix at config load time and on every
 `update_config` manager command — invalid combinations are rejected
@@ -908,12 +908,22 @@ If `sample_rate` is unset, the encoder uses the input PCM sample rate.
 `sample_rate`, per RFC 7587. If `channels` is unset, the encoder uses
 the input channel count (1 or 2).
 
+An AAC-LC target at `channels: 8` (7.1) is written as channel
+configuration 0 with a program_config_element in every frame: fdk-aac's
+7.1 is channel configuration 12, which ADTS cannot carry, and every 7.1
+target used to announce 4.0. See
+[transcoding.md](transcoding.md#aac-channel-layouts-the-header-does-not-name).
+
 ### Same-codec passthrough fast path (RTMP only)
 
 The RTMP output detects the case where you set `audio_encode = { codec:
 aac_lc }` with no overrides on an AAC-LC source, and skips both decoder
 and encoder construction — the existing zero-cost passthrough path runs
-unchanged. This is the right behaviour for "I want to confirm the
+unchanged. An HE-AAC source carries the AAC-LC profile in its ADTS header
+too (SBR / PS are signalled implicitly), so the source is told by what its
+first frame decodes to — twice its header's rate, or stereo from a mono
+core — and an HE-AAC one is re-encoded to the AAC-LC the block asks for.
+Before edge#210 it was passed through as HE-AAC. This is the right behaviour for "I want to confirm the
 config schema accepts audio_encode but I don't actually need to
 re-encode anything." Any field override (`bitrate_kbps`, `sample_rate`,
 `channels`) forces the full decode/encode chain.

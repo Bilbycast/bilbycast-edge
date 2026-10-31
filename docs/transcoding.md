@@ -617,6 +617,74 @@ field set from the compressed codecs and validation checks it apart:
 - `audio_encode` + SMPTE 2022-1 FEC encode (RTP).
 - `audio_encode` + SRT FEC (`packet_filter`).
 
+### AAC channel layouts the header does not name
+
+Two AAC layouts cannot be said in the four bits an AudioSpecificConfig, or
+the three an ADTS header, give the channel configuration. Both are now
+carried in a **program_config_element** (PCE), the element the AAC syntax
+has for them (ISO/IEC 14496-3 §4.4.1.1). Shared code:
+`src/engine/aac_config.rs`.
+
+- **7.1 targets** (`audio_encode.channels: 8`, AAC-LC). fdk-aac's 7.1 mode
+  is channel configuration 12, and ADTS has three bits for it: fdk wrote it
+  masked, as 4 (4.0), with no PCE, so every 7.1 AAC target — the TS audio
+  replacer, HLS, CMAF and RTMP — told its receivers 4.0 over five channel
+  elements. Each 7.1 frame now says channel configuration 0 and opens with
+  the PCE fdk itself writes for that mode (centre, front pair, surround pair,
+  rear pair, LFE: `pce_7_1_back`), nine bytes a frame; CMAF and RTMP carry
+  that PCE in the AudioSpecificConfig, as their sample entry and sequence
+  header need. ffmpeg decodes it as 7.1 with each input channel (WAV order:
+  FL FR FC LFE BL BR SL SR) on its own output channel. The in-process fdk-aac
+  decoder downmixes anything wider than six channels by default, so an
+  edge-side decode of a 7.1 AAC stream hands out 5.1.
+- **PCE-signalled sources** (channel configuration 0 — ISDB-T 1seg, e.g.
+  NHK's HE-AAC at a 24 kHz core with two single channel elements). The
+  layout is in a PCE that only some frames open with (on NHK about one in
+  twelve, and not the first frames of a capture). RTMP and CMAF passthrough
+  and the replay MP4 export copy it, bit for bit as FFmpeg's `aac_adtstoasc`
+  does, into the AudioSpecificConfig, and a re-encode (`audio_encode`) on RTMP
+  or CMAF builds its decoder from that configuration. RTMP and CMAF hold the
+  audio back until a frame carrying the PCE has arrived; from then on every
+  frame goes, as it came, PCE or not. If none arrives within five seconds of
+  the source's audio the output raises Warning `aac_channel_layout_missing`
+  (once per wait) and keeps holding: a header without the PCE is one no
+  decoder opens (ffmpeg: "decode_pce: Input buffer exhausted before END
+  element found"), which is what RTMP used to publish, CMAF used to put in its
+  init and the MP4 export used to write. With `audio_encode`, RTMP refused
+  channel configuration 0 with only a log line and CMAF raised an
+  `audio_encode` error on every frame. A window none of whose frames carries
+  the PCE is refused by the MP4 export (`replay_export_format_unsupported`;
+  the TS export carries the stream as it came).
+
+The **TS outputs need no AudioSpecificConfig**: they carry ADTS, where a
+7.1 target's PCE rides in each frame, and a PCE-signalled source passes
+through as it came.
+
+### Re-encoded AAC on CMAF, and the RTMP same-codec fast path
+
+- **CMAF re-encode**: each sample is the raw access unit, the encoder's ADTS
+  header taken off (`audio_au::adts_access_unit`), and the track's
+  AudioSpecificConfig is what the encoder's first frame's ADTS header names —
+  for HE-AAC its core (24 kHz for a 48 kHz target, v2's mono core), SBR / PS
+  signalled implicitly, the core's rate also the track timescale, as a
+  passed-through HE-AAC source's track says. Every sample used to keep its
+  7-byte ADTS header inside the `mdat`, and the track announced the target
+  rate under AAC-LC — an HE-AAC track a core twice its real rate. The RTMP
+  output's edge#210 defect, on CMAF; it reaches every DVR rendition the
+  manager provisions with `audio_encode: aac_lc` for an MP2 / AC-3 / E-AC-3 /
+  AAC-LATM source. A `silent_fallback` track, built before any frame exists,
+  announces what the eager encoder will write (`encode::expected_adts_config`,
+  pinned to fdk's own headers by a test) at that encoder's rate and layout
+  (stereo at most); a declared 5.1 used to build a six-channel track over its
+  stereo frames.
+- **RTMP same-codec fast path** (`audio_encode: { codec: aac_lc }`, no
+  bitrate, rate, channels or `transcode`): taken only for an AAC-LC source. An
+  HE-AAC source carries the AAC-LC profile in its ADTS header too, SBR / PS
+  signalled implicitly; it is told by what its first frame decodes to (twice
+  its core's rate, or stereo from a mono core) and re-encoded as the AAC-LC
+  the block asks for. It used to be passed through as HE-AAC. The CMAF, HLS
+  and TS re-encoders have no such shortcut.
+
 ### Audio timing in the TS audio replacer
 
 On the TS outputs (SRT / UDP / RTP / RIST) and on TS-carrying inputs the

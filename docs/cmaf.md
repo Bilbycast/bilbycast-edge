@@ -24,7 +24,19 @@ players without transcoding twice. Supports:
   load and then leave the re-encoder unset at flow start — publishing the
   source encoding under a config that says it is being re-encoded.
 - **Audio**: AAC-LC / HE-AACv1 / HE-AACv2 passthrough, or re-encode via
-  the in-process fdk-aac backend. Audio is **muxed into the same
+  the in-process fdk-aac backend. A re-encode's samples are raw access
+  units, the encoder's ADTS header taken off, and its `esds` names what
+  that header does — for HE-AAC its core (24 kHz for a 48 kHz target, v2's
+  mono), SBR / PS implicit, the core's rate also the track timescale, as a
+  passed-through HE-AAC source's track says. Before edge#210 every sample
+  kept its ADTS header inside the `mdat` and the track announced the
+  target rate under AAC-LC. A PCE-signalled source (channel configuration
+  0, ISDB-T 1seg) gets a track only once a frame carrying its
+  program_config_element has arrived, and that PCE goes into the `esds`
+  (Warning `aac_channel_layout_missing` after five seconds without one); a
+  7.1 target's `esds` carries the PCE of its layout. See
+  [transcoding.md](transcoding.md#aac-channel-layouts-the-header-does-not-name).
+  Audio is **muxed into the same
   fragment as the video** — one `moof` addressing both tracks — so a
   browser needs a single MSE SourceBuffer and there is no second
   timeline to keep aligned. The audio run in a fragment tiles the audio

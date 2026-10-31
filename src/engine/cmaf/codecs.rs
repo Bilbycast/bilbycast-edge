@@ -690,21 +690,6 @@ pub fn write_esds(parent: &mut BoxWriter<'_>, audio_specific_config: &[u8], avg_
     esds.u8(0x02); // predefined = MP4 default
 }
 
-/// Build a 2-byte AudioSpecificConfig for AAC-LC (and HE-AAC bases).
-///
-/// ISO/IEC 14496-3 §1.6.2.1: `audioObjectType(5) | samplingFrequencyIndex(4)
-/// | channelConfiguration(4) | GA bits(3)`.
-///
-/// Input comes from `TsDemuxer::cached_aac_config()` which returns the
-/// ADTS header's `(profile, sr_idx, ch_cfg)` triplet. ADTS `profile` maps
-/// to `audio_object_type = profile + 1` (i.e. profile=1 → AOT=2 = AAC-LC).
-pub fn aac_audio_specific_config(profile: u8, sr_idx: u8, ch_cfg: u8) -> [u8; 2] {
-    let aot = (profile + 1) & 0x1F;
-    let byte0 = (aot << 3) | ((sr_idx >> 1) & 0x07);
-    let byte1 = ((sr_idx & 0x01) << 7) | ((ch_cfg & 0x0F) << 3);
-    [byte0, byte1]
-}
-
 /// Write an `esds` box for MPEG-1 / MPEG-2 Layer II audio.
 ///
 /// Same descriptor chain as [`write_esds`] but with
@@ -1096,7 +1081,7 @@ mod tests {
         // profile=1 (AAC-LC ADTS) → AOT=2
         // sr_idx=3 → 48 kHz
         // ch_cfg=2 → stereo
-        let asc = aac_audio_specific_config(1, 3, 2);
+        let asc = crate::engine::aac_config::AacConfig::new(1, 3, 2).unwrap().audio_specific_config();
         // byte0 = (2 << 3) | (3 >> 1) = 0x10 | 0x01 = 0x11
         // byte1 = ((3 & 1) << 7) | (2 << 3) = 0x80 | 0x10 = 0x90
         assert_eq!(asc, [0x11, 0x90]);

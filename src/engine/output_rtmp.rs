@@ -20,6 +20,7 @@ use crate::config::models::{RtmpOutputConfig, VideoEncodeConfig};
 use crate::manager::events::{Event, EventSender, EventSeverity, category};
 use crate::stats::collector::OutputStatsAccumulator;
 
+use super::aac_config::{AacConfig, LayoutWait, emit_layout_missing};
 use super::audio_au::adts_access_unit;
 use super::audio_decode::{AacDecoder, DecodeStats, sample_rate_from_index};
 use super::audio_encode::{
@@ -213,6 +214,10 @@ pub fn spawn_rtmp_output(
             config.audio_encode.as_ref().and_then(|a| a.source_audio_pid),
             aac_output_can_publish,
         );
+        // How long a PCE-signalled source has been held back for want of a
+        // frame carrying its layout — also kept across reconnects, so the
+        // Warning is said once per wait, not once per connection.
+        let mut layout_wait = LayoutWait::default();
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -317,6 +322,7 @@ pub fn spawn_rtmp_output(
             let err = publish_loop(
                 &config, &mut client, &mut rx, &output_stats, &cancel,
                 compressed_audio_input, &flow_id, &event_sender, &mut audio_watch,
+                &mut layout_wait,
             ).await;
 
             let _ = client.close().await;
@@ -372,6 +378,7 @@ async fn publish_loop(
     flow_id: &str,
     event_sender: &EventSender,
     audio_watch: &mut AudioTrackWatch,
+    layout_wait: &mut LayoutWait,
 ) -> anyhow::Result<()> {
     // The audio track `audio_encode.source_audio_pid` names, when it is one
     // this output can publish; the first it publishes as configured
@@ -564,22 +571,38 @@ async fn publish_loop(
                         );
                     }
 
+                    // A PCE-signalled source (channel_configuration 0)
+                    // whose layout no frame has carried yet is held back,
+                    // passed through or re-encoded alike: neither a header
+                    // nor a decoder can be built without it.
+                    if !matches!(encoder_state, EncoderState::Failed)
+                        && hold_for_layout(&demuxer, layout_wait, config, flow_id, event_sender)
+                    {
+                        continue;
+                    }
+
                     // The FLV AAC sequence header's format, for a frame
-                    // passed through: the source's ADTS rate and channels
-                    // under AOT 2 (AAC-LC). For an HE-AAC source that is its
-                    // core, SBR / PS signalled implicitly, as in the ADTS it
-                    // arrived in. A re-encode's comes from its encoder's
-                    // first frame (`send_encoded_audio`).
-                    let header_format = demuxer
-                        .cached_aac_config()
-                        .and_then(|cached| aac_sequence_header_format(&encoder_state, cached));
+                    // passed through: the source's ADTS profile, rate and
+                    // channels — for an HE-AAC source its core, SBR / PS
+                    // signalled implicitly, as in the ADTS it arrived in —
+                    // and a PCE-signalled source's program_config_element.
+                    // A re-encode's comes from its encoder's first frame
+                    // (`send_encoded_audio`). Only wanted until it is sent.
+                    let header_format = if sent_audio_header {
+                        None
+                    } else {
+                        aac_sequence_header_format(&encoder_state, demuxer.cached_aac_specific_config())
+                    };
 
                     match &mut encoder_state {
                         EncoderState::Disabled | EncoderState::Transparent => {
                             // Passthrough: the raw ADTS-stripped AAC frame as
                             // an FLV audio tag, the sequence header ahead of
                             // the first. A frame at or behind one already sent
-                            // (a loop's overlap) is dropped.
+                            // (a loop's overlap) is dropped. Frames of a
+                            // PCE-signalled source go out as they came, with
+                            // or without a PCE of their own: the header
+                            // carries the layout.
                             if !sent_audio_header && header_format.is_none() {
                                 continue;
                             }
@@ -587,9 +610,9 @@ async fn publish_loop(
                                 continue;
                             };
                             if !sent_audio_header
-                                && let Some((asc_sr_idx, asc_ch_cfg)) = header_format
+                                && let Some(source) = header_format.as_ref()
                             {
-                                let header = build_aac_sequence_header(1, asc_sr_idx, asc_ch_cfg);
+                                let header = build_aac_sequence_header(&source.audio_specific_config());
                                 client.send_audio(&header, ts_ms).await?;
                                 sent_audio_header = true;
                                 tracing::debug!("RTMP output '{}': sent AAC sequence header", config.id);
@@ -614,15 +637,10 @@ async fn publish_loop(
                             // first real frame (the stage, pinned to the
                             // encoder's format, converts whatever it is).
                             if decoder.is_none()
-                                && let Some((profile, sr_idx, ch_cfg)) =
-                                    demuxer.cached_aac_config()
-                                {
-                                    lazy_build_decoder(
-                                        decoder,
-                                        (profile, sr_idx, ch_cfg),
-                                        &config.id,
-                                    );
-                                }
+                                && let Some(source) = demuxer.cached_aac_specific_config()
+                            {
+                                lazy_build_decoder(decoder, &source, &config.id);
+                            }
                             // Reset the drop watchdog: real audio is
                             // flowing, suppress silence until the next
                             // grace-window expiry. And measure the picture's
@@ -1283,10 +1301,12 @@ fn lay_silence(
 ///
 /// The AAC sequence header is the format that ADTS header names — for
 /// HE-AAC its core (24 kHz for a 48 kHz output, v2's mono), SBR / PS
-/// signalled implicitly, as a passed-through HE-AAC source's header is — and
-/// goes out with the first frame, at its timestamp: the encoder's first
-/// frame is stamped its codec delay before the source time that produced it,
-/// so a header sent at that source time stepped the audio track back.
+/// signalled implicitly, as a passed-through HE-AAC source's header is; for
+/// 7.1, channel configuration 0 and the program_config_element the frame
+/// opens with — and goes out with the first frame, at its timestamp: the
+/// encoder's first frame is stamped its codec delay before the source time
+/// that produced it, so a header sent at that source time stepped the audio
+/// track back.
 async fn send_encoded_audio(
     client: &mut RtmpClient,
     encoder: &mut AudioEncoder,
@@ -1298,11 +1318,11 @@ async fn send_encoded_audio(
     // The encoder's stamps are already on the timeline: it was anchored on
     // mapped times.
     for frame in encoder.drain() {
-        let Some((ts_ms, au, (profile, sr_idx, ch_cfg))) = encoded_aac_tag(&frame, timeline) else {
+        let Some((ts_ms, au, header)) = encoded_aac_tag(&frame, !*sent_audio_header, timeline) else {
             continue;
         };
-        if !*sent_audio_header {
-            client.send_audio(&build_aac_sequence_header(profile, sr_idx, ch_cfg), ts_ms).await?;
+        if let Some(format) = header {
+            client.send_audio(&build_aac_sequence_header(&format.audio_specific_config()), ts_ms).await?;
             *sent_audio_header = true;
             tracing::debug!("RTMP output '{}': sent AAC sequence header (re-encoded)", timeline.output_id);
         }
@@ -1320,12 +1340,18 @@ async fn send_encoded_audio(
 
 /// What [`send_encoded_audio`] sends of one encoded frame: its FLV ms on the
 /// connection's timeline, the raw access unit its ADTS frame carries
-/// ([`adts_access_unit`]) and the `(profile, sampling-frequency index,
-/// channel configuration)` that ADTS header names — or `None` to send
-/// nothing. A frame FLV cannot carry is turned away before the timeline sees
-/// it: past [`FlvTimeline::audio_tag_ms`] it would take the place of the frame
-/// after it, which would then go as at or behind one already sent.
-fn encoded_aac_tag<'a>(frame: &'a EncodedFrame, timeline: &mut FlvTimeline) -> Option<(u32, &'a [u8], (u8, u8, u8))> {
+/// ([`adts_access_unit`]) and, when `need_header`, the configuration that
+/// ADTS header (and, for channel configuration 0, the PCE the frame opens
+/// with) names, for the sequence header — or `None` to send nothing. A frame
+/// FLV cannot carry, or that cannot open the stream (channel configuration 0
+/// without its PCE), is turned away before the timeline sees it: past
+/// [`FlvTimeline::audio_tag_ms`] it would take the place of the frame after
+/// it, which would then go as at or behind one already sent.
+fn encoded_aac_tag<'a>(
+    frame: &'a EncodedFrame,
+    need_header: bool,
+    timeline: &mut FlvTimeline,
+) -> Option<(u32, &'a [u8], Option<AacConfig>)> {
     // fdk may hand back an empty frame while it primes: nothing to send.
     if frame.data.is_empty() {
         return None;
@@ -1343,7 +1369,13 @@ fn encoded_aac_tag<'a>(frame: &'a EncodedFrame, timeline: &mut FlvTimeline) -> O
         }
         return None;
     };
-    Some((timeline.audio_tag_ms(frame.pts)?, au, asc))
+    let header = if need_header {
+        let (profile, sr_idx, ch_cfg) = asc;
+        Some(AacConfig::from_adts(profile, sr_idx, ch_cfg, au)?)
+    } else {
+        None
+    };
+    Some((timeline.audio_tag_ms(frame.pts)?, au, header))
 }
 
 /// FLV timing of one passed-through H.264 / HEVC picture: `(tag timestamp,
@@ -2591,42 +2623,64 @@ fn transcode_access_unit(
     Ok(out)
 }
 
-/// The `(sample_rate_index, channel_config)` the FLV AAC sequence header
-/// announces for a frame passed through: the source's ADTS config. Nothing
-/// for a re-encode, whose header is its encoder's own format, read off its
-/// first frame's ADTS header ([`send_encoded_audio`]); and nothing while the
-/// re-encoder is still waiting for a frame that decodes (`Lazy`): its format
-/// is the decoder's, which for HE-AAC is not the source header's (24 kHz /
-/// mono core), and a header sent from the ADTS config then would announce
-/// the wrong rate and channels for the whole connection.
-fn aac_sequence_header_format(state: &EncoderState, cached: (u8, u8, u8)) -> Option<(u8, u8)> {
-    let (_, sr_idx, ch_cfg) = cached;
+/// The configuration the FLV AAC sequence header announces for a frame
+/// passed through: the source's (`source`, from the demuxer — its ADTS
+/// profile, rate and channels, and a PCE-signalled source's
+/// program_config_element; `None` while such a source's layout has not
+/// arrived). Nothing for a re-encode, whose header is its encoder's own
+/// format, read off its first frame's ADTS header ([`send_encoded_audio`]);
+/// and nothing while the re-encoder is still waiting for a frame that decodes
+/// (`Lazy`): its format is the decoder's, which for HE-AAC is not the source
+/// header's (24 kHz / mono core), and a header sent from the ADTS config then
+/// would announce the wrong rate and channels for the whole connection.
+fn aac_sequence_header_format(state: &EncoderState, source: Option<AacConfig>) -> Option<AacConfig> {
     match state {
         EncoderState::Active { .. } | EncoderState::Lazy => None,
-        _ => Some((sr_idx, ch_cfg)),
+        _ => source,
     }
 }
 
-/// Build an AAC sequence header FLV audio tag (AudioSpecificConfig).
-fn build_aac_sequence_header(profile: u8, sample_rate_idx: u8, channel_config: u8) -> Vec<u8> {
-    let mut buf = BytesMut::with_capacity(4);
+/// Build an AAC sequence header FLV audio tag carrying `asc`, the
+/// AudioSpecificConfig ([`AacConfig::audio_specific_config`]): two bytes,
+/// or more for a program_config_element. It used to be a fixed two bytes
+/// from the ADTS fields, which for channel configuration 0 is a header no
+/// decoder opens (edge#210).
+fn build_aac_sequence_header(asc: &[u8]) -> Vec<u8> {
+    let mut buf = BytesMut::with_capacity(2 + asc.len());
 
     // FLV audio tag header
     buf.put_u8(0xAF); // AAC + 44kHz + 16-bit + stereo (standard for AAC in FLV)
     buf.put_u8(0x00); // AAC sequence header
-
-    // AudioSpecificConfig (2 bytes)
-    // audioObjectType (5 bits) = profile + 1 (AAC-LC = 2)
-    // samplingFrequencyIndex (4 bits)
-    // channelConfiguration (4 bits)
-    // remaining bits = 0
-    let aot = (profile + 1) & 0x1F;
-    let byte0 = (aot << 3) | (sample_rate_idx >> 1);
-    let byte1 = (sample_rate_idx << 7) | (channel_config << 3);
-    buf.put_u8(byte0);
-    buf.put_u8(byte1);
+    buf.put_slice(asc);
 
     buf.to_vec()
+}
+
+/// Whether to hold this AAC frame back for want of its layout: the
+/// demuxer's source signals it in a program_config_element (channel
+/// configuration 0, ISDB-T 1seg) and no frame has carried one yet, so
+/// neither a sequence header a decoder opens nor a decoder can be built.
+/// Once the hold passes [`super::aac_config::LAYOUT_WAIT_WARN_SECS`] of the
+/// source's audio, Warning `aac_channel_layout_missing`, once per wait. It
+/// used to publish the two-byte header with channel configuration 0, which
+/// no decoder opens, and — with `audio_encode` — refuse the source with
+/// only a log line.
+fn hold_for_layout(
+    demuxer: &TsDemuxer,
+    wait: &mut LayoutWait,
+    config: &RtmpOutputConfig,
+    flow_id: &str,
+    event_sender: &EventSender,
+) -> bool {
+    let Some(sr_idx) = demuxer.aac_layout_pending() else {
+        wait.clear();
+        return false;
+    };
+    let rate = sample_rate_from_index(sr_idx).unwrap_or(48_000);
+    if wait.hold(rate) {
+        emit_layout_missing(event_sender, category::RTMP, "RTMP", &config.id, flow_id, wait.held_secs(rate));
+    }
+    true
 }
 
 /// Build an FLV audio tag with raw AAC frame data.
@@ -2654,7 +2708,9 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) {
 /// [`EncoderState`]. Called once on the first AAC frame.
 ///
 /// - If the requested codec is `aac_lc` and the operator did not override
-///   bitrate / SR / channels and the input is itself AAC-LC, returns
+///   bitrate / SR / channels and the input is itself AAC-LC — decoding to
+///   its header's rate and channels, which an HE-AAC source (SBR / PS
+///   signalled implicitly behind the same profile) does not — returns
 ///   `Transparent` (zero-cost passthrough).
 /// - If the input is non-AAC-LC, returns `Failed` after logging the
 ///   reason. (Phase A's decoder rejects HE-AAC, multichannel, etc.)
@@ -2723,10 +2779,27 @@ fn build_encoder_state(
         );
         return EncoderState::Failed;
     }
-    if ch_cfg == 0 || ch_cfg > 2 {
-        tracing::error!(
-            "RTMP output '{}': audio_encode rejected unsupported AAC channel_config={ch_cfg}",
-            config.id
+    // Channel configuration 0 (ISDB-T 1seg) names its layout in a
+    // program_config_element some frames carry: the decoder is built from the
+    // configuration with it, once one has arrived (the caller holds the
+    // frames back meanwhile, `hold_for_layout`). It used to be refused here
+    // with only a log line.
+    let Some(source) = demuxer.cached_aac_specific_config() else {
+        return EncoderState::Lazy;
+    };
+    if source.channels() > 2 {
+        let msg = format!(
+            "RTMP output '{}': audio_encode requires mono or stereo AAC input, got {} channels \
+             (channel_config={ch_cfg}); audio will be dropped",
+            config.id,
+            source.channels()
+        );
+        tracing::error!("{msg}");
+        event_sender.emit_flow(
+            EventSeverity::Warning,
+            crate::manager::events::category::AUDIO_ENCODE,
+            msg,
+            flow_id,
         );
         return EncoderState::Failed;
     }
@@ -2740,29 +2813,13 @@ fn build_encoder_state(
         return EncoderState::Failed;
     };
 
-    // Same-codec fast path: AAC-LC input → AAC-LC output, no overrides.
-    // Disabled when a transcode block is present — transcode requires the
-    // decode→encode pipeline to apply channel remap / SRC.
-    let no_overrides = enc_cfg.bitrate_kbps.is_none()
-        && enc_cfg.sample_rate.is_none()
-        && enc_cfg.channels.is_none();
-    if codec == AudioCodec::AacLc && no_overrides && config.transcode.is_none() {
-        tracing::info!(
-            "RTMP output '{}': audio_encode same-codec passthrough (AAC-LC {} Hz {} ch)",
-            config.id,
-            sample_rate_from_index(sr_idx).unwrap_or(0),
-            ch_cfg
-        );
-        return EncoderState::Transparent;
-    }
-
     // What the decoder really hands out: an HE-AAC header gives the core's
     // rate (24 kHz for a 48 kHz service) and v2's mono core, which SBR and
     // PS double. Resolved from the header, the stage and the encoder were
     // pinned to the core's format — 48 kHz decoded PCM resampled to 24 kHz
     // (a 12 kHz audio bandwidth) and v2's stereo mixed to mono.
     let Some((input_sr, input_ch)) = first_frame
-        .and_then(|f| super::audio_decode::aac_decoded_format(profile, sr_idx, ch_cfg, f))
+        .and_then(|f| super::audio_decode::aac_decoded_format(&source, f))
     else {
         tracing::debug!(
             "RTMP output '{}': audio_encode waits for an AAC frame that decodes",
@@ -2771,7 +2828,28 @@ fn build_encoder_state(
         return EncoderState::Lazy;
     };
 
-    let decoder = match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+    // Same-codec fast path: AAC-LC input → AAC-LC output, no overrides.
+    // Disabled when a transcode block is present — transcode requires the
+    // decode→encode pipeline to apply channel remap / SRC. An HE-AAC source
+    // carries the AAC-LC profile in its ADTS header too, SBR / PS signalled
+    // implicitly, and is told by what it decodes to — twice its core's rate
+    // (SBR), or stereo from a mono core (PS) — so `aac_lc` re-encodes it as
+    // the AAC-LC it asks for. It used to be passed through as HE-AAC.
+    let no_overrides = enc_cfg.bitrate_kbps.is_none()
+        && enc_cfg.sample_rate.is_none()
+        && enc_cfg.channels.is_none();
+    let plain_lc = Some(input_sr) == source.sample_rate() && input_ch == source.channels();
+    if codec == AudioCodec::AacLc && no_overrides && config.transcode.is_none() && plain_lc {
+        tracing::info!(
+            "RTMP output '{}': audio_encode same-codec passthrough (AAC-LC {} Hz {} ch)",
+            config.id,
+            input_sr,
+            input_ch
+        );
+        return EncoderState::Transparent;
+    }
+
+    let decoder = match AacDecoder::from_config(&source) {
         Ok(d) => d,
         Err(e) => {
             tracing::error!(
@@ -3191,20 +3269,23 @@ fn build_encoder_state_eager_for_silent_fallback(
 /// leaves `decoder = None` on failure so we keep producing silence instead
 /// of crashing the output. The encoder's stage (pinned to its format)
 /// converts whatever the source turns out to be.
+///
+/// `source` is the demuxer's whole configuration, so a PCE-signalled
+/// source's decoder is built once its layout has arrived.
 fn lazy_build_decoder(
     decoder: &mut Option<AacDecoder>,
-    cached_aac: (u8, u8, u8),
+    source: &AacConfig,
     output_id: &str,
 ) {
-    let (profile, sr_idx, ch_cfg) = cached_aac;
-    if profile != 1 {
+    if source.profile != 1 {
         tracing::warn!(
-            "RTMP output '{}': silent-fallback ignoring non-AAC-LC source frame (profile={profile}); keeping silence track",
-            output_id
+            "RTMP output '{}': silent-fallback ignoring non-AAC-LC source frame (profile={}); keeping silence track",
+            output_id,
+            source.profile
         );
         return;
     }
-    match AacDecoder::from_adts_config(profile, sr_idx, ch_cfg) {
+    match AacDecoder::from_config(source) {
         Ok(d) => *decoder = Some(d),
         Err(e) => {
             tracing::warn!(
@@ -4623,7 +4704,7 @@ mod flv_timestamp_tests {
     /// (`send_encoded_audio` without the client: its [`encoded_aac_tag`]).
     #[cfg(feature = "fdk-aac")]
     fn sent(encoder: &mut AudioEncoder, tl: &mut FlvTimeline) -> Vec<u64> {
-        encoder.drain().into_iter().filter(|f| encoded_aac_tag(f, tl).is_some()).map(|f| f.pts).collect()
+        encoder.drain().into_iter().filter(|f| encoded_aac_tag(f, false, tl).is_some()).map(|f| f.pts).collect()
     }
 
     /// edge#210: what an encoder hands back that FLV cannot carry — an empty
@@ -4642,16 +4723,26 @@ mod flv_timestamp_tests {
         let at = tl.video(P0, None, true).expect("a picture").pts + 1_920;
         let frame = |data: &[u8]| EncodedFrame { data: bytes::Bytes::copy_from_slice(data), pts: at };
         for junk in [&[][..], &whole[..7], &whole[7..]] {
-            assert!(encoded_aac_tag(&frame(junk), &mut tl).is_none(), "{} bytes sent", junk.len());
+            assert!(encoded_aac_tag(&frame(junk), true, &mut tl).is_none(), "{} bytes sent", junk.len());
         }
         let mut clean = FlvTimeline::new("o");
         clean.video(P0, None, true);
         let want = clean.audio_tag_ms(at).expect("a frame after the picture goes");
         assert!(want > 0);
         let real = frame(whole);
-        let (ts_ms, au, asc) = encoded_aac_tag(&real, &mut tl).expect("the whole frame goes");
-        assert_eq!((ts_ms, au, asc), (want, &whole[7..], (1, 3, 2)), "at its time, less its header");
-        assert!(encoded_aac_tag(&real, &mut tl).is_none(), "a second at that time is at or behind it");
+        let (ts_ms, au, header) = encoded_aac_tag(&real, true, &mut tl).expect("the whole frame goes");
+        assert_eq!((ts_ms, au, header), (want, &whole[7..], AacConfig::new(1, 3, 2)), "at its time, less its header");
+        assert!(encoded_aac_tag(&real, false, &mut tl).is_none(), "a second at that time is at or behind it");
+        // A frame of channel configuration 0 that does not open with its
+        // PCE cannot open the stream: turned away while a header is owed,
+        // before the timeline sees it.
+        let mut cfg0 = whole.to_vec();
+        cfg0[2] &= !0x01;
+        cfg0[3] &= 0x3F;
+        let later = EncodedFrame { data: bytes::Bytes::from(cfg0), pts: at + 1_920 };
+        assert!(encoded_aac_tag(&later, true, &mut tl).is_none(), "no header without the layout");
+        let (_, _, header) = encoded_aac_tag(&later, false, &mut tl).expect("once a header is out, it goes");
+        assert_eq!(header, None);
     }
 
     /// A video-only source (the case `silent_fallback` exists for) whose PTS
@@ -5356,10 +5447,15 @@ pub(super) mod flv_wire_tests {
     /// with the RTMP output `output` into a loopback server, and return what
     /// the server read, in order.
     pub(super) async fn publish(ts: Vec<Bytes>, output: serde_json::Value) -> Vec<WireTag> {
+        publish_with_events(ts, output).await.0
+    }
+
+    /// [`publish`], and the events the output raised.
+    pub(super) async fn publish_with_events(ts: Vec<Bytes>, output: serde_json::Value) -> (Vec<WireTag>, Vec<Event>) {
         let (mut client, media_rx, cancel) = loopback().await;
         let config: RtmpOutputConfig = serde_json::from_value(output).unwrap();
         let stats = Arc::new(OutputStatsAccumulator::new("o".into(), "o".into(), "rtmp".into()));
-        let (events, _events_rx) = crate::manager::events::event_channel();
+        let (events, mut events_rx) = crate::manager::events::event_channel();
         let (tx, mut rx) = broadcast::channel(ts.len().max(1));
         for (k, data) in ts.into_iter().enumerate() {
             tx.send(RtpPacket {
@@ -5383,14 +5479,15 @@ pub(super) mod flv_wire_tests {
         );
         publish_loop(
             &config, &mut client, &mut rx, &stats, &CancellationToken::new(), true, "f", &events,
-            &mut audio_watch,
+            &mut audio_watch, &mut LayoutWait::default(),
         )
         .await
         .expect("publish_loop");
         client.close().await.unwrap();
         let tags = tags_read(media_rx).await;
         cancel.cancel();
-        tags
+        let raised = std::iter::from_fn(|| events_rx.try_recv().ok()).collect();
+        (tags, raised)
     }
 
     /// A plain RTMP output: no `video_encode`, so video passes through.
@@ -6584,8 +6681,10 @@ pub(super) mod flv_wire_tests {
     /// An HE-AAC v2 source re-encoded to AAC-LC: the header names what the
     /// re-encode carries, 48 kHz stereo LC, not the source's 24 kHz mono
     /// core (its cached ADTS config, which passthrough announces). One
-    /// source frame (2 048 samples, 3 840 ticks) a PES; `bitrate_kbps` keeps
-    /// it off the same-codec fast path.
+    /// source frame (2 048 samples, 3 840 ticks) a PES. With and without
+    /// `bitrate_kbps`: a bare `aac_lc` used to take the same-codec fast path,
+    /// since the HE-AAC source's ADTS header names AAC-LC too, and passed
+    /// the HE-AAC through.
     #[cfg(feature = "fdk-aac")]
     #[tokio::test]
     async fn an_he_aac_source_re_encoded_to_aac_lc_announces_lc_not_its_core() {
@@ -6600,11 +6699,42 @@ pub(super) mod flv_wire_tests {
             off += len;
         }
         assert!(frames.len() >= 20, "{} HE-AAC frames", frames.len());
+        for audio_encode in [
+            serde_json::json!({ "codec": "aac_lc", "bitrate_kbps": 128 }),
+            serde_json::json!({ "codec": "aac_lc" }),
+        ] {
+            let output = serde_json::json!({
+                "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
+                "audio_encode": audio_encode
+            });
+            let n = assert_raw_aac(&publish(programme_of(&frames, 3_840), output).await, (2, 3, 2), 1_024);
+            assert!(n >= 30, "{audio_encode}: {n} AAC frames");
+        }
+    }
+
+    /// The ADTS frames of `adts`, split.
+    fn split_adts(adts: &[u8]) -> Vec<&[u8]> {
+        let mut frames = Vec::new();
+        let mut off = 0;
+        while off + 7 <= adts.len() {
+            let len = (usize::from(adts[off + 3] & 0x03) << 11)
+                | (usize::from(adts[off + 4]) << 3)
+                | (usize::from(adts[off + 5]) >> 5);
+            frames.push(&adts[off..off + len]);
+            off += len;
+        }
+        frames
+    }
+
+    /// A programme of [`LAP_PICTURES`] H.264 pictures with `frames` (whole
+    /// ADTS frames), one a PES, `step` ticks apart from three pictures in,
+    /// each muxed ahead of the first picture decoding after it.
+    fn programme_of(frames: &[&[u8]], step: u64) -> Vec<Bytes> {
         let pics = ibbp(LAP_PICTURES, |k| T0 + k * F);
         let mut mux = TsMuxer::new();
         mux.set_has_audio(true);
         let mut ts = Vec::new();
-        let mut next = frames.iter().enumerate().map(|(j, f)| (T0 + 3 * F + j as u64 * 3_840, *f)).peekable();
+        let mut next = frames.iter().enumerate().map(|(j, f)| (T0 + 3 * F + j as u64 * step, *f)).peekable();
         for (k, &(pts, dts)) in pics.iter().enumerate() {
             let decode = dts.unwrap_or(pts);
             while let Some((at, f)) = next.next_if(|&(at, _)| at <= decode) {
@@ -6617,12 +6747,91 @@ pub(super) mod flv_wire_tests {
         }
         let end = pics.iter().map(|p| p.0).max().unwrap() + F;
         ts.extend(mux.mux_video(&h264(false, 0), end, end, false));
+        ts
+    }
+
+    /// edge#210 item 3: a PCE-signalled source (channel_configuration 0, as
+    /// ISDB-T 1seg sends it, the PCE in only some frames and not the first)
+    /// passed through. The sequence header waits for the first frame that
+    /// opens with the PCE and carries it — channel configuration 0 and the
+    /// program_config_element after the two bytes — and goes out with that
+    /// frame; nothing before it is published, every frame after it is, as it
+    /// came, with or without a PCE of its own, and every one decodes in a
+    /// decoder set up from that header alone. It used to send `11 80`, two
+    /// bytes naming channel configuration 0 and no PCE — ffmpeg: "decode_pce:
+    /// Input buffer exhausted before END element found" — from the first
+    /// frame.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn a_pce_signalled_source_passes_through_with_its_pce_in_the_header() {
+        let sine = crate::engine::ts_test_fixtures::sine_aac_lc_frames();
+        let looped: Vec<&[u8]> = sine.iter().cycle().take(85).copied().collect();
+        let adts = crate::engine::ts_test_fixtures::pce_signalled_adts(&looped, 5, 12);
+        let frames = split_adts(&adts);
+        let tags = publish(programme_of(&frames, 1_920), passthrough_output()).await;
+        let audio: Vec<&WireTag> = tags.iter().filter(|t| !t.video).collect();
+        let headers: Vec<usize> = (0..audio.len()).filter(|&i| audio[i].data[..2] == [0xAF, 0x00]).collect();
+        assert_eq!(headers, [0], "one sequence header, ahead of every frame");
+        let asc = &audio[0].data[2..];
+        let want = crate::engine::aac_config::AacConfig::from_adts(1, 3, 0, &frames[5][7..]).expect("frame 5's PCE");
+        assert_eq!(asc, &want.audio_specific_config()[..], "the source's PCE in the header");
+        assert_eq!(&asc[..2], [0x11, 0x80], "AAC-LC, 48 kHz, channel configuration 0");
+        assert!(asc.len() > 2, "the program_config_element after the two bytes");
+        let bodies: Vec<&[u8]> = audio[1..].iter().map(|t| &t.data[2..]).collect();
+        assert_eq!(bodies.len(), frames.len() - 5, "everything from the first PCE on, nothing before");
+        assert!(
+            bodies.iter().zip(&frames[5..]).all(|(b, f)| *b == &f[7..]),
+            "the source's frames, less their ADTS header, PCE or not"
+        );
+        let mut dec = aac_audio::AacDecoder::open_raw(asc).expect("a decoder from the header alone");
+        for (i, b) in bodies.iter().enumerate() {
+            let pcm = dec.decode_frame(b).unwrap_or_else(|e| panic!("frame {i} does not decode: {e}"));
+            assert_eq!((pcm.planar.len(), pcm.frame_size), (2, 1_024), "frame {i}");
+        }
+    }
+
+    /// A PCE-signalled source no frame of which carries its PCE publishes no
+    /// audio rather than a header no decoder opens, and says so once, after
+    /// five seconds of its audio: Warning `aac_channel_layout_missing`,
+    /// output-scoped. Before, the undecodable header went out and nothing
+    /// was said.
+    #[tokio::test]
+    async fn a_pce_signalled_source_without_its_pce_is_held_back_and_reported() {
+        let sine = crate::engine::ts_test_fixtures::sine_aac_lc_frames();
+        // 300 frames, 6.4 s at 48 kHz.
+        let looped: Vec<&[u8]> = sine.iter().cycle().take(300).copied().collect();
+        let adts = crate::engine::ts_test_fixtures::pce_signalled_adts(&looped, usize::MAX, 1);
+        let ts: Vec<Bytes> =
+            crate::engine::ts_test_fixtures::aac_program_ts(&adts).chunks(188).map(Bytes::copy_from_slice).collect();
+        let (tags, raised) = publish_with_events(ts, passthrough_output()).await;
+        assert!(tags.iter().all(|t| t.video), "no audio tag, header or frame");
+        let warned: Vec<&Event> = raised
+            .iter()
+            .filter(|e| e.details.as_ref().is_some_and(|d| d["error_code"] == "aac_channel_layout_missing"))
+            .collect();
+        assert_eq!(warned.len(), 1, "said once");
+        assert_eq!(warned[0].severity, EventSeverity::Warning);
+        assert_eq!(warned[0].output_id.as_deref(), Some("o"));
+        assert_eq!(warned[0].details.as_ref().unwrap()["held_secs"], 5);
+    }
+
+    /// The same source re-encoded (`audio_encode`, here AAC-LC at 96 kb/s):
+    /// its decoder is built from the configuration with the PCE once the
+    /// first frame carrying one has arrived, and every frame from there is
+    /// re-encoded. It used to be refused for channel configuration 0 with
+    /// only a log line, and no audio went out.
+    #[cfg(feature = "fdk-aac")]
+    #[tokio::test]
+    async fn a_pce_signalled_source_is_re_encoded() {
+        let sine = crate::engine::ts_test_fixtures::sine_aac_lc_frames();
+        let looped: Vec<&[u8]> = sine.iter().cycle().take(85).copied().collect();
+        let adts = crate::engine::ts_test_fixtures::pce_signalled_adts(&looped, 5, 12);
         let output = serde_json::json!({
             "id": "o", "name": "o", "dest_url": "rtmp://127.0.0.1/live", "stream_key": "k",
-            "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 128 }
+            "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 96 }
         });
-        let n = assert_raw_aac(&publish(ts, output).await, (2, 3, 2), 1_024);
-        assert!(n >= 30, "{n} AAC frames");
+        let n = assert_raw_aac(&publish(programme_of(&split_adts(&adts), 1_920), output).await, (2, 3, 2), 1_024);
+        assert!(n >= 60, "{n} AAC frames");
     }
 
     /// The same for an MP2 source, the `OtherAudio` arm's re-encode: four
@@ -6842,6 +7051,44 @@ pub(crate) mod tests {
         }
     }
 
+    /// edge#210: the same-codec fast path (`aac_lc`, no bitrate, rate,
+    /// channels or `transcode` block) is taken for an AAC-LC source alone.
+    /// An HE-AAC source's ADTS header names AAC-LC as well — SBR and PS are
+    /// signalled implicitly — and it used to be passed through as HE-AAC
+    /// under a configuration that asked for AAC-LC; it is told by what its
+    /// first frame decodes to (48 kHz from a 24 kHz core, stereo from v2's
+    /// mono one) and re-encoded.
+    #[cfg(feature = "fdk-aac")]
+    #[test]
+    fn only_an_aac_lc_source_takes_the_same_codec_fast_path() {
+        let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
+            "audio_encode": { "codec": "aac_lc" }
+        }))
+        .unwrap();
+        const LC: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+        let he_v1 = crate::engine::ts_test_fixtures::he_aac_adts(false);
+        let he_v2 = crate::engine::ts_test_fixtures::he_aac_adts(true);
+        for (what, adts, transparent) in [("AAC-LC", LC, true), ("HE-AAC v1", &he_v1[..], false), ("HE-AAC v2", &he_v2[..], false)] {
+            let ts = crate::engine::ts_test_fixtures::aac_program_ts(adts);
+            let mut demux = TsDemuxer::new(None);
+            let first = first_aac_frame(&mut demux, &ts);
+            assert_eq!(demux.cached_aac_config().map(|c| c.0), Some(1), "{what}: the LC profile in ADTS");
+            let (events, _rx) = crate::manager::events::event_channel();
+            let stats = Arc::new(OutputStatsAccumulator::new("r1".into(), "r1".into(), "rtmp".into()));
+            let st = build_encoder_state(&cfg, &demux, Some(&first), true, &CancellationToken::new(), &stats, "f", &events);
+            match st {
+                EncoderState::Transparent => assert!(transparent, "{what}: passed through"),
+                EncoderState::Active { encoder, .. } => {
+                    assert!(!transparent, "{what}: re-encoded");
+                    let p = encoder.params();
+                    assert_eq!((p.codec, p.target_sample_rate, p.target_channels), (AudioCodec::AacLc, 48_000, 2), "{what}");
+                }
+                _ => panic!("{what}: neither passed through nor re-encoded"),
+            }
+        }
+    }
+
     /// No FLV AAC sequence header goes out while the re-encoder waits for a
     /// frame that decodes: it would announce the ADTS header's format —
     /// for HE-AAC the 24 kHz / mono core — not the 48 kHz stereo the
@@ -6852,9 +7099,9 @@ pub(crate) mod tests {
     #[cfg(feature = "fdk-aac")]
     #[test]
     fn the_aac_sequence_header_waits_for_the_resolved_format() {
-        let he_aac_v2 = (1u8, 6u8, 1u8);
-        assert_eq!(aac_sequence_header_format(&EncoderState::Lazy, he_aac_v2), None);
-        assert_eq!(aac_sequence_header_format(&EncoderState::Transparent, he_aac_v2), Some((6, 1)));
+        let he_aac_v2 = AacConfig::new(1, 6, 1);
+        assert_eq!(aac_sequence_header_format(&EncoderState::Lazy, he_aac_v2.clone()), None);
+        assert_eq!(aac_sequence_header_format(&EncoderState::Transparent, he_aac_v2.clone()), he_aac_v2);
         let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({
             "id": "r1", "name": "r1", "dest_url": "rtmp://127.0.0.1/app", "stream_key": "k",
             "audio_encode": { "codec": "aac_lc", "bitrate_kbps": 128 }
