@@ -348,6 +348,87 @@ pub fn emit_pinned_pid_absent(
     }
 }
 
+/// `audio_encode.source_audio_pid` on an output that picks its audio track
+/// itself — RTMP, CMAF and WebRTC through `TsDemuxer::with_audio_pid`, HLS
+/// in its remux — rather than through a `TsAudioReplacer`: the replacers'
+/// `(pinned, actual)` dedupe, as a value the output keeps for its lifetime.
+/// Those outputs used to ignore the pin and publish the track they picked.
+#[derive(Debug)]
+pub struct AudioPinWatch {
+    pin: Option<u16>,
+    /// The `(pinned, actual)` pair last warned about; cleared once the
+    /// output is on the pin again, so a later drop-out warns again.
+    warned: Option<(u16, u16)>,
+}
+
+impl AudioPinWatch {
+    pub fn new(pin: Option<u16>) -> Self {
+        Self { pin, warned: None }
+    }
+
+    /// The pinned PID, `None` when nothing is pinned.
+    #[cfg_attr(not(feature = "media-codecs"), allow(dead_code))]
+    pub fn pin(&self) -> Option<u16> {
+        self.pin
+    }
+
+    /// The output is on audio `track` (`(pid, stream_type)`, `None` while it
+    /// has none). Returns `(pinned, actual, actual_stream_type)` the first
+    /// time it is off the pin on a given actual PID — the moment to raise
+    /// [`emit_pinned_audio_pid_absent`]. Cheap enough to call per datagram.
+    pub fn check(&mut self, track: Option<(u16, u8)>) -> Option<(u16, u16, u8)> {
+        let (pin, (actual, stream_type)) = (self.pin?, track?);
+        if pin == actual {
+            self.warned = None;
+            return None;
+        }
+        if self.warned == Some((pin, actual)) {
+            return None;
+        }
+        self.warned = Some((pin, actual));
+        Some((pin, actual, stream_type))
+    }
+}
+
+/// The `audio_source_pid_not_found` Warning for an output that picks its
+/// own audio track ([`AudioPinWatch`]): the code, category, scope and
+/// details [`emit_pinned_pid_absent`] raises for a replacer, with a message
+/// naming what the output fell back to — `fallback`, e.g. "the program's
+/// first audio stream", which need not be a stream it can decode.
+pub fn emit_pinned_audio_pid_absent(
+    sender: &EventSender,
+    output_id: &str,
+    pinned: u16,
+    actual: u16,
+    actual_stream_type: u8,
+    fallback: &str,
+) {
+    let message = format!(
+        "Output '{output_id}': audio_encode.source_audio_pid 0x{pinned:04X} matches no audio \
+         stream this output reads in the PMT — using {fallback}, PID 0x{actual:04X} \
+         (stream_type 0x{actual_stream_type:02X}), instead."
+    );
+    tracing::warn!(
+        error_code = "audio_source_pid_not_found",
+        pinned_pid = format!("0x{pinned:04X}"),
+        actual_pid = format!("0x{actual:04X}"),
+        actual_stream_type = format!("0x{actual_stream_type:02X}"),
+        "{message}"
+    );
+    sender.emit_output_with_details(
+        EventSeverity::Warning,
+        category::FLOW,
+        message,
+        output_id,
+        serde_json::json!({
+            "error_code": "audio_source_pid_not_found",
+            "pinned_pid": pinned,
+            "actual_pid": actual,
+            "actual_stream_type": actual_stream_type,
+        }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +580,45 @@ mod tests {
             w.on_reset();
         }
         assert!(matches!(w.note_locked(0x101, 0x0F), Some(EngageEvent::Found { .. })));
+    }
+
+    /// An output off its pinned audio PID is told once per distinct actual
+    /// PID — the replacers' `(pinned, actual)` rule — however often it is
+    /// polled, and again after it has been back on the pin.
+    #[test]
+    fn a_missed_audio_pin_is_reported_once_per_pair_and_rearmed_on_the_pin() {
+        let mut w = AudioPinWatch::new(Some(0x305));
+        assert_eq!(w.check(None), None, "no track yet: nothing to judge");
+        assert_eq!(w.check(Some((0x301, 0x81))), Some((0x305, 0x301, 0x81)));
+        assert_eq!(w.check(Some((0x301, 0x81))), None, "once per pair");
+        assert_eq!(w.check(Some((0x302, 0x0F))), Some((0x305, 0x302, 0x0F)), "a new actual PID");
+        assert_eq!(w.check(Some((0x305, 0x03))), None, "on the pin");
+        assert_eq!(w.check(Some((0x302, 0x0F))), Some((0x305, 0x302, 0x0F)), "re-armed");
+
+        let mut unpinned = AudioPinWatch::new(None);
+        assert_eq!(unpinned.check(Some((0x301, 0x81))), None, "nothing pinned, nothing to say");
+    }
+
+    /// The output's Warning carries the replacer's code, category, severity,
+    /// scope and details.
+    #[test]
+    fn a_missed_audio_pin_on_an_output_is_the_replacers_warning() {
+        let (tx, mut rx) = crate::manager::events::event_channel();
+        emit_pinned_audio_pid_absent(&tx, "rtmp-1", 0x305, 0x300, 0xAC, "the program's first audio stream");
+        let ev = rx.try_recv().expect("one Warning");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::FLOW);
+        assert_eq!(ev.output_id.as_deref(), Some("rtmp-1"));
+        assert!(ev.message.contains("0x0305") && ev.message.contains("PID 0x0300"), "{}", ev.message);
+        assert_eq!(
+            ev.details.unwrap(),
+            serde_json::json!({
+                "error_code": "audio_source_pid_not_found",
+                "pinned_pid": 0x305,
+                "actual_pid": 0x300,
+                "actual_stream_type": 0xAC,
+            })
+        );
     }
 }
 

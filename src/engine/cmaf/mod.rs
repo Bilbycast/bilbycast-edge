@@ -1624,7 +1624,11 @@ async fn run(
     });
     let mut filter_scratch: Vec<u8> = Vec::new();
 
-    let mut demuxer = TsDemuxer::new(config.program_number);
+    // The audio track `audio_encode.source_audio_pid` names, when the PMT
+    // carries it; the first audio track otherwise, which `audio_pin` reports.
+    let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
+    let mut demuxer = TsDemuxer::with_audio_pid(config.program_number, pinned_audio);
+    let mut audio_pin = crate::engine::transcode_engage::AudioPinWatch::new(pinned_audio);
     let mut state = CmafState::new();
     // One media timeline for every CMAF output of the flow: they share
     // the flow's wall-clock epoch (`FlowClock`), so a jump one absorbs
@@ -1863,6 +1867,16 @@ async fn run(
                         };
 
                         let frames = demuxer.demux(ts_bytes);
+                        if let Some((pinned, actual, stream_type)) = audio_pin.check(demuxer.audio_track()) {
+                            crate::engine::transcode_engage::emit_pinned_audio_pid_absent(
+                                event_sender,
+                                &config.id,
+                                pinned,
+                                actual,
+                                stream_type,
+                                "the program's first audio stream",
+                            );
+                        }
                         for frame in frames {
                             handle_frame(
                                 frame,

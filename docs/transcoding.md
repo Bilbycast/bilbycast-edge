@@ -218,6 +218,38 @@ reappears. Until this release it was a log line only, so a mis-typed
 pin silently transcoded the wrong track; see
 [`events-and-alarms.md`](events-and-alarms.md) ("Transcode engage").
 
+**RTMP, CMAF, WebRTC and HLS outputs** pick their audio track themselves
+rather than through the replacer, and honour the pin too. Releases up to
+0.116.0 ignored it there and published the track each output picked
+unpinned, whatever the pin said:
+
+- **RTMP, CMAF and WebRTC** (the shared demuxer,
+  `TsDemuxer::with_audio_pid`): unpinned, the program's **first** audio
+  stream, any codec the demuxer recognises — AC-4 and Opus included. A pin
+  is taken when the PMT carries it as audio, whatever its codec; otherwise
+  the output falls back to the first audio stream. A later PMT that carries
+  the pin moves the output back onto it.
+- **HLS** (`audio_encode` remux): unpinned, the **last** audio stream it
+  can decode, as before. A pin is taken when it is one it can decode;
+  otherwise (absent, or AC-4 / DTS) the output falls back to that last
+  one. This is the in-process remux every shipped build runs; the
+  ffmpeg-subprocess fallback of a build without `media-codecs` still
+  takes ffmpeg's own choice of audio stream and ignores the pin.
+
+The fallback raises the same Warning, `audio_source_pid_not_found`
+(category `flow`, output-scoped, same `details`), with a message naming
+the stream the output fell back to. It fires once per distinct
+(pinned, actual) pair for the output's lifetime and re-arms when the pin
+reappears: a WebRTC output raises it once, not once per WHEP viewer or
+WHIP reconnect, and an RTMP output not again on a reconnect.
+
+An RTMP output on a track it cannot publish — AC-4, Opus-in-TS, or on a
+build without `media-codecs` anything but AAC — publishes no audio and
+raises the Warning `audio_codec_unpublishable` naming the PID and codec,
+once per episode (see
+[`events-and-alarms.md`](events-and-alarms.md#rtmp-output-push-to-twitch--youtube--any-rtmp-ingest)).
+Pin a track it can publish to fix it.
+
 **The in-place transcoder is single-program**, so one output transcodes
 exactly one audio PID. To pull two tracks out of an MPTS — say an
 English AAC output and a French AAC output — create **one output per

@@ -1168,7 +1168,12 @@ async fn whep_server_loop(
     // The source's PSI, read off the packets this loop already consumes: a
     // viewer that accepts no H.264 is sent audio alone only if there is Opus
     // to send it, and without an `audio_encode` that is an Opus source's own.
-    let mut source = super::webrtc::ts_demux::TsDemuxer::new(config.program_number);
+    // With one, its `source_audio_pid` pins the track every viewer's demuxer
+    // takes; this one, following the same PMT, says once for the output —
+    // not once per viewer — when the PMT does not carry it.
+    let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
+    let mut source = super::webrtc::ts_demux::TsDemuxer::with_audio_pid(config.program_number, pinned_audio);
+    let mut audio_pin = super::transcode_engage::AudioPinWatch::new(pinned_audio);
 
     loop {
         // Wait for a viewer to connect via WHEP
@@ -1183,6 +1188,16 @@ async fn whep_server_loop(
                 match result {
                     Ok(packet) => {
                         source.observe_psi(super::ts_parse::strip_rtp_header(&packet));
+                        if let Some((pinned, actual, stream_type)) = audio_pin.check(source.audio_track()) {
+                            super::transcode_engage::emit_pinned_audio_pid_absent(
+                                events,
+                                &config.id,
+                                pinned,
+                                actual,
+                                stream_type,
+                                "the program's first audio stream",
+                            );
+                        }
                         continue;
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1529,8 +1544,13 @@ async fn whep_viewer_loop(
 
     // Send loop: demux TS → packetize H.264 → send via str0m.
     // Also processes incoming RTCP/STUN via drive_udp_io() to keep
-    // the session alive (same pattern as whip_client_loop).
-    let mut demuxer = TsDemuxer::new(program_number);
+    // the session alive (same pattern as whip_client_loop). The audio is
+    // the track `audio_encode.source_audio_pid` pins, when the PMT carries
+    // it (the server loop reports when it does not).
+    let mut demuxer = TsDemuxer::with_audio_pid(
+        program_number,
+        audio_encode.as_ref().and_then(|a| a.source_audio_pid),
+    );
     // The 48 kHz RTP timeline of an Opus source passed through.
     let mut opus_timeline = super::webrtc::opus_passthrough::OpusTimeline::default();
     // A viewer that leaves without a DELETE — `pc.close()`, a closed tab, a
@@ -1957,6 +1977,10 @@ async fn whip_client_loop(
     // WHIP output is the client side — full ICE (not ICE-Lite).
     let session_config = SessionConfig { bind_addr, public_ip, ice_lite: false };
     let mut backoff_secs = 1u64;
+    // `audio_encode.source_audio_pid` absent from the PMT, said once for the
+    // output rather than once per connection.
+    let pinned_audio = config.audio_encode.as_ref().and_then(|a| a.source_audio_pid);
+    let mut audio_pin = super::transcode_engage::AudioPinWatch::new(pinned_audio);
 
     'outer: loop {
         // Create session
@@ -2175,7 +2199,7 @@ async fn whip_client_loop(
         // keepalives) so str0m can maintain the connection. Without this
         // the remote peer never receives RTCP feedback, timers expire,
         // and the session silently dies.
-        let mut demuxer = TsDemuxer::new(config.program_number);
+        let mut demuxer = TsDemuxer::with_audio_pid(config.program_number, pinned_audio);
         // The 48 kHz RTP timeline of an Opus source passed through.
         let mut opus_timeline = super::webrtc::opus_passthrough::OpusTimeline::default();
         // As on the WHEP viewer loop: the session is driven when no packet
@@ -2248,6 +2272,16 @@ async fn whip_client_loop(
                             if payload.is_empty() { continue; }
 
                             let frames = demuxer.demux(payload);
+                            if let Some((pinned, actual, stream_type)) = audio_pin.check(demuxer.audio_track()) {
+                                super::transcode_engage::emit_pinned_audio_pid_absent(
+                                    events,
+                                    &config.id,
+                                    pinned,
+                                    actual,
+                                    stream_type,
+                                    "the program's first audio stream",
+                                );
+                            }
                             for frame in frames {
                                 // Nothing is written while ICE is down, as
                                 // on the WHEP viewer loop (`write_media`

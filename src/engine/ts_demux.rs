@@ -57,6 +57,22 @@ enum PrivateAudioKind {
 /// AC-4 descriptor tag value to make tracing self-documenting.
 pub const SYNTHETIC_STREAM_TYPE_AC4: u8 = 0xAC;
 
+/// The codec an audio track the demuxer routes as `stream_type` carries
+/// (the effective type [`TsDemuxer::audio_track`] reports), for logs and
+/// operator-facing events.
+pub fn audio_codec_name(stream_type: u8) -> &'static str {
+    match stream_type {
+        STREAM_TYPE_AAC_ADTS => "AAC",
+        STREAM_TYPE_AAC_LATM => "AAC-LATM",
+        STREAM_TYPE_PRIVATE => "Opus",
+        0x03 | 0x04 => "MP2",
+        0x80 | 0x81 | 0xC1 => "AC-3",
+        0x87 | 0xC2 => "E-AC-3",
+        SYNTHETIC_STREAM_TYPE_AC4 => "AC-4",
+        _ => "unknown",
+    }
+}
+
 /// Extracted media frame from the TS demuxer.
 pub enum DemuxedFrame {
     /// Stream discontinuity signal — the demuxer detected that the upstream
@@ -398,6 +414,10 @@ pub struct TsDemuxer {
     /// first audio PID in the PMT is used (default). If `Some(N)`, the Nth
     /// audio track (0-based) is selected.
     audio_track_index: Option<u8>,
+    /// Audio PID pinned by the consumer (`audio_encode.source_audio_pid`).
+    /// When the PMT carries it as an audio track it is selected ahead of
+    /// `audio_track_index`; when it does not, selection falls back to that.
+    audio_pid_pin: Option<u16>,
     /// PMT PID we're locked onto (set after the first PAT is parsed).
     selected_pmt_pid: Option<u16>,
     /// Video PID (H.264 or H.265) discovered from the selected PMT.
@@ -478,6 +498,7 @@ impl TsDemuxer {
         Self {
             target_program,
             audio_track_index: None,
+            audio_pid_pin: None,
             selected_pmt_pid: None,
             video_pid: None,
             video_stream_type: 0,
@@ -515,6 +536,7 @@ impl TsDemuxer {
         Self {
             target_program,
             audio_track_index,
+            audio_pid_pin: None,
             selected_pmt_pid: None,
             video_pid: None,
             video_stream_type: 0,
@@ -536,6 +558,23 @@ impl TsDemuxer {
             selected_program: None,
             selected_pmt_pid_shared: false,
             scte35_section: crate::engine::ts_parse::SectionAssembler::new(),
+        }
+    }
+
+    /// Create a new demuxer whose audio is pinned to one elementary PID —
+    /// what an output with `audio_encode.source_audio_pid` builds.
+    ///
+    /// - `None` — the first audio track, as [`Self::new`].
+    /// - `Some(pid)` — the track on `pid` whenever the program's PMT carries
+    ///   it as audio the demuxer recognises, whatever its codec. A PMT that
+    ///   does not (the PID is missing, or is not audio) gets the first audio
+    ///   track instead; the consumer compares [`Self::audio_track`] with its
+    ///   pin to tell the operator (`audio_source_pid_not_found`). A later PMT
+    ///   that carries the pin moves back onto it.
+    pub fn with_audio_pid(target_program: Option<u16>, audio_pid: Option<u16>) -> Self {
+        Self {
+            audio_pid_pin: audio_pid,
+            ..Self::new(target_program)
         }
     }
 
@@ -587,6 +626,16 @@ impl TsDemuxer {
     #[allow(dead_code)]
     pub fn audio_pid(&self) -> Option<u16> {
         self.audio_pid
+    }
+
+    /// The audio track the demuxer is on: its PID and the stream type it is
+    /// routed as — the PMT's, or for a `0x06` private stream the one its
+    /// descriptor resolves to (`0x81` AC-3, `0x87` E-AC-3, `0x11` LATM,
+    /// [`SYNTHETIC_STREAM_TYPE_AC4`]; Opus stays `0x06`). `None` until a PMT
+    /// carrying audio has been read.
+    pub fn audio_track(&self) -> Option<(u16, u8)> {
+        let pid = self.audio_pid?;
+        Some((pid, self.pes_assemblers.get(&pid)?.stream_type))
     }
 
     /// Active program number, if the demuxer was constructed with one.
@@ -1009,12 +1058,17 @@ impl TsDemuxer {
             pos += 5 + es_info_length;
         }
 
-        // Select the audio track based on audio_track_index.
+        // Select the audio track: the pinned PID when the PMT carries it,
+        // else by audio_track_index.
         if !audio_tracks.is_empty() {
             let idx = self
-                .audio_track_index
-                .map(|i| (i as usize).min(audio_tracks.len() - 1))
-                .unwrap_or(0);
+                .audio_pid_pin
+                .and_then(|pin| audio_tracks.iter().position(|(pid, _)| *pid == pin))
+                .unwrap_or_else(|| {
+                    self.audio_track_index
+                        .map(|i| (i as usize).min(audio_tracks.len() - 1))
+                        .unwrap_or(0)
+                });
             let (selected_pid, selected_type) = audio_tracks[idx];
             let opus_code = opus_codes
                 .iter()
@@ -1041,24 +1095,18 @@ impl TsDemuxer {
                 .and_then(|pid| self.pes_assemblers.get(&pid))
                 .is_none_or(|a| a.stream_type != selected_type);
             if audio_pid_changed || audio_codec_changed {
-                let codec_name = match selected_type {
-                    STREAM_TYPE_AAC_ADTS => "AAC",
-                    STREAM_TYPE_AAC_LATM => "AAC-LATM",
-                    STREAM_TYPE_PRIVATE => "Opus",
-                    0x03 | 0x04 => "MP2",
-                    0x80 | 0x81 | 0xC1 => "AC-3",
-                    0x87 | 0xC2 => "E-AC-3",
-                    SYNTHETIC_STREAM_TYPE_AC4 => "AC-4 (passthrough — no decoder)",
-                    _ => "unknown",
-                };
                 tracing::info!(
-                    "TS demux: {} audio PID 0x{:04X} (track {}/{} selected{})",
-                    codec_name,
+                    "TS demux: {}{} audio PID 0x{:04X} (track {}/{} selected{}{})",
+                    audio_codec_name(selected_type),
+                    if selected_type == SYNTHETIC_STREAM_TYPE_AC4 { " (passthrough — no decoder)" } else { "" },
                     selected_pid,
                     idx,
                     audio_tracks.len(),
                     self.audio_track_index
                         .map(|i| format!(", requested index {i}"))
+                        .unwrap_or_default(),
+                    self.audio_pid_pin
+                        .map(|p| format!(", pinned PID 0x{p:04X}"))
                         .unwrap_or_default(),
                 );
                 self.audio_pid = Some(selected_pid);
@@ -2382,5 +2430,55 @@ mod tests {
             .collect();
         assert!(pts.ends_with(&[P0 + 3 * 1920, P0 + 4 * 1920, P0 + 5 * 1920]), "{pts:?}");
         assert!(pts.len() < 6, "the damaged frame is not passed on: {pts:?}");
+    }
+
+    /// PAT + one PMT (version `version`) for program 1: H.264 on 0x100,
+    /// then the audio ES `audio` in PMT order.
+    fn pinned_audio_psi(version: u8, audio: &[(u8, u16, &[u8])]) -> Vec<u8> {
+        use crate::engine::ts_test_fixtures::{packetize_sections, pat_packet, pmt_section};
+        let mut es: Vec<(u8, u16, &[u8])> = vec![(0x1B, 0x100, &[])];
+        es.extend_from_slice(audio);
+        let pmt = pmt_section(1, version, 0x100, &[], &es);
+        let mut ts = pat_packet(&[(1, 0x1000)], 0, 0).to_vec();
+        ts.extend_from_slice(&packetize_sections(0x1000, &[&pmt], version)[0]);
+        ts
+    }
+
+    /// An MPTS-style program whose first audio track is AC-4: unpinned, the
+    /// demuxer takes the AC-4; pinned (`audio_encode.source_audio_pid`), it
+    /// takes the pinned E-AC-3 instead, wherever it sits in the PMT.
+    #[test]
+    fn a_pinned_audio_pid_is_taken_over_the_first_track() {
+        const AC4: &[u8] = &[0xAC, 0x03, 0x00, 0x00, 0x00];
+        let ts = pinned_audio_psi(0, &[(0x06, 0x300, AC4), (0x87, 0x301, &[]), (0x0F, 0x302, &[])]);
+
+        let mut demux = TsDemuxer::new(None);
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x300, SYNTHETIC_STREAM_TYPE_AC4)));
+
+        let mut demux = TsDemuxer::with_audio_pid(None, Some(0x301));
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x301, 0x87)));
+
+        let mut demux = TsDemuxer::with_audio_pid(None, Some(0x302));
+        demux.demux(&ts);
+        assert_eq!(demux.audio_track(), Some((0x302, 0x0F)));
+    }
+
+    /// A pin the PMT does not carry as audio — absent, or the video PID —
+    /// falls back to the first audio track, as `TsAudioReplacer` falls back
+    /// to first-match; a later PMT that carries it moves the demuxer onto it.
+    #[test]
+    fn an_absent_audio_pin_falls_back_to_the_first_track_until_the_pmt_carries_it() {
+        let mut demux = TsDemuxer::with_audio_pid(None, Some(0x305));
+        demux.demux(&pinned_audio_psi(0, &[(0x81, 0x301, &[]), (0x0F, 0x302, &[])]));
+        assert_eq!(demux.audio_track(), Some((0x301, 0x81)), "absent pin: first audio track");
+
+        demux.demux(&pinned_audio_psi(1, &[(0x81, 0x301, &[]), (0x0F, 0x302, &[]), (0x03, 0x305, &[])]));
+        assert_eq!(demux.audio_track(), Some((0x305, 0x03)), "the pin, once the PMT carries it");
+
+        let mut demux = TsDemuxer::with_audio_pid(None, Some(0x100));
+        demux.demux(&pinned_audio_psi(0, &[(0x0F, 0x302, &[])]));
+        assert_eq!(demux.audio_track(), Some((0x302, 0x0F)), "a video PID is no audio pin");
     }
 }
