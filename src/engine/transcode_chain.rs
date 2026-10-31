@@ -64,8 +64,10 @@
 //! new receiver's stream must start from the input as it is now: every
 //! chunk is tagged with the stream it was submitted for, the codec thread
 //! drops input of a stream the output has left and resets both replacers
-//! at the first chunk of the new one, and [`TranscodeChain::try_recv`]
-//! drops output produced for an earlier one.
+//! at the first chunk of the new one (the video replacer closing its
+//! encoder, so no picture it held from the old stream comes out into the
+//! new one), and [`TranscodeChain::try_recv`] drops output produced for an
+//! earlier one.
 //!
 //! ## Stats + shared flags
 //!
@@ -374,9 +376,11 @@ impl TranscodeChain {
     /// before this call reaches the new stream: input still queued is
     /// dropped by the codec thread, and output it produced is dropped by
     /// [`Self::try_recv`]. The first chunk submitted after it resets both
-    /// replacers as an input switch does (decoder, encoder and PTS anchor
-    /// afresh, the video's next frame an IDR), so the new receiver's stream
-    /// starts from the input as it is now.
+    /// replacers as an input switch does (decoders, the audio encoder and
+    /// the PTS anchors afresh), and closes the video encoder with every
+    /// picture it still holds, which an input switch keeps open (it reopens
+    /// on the next picture, an IDR), so the new receiver's stream starts
+    /// from the input as it is now.
     ///
     /// The output submits nothing while no receiver is connected, so its
     /// input has a gap across the change. Carried across it, the chain
@@ -650,11 +654,11 @@ fn run_chain(
         // no receiver: skip it. The first chunk of a new stream after one
         // was carried resets both replacers, so nothing of the old stream
         // (a partial access unit, audio waiting in the encoder, the PTS
-        // anchor, the video decoder's references) runs on across the gap
-        // into it. The PCR stage needs no reset: the gap is a forward
-        // input PCR step without DI, which it carries as the step it is —
-        // the clock ran on, only the delivery paused — and a new receiver
-        // never saw the PCR before it.
+        // anchor, the video decoder's references, the pictures the video
+        // encoder holds) runs on across the gap into it. The PCR stage
+        // needs no reset: the gap is a forward input PCR step without DI,
+        // which it carries as the step it is — the clock ran on, only the
+        // delivery paused — and a new receiver never saw the PCR before it.
         if input_stream < stream.load(Ordering::Acquire) {
             continue;
         }
@@ -666,8 +670,11 @@ fn run_chain(
             if let Some(a) = audio.as_ref() {
                 a.external_reset_handle().store(true, Ordering::Relaxed);
             }
-            if let Some(v) = video.as_ref() {
-                v.external_reset_handle().store(true, Ordering::Relaxed);
+            // The video replacer resets as on an input switch and closes its
+            // encoder too: an input switch keeps it open, and the pictures it
+            // still held from the old stream came out into the new one.
+            if let Some(v) = video.as_mut() {
+                v.restart_stream();
             }
         }
         carrying = Some(input_stream);

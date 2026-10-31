@@ -1142,9 +1142,12 @@ bits on; band-limited MP2 / AAC sources are not.
   to the egress pipeline. An SRT output restarts the chain's stream at each
   connection (`TranscodeChain::restart_stream`): input and output of the
   last connection still in the chain are dropped, and both replacers reset
-  as on an input switch, so a re-joining receiver starts on the live
-  programme rather than on TS the last one never got followed by a PCR jump
-  over the reconnection gap. See
+  as on an input switch, the video replacer closing its encoder as well
+  (`TsVideoReplacer::restart_stream`: an input switch keeps it open, and
+  kept open the pictures it held would come out on the new connection, each
+  taking one of its PTS, its video that many frames behind its audio), so a
+  re-joining receiver starts on the live programme rather than on TS the
+  last one never got followed by a PCR jump over the reconnection gap. See
   [configuration-guide.md](configuration-guide.md#srt-output) (Reconnections).
   The SRT and RIST outputs take everything the chain has ready each time
   round (`TranscodeChain::try_recv_ready`), as UDP and RTP always did:

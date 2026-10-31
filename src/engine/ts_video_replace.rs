@@ -594,6 +594,18 @@ impl TsVideoReplacer {
         self.external_reset_on_switch.clone()
     }
 
+    /// The output this replacer feeds started a new stream to a new
+    /// receiver (an SRT output's next connection): reset as an input switch
+    /// does, and close the encoder too, so no frame it still holds from the
+    /// last stream reaches the new one. It reopens on the next frame, an
+    /// IDR. Called on the codec thread that owns the replacer.
+    pub fn restart_stream(&mut self) {
+        #[cfg(feature = "media-codecs")]
+        {
+            self.inner.restart_stream();
+        }
+    }
+
     /// Feed one chunk of 188-byte-aligned TS into the replacer. Output
     /// TS is appended to `output`. Mis-aligned input is passed through
     /// verbatim (best-effort for boundary recovery in the caller).
@@ -1126,7 +1138,8 @@ mod inner {
         /// with different codecs, or a PAT/PMT program re-layout).
         ///
         /// The encoder pipeline is intentionally *not* reset — it targets
-        /// the output's configured codec, which never changes.
+        /// the output's configured codec, which never changes. A new
+        /// output stream closes it as well ([`Self::restart_stream`]).
         fn reset_source_state(&mut self, reason: &str) {
             tracing::info!("ts_video_replace: {reason}; reopening decoder");
             self.pes_buffer.clear();
@@ -1173,6 +1186,23 @@ mod inner {
             self.pmt_version.bump();
             // A new source gets a fresh engage window.
             self.engage.on_reset();
+        }
+
+        /// The output this replacer feeds started a new stream to a new
+        /// receiver (an SRT output's next connection,
+        /// `TranscodeChain::restart_stream`): the source state resets as on
+        /// an input switch, and the encoder is closed with every frame it
+        /// still holds. Kept open, as an input switch keeps it, the frames
+        /// it held from the last stream (a lookahead, frame threads, an
+        /// async hardware pipeline) came out into the new one, each taking a
+        /// PTS from the new stream's queue, and every later picture went out
+        /// that many frames late: the new receiver's video behind its audio
+        /// for the whole connection. It reopens on the new stream's first
+        /// frame, at the rate it ran at (the reset above keeps the rate
+        /// locked), and that frame is an IDR.
+        pub(super) fn restart_stream(&mut self) {
+            self.reset_source_state("the output started a new stream");
+            self.pipeline.close();
         }
 
         pub fn process(&mut self, input_ts: &[u8], output: &mut Vec<u8>) {
@@ -4349,6 +4379,43 @@ mod tests {
             assert!(decoded >= 8, "{decoded} decoded");
             assert!(r.inner.source_fps_locked);
             assert_eq!(encoded, decoded, "every decoded frame of the new source encoded");
+        }
+
+        /// A new output stream (an SRT output's next connection) gets no
+        /// picture the encoder still held from the last. With `tune: film`
+        /// libx264 runs a lookahead and frame threads, so pictures fed for
+        /// the old stream are still inside it at the restart. Kept open, as
+        /// an input switch keeps it, they came out first on the new stream,
+        /// each taking one of its PTS, and every picture of the new stream
+        /// went out that many frames late. The encoder reopens on the new
+        /// stream's first picture, an IDR, at the rate it ran at.
+        #[test]
+        fn a_new_stream_gets_no_picture_the_encoder_held_from_the_last() {
+            let aus = x264_aus(40, (320, 240), None, None);
+            let mut config = cfg("x264");
+            config.tune = Some("film".into());
+            let mut cc = 0u8;
+            let mut r = TsVideoReplacer::new(&config, None).unwrap();
+            let _ = run(&mut r, &ts_of(&aus, 900_000, false, &mut cc));
+            assert!(
+                !r.inner.src_pts_queue.is_empty(),
+                "the encoder holds pictures of the old stream"
+            );
+            r.restart_stream();
+            let decoded_before = r.decode_stats_handle().output_frames.load(Ordering::Relaxed);
+            let base = 5_000_000;
+            let mut out = run(&mut r, &ts_of(&aus, base, false, &mut cc));
+            r.flush(&mut out);
+            let decoded =
+                r.decode_stats_handle().output_frames.load(Ordering::Relaxed) - decoded_before;
+            assert!(r.inner.source_fps_locked, "the rate stays locked across the restart");
+            let pes = out_pes(&out);
+            assert!(decoded >= 30, "{decoded} decoded");
+            assert_eq!(pes.len() as u64, decoded, "one picture out per picture of the new stream");
+            assert!(has_idr(&pes[0].0), "the new stream starts on an IDR");
+            for (i, (_, pts)) in pes.iter().enumerate() {
+                assert_eq!(*pts, base + i as u64 * 3_600, "picture {i} keeps its own PTS");
+            }
         }
     }
 }
