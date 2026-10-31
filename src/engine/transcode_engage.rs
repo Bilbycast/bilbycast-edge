@@ -507,9 +507,11 @@ impl AudioTrackWatch {
 
 /// The `audio_codec_unpublishable` Warning [`AudioTrackWatch::poll`] owes:
 /// the audio track output `output_id` is on, PID `pid`, is in a codec it can
-/// neither carry nor re-encode, so the source's audio is not published. A
-/// program whose first audio track is AC-4 used to go out that way without a
-/// word. `kind` names the output ("RTMP"), `category` is its event category
+/// neither carry nor re-encode, so the source's audio is not published. Its
+/// demuxer is on such a track only when the program carries no track it can
+/// publish, so no pin would help. A program whose first audio track is AC-4
+/// used to go out that way without a word, whatever followed it.
+/// `kind` names the output ("RTMP"), `category` is its event category
 /// and `carries` what it can publish. Output-scoped, with the flow in
 /// `details`, like `codec_needs_encode`.
 #[allow(clippy::too_many_arguments)]
@@ -526,9 +528,8 @@ pub fn emit_audio_codec_unpublishable(
     let codec = crate::engine::ts_demux::audio_codec_name(stream_type);
     let message = format!(
         "{kind} output '{output_id}': its audio track, PID 0x{pid:04X}, is {codec} (stream_type \
-         0x{stream_type:02X}), which {kind} cannot carry or re-encode here ({carries}); the \
-         source's audio is not published. If the program carries an audio track it can \
-         publish, pin it with `audio_encode.source_audio_pid`"
+         0x{stream_type:02X}), which {kind} cannot carry or re-encode here ({carries}), and \
+         the program carries no audio track it can: the source's audio is not published"
     );
     tracing::warn!(error_code = "audio_codec_unpublishable", "{message}");
     sender.emit_output_with_details(
@@ -792,6 +793,13 @@ mod tests {
         assert_eq!(ev.output_id.as_deref(), Some("c1"));
         assert!(
             ev.message.starts_with("CMAF output 'c1': its audio track, PID 0x0300, is AC-4 (stream_type 0xAC)"),
+            "{}",
+            ev.message
+        );
+        assert!(
+            ev.message.ends_with(
+                "(AAC only), and the program carries no audio track it can: the source's audio is not published"
+            ),
             "{}",
             ev.message
         );

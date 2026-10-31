@@ -224,14 +224,15 @@ rather than through the replacer, and honour the pin too. Releases up to
 unpinned, whatever the pin said:
 
 - **RTMP, CMAF and WebRTC** (the shared demuxer,
-  `TsDemuxer::with_audio_pid`): unpinned, the program's **first** audio
-  stream, any codec the demuxer recognises — AC-4 and Opus included. A pin
-  is taken when it is a track the output can publish (below); otherwise —
-  absent, not audio, or a codec the output cannot publish — the output
-  falls back to the **first audio stream it can publish**, as the replacer
-  falls back to the first one it can decode, and to the first audio stream
-  of all only when the program has none it can publish. A later PMT that
-  carries the pin moves the output back onto it.
+  `TsDemuxer::with_audio_pid`): unpinned, the program's **first audio
+  stream the output can publish** (below), as the replacer locks only onto
+  audio it can decode, and the first audio stream of all only when the
+  program has none it can publish. Releases up to 0.116.0 took the first
+  audio stream whatever its codec, so an MPTS whose first audio track is
+  AC-4 published silence. A pin is taken when it is a track the output can
+  publish; otherwise — absent, not audio, or a codec the output cannot
+  publish — the output takes the track it would take unpinned. A later PMT
+  that carries the pin moves the output back onto it.
 - **HLS** (`audio_encode` remux): unpinned, the **last** audio stream it
   can decode, as before. A pin is taken when it is one it can decode;
   otherwise (absent, or AC-4 / DTS) the output falls back to that last
@@ -241,24 +242,29 @@ unpinned, whatever the pin said:
 
 The fallback raises the same Warning, `audio_source_pid_not_found`
 (category `flow`, output-scoped, same `details`), with a message naming
-the stream the output fell back to. It fires once per distinct
-(pinned, actual) pair for the output's lifetime and re-arms when the pin
-reappears: a WebRTC output raises it once, not once per WHEP viewer or
-WHIP reconnect, and an RTMP output not again on a reconnect.
+the stream the output fell back to, whenever the output is on a track
+other than the pin. It fires once per distinct (pinned, actual) pair for
+the output's lifetime and re-arms when the pin reappears: a WebRTC output
+raises it once, not once per WHEP viewer or WHIP reconnect, and an RTMP
+output not again on a reconnect.
 
 What each of the three can publish: **RTMP and CMAF** carry AAC as it
 is, and MP2 / AC-3 / E-AC-3 / AAC-LATM re-encoded through `audio_encode`
-(a `media-codecs` build) — never Opus-in-TS or AC-4. **WebRTC** carries
-Opus-in-TS, and AAC (plus MP2 / AC-3 / E-AC-3 / AAC-LATM on a
-`media-codecs` build) re-encoded through `audio_encode` — never AC-4. An
-output on a track it cannot publish — the program's first audio stream
-when nothing is pinned; under a pin, only when the program has no audio
-stream it can publish — publishes none of the source's audio and raises
-the Warning `audio_codec_unpublishable` naming the PID and codec, once per
-episode, in its own category (`rtmp`, `cmaf`, `webrtc`; see
+(a `media-codecs` build; without one, AAC only) — never Opus-in-TS or
+AC-4. **WebRTC** carries Opus-in-TS, and AAC (plus MP2 / AC-3 / E-AC-3 /
+AAC-LATM on a `media-codecs` build; without one, Opus and AAC only)
+re-encoded through `audio_encode` — never AC-4. An output on a track it
+cannot publish — which, pinned or not, happens only when the program has
+no audio stream it can publish, leaving it on the first one — publishes
+none of the source's audio and raises the Warning
+`audio_codec_unpublishable` naming the PID and codec, once per episode,
+in its own category (`rtmp`, `cmaf`, `webrtc`; see
 [`events-and-alarms.md`](events-and-alarms.md#rtmp-output-push-to-twitch--youtube--any-rtmp-ingest)).
-A WebRTC output raises it once for the output, not per viewer, and not at
-all when it is `video_only`. Pin a track it can publish to fix it.
+Under a pin, when that first stream is the pin itself the output is on
+its pin and raises `audio_codec_unpublishable` alone; when it is another
+stream it raises `audio_source_pid_not_found` as well. A WebRTC output raises each once
+for the output, not per viewer, and `audio_codec_unpublishable` not at
+all when it is `video_only`.
 Releases up to 0.116.0 said nothing, and a WebRTC output under
 `silent_fallback` did not even lay silence on an AC-4 track.
 
