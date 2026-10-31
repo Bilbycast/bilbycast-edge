@@ -387,6 +387,78 @@ pub fn he_aac_adts(v2: bool) -> Vec<u8> {
     out
 }
 
+/// The 25 frames of the AAC-LC 48 kHz stereo sine fixture.
+pub fn sine_aac_lc_frames() -> Vec<&'static [u8]> {
+    const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
+    let mut out = Vec::new();
+    let mut off = 0;
+    while off + 7 <= ADTS.len() {
+        let len = (usize::from(ADTS[off + 3] & 0x03) << 11) | (usize::from(ADTS[off + 4]) << 3) | (usize::from(ADTS[off + 5]) >> 5);
+        out.push(&ADTS[off..off + len]);
+        off += len;
+    }
+    out
+}
+
+/// `frames` (whole ADTS frames of a stereo stream, no CRC — the sine
+/// fixture's) re-signalled the way ISDB-T 1seg signals its layout: every
+/// header says channel_configuration 0, and only frame `first` and every
+/// `every`th after it opens its raw_data_block with a program_config_element
+/// (one front channel pair, tag 0 — the element the stereo frames carry).
+/// The frames before `first` carry none, like the start of an NHK capture.
+pub fn pce_signalled_adts(frames: &[&[u8]], first: usize, every: usize) -> Vec<u8> {
+    use crate::engine::aac_config::{PceElement, PceLayout, adts_with_pce, raw_block_pce};
+    let mut out = Vec::new();
+    for (i, frame) in frames.iter().enumerate() {
+        let carries = i >= first && (i - first).is_multiple_of(every);
+        let pce = if carries {
+            let (profile, sr_idx) = (frame[2] >> 6, (frame[2] >> 2) & 0x0F);
+            raw_block_pce(
+                profile,
+                sr_idx,
+                &PceLayout { front: &[PceElement { is_cpe: true, tag: 0 }], side: &[], back: &[], lfe: &[] },
+            )
+        } else {
+            Vec::new()
+        };
+        out.extend(adts_with_pce(frame, &pce).expect("a whole ADTS frame"));
+    }
+    out
+}
+
+/// `frames` AAC-LC frames of `channels` channels at `sample_rate` as ADTS,
+/// from the fdk encoder, a distinct tone on each channel — one encoder
+/// configuration the sine fixture is not (mono, 5.1, another rate).
+#[cfg(feature = "fdk-aac")]
+pub fn aac_lc_adts(sample_rate: u32, channels: u8, frames: usize) -> Vec<u8> {
+    let mut enc = aac_audio::AacEncoder::open(&aac_codec::EncoderConfig {
+        profile: aac_codec::AacProfile::AacLc,
+        sample_rate,
+        channels,
+        bitrate: 64_000 * u32::from(channels),
+        afterburner: true,
+        sbr_signaling: aac_codec::SbrSignaling::default(),
+        transport: aac_codec::TransportType::Adts,
+    })
+    .expect("fdk AAC-LC encoder");
+    let n = enc.frame_size() as usize;
+    let mut out = Vec::new();
+    let mut k = 0;
+    while split_adts(&out).len() < frames {
+        let planar: Vec<Vec<f32>> = (0..channels)
+            .map(|ch| {
+                let f = 300.0 + 200.0 * f32::from(ch);
+                (0..n)
+                    .map(|i| 0.3 * (2.0 * std::f32::consts::PI * f * (k * n + i) as f32 / sample_rate as f32).sin())
+                    .collect()
+            })
+            .collect();
+        out.extend(enc.encode_frame(&planar).expect("encode").bytes);
+        k += 1;
+    }
+    out
+}
+
 /// A live programme for the transcode tests: MP2 48 kHz stereo on PID
 /// 0x101 and its PCR on PID 0x100, which the PMT names a video PID and
 /// which carries nothing else, the audio 100 ms ahead of the PCR. One chunk
@@ -523,75 +595,4 @@ pub fn assert_one_followable_stream(events: &[ProgrammeEvent], after_27mhz: u64)
         }
     }
     assert!(pcrs >= 10 && audio >= 10, "{pcrs} PCRs and {audio} audio PES: too little to judge");
-
-/// The 25 frames of the AAC-LC 48 kHz stereo sine fixture.
-pub fn sine_aac_lc_frames() -> Vec<&'static [u8]> {
-    const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
-    let mut out = Vec::new();
-    let mut off = 0;
-    while off + 7 <= ADTS.len() {
-        let len = (usize::from(ADTS[off + 3] & 0x03) << 11) | (usize::from(ADTS[off + 4]) << 3) | (usize::from(ADTS[off + 5]) >> 5);
-        out.push(&ADTS[off..off + len]);
-        off += len;
-    }
-    out
-}
-
-/// `frames` (whole ADTS frames of a stereo stream, no CRC — the sine
-/// fixture's) re-signalled the way ISDB-T 1seg signals its layout: every
-/// header says channel_configuration 0, and only frame `first` and every
-/// `every`th after it opens its raw_data_block with a program_config_element
-/// (one front channel pair, tag 0 — the element the stereo frames carry).
-/// The frames before `first` carry none, like the start of an NHK capture.
-pub fn pce_signalled_adts(frames: &[&[u8]], first: usize, every: usize) -> Vec<u8> {
-    use crate::engine::aac_config::{PceElement, PceLayout, adts_with_pce, raw_block_pce};
-    let mut out = Vec::new();
-    for (i, frame) in frames.iter().enumerate() {
-        let carries = i >= first && (i - first).is_multiple_of(every);
-        let pce = if carries {
-            let (profile, sr_idx) = (frame[2] >> 6, (frame[2] >> 2) & 0x0F);
-            raw_block_pce(
-                profile,
-                sr_idx,
-                &PceLayout { front: &[PceElement { is_cpe: true, tag: 0 }], side: &[], back: &[], lfe: &[] },
-            )
-        } else {
-            Vec::new()
-        };
-        out.extend(adts_with_pce(frame, &pce).expect("a whole ADTS frame"));
-    }
-    out
-}
-
-/// `frames` AAC-LC frames of `channels` channels at `sample_rate` as ADTS,
-/// from the fdk encoder, a distinct tone on each channel — one encoder
-/// configuration the sine fixture is not (mono, 5.1, another rate).
-#[cfg(feature = "fdk-aac")]
-pub fn aac_lc_adts(sample_rate: u32, channels: u8, frames: usize) -> Vec<u8> {
-    let mut enc = aac_audio::AacEncoder::open(&aac_codec::EncoderConfig {
-        profile: aac_codec::AacProfile::AacLc,
-        sample_rate,
-        channels,
-        bitrate: 64_000 * u32::from(channels),
-        afterburner: true,
-        sbr_signaling: aac_codec::SbrSignaling::default(),
-        transport: aac_codec::TransportType::Adts,
-    })
-    .expect("fdk AAC-LC encoder");
-    let n = enc.frame_size() as usize;
-    let mut out = Vec::new();
-    let mut k = 0;
-    while split_adts(&out).len() < frames {
-        let planar: Vec<Vec<f32>> = (0..channels)
-            .map(|ch| {
-                let f = 300.0 + 200.0 * f32::from(ch);
-                (0..n)
-                    .map(|i| 0.3 * (2.0 * std::f32::consts::PI * f * (k * n + i) as f32 / sample_rate as f32).sin())
-                    .collect()
-            })
-            .collect();
-        out.extend(enc.encode_frame(&planar).expect("encode").bytes);
-        k += 1;
-    }
-    out
 }
