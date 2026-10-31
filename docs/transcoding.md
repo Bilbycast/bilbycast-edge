@@ -197,8 +197,14 @@ in the active program's PMT whose `stream_type` is one the replacer can
 decode: `0x0F` (AAC ADTS), `0x11` (AAC LATM), `0x03` / `0x04`
 (MPEG-1/2), `0x80` / `0x81` / `0xC1` (AC-3), `0x87` / `0xC2` (E-AC-3),
 or `0x06` (DVB private) resolved through its descriptor to one of AC-3 /
-E-AC-3 / LATM-AAC — a `0x06` that resolves to DTS, Opus, SMPTE 302M or
-AC-4 is walked past, not locked onto. Set it to
+E-AC-3 / LATM-AAC, or to Opus (the "Opus" registration descriptor) when it
+is one mono or stereo stream — no Opus extension descriptor, or
+`channel_config_code` 1 / 2 — as every WHIP / WHEP input and ffmpeg's
+`-c:a libopus -f mpegts` carry it. Opus is cut on its control header and
+decoded by libavcodec at 48 kHz; until 2026-10 it was walked past, so an
+ingress `audio_encode` on a WebRTC input re-encoded nothing. A `0x06` that
+resolves to DTS, multistream Opus (a channel mapping the decoder is not
+given), SMPTE 302M or AC-4 is walked past, not locked onto. Set it to
 pin a specific elementary PID instead — the case that matters is a
 program carrying several audio tracks (EN / FR / 5.1) where first-match
 would pick the wrong one, and the case where an input swap reorders the
@@ -437,8 +443,8 @@ carried at least 10 PUSI packets, or 10 s and 1000 TS packets have
 passed. `details.reason` says why: `no_pat`, `pmt_not_parsed` (with
 `first_table_id` — what the PID does carry), `no_supported_es`, or
 `codec_not_replaceable` (the program has audio / video, but only in a
-codec the replacer cannot decode: DTS, Opus, AC-4, SMPTE 302M, VC-1,
-JPEG XS, …). A later lock raises the Info `*_transcode_source_found` —
+codec the replacer cannot decode: DTS, multistream Opus, AC-4, SMPTE 302M,
+VC-1, JPEG XS, …; single-stream Opus is decoded since 2026-10). A later lock raises the Info `*_transcode_source_found` —
 including the first lock after an input switch, which used to close the
 Warning silently; a PMT update that removes the ES re-arms the watch. Catalogue:
 [`events-and-alarms.md`](events-and-alarms.md) ("Transcode engage").

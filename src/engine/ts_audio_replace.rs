@@ -981,6 +981,7 @@ impl TsAudioReplacer {
             0x03 | 0x04 => "MP2",
             0x81 | 0x80 | 0xC1 => "AC-3",
             0x87 | 0xC2 => "E-AC-3",
+            0x06 => "Opus",
             _ => "",
         };
         // Output-side path: look the handle up through the per-output
@@ -1560,7 +1561,7 @@ impl TsAudioReplacer {
         if payload_start >= TS_PACKET_SIZE {
             return;
         }
-        let Some(fmt) = AuFormat::for_stream_type(self.source_stream_type) else {
+        let Some(fmt) = source_au_format(self.source_stream_type) else {
             return;
         };
         if self.cutter.as_ref().is_none_or(|c| c.format() != fmt) {
@@ -1963,7 +1964,7 @@ impl TsAudioReplacer {
                 sample_rate: decoder.sample_rate().unwrap_or(48_000),
             }]);
         }
-        // MP2 / AC-3 / E-AC-3 / AAC-LATM via libavcodec, one AU per
+        // MP2 / AC-3 / E-AC-3 / AAC-LATM / Opus via libavcodec, one AU per
         // `avcodec_send_packet`.
         #[cfg(feature = "media-codecs")]
         if let Some(ff_codec) =
@@ -1973,8 +1974,16 @@ impl TsAudioReplacer {
                 self.ff_decoder =
                     Some(crate::engine::audio_decode::open_ff_decoder(ff_codec).map_err(|_| ())?);
             }
+            // An Opus AU goes to the decoder as the packet it carries,
+            // without the Opus-in-TS control header (the cutter has checked
+            // there is one).
+            let packet = if ff_codec == video_codec::AudioDecoderCodec::Opus {
+                *crate::engine::audio_decode::split_opus_frames(au).first().ok_or(())?
+            } else {
+                au
+            };
             let decoder = self.ff_decoder.as_mut().expect("opened above");
-            decoder.send_packet(au, 0).map_err(|_| ())?;
+            decoder.send_packet(packet, 0).map_err(|_| ())?;
             let mut frames = Vec::new();
             while let Ok(frame) = decoder.receive_frame() {
                 frames.push(Decoded {
@@ -2606,13 +2615,29 @@ impl TsAudioReplacer {
 /// stream (0x06 + descriptor 0x6A) arrives here as the synthesised
 /// 0x81 and lights up exactly like its ATSC sibling.
 ///
+/// Opus (0x06 + the "Opus" registration descriptor, a single mono or
+/// stereo stream) is resolved to the raw `0x06`, which therefore names Opus
+/// here and nothing else: [`resolve_private_audio_stream_type`] resolves no
+/// other private stream to it. Its access units are cut on the Opus-in-TS
+/// control header ([`AuFormat::Opus`]) and decoded by libavcodec.
+///
 /// Anything else falls through to passthrough (no PMT rewrite, audio
 /// bytes preserved).
 fn source_replaceable(stream_type: u8) -> bool {
     matches!(
         stream_type,
-        0x0F | 0x11 | 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2,
+        0x0F | 0x11 | 0x03 | 0x04 | 0x80 | 0x81 | 0x87 | 0xC1 | 0xC2 | 0x06,
     )
+}
+
+/// How the access units of a (resolved) source stream_type are framed — the
+/// shared [`AuFormat::for_stream_type`], and Opus for the resolved `0x06`
+/// (see [`source_replaceable`]).
+fn source_au_format(stream_type: u8) -> Option<AuFormat> {
+    match stream_type {
+        0x06 => Some(AuFormat::Opus),
+        st => AuFormat::for_stream_type(st),
+    }
 }
 
 /// Walk the ES-info descriptor loop after a `stream_type = 0x06`
@@ -2627,15 +2652,20 @@ fn source_replaceable(stream_type: u8) -> bool {
 ///   dispatch through the LOAS path)
 /// - `registration_descriptor` (tag `0x05`) with `format_identifier`
 ///   `"AC-3"` / `"EAC3"`
+/// - `registration_descriptor` `"Opus"` → the raw `0x06`, when it is one
+///   mono or stereo Opus stream: no Opus extension descriptor, or one whose
+///   `channel_config_code` is 1 or 2. A multistream layout (more than two
+///   channels, dual mono) needs a channel mapping the libavcodec decoder is
+///   not given, so it is not replaced. Opus used to be refused whatever its
+///   layout, so an ingress `audio_encode` on a WHIP or WHEP input, whose
+///   audio is always Opus, re-encoded nothing — the engage watchdog's
+///   `codec_not_replaceable`.
 ///
-/// Returns `None` for any other private stream (Opus, AC-4, DTS,
-/// SMPTE 302M, …) — the caller keeps the raw `0x06` and downstream
-/// paths handle it (Opus has its own arm in
-/// [`crate::engine::audio_decode::ff_codec_for_stream_type`]; AC-4 /
-/// DTS fall through to passthrough). The replacer must only be handed
-/// codecs it can actually decode, which is why the broader kinds the
-/// shared classifier recognises are deliberately collapsed to `None`
-/// here. DVB AC-3 carriage and the ATSC equivalent thus collapse onto
+/// Returns `None` for any other private stream (multistream Opus, AC-4,
+/// DTS, SMPTE 302M, …) — the caller keeps the raw `0x06` and the ES passes
+/// through. The replacer must only be handed codecs it can actually
+/// decode, which is why the broader kinds the shared classifier recognises
+/// are deliberately collapsed to `None` here. DVB AC-3 carriage and the ATSC equivalent thus collapse onto
 /// one code path — operators see the same transcoding behaviour
 /// whether the source comes from Europe / Australia (DVB) or North
 /// America (ATSC).
@@ -2651,11 +2681,12 @@ fn resolve_private_audio_stream_type(descriptors: &[u8]) -> Option<u8> {
         PrivateEsAudioKind::Ac3 => Some(0x81),
         PrivateEsAudioKind::Eac3 => Some(0x87),
         PrivateEsAudioKind::AacLatm => Some(0x11),
+        PrivateEsAudioKind::Opus => {
+            let layout = crate::engine::ts_parse::opus_channel_config_code(descriptors);
+            matches!(layout, None | Some(1) | Some(2)).then_some(0x06)
+        }
         // Not decodable by the replacer — keep raw 0x06 / passthrough.
-        PrivateEsAudioKind::Dts
-        | PrivateEsAudioKind::Opus
-        | PrivateEsAudioKind::Smpte302m
-        | PrivateEsAudioKind::Ac4 => None,
+        PrivateEsAudioKind::Dts | PrivateEsAudioKind::Smpte302m | PrivateEsAudioKind::Ac4 => None,
     }
 }
 
@@ -2665,8 +2696,8 @@ enum AudioClass {
     /// Audio we can decode; carries the (DVB-resolved) stream_type the rest
     /// of the replacer keys on.
     Replaceable(u8),
-    /// Audio, but a codec the replacer cannot decode (DTS, Opus, AC-4,
-    /// SMPTE 302M, MPEG-4 raw audio, TrueHD, …).
+    /// Audio, but a codec the replacer cannot decode (DTS, multistream
+    /// Opus, AC-4, SMPTE 302M, MPEG-4 raw audio, TrueHD, …).
     Unsupported,
     NotAudio,
 }
@@ -3132,11 +3163,10 @@ mod tests {
     /// Private-data streams that aren't audio (Opus, AC-4, DTS, …) or
     /// that carry no recognised descriptor must NOT be picked up as
     /// audio. The replacer would otherwise try to decode raw Opus
-    /// frames with the libavcodec AC-3 decoder. Note: Opus is the one
-    /// codec whose downstream path *does* accept stream_type 0x06, but
-    /// only when routed there explicitly — `select_audio_es` is the
-    /// re-encode gate and Opus isn't a re-encodable target on this
-    /// MPEG-TS surface.
+    /// frames with the libavcodec AC-3 decoder. Opus is the exception: a
+    /// single mono or stereo stream is decodable, and resolves to the raw
+    /// 0x06 (cut on its control header, decoded by libavcodec); it used to
+    /// be skipped like the rest.
     #[test]
     fn unrecognised_private_descriptor_is_skipped() {
         // 0xAB is a placeholder descriptor tag we don't recognise.
@@ -3144,10 +3174,10 @@ mod tests {
         let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
         assert_eq!(parse_pmt_audio(&pkt, None), None);
 
-        // Opus registration: also skipped by the re-encode gate.
+        // Opus registration: one stream, taken as the raw 0x06.
         let desc = [0x05, 0x04, b'O', b'p', b'u', b's'];
         let pkt = synth_pmt_private_audio(0x1000, 0x0289, &desc);
-        assert_eq!(parse_pmt_audio(&pkt, None), None);
+        assert_eq!(parse_pmt_audio(&pkt, None), Some((0x0289, 0x06)));
     }
 
     /// `resolve_private_audio_stream_type` survives a descriptor loop
@@ -4146,6 +4176,9 @@ mod tests {
             HeAac,
             Mp2,
             Ac3,
+            /// Opus in the Opus-in-TS carriage, as a WHIP / WHEP input muxes
+            /// it ([`mux`] adds the "Opus" registration descriptor).
+            Opus,
         }
 
         impl Src {
@@ -4154,8 +4187,24 @@ mod tests {
                     Src::Aac | Src::HeAac => 0x0F,
                     Src::Mp2 => 0x03,
                     Src::Ac3 => 0x81,
+                    Src::Opus => 0x06,
                 }
             }
+        }
+
+        /// One Opus packet as an Opus-in-TS access unit: the control header
+        /// (`0x7F 0xE0`, no trims, no extension) and `au_size`, as
+        /// `TsMuxer::mux_audio_opus` writes it.
+        pub fn opus_au(packet: &[u8]) -> Vec<u8> {
+            let mut au = vec![0x7F, 0xE0];
+            let mut n = packet.len();
+            while n >= 255 {
+                au.push(0xFF);
+                n -= 255;
+            }
+            au.push(n as u8);
+            au.extend_from_slice(packet);
+            au
         }
 
         /// Encode mono `pcm` (as stereo) in `src`. Each AU carries the PTS a
@@ -4200,11 +4249,13 @@ mod tests {
                         n += 1;
                     }
                 }
-                Src::Mp2 | Src::Ac3 => {
+                Src::Mp2 | Src::Ac3 | Src::Opus => {
                     let (codec, kbps) = match src {
                         Src::Mp2 => (video_codec::AudioCodecType::Mp2, 192),
+                        Src::Opus => (video_codec::AudioCodecType::Opus, 128),
                         _ => (video_codec::AudioCodecType::Ac3, 384),
                     };
+                    let au = |data: &[u8]| if matches!(src, Src::Opus) { opus_au(data) } else { data.to_vec() };
                     let mut e = video_engine::AudioEncoder::open(&video_codec::AudioEncoderConfig {
                         codec,
                         sample_rate: rate,
@@ -4217,27 +4268,37 @@ mod tests {
                         let mut c = chunk.to_vec();
                         c.resize(fs, 0.0);
                         for f in e.encode_frame(&frame(&c)).unwrap() {
-                            out.push((f.data.to_vec(), pts_at(f.pts)));
+                            out.push((au(&f.data), pts_at(f.pts)));
                         }
                     }
                     for f in e.flush().unwrap() {
-                        out.push((f.data.to_vec(), pts_at(f.pts)));
+                        out.push((au(&f.data), pts_at(f.pts)));
                     }
                 }
             }
             out
         }
 
-        /// PAT + PMT + the given PES (ES bytes, PTS) on PID 0x0101.
+        /// PAT + PMT + the given PES (ES bytes, PTS) on PID 0x0101. An Opus
+        /// source (`0x06`) is announced with the "Opus" registration
+        /// descriptor and rides private_stream_1, as an edge muxes it.
         pub fn mux(stream_type: u8, pes: &[(Vec<u8>, Option<u64>)]) -> Vec<u8> {
             let mut ts = synth_pat(0x1000).to_vec();
-            ts.extend_from_slice(&synth_pmt_audio(0x1000, 0x0101, stream_type));
+            let stream_id = if stream_type == 0x06 {
+                const OPUS: &[u8] = &[0x05, 0x04, b'O', b'p', b'u', b's'];
+                let pmt = crate::engine::ts_test_fixtures::pmt_section(1, 0, 0x0101, &[], &[(0x06, 0x0101, OPUS)]);
+                ts.extend_from_slice(&crate::engine::ts_test_fixtures::packetize_sections(0x1000, &[&pmt], 0)[0]);
+                0xBD
+            } else {
+                ts.extend_from_slice(&synth_pmt_audio(0x1000, 0x0101, stream_type));
+                0xC0
+            };
             let mut cc = 0u8;
             for (es, pts) in pes {
                 let bytes = match pts {
-                    Some(p) => build_audio_pes(0xC0, es, *p),
+                    Some(p) => build_audio_pes(stream_id, es, *p),
                     None => {
-                        let mut b = vec![0, 0, 1, 0xC0];
+                        let mut b = vec![0, 0, 1, stream_id];
                         b.extend_from_slice(&((3 + es.len()) as u16).to_be_bytes());
                         b.extend_from_slice(&[0x80, 0x00, 0x00]);
                         b.extend_from_slice(es);
@@ -5024,6 +5085,8 @@ mod tests {
             (Src::HeAac, "aac_lc", None, None, 48_000),
             (Src::Mp2, "aac_lc", None, None, 48_000),
             (Src::Ac3, "mp2", None, None, 48_000),
+            (Src::Opus, "aac_lc", None, None, 48_000),
+            (Src::Opus, "ac3", None, None, 48_000),
             // audio_encode.sample_rate alone (no transcode block) resamples.
             (Src::Aac, "aac_lc", Some(44_100), None, 44_100),
             (
@@ -5042,6 +5105,71 @@ mod tests {
             let e = err_samples(target, &out, src_time(at), *out_rate);
             assert!(e.abs() <= 3.0, "{src:?} -> {target} @ {out_rate}: {e:.1} samples off");
             assert_eq!(r.resolved_sample_rate, *out_rate);
+        }
+    }
+
+    /// An Opus source — what a WHIP or WHEP input publishes, Opus-in-TS on
+    /// stream_type 0x06 with the "Opus" registration — is re-encoded like
+    /// any other: the PMT names the target and no longer the Opus (its
+    /// registration and its extension descriptor dropped), every access
+    /// unit decodes, three of them to a PES (as ffmpeg packs them) or one
+    /// (as an edge does), and the audio is on time. The replacer took Opus
+    /// for a codec it cannot decode and passed it through, so an ingress
+    /// `audio_encode` on a WebRTC input re-encoded nothing — the engage
+    /// watchdog's `codec_not_replaceable`. A multistream layout (here 5.1,
+    /// `channel_config_code` 6) still passes through, with that reason.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
+    #[test]
+    fn an_opus_source_is_re_encoded() {
+        use e2e::*;
+        let at = 48_000 + 333;
+        let aus = encode_source(Src::Opus, &content(at, 48_000 * 3));
+        for per_pes in [1, 3] {
+            let ts = mux(0x06, &pack(&aus, per_pes));
+            let mut r = replacer("aac_lc", None, None);
+            let out = run(&mut r, &ts);
+            assert_eq!(r.source_stream_type, 0x06, "{per_pes} AU(s) to a PES");
+            assert_eq!(r.decode_stats.decode_errors.load(Ordering::Relaxed), 0);
+            assert_eq!(r.decode_stats.input_frames.load(Ordering::Relaxed), aus.len() as u64);
+            let section = pmt_in(&out, 1);
+            let pmt = parse_pmt(&section).unwrap();
+            assert_eq!((pmt.es[0].stream_type, pmt.es[0].pid), (0x0F, 0x0101));
+            assert!(pmt.es_info(&pmt.es[0]).is_empty(), "no Opus descriptor left on the AAC");
+            let e = err_samples("aac_lc", &out, src_time(at), 48_000);
+            assert!(e.abs() <= 3.0, "{per_pes} AU(s) to a PES: {e:.1} samples off");
+        }
+
+        // The registration with the Opus extension descriptor: stereo is
+        // re-encoded and the extension dropped; 5.1 passes through.
+        for (code, replaced) in [(2u8, true), (6, false)] {
+            let info = [0x05, 0x04, b'O', b'p', b'u', b's', 0x7F, 0x02, 0x80, code];
+            let pmt = crate::engine::ts_test_fixtures::pmt_section(1, 0, 0x0101, &[], &[(0x06, 0x0101, &info)]);
+            let mut r = replacer("aac_lc", None, None);
+            let (tx, mut rx) = crate::manager::events::event_channel();
+            r.set_event_watchdog(tx, "out-1", false);
+            let mut out = Vec::new();
+            for i in 0..12u8 {
+                out.clear();
+                r.process(&synth_pat(0x1000), &mut out);
+                r.process(&crate::engine::ts_test_fixtures::packetize_sections(0x1000, &[&pmt], i)[0], &mut out);
+            }
+            let section = pmt_in(&out, 1);
+            let v = parse_pmt(&section).unwrap();
+            if replaced {
+                assert_eq!(r.audio_pid, Some(0x0101));
+                assert_eq!(v.es[0].stream_type, 0x0F);
+                assert!(v.es_info(&v.es[0]).is_empty(), "{:02X?}", v.es_info(&v.es[0]));
+            } else {
+                assert_eq!(r.audio_pid, None);
+                assert_eq!((v.es[0].stream_type, v.es_info(&v.es[0])), (0x06, &info[..]));
+                match r.poll_engage(future(6)) {
+                    Some(EngageEvent::NotFound { reason, .. }) => {
+                        assert_eq!(reason.as_str(), "codec_not_replaceable")
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert!(rx.try_recv().is_ok(), "the watchdog said so");
+            }
         }
     }
 
