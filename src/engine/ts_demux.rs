@@ -1235,7 +1235,16 @@ impl TsDemuxer {
                 // `cached_aac_config` is intentionally kept across codec
                 // changes — every ADTS header refreshes it, and the export
                 // path needs the AAC config to remain available for the
-                // frames it captured before the switch.
+                // frames it captured before the switch. The layout a PCE
+                // gave the old track is not: a header alone does not clear
+                // it (only a change of profile, rate or channel
+                // configuration does), so a new track signalling its layout
+                // the same way — channel configuration 0 at the old track's
+                // profile and rate — ran on the old track's PCE until its
+                // own first one, a stale sequence header on RTMP passthrough
+                // and a decoder of the wrong layout on a re-encode, where the
+                // wait for it (`aac_layout_pending`) should hold them back.
+                self.cached_aac_pce = None;
             }
         } else if let Some(old) = self.audio_pid.take() {
             // The program no longer carries audio this demuxer surfaces: let
@@ -1247,13 +1256,18 @@ impl TsDemuxer {
             // video, whose assembler took its place in the map above.
             // `cached_aac_config` is kept for the export path, as on a codec
             // change: no `Aac` frame leaves before its own ADTS header has
-            // refreshed it, so a returning track never runs on the old one.
+            // refreshed it. Its PCE goes, as on a track change: a returning
+            // track's header can equal the old one's (channel
+            // configuration 0, same profile and rate) and leave it in place,
+            // so the new track ran on the old track's layout until its own
+            // first PCE.
             tracing::info!(
                 "TS demux: audio PID 0x{:04X} is gone from the PMT; no audio track selected",
                 old
             );
             self.audio_au = None;
             self.opus_channel_config = None;
+            self.cached_aac_pce = None;
             if Some(old) != self.video_pid {
                 self.pes_assemblers.remove(&old);
             }
@@ -2645,6 +2659,48 @@ mod tests {
             assert_eq!(*pending, None);
             assert_eq!((cfg.ch_cfg, cfg.channels()), (0, 2), "frame {i}: the PCE's one channel pair");
             assert_eq!(&cfg.audio_specific_config()[..2], [0x11, 0x80]);
+        }
+    }
+
+    /// A PCE-signalled track that leaves the PMT, or is replaced by one on
+    /// another PID, takes its layout with it: the next track, signalled the
+    /// same way at the same profile and rate, waits for a PCE of its own —
+    /// `aac_layout_pending`, and no configuration to build a header or a
+    /// decoder from — however alike its headers are. The old track's PCE
+    /// survived both (it was cleared only when the header's profile, rate
+    /// or channel configuration changed), so RTMP passthrough sent a
+    /// sequence header with the old layout and a re-encode decoded the new
+    /// track with it until the new track's first PCE.
+    #[test]
+    fn a_new_pce_signalled_track_waits_for_its_own_layout() {
+        use crate::engine::ts_test_fixtures::{pce_signalled_adts, pes_packets, sine_aac_lc_frames};
+        const P0: u64 = 900_000;
+        let sine = sine_aac_lc_frames();
+        let with_pce = pce_signalled_adts(&sine[..3], 0, 1);
+        let without = pce_signalled_adts(&sine[..3], 3, 1);
+        let state = |demux: &TsDemuxer| (demux.aac_layout_pending(), demux.cached_aac_specific_config().is_some());
+        for moved in [false, true] {
+            let mut demux = TsDemuxer::new(None);
+            let mut cc = 0;
+            let mut ts = build_pat(0x100).to_vec();
+            ts.extend(pmt_packets(0, &[(0x1B, 0x200), (0x0F, 0x300)]));
+            ts.extend(audio_pes_packets(&with_pce, P0, &mut cc));
+            assert_eq!(aac_frames(&mut demux, &ts).len(), 3);
+            assert_eq!(state(&demux), (None, true), "moved {moved}: the first track's layout");
+            let (pid, back) = if moved {
+                // Straight onto another PID.
+                (0x301, pmt_packets(1, &[(0x1B, 0x200), (0x0F, 0x301)]))
+            } else {
+                // Gone from the PMT, then back.
+                assert!(aac_frames(&mut demux, &pmt_packets(1, &[(0x1B, 0x200)])).is_empty());
+                (0x300, pmt_packets(2, &[(0x1B, 0x200), (0x0F, 0x300)]))
+            };
+            let mut back = back;
+            let mut cc2 = 0;
+            back.extend(pes_packets(pid, 0xC0, &without, P0 + 6 * 1920, &mut cc2));
+            assert_eq!(aac_frames(&mut demux, &back).len(), 3, "moved {moved}");
+            assert_eq!(demux.cached_aac_config(), Some((1, 3, 0)), "moved {moved}: the same header");
+            assert_eq!(state(&demux), (Some(3), false), "moved {moved}: the new track's layout is not known yet");
         }
     }
 
