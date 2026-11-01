@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aac-audio"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aac-codec",
  "libfdk-aac-sys",
@@ -475,7 +475,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bilbycast-edge"
-version = "0.116.0"
+version = "0.117.0"
 dependencies = [
  "aac-audio",
  "aac-codec",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "srt-transport"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "bytes",
  "libc",
