@@ -381,7 +381,7 @@ async fn patch_sender_staged(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
-        if let Some(new_output) = apply_result {
+        if let Some(mut new_output) = apply_result {
             // Validate the patched entity BEFORE the runtime is touched — the
             // controller's `destination_ip` / `source_port` reach this point
             // unchecked, and `apply_sender_params_to_output` only round-trips
@@ -397,6 +397,12 @@ async fn patch_sender_staged(
             // collide with another input, output or tunnel on this node.
             let conflict = {
                 let cfg = state.config.read().await;
+                // A sender edit changes transport parameters, never activation,
+                // so the stored flag stands: the patched copy was built from a
+                // snapshot taken before this request's checks.
+                if let Some(stored) = cfg.outputs.iter().find(|o| o.id() == output_id) {
+                    new_output.set_active(stored.active());
+                }
                 crate::config::validation::validate_port_conflicts_with_output(&cfg, &new_output)
                     .err()
             };
@@ -406,12 +412,13 @@ async fn patch_sender_staged(
                 ));
             }
 
-            // Hot-swap: remove then add the patched output. If the remove
+            // Hot-swap: stop any running task, then add the patched output,
+            // which attaches a passive sender with no task. If the stop
             // succeeds but add fails the flow ends up with one fewer
             // output; we surface that to the NMOS client as a 500 so it
             // can retry.
-            let _ = state.flow_manager.remove_output(&sender_flow_id, &output_id).await;
-            if let Err(e) = state.flow_manager.add_output(&sender_flow_id, new_output.clone()).await {
+            let stays_passive = !new_output.active();
+            if let Err(e) = state.flow_manager.replace_output(&sender_flow_id, new_output.clone()).await {
                 if let Some(ref tx) = state.event_sender {
                     tx.emit_flow_with_details(
                         EventSeverity::Critical,
@@ -437,6 +444,8 @@ async fn patch_sender_staged(
             {
                 let mut cfg = state.config.write().await;
                 if let Some(existing) = cfg.outputs.iter_mut().find(|o| o.id() == output_id) {
+                    // Again from the live config: a press can land in the swap.
+                    new_output.set_active(existing.active());
                     *existing = new_output;
                 }
                 let cfg_snapshot = cfg.clone();
@@ -455,24 +464,43 @@ async fn patch_sender_staged(
             }
 
             if let Some(ref tx) = state.event_sender {
+                let (message, action) = if stays_passive {
+                    (
+                        format!(
+                            "IS-05 sender {uuid} parameters saved; the sender stays passive, so \
+                             nothing was started"
+                        ),
+                        "sender_params_saved_passive",
+                    )
+                } else {
+                    (
+                        format!("IS-05 sender {uuid} activated and applied to live flow"),
+                        "sender_activated",
+                    )
+                };
                 tx.emit_flow_with_details(
                     EventSeverity::Info,
                     category::NMOS,
-                    format!("IS-05 sender {uuid} activated and applied to live flow"),
+                    message,
                     &sender_flow_id,
                     serde_json::json!({
                         "subsystem": "is-05",
-                        "action": "sender_activated",
+                        "action": action,
                         "sender_id": uuid.to_string(),
                         "output_id": output_id,
                     }),
                 );
             }
         } else if let Some(ref tx) = state.event_sender {
+            let message = if existing_output.active() {
+                format!("IS-05 sender {uuid} activated (no address change — no-op on live flow)")
+            } else {
+                format!("IS-05 sender {uuid}: no address change, and the sender stays passive")
+            };
             tx.emit_flow_with_details(
                 EventSeverity::Info,
                 category::NMOS,
-                format!("IS-05 sender {uuid} activated (no address change — no-op on live flow)"),
+                message,
                 &sender_flow_id,
                 serde_json::json!({
                     "subsystem": "is-05",
@@ -882,7 +910,7 @@ fn active_sender_params(
     Ok(TransportParams {
         transport_params: vec![param_set],
         activation: None,
-        master_enable: true,
+        master_enable: output.active(),
     })
 }
 
@@ -987,6 +1015,121 @@ fn active_receiver_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `master_enable` on `GET /active` reports the output's real flag, and a
+    /// sender activation changes transport parameters and never activation: a
+    /// passive sender takes the new address, stays passive and gets no task.
+    #[tokio::test]
+    async fn activating_a_passive_sender_patches_it_without_starting_it() {
+        use crate::api::flows::passive_output_tests::{running_flow, udp_output};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, mut events) =
+            running_flow(dir.path(), 27882, vec![udp_output("o", 27883, false)], vec![]).await;
+        let sender = {
+            let config = state.config.read().await;
+            nmos::sender_uuid_for(&nmos::node_uuid_from_config(&config), "f1", "o").to_string()
+        };
+        let master_enable = |state: AppState, sender: String| async move {
+            let Json(active) = get_sender_active(State(state), Path(sender))
+                .await
+                .unwrap_or_else(|status| panic!("GET /active: {status}"));
+            active.master_enable
+        };
+        assert!(!master_enable(state.clone(), sender.clone()).await);
+
+        let patch = TransportParams {
+            transport_params: vec![TransportParamSet {
+                destination_ip: Some("127.0.0.1".to_string()),
+                destination_port: Some(27884),
+                ..Default::default()
+            }],
+            activation: Some(Activation {
+                mode: Some("activate_immediate".to_string()),
+                requested_time: None,
+                activation_time: None,
+            }),
+            master_enable: true,
+        };
+        let patched =
+            patch_sender_staged(State(state.clone()), Path(sender.clone()), Json(patch)).await;
+        assert!(patched.is_ok());
+
+        assert!(!state.flow_manager.output_is_running("f1", "o").await, "no task");
+        let stored = serde_json::to_value(&state.config.read().await.outputs[0]).expect("serialise");
+        assert_eq!(stored["dest_addr"], "127.0.0.1:27884", "the parameters are stored");
+        assert_eq!(stored["active"], false, "the flag stands");
+        assert!(!master_enable(state.clone(), sender.clone()).await);
+        let is04 = nmos::build_sender_values(&*state.config.read().await, "0:0");
+        assert_eq!(is04[0]["subscription"]["active"], false, "IS-04 agrees with IS-05");
+        let actions: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| e.details?["action"].as_str().map(str::to_string))
+            .collect();
+        assert!(actions.iter().any(|a| a == "sender_params_saved_passive"), "{actions:?}");
+        assert!(!actions.iter().any(|a| a == "sender_activated"), "{actions:?}");
+
+        // Switching it on is a separate press.
+        crate::manager::client::apply_output_activation(
+            &state.flow_manager,
+            &mut *state.config.write().await,
+            "o",
+            true,
+        )
+        .await
+        .expect("the output exists");
+        assert!(state.flow_manager.output_is_running("f1", "o").await);
+        assert!(master_enable(state.clone(), sender).await);
+        let is04 = nmos::build_sender_values(&*state.config.read().await, "0:0");
+        assert_eq!(is04[0]["subscription"]["active"], true);
+        let _ = state.flow_manager.destroy_flow("f1").await;
+    }
+
+    /// An activation on a running sender stops its task and starts one at the
+    /// new address.
+    #[tokio::test]
+    async fn activating_a_running_sender_swaps_it_to_the_new_address() {
+        use crate::api::flows::passive_output_tests::{running_flow, udp_output};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, mut events) =
+            running_flow(dir.path(), 27891, vec![udp_output("o", 27892, true)], vec![]).await;
+        let sender = {
+            let config = state.config.read().await;
+            nmos::sender_uuid_for(&nmos::node_uuid_from_config(&config), "f1", "o").to_string()
+        };
+        let old_task = {
+            let runtime = state.flow_manager.get_runtime("f1").expect("f1 runs");
+            let handles = runtime.output_handles.read().await;
+            handles.get("o").expect("running").cancel_token.clone()
+        };
+
+        let patch = TransportParams {
+            transport_params: vec![TransportParamSet {
+                destination_ip: Some("127.0.0.1".to_string()),
+                destination_port: Some(27893),
+                ..Default::default()
+            }],
+            activation: Some(Activation {
+                mode: Some("activate_immediate".to_string()),
+                requested_time: None,
+                activation_time: None,
+            }),
+            master_enable: true,
+        };
+        let patched = patch_sender_staged(State(state.clone()), Path(sender), Json(patch)).await;
+        assert!(patched.is_ok());
+
+        assert!(old_task.is_cancelled(), "the old task was stopped");
+        assert!(state.flow_manager.output_is_running("f1", "o").await);
+        let stored = serde_json::to_value(&state.config.read().await.outputs[0]).expect("serialise");
+        assert_eq!(stored["dest_addr"], "127.0.0.1:27893");
+        assert_eq!(stored["active"], true);
+        let actions: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| e.details?["action"].as_str().map(str::to_string))
+            .collect();
+        assert!(actions.iter().any(|a| a == "sender_activated"), "{actions:?}");
+        let _ = state.flow_manager.destroy_flow("f1").await;
+    }
 
     /// A minimal UDP output. `dest_addr` is the sender-side address IS-05
     /// rewrites from `destination_ip` / `destination_port`.

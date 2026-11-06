@@ -2222,10 +2222,61 @@ Architecture rationale + integration plan:
 
 Each entry in the top-level `outputs` array is an `OutputConfig` with `id`, `name`, and protocol-specific fields (enum-tagged by `type`). Outputs are independent top-level entities that exist whether or not they are assigned to a flow. They are managed via REST at `/api/v1/outputs` (CRUD) and via manager WebSocket commands.
 
-All outputs share `id`, `name`, `active` (boolean, default `true` — a passive
-output is persisted in config but never spawned by the engine; toggle it live
-with `POST /api/v1/outputs/{output_id}/active`) and `group` (string, max 64
-chars, default `null` — free-form tag for UI grouping).
+All outputs share `id`, `name`, `active` (boolean, default `true`, see below) and
+`group` (string, max 64 chars, default `null` — free-form tag for UI grouping).
+
+**`active` says whether the output may have a task.** A passive output stays
+listed in its flow's `output_ids`, stays persisted and keeps its port claim, but
+has no task: it sends nothing, and no hot route starts it. Only two things change
+the flag on an existing output: the `activate_output` manager command, which the
+Switcher sends, and `POST /api/v1/outputs/{output_id}/active`. Both:
+
+- act on the running flow that lists the output, with the definition as it stands
+  in the config at that moment, resolved as at flow start (so a flow-invalid
+  `epoch_lock` is stripped here too). `flow_id` on `activate_output` is only a hint
+  and may be empty;
+- change only the flag when no running flow lists the output, and flow start
+  honours it;
+- persist the flag.
+
+**What a press on can report.** A start the engine refuses (this build does not
+carry the output type, or an MXL host's libmxl probe failed) answers
+`error_code: output_activate_failed` (HTTP 500 on the REST route) and raises a
+Warning event of that code, with the flag left as it was: the same refusal at the
+flow's next start would take the whole flow off air.
+
+A socket failure is not reported this way. An output opens its socket on its own
+task, after the ack, and a passive output's port claim is a check against this
+node's own config, not a held socket. So a UDP output whose `bind_addr` port is
+held by another process acks success, its task logs the error and exits, and the
+flag says on with nothing sending. Pressing on again retries the start.
+
+Everything else keeps the stored flag: a whole-config `update_config` push,
+`update_output` and `PUT /api/v1/outputs/{output_id}`, `add_output` naming an id
+the node already has, and an IS-05 sender activation. So an edit to a passive
+output only persists, and activation later starts the edited definition; and a
+stale `active` in the copy of the config the manager replays cannot switch an
+on-air output off or a passive one on. A reconcile (`update_flow`, `update_config`)
+stops a task it finds running for a passive output.
+
+Creation takes the value given: `create_output`, `POST /api/v1/outputs`,
+`add_output` with a new id, and an id a whole-config push adds. So does node-local
+whole replacement, as for inputs: `config.json` at boot,
+`POST /api/v1/config/reload` and `PUT /api/v1/config`.
+
+**A press during a whole-config push.** `update_config` decides its diff on the
+flag as it read it when the push began, and holds no lock while it runs. A press
+landing in that window is kept in the config, because the commit re-applies each
+output's flag from the live config, but the runtime may disagree until the next
+push or press reconciles it: the diff can stop an output just switched on, or
+start one just switched off. A press on for an output whose definition the push is
+replacing can start the old definition while the old task stops. The diff's own
+start is then refused as already running, the commit stores the new definition,
+and a later push sees nothing to change, so that output keeps its old definition
+until it is switched off and on or its flow restarts. A press while a flow is
+restarting changes only the flag, and the rebuild can bring the output up in its
+earlier state until the same reconcile. `activate_input` lives with the same
+narrow race.
 
 ### RTP Output
 
@@ -2468,8 +2519,9 @@ paths disagree.** `validate_config` runs the scope rules above and **rejects**
 outright — a node started on such a config file logs `Invalid configuration` and
 exits (`main.rs`), and the same refusal covers the setup wizard, a whole-config
 `update_config` push, `PUT /api/v1/config`, `POST /api/v1/config/reload` and the
-`activate-input` / output-`active` toggles. The per-entity paths — flow start,
-restart and every hot edit, all of which land in `AppConfig::resolve_flow` —
+`activate-input` toggle. The per-entity paths — flow start,
+restart, switching an output on and every hot edit, all of which land in
+`AppConfig::resolve_flow` —
 instead **strip `epoch_lock` from the flow's RTP/UDP outputs and keep running**,
 logging why at error level; the absent `epoch_lock` telemetry block is what
 tells the manager the group never armed.

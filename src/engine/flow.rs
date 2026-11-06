@@ -810,8 +810,10 @@ impl FlowRuntime {
             flow_stats.update_active_input_meta(input_type, input_meta);
         }
 
-        // Populate output config metadata (all outputs, active or passive —
-        // the manager UI shows passive outputs too, just with an inactive flag).
+        // Populate output config metadata for every output, active or passive.
+        // This alone produces no stats row: `snapshot_with` walks `output_stats`,
+        // which only a running output registers in, and reads this map to fill
+        // those rows. A passive output has no row in the flow's stats.
         for oc in &config.outputs {
             flow_stats.output_config_meta.insert(
                 oc.id().to_string(),
@@ -2288,62 +2290,35 @@ impl FlowRuntime {
         }
     }
 
-    /// Toggle an output between active (running task) and passive (no task).
+    /// Bring this flow's runtime into line with `output`'s `active` flag.
     ///
-    /// When `active = true`, a new output task is started as if the output
-    /// were being hot-added. When `active = false`, the running task is
-    /// cancelled and removed from `output_handles` — the output config
-    /// itself stays in `self.config.outputs` so it can be toggled back on
-    /// later without re-creating it.
+    /// `output` is the definition to run, as the caller holds it now: the
+    /// start-time `self.config` knows nothing of an output assigned after the
+    /// flow started, and holds the old definition of one edited while passive.
+    ///
+    /// Active starts a task unless one is running. A task that has exited, such
+    /// as an output that could not bind its socket, leaves its handle behind and
+    /// counts as not running: the handle is removed and the start is retried.
+    /// Passive stops the task if there is one, through
+    /// [`remove_output`](Self::remove_output), so a stop that times out aborts
+    /// the task and the output's resource contribution leaves the totals.
     pub async fn set_output_active(
         &self,
-        output_id: &str,
-        active: bool,
+        output: OutputConfig,
         flow_stats: &Arc<FlowStatsAccumulator>,
     ) -> Result<()> {
-        if active {
-            // Do we already have a running task for this output?
-            {
-                let handles = self.output_handles.read().await;
-                if handles.contains_key(output_id) {
-                    return Ok(());
-                }
+        let task_exited = {
+            let handles = self.output_handles.read().await;
+            handles.get(output.id()).map(|rt| rt.handle.is_finished())
+        };
+        match (output.active(), task_exited) {
+            (true, None) => self.add_output(output, flow_stats).await,
+            (true, Some(true)) => {
+                self.remove_output(output.id()).await?;
+                self.add_output(output, flow_stats).await
             }
-            let output_cfg = self
-                .config
-                .outputs
-                .iter()
-                .find(|o| o.id() == output_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Flow '{}': output '{}' is not a member of this flow",
-                        self.config.config.id,
-                        output_id
-                    )
-                })?
-                .clone();
-            self.add_output(output_cfg, flow_stats).await
-        } else {
-            // Remove the running task if any; keep the output in config.
-            let maybe_rt = {
-                let mut handles = self.output_handles.write().await;
-                handles.remove(output_id)
-            };
-            if let Some(rt) = maybe_rt {
-                rt.cancel_token.cancel();
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    rt.handle,
-                )
-                .await;
-                self.stats.unregister_output(output_id);
-                tracing::info!(
-                    "Flow '{}': output '{}' set passive",
-                    self.config.config.id,
-                    output_id
-                );
-            }
-            Ok(())
+            (false, Some(_)) => self.remove_output(output.id()).await,
+            (true, Some(false)) | (false, None) => Ok(()),
         }
     }
 
@@ -2931,12 +2906,37 @@ impl FlowRuntime {
     ///
     /// The output is inserted into `output_handles` under a write lock so
     /// that concurrent stats reads are not blocked for long.
+    ///
+    /// `active` says whether a task may exist, and every hot route ends here,
+    /// so a passive output returns `Ok` with no task: it stays attached in the
+    /// config until `activate_output` or `POST /api/v1/outputs/{id}/active`
+    /// switches it on.
+    ///
+    /// An id that already has a task is refused. Inserting over its handle
+    /// would leave that task running with nothing able to stop it, so a route
+    /// replacing a definition stops the old task first.
     pub async fn add_output(
         &self,
         output_config: OutputConfig,
         flow_stats: &Arc<FlowStatsAccumulator>,
     ) -> Result<()> {
         let output_id = output_config.id().to_string();
+
+        if !output_config.active() {
+            tracing::info!(
+                "Output '{}' is passive: attached to flow '{}', not started",
+                output_id,
+                self.config.config.id
+            );
+            return Ok(());
+        }
+        if self.output_handles.read().await.contains_key(&output_id) {
+            bail!(
+                "Output '{}' is already running on flow '{}'",
+                output_id,
+                self.config.config.id
+            );
+        }
 
         // Note: WHEP server outputs hot-added at runtime won't accept viewers
         // until the flow is restarted (the session channel cannot be registered
@@ -2993,13 +2993,24 @@ impl FlowRuntime {
             },
         ).await?;
 
+        let mut handles = self.output_handles.write().await;
+        // The check above released its guard, so an overlapping add can have
+        // got here first.
+        if handles.contains_key(&output_id) {
+            drop(handles);
+            output_rt.cancel_token.cancel();
+            bail!(
+                "Output '{}' is already running on flow '{}'",
+                output_id,
+                self.config.config.id
+            );
+        }
+
         // Update output config metadata so stats snapshots reflect the new address/port
         flow_stats.output_config_meta.insert(
             output_id.clone(),
             build_output_config_meta(&output_config),
         );
-
-        let mut handles = self.output_handles.write().await;
         handles.insert(output_id.clone(), output_rt);
 
         // Apply this output's resource-budget contribution onto the

@@ -741,7 +741,7 @@ async fn list_senders(State(state): State<AppState>) -> Json<Vec<NmosSender>> {
                 device_id: did.to_string(),
                 manifest_href: String::new(),
                 interface_bindings: vec![],
-                subscription: serde_json::json!({"receiver_id": null, "active": true}),
+                subscription: serde_json::json!({"receiver_id": null, "active": output.active()}),
             });
         }
     }
@@ -779,7 +779,7 @@ async fn get_sender(
                     device_id: did.to_string(),
                     manifest_href: String::new(),
                     interface_bindings: vec![],
-                    subscription: serde_json::json!({"receiver_id": null, "active": true}),
+                    subscription: serde_json::json!({"receiver_id": null, "active": output.active()}),
                 }));
             }
         }
@@ -1007,7 +1007,7 @@ pub fn build_sender_values(
                 "device_id": did.to_string(),
                 "manifest_href": "",
                 "interface_bindings": [],
-                "subscription": {"receiver_id": null, "active": true},
+                "subscription": {"receiver_id": null, "active": output.active()},
             }));
         }
     }

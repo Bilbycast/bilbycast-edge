@@ -315,7 +315,7 @@ Create a new output definition. **Auth:** `admin`. Body is an `OutputConfig` (`t
 
 ### PUT /api/v1/outputs/{output_id}
 
-Update an existing output. **Auth:** `admin`. The path `output_id` overrides the body `id`. If the output is assigned to a running flow, the change is applied to that flow. Returns 404 if not found, 400 on validation failure.
+Update an existing output. **Auth:** `admin`. The path `output_id` overrides the body `id`. If a running flow lists the output, the change is applied to that flow. The stored `active` flag stands whatever the body says, and the answer carries it: use `POST /api/v1/outputs/{output_id}/active` to change it. An edit to a passive output only persists, and activation later starts the edited definition. Returns 404 if not found, 400 on validation failure.
 
 ### DELETE /api/v1/outputs/{output_id}
 
@@ -323,7 +323,7 @@ Delete an output definition. **Auth:** `admin`. Returns 404 if not found; reject
 
 ### POST /api/v1/outputs/{output_id}/active
 
-Toggle an output between active (running task) and passive (persisted but not running). **Auth:** `admin`. If the output is assigned to a running flow, the toggle is applied to the engine without restarting the flow.
+Toggle an output between active (running task) and passive (persisted but not running). **Auth:** `admin`. If a running flow lists the output, the toggle is applied to that flow, with the definition as it stands in the config now, without restarting the flow. With no running flow listing it, only the flag changes and flow start honours it. The flag is persisted.
 
 **Request body:**
 
@@ -335,7 +335,7 @@ Toggle an output between active (running task) and passive (persisted but not ru
 |-------|------|----------|-------------|
 | `active` | `bool` | Yes | `true` starts the output task, `false` stops it |
 
-Returns 404 if the output does not exist.
+Returns 404 if the output does not exist, and 500 if the engine refuses the start (this build does not carry the output type, or an MXL host's libmxl probe failed), with the flag left as it was. A socket failure answers success: an output opens its socket on its own task, after the answer, so a `bind_addr` port held by another process leaves the flag on with nothing sending. Posting `active: true` again retries the start.
 
 ---
 

@@ -3265,17 +3265,26 @@ async fn execute_command(
         }
         "add_output" => {
             let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
-            let output: OutputConfig =
+            let mut output: OutputConfig =
                 serde_json::from_value(action["output"].clone())
                     .map_err(|e| format!("Invalid output config: {e}"))?;
             validate_output(&output).map_err(|e| CommandError::from_validation("Invalid output config", e))?;
-            // Cheap pre-check so an obviously-clashing output never reaches the
-            // runtime at all. NOT authoritative — see the re-check below.
-            validate_port_conflicts_with_output(&*app_config.read().await, &output)
-                .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
+            {
+                let cfg = app_config.read().await;
+                // Cheap pre-check so an obviously-clashing output never reaches
+                // the runtime at all. NOT authoritative — see the re-check below.
+                validate_port_conflicts_with_output(&cfg, &output)
+                    .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
+                // An existing id keeps its stored flag, which `activate_output`
+                // owns; a command with no `active` key parses as true. A new id
+                // takes the value it was given.
+                if let Some(stored) = cfg.outputs.iter().find(|o| o.id() == output.id()) {
+                    output.set_active(stored.active());
+                }
+            }
             tracing::info!("Manager command: add output to flow '{flow_id}'");
             flow_manager
-                .add_output(flow_id, output.clone())
+                .replace_output(flow_id, output.clone())
                 .await
                 .map_err(|e| e.to_string())?;
             // Add to config: store output in top-level outputs and reference from flow
@@ -3290,7 +3299,10 @@ async fn execute_command(
             // costs a runtime rollback; losing it there costs a crash-loop.
             if let Err(e) = validate_port_conflicts_with_output(&cfg, &output) {
                 drop(cfg);
-                if let Err(rollback) = flow_manager.remove_output(flow_id, &output_id).await {
+                // A passive output never ran, so there is nothing to roll back.
+                if flow_manager.output_is_running(flow_id, &output_id).await
+                    && let Err(rollback) = flow_manager.remove_output(flow_id, &output_id).await
+                {
                     tracing::warn!(
                         "Failed to roll back output '{output_id}' after a losing \
                          port-conflict race on flow '{flow_id}': {rollback}"
@@ -3298,8 +3310,13 @@ async fn execute_command(
                 }
                 return Err(CommandError::with_code(e.to_string(), "port_conflict"));
             }
-            // Add to top-level outputs if not already present
-            if !cfg.outputs.iter().any(|o| o.id() == output_id) {
+            // Store what was started, so the stored definition and the running
+            // one are the same. The flag comes from the live config: a press can
+            // land while the output starts.
+            if let Some(stored) = cfg.outputs.iter_mut().find(|o| o.id() == output_id) {
+                output.set_active(stored.active());
+                *stored = output;
+            } else {
                 cfg.outputs.push(output);
             }
             // Add output_id reference to the flow
@@ -3768,27 +3785,20 @@ async fn execute_command(
             Ok(None)
         }
         "activate_output" => {
-            let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?.to_string();
-            let output_id = action["output_id"].as_str().ok_or("Missing output_id")?.to_string();
+            // `flow_id` is only a hint, named in the log and allowed to be
+            // empty: `apply_output_activation` finds the flow to act on.
+            let flow_id = action["flow_id"].as_str().ok_or("Missing flow_id")?;
+            let output_id = action["output_id"].as_str().ok_or("Missing output_id")?;
             let active = action["active"].as_bool().ok_or("Missing active flag")?;
             tracing::info!(
                 "Manager command: activate_output '{output_id}' on flow '{flow_id}' → active={active}"
             );
             let mut cfg = app_config.write().await;
-            let output = cfg
-                .outputs
-                .iter_mut()
-                .find(|o| o.id() == output_id)
-                .ok_or_else(|| format!("Output '{output_id}' not found"))?;
-            output.set_active(active);
-            if flow_manager.is_running(&flow_id)
-                && let Err(e) = flow_manager
-                    .set_output_active(&flow_id, &output_id, active)
-                    .await
-                {
-                    tracing::warn!("set_output_active failed for '{flow_id}': {e}");
-                }
+            let outcome = apply_output_activation(flow_manager, &mut cfg, output_id, active).await?;
             persist_config(&cfg, config_path, secrets_path).await?;
+            if let OutputActivation::Failed(message) = outcome {
+                return Err(CommandError::with_code(message, "output_activate_failed"));
+            }
             Ok(None)
         }
         "delete_input" => {
@@ -3833,7 +3843,7 @@ async fn execute_command(
         }
         "update_output" => {
             let output_id = action["output_id"].as_str().ok_or("Missing output_id")?;
-            let output: OutputConfig = serde_json::from_value(action["output"].clone())
+            let mut output: OutputConfig = serde_json::from_value(action["output"].clone())
                 .map_err(|e| format!("Invalid output config: {e}"))?;
             // The command id is authoritative (see `update_input`). `OutputConfig`
             // carries its id inside the variant, so mirror the REST handler and
@@ -3852,6 +3862,10 @@ async fn execute_command(
             validate_port_conflicts_with_output(&cfg, &output)
                 .map_err(|e| CommandError::with_code(e.to_string(), "port_conflict"))?;
             let old_output = cfg.outputs[idx].clone();
+            // The stored flag stands: `activate_output` owns it, and a body with
+            // no `active` key parses as true. A passive output's edit therefore
+            // only persists, and activation later starts the edited definition.
+            output.set_active(old_output.active());
             cfg.outputs[idx] = output.clone();
             // Hot-swap on the running flow if the config actually changed.
             // Surface a failed swap to the operator instead of swallowing it
@@ -3861,22 +3875,13 @@ async fn execute_command(
             // exact trap behind "I changed the display connector and nothing
             // happened, had to restart the node".
             let mut swap_error: Option<String> = None;
-            if let Some(flow) = cfg.flow_using_output(output_id).cloned()
-                && flow_manager.is_running(&flow.id) && old_output != output {
-                    if let Err(e) = flow_manager.remove_output(&flow.id, output_id).await {
-                        tracing::warn!(
-                            "update_output '{output_id}': remove_output on flow '{}' failed: {e}",
-                            flow.id
-                        );
-                    }
-                    if let Err(e) = flow_manager.add_output(&flow.id, output.clone()).await {
-                        tracing::warn!(
-                            "update_output '{output_id}': add_output on flow '{}' failed: {e}",
-                            flow.id
-                        );
-                        swap_error = Some(e.to_string());
-                    }
-                }
+            if old_output != output
+                && let Some(flow_id) = running_flow_listing_output(flow_manager, &cfg, output_id)
+                && let Err(e) = flow_manager.replace_output(&flow_id, output.clone()).await
+            {
+                tracing::warn!("update_output '{output_id}': hot-swap on flow '{flow_id}' failed: {e}");
+                swap_error = Some(e.to_string());
+            }
             // Persist regardless: config.json is the operator's stated intent
             // and the change still takes effect at the next (re)start even if
             // the live hot-swap failed.
@@ -4110,6 +4115,8 @@ async fn execute_command(
             // validation and before the flow diff, so every later stage —
             // including `resolve_flow` on a restart — sees the held value.
             hold_active_inputs(&old_config, &mut new_config);
+            // Same rule for outputs, which `activate_output` owns.
+            hold_active_outputs(&old_config, &mut new_config);
             // Same rule for the recorder, which `configure_recording` owns.
             hold_recording(&old_config, &mut new_config, &action["config"]);
 
@@ -4562,6 +4569,11 @@ async fn execute_command(
             // Apply new config and persist
             {
                 let mut cfg = app_config.write().await;
+                // The hold above read a copy taken when the push began, and the
+                // diff held no guard, so a press can have landed since. Its flag
+                // stands; the runtime may disagree until the next push or press
+                // reconciles it.
+                hold_active_outputs(&cfg, &mut new_config);
                 cfg.inputs = new_config.inputs.clone();
                 cfg.outputs = new_config.outputs.clone();
                 cfg.flows = new_config.flows.clone();
@@ -7044,6 +7056,143 @@ fn hold_active_inputs(old: &AppConfig, new: &mut AppConfig) {
     }
 }
 
+/// Hold every output's `active` flag across a whole-config push.
+///
+/// [`hold_active_inputs`] for outputs, with none of its exemptions, because
+/// there is no at-most-one rule here: `active` says whether a task may exist,
+/// and only `activate_output` and `POST /api/v1/outputs/{id}/active` change it
+/// on an existing output. The manager pushes a cached copy of the node's
+/// config, so a stale flag could otherwise switch an on-air output off, or
+/// switch back on one an operator switched off, as a side effect of renaming
+/// the node. An id absent from `old` is a creation and takes its given value.
+fn hold_active_outputs(old: &AppConfig, new: &mut AppConfig) {
+    for output in &mut new.outputs {
+        let Some(stored) = old.outputs.iter().find(|o| o.id() == output.id()) else {
+            continue;
+        };
+        if output.active() != stored.active() {
+            tracing::info!(
+                "Config diff: holding output '{}' at active={} (push said {}) — activation is \
+                 owned by the activate_output command, not a config push",
+                output.id(),
+                stored.active(),
+                output.active(),
+            );
+            output.set_active(stored.active());
+        }
+    }
+}
+
+/// The running flow that lists `output_id`, the flow an edit to that output acts
+/// on. `AppConfig::flow_using_output` cannot answer this: uniqueness is enforced
+/// only among enabled flows, so its first match can be a disabled flow listing
+/// the same id.
+pub(crate) fn running_flow_listing_output(
+    flow_manager: &FlowManager,
+    cfg: &AppConfig,
+    output_id: &str,
+) -> Option<String> {
+    cfg.flows
+        .iter()
+        .find(|f| f.output_ids.iter().any(|id| id == output_id) && flow_manager.is_running(&f.id))
+        .map(|f| f.id.clone())
+}
+
+/// What [`apply_output_activation`] did, once it found the output. The config
+/// holds the flag that stands either way, so the caller persists either way.
+pub(crate) enum OutputActivation {
+    /// The runtime follows the flag, or no running flow lists the output and
+    /// the flag is all there is to change: flow start honours it.
+    Applied,
+    /// The running flow could not follow the press. The caller persists, then
+    /// reports this sentence. A refused start leaves the flag as it was. A stop
+    /// fails only when another route has already stopped the task, so the flag
+    /// stays passive.
+    Failed(String),
+}
+
+/// `output_id` as flow start would run it on `flow_id`: out of
+/// [`AppConfig::resolve_flow`], so the `epoch_lock` gate there applies.
+fn resolved_output(
+    cfg: &AppConfig,
+    flow_id: &str,
+    output_id: &str,
+) -> anyhow::Result<OutputConfig> {
+    let flow = cfg
+        .flows
+        .iter()
+        .find(|f| f.id == flow_id)
+        .ok_or_else(|| anyhow::anyhow!("Flow '{flow_id}' not found in config"))?;
+    cfg.resolve_flow(flow)?
+        .outputs
+        .into_iter()
+        .find(|o| o.id() == output_id)
+        .ok_or_else(|| anyhow::anyhow!("Flow '{flow_id}' does not list output '{output_id}'"))
+}
+
+/// Set an output's `active` flag and apply it on the running flow that lists
+/// the output.
+///
+/// Shared by the `activate_output` manager command and
+/// `POST /api/v1/outputs/{output_id}/active`, each under the config write guard
+/// it holds across this call and the persist that follows; the message is built
+/// here and the envelope is chosen by the caller, as with
+/// [`OutputDetachRefusal`].
+///
+/// A start runs the definition as it stands in the config now, resolved as at
+/// flow start. A running flow's start-time snapshot is no use here: it holds the
+/// old definition of an output edited while passive, and nothing of one assigned
+/// after the flow started. A stop reads only the id and the flag, so it needs no
+/// resolving and works whatever else is wrong with the flow.
+///
+/// A start the engine refuses puts the flag back. The same refusal recurs at
+/// every flow start, where it takes the whole flow off air, so a refused press
+/// must not leave the flag set. A socket failure is not seen here: an output
+/// opens its socket on its own task, after this returns, so that reads as
+/// `Applied`.
+///
+/// `Err` is the not-found message, with nothing changed.
+pub(crate) async fn apply_output_activation(
+    flow_manager: &FlowManager,
+    cfg: &mut AppConfig,
+    output_id: &str,
+    active: bool,
+) -> Result<OutputActivation, String> {
+    let idx = cfg
+        .outputs
+        .iter()
+        .position(|o| o.id() == output_id)
+        .ok_or_else(|| format!("Output '{output_id}' not found"))?;
+    let previous = cfg.outputs[idx].active();
+    cfg.outputs[idx].set_active(active);
+    let Some(flow_id) = running_flow_listing_output(flow_manager, cfg, output_id) else {
+        return Ok(OutputActivation::Applied);
+    };
+    let definition = if active {
+        resolved_output(cfg, &flow_id, output_id)
+    } else {
+        Ok(cfg.outputs[idx].clone())
+    };
+    let applied = match definition {
+        Ok(definition) => flow_manager.set_output_active(&flow_id, definition).await,
+        Err(e) => Err(e),
+    };
+    let Err(e) = applied else {
+        return Ok(OutputActivation::Applied);
+    };
+    tracing::warn!("set_output_active failed for '{flow_id}': {e}");
+    if active {
+        cfg.outputs[idx].set_active(previous);
+        return Ok(OutputActivation::Failed(format!(
+            "Output '{output_id}' was not switched on: flow '{flow_id}' could not start it, and \
+             its active flag stays {previous}: {e}"
+        )));
+    }
+    Ok(OutputActivation::Failed(format!(
+        "Output '{output_id}' saved with active=false, but flow '{flow_id}' could not stop it: {e}"
+    )))
+}
+
 /// Hold a flow's recorder across a whole-config push that does not model it.
 ///
 /// `flow.recording` has a second owner: `configure_recording`, which the
@@ -7341,6 +7490,63 @@ mod hold_active_inputs_tests {
         let mut pushed = config(&[("a", true), ("spare", true)], passthrough(&["a"]));
         hold_active_inputs(&on_node, &mut pushed);
         assert_eq!(active_of(&pushed), vec!["a", "spare"]);
+    }
+}
+
+#[cfg(test)]
+mod hold_active_outputs_tests {
+    use super::hold_active_outputs;
+    use crate::config::models::AppConfig;
+
+    fn config(outputs: &[(&str, bool)]) -> AppConfig {
+        let outputs: Vec<serde_json::Value> = outputs
+            .iter()
+            .map(|(id, active)| {
+                serde_json::json!({
+                    "id": id, "name": id, "active": active,
+                    "type": "udp", "dest_addr": "127.0.0.1:5000"
+                })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "server": {"listen_addr": "127.0.0.1", "listen_port": 8080},
+            "outputs": outputs
+        }))
+        .expect("fixture")
+    }
+
+    fn active_of(cfg: &AppConfig, id: &str) -> bool {
+        cfg.outputs.iter().find(|o| o.id() == id).expect("output").active()
+    }
+
+    /// A cached copy taken before the operator switched the output off must
+    /// not switch it back on.
+    #[test]
+    fn a_stale_push_cannot_switch_a_passive_output_on() {
+        let on_node = config(&[("o", false)]);
+        let mut pushed = config(&[("o", true)]);
+        hold_active_outputs(&on_node, &mut pushed);
+        assert!(!active_of(&pushed, "o"));
+    }
+
+    /// Nor take an on-air output off air.
+    #[test]
+    fn a_stale_push_cannot_switch_an_active_output_off() {
+        let on_node = config(&[("o", true)]);
+        let mut pushed = config(&[("o", false)]);
+        hold_active_outputs(&on_node, &mut pushed);
+        assert!(active_of(&pushed, "o"));
+    }
+
+    /// Creation owns the first value, in both directions.
+    #[test]
+    fn an_id_the_node_does_not_have_keeps_its_given_value() {
+        let on_node = config(&[("o", true)]);
+        let mut pushed = config(&[("o", true), ("new-off", false), ("new-on", true)]);
+        hold_active_outputs(&on_node, &mut pushed);
+        assert!(!active_of(&pushed, "new-off"));
+        assert!(active_of(&pushed, "new-on"));
     }
 }
 
@@ -9015,7 +9221,7 @@ mod output_diff_live_flow_tests {
     use crate::config::models::{AppConfig, FlowConfig, InputDefinition, OutputConfig};
     use crate::stats::collector::StatsCollector;
 
-    fn fm() -> Arc<FlowManager> {
+    pub(super) fn fm() -> Arc<FlowManager> {
         let stats = Arc::new(StatsCollector::new());
         let (event_sender, rx) = crate::manager::events::event_channel();
         // Keep the receiver alive so the best-effort emitters don't turn every
@@ -9036,7 +9242,7 @@ mod output_diff_live_flow_tests {
         ))
     }
 
-    fn udp_input(id: &str, port: u16) -> InputDefinition {
+    pub(super) fn udp_input(id: &str, port: u16) -> InputDefinition {
         serde_json::from_value(serde_json::json!({
             "id": id, "name": id, "active": true,
             "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
@@ -9044,7 +9250,7 @@ mod output_diff_live_flow_tests {
         .expect("input fixture")
     }
 
-    fn udp_output(id: &str, port: u16) -> OutputConfig {
+    pub(super) fn udp_output(id: &str, port: u16) -> OutputConfig {
         serde_json::from_value(serde_json::json!({
             "id": id, "name": id, "active": true,
             "type": "udp", "dest_addr": format!("127.0.0.1:{port}")
@@ -9054,7 +9260,7 @@ mod output_diff_live_flow_tests {
 
     /// `outputs` are the flow's members; `spare` are defined on the node but
     /// not attached, so a diff can add them.
-    fn config(input: InputDefinition, outputs: Vec<OutputConfig>, spare: Vec<OutputConfig>) -> AppConfig {
+    pub(super) fn config(input: InputDefinition, outputs: Vec<OutputConfig>, spare: Vec<OutputConfig>) -> AppConfig {
         let flow: FlowConfig = serde_json::from_value(serde_json::json!({
             "id": "f1", "name": "f1",
             "input_ids": [input.id.clone()],
@@ -9071,7 +9277,7 @@ mod output_diff_live_flow_tests {
         }
     }
 
-    async fn start(fm: &Arc<FlowManager>, cfg: &AppConfig) {
+    pub(super) async fn start(fm: &Arc<FlowManager>, cfg: &AppConfig) {
         let resolved = cfg.resolve_flow(&cfg.flows[0]).expect("resolve");
         fm.create_flow(resolved).await.expect("create_flow");
     }
@@ -9186,6 +9392,567 @@ mod output_diff_live_flow_tests {
 
         drop(handles_guard);
         let _ = stop.await;
+    }
+}
+
+#[cfg(test)]
+mod output_activation_tests {
+    //! `active` says whether an output's task may exist, and only
+    //! `activate_output` changes it on an existing output. Driven through
+    //! `execute_command` against a live `FlowManager`, so what is asserted is
+    //! the ack, what is stored and written to disk, and what is running.
+    //!
+    //! Ports sit below the kernel's ephemeral range, as in
+    //! `update_input_restart_tests`.
+    use super::output_diff_live_flow_tests::{config, fm, start, udp_input, udp_output};
+    use super::*;
+    use crate::config::models::OutputConfig;
+    use std::time::Duration;
+
+    struct Rig {
+        fm: Arc<FlowManager>,
+        tm: Arc<TunnelManager>,
+        cfg: Arc<RwLock<AppConfig>>,
+        dir: tempfile::TempDir,
+    }
+
+    fn passive(mut output: OutputConfig) -> OutputConfig {
+        output.set_active(false);
+        output
+    }
+
+    /// Flow `f1` running on a UDP input bound to `port`, listing `listed`, with
+    /// `spare` defined on the node and attached to nothing.
+    async fn rig(port: u16, listed: Vec<OutputConfig>, spare: Vec<OutputConfig>) -> Rig {
+        let fm = fm();
+        let cfg = config(udp_input("a", port), listed, spare);
+        start(&fm, &cfg).await;
+        let tm = Arc::new(TunnelManager::new(fm.event_sender().clone()));
+        Rig {
+            fm,
+            tm,
+            cfg: Arc::new(RwLock::new(cfg)),
+            dir: tempfile::tempdir().expect("tempdir"),
+        }
+    }
+
+    impl Rig {
+        async fn command(
+            &self,
+            action_type: &str,
+            action: serde_json::Value,
+        ) -> Result<Option<serde_json::Value>, CommandError> {
+            execute_command(
+                action_type,
+                &action,
+                &self.fm,
+                &self.tm,
+                &self.cfg,
+                &self.dir.path().join("config.json"),
+                &self.dir.path().join("secrets.json"),
+                &WebrtcRegistry::default(),
+            )
+            .await
+        }
+
+        async fn activate(&self, id: &str, active: bool) -> Result<Option<serde_json::Value>, CommandError> {
+            let action = serde_json::json!({ "flow_id": "f1", "output_id": id, "active": active });
+            self.command("activate_output", action).await
+        }
+
+        async fn running(&self) -> Vec<String> {
+            let mut ids = self.fm.running_output_ids("f1").await.expect("f1 runs");
+            ids.sort();
+            ids
+        }
+
+        async fn stored(&self, id: &str) -> OutputConfig {
+            let cfg = self.cfg.read().await;
+            cfg.outputs.iter().find(|o| o.id() == id).expect("stored").clone()
+        }
+
+        /// The `active` this output carries in `config.json`.
+        fn saved_active(&self, id: &str) -> bool {
+            let saved = std::fs::read_to_string(self.dir.path().join("config.json")).expect("saved");
+            let saved: serde_json::Value = serde_json::from_str(&saved).expect("saved is JSON");
+            saved["outputs"]
+                .as_array()
+                .expect("outputs")
+                .iter()
+                .find(|o| o["id"] == id)
+                .expect("saved output")["active"]
+                .as_bool()
+                .expect("active is written")
+        }
+
+        /// The node's config as a push would carry it, edited by `edit`.
+        async fn push_of(&self, edit: impl FnOnce(&mut serde_json::Value)) -> serde_json::Value {
+            let mut push = serde_json::to_value(&*self.cfg.read().await).expect("serialise");
+            edit(&mut push);
+            serde_json::json!({ "config": push })
+        }
+
+        /// A token for `id`'s running task, which an action that stops or
+        /// replaces that task cancels.
+        async fn token_of(&self, id: &str) -> tokio_util::sync::CancellationToken {
+            let runtime = self.fm.get_runtime("f1").expect("f1 runs");
+            let handles = runtime.output_handles.read().await;
+            handles.get(id).expect("running").cancel_token.clone()
+        }
+    }
+
+    fn set_output_field(push: &mut serde_json::Value, id: &str, field: &str, value: serde_json::Value) {
+        let outputs = push["outputs"].as_array_mut().expect("outputs");
+        let output = outputs.iter_mut().find(|o| o["id"] == id).expect("pushed output");
+        output[field] = value;
+    }
+
+    fn dest_of(output: &OutputConfig) -> String {
+        serde_json::to_value(output).expect("serialise")["dest_addr"]
+            .as_str()
+            .expect("udp output has a dest_addr")
+            .to_string()
+    }
+
+    /// A reconcile reaches every output the flow lists, so a passive one read
+    /// as "not running" and was started.
+    #[tokio::test]
+    async fn a_reconcile_does_not_start_a_passive_output() {
+        let rig = rig(27810, vec![udp_output("o1", 27811), passive(udp_output("o2", 27812))], vec![]).await;
+        let cfg = rig.cfg.read().await.clone();
+        let ids = cfg.flows[0].output_ids.clone();
+        let outcome = diff_outputs(&rig.fm, "f1", &ids, &cfg).await;
+        assert_eq!(outcome, OutputDiffOutcome::default());
+        assert_eq!(rig.running().await, ["o1"]);
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// The other half of the rule: a task the config says may not exist goes.
+    #[tokio::test]
+    async fn a_reconcile_stops_a_running_output_the_config_says_is_passive() {
+        let rig = rig(27813, vec![udp_output("o", 27814)], vec![]).await;
+        assert_eq!(rig.running().await, ["o"]);
+        let mut cfg = rig.cfg.read().await.clone();
+        cfg.outputs[0].set_active(false);
+        let ids = cfg.flows[0].output_ids.clone();
+        let outcome = diff_outputs(&rig.fm, "f1", &ids, &cfg).await;
+        assert_eq!(outcome, OutputDiffOutcome::default());
+        assert!(rig.running().await.is_empty());
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// `update_flow` and `update_config` both end in that reconcile.
+    #[tokio::test]
+    async fn update_flow_and_update_config_leave_a_passive_output_stopped() {
+        let rig = rig(27815, vec![passive(udp_output("o", 27816))], vec![]).await;
+
+        let flow = rig.cfg.read().await.flows[0].clone();
+        let renamed = FlowConfig { name: "renamed".to_string(), ..flow };
+        rig.command("update_flow", serde_json::json!({ "flow_id": "f1", "flow": renamed }))
+            .await
+            .expect("update_flow");
+        assert!(rig.running().await.is_empty(), "update_flow started it");
+
+        let push = rig.push_of(|p| p["device_name"] = "renamed".into()).await;
+        rig.command("update_config", push).await.expect("update_config");
+        assert!(rig.running().await.is_empty(), "update_config started it");
+        assert!(!rig.stored("o").await.active());
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// A cached copy saying `active: true` neither starts it nor records it.
+    #[tokio::test]
+    async fn a_whole_config_push_does_not_start_a_passive_output() {
+        let rig = rig(27817, vec![passive(udp_output("o", 27818))], vec![]).await;
+        let push = rig
+            .push_of(|p| set_output_field(p, "o", "active", true.into()))
+            .await;
+        rig.command("update_config", push).await.expect("update_config");
+        assert!(rig.running().await.is_empty());
+        assert!(!rig.stored("o").await.active());
+        assert!(!rig.saved_active("o"));
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// A cached copy saying `active: false` does not touch an on-air output:
+    /// the flag stands and the task is the one that was there.
+    #[tokio::test]
+    async fn a_whole_config_push_does_not_switch_off_an_active_output() {
+        let rig = rig(27819, vec![udp_output("o", 27820)], vec![]).await;
+        let token = rig.token_of("o").await;
+        let push = rig
+            .push_of(|p| set_output_field(p, "o", "active", false.into()))
+            .await;
+        rig.command("update_config", push).await.expect("update_config");
+        assert_eq!(rig.running().await, ["o"]);
+        assert!(!token.is_cancelled(), "the running task was replaced");
+        assert!(rig.stored("o").await.active());
+        assert!(rig.saved_active("o"));
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// An id the push creates takes the value it carries, with no task.
+    #[tokio::test]
+    async fn a_whole_config_push_takes_active_on_an_id_it_adds() {
+        let rig = rig(27821, vec![], vec![]).await;
+        let push = rig
+            .push_of(|p| {
+                p["outputs"] = serde_json::json!([passive(udp_output("new", 27822))]);
+                p["flows"][0]["output_ids"] = serde_json::json!(["new"]);
+            })
+            .await;
+        rig.command("update_config", push).await.expect("update_config");
+        assert!(rig.running().await.is_empty());
+        assert!(!rig.stored("new").await.active());
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// A press landing while a push runs its diff is not overwritten at commit,
+    /// though the hold ahead of the diff read the flag before the press.
+    ///
+    /// The window is held open: the push replaces `o`, so `remove_output` parks
+    /// on the matching write while this test holds a read guard on
+    /// `output_handles`, and a queued writer is what fails `try_read`. The
+    /// press names a spare output, which is flag-only and so does not queue
+    /// behind that writer.
+    #[tokio::test]
+    async fn a_press_during_a_push_is_kept_at_commit() {
+        let rig = Arc::new(
+            rig(27823, vec![udp_output("o", 27824)], vec![udp_output("spare", 27825)]).await,
+        );
+        let runtime = rig.fm.get_runtime("f1").expect("f1 runs");
+        let handles_guard = runtime.output_handles.read().await;
+        let push = rig
+            .push_of(|p| set_output_field(p, "o", "dest_addr", "127.0.0.1:27826".into()))
+            .await;
+        let pusher = Arc::clone(&rig);
+        let push = tokio::spawn(async move { pusher.command("update_config", push).await });
+        let mut parked = false;
+        for _ in 0..2000 {
+            if runtime.output_handles.try_read().is_err() {
+                parked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(parked, "the push never reached the replacement");
+
+        rig.activate("spare", false).await.expect("the press");
+
+        drop(handles_guard);
+        push.await.expect("join").expect("update_config");
+        assert!(!rig.stored("spare").await.active(), "the push undid the press");
+        assert!(!rig.saved_active("spare"), "the push wrote the old flag to disk");
+        assert_eq!(dest_of(&rig.stored("o").await), "127.0.0.1:27826", "the push still applied");
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// An old manager's modal sends no `active`, which parses as true.
+    #[tokio::test]
+    async fn update_output_of_a_passive_output_persists_the_edit_with_no_task() {
+        let rig = rig(27827, vec![passive(udp_output("o", 27828))], vec![]).await;
+        let action = serde_json::json!({
+            "output_id": "o",
+            "output": { "id": "o", "name": "o", "type": "udp", "dest_addr": "127.0.0.1:27829" },
+        });
+        rig.command("update_output", action).await.expect("update_output");
+        assert!(rig.running().await.is_empty());
+        let stored = rig.stored("o").await;
+        assert!(!stored.active(), "the flag is held");
+        assert_eq!(dest_of(&stored), "127.0.0.1:27829", "the edit is stored");
+        assert!(!rig.saved_active("o"));
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// Activation after that edit runs the edited definition: media reaches
+    /// the edited address and not the one the flow started with.
+    #[tokio::test]
+    async fn activating_after_an_edit_sends_to_the_edited_address() {
+        let original = tokio::net::UdpSocket::bind("127.0.0.1:27831").await.expect("bind");
+        let edited = tokio::net::UdpSocket::bind("127.0.0.1:27832").await.expect("bind");
+        let rig = rig(27830, vec![passive(udp_output("o", 27831))], vec![]).await;
+        let edit = serde_json::json!({ "output_id": "o", "output": udp_output("o", 27832) });
+        rig.command("update_output", edit).await.expect("update_output");
+        assert!(rig.running().await.is_empty());
+
+        rig.activate("o", true).await.expect("activate_output");
+        assert_eq!(rig.running().await, ["o"]);
+
+        // Seven null TS packets, sent until they come out: the input binds on
+        // its own task, after the flow start has returned.
+        let mut datagram = Vec::with_capacity(7 * 188);
+        for _ in 0..7 {
+            datagram.extend_from_slice(&[0x47, 0x1F, 0xFF, 0x10]);
+            datagram.extend_from_slice(&[0xFF; 184]);
+        }
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let mut received = [0u8; 2048];
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                sender.send_to(&datagram, "127.0.0.1:27830").await.expect("send");
+                let wait = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    edited.recv_from(&mut received),
+                );
+                if wait.await.is_ok() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(delivered.is_ok(), "nothing reached the edited address");
+        let stray = tokio::time::timeout(
+            Duration::from_millis(100),
+            original.recv_from(&mut received),
+        );
+        assert!(stray.await.is_err(), "the old definition is sending to the original address");
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// The flow's start-time snapshot has never heard of this output, and
+    /// activation used to answer "not a member of this flow" and ack success.
+    #[tokio::test]
+    async fn an_output_assigned_after_flow_start_can_be_activated() {
+        let rig = rig(27833, vec![], vec![passive(udp_output("o", 27834))]).await;
+        rig.cfg.write().await.flows[0].output_ids.push("o".to_string());
+        rig.activate("o", true).await.expect("activate_output");
+        assert_eq!(rig.running().await, ["o"]);
+        assert!(rig.stored("o").await.active());
+        assert!(rig.saved_active("o"));
+
+        rig.activate("o", false).await.expect("activate_output");
+        assert!(rig.running().await.is_empty());
+        assert!(!rig.saved_active("o"));
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// An MXL output, which the engine refuses on a build without that feature.
+    #[cfg(not(feature = "mxl"))]
+    fn mxl_output(active: bool) -> OutputConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "m", "active": active, "type": "mxl_audio",
+            "domain_path": "/dev/shm/bilbycast-test", "flow_name": "f",
+        }))
+        .expect("output fixture")
+    }
+
+    /// The flow's next start would refuse this output the same way and take
+    /// every sibling off air with it, so the flag goes back and the flow can
+    /// still restart.
+    #[cfg(not(feature = "mxl"))]
+    #[tokio::test]
+    async fn a_refused_start_puts_the_flag_back_and_the_flow_can_still_restart() {
+        let rig = rig(27835, vec![mxl_output(false), udp_output("sibling", 27851)], vec![]).await;
+        let refused = rig.activate("m", true).await.expect_err("the start is refused");
+        assert_eq!(refused.code.as_deref(), Some("output_activate_failed"));
+        assert_eq!(rig.running().await, ["sibling"]);
+        assert!(!rig.stored("m").await.active(), "the flag goes back");
+        assert!(!rig.saved_active("m"), "and is written so");
+
+        let action = serde_json::json!({ "flow_id": "f1" });
+        rig.command("restart_flow", action).await.expect("the flow restarts");
+        assert_eq!(rig.running().await, ["sibling"]);
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// "Back" is to what it was, not to passive: an output already flagged on
+    /// that has no task stays flagged on.
+    #[cfg(not(feature = "mxl"))]
+    #[tokio::test]
+    async fn a_refused_start_leaves_a_flag_that_was_already_on() {
+        let rig = rig(27852, vec![], vec![mxl_output(true)]).await;
+        rig.cfg.write().await.flows[0].output_ids.push("m".to_string());
+        let refused = rig.activate("m", true).await.expect_err("the start is refused");
+        assert_eq!(refused.code.as_deref(), Some("output_activate_failed"));
+        assert!(rig.stored("m").await.active());
+        assert!(rig.saved_active("m"));
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// A UDP output carrying `epoch_lock`.
+    fn epoch_locked_output(id: &str, port: u16) -> OutputConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": false, "type": "udp",
+            "dest_addr": format!("127.0.0.1:{port}"),
+            "egress_pacing": "pcr",
+            "epoch_lock": { "egress_offset_ms": 200 },
+        }))
+        .expect("output fixture")
+    }
+
+    impl Rig {
+        /// `id`'s stats, once its wire emitter has started: that thread sets
+        /// the pacing tier, then registers any `epoch_lock` offset.
+        async fn stats_once_emitting(
+            &self,
+            id: &str,
+        ) -> Arc<crate::stats::collector::OutputStatsAccumulator> {
+            let runtime = self.fm.get_runtime("f1").expect("f1 runs");
+            let stats = runtime.output_handles.read().await.get(id).expect("started").stats.clone();
+            let started = tokio::time::timeout(Duration::from_secs(5), async {
+                while stats.wire_pacing_tier.get().is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            assert!(started.is_ok(), "the wire emitter never started");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            stats
+        }
+    }
+
+    /// Flow start strips an `epoch_lock` the flow cannot honour, here for an
+    /// input without `passthrough_clock`. Switching the output on must run what
+    /// flow start would run, not arm a lock that changes egress timing on air
+    /// and goes away at the next restart. The strip is in a clone, so the block
+    /// stays in the config.
+    #[tokio::test]
+    async fn activation_does_not_arm_an_epoch_lock_the_flow_cannot_honour() {
+        let rig = rig(27853, vec![epoch_locked_output("o", 27854)], vec![]).await;
+        rig.activate("o", true).await.expect("activate_output");
+        let stats = rig.stats_once_emitting("o").await;
+        assert_eq!(stats.epoch_lock_offset_us.get(), None, "armed against the gate");
+        let stored = serde_json::to_value(rig.stored("o").await).expect("serialise");
+        assert_eq!(stored["epoch_lock"]["egress_offset_ms"], 200);
+        assert_eq!(stored["active"], true);
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// The control for that test: the telemetry it reads does show a lock the
+    /// flow can honour.
+    #[tokio::test]
+    async fn activation_arms_an_epoch_lock_the_flow_can_honour() {
+        let rig = rig(27855, vec![epoch_locked_output("o", 27856)], vec![]).await;
+        match &mut rig.cfg.write().await.inputs[0].config {
+            crate::config::models::InputConfig::Udp(c) => c.passthrough_clock = Some(true),
+            _ => panic!("the rig's input is UDP"),
+        }
+        rig.activate("o", true).await.expect("activate_output");
+        let stats = rig.stats_once_emitting("o").await;
+        assert_eq!(stats.epoch_lock_offset_us.get(), Some(&200_000));
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// The ack sees only a start the engine refuses. A UDP output binds on its
+    /// own task, so a port held outside the config acks success and the task
+    /// exits with its handle left behind. Pressing on again retries the start
+    /// rather than reading that handle as a running task.
+    #[tokio::test]
+    async fn a_socket_failure_acks_success_and_a_second_press_retries_the_start() {
+        let held = std::net::UdpSocket::bind("127.0.0.1:27857").expect("bind");
+        let output: OutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "o", "name": "o", "active": false, "type": "udp",
+            "dest_addr": "127.0.0.1:27858", "bind_addr": "127.0.0.1:27857",
+        }))
+        .expect("output fixture");
+        let rig = rig(27859, vec![output], vec![]).await;
+
+        rig.activate("o", true).await.expect("the ack does not see the socket");
+        assert!(rig.stored("o").await.active());
+        let runtime = rig.fm.get_runtime("f1").expect("f1 runs");
+        let exited = tokio::time::timeout(Duration::from_secs(5), async {
+            while !runtime.output_handles.read().await["o"].handle.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(exited.is_ok(), "the task should fail its bind and exit");
+
+        drop(held);
+        rig.activate("o", true).await.expect("activate_output");
+        rig.stats_once_emitting("o").await;
+        assert!(!runtime.output_handles.read().await["o"].handle.is_finished());
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_output_is_refused_with_nothing_written() {
+        let rig = rig(27836, vec![], vec![]).await;
+        let refused = rig.activate("ghost", true).await.expect_err("no such output");
+        assert!(refused.message.contains("not found"), "{}", refused.message);
+        assert!(!rig.dir.path().join("config.json").exists());
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// No running flow lists it: the flag is all there is, and flow start
+    /// honours it. An empty hint is fine, since the flow is found from config.
+    #[tokio::test]
+    async fn with_no_running_flow_only_the_flag_changes() {
+        let rig = rig(27837, vec![], vec![udp_output("spare", 27838)]).await;
+        let action = serde_json::json!({ "flow_id": "", "output_id": "spare", "active": false });
+        rig.command("activate_output", action).await.expect("activate_output");
+        assert!(!rig.stored("spare").await.active());
+        assert!(!rig.saved_active("spare"));
+        assert!(rig.running().await.is_empty());
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// Uniqueness is enforced only among enabled flows, so a disabled flow can
+    /// list the id ahead of the flow running it. Both activation and an edit
+    /// act on the running one.
+    #[tokio::test]
+    async fn a_disabled_flow_listing_the_id_first_does_not_hide_the_running_flow() {
+        let rig = rig(27839, vec![passive(udp_output("o", 27840))], vec![]).await;
+        let disabled: FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "off", "name": "off", "enabled": false, "input_ids": [], "output_ids": ["o"],
+        }))
+        .expect("flow fixture");
+        rig.cfg.write().await.flows.insert(0, disabled);
+
+        rig.activate("o", true).await.expect("activate_output");
+        assert_eq!(rig.running().await, ["o"]);
+
+        let token = rig.token_of("o").await;
+        let edit = serde_json::json!({ "output_id": "o", "output": udp_output("o", 27841) });
+        rig.command("update_output", edit).await.expect("update_output");
+        assert_eq!(rig.running().await, ["o"]);
+        assert!(token.is_cancelled(), "the running task was left on the old definition");
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// A command with no `active` key parses as true; the id keeps its flag.
+    #[tokio::test]
+    async fn add_output_on_a_passive_id_keeps_it_passive() {
+        let rig = rig(27842, vec![], vec![passive(udp_output("o", 27843))]).await;
+        let action = serde_json::json!({
+            "flow_id": "f1",
+            "output": { "id": "o", "name": "o", "type": "udp", "dest_addr": "127.0.0.1:27844" },
+        });
+        rig.command("add_output", action).await.expect("add_output");
+        assert!(rig.running().await.is_empty());
+        let stored = rig.stored("o").await;
+        assert!(!stored.active());
+        assert_eq!(dest_of(&stored), "127.0.0.1:27844", "the sent definition is stored");
+        assert!(rig.cfg.read().await.flows[0].output_ids.iter().any(|id| id == "o"), "attached");
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    /// The old task is stopped, not overwritten and left running, and what is
+    /// stored is what runs.
+    #[tokio::test]
+    async fn add_output_on_a_running_id_replaces_it() {
+        let rig = rig(27845, vec![udp_output("o", 27846)], vec![]).await;
+        let token = rig.token_of("o").await;
+        let action = serde_json::json!({ "flow_id": "f1", "output": udp_output("o", 27847) });
+        rig.command("add_output", action).await.expect("add_output");
+        assert!(token.is_cancelled(), "the old task is still running");
+        assert_eq!(rig.running().await, ["o"]);
+        assert!(!rig.token_of("o").await.is_cancelled());
+        assert_eq!(dest_of(&rig.stored("o").await), "127.0.0.1:27847");
+        let _ = rig.fm.destroy_flow("f1").await;
+    }
+
+    #[tokio::test]
+    async fn add_output_of_a_new_id_takes_the_given_value() {
+        let rig = rig(27848, vec![], vec![]).await;
+        let off = serde_json::json!({ "flow_id": "f1", "output": passive(udp_output("off", 27849)) });
+        rig.command("add_output", off).await.expect("add_output");
+        let on = serde_json::json!({ "flow_id": "f1", "output": udp_output("on", 27850) });
+        rig.command("add_output", on).await.expect("add_output");
+        assert_eq!(rig.running().await, ["on"]);
+        assert!(!rig.stored("off").await.active());
+        assert!(rig.stored("on").await.active());
+        let _ = rig.fm.destroy_flow("f1").await;
     }
 }
 
@@ -9993,6 +10760,17 @@ async fn diff_outputs_inner(
                 continue;
             }
         };
+
+        // A passive output may not have a task, whatever brought one about.
+        if !new_output.active() {
+            if running_set.contains(id) {
+                tracing::info!("Config diff: stopping output '{id}' on flow '{flow_id}' (passive)");
+                if let Err(e) = flow_manager.remove_output(flow_id, id).await {
+                    tracing::warn!("Failed to stop passive output '{id}' on flow '{flow_id}': {e}");
+                }
+            }
+            continue;
+        }
 
         if !running_set.contains(id) {
             // Not currently running — spawn it

@@ -267,6 +267,14 @@ cross-entity port check (`validate_port_conflicts_with_output` /
 newly collide with another input, output or tunnel on this node). Any failure
 returns **HTTP 400** and the flow is left exactly as it was.
 
+A sender activation changes transport parameters and never activation. The
+output's stored `active` flag stands, so a passive sender takes the new parameters
+with no task, raises Info `action: sender_params_saved_passive` rather than
+`sender_activated`, and starts on them when it is switched on. `GET
+.../single/senders/{id}/active` reports `master_enable` from that flag, and an
+IS-04 sender resource its `subscription.active`. A `master_enable` in the `PATCH`
+body is echoed back and not applied.
+
 The handler's error type is a bare status code, so there is nowhere to put the
 reason for the controller. It surfaces only as a Warning event on category
 `nmos` with `error_code: "invalid_transport_params"` and details

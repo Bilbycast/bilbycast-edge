@@ -10,7 +10,9 @@ use crate::config::models::{AppConfig, FlowConfig};
 use crate::config::persistence::save_config_split_async;
 use crate::config::secrets::SecretsConfig;
 use crate::config::validation::{validate_config, validate_flow};
-use crate::manager::client::{OutputDetachRefusal, resolve_failed_output_removal};
+use crate::manager::client::{
+    OutputActivation, OutputDetachRefusal, apply_output_activation, resolve_failed_output_removal,
+};
 
 use super::auth::RequireAdmin;
 use super::errors::ApiError;
@@ -535,7 +537,8 @@ pub async fn restart_flow(
 /// - [`ApiError::Internal`] (500) if persisting the config to disk fails.
 ///
 /// Note: if hot-adding the output to a running flow fails, the assignment is still
-/// persisted to config and a warning is logged.
+/// persisted to config and a warning is logged. A passive output is assigned with
+/// no task, and activation starts it later.
 pub async fn add_output(
     _admin: RequireAdmin,
     State(state): State<AppState>,
@@ -1030,15 +1033,19 @@ pub async fn activate_input(
 
 /// `POST /api/v1/outputs/{output_id}/active` — Toggle an output active/passive.
 ///
-/// Persists the new active flag on the output config and, if the output is
-/// assigned to a running flow, starts or stops the output task accordingly.
-/// An output can be toggled without restarting the flow's input or any
-/// sibling outputs.
+/// Sets the output's `active` flag and applies the definition as it stands now
+/// on the running flow that lists it, starting or stopping the output task
+/// without restarting the flow's input or any sibling output. With no running
+/// flow listing it, only the flag changes, and flow start honours it. The flag
+/// is persisted, and the config write guard is held across the toggle so nothing
+/// else edits the output meanwhile.
 ///
 /// # Errors
 ///
 /// - `NotFound` if the output does not exist.
-/// - `Internal` if the runtime toggle fails.
+/// - `Internal` if the engine refuses the start, with the flag left as it was;
+///   or if the config cannot be saved. A socket failure answers success: an
+///   output opens its socket on its own task, after this returns.
 pub async fn set_output_active(
     _admin: RequireAdmin,
     State(state): State<AppState>,
@@ -1046,35 +1053,157 @@ pub async fn set_output_active(
     Json(req): Json<SetOutputActiveRequest>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let mut config = state.config.write().await;
-    // Update the output's active flag in the top-level outputs list.
-    let output = config
-        .outputs
-        .iter_mut()
-        .find(|o| o.id() == output_id)
-        .ok_or_else(|| ApiError::NotFound(format!("Output '{}' not found", output_id)))?;
-    output.set_active(req.active);
-    // Find the flow that owns this output (if any). Outputs are still
-    // exclusive to at most one flow.
-    let owning_flow_id = config
-        .flows
-        .iter()
-        .find(|f| f.output_ids.iter().any(|id| id == &output_id))
-        .map(|f| f.id.clone());
-    validate_config(&config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let outcome = apply_output_activation(&state.flow_manager, &mut config, &output_id, req.active)
+        .await
+        .map_err(ApiError::NotFound)?;
     save_config_split_async(state.config_path.clone(), state.secrets_path.clone(), config.clone())
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    drop(config);
-    // Apply the toggle at runtime if the flow is running.
-    if let Some(flow_id) = owning_flow_id
-        && state.flow_manager.is_running(&flow_id) {
-            state
-                .flow_manager
-                .set_output_active(&flow_id, &output_id, req.active)
-                .await
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-        }
+    if let OutputActivation::Failed(message) = outcome {
+        return Err(ApiError::Internal(message));
+    }
     Ok(Json(ApiResponse::ok(())))
+}
+
+#[cfg(test)]
+pub(crate) mod passive_output_tests {
+    //! The REST routes that change or start an output honour `active`. Their
+    //! outcomes are pinned at the engine and in `output_activation_tests` in
+    //! `manager::client`; these pin that the REST mirrors take the same path.
+    use super::whole_config_tests::state;
+    use super::*;
+
+    use tokio::sync::mpsc;
+
+    use crate::config::models::OutputConfig;
+    use crate::manager::events::Event;
+
+    /// Flow `f1` running on a UDP input bound to `port`, listing `listed`, with
+    /// `spare` defined and attached to nothing, behind the state the API serves
+    /// it from.
+    pub(crate) async fn running_flow(
+        dir: &std::path::Path,
+        port: u16,
+        listed: Vec<OutputConfig>,
+        spare: Vec<OutputConfig>,
+    ) -> (AppState, mpsc::Receiver<Event>) {
+        let (state, events) = state(dir);
+        let flow: crate::config::models::FlowConfig = serde_json::from_value(serde_json::json!({
+            "id": "f1", "name": "f1", "input_ids": ["a"],
+            "output_ids": listed.iter().map(|o| o.id().to_string()).collect::<Vec<_>>(),
+        }))
+        .expect("flow fixture");
+        {
+            let mut config = state.config.write().await;
+            config.inputs = serde_json::from_value(serde_json::json!([{
+                "id": "a", "name": "a", "active": true,
+                "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+            }]))
+            .expect("input fixture");
+            config.outputs = listed;
+            config.outputs.extend(spare);
+            config.flows = vec![flow];
+            let resolved = config.resolve_flow(&config.flows[0]).expect("resolve");
+            state.flow_manager.create_flow(resolved).await.expect("create_flow");
+        }
+        (state, events)
+    }
+
+    pub(crate) fn udp_output(id: &str, port: u16, active: bool) -> OutputConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": active,
+            "type": "udp", "dest_addr": format!("127.0.0.1:{port}")
+        }))
+        .expect("output fixture")
+    }
+
+    async fn stored_active(state: &AppState, id: &str) -> bool {
+        let config = state.config.read().await;
+        config.outputs.iter().find(|o| o.id() == id).expect("stored").active()
+    }
+
+    async fn post_active(
+        state: &AppState,
+        id: &str,
+        active: bool,
+    ) -> Result<Json<ApiResponse<()>>, ApiError> {
+        set_output_active(
+            RequireAdmin,
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(SetOutputActiveRequest { active }),
+        )
+        .await
+    }
+
+    /// Assigning attaches and persists; a passive output gets no task.
+    #[tokio::test]
+    async fn assigning_a_passive_output_does_not_start_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) =
+            running_flow(dir.path(), 27870, vec![], vec![udp_output("o", 27871, false)]).await;
+        let assigned = add_output(
+            RequireAdmin,
+            State(state.clone()),
+            Path("f1".to_string()),
+            Json(AddOutputRequest { output_id: "o".to_string() }),
+        )
+        .await;
+        assert!(assigned.is_ok());
+        assert!(!state.flow_manager.output_is_running("f1", "o").await);
+        assert!(!stored_active(&state, "o").await);
+        assert!(state.config.read().await.flows[0].output_ids.iter().any(|id| id == "o"));
+        let _ = state.flow_manager.destroy_flow("f1").await;
+    }
+
+    /// The route acts on the definition in the config now, so an output
+    /// assigned after the flow started can be switched on and off.
+    #[tokio::test]
+    async fn the_toggle_starts_and_stops_an_output_assigned_after_flow_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) =
+            running_flow(dir.path(), 27872, vec![], vec![udp_output("o", 27873, false)]).await;
+        state.config.write().await.flows[0].output_ids.push("o".to_string());
+
+        assert!(post_active(&state, "o", true).await.is_ok());
+        assert!(state.flow_manager.output_is_running("f1", "o").await);
+        assert!(stored_active(&state, "o").await);
+        assert!(state.config_path.exists(), "the flag is persisted");
+
+        assert!(post_active(&state, "o", false).await.is_ok());
+        assert!(!state.flow_manager.output_is_running("f1", "o").await);
+        assert!(!stored_active(&state, "o").await);
+        let _ = state.flow_manager.destroy_flow("f1").await;
+    }
+
+    #[tokio::test]
+    async fn the_toggle_answers_404_for_an_unknown_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = running_flow(dir.path(), 27874, vec![], vec![]).await;
+        assert!(matches!(post_active(&state, "ghost", true).await, Err(ApiError::NotFound(_))));
+        assert!(!state.config_path.exists(), "nothing written");
+        let _ = state.flow_manager.destroy_flow("f1").await;
+    }
+
+    /// 500, with the flag left as it was. Stated as an MXL output, which the
+    /// engine refuses on a build without that feature.
+    #[cfg(not(feature = "mxl"))]
+    #[tokio::test]
+    async fn the_toggle_answers_500_for_a_refused_start_with_the_flag_left_as_it_was() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mxl: OutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "m", "active": false, "type": "mxl_audio",
+            "domain_path": "/dev/shm/bilbycast-test", "flow_name": "f",
+        }))
+        .expect("output fixture");
+        let (state, _events) = running_flow(dir.path(), 27875, vec![mxl], vec![]).await;
+        assert!(matches!(post_active(&state, "m", true).await, Err(ApiError::Internal(_))));
+        assert!(!stored_active(&state, "m").await);
+        let saved = std::fs::read_to_string(&state.config_path).expect("saved");
+        let saved: serde_json::Value = serde_json::from_str(&saved).expect("saved is JSON");
+        assert_eq!(saved["outputs"][0]["active"], false);
+        let _ = state.flow_manager.destroy_flow("f1").await;
+    }
 }
 
 #[cfg(test)]
@@ -1099,7 +1228,7 @@ mod whole_config_tests {
 
     /// The API's state over an empty config, its files in `dir`; the event
     /// receiver is returned.
-    fn state(dir: &std::path::Path) -> (AppState, mpsc::Receiver<Event>) {
+    pub(super) fn state(dir: &std::path::Path) -> (AppState, mpsc::Receiver<Event>) {
         let (event_sender, events) = crate::manager::events::event_channel();
         let resource_state = Arc::new(SystemResourceState::new());
         let flow_manager = Arc::new(FlowManager::new(

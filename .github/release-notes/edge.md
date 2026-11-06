@@ -4,6 +4,15 @@ Release of bilbycast-edge version {{VERSION}}.
 
 {{CHANGES}}
 
+## Upgrading from v0.117.0 or earlier
+
+<!-- Static text: remove once no supported upgrade starts at v0.117.0 or earlier. -->
+- **An output switched off stays off, and one sending today despite `active: false` stops at the upgrade.** Up to 0.117.0 only flow start honoured `outputs[].active`: a flow-modal save, a node rename, a config restore, an Outputs modal save, an assign or an IS-05 sender activation started a passive output again, or reset the flag. Every hot route now keeps a passive output stopped. The edge upgrade restarts flows and flow start honours the flag, so an output with `active: false` that is sending today because of this stops at the upgrade. Before upgrading, look for outputs with `active: false` that are on air and switch on any that should stay on air, through the Switcher, `activate_output` or `POST /api/v1/outputs/<id>/active`.
+- **Only `activate_output` and `POST /api/v1/outputs/<id>/active` change `active` on an existing output.** A whole-config push, `update_output`, `PUT /api/v1/outputs/<id>`, `add_output` naming an existing id and an IS-05 sender activation all keep the stored flag, so a raw JSON edit of the flag no longer takes effect. An edit to a passive output only persists, and activation later starts the edited definition. A new id, `config.json` at boot, `POST /api/v1/config/reload` and `PUT /api/v1/config` take the value as written.
+- **A start the engine refuses is now reported, and changes nothing.** `activate_output` acked success when the output did not start, and with the REST route it could not start an output assigned after the flow started (`not a member of this flow`), and ran the definition from flow start after an edit. Both now run the definition as it stands, resolved as at flow start. A start the engine refuses (this build does not carry the output type, or an MXL host's libmxl probe failed) answers `error_code: output_activate_failed` (HTTP 500 on the REST route) with a Warning event of that code, and the flag stays as it was, because the same refusal at the flow's next start would take the whole flow off air. A socket failure still acks success: an output opens its socket on its own task, after the ack, so a UDP output whose `bind_addr` port is held by another process leaves the flag on and nothing sending, with the error in the log. Pressing on again now retries that start, where only off then on did.
+- **`POST /api/v1/outputs/<id>/active` no longer runs whole-config validation.** It changes a flag no validator reads, and it answered 400 on a config already invalid for an unrelated reason, with the flag changed in memory.
+- **IS-05 `GET .../senders/<id>/active` reports `master_enable` from the output's real flag, and an IS-04 sender resource its `subscription.active`.** Both were always `true`. A sender activation on a passive sender saves the parameters with no task and raises Info `sender_params_saved_passive` in place of `sender_activated`.
+
 ## Upgrading from v0.116.0 or earlier
 
 <!-- Static text: remove once no supported upgrade starts at v0.116.0 or earlier. -->

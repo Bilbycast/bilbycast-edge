@@ -859,23 +859,33 @@ impl FlowManager {
     /// The output subscribes to the flow's existing broadcast channel and
     /// begins receiving packets immediately. This enables adding destinations
     /// at runtime without restarting the flow or interrupting other outputs.
+    /// A passive output is attached with no task and receives nothing until
+    /// it is switched on ([`FlowRuntime::add_output`]).
     ///
     /// # Errors
     ///
-    /// Returns an error if the flow is not running or if the output fails to
-    /// start (e.g., socket bind failure).
+    /// Returns an error if the flow is not running, if the id already has a
+    /// task on this flow, or if the engine refuses to start the output (a type
+    /// this build does not carry, say). A socket failure comes later, on the
+    /// output's own task.
     pub async fn add_output(&self, flow_id: &str, output: OutputConfig) -> Result<()> {
         let output_id = output.id().to_string();
+        let passive = !output.active();
         let runtime = self
             .flows
             .get(flow_id)
             .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
         match runtime.add_output(output, &runtime.stats).await {
             Ok(()) => {
+                let message = if passive {
+                    format!("Output '{output_id}' attached to flow '{flow_id}', not started: it is passive")
+                } else {
+                    format!("Output '{output_id}' added to flow '{flow_id}'")
+                };
                 self.event_sender.emit_flow(
                     EventSeverity::Info,
                     category::FLOW,
-                    format!("Output '{output_id}' added to flow '{flow_id}'"),
+                    message,
                     flow_id,
                 );
                 Ok(())
@@ -889,6 +899,36 @@ impl FlowManager {
                 );
                 Err(e)
             }
+        }
+    }
+
+    /// Put a definition on a running flow in place of whatever task its id
+    /// has there: any running task is stopped, then [`add_output`](Self::add_output)
+    /// starts the definition, or attaches it with no task when it is passive.
+    ///
+    /// # Errors
+    ///
+    /// As [`add_output`](Self::add_output). A failed stop is logged here and
+    /// `add_output` then refuses the id that is still running.
+    pub async fn replace_output(&self, flow_id: &str, output: OutputConfig) -> Result<()> {
+        let output_id = output.id().to_string();
+        if self.output_is_running(flow_id, &output_id).await
+            && let Err(e) = self.remove_output(flow_id, &output_id).await
+        {
+            tracing::warn!(
+                "Failed to stop output '{output_id}' on flow '{flow_id}' to replace it: {e}"
+            );
+        }
+        self.add_output(flow_id, output).await
+    }
+
+    /// Whether `output_id` has a task handle on `flow_id`, which a task that has
+    /// exited keeps until something removes it. A passive output, or a flow that
+    /// is not running, answers `false`.
+    pub async fn output_is_running(&self, flow_id: &str, output_id: &str) -> bool {
+        match self.flows.get(flow_id) {
+            Some(runtime) => runtime.output_handles.read().await.contains_key(output_id),
+            None => false,
         }
     }
 
@@ -1226,37 +1266,50 @@ impl FlowManager {
         Ok(())
     }
 
-    /// Toggle an output active or passive on a running flow.
+    /// Bring a running flow's runtime into line with `output`'s `active` flag.
     ///
-    /// Setting an output active spawns a fresh output task if one is not
-    /// already running; setting it passive cancels and removes the running
-    /// task while leaving the output config in place for a later re-activation.
-    pub async fn set_output_active(
-        &self,
-        flow_id: &str,
-        output_id: &str,
-        active: bool,
-    ) -> Result<()> {
+    /// `output` is the definition as the caller holds it now. Active starts a
+    /// task if none is running, which includes one that has exited; passive
+    /// stops one if it is. Either way the output stays attached in the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the flow is not running or the engine refuses the
+    /// start; a Warning `output_activate_failed` event records the second.
+    pub async fn set_output_active(&self, flow_id: &str, output: OutputConfig) -> Result<()> {
+        let output_id = output.id().to_string();
+        let active = output.active();
+        let state = if active { "active" } else { "passive" };
         let runtime = self
             .flows
             .get(flow_id)
             .ok_or_else(|| anyhow::anyhow!("Flow '{}' is not running", flow_id))?;
-        runtime
-            .set_output_active(output_id, active, &runtime.stats)
-            .await?;
+        if let Err(e) = runtime.set_output_active(output, &runtime.stats).await {
+            self.event_sender.send(Event {
+                severity: EventSeverity::Warning,
+                category: category::FLOW.to_string(),
+                message: format!("Flow '{flow_id}': output '{output_id}' could not be set {state}: {e}"),
+                details: Some(serde_json::json!({
+                    "error_code": "output_activate_failed",
+                    "active": active,
+                    "error": e.to_string(),
+                })),
+                flow_id: Some(flow_id.to_string()),
+                input_id: None,
+                output_id: Some(output_id),
+            });
+            return Err(e);
+        }
         self.event_sender.send(Event {
             severity: EventSeverity::Info,
             category: category::FLOW.to_string(),
-            message: format!(
-                "Flow '{flow_id}': output '{output_id}' set {}",
-                if active { "active" } else { "passive" }
-            ),
+            message: format!("Flow '{flow_id}': output '{output_id}' set {state}"),
             details: Some(serde_json::json!({
                 "active": active,
             })),
             flow_id: Some(flow_id.to_string()),
             input_id: None,
-            output_id: Some(output_id.to_string()),
+            output_id: Some(output_id),
         });
         Ok(())
     }
@@ -1470,6 +1523,130 @@ mod tests {
             None,
         ));
         (fm, rx)
+    }
+
+    /// A UDP output at `port`, carrying an `audio_encode` so it has a cost.
+    fn costed_output(id: &str, port: u16, active: bool) -> OutputConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "active": active, "type": "udp",
+            "dest_addr": format!("127.0.0.1:{port}"),
+            "audio_encode": { "codec": "aac_lc" },
+        }))
+        .expect("output fixture")
+    }
+
+    /// Flow `f1` running on a UDP input bound to `port`, listing `outputs`.
+    async fn start_flow_with(fm: &Arc<FlowManager>, port: u16, outputs: Vec<OutputConfig>) {
+        let config: crate::config::models::AppConfig = serde_json::from_value(serde_json::json!({
+            "version": 2,
+            "server": { "listen_addr": "127.0.0.1", "listen_port": 8080 },
+            "inputs": [{
+                "id": "a", "name": "a", "active": true,
+                "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+            }],
+            "outputs": outputs,
+            "flows": [{
+                "id": "f1", "name": "f1", "input_ids": ["a"],
+                "output_ids": outputs.iter().map(|o| o.id().to_string()).collect::<Vec<_>>(),
+            }],
+        }))
+        .expect("config fixture");
+        let resolved = config.resolve_flow(&config.flows[0]).expect("resolve");
+        fm.create_flow(resolved).await.expect("create_flow");
+    }
+
+    /// `active` says whether a task may exist: `add_output` is the one place
+    /// every hot route ends, so it holds the rule, and its event does not claim
+    /// a start that did not happen.
+    #[tokio::test]
+    async fn add_output_attaches_a_passive_output_without_starting_it() {
+        let (fm, mut events) = make_fm_with_events();
+        start_flow_with(&fm, 27860, vec![]).await;
+        fm.add_output("f1", costed_output("o", 27861, false)).await.expect("add_output");
+        assert_eq!(fm.running_output_ids("f1").await, Some(vec![]));
+        assert!(!fm.output_is_running("f1", "o").await);
+        let messages: Vec<String> =
+            std::iter::from_fn(|| events.try_recv().ok()).map(|e| e.message).collect();
+        assert!(
+            messages.iter().any(|m| m.contains("attached to flow 'f1', not started")),
+            "{messages:?}"
+        );
+        assert!(!messages.iter().any(|m| m.contains("added to flow")), "{messages:?}");
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// Inserting over a running handle would leave the old task running with
+    /// nothing able to stop it.
+    #[tokio::test]
+    async fn add_output_refuses_an_id_already_running() {
+        let fm = make_fm();
+        start_flow_with(&fm, 27862, vec![costed_output("o", 27863, true)]).await;
+        let refused = fm.add_output("f1", costed_output("o", 27864, true)).await;
+        assert!(
+            refused.is_err_and(|e| e.to_string().contains("already running")),
+            "a second task under one id must be refused"
+        );
+        assert_eq!(fm.running_output_ids("f1").await, Some(vec!["o".to_string()]));
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// The stop goes through `remove_output`, so the output's contribution
+    /// leaves the totals and each start adds it back once.
+    #[tokio::test]
+    async fn switching_an_output_off_and_on_leaves_the_cost_budget_where_it_was() {
+        let fm = make_fm();
+        start_flow_with(&fm, 27865, vec![costed_output("o", 27866, true)]).await;
+        let before = fm.total_cost_units();
+        assert!(before > 0);
+        for _ in 0..3 {
+            fm.set_output_active("f1", costed_output("o", 27866, false)).await.expect("off");
+            assert!(fm.total_cost_units() < before, "the stop must subtract its cost");
+            assert!(!fm.output_is_running("f1", "o").await);
+            fm.set_output_active("f1", costed_output("o", 27866, true)).await.expect("on");
+            assert!(fm.output_is_running("f1", "o").await);
+        }
+        assert_eq!(fm.total_cost_units(), before);
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// Asking for the state an output is already in changes nothing.
+    #[tokio::test]
+    async fn set_output_active_is_idempotent() {
+        let fm = make_fm();
+        start_flow_with(&fm, 27867, vec![costed_output("o", 27868, true)]).await;
+        let token = {
+            let runtime = fm.get_runtime("f1").expect("f1 runs");
+            let handles = runtime.output_handles.read().await;
+            handles.get("o").expect("running").cancel_token.clone()
+        };
+        fm.set_output_active("f1", costed_output("o", 27868, true)).await.expect("on");
+        assert!(!token.is_cancelled(), "a running output is left alone");
+        fm.set_output_active("f1", costed_output("o", 27868, false)).await.expect("off");
+        fm.set_output_active("f1", costed_output("o", 27868, false)).await.expect("off again");
+        assert!(!fm.output_is_running("f1", "o").await);
+        let _ = fm.destroy_flow("f1").await;
+    }
+
+    /// Stated as an MXL output, which the engine refuses on a build without
+    /// that feature.
+    #[cfg(not(feature = "mxl"))]
+    #[tokio::test]
+    async fn a_failed_activation_raises_output_activate_failed() {
+        let (fm, mut events) = make_fm_with_events();
+        start_flow_with(&fm, 27869, vec![]).await;
+        let mxl: OutputConfig = serde_json::from_value(serde_json::json!({
+            "id": "m", "name": "m", "type": "mxl_audio",
+            "domain_path": "/dev/shm/bilbycast-test", "flow_name": "f",
+        }))
+        .expect("output fixture");
+        assert!(fm.set_output_active("f1", mxl).await.is_err());
+        let raised = std::iter::from_fn(|| events.try_recv().ok()).any(|e| {
+            e.output_id.as_deref() == Some("m")
+                && e.flow_id.as_deref() == Some("f1")
+                && e.details.as_ref().is_some_and(|d| d["error_code"] == "output_activate_failed")
+        });
+        assert!(raised, "the failed start is reported");
+        let _ = fm.destroy_flow("f1").await;
     }
 
     #[tokio::test]
