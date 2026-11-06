@@ -205,6 +205,16 @@ const MAX_PENDING_CLOSES: usize = 4;
 /// Minimum gap between `replay_writer_lagged` events when the writer is
 /// continuously dropping. Avoids flooding the events feed.
 const LAG_EVENT_INTERVAL: Duration = Duration::from_secs(5);
+/// How long after a segment fails to open the writer tries again, measured on
+/// the feed's time like a segment's age (see [`WriterState::arrived`]).
+///
+/// With no segment open every arriving message wants a roll, so a volume that
+/// refuses the open (read-only, detached, out of inodes) used to get one
+/// `open()` and one Critical `replay_disk_full` per message: thousands a
+/// second, which spent the node's event allowance at the manager and silently
+/// cost it every other alarm for the rest of each minute. An operator's Start
+/// retries at once.
+const SEGMENT_OPEN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Live, atomic counters for one recording. Read by the manager-WS
 /// stats poller via the FlowRuntime.
@@ -1111,6 +1121,7 @@ async fn open_writer(setup: WriterSetup, lease: RecordingLease) -> Result<Writer
         budget,
         arrived: Instant::now(),
         current_segment_started: None,
+        segment_open_retry_at: None,
         accumulated_pts: resumed_pts.unwrap_or(0),
         last_pcr: None,
         pending_resume,
@@ -1302,6 +1313,9 @@ struct WriterState {
     arrived: Instant,
     /// When the open segment's first message arrived — see [`Self::arrived`].
     current_segment_started: Option<Instant>,
+    /// Set when a segment failed to open: no roll is tried for a message that
+    /// arrived before this. See [`SEGMENT_OPEN_RETRY_INTERVAL`].
+    segment_open_retry_at: Option<Instant>,
     accumulated_pts: u64,
     last_pcr: Option<u64>,
     /// A resume whose wall-clock gap has not been measured yet, or an
@@ -1424,8 +1438,18 @@ impl WriterState {
                 arrived.saturating_duration_since(started).as_secs() >= self.config.segment_seconds as u64
             }
         };
-        if need_roll {
-            self.roll_segment().await?;
+        // After a failed open, what arrives before the retry falls through with
+        // no segment, as it does after a write error: dropped, its PCR followed.
+        if need_roll && self.segment_open_retry_at.is_none_or(|at| arrived >= at) {
+            if let Err(e) = self.roll_segment().await {
+                self.segment_open_retry_at = Some(arrived + SEGMENT_OPEN_RETRY_INTERVAL);
+                // The PCR is followed across the hole, so no step in it will
+                // mark it. The first frame back has to, or an MP4 export muxes
+                // straight across and declares the outage as a picture's length.
+                self.pending_pcr_discontinuity = true;
+                return Err(e);
+            }
+            self.segment_open_retry_at = None;
         }
         // Per-TS-packet processing: PCR + timecode + collect index entries.
         let mut offset_in_seg = self.current_segment.as_ref().map(|s| s.bytes_written).unwrap_or(0);
@@ -1860,6 +1884,7 @@ impl WriterState {
                     self.pending_pcr_discontinuity = true;
                 }
                 self.mode = WriterMode::Armed;
+                self.segment_open_retry_at = None;
                 self.stats.armed.store(true, Ordering::Relaxed);
                 self.stats.mode.store(MODE_ARMED, Ordering::Relaxed);
                 if was_pre_buffer {
@@ -3150,6 +3175,144 @@ mod tests {
         for n in from..to {
             let _ = tx.send(raw_ts(ts_packet(n, Some(n * 9_000), n % 5 == 0).to_vec()));
         }
+    }
+
+    /// Put a directory where segment `id`'s staging file goes, so its open
+    /// fails whoever runs the test (a mode bit would not stop root) while the
+    /// segment open now can still be closed.
+    fn block_segment_open(dir: &Path, id: u32) {
+        std::fs::create_dir(dir.join(".tmp").join(format!("{id:06}.ts"))).unwrap();
+    }
+
+    fn unblock_segment_open(dir: &Path, id: u32) {
+        std::fs::remove_dir(dir.join(".tmp").join(format!("{id:06}.ts"))).unwrap();
+    }
+
+    /// A volume refusing the open costs one attempt per retry interval, not
+    /// one per packet, and recording resumes by itself at the first retry
+    /// after the volume recovers. What arrives in between is dropped as it is
+    /// after a write error: unindexed, with its PCR still followed.
+    #[tokio::test]
+    async fn a_refused_segment_open_is_retried_on_an_interval_and_recovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let (mut state, _events) = writer_in(tmp.path(), config).await;
+        let dir = tmp.path().join("rec");
+        block_segment_open(&dir, 0);
+
+        // 100 ms apart, so 5.0 s of feed is packet 50.
+        let t0 = Instant::now();
+        let mut refused = Vec::new();
+        for n in 0..=50u64 {
+            let data = Bytes::from(ts_packet(n, Some(n * 9_000), n % 5 == 0).to_vec());
+            if state.write_chunk(&data, t0 + Duration::from_millis(n * 100)).await.is_err() {
+                refused.push(n);
+            }
+        }
+        assert_eq!(refused, [0, 50], "the open was not tried once per retry interval");
+
+        // Mended, but the next retry is not due until packet 100.
+        unblock_segment_open(&dir, 0);
+        feed(&mut state, t0, 51, 100).await;
+        assert!(state.current_segment.is_none(), "opened before the retry was due");
+        assert_eq!(state.stats.bytes_written.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.index_entries.load(Ordering::Relaxed), 0, "indexed media nobody wrote");
+        // Packet 0 was refused before its PCR was read, so the first is packet 1's.
+        assert_eq!(state.accumulated_pts, 98 * 9_000, "the timeline stopped across the gap");
+
+        // Up to the next roll, 2 s of feed later.
+        feed(&mut state, t0, 100, 120).await;
+        command(&mut state, true).await;
+        assert_eq!(segment_files(&dir), ["000000.ts"]);
+        let written = std::fs::metadata(dir.join("000000.ts")).unwrap().len();
+        assert_eq!(written, 20 * TS_PACKET as u64, "recording did not resume at the first retry");
+    }
+
+    /// The hole a refused open leaves is marked on the first frame back, on
+    /// that frame alone. The PCR is followed through the wait, so no PCR step
+    /// marks it, and without the flag an MP4 export across it succeeds with
+    /// the outage as one picture's duration and its audio out of step after.
+    #[tokio::test]
+    async fn the_first_frame_after_a_refused_open_marks_the_hole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = RecordingConfig { segment_seconds: 2, ..RecordingConfig::default() };
+        let (mut state, _events) = writer_in(tmp.path(), config).await;
+        let dir = tmp.path().join("rec");
+        let t0 = Instant::now();
+        // Segment 0 is packets 0..20, and segment 1 is open from packet 20.
+        feed(&mut state, t0, 0, 30).await;
+        block_segment_open(&dir, 2);
+        // Segment 1 reaches its age at packet 40, where segment 2 is refused.
+        for n in 30..90u64 {
+            let data = Bytes::from(ts_packet(n, Some(n * 9_000), n % 5 == 0).to_vec());
+            let result = state.write_chunk(&data, t0 + Duration::from_millis(n * 100)).await;
+            assert_eq!(result.is_err(), n == 40, "packet {n}");
+        }
+        unblock_segment_open(&dir, 2);
+        feed(&mut state, t0, 90, 100).await;
+        command(&mut state, true).await;
+        assert_eq!(segment_files(&dir), ["000000.ts", "000001.ts", "000002.ts"]);
+
+        let index = InMemoryIndex::load(&dir.join("index.bin")).await.unwrap();
+        let back = index.entries.iter().find(|e| e.segment_id == 2).expect("nothing indexed after the hole");
+        assert_ne!(back.flags & flag::PCR_DISCONTINUITY, 0, "the first frame back does not mark the hole");
+        let marked = index.entries.iter().filter(|e| e.flags & flag::PCR_DISCONTINUITY != 0).count();
+        assert_eq!(marked, 1, "only the first frame back marks it");
+        assert!(index.spans_discontinuity(index.entries[0].pts_90khz, back.pts_90khz + 1));
+    }
+
+    /// An operator's Start tries again at once, rather than waiting out the
+    /// retry interval.
+    #[tokio::test]
+    async fn start_retries_a_refused_segment_open_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, _events) = writer_in(tmp.path(), RecordingConfig::default()).await;
+        let dir = tmp.path().join("rec");
+        block_segment_open(&dir, 0);
+
+        let t0 = Instant::now();
+        let data = Bytes::from(ts_packet(0, Some(0), true).to_vec());
+        state.write_chunk(&data, t0).await.expect_err("the open should have been refused");
+        unblock_segment_open(&dir, 0);
+
+        command(&mut state, true).await;
+        command(&mut state, false).await;
+        feed(&mut state, t0, 1, 2).await;
+        assert!(state.current_segment.is_some(), "Start did not retry the open");
+    }
+
+    /// Through the whole writer: a burst of packets at a refused open raises
+    /// one Critical. It raised one per packet, and those spent the node's
+    /// event allowance at the manager, hiding every other alarm from the node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_segment_open_raises_one_event_for_a_burst_of_packets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("rec");
+        let (events, mut events_rx) = crate::manager::events::event_channel();
+        let (tx, _) = broadcast::channel::<RtpPacket>(1024);
+        let cancel = CancellationToken::new();
+        let handle = spawn_writer_at(
+            "flow".into(), "rec".into(), dir.clone(), RecordingConfig::default(), tx.clone(), events, cancel.clone(), HANDOVER_GRACE,
+        )
+            .await
+            .unwrap();
+        // Opened inline, as nothing else holds the recording: the sweep is done.
+        block_segment_open(&dir, 0);
+
+        publish(&tx, 0, 500);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !tx.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the subscriber never drained the broadcast");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let raised = drain_events(&mut events_rx).iter().filter(|e| error_code(e) == Some("replay_disk_full")).count();
+        assert_eq!(raised, 1, "a refused open raised {raised} events for one burst");
+        cancel.cancel();
+        assert!(handle.finished(Duration::from_secs(5)).await);
     }
 
     /// A writer started for a recording whose previous writer is still

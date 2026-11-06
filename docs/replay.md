@@ -188,7 +188,7 @@ defined and set by the writer:
 | Bit | Constant | Meaning |
 |---|---|---|
 | `1 << 0` | `IS_IDR` | Entry marks an IDR / GOP boundary (set on every entry) |
-| `1 << 1` | `PCR_DISCONTINUITY` | Set on the first IDR after a > 5 min PCR step (stream-source change) **and on the first IDR after a writer restart**; MP4 clip export refuses to cut across it (`InMemoryIndex::spans_discontinuity`, checked by both `export_mp4` and the DVR clip cutter in `engine::cmaf::clips`); the raw-TS export (`replay::export`) does not check it, and the playback pacer does not consult the flag |
+| `1 << 1` | `PCR_DISCONTINUITY` | Set on the first IDR after a > 5 min PCR step (stream-source change) **and on the first IDR after a writer restart, a Stop/Start or a refused segment open**; MP4 clip export refuses to cut across it (`InMemoryIndex::spans_discontinuity`, checked by both `export_mp4` and the DVR clip cutter in `engine::cmaf::clips`); the raw-TS export (`replay::export`) does not check it, and the playback pacer does not consult the flag |
 | `1 << 2` | `SMPTE_TC_VALID` | `smpte_tc` holds a decoded SMPTE timecode for this IDR |
 
 Entries are append-only; rebuild on corruption is a Phase 2 item — the
@@ -301,7 +301,9 @@ the shifted window rather than inside it.
 across the join, but the PCR in the TS begins again with the process, so the two
 sides are two timelines however neatly the index numbers them. The first entry
 after a resume therefore carries `PCR_DISCONTINUITY`, and anything muxing a
-range has to honour it — see [Clip export](#clip-export) below.
+range has to honour it — see [Clip export](#clip-export) below. So does the
+first entry after a refused segment open: its PCR was followed through the wait,
+so the counter needs no dating, but the media has a hole there all the same.
 
 ## Lifecycle
 
@@ -390,6 +392,12 @@ range has to honour it — see [Clip export](#clip-export) below.
    but no random-access point in it is indexed — an entry made then used
    to name segment 0, at an offset into packets nobody wrote, so a scrub
    or an export resolving it read the start of the recording instead.
+   A segment that cannot be opened at all (a read-only or detached volume,
+   no free inodes) raises the same event and is retried at most once per
+   5 s of feed (`SEGMENT_OPEN_RETRY_INTERVAL`), or at once on
+   `start_recording`; what arrives in between is dropped the same way, and
+   the first IDR back carries `PCR_DISCONTINUITY`, since no PCR step marks
+   this hole.
 6. A close that fails — flush, fsync or rename — unlinks the segment's
    staging file and raises a Critical event: `replay_disk_full` when the
    disk itself failed (ENOSPC, EDQUOT, EIO, EROFS), the fault the writer's
@@ -658,7 +666,7 @@ parsing strings.
 | `replay_writer_lagged` | Critical | The writer's queue is past its 32 MiB budget, or past its own first 4 MiB with the node's recorders past the 256 MiB they share — the writer has been seconds behind its feed — and the recorder dropped packets | Check disk throughput; reduce concurrent recording flows; investigate fs latency |
 | `replay_disk_pressure` | Warning | Recording usage ≥ 80 % of `max_bytes` (or of replay-root filesystem when `max_bytes = 0`); sticky until back below 70 % | Free disk before ENOSPC; raise `max_bytes` if appropriate; reduce retention |
 | `replay_recording_in_use` | Critical (`recording_start_failed`) | The flow's recorder was not started: another flow's writer was still working in the same recording directory 30 s after it was asked to start, and that flow was not stopping — both flows' recordings resolve to one `storage_id`, or one flow's `storage_id` names another flow's id. Nothing in validation refuses the pair, and the two writers used to corrupt the directory between them. A recording moved from one flow to another is handed over instead, whatever order the push restarts the two in | Give one of the flows its own `recording.storage_id`, then restart it |
-| `replay_disk_full` | Critical | A segment write hit a disk error (typically ENOSPC), or a finished segment's close (flush, fsync, rename) failed on the disk itself — ENOSPC, EDQUOT, EIO or EROFS; the latter carries `details.segment_id`, and that segment is lost | Free disk, then `stop_recording` + `start_recording` to re-arm |
+| `replay_disk_full` | Critical | A segment write hit a disk error (typically ENOSPC), a segment could not be opened (a read-only or detached volume, no free inodes, or anything else that refuses the open), or a finished segment's close (flush, fsync, rename) failed on the disk itself — ENOSPC, EDQUOT, EIO or EROFS; the latter carries `details.segment_id`, and that segment is lost | Free disk or fix the volume. Recording resumes by itself; `stop_recording` + `start_recording` retries at once |
 | `replay_segment_close_failed` | Critical | A finished segment's close failed for a reason other than the disk — its staging file removed from under the writer, a rename refused (permissions, something else at the final path). The staging file is unlinked and the segment lost; `details.segment_id`. Recording carries on with the next segment | Check the recording directory's ownership and permissions, and that nothing else writes into it |
 | `validation_error` | Error (`command_ack.error_code` only — no event) | `configure_recording`, `create_flow`, `update_flow` or `update_config` carrying a `recording` block whose `segment_seconds` is outside `[2, 60]`, `pre_buffer_seconds` outside `[1, 300]` or above a non-zero `retention_seconds`, `filmstrip_seconds` outside `[1, 30]`, `storage_id` not 1–64 ASCII alphanumerics + `_-`, or no `storage_id` on a flow whose id is not a single path component (`.`, `..`, or containing `/` `\`). The same check refuses `config.json` at node start, where there is no ack at all | Use a value in range, or set a valid `storage_id` |
 | `replay_storage_id_invalid` | Error (`command_ack.error_code` only — no event) | `delete_recording` whose `recording_id` is empty, > 64 chars, or contains a character outside ASCII alphanumerics + `_-`, or whose directory could not be removed (`remove_dir_all` failed; a directory that does not exist is acked with `bytes_freed: 0`, not refused). A bad `RecordingConfig.storage_id` is never reported under this code — it is refused as `validation_error` (row above), and `.` is not permitted in the charset | Use a valid id / check the replay volume |
