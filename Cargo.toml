@@ -292,6 +292,9 @@ tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"]
 webpki-roots = "1.0.12"
 futures-util = "0.3.34"
 url = "2.5.9"
+# Decodes the userinfo of an RTSP URL into the credentials the session
+# presents (engine::input_rtsp::session_target); `url` keeps it encoded.
+percent-encoding = "2.3.2"
 
 # Netlink (gateway-mode bonded-path policy routing — engine::bond_routing).
 # Pure Rust; uses the edge process's CAP_NET_ADMIN at runtime.

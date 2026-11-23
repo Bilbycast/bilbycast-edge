@@ -1404,12 +1404,31 @@ two stay aligned.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"rtsp"`. |
-| `rtsp_url` | string | Yes | - | RTSP source URL. Must start with `rtsp://` or `rtsps://`. |
+| `rtsp_url` | string | Yes | - | RTSP source URL. Must start with `rtsp://`; `rtsps://` (RTSP over TLS) is refused, since the RTSP client speaks no TLS. Credentials in the URL (`rtsp://user:pass@camera/…`, percent-encoded as a URL carries them) are taken off the URL and presented as the session's credentials, unless `username` and `password` are both set, which win. |
 | `username` | string | No | `null` | RTSP authentication username (Digest or Basic). |
 | `password` | string | No | `null` | RTSP authentication password. |
 | `transport` | string | No | `"tcp"` | `"tcp"` (interleaved, reliable) or `"udp"` (lower latency). |
-| `timeout_secs` | integer | No | `10` | Connection timeout in seconds. |
+| `timeout_secs` | integer | No | `10` | 1–300. How long a session's setup — the connection, DESCRIBE, SETUP and PLAY together — may take. Past it the attempt is abandoned and retried after `reconnect_delay_secs`, as a lost session is. It does not bound a session once it plays. |
 | `reconnect_delay_secs` | integer | No | `5` | Delay between reconnection attempts on failure. |
+
+The URL's userinfo is never shown: a log line, an event's `url`, and the
+stats' `rtsp_url` all carry the URL without it (`GET /api/v1/config`, which
+returns flow credentials in full by design, still has it as configured).
+Until 2026-11 such a URL was passed to the RTSP client as it was, which
+refused it, so the input retried every `reconnect_delay_secs` for good and
+logged the password at INFO with each start; `rtsps://` passed validation and
+did the same; and `timeout_secs` was read nowhere, so a server that took the
+connection and never answered held the input in DESCRIBE indefinitely.
+
+Each reconnect continues the TS's continuity counters where the last session
+left them, PAT, PMT, video and audio alike. A reconnect's fresh muxer used to
+start every PID at CC 0, a break with no `discontinuity_indicator` that the
+flow's own TR 101 290 counted as a `cc_errors` and a strict receiver reads, one
+reconnect in sixteen, as a duplicate packet to drop. The new session's
+timestamps still restart, which a PCR's `discontinuity_indicator` announces:
+the muxer-mode rewriter's on the step itself, or — with
+`passthrough_clock: true` — the flow's source-discontinuity watch's, on the
+PCR after it.
 | `ingress_delay_ms` | integer | No | `null` | Fixed ingress delay line, 0–1000 ms — a pure delay that preserves jitter rather than removing it. See [RTP Input](#rtp-input) above. |
 | `passthrough_clock` | boolean | No | `false` | Opt out of muxer-mode PCR + PES PTS/DTS regeneration — see [RTP Input](#rtp-input) above. |
 

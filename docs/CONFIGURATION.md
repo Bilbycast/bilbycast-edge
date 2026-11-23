@@ -542,11 +542,11 @@ Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, med
 | Field                 | Type     | Default  | Description                                     |
 |-----------------------|----------|----------|-------------------------------------------------|
 | `type`                | `"rtsp"` | --       | Input type discriminator                        |
-| `rtsp_url`            | `string` | --       | RTSP source URL, e.g. `"rtsp://camera:554/stream1"` |
+| `rtsp_url`            | `string` | --       | RTSP source URL, e.g. `"rtsp://camera:554/stream1"`. `rtsp://` only (`rtsps://` is refused). Credentials in the URL are presented as the session's credentials unless `username` + `password` are both set |
 | `username`            | `string?`| `null`   | Username for RTSP authentication                 |
 | `password`            | `string?`| `null`   | Password for RTSP authentication                 |
 | `transport`           | `string` | `"tcp"`  | `"tcp"` (interleaved, default) or `"udp"`        |
-| `timeout_secs`        | `u64`    | `10`     | Connection timeout in seconds                    |
+| `timeout_secs`        | `u64`    | `10`     | 1–300. Bound on a session's setup (connect, DESCRIBE, SETUP, PLAY); past it the input retries |
 | `reconnect_delay_secs`| `u64`    | `5`      | Delay between reconnection attempts              |
 
 ### WebRTC/WHIP Input (`"type": "webrtc"`)

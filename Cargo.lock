@@ -469,6 +469,7 @@ dependencies = [
  "mxl-rs",
  "netlink-packet-route",
  "nvml-wrapper",
+ "percent-encoding",
  "quinn",
  "rand 0.10.4",
  "rcgen",

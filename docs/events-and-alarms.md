@@ -508,6 +508,8 @@ publish-vs-connect rejection distinction through the `anyhow` chain)
 
 The disconnect event fires **once per connection cycle** — if the RTSP server is unreachable and the edge retries repeatedly, only the first failure emits an event. A new "connected" event followed by a new "disconnected" event will fire when the connection is established and then lost again.
 
+An attempt whose setup never completes — a refused connection, an error answer, or no answer to DESCRIBE, SETUP or PLAY within the input's `timeout_secs` — raises neither event on its own: it is logged at WARN (`RTSP connection lost: no answer to the connection or DESCRIBE within timeout_secs (10s). Reconnecting in 5s...`) and retried after `reconnect_delay_secs`. `{url}` and `details.url` are the URL without its userinfo: credentials in `rtsp_url` never reach an event or a log line.
+
 **Source**: `src/engine/input_rtsp.rs`
 
 ---

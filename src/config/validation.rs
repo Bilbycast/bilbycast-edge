@@ -1479,8 +1479,17 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             )?;
         }
         InputConfig::Rtsp(rtsp) => {
-            if !rtsp.rtsp_url.starts_with("rtsp://") && !rtsp.rtsp_url.starts_with("rtsps://") {
-                bail!("RTSP input: rtsp_url must start with rtsp:// or rtsps://");
+            // rtsps:// was accepted here and refused by the RTSP client
+            // (retina speaks no TLS), so such an input retried every
+            // `reconnect_delay_secs` for good.
+            if rtsp.rtsp_url.starts_with("rtsps://") {
+                bail!(
+                    "RTSP input: rtsp_url: rtsps:// (RTSP over TLS) is not supported; \
+                     use rtsp://"
+                );
+            }
+            if !rtsp.rtsp_url.starts_with("rtsp://") {
+                bail!("RTSP input: rtsp_url must start with rtsp://");
             }
             if rtsp.rtsp_url.len() > 2048 {
                 bail!("RTSP input: rtsp_url must be at most 2048 characters");
@@ -1493,6 +1502,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 && pass.len() > 256 {
                     bail!("RTSP input: password must be at most 256 characters");
                 }
+            if !(1..=300).contains(&rtsp.timeout_secs) {
+                bail!(
+                    "RTSP input: timeout_secs must be between 1 and 300 (got {})",
+                    rtsp.timeout_secs
+                );
+            }
             validate_input_transcode_group_a(
                 rtsp.audio_encode.as_ref(),
                 rtsp.transcode.as_ref(),
@@ -16091,5 +16106,55 @@ mod tests {
             msg.contains("out-1") && msg.contains("path_differential_ms applies only to an SRT input"),
             "{msg}"
         );
+    }
+
+    fn rtsp_input(extra: serde_json::Value) -> crate::config::models::InputConfig {
+        let mut v = serde_json::json!({"type": "rtsp", "rtsp_url": "rtsp://camera.local:554/stream1"});
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).expect("RTSP input fixture")
+    }
+
+    /// The RTSP client speaks no TLS, so an rtsps:// input retried every
+    /// `reconnect_delay_secs` for good. It is refused, naming the scheme
+    /// that works.
+    #[test]
+    fn rtsp_input_refuses_rtsps() {
+        let err = validate_input(&rtsp_input(serde_json::json!({"rtsp_url": "rtsps://camera.local:322/s"})))
+            .expect_err("rtsps:// must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("rtsps://") && msg.contains("not supported") && msg.contains("use rtsp://"), "{msg}");
+        assert!(validate_input(&rtsp_input(serde_json::json!({}))).is_ok());
+        let err = validate_input(&rtsp_input(serde_json::json!({"rtsp_url": "http://camera.local/s"})))
+            .expect_err("another scheme is refused");
+        assert!(err.to_string().contains("must start with rtsp://"), "{err}");
+    }
+
+    /// `timeout_secs` bounds the session setup: 1..=300, the manager form's
+    /// range. 0 would give up on every attempt before it began.
+    #[test]
+    fn rtsp_input_timeout_secs_is_bounded() {
+        for secs in [1, 10, 300] {
+            assert!(validate_input(&rtsp_input(serde_json::json!({"timeout_secs": secs}))).is_ok(), "{secs} s");
+        }
+        for secs in [0, 301] {
+            let err = validate_input(&rtsp_input(serde_json::json!({"timeout_secs": secs})))
+                .expect_err("out of range");
+            assert!(err.to_string().contains("timeout_secs must be between 1 and 300"), "{err}");
+        }
+    }
+
+    /// Credentials in the URL are the form cameras document; the input lifts
+    /// them into the session's credentials, and no refusal may print them.
+    #[test]
+    fn rtsp_input_accepts_url_userinfo_and_never_prints_it() {
+        assert!(
+            validate_input(&rtsp_input(serde_json::json!({"rtsp_url": "rtsp://admin:s3cret@camera.local/s"})))
+                .is_ok()
+        );
+        let err = validate_input(&rtsp_input(serde_json::json!({
+            "rtsp_url": "rtsps://admin:s3cret@camera.local/s"
+        })))
+        .expect_err("rtsps:// is refused whatever the userinfo");
+        assert!(!err.to_string().contains("s3cret"), "{err}");
     }
 }

@@ -277,13 +277,14 @@ bilbycast-edge is a media gateway supporting multiple transport protocols for pr
 - **Client library:** `retina` (pure Rust)
 - **Features:**
   - Pull H.264 or H.265/HEVC video and AAC audio from IP cameras and media servers
-  - Digest and Basic authentication support
+  - Digest and Basic authentication support — `username` / `password`, or credentials in the URL (`rtsp://user:pass@camera/…`), which are taken off it and never shown in logs, events or stats
   - TCP interleaved (default, works through firewalls) or UDP transport
-  - Automatic reconnection with configurable delay
+  - Automatic reconnection with configurable delay; session setup (connect, DESCRIBE, SETUP, PLAY) bounded by `timeout_secs`
   - Received media is muxed into MPEG-TS with proper PAT/PMT program tables
   - Audio-only streams supported (PAT/PMT emitted even without video)
 - **Limitations:**
   - Input only (no RTSP server mode)
+  - No RTSP over TLS: `rtsps://` is refused at validation
   - AAC audio is passed through as ADTS in MPEG-TS
 
 ### SMPTE ST 2110-30 / -31 (PCM / AES3 audio)
