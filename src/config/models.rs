@@ -3079,10 +3079,16 @@ pub enum RtspTransport {
 pub struct RtspInputConfig {
     /// RTSP source URL, e.g. "rtsp://camera.local:554/stream1". Userinfo in
     /// it is presented as the session's credentials (`username` +
-    /// `password` win) and never shown: logs, events and stats carry the
-    /// URL with everything between `://` and its last `@` left out. An edit
-    /// of the input refuses `rtsps://` and userinfo url::Url does not read
-    /// as written; a whole config keeps such a URL and warns.
+    /// `password` win). When a `:` lies between `://` and the URL's last
+    /// `@` (a password may be there), logs, events and stats carry the URL
+    /// with that whole span left out (`input_rtsp::shown_url`); a username
+    /// alone, or an `@` in a path or query with no `:` ahead of it, is shown
+    /// as written. An edit of the input refuses `rtsps://` and a URL
+    /// url::Url cannot parse at all; a whole config keeps either and warns.
+    /// A URL whose `:`-bearing span url::Url reads as no userinfo
+    /// (`rtsp://admin:1234#5@cam/live`, or a port ahead of an `@` in a path)
+    /// is accepted and warned of once at input start
+    /// (`input_rtsp::userinfo_may_be_misread`).
     pub rtsp_url: String,
     /// Username for RTSP authentication (Digest or Basic).
     #[serde(default, skip_serializing_if = "Option::is_none")]
