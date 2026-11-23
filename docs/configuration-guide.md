@@ -1565,10 +1565,10 @@ edge's WHEP output on an audio-only flow — published nothing, its flow
 sending NULL keepalives and reporting the input stalled.
 
 A pull of a server that sends its video first — bilbycast-relay primes each
-viewer with its cached IDR, its first Opus packet about 20 ms behind — holds
-that video until the first Opus packet says whether it is mono or stereo
-(300 ms at most), so the first PMT already names the channel count and the
-IDR goes out behind it; see
+viewer with its cached IDR, its first Opus packet 60–130 ms behind on a
+loopback rig — holds that video until the first Opus packet says whether it
+is mono or stereo (300 ms at most), so the first PMT already names the
+channel count and the IDR goes out behind it; see
 [supported-protocols.md](supported-protocols.md) ("Audio") for why the first
 PMT's count is the one ffmpeg and GStreamer keep.
 

@@ -1092,17 +1092,18 @@ type MuxedFrame = (Vec<bytes::Bytes>, u64);
 
 /// How long a session's video is held for its first Opus packet to settle
 /// the channel count before the first PMT goes out ([`WhipMux::session`]).
-/// The first Opus packet is due one packet time after the first picture
-/// when the sender sends both: 20 ms from Chrome, ffmpeg's WHIP muxer and
-/// str0m (the edge's and the relay's senders), at most 120 ms under RFC
-/// 6716 §3.2.5; and bilbycast-relay primes a WHEP viewer with its cached
-/// IDR and then forwards the live stream, whose next Opus packet follows
-/// within a packet time (20 ms on the rig). 300 ms is that longest packet
-/// twice over plus a network's jitter. What it costs is paid by a sender
-/// that negotiated audio and sends none, or sends it later than that: its
-/// first pictures go out together 300 ms late, behind a PMT listing the
-/// Opus as the TS did before (mono, unless an earlier session sent
-/// stereo), and a stereo packet after that lists it so with a version
+/// A sender sending both tracks sends a packet each packet time — 20 ms
+/// from Chrome, ffmpeg's WHIP muxer and str0m (the edge's and the relay's
+/// senders), at most 120 ms under RFC 6716 §3.2.5 — and bilbycast-relay
+/// primes a WHEP viewer with its cached IDR before forwarding the live
+/// stream: on an edge WHIP output → relay → edge WHEP input rig (debug
+/// builds, loopback) the first Opus packet came 62, 109, 126 and 129 ms
+/// behind that IDR on four pulls. 300 ms covers the longest Opus packet
+/// twice over, and more than twice what the rig measured. What it costs is
+/// paid by a sender that negotiated audio and sends none, or sends it later
+/// than that: its first pictures go out together 300 ms late, behind a PMT
+/// listing the Opus as the TS did before (mono, unless an earlier session
+/// sent stereo), and a stereo packet after that lists it so with a version
 /// bump, as every undeclared stereo sender did without the hold.
 #[cfg(any(feature = "webrtc", test))]
 const OPUS_COUNT_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
@@ -1149,7 +1150,7 @@ impl WhipMux {
     /// GStreamer's tsdemux keep the channel count of the PMT they start on
     /// across a version bump, and a WHEP pull from bilbycast-relay always
     /// starts with video (the relay primes a viewer with its cached IDR),
-    /// so a stereo feed listed mono until its first packet, 20 ms later, was
+    /// so a stereo feed listed mono until its first packet, ~0.1 s later, was
     /// read as mono throughout. The TS never goes back to mono (a stereo
     /// decoder plays a mono packet on both channels, where a mono one folds
     /// a stereo packet down), so nothing is held once it lists stereo: a
