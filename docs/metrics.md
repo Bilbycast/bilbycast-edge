@@ -283,7 +283,7 @@ Emitted per running flow while `FlowStats.media_analysis` is populated.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `bilbycast_edge_media_video_info` | gauge | `flow_id,pid,codec,resolution,profile,level` | Always 1; carries the video ES description as labels. Unknown fields render as `"unknown"`, never absent. |
-| `bilbycast_edge_media_video_framerate` | gauge | `flow_id,pid` | Detected frame rate. Emitted only when a frame rate was resolved. |
+| `bilbycast_edge_media_video_framerate` | gauge | `flow_id,pid` | Detected frame rate. Emitted only when a frame rate was resolved. The bitstream's own (H.264 / HEVC VUI timing, the MPEG-2 sequence header) when it states one; otherwise measured from the PES timestamps over 2 s windows and reported as the mean since the rate last changed, so it follows a real change of rate (a window more than 3 % off) and settles through stamp jitter. Until 2026-11 that measurement was the first 30 frames', kept for good: a WebRTC publish that opens at 15 fps and runs at 30 read 23.08. |
 | `bilbycast_edge_media_audio_info` | gauge | `flow_id,pid,codec,sample_rate,channels[,language]` | Always 1; `language` is present **only** when the elementary stream declares one, so the label set differs between series of the same family. |
 | `bilbycast_edge_media_pid_bitrate_bps` | gauge | `flow_id,pid,type="video\|audio"` | Per-ES bitrate. Suppressed when the measured bitrate is 0. |
 | `bilbycast_edge_media_total_bitrate_bps` | gauge | `flow_id` | Total measured bitrate. Suppressed when 0. |
