@@ -1550,13 +1550,27 @@ one the WebRTC stack cannot apply fails the pull: either raises a Warning
 `whep_answer_unusable` once per episode (until a pull connects), and the
 pull is tried again after the backoff. However a pull ends — the session
 closes, its handshake or answer fails, the input stops — its resource on the
-server is released with a `DELETE` to the answer's `Location`, in the
-background and bounded to 10 s, so it never holds up the retry; the input
-used to leave every resource to the server's own timeout. Until
-2026-10 the input muxed the video alone, on its raw RTP timestamps: an A/V
-pull lost its audio, and a pull from a server sending no video — another
+server is released with a `DELETE` to the answer's `Location`, waited for in
+the input's task for up to 2 s, so a stopping flow and a node shutting down
+send it before they finish (a stopping flow gives each input task 5 s). A
+server answering 404 or 410 has ended the session already — bilbycast-relay
+once the stream it served has closed — and that is a release like any other,
+logged at debug. Until 2026-11 the DELETE went out in the background, which a
+shutdown cut short, and before 2026-10 there was none: the server kept every
+dead pull until its own timeout.
+
+Until 2026-10 the input muxed the video alone, on its raw RTP timestamps: an
+A/V pull lost its audio, and a pull from a server sending no video — another
 edge's WHEP output on an audio-only flow — published nothing, its flow
 sending NULL keepalives and reporting the input stalled.
+
+A pull of a server that sends its video first — bilbycast-relay primes each
+viewer with its cached IDR, its first Opus packet about 20 ms behind — holds
+that video until the first Opus packet says whether it is mono or stereo
+(300 ms at most), so the first PMT already names the channel count and the
+IDR goes out behind it; see
+[supported-protocols.md](supported-protocols.md) ("Audio") for why the first
+PMT's count is the one ffmpeg and GStreamer keep.
 
 ### Media Player Input
 
