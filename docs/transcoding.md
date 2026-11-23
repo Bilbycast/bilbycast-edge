@@ -199,8 +199,9 @@ decode: `0x0F` (AAC ADTS), `0x11` (AAC LATM), `0x03` / `0x04`
 or `0x06` (DVB private) resolved through its descriptor to one of AC-3 /
 E-AC-3 / LATM-AAC, or to Opus (the "Opus" registration descriptor) when it
 is one mono or stereo stream — no Opus extension descriptor, or
-`channel_config_code` 1 / 2 — as every WHIP / WHEP input and ffmpeg's
-`-c:a libopus -f mpegts` carry it. Opus is cut on its control header and
+`channel_config_code` 1 / 2 — as every WHIP / WHEP input (which writes
+the code since 2026-11, none before) and ffmpeg's `-c:a libopus -f mpegts`
+carry it. Opus is cut on its control header and
 decoded by libavcodec at 48 kHz; until 2026-10 it was walked past, so an
 ingress `audio_encode` on a WebRTC input re-encoded nothing. A `0x06` that
 resolves to DTS, multistream Opus (a channel mapping the decoder is not

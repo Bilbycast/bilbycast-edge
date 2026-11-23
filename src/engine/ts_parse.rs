@@ -1125,7 +1125,7 @@ pub fn descriptor_audio_kind(descriptors: &[u8]) -> Option<PrivateEsAudioKind> {
 /// The `channel_config_code` of an Opus ES, from the DVB extension
 /// descriptor (tag 0x7F) with the provisional Opus extension tag 0x80 in its
 /// PMT ES-info loop — `None` when the loop carries none (an edge's own muxer
-/// writes only the registration descriptor) or it is cut short.
+/// wrote only the registration descriptor until 2026-11) or it is cut short.
 ///
 /// The code is what ffmpeg's `mpegts` muxer writes and its demuxer reads:
 /// 1 / 2 a mono / stereo single Opus stream; 0 dual mono (two mono
@@ -1847,7 +1847,7 @@ mod tests {
         assert_eq!(opus_channel_config_code(&stereo), Some(2));
         let five_one = [0x05, 0x04, b'O', b'p', b'u', b's', 0x7F, 0x02, 0x80, 0x06];
         assert_eq!(opus_channel_config_code(&five_one), Some(6));
-        // Registration only (an edge's own muxer), another extension tag,
+        // Registration only (an edge's own muxer until 2026-11), another extension tag,
         // a descriptor cut short: none signalled.
         assert_eq!(opus_channel_config_code(&stereo[..6]), None);
         assert_eq!(opus_channel_config_code(&[0x7F, 0x02, 0x15, 0x02]), None);

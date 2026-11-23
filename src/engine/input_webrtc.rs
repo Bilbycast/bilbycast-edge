@@ -152,6 +152,15 @@ async fn whip_input_loop(
         }
     };
 
+    // The input's TS, one for every publisher in turn (`WhipMux`): each
+    // takes it on from the last — continuity counters, PSI versions and the
+    // timeline carried on, the step to its first PCR marked (`WhipMux::
+    // session`). A muxer per publisher restarted all of it from zero with no
+    // discontinuity_indicator, which a receiver locked across a re-publish
+    // took for CC errors and an unflagged backward PCR jump.
+    let mut whip = WhipMux::new(opus_ts_muxer(config.pid_overrides.as_ref()));
+    let mut seq_num: u16 = 0;
+
     loop {
         // Wait for a WHIP publisher to connect
         let msg = tokio::select! {
@@ -236,11 +245,10 @@ async fn whip_input_loop(
         let child_cancel = cancel.child_token();
         let _ = msg.reply.send(Ok((answer, session_id.clone(), child_cancel.clone())));
 
-        // The tracks' frames onto one TS (`WhipMux`): one timeline for
-        // both, the parameter sets ahead of every IDR, the Opus in the
+        // The tracks' frames onto the input's TS (`WhipMux`): one timeline
+        // for both, the parameter sets ahead of every IDR, the Opus in the
         // FFmpeg-compatible carriage, no payload-less frame.
-        let mut whip = WhipMux::new(opus_ts_muxer(config.pid_overrides.as_ref()));
-        let mut seq_num: u16 = 0;
+        whip.session(sdp_declares_stereo_opus(&msg.offer_sdp));
         // The publish's layout — which of video and audio its offer carried
         // — is settled from the session's tracks on the first media
         // (`WhipLayout`). The muxer used to assume video and no audio: an
@@ -349,7 +357,36 @@ fn opus_ts_muxer(
         ts_muxer.set_pids(entry.pmt_pid, entry.video_pid, entry.audio_pid, entry.pcr_pid);
     }
     ts_muxer.set_audio_stream(0x06, Some(*b"Opus"));
+    // RFC 7587's default; `WhipMux` follows the session.
+    ts_muxer.change_opus_channels(1);
     ts_muxer
+}
+
+/// Whether `sdp` — the description of the end that sends the Opus: a WHIP
+/// publisher's offer, a WHEP server's answer — declares it stereo, with
+/// `sprop-stereo=1` on an audio m-line's Opus payload type (RFC 7587 §7.1).
+/// Without it RFC 7587 has the sender likely to send mono, "the received
+/// signal can be safely downmixed to mono"; Chrome declares nothing and
+/// sends mono unless the answer asks for stereo, which this edge's never
+/// does. The packets themselves have the last word (`WhipMux::frame`).
+#[cfg(feature = "webrtc")]
+fn sdp_declares_stereo_opus(sdp: &str) -> bool {
+    let (mut audio, mut opus, mut stereo) = (false, Vec::new(), Vec::new());
+    for line in sdp.lines().map(str::trim_end) {
+        if let Some(media) = line.strip_prefix("m=") {
+            audio = media.starts_with("audio ");
+        } else if !audio {
+        } else if let Some((pt, codec)) = line.strip_prefix("a=rtpmap:").and_then(|r| r.split_once(' ')) {
+            if codec.to_ascii_lowercase().starts_with("opus/") {
+                opus.push(pt);
+            }
+        } else if let Some((pt, params)) = line.strip_prefix("a=fmtp:").and_then(|r| r.split_once(' '))
+            && params.split(';').any(|p| p.trim().eq_ignore_ascii_case("sprop-stereo=1"))
+        {
+            stereo.push(pt);
+        }
+    }
+    opus.iter().any(|pt| stereo.contains(pt))
 }
 
 /// Publish one frame's TS packets, stamped `pts_90khz`, onto the flow —
@@ -468,6 +505,10 @@ async fn whep_input_loop(
     // The unusable answer last reported (`report_whep_answer`), until a pull
     // connects.
     let mut answer_fault: Option<&'static str> = None;
+    // The input's TS, one for every pull in turn, as the WHIP input's is for
+    // every publisher (`WhipMux::session`).
+    let mut whep = WhipMux::new(opus_ts_muxer(config.pid_overrides.as_ref()));
+    let mut seq_num: u16 = 0;
 
     loop {
         // Create session and SDP offer
@@ -634,9 +675,8 @@ async fn whep_input_loop(
         // server actually sends (`WhipLayout`). Only the video was muxed: the
         // Opus was dropped, and a pull of a server sending no video
         // published nothing at all.
-        let mut whep = WhipMux::new(opus_ts_muxer(config.pid_overrides.as_ref()));
+        whep.session(sdp_declares_stereo_opus(&answer_sdp));
         let mut layout = WhipLayout::new("WHEP pull");
-        let mut seq_num: u16 = 0;
 
         // Receive loop
         loop {
@@ -834,7 +874,8 @@ impl WhipLayout {
 
     /// Set the muxer's layout from the session's tracks, once. With no video
     /// the PMT lists the Opus alone, names it as PCR_PID, and it carries the
-    /// PCR (`TsMuxer::audio_pcr`).
+    /// PCR (`TsMuxer::audio_pcr`). A layout other than the one an earlier
+    /// session left on the muxer goes out with a PMT version bump.
     fn apply(
         &mut self,
         muxer: &mut crate::engine::rtmp::ts_mux::TsMuxer,
@@ -848,8 +889,10 @@ impl WhipLayout {
         self.applied = true;
         self.negotiated = [has_video, has_audio];
         self.listed = [has_video, has_audio];
-        muxer.set_has_video(has_video);
-        muxer.set_has_audio(has_audio);
+        // A muxer that has gone out with an earlier session's layout bumps
+        // its PMT version for a different one.
+        muxer.change_has_video(has_video);
+        muxer.change_has_audio(has_audio);
         tracing::info!(
             flow_id,
             has_video,
@@ -978,6 +1021,9 @@ struct WhipMux {
     /// The last audio PTS: a frame whose RTP clock rate is unknown (0)
     /// takes it.
     last_audio_pts_90khz: u64,
+    /// The session's Opus is listed as stereo in the PMT (`channel_config_code`
+    /// 2, else 1).
+    opus_stereo: bool,
 }
 
 #[cfg(any(feature = "webrtc", test))]
@@ -988,7 +1034,29 @@ impl WhipMux {
             clock: WhipClock::default(),
             param_sets: H264ParamSets::default(),
             last_audio_pts_90khz: 0,
+            opus_stereo: false,
         }
+    }
+
+    /// A session — a WHIP publisher, a WHEP pull — starts onto this TS,
+    /// taking it on from the last one: the muxer's continuity counters and
+    /// PSI versions run on, its tracks are timed on the same timeline as the
+    /// last session's (`WhipClock::session`), and the step to its first PCR
+    /// — the wall-clock gap between the sessions, which no PCR spanned —
+    /// carries `discontinuity_indicator` (`TsMuxer::mark_discontinuity`):
+    /// TR 101 290 counts any PCR step past 100 ms without one, and the
+    /// flow's source-discontinuity watcher put one on the PCR after it. Its
+    /// Opus is listed as `opus_stereo` says ([`sdp_declares_stereo_opus`])
+    /// until a stereo packet says otherwise ([`Self::frame`]).
+    ///
+    /// Each session used to get a muxer and clock of its own: CC, PTS and
+    /// PCR started again from zero with no discontinuity_indicator.
+    fn session(&mut self, opus_stereo: bool) {
+        self.muxer.mark_discontinuity();
+        self.clock.session();
+        self.param_sets = H264ParamSets::default();
+        self.opus_stereo = opus_stereo;
+        self.muxer.change_opus_channels(if opus_stereo { 2 } else { 1 });
     }
 
     /// One depayloaded frame of the video (`video`) or the audio track —
@@ -1013,6 +1081,17 @@ impl WhipMux {
             let (annex_b, is_keyframe) = self.param_sets.access_unit(data);
             Some((self.muxer.mux_video(&annex_b, pts, pts, is_keyframe), pts))
         } else {
+            // A stereo packet (its TOC's `s` bit, RFC 6716 §3.1) lists the
+            // Opus as stereo from here on: before the PMT first goes out when
+            // the audio leads, else with a version bump. Never back to mono:
+            // a stereo decoder plays a mono packet on both channels, where a
+            // mono one folds a stereo packet down.
+            if !self.opus_stereo && data[0] & 0x04 != 0 {
+                self.opus_stereo = true;
+                if self.muxer.change_opus_channels(2) {
+                    tracing::info!("WebRTC Opus is stereo: the PMT lists it so (channel_config_code 2)");
+                }
+            }
             // Opus: the RTP timestamp on the Opus clock (48 kHz, carried in
             // MediaTime.denom) onto the publish's 90 kHz timeline.
             let pts = if rate == 0 {
@@ -1045,14 +1124,28 @@ impl WhipMux {
 /// difference and the network's, tens of milliseconds — not an arbitrary
 /// distance. (The RTCP sender reports' NTP ↔ RTP mapping would take out
 /// even that; str0m exposes them and doing so is a follow-up.)
+///
+/// A later session's tracks ([`Self::session`]) are anchored the same way on
+/// the same timeline — at their first frames' arrival after the input's
+/// first frame — so the timeline runs on across sessions as the wall clock
+/// did, never before a PTS the last session issued. It used to start again
+/// at the lead, 20 s back after a 20 s publish.
 #[cfg(any(feature = "webrtc", test))]
 #[derive(Debug, Default)]
 struct WhipClock {
-    /// When the publish's first frame of any track arrived.
+    /// When the input's first frame of any track arrived: the timeline's
+    /// origin, for every session.
     origin: Option<std::time::Instant>,
-    /// Each track's first RTP timestamp and the PTS (90 kHz) it maps to.
+    /// The session's tracks: each one's first RTP timestamp and the PTS
+    /// (90 kHz, unwrapped) it maps to.
     video: Option<(u64, u64)>,
     audio: Option<(u64, u64)>,
+    /// The latest PTS issued (unwrapped).
+    latest: u64,
+    /// The earliest PTS a session's track may start at: past the last
+    /// session's latest. A long session whose sender's clock ran fast would
+    /// otherwise leave the next one, anchored on the wall clock, behind it.
+    floor: u64,
 }
 
 #[cfg(any(feature = "webrtc", test))]
@@ -1062,13 +1155,26 @@ impl WhipClock {
     /// `arrival`.
     fn pts_90k(&mut self, video: bool, rtp: u64, rate: u64, arrival: std::time::Instant) -> u64 {
         let origin = *self.origin.get_or_insert(arrival);
+        let floor = self.floor;
         let slot = if video { &mut self.video } else { &mut self.audio };
         let (first, base) = *slot.get_or_insert_with(|| {
             let late_us = arrival.saturating_duration_since(origin).as_micros() as u64;
-            (rtp, crate::engine::rtmp::ts_mux::PCR_LEAD_90K + late_us * 9 / 100)
+            (rtp, (crate::engine::rtmp::ts_mux::PCR_LEAD_90K + late_us * 9 / 100).max(floor))
         });
         let ticks = (rtp as i128 - first as i128) * 90_000 / rate.max(1) as i128;
-        ((base as i128 + ticks).max(0) as u64) & 0x1_FFFF_FFFF
+        let pts = (base as i128 + ticks).max(0) as u64;
+        self.latest = self.latest.max(pts);
+        pts & 0x1_FFFF_FFFF
+    }
+
+    /// A new session's tracks start: each is anchored afresh, at its first
+    /// frame, past every PTS issued so far.
+    fn session(&mut self) {
+        self.video = None;
+        self.audio = None;
+        if self.origin.is_some() {
+            self.floor = self.latest + 1;
+        }
     }
 }
 
@@ -1170,6 +1276,175 @@ mod tests {
         // An audio frame a little behind its first (a late reordered one)
         // stays on the timeline.
         assert_eq!(c.pts_90k(false, 123_456 - 960, 48_000, t0 + ms(30)), LEAD + 1_800 - 1_800);
+    }
+
+    /// A later session's tracks run on from the last session's timeline as
+    /// the wall clock did — 3 s after the input's first frame is 3 s on —
+    /// and never before a PTS already issued: a session whose sender's clock
+    /// ran fast (10 s of RTP time in 5 s) is followed past its own end. A
+    /// clock per session started every one at the lead again.
+    #[test]
+    fn a_sessions_timeline_runs_on_from_the_last() {
+        use super::WhipClock;
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let s = Duration::from_secs;
+        let mut c = WhipClock::default();
+        assert_eq!(c.pts_90k(false, 500, 48_000, t0), LEAD);
+        assert_eq!(c.pts_90k(false, 48_500, 48_000, t0 + s(1)), LEAD + 90_000);
+        c.session();
+        assert_eq!(c.pts_90k(false, 77, 48_000, t0 + s(3)), LEAD + 270_000, "3 s on the wall clock");
+        assert_eq!(c.pts_90k(true, 9_000, 90_000, t0 + s(3)), LEAD + 270_000, "video likewise");
+        assert_eq!(c.pts_90k(false, 77 + 480_000, 48_000, t0 + s(8)), LEAD + 1_170_000);
+        c.session();
+        assert_eq!(c.pts_90k(false, 3, 48_000, t0 + s(9)), LEAD + 1_170_001, "past the last session's end");
+    }
+
+    /// The sender's description of its Opus says stereo with
+    /// `sprop-stereo=1` on its audio m-line's Opus PT (OBS); Chrome's, and
+    /// any other that says nothing, is mono (RFC 7587's default).
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn a_stereo_opus_sender_is_read_off_its_sdp() {
+        let sdp = |fmtp: &str| {
+            format!(
+                "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 H264/90000\r\n\
+                 a=fmtp:111 sprop-stereo=1\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111 63\r\n\
+                 a=rtpmap:111 opus/48000/2\r\na=rtpmap:63 red/48000/2\r\na=fmtp:{fmtp}\r\n"
+            )
+        };
+        assert!(super::sdp_declares_stereo_opus(&sdp(
+            "111 minptime=10;maxaveragebitrate=96000;stereo=1;sprop-stereo=1;useinbandfec=1"
+        )));
+        assert!(!super::sdp_declares_stereo_opus(&sdp("111 minptime=10;useinbandfec=1")));
+        assert!(!super::sdp_declares_stereo_opus(&sdp("111 stereo=1")), "what it takes, not sends");
+        assert!(!super::sdp_declares_stereo_opus(&sdp("63 sprop-stereo=1")), "not the Opus PT");
+        assert!(!super::sdp_declares_stereo_opus(&sdp("111 sprop-stereo=0")));
+    }
+
+    /// The Opus `channel_config_code` each PMT in `ts` lists, in turn, with
+    /// its version.
+    #[cfg(feature = "webrtc")]
+    fn opus_channels_of(ts: &[bytes::Bytes]) -> Vec<(u8, Option<u8>)> {
+        let mut seen = Vec::new();
+        for pmt in ts.iter().filter(|p| crate::engine::ts_parse::ts_pid(p) == 0x1000) {
+            let sec = &pmt[5..];
+            let len = (((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize;
+            let mut pos = 12;
+            while pos + 5 <= 3 + len - 4 {
+                let info_len = (((sec[pos + 3] & 0x0F) as usize) << 8) | sec[pos + 4] as usize;
+                if sec[pos] == 0x06 {
+                    let code = crate::engine::ts_parse::opus_channel_config_code(&sec[pos + 5..pos + 5 + info_len]);
+                    let entry = ((sec[5] >> 1) & 0x1F, code);
+                    if seen.last() != Some(&entry) {
+                        seen.push(entry);
+                    }
+                }
+                pos += 5 + info_len;
+            }
+        }
+        seen
+    }
+
+    /// A publisher after another runs on the same TS: every PID's
+    /// continuity counter continues, the PCR never steps back, and the step
+    /// to the new publisher's first PCR — the gap no PCR spanned — is the
+    /// one carrying `discontinuity_indicator`. The PMT lists the first
+    /// publisher's mono Opus as mono and the second's stereo as stereo
+    /// (`channel_config_code` 1, then 2 with a version bump). Each publisher
+    /// used to get a muxer of its own: CC, PTS and PCR from zero with no
+    /// DI, and an Opus entry with no channel count.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_republish_runs_on_the_same_ts_with_its_step_marked() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::engine::ts_parse::{extract_pcr, ts_cc, ts_discontinuity_indicator, ts_has_payload, ts_pid};
+        use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+        use std::time::{Duration, Instant};
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(4096);
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config, "flow-w", broadcast_tx, stats, cancel, session_rx, &events,
+                    &mut transcoder, &mut post, Duration::from_secs(10),
+                )
+                .await;
+            }
+        });
+
+        let mut ts = Vec::new();
+        // An audio-only publisher sending a second of Opus whose TOC is
+        // `toc` (0x78: 20 ms CELT mono; 0xFC: 20 ms CELT stereo), then
+        // leaving (DTLS close_notify).
+        for toc in [0x78u8, 0xFC] {
+            let peer = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: false };
+            let mut publisher = WebrtcSession::new(&peer).await.unwrap();
+            let (offer, pending) = publisher.create_offer(false, true, true).unwrap();
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            session_tx.send(NewSessionMsg { offer_sdp: offer, reply }).await.unwrap();
+            let (answer, _session, _cancel) = answer.await.unwrap().unwrap();
+            publisher.apply_answer(&answer, pending).unwrap();
+            let audio_mid = publisher.audio_mid.unwrap();
+            let audio_pt = publisher.get_pt(audio_mid).expect("Opus accepted");
+            let connected = tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(publisher.poll_event(&cancel).await, SessionEvent::Connected) {}
+            })
+            .await;
+            assert!(connected.is_ok(), "the publisher never connected");
+            let mut frame = vec![toc];
+            frame.resize(80, 0xA5);
+            for k in 0..50u64 {
+                let at = str0m::media::MediaTime::new(k * 960, str0m::media::Frequency::FORTY_EIGHT_KHZ);
+                publisher.write_media(audio_mid, audio_pt, Instant::now(), at, &frame).unwrap();
+                publisher.drain_outputs().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let _ = publisher.drive_udp_io().await;
+                while let Ok(pkt) = published.try_recv() {
+                    ts.extend(pkt.data.chunks(188).map(bytes::Bytes::copy_from_slice));
+                }
+            }
+            publisher.close().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        while let Ok(pkt) = published.try_recv() {
+            ts.extend(pkt.data.chunks(188).map(bytes::Bytes::copy_from_slice));
+        }
+
+        assert!(carries_opus(&ts), "no Opus was published ({} packets)", ts.len());
+        for pid in [0x0000, 0x1000, 0x0101] {
+            let ccs: Vec<u8> = ts.iter().filter(|p| ts_pid(p) == pid && ts_has_payload(p)).map(|p| ts_cc(p)).collect();
+            assert!(ccs.len() > 4, "PID 0x{pid:04X}: {} packets", ccs.len());
+            for w in ccs.windows(2) {
+                assert_eq!(w[1], (w[0] + 1) & 0x0F, "PID 0x{pid:04X} CC breaks: {ccs:?}");
+            }
+        }
+        let pcrs: Vec<(u64, bool)> =
+            ts.iter().filter_map(|p| extract_pcr(p).map(|pcr| (pcr / 300, ts_discontinuity_indicator(p)))).collect();
+        assert!(pcrs.windows(2).all(|w| w[1].0 >= w[0].0), "the PCR stepped back: {pcrs:?}");
+        let marked: Vec<usize> = (0..pcrs.len()).filter(|&i| pcrs[i].1).collect();
+        let step = (1..pcrs.len()).max_by_key(|&i| pcrs[i].0 - pcrs[i - 1].0).unwrap();
+        assert_eq!(marked, [step], "one DI, on the PCR after the gap: {pcrs:?}");
+        assert!(pcrs[step].0 - pcrs[step - 1].0 > 9_000, "a gap of {} ticks", pcrs[step].0 - pcrs[step - 1].0);
+        let channels = opus_channels_of(&ts);
+        assert_eq!(channels.first().map(|c| c.1), Some(Some(1)), "{channels:?}");
+        assert_eq!(channels.last().map(|c| c.1), Some(Some(2)), "{channels:?}");
+        assert_ne!(channels.first().map(|c| c.0), channels.last().map(|c| c.0), "the version moved: {channels:?}");
     }
 
     /// The PMT of `ts` as `(PCR_PID, [(stream_type, PID)])`, and the PIDs

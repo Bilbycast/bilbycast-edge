@@ -33,9 +33,9 @@ const PTS_WRAP: u64 = 1 << 33;
 /// Whether a source whose PMT signals Opus `channel_config_code`
 /// (`ts_parse::opus_channel_config_code`) is a single mono or stereo Opus
 /// stream — what an RTP Opus track carries. A source that signals none (an
-/// edge's own muxer, writing only the registration descriptor) is taken as
-/// one: Opus-in-TS without the extension descriptor has no way to describe
-/// a multistream layout.
+/// edge's own muxer until 2026-11, which wrote only the registration
+/// descriptor) is taken as one: Opus-in-TS without the extension descriptor
+/// has no way to describe a multistream layout.
 pub fn carries(channel_config_code: Option<u8>) -> bool {
     matches!(channel_config_code, None | Some(1) | Some(2))
 }

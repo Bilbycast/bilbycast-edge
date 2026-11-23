@@ -875,7 +875,7 @@ fn opus_through_audio_encode(
 /// RTP packets, and its latency from `recv_time_us` when it came from the
 /// source. `None` — ICE was down, or the write failed — counts nothing: the
 /// frame went nowhere, though it was still encoded, so the encoders keep
-/// their timelines (see `write_media`). Up to 0.118.0 an access unit counted
+/// their timelines (see `write_media`). Until 2026-11 an access unit counted
 /// as the send loop had it, filler included.
 #[cfg(feature = "webrtc")]
 fn count_sent(

@@ -172,6 +172,10 @@ pub struct TsMuxer {
     /// audio elementary stream. Set to `Some(*b"BSSD")` for SMPTE 302M
     /// LPCM. When `None`, no registration descriptor is written.
     audio_registration: Option<[u8; 4]>,
+    /// The Opus `channel_config_code` the PMT carries beside the "Opus"
+    /// registration, in the Opus extension descriptor
+    /// ([`Self::change_opus_channels`]); `None` writes none.
+    opus_channel_config: Option<u8>,
     /// Frame counter for periodic PAT/PMT emission. Used as a fallback
     /// when no time clock is available — see `last_pat_pmt_pts_90khz`
     /// for the time-based primary path.
@@ -217,6 +221,10 @@ pub struct TsMuxer {
     /// The caller releases the filler PCRs on its own clock
     /// ([`Self::clock_pcr_fillers`]); none go ahead of an access unit.
     pcr_fillers_clocked: bool,
+    /// The next PCR starts a new timeline ([`Self::mark_discontinuity`]):
+    /// it carries `discontinuity_indicator`, and no filler bridges the step
+    /// to it.
+    pcr_discontinuity_pending: bool,
     /// PMT `version_number` field (5 bits, `0..=31`). Bumped by the caller
     /// across a layout-change boundary (e.g. media-player playlist
     /// transition where the new file's codec/PID layout differs) so
@@ -245,6 +253,7 @@ impl TsMuxer {
             video_stream_type: STREAM_TYPE_H264,
             audio_stream_type: STREAM_TYPE_AAC,
             audio_registration: None,
+            opus_channel_config: None,
             pat_pmt_counter: 0,
             pat_pmt_sent: false,
             psi_due: false,
@@ -254,6 +263,7 @@ impl TsMuxer {
             pcr_start_hold: false,
             timeline_continues: false,
             pcr_fillers_clocked: false,
+            pcr_discontinuity_pending: false,
             pmt_version: 0,
         }
     }
@@ -427,6 +437,38 @@ impl TsMuxer {
         self.audio_registration = registration;
     }
 
+    /// The channel layout of an Opus audio stream (`set_audio_stream(0x06,
+    /// Some(*b"Opus"))`): `channels` 1 or 2, a single mono or stereo Opus
+    /// stream, written as the Opus extension descriptor's
+    /// `channel_config_code` (DVB extension descriptor `0x7F`, extension tag
+    /// `0x80`, as ffmpeg writes and reads it) after the registration. With
+    /// none, GStreamer's `tsdemux` refuses the stream ("Opus, but no
+    /// extension descriptor") and ffmpeg takes any Opus for stereo. A change
+    /// after PAT/PMT went out bumps the PMT version and makes the next mux
+    /// call re-emit them at once, as [`Self::change_has_audio`] does.
+    /// Returns whether anything changed.
+    pub fn change_opus_channels(&mut self, channels: u8) -> bool {
+        let code = Some(channels.clamp(1, 2));
+        if self.opus_channel_config == code {
+            return false;
+        }
+        self.opus_channel_config = code;
+        if self.pat_pmt_sent && self.has_audio {
+            self.pmt_version = (self.pmt_version + 1) & 0x1F;
+            self.psi_due = true;
+        }
+        true
+    }
+
+    /// The timeline breaks at the next PCR — a new WebRTC publisher onto
+    /// the same TS, timed afresh: that PCR carries `discontinuity_indicator`
+    /// (ISO/IEC 13818-1 §2.4.3.5), and no filler PCRs bridge the step to it
+    /// (they would go out at once, a burst of values the wall clock never
+    /// ran through). Nothing before the muxer's first PCR.
+    pub fn mark_discontinuity(&mut self) {
+        self.pcr_discontinuity_pending = self.last_pcr_90khz.is_some();
+    }
+
     /// Advertise a raw SCTE-35 section stream (`stream_type 0x86`) in the PMT.
     // Wired only into the SDI VANC SCTE-35 extraction path (`engine::sdi_io`,
     // `#[cfg(feature = "sdi-decklink")]`) + unit tests.
@@ -591,6 +633,7 @@ impl TsMuxer {
         let pcr = if self.pcr_start_hold { 0 } else { ts.wrapping_sub(PCR_LEAD_90K) & MASK_33 };
         if let Some(last) = self.last_pcr_90khz
             && !self.pcr_fillers_clocked
+            && !self.pcr_discontinuity_pending
         {
             let gap = pcr.wrapping_sub(last) & MASK_33;
             for off in pcr_filler_offsets(gap, fill_after) {
@@ -732,7 +775,8 @@ impl TsMuxer {
     /// Callers must have previously configured the muxer via
     /// `set_audio_stream(0x06, Some(*b"Opus"))` so the PMT advertises
     /// stream_type 0x06 with the mandatory "Opus" registration
-    /// descriptor. `stream_id = 0xBD` (private_stream_1) per the carriage
+    /// descriptor, and via [`Self::change_opus_channels`] so it carries the
+    /// channel count. `stream_id = 0xBD` (private_stream_1) per the carriage
     /// spec.
     pub fn mux_audio_opus(&mut self, opus_packet: &[u8], pts_90khz: u64) -> Vec<Bytes> {
         let pts_90khz = self.clamp_audio_pts(pts_90khz);
@@ -828,6 +872,9 @@ impl TsMuxer {
                 let mut af_flags = 0x10u8; // PCR present
                 if is_first && is_random_access_point {
                     af_flags |= 0x40; // random_access_indicator
+                }
+                if std::mem::take(&mut self.pcr_discontinuity_pending) {
+                    af_flags |= 0x80; // discontinuity_indicator
                 }
                 pkt[pos] = af_flags;
                 pos += 1;
@@ -973,12 +1020,13 @@ impl TsMuxer {
         pkt[pmt_start] = 0x02; // table_id = 2 (PMT)
 
         // Per-ES descriptor sizes (registration descriptor is 6 bytes:
-        // tag(1) + len(1) + format_identifier(4)).
-        let audio_desc_len = if self.audio_registration.is_some() {
-            6
-        } else {
-            0
-        };
+        // tag(1) + len(1) + format_identifier(4); the Opus extension
+        // descriptor 4: tag(1) + len(1) + extension tag(1) + code(1)).
+        let opus_ext = self
+            .opus_channel_config
+            .filter(|_| self.audio_registration == Some(*b"Opus"));
+        let audio_desc_len = if self.audio_registration.is_some() { 6 } else { 0 }
+            + if opus_ext.is_some() { 4 } else { 0 };
         // 5 bytes per stream entry header + per-stream descriptor bytes.
         let streams_len = (if self.has_video { 5 } else { 0 })
             + (if self.has_audio {
@@ -1060,6 +1108,13 @@ impl TsMuxer {
                 pkt[pos + 4] = reg[2];
                 pkt[pos + 5] = reg[3];
                 pos += 6;
+            }
+            if let Some(code) = opus_ext {
+                pkt[pos] = 0x7F; // descriptor_tag = extension_descriptor
+                pkt[pos + 1] = 0x02; // descriptor_length
+                pkt[pos + 2] = 0x80; // descriptor_tag_extension: Opus (provisional)
+                pkt[pos + 3] = code; // channel_config_code
+                pos += 4;
             }
         }
 
@@ -1329,6 +1384,69 @@ mod tests {
     /// This test pumps a deliberately non-monotonic sequence through
     /// `clamp_audio_pts` and asserts every clamped value is strictly
     /// greater than the previous one.
+    /// An Opus PMT entry carries the channel count beside the "Opus"
+    /// registration: the Opus extension descriptor (`7F 02 80 code`), as
+    /// ffmpeg writes it — every reader here still takes it for one mono or
+    /// stereo Opus stream. It carried the registration alone, so GStreamer's
+    /// `tsdemux` linked no audio pad and ffmpeg read a mono publish as
+    /// stereo. A change once the PMT is out bumps its version.
+    #[test]
+    fn an_opus_pmt_entry_carries_its_channel_count() {
+        use crate::engine::ts_parse::{descriptor_audio_kind, opus_channel_config_code, PrivateEsAudioKind};
+        let mut muxer = TsMuxer::new();
+        muxer.set_has_video(false);
+        muxer.set_has_audio(true);
+        muxer.set_audio_stream(0x06, Some(*b"Opus"));
+        assert!(muxer.change_opus_channels(1));
+        assert!(!muxer.change_opus_channels(1), "no change");
+        let es_info = |pmt: &[u8]| -> Vec<u8> {
+            let es = 5 + 12;
+            let len = ((pmt[es + 3] & 0x0F) as usize) << 8 | pmt[es + 4] as usize;
+            pmt[es + 5..es + 5 + len].to_vec()
+        };
+        let mono = muxer.maybe_emit_pat_pmt(true).pop().expect("a PMT");
+        assert_eq!(es_info(&mono), [0x05, 0x04, b'O', b'p', b'u', b's', 0x7F, 0x02, 0x80, 0x01]);
+        assert_eq!(opus_channel_config_code(&es_info(&mono)), Some(1));
+        assert_eq!(descriptor_audio_kind(&es_info(&mono)), Some(PrivateEsAudioKind::Opus));
+        assert!(crate::engine::webrtc::opus_passthrough::carries(Some(1)));
+        let crc = crate::engine::ts_parse::mpeg2_crc32(&mono[5..5 + 3 + 9 + 5 + 10]);
+        assert_eq!(&mono[5 + 3 + 9 + 5 + 10..5 + 3 + 9 + 5 + 14], crc.to_be_bytes());
+
+        assert!(muxer.change_opus_channels(2));
+        let stereo = muxer.maybe_emit_pat_pmt(false).pop().expect("re-emitted at once");
+        assert_eq!(opus_channel_config_code(&es_info(&stereo)), Some(2));
+        assert_eq!((stereo[10] >> 1) & 0x1F, ((mono[10] >> 1) & 0x1F) + 1, "version bumped");
+    }
+
+    /// `mark_discontinuity` puts `discontinuity_indicator` on the next PCR
+    /// and bridges nothing to it: the filler PCRs a 600 ms step would get go
+    /// out at once, values the wall clock never ran through. A muxer that
+    /// has sent no PCR yet marks nothing.
+    #[test]
+    fn a_marked_discontinuity_flags_the_next_pcr_alone() {
+        use crate::engine::ts_parse::{extract_pcr, ts_discontinuity_indicator};
+        let mut muxer = TsMuxer::new();
+        muxer.mark_discontinuity();
+        let mut ts = muxer.mux_video(&[0, 0, 0, 1, 0x65, 0x88], PCR_LEAD_90K, PCR_LEAD_90K, true);
+        ts.extend(muxer.mux_video(&[0, 0, 0, 1, 0x41, 0x9a], PCR_LEAD_90K + 3_600, PCR_LEAD_90K + 3_600, false));
+        let unmarked = ts.len();
+        muxer.mark_discontinuity();
+        let at = PCR_LEAD_90K + 3_600 + 54_000;
+        ts.extend(muxer.mux_video(&[0, 0, 0, 1, 0x41, 0x9a], at, at, false));
+        ts.extend(muxer.mux_video(&[0, 0, 0, 1, 0x41, 0x9a], at + 3_600, at + 3_600, false));
+        let pcrs: Vec<(usize, u64, bool)> = ts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| extract_pcr(p).map(|pcr| (i, pcr / 300, ts_discontinuity_indicator(p))))
+            .collect();
+        assert_eq!(
+            pcrs.iter().map(|&(_, pcr, di)| (pcr, di)).collect::<Vec<_>>(),
+            [(0, false), (3_600, false), (3_600 + 54_000, true), (3_600 + 57_600, false)],
+            "no fillers across the marked step"
+        );
+        assert!(pcrs[2].0 >= unmarked);
+    }
+
     #[test]
     fn clamp_audio_pts_is_strictly_monotonic_under_regression() {
         let mut muxer = TsMuxer::new();
