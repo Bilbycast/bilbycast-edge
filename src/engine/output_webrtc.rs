@@ -2042,8 +2042,48 @@ async fn whep_viewer_loop(
     events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP viewer disconnected", flow_id);
 }
 
-/// Leave a WHIP session the output will not publish on: DELETE its
-/// `resource` (when there is one to delete) and wait out `backoff_secs`.
+/// How long the WHIP output waits for an endpoint to answer the DELETE that
+/// ends a session ([`whip_release`]). A live endpoint answers in a few round
+/// trips; this bounds what a dead one costs. It is waited out inside the
+/// output's task, so a stopping flow and a node shutting down wait for it —
+/// within the 5 s a stopping flow gives each output task
+/// (`FlowRuntime::stop`, `remove_output`), with room left for the rest of
+/// the task's teardown.
+#[cfg(feature = "webrtc")]
+const WHIP_DELETE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// End the WHIP session at `resource` (when there is one): DELETE it (RFC
+/// 9725 §4.2), waiting up to [`WHIP_DELETE_BOUND`] for the answer. Best
+/// effort — a failure is a log line. Awaited rather than spawned, and never
+/// cut short by the output's cancel: a spawned DELETE does not outlive a
+/// process shutting down (it leaves through `_exit` once the flows have
+/// stopped), and the output used to send none at all when it stopped, so an
+/// endpoint kept the dead session until its ICE timed out (the relay's
+/// ingest, about 15 s after a node restart).
+#[cfg(feature = "webrtc")]
+async fn whip_release(
+    resource: Option<&str>,
+    config: &WebrtcOutputConfig,
+    tls: &crate::util::tls::TlsTrust,
+) {
+    let Some(resource) = resource else {
+        return;
+    };
+    let delete = super::webrtc::signaling::delete_session(resource, config.bearer_token.as_deref(), tls);
+    match tokio::time::timeout(WHIP_DELETE_BOUND, delete).await {
+        Ok(Ok(())) => tracing::debug!("WHIP client '{}': released {}", config.id, resource),
+        Ok(Err(e)) => tracing::warn!("WHIP client '{}': DELETE {} failed: {}", config.id, resource, e),
+        Err(_) => tracing::warn!(
+            "WHIP client '{}': DELETE {} unanswered after {} s; left to the endpoint's own timeout",
+            config.id,
+            resource,
+            WHIP_DELETE_BOUND.as_secs(),
+        ),
+    }
+}
+
+/// Leave a WHIP session the output will not publish on, or that has ended:
+/// DELETE its `resource` ([`whip_release`]) and wait out `backoff_secs`.
 /// `false` when `cancel` fired meanwhile — the output is stopping.
 #[cfg(feature = "webrtc")]
 async fn whip_leave_and_back_off(
@@ -2053,16 +2093,7 @@ async fn whip_leave_and_back_off(
     backoff_secs: u64,
     cancel: &CancellationToken,
 ) -> bool {
-    if let Some(resource) = resource {
-        tokio::select! {
-            _ = cancel.cancelled() => return false,
-            r = super::webrtc::signaling::delete_session(resource, config.bearer_token.as_deref(), tls) => {
-                if let Err(e) = r {
-                    tracing::warn!("WHIP client '{}': DELETE {} failed: {}", config.id, resource, e);
-                }
-            }
-        }
-    }
+    whip_release(resource, config, tls).await;
     tokio::select! {
         _ = cancel.cancelled() => false,
         _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => true,
@@ -2195,9 +2226,9 @@ async fn whip_client_loop(
             report_negotiation_panic(&e, events, flow_id, "WHIP endpoint");
             // Back off before retrying — a bare `continue` here spins the
             // session/offer/POST loop with no delay on a persistent SDP fault.
-            tokio::select! {
-                _ = cancel.cancelled() => break 'outer,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            // The endpoint made a resource for the offer: it goes too.
+            if !whip_leave_and_back_off(resource_url.as_deref(), &config, &tls, backoff_secs, &cancel).await {
+                break 'outer;
             }
             backoff_secs = (backoff_secs * 2).min(30);
             continue;
@@ -2252,6 +2283,7 @@ async fn whip_client_loop(
                 }
                 SessionEvent::Disconnected => {
                     if cancel.is_cancelled() {
+                        whip_release(resource_url.as_deref(), &config, &tls).await;
                         break 'outer;
                     }
                     // ICE or DTLS failed. The session is left — its resource
@@ -2369,8 +2401,9 @@ async fn whip_client_loop(
                 // A floor under the republish, doubling from one session to
                 // the next unless one lasted: an endpoint that closes each
                 // session as it opens would otherwise be published to in a
-                // tight loop.
-                if !whip_leave_and_back_off(None, &config, &tls, backoff_secs, &cancel).await {
+                // tight loop. The session is DELETEd first, in case the
+                // endpoint still holds it.
+                if !whip_leave_and_back_off(resource_url.as_deref(), &config, &tls, backoff_secs, &cancel).await {
                     break 'outer;
                 }
                 backoff_secs = (backoff_secs * 2).min(30);
@@ -2383,7 +2416,14 @@ async fn whip_client_loop(
                 }
             };
             tokio::select! {
-                _ = cancel.cancelled() => break 'outer,
+                // The output is stopping (flow stop, output removal, node
+                // shutdown): its session is ended with a DELETE before the
+                // task returns. It used to break out without one, and the
+                // endpoint held the session until its ICE timed out.
+                _ = cancel.cancelled() => {
+                    whip_release(resource_url.as_deref(), &config, &tls).await;
+                    break 'outer;
+                }
 
                 _ = idle.tick() => {
                     session.drive_udp_io().await;
@@ -2723,7 +2763,10 @@ async fn whip_client_loop(
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
                         }
-                        Err(broadcast::error::RecvError::Closed) => break 'outer,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            whip_release(resource_url.as_deref(), &config, &tls).await;
+                            break 'outer;
+                        }
                     }
                 }
             }
@@ -5359,6 +5402,11 @@ mod whip_client_tests {
         /// Connects, then closes the session (DTLS close_notify), as a
         /// server dropping its publisher does.
         ClosesOnConnect,
+        /// Connects and keeps the session.
+        Keeps,
+        /// Connects and keeps the session, and never answers a DELETE (its
+        /// handler notes the request, then hangs): a dead endpoint.
+        KeepsAndHangsOnDelete,
     }
 
     /// A WHIP endpoint on loopback answering every publish with a real
@@ -5439,6 +5487,9 @@ mod whip_client_tests {
                     let deleted = deleted.clone();
                     move |Path(resource): Path<String>| async move {
                         deleted.lock().unwrap().push(resource);
+                        if let Endpoint::KeepsAndHangsOnDelete = mode {
+                            std::future::pending::<()>().await;
+                        }
                         StatusCode::OK
                     }
                 }),
@@ -5579,5 +5630,82 @@ mod whip_client_tests {
             lost += usize::from(ev.message == "WHIP client disconnected");
         }
         assert!(lost >= 3, "{lost} sessions lost: not the connected path");
+    }
+
+    /// Wait for the output's session to connect: its "WHIP session
+    /// established" event.
+    async fn established(raised: &mut tokio::sync::mpsc::Receiver<crate::manager::events::Event>) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = raised.recv().await {
+                if ev.message == "WHIP session established" {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the session connected");
+    }
+
+    /// An output stopping while it publishes — a flow stop, the output's
+    /// removal, a node shutting down: its cancel — ends its session with a
+    /// DELETE, and has sent it by the time its task returns, which is what
+    /// a stopping flow and a shutdown wait for. It used to stop without one,
+    /// and the endpoint (the relay's WHIP ingest) held the dead session
+    /// until its ICE timed out, ~15 s later.
+    #[tokio::test]
+    async fn a_stopping_output_deletes_its_session_before_it_returns() {
+        let (addr, posts, deleted, server) = webrtc_endpoint(Endpoint::Keeps).await;
+        let (_source, cancel, mut raised, task) = whip_output(addr);
+        established(&mut raised).await;
+        assert!(deleted.lock().unwrap().is_empty(), "nothing deleted while publishing");
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the output stopped")
+            .unwrap();
+        assert_eq!(*deleted.lock().unwrap(), ["res-0"], "deleted before the task returned");
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// The same when the flow's channel closes under the output.
+    #[tokio::test]
+    async fn an_output_whose_source_closes_deletes_its_session() {
+        let (addr, _posts, deleted, server) = webrtc_endpoint(Endpoint::Keeps).await;
+        let (source, _cancel, mut raised, task) = whip_output(addr);
+        established(&mut raised).await;
+
+        drop(source);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the output stopped")
+            .unwrap();
+        assert_eq!(*deleted.lock().unwrap(), ["res-0"]);
+        server.abort();
+    }
+
+    /// An endpoint that never answers the DELETE holds the stop no longer
+    /// than `WHIP_DELETE_BOUND`: a dead server must not stall a flow stop or
+    /// a node shutdown (a stopping flow gives each output task 5 s).
+    #[tokio::test]
+    async fn an_unanswered_delete_holds_the_stop_only_to_its_bound() {
+        let (addr, _posts, deleted, server) = webrtc_endpoint(Endpoint::KeepsAndHangsOnDelete).await;
+        let (_source, cancel, mut raised, task) = whip_output(addr);
+        established(&mut raised).await;
+
+        let stopping = std::time::Instant::now();
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the output stopped")
+            .unwrap();
+        let took = stopping.elapsed();
+        assert_eq!(*deleted.lock().unwrap(), ["res-0"], "the DELETE was sent");
+        assert!(
+            took >= WHIP_DELETE_BOUND && took < WHIP_DELETE_BOUND + std::time::Duration::from_secs(1),
+            "stopped after {took:?}"
+        );
+        server.abort();
     }
 }
