@@ -272,6 +272,151 @@ fn send_pt<'a>(kind: MediaKind, params: impl Iterator<Item = &'a PayloadParams>)
     mode_0
 }
 
+/// An H.264 profile, told apart as RFC 6184 §8.1 (Table 5) tells them: by
+/// `profile_idc` and the constraint flags (`profile-iop`). Only those a
+/// WebRTC peer negotiates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum H264Profile {
+    ConstrainedBaseline,
+    Baseline,
+    Main,
+    High,
+    ConstrainedHigh,
+}
+
+impl H264Profile {
+    /// The profile an SDP `profile-level-id` names by its first two bytes,
+    /// matched as libwebrtc matches them (RFC 6184 Table 5, the low four
+    /// constraint bits zero); `None` for any other (Extended, High 10, ...).
+    fn of_profile_level_id(profile_idc: u8, iop: u8) -> Option<Self> {
+        // `iop` against a pattern: the bits `mask` covers equal `bits`.
+        let is = |mask: u8, bits: u8| iop & mask == bits;
+        match profile_idc {
+            0x42 if is(0x4F, 0x40) => Some(Self::ConstrainedBaseline), // x1xx0000
+            0x4D if is(0x8F, 0x80) => Some(Self::ConstrainedBaseline), // 1xxx0000
+            0x58 if is(0xCF, 0xC0) => Some(Self::ConstrainedBaseline), // 11xx0000
+            0x42 if is(0x4F, 0x00) => Some(Self::Baseline),            // x0xx0000
+            0x58 if is(0xCF, 0x80) => Some(Self::Baseline),            // 10xx0000
+            0x4D if is(0xAF, 0x00) => Some(Self::Main),                // 0x0x0000
+            0x64 if iop == 0x00 => Some(Self::High),
+            0x64 if iop == 0x0C => Some(Self::ConstrainedHigh),
+            _ => None,
+        }
+    }
+
+    /// The profile of a stream whose SPS reads `profile_idc` and constraint
+    /// flags `iop`. As [`Self::of_profile_level_id`], save that an SPS may
+    /// set `constraint_set4_flag` / `constraint_set5_flag` (frame MBs only,
+    /// no B slices): they narrow the stream within its profile, so only
+    /// both together on High — Constrained High — count.
+    fn of_sps(profile_idc: u8, iop: u8) -> Option<Self> {
+        if profile_idc == 0x64 && iop & 0xFC == 0x0C {
+            return Some(Self::ConstrainedHigh);
+        }
+        Self::of_profile_level_id(profile_idc, iop & 0xF0)
+    }
+
+    /// The profiles whose decoders decode a stream of this one, its own
+    /// first (H.264 Annex A.2): a Constrained Baseline stream conforms to
+    /// Baseline and Main too, and High decoders decode Main and Constrained
+    /// Baseline; a Baseline stream may use what Main and High have not
+    /// (FMO, ASO, redundant slices).
+    fn decoded_by(self) -> &'static [Self] {
+        match self {
+            Self::ConstrainedBaseline => &[Self::ConstrainedBaseline, Self::Baseline, Self::Main, Self::High],
+            Self::Baseline => &[Self::Baseline],
+            Self::Main => &[Self::Main, Self::High],
+            Self::High => &[Self::High],
+            Self::ConstrainedHigh => &[Self::ConstrainedHigh, Self::High],
+        }
+    }
+}
+
+/// `profile_idc` and the constraint flags of the SPS in `au`, an Annex-B
+/// H.264 access unit, looked for up to its first slice (an SPS comes ahead
+/// of the slices it applies to); `None` when there is none.
+fn h264_sps_profile(au: &[u8]) -> Option<(u8, u8)> {
+    let mut zeros = 0;
+    for (i, &b) in au.iter().enumerate() {
+        match b {
+            0 => zeros += 1,
+            1 if zeros >= 2 => {
+                zeros = 0;
+                let nal = &au[i + 1..];
+                match nal.first().map(|h| h & 0x1f) {
+                    // profile_idc and the constraint byte come before any
+                    // byte an emulation-prevention 0x03 could precede.
+                    Some(7) if nal.len() >= 3 => return Some((nal[1], nal[2])),
+                    Some(1..=5) => return None,
+                    _ => {}
+                }
+            }
+            _ => zeros = 0,
+        }
+    }
+    None
+}
+
+/// The payload type an H.264 stream whose SPS reads `profile_idc` / `iop`
+/// ([`h264_sps_profile`]) goes out on, from the payload params its m-line
+/// negotiated: the first packetization-mode=1 PT of the stream's own
+/// profile, else of a profile whose decoders decode it
+/// ([`H264Profile::decoded_by`] — a Main stream on a High PT, a Constrained
+/// Baseline one on any). Level is not compared: `level-asymmetry-allowed`
+/// lets each direction run at its own level, and every entry of
+/// [`H264_LEVEL_5_1`] carries it.
+///
+/// When the peer accepted no profile that decodes the stream — a High one
+/// to a peer offering Baseline and Main only (Chrome 124 offers no High), a
+/// High 10 or 4:2:2 one to anyone — the fallback is the PT of the most
+/// capable profile it did accept, in [`H264_FALLBACK_ORDER`]: the one
+/// likeliest to decode it, as nothing it accepted is sure to and there is
+/// nothing else to send (`video_encode` is the cure). `None` only when it
+/// accepted no packetization-mode=1 PT of a profile named here: the caller
+/// then keeps [`send_pt`]'s (a mode-0 PT).
+///
+/// [`send_pt`] alone took the first mode-1 PT whatever the stream: an x264
+/// Main stream went out to Chrome on its Baseline PT (offered `42001f`)
+/// with its Main PT (`4d001f`) negotiated beside it.
+///
+/// bilbycast-relay chooses with this same code (`distribution::webrtc::
+/// session`), and the tests here carry every case of its tests: change one,
+/// change both.
+fn h264_pt_for_sps<'a>(
+    params: impl Iterator<Item = &'a PayloadParams>,
+    profile_idc: u8,
+    iop: u8,
+) -> Option<Pt> {
+    let accepted: Vec<(H264Profile, Pt)> = params
+        .filter_map(|p| {
+            let spec = p.spec();
+            if spec.codec != Codec::H264 || spec.format.packetization_mode != Some(1) {
+                return None;
+            }
+            // RFC 6184 §8.1: an absent profile-level-id means Baseline
+            // (level 1, which is not compared).
+            let plid = spec.format.profile_level_id.unwrap_or(0x42_00_0a);
+            let profile = H264Profile::of_profile_level_id((plid >> 16) as u8, (plid >> 8) as u8)?;
+            Some((profile, p.pt()))
+        })
+        .collect();
+    let decoded_by = H264Profile::of_sps(profile_idc, iop).map_or(&[][..], H264Profile::decoded_by);
+    decoded_by
+        .iter()
+        .chain(H264_FALLBACK_ORDER)
+        .find_map(|want| accepted.iter().find(|(have, _)| have == want).map(|&(_, pt)| pt))
+}
+
+/// The profiles [`h264_pt_for_sps`] falls back on, most capable first, for a
+/// stream no accepted profile decodes.
+const H264_FALLBACK_ORDER: &[H264Profile] = &[
+    H264Profile::High,
+    H264Profile::ConstrainedHigh,
+    H264Profile::Main,
+    H264Profile::ConstrainedBaseline,
+    H264Profile::Baseline,
+];
+
 /// H.264 `nal_unit_type` of filler data (ITU-T H.264 Table 7-1).
 const H264_FILLER_NAL_TYPE: u8 = 12;
 
@@ -418,6 +563,10 @@ pub struct WebrtcSession {
     /// `drain_outputs` returns no events and `drive_udp_io` only a batch's
     /// first.
     keyframe_requested: bool,
+    /// The H.264 PT the last SPS written on a track chose
+    /// ([`h264_pt_for_sps`]), with the track: `None` beside it when the peer
+    /// accepted no packetization-mode=1 PT. See [`Self::h264_write_pt`].
+    h264_sps_pt: Option<(Mid, Option<Pt>)>,
     buf: Vec<u8>,
 }
 
@@ -487,6 +636,7 @@ impl WebrtcSession {
             ice_disconnected_since: None,
             keyframe_requested: false,
             ice_lite: config.ice_lite,
+            h264_sps_pt: None,
             buf: vec![0u8; 2048],
         })
     }
@@ -619,7 +769,14 @@ impl WebrtcSession {
     /// on the RTP clock it would have had all along.
     ///
     /// An H.264 access unit goes without its filler data NAL units (see
-    /// [`strip_h264_filler`]).
+    /// [`strip_h264_filler`]), on the PT its stream's SPS chose
+    /// ([`Self::h264_write_pt`]) rather than `pt` once one has been seen.
+    ///
+    /// Returns the bytes handed to str0m — after the strip, what goes out
+    /// as RTP payload — or `None` when nothing was: ICE is down, or the
+    /// track has no writer. The send loops count that as sent; they counted
+    /// the access unit as they had it, filler included, so a CBR source's
+    /// output bitrate read its padding too (14 % of a live x264 CBR feed).
     pub fn write_media(
         &mut self,
         mid: Mid,
@@ -627,9 +784,9 @@ impl WebrtcSession {
         wallclock: Instant,
         rtp_time: MediaTime,
         data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<usize>> {
         if self.ice_down() {
-            return Ok(());
+            return Ok(None);
         }
         let h264 = self
             .rtc
@@ -637,15 +794,41 @@ impl WebrtcSession {
             .params()
             .iter()
             .any(|p| p.pt() == pt && p.spec().codec == Codec::H264);
-        let data = if h264 { strip_h264_filler(data) } else { Cow::Borrowed(data) };
-        if let Some(writer) = self.rtc.writer(mid) {
-            // str0m takes `impl Into<Arc<[u8]>>`: building the `Arc` from
-            // the slice is one allocation and one copy, where `to_vec()`
-            // first would pay for both twice.
-            writer.write(pt, wallclock, rtp_time, Arc::<[u8]>::from(&*data))
-                .map_err(|e| anyhow::anyhow!("Write error: {}", e))?;
+        let (data, pt) = if h264 {
+            (strip_h264_filler(data), self.h264_write_pt(mid, pt, data))
+        } else {
+            (Cow::Borrowed(data), pt)
+        };
+        let Some(writer) = self.rtc.writer(mid) else {
+            return Ok(None);
+        };
+        // str0m takes `impl Into<Arc<[u8]>>`: building the `Arc` from the
+        // slice is one allocation and one copy, where `to_vec()` first
+        // would pay for both twice.
+        writer.write(pt, wallclock, rtp_time, Arc::<[u8]>::from(&*data))
+            .map_err(|e| anyhow::anyhow!("Write error: {}", e))?;
+        Ok(Some(data.len()))
+    }
+
+    /// The PT H.264 access unit `au` goes out on, on track `mid`: the PT the
+    /// stream's latest SPS chose ([`h264_pt_for_sps`], judged again at every
+    /// access unit carrying one, so a source that changes profile is
+    /// followed), else `pt`, the caller's ([`Self::get_pt`]) — before the
+    /// first SPS, and when the peer accepted no packetization-mode=1 PT. The
+    /// PT can only be chosen here: the answer is settled before any of the
+    /// stream is seen, and a passed-through stream's SPS comes with it.
+    fn h264_write_pt(&mut self, mid: Mid, pt: Pt, au: &[u8]) -> Pt {
+        if let Some((profile_idc, iop)) = h264_sps_profile(au) {
+            let chosen = self
+                .rtc
+                .writer(mid)
+                .and_then(|w| h264_pt_for_sps(w.payload_params(), profile_idc, iop));
+            self.h264_sps_pt = Some((mid, chosen));
         }
-        Ok(())
+        match self.h264_sps_pt {
+            Some((track, Some(chosen))) if track == mid => chosen,
+            _ => pt,
+        }
     }
 
     /// Drain str0m's pending output queue, sending any queued UDP transmits
@@ -2479,6 +2662,186 @@ mod negotiation_tests {
             assert_eq!(*codec, Codec::H264);
             assert!(ours.contains(k), "{k:?}");
         }
+    }
+
+    // ── The H.264 payload type, by the stream's profile ───────────────
+    //
+    // bilbycast-relay's `distribution::webrtc::session` carries these cases
+    // case for case: the two choices must not diverge.
+
+    /// An offer for one m-line of `kind`, `recvonly` (its PTs binding),
+    /// offering `offered` as `(pt, codec name, fmtp)`.
+    fn offer_sdp(kind: MediaKind, offered: &[(u8, &str, &str)]) -> String {
+        let (m, clock) = match kind {
+            MediaKind::Video => ("video", "90000"),
+            MediaKind::Audio => ("audio", "48000/2"),
+        };
+        let mut sdp = format!(
+            "v=0\r\no=- 1 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\n\
+             m={m} 9 UDP/TLS/RTP/SAVPF {}\r\nc=IN IP4 0.0.0.0\r\n\
+             a=ice-ufrag:pptu\r\na=ice-pwd:payloadtypepasswordpw\r\n\
+             a=fingerprint:sha-256 5B:7E:0A:26:41:91:C4:7F:33:D8:12:6E:A0:5C:B9:E4:08:71:2D:9F:C6:3A:55:EB:10:84:7D:F2:69:0C:A3:1E\r\n\
+             a=setup:actpass\r\na=mid:0\r\na=recvonly\r\na=rtcp-mux\r\n",
+            offered
+                .iter()
+                .map(|o| o.0.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (pt, codec, fmtp) in offered {
+            sdp.push_str(&format!("a=rtpmap:{pt} {codec}/{clock}\r\n"));
+            if !fmtp.is_empty() {
+                sdp.push_str(&format!("a=fmtp:{pt} {fmtp}\r\n"));
+            }
+        }
+        sdp
+    }
+
+    /// The payload params m-line `0` negotiates for [`offer_sdp`]'s offer —
+    /// what `Writer::payload_params` hands `send_pt` and `h264_pt_for_sps`.
+    fn negotiated(kind: MediaKind, offered: &[(u8, &str, &str)]) -> Vec<PayloadParams> {
+        let mut rtc = rtc_config(true).build(Instant::now());
+        rtc.sdp_api()
+            .accept_offer(SdpOffer::from_sdp_string(&offer_sdp(kind, offered)).unwrap())
+            .unwrap();
+        rtc.writer(Mid::from("0")).unwrap().payload_params().cloned().collect()
+    }
+
+    const B_1: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f";
+    const B_0: &str = "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f";
+    const CB_1: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
+    const MAIN_1: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=4d001f";
+    const MAIN_0: &str = "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=4d001f";
+    const HIGH_1: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=64001f";
+
+    /// Streams, by their SPS's `(profile_idc, constraint flags)`.
+    const X264_MAIN: (u8, u8) = (0x4d, 0x40); // constraint_set1, as x264 writes Main
+    const OPENH264_CB: (u8, u8) = (0x42, 0xc0); // constraint_set0 + 1
+    const BASELINE: (u8, u8) = (0x42, 0x80); // constraint_set0 alone
+    const MAIN_AS_CB: (u8, u8) = (0x4d, 0x80); // Main with constraint_set0
+    const HIGH: (u8, u8) = (0x64, 0x00);
+    const HIGH_PROGRESSIVE: (u8, u8) = (0x64, 0x08); // constraint_set4
+    const HIGH_10: (u8, u8) = (0x6e, 0x00);
+
+    /// The PT [`h264_pt_for_sps`] chooses among `params` for a stream.
+    fn chosen(params: &[PayloadParams], (profile_idc, iop): (u8, u8)) -> Option<u8> {
+        h264_pt_for_sps(params.iter(), profile_idc, iop).map(|pt| *pt)
+    }
+
+    /// Each stream goes out on the PT of its own profile when the peer took
+    /// one. [`send_pt`] alone took the first packetization-mode=1 PT: an
+    /// x264 Main stream went out to Chrome on its Baseline PT 102, with its
+    /// Main PT 127 negotiated beside it. A Main SPS with constraint_set0 is
+    /// Constrained Baseline, and a High one with constraint_set4 still High.
+    #[test]
+    fn each_stream_goes_out_on_the_pt_of_its_own_profile() {
+        let params = negotiated(
+            MediaKind::Video,
+            &[
+                (102, "H264", B_1),
+                (104, "H264", B_0),
+                (106, "H264", CB_1),
+                (127, "H264", MAIN_1),
+                (39, "H264", MAIN_0),
+                (100, "H264", HIGH_1),
+            ],
+        );
+        assert_eq!(send_pt(MediaKind::Video, params.iter()), Some(Pt::new_with_value(102)));
+        assert_eq!(chosen(&params, X264_MAIN), Some(127));
+        assert_eq!(chosen(&params, OPENH264_CB), Some(106));
+        assert_eq!(chosen(&params, BASELINE), Some(102));
+        assert_eq!(chosen(&params, MAIN_AS_CB), Some(106));
+        assert_eq!(chosen(&params, HIGH), Some(100));
+        assert_eq!(chosen(&params, HIGH_PROGRESSIVE), Some(100));
+    }
+
+    /// Without a PT of its own profile a stream goes out on one whose
+    /// decoders decode it (Constrained Baseline on Baseline, Main on High),
+    /// and without that on the most capable profile the peer accepted — a
+    /// High stream to Chrome 124, which offers no High, on its Main PT, not
+    /// its Baseline one. A peer that took packetization-mode 0 only is left
+    /// to `send_pt`'s mode-0 PT.
+    #[test]
+    fn a_stream_without_a_pt_of_its_profile_goes_out_on_the_likeliest() {
+        let chrome_124 = negotiated(
+            MediaKind::Video,
+            &[(102, "H264", B_1), (106, "H264", CB_1), (127, "H264", MAIN_1)],
+        );
+        assert_eq!(chosen(&chrome_124, HIGH), Some(127));
+        assert_eq!(chosen(&chrome_124, HIGH_10), Some(127));
+        let b_only = negotiated(MediaKind::Video, &[(102, "H264", B_1)]);
+        assert_eq!(chosen(&b_only, OPENH264_CB), Some(102));
+        let high_only = negotiated(MediaKind::Video, &[(100, "H264", HIGH_1)]);
+        assert_eq!(chosen(&high_only, X264_MAIN), Some(100));
+        let cb_only = negotiated(MediaKind::Video, &[(106, "H264", CB_1)]);
+        assert_eq!(chosen(&cb_only, X264_MAIN), Some(106));
+        let mode_0 = negotiated(MediaKind::Video, &[(104, "H264", B_0), (39, "H264", MAIN_0)]);
+        assert_eq!(chosen(&mode_0, X264_MAIN), None);
+        assert_eq!(send_pt(MediaKind::Video, mode_0.iter()), Some(Pt::new_with_value(104)));
+    }
+
+    const PT_SC: &[u8] = &[0, 0, 0, 1];
+    const PT_SPS_MAIN: &[u8] = &[0x67, 0x4d, 0x40, 0x1f, 0xec];
+    const PT_SPS_CB: &[u8] = &[0x67, 0x42, 0xc0, 0x1f, 0xd9];
+    const PT_PPS: &[u8] = &[0x68, 0xeb, 0xe3, 0xcb];
+    const PT_IDR: &[u8] = &[0x65, 0x88, 0x84, 0x21];
+    const PT_SLICE: &[u8] = &[0x41, 0x9a, 0x0c];
+    const PT_FILLER: &[u8] = &[0x0c, 0xff, 0xff, 0xff, 0xff, 0x80];
+
+    /// The SPS is read up to the access unit's first slice — after an AUD,
+    /// behind a three-byte start code — and only there: one after a slice
+    /// belongs to the next access unit.
+    #[test]
+    fn the_sps_is_read_up_to_the_first_slice() {
+        let aud: &[u8] = &[0x09, 0xf0];
+        assert_eq!(
+            h264_sps_profile(&[PT_SC, aud, PT_SC, PT_SPS_MAIN, PT_SC, PT_PPS, PT_SC, PT_IDR].concat()),
+            Some((0x4d, 0x40))
+        );
+        assert_eq!(h264_sps_profile(&[&[0, 0, 1][..], PT_SPS_CB].concat()), Some((0x42, 0xc0)));
+        assert_eq!(h264_sps_profile(&[PT_SC, PT_SLICE].concat()), None);
+        assert_eq!(h264_sps_profile(&[PT_SC, PT_IDR, PT_SC, PT_SPS_MAIN].concat()), None);
+        assert_eq!(h264_sps_profile(&[PT_SC, &[0x67, 0x4d]].concat()), None, "cut short");
+    }
+
+    /// A session answering [`offer_sdp`]'s Chrome-124-like offer of
+    /// Baseline, Constrained Baseline and Main.
+    async fn answering_chrome_124() -> WebrtcSession {
+        let mut s = server().await;
+        s.accept_offer(&offer_sdp(
+            MediaKind::Video,
+            &[(102, "H264", B_1), (106, "H264", CB_1), (127, "H264", MAIN_1)],
+        ))
+        .unwrap();
+        s
+    }
+
+    /// Each access unit goes out on the PT its stream's latest SPS chose:
+    /// the caller's until the first SPS, the stream's own from it, kept for
+    /// the slices after it, and moved when the source changes profile.
+    #[tokio::test]
+    async fn the_pt_follows_the_streams_sps() {
+        let mut s = answering_chrome_124().await;
+        let (mid, caller) = (Mid::from("0"), Pt::new_with_value(102));
+        let slice = [PT_SC, PT_SLICE].concat();
+        let idr = |sps: &[u8]| [PT_SC, sps, PT_SC, PT_PPS, PT_SC, PT_IDR].concat();
+        assert_eq!(*s.h264_write_pt(mid, caller, &slice), 102, "no SPS yet");
+        assert_eq!(*s.h264_write_pt(mid, caller, &idr(PT_SPS_MAIN)), 127);
+        assert_eq!(*s.h264_write_pt(mid, caller, &slice), 127, "kept");
+        assert_eq!(*s.h264_write_pt(mid, caller, &idr(PT_SPS_CB)), 106, "the source's new profile");
+    }
+
+    /// `write_media` hands str0m an access unit without its filler and says
+    /// how many bytes that was — what the send loops count as sent.
+    #[tokio::test]
+    async fn write_media_says_what_it_handed_str0m() {
+        let mut s = answering_chrome_124().await;
+        let au = [PT_SC, PT_SPS_MAIN, PT_SC, PT_IDR, PT_SC, PT_FILLER].concat();
+        let at = MediaTime::new(0, str0m::media::Frequency::NINETY_KHZ);
+        let handed = s
+            .write_media(Mid::from("0"), Pt::new_with_value(102), Instant::now(), at, &au)
+            .unwrap();
+        assert_eq!(handed, Some(2 * PT_SC.len() + PT_SPS_MAIN.len() + PT_IDR.len()));
     }
 }
 
