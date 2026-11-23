@@ -134,7 +134,7 @@ Enables HTTPS on the API server. The `tls` feature is enabled by default.
 | Field       | Type     | Description                          |
 |-------------|----------|--------------------------------------|
 | `cert_path` | `string` | Path to PEM-encoded TLS certificate  |
-| `key_path`  | `string` | Path to PEM-encoded TLS private key  |
+| `key_path`  | `string` | Path to PEM-encoded TLS private key; its PEM label must match its encoding, or the edge stops at startup (see [api-security.md](api-security.md#tlshttps-setup)) |
 
 ```json
 {

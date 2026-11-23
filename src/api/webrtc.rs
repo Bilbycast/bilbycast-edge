@@ -403,9 +403,10 @@ mod tests {
     }
 
     /// An offer the WHEP output could not answer for its own fault — it does
-    /// not parse, or str0m panics on it — comes back 400 with a short text
-    /// reason, as the relay answers it; one this end failed is still a bare
-    /// 500. Every failure used to be the bare 500, empty-bodied.
+    /// not parse (str0m's parser also refuses one whose RTX PT repairs two
+    /// PTs; str0m up to 0.24 panicked on it instead) — comes back 400 with a
+    /// short text reason, as the relay answers it; one this end failed is
+    /// still a bare 500. Every failure used to be the bare 500, empty-bodied.
     #[tokio::test]
     async fn an_offer_at_fault_is_answered_400_with_its_reason() {
         let config: crate::config::models::WebrtcOutputConfig = serde_json::from_value(serde_json::json!({
@@ -432,7 +433,7 @@ mod tests {
 
         for (offer, reason) in [
             ("v=0\r\nnot an offer\r\n", "SDP parse error"),
-            (RTX_REPAIRING_TWO_PTS, "str0m panicked during SDP offer: Pt locked multiple times"),
+            (RTX_REPAIRING_TWO_PTS, "SDP parse error: the offer is not valid SDP"),
         ] {
             let err = registry.handle_whep_offer("flow-a", offer).await.unwrap_err();
             let resp = offer_failed("WHEP", "flow-a", &err);

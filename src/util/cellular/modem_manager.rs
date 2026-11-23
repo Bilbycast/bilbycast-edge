@@ -300,7 +300,7 @@ fn build_signal(s: &ModemSnapshot) -> Option<CellularSignal> {
 mod dbus {
     use super::*;
     use std::collections::HashMap;
-    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+    use zbus::{OwnedObjectPath, OwnedVariant, Variant};
 
     const MM_DEST: &str = "org.freedesktop.ModemManager1";
     const MM_ROOT: &str = "/org/freedesktop/ModemManager1";
@@ -309,7 +309,7 @@ mod dbus {
     const IFACE_SIGNAL: &str = "org.freedesktop.ModemManager1.Modem.Signal";
 
     type ManagedObjects =
-        HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedValue>>>;
+        HashMap<OwnedObjectPath, HashMap<String, HashMap<String, OwnedVariant>>>;
 
     /// Connect to the system bus. Returns `None` when D-Bus / ModemManager is
     /// absent (containers, non-systemd hosts) — the caller treats that as
@@ -426,7 +426,7 @@ mod dbus {
         let mut candidates: Vec<SignalReads> = Vec::with_capacity(4);
         for tech in ["Nr5g", "Lte", "Umts", "Gsm"] {
             let Ok(dict) = signal
-                .get_property::<HashMap<String, OwnedValue>>(tech)
+                .get_property::<HashMap<String, OwnedVariant>>(tech)
                 .await
             else {
                 continue;
@@ -452,22 +452,22 @@ mod dbus {
         let _ = signal.call::<_, _, ()>("Setup", &(5u32)).await;
     }
 
-    fn dict_f32(d: &HashMap<String, OwnedValue>, key: &str) -> Option<f32> {
+    fn dict_f32(d: &HashMap<String, OwnedVariant>, key: &str) -> Option<f32> {
         d.get(key).and_then(value_to_f64).map(|f| f as f32)
     }
 
     /// Numeric coercion across the variant types ModemManager uses (`d` mostly,
     /// but some firmwares report integers). Version-stable variant match.
-    fn value_to_f64(v: &OwnedValue) -> Option<f64> {
+    fn value_to_f64(v: &OwnedVariant) -> Option<f64> {
         match &**v {
-            Value::F64(x) => Some(*x),
-            Value::I16(x) => Some(*x as f64),
-            Value::U16(x) => Some(*x as f64),
-            Value::I32(x) => Some(*x as f64),
-            Value::U32(x) => Some(*x as f64),
-            Value::I64(x) => Some(*x as f64),
-            Value::U64(x) => Some(*x as f64),
-            Value::U8(x) => Some(*x as f64),
+            Variant::F64(x) => Some(*x),
+            Variant::I16(x) => Some(*x as f64),
+            Variant::U16(x) => Some(*x as f64),
+            Variant::I32(x) => Some(*x as f64),
+            Variant::U32(x) => Some(*x as f64),
+            Variant::I64(x) => Some(*x as f64),
+            Variant::U64(x) => Some(*x as f64),
+            Variant::U8(x) => Some(*x as f64),
             _ => None,
         }
     }

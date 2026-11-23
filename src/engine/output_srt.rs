@@ -5629,7 +5629,9 @@ mod tests {
     /// it gave it: the second caller first got TS the first one never did,
     /// then the PCR jumped over the reconnection gap with no DI, and a
     /// receiving edge stepped its audio PTS by about a second.
-    #[cfg(feature = "media-codecs")]
+    // The MP2 programme is built by libavcodec, and the chain's TS audio
+    // replacer encodes the `aac_lc` target through fdk-aac alone.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     #[tokio::test]
     async fn a_transcoding_listener_output_starts_a_rejoining_caller_on_the_live_programme() {
         use crate::engine::ts_test_fixtures::{

@@ -174,7 +174,21 @@ fn role_name(controlling: bool) -> &'static str {
     }
 }
 
+/// Whether `addr` can reach a peer. Port 0 can't be sent to, and an unspecified
+/// IP (`0.0.0.0`, `::` or `::ffff:0.0.0.0`) is delivered to the local host.
+fn is_valid_peer_addr(addr: SocketAddr) -> bool {
+    addr.port() != 0 && !addr.ip().to_canonical().is_unspecified()
+}
+
 const REMOTE_PEER_REFLEXIVE_TEMP_FOUNDATION: &str = "tmp_prflx";
+
+/// How long a USE-CANDIDATE keeps a pair counted as the controlling agent's
+/// current choice. libWebRTC pings its selected connection at least every
+/// 2.5s ([`kStrongAndStableWritableConnectionPingInterval`][1]) and str0m, by
+/// default, every 3s (`StunTiming::max_rto`).
+///
+/// [1]: https://webrtc.googlesource.com/src/+/66c2e6ecd8/p2p/base/p2p_constants.h#83
+const RECENT_NOMINATION: Duration = Duration::from_secs(6);
 
 /// States the ICE connection can be in.
 ///
@@ -397,8 +411,8 @@ impl IceAgent {
 
     /// Set a new timing advance (Ta) value.
     ///
-    /// Ta specifies the minimum increment of time that has to pass between calls to
-    /// [`IceAgent::handle_timeout`]s (guided via [`IceAgent::poll_timeout`]).
+    /// [`IceAgent::poll_timeout`] uses Ta to pace connectivity checks and queued
+    /// STUN work. ICE-lite may wake sooner to handle a nomination expiry.
     ///
     /// Defaults to 50ms.
     pub fn set_timing_advance(&mut self, duration: Duration) {
@@ -658,6 +672,7 @@ impl IceAgent {
         let local_idx = if let Some((idx, other)) = maybe_redundant {
             if other.discarded() && c.kind() == other.kind() && c.raddr() == other.raddr() {
                 debug!("Re-enable previously discarded local: {:?}", other);
+                other.set_ufrag(&self.local_credentials.ufrag);
                 other.set_discarded(false);
                 idx
             } else {
@@ -723,14 +738,18 @@ impl IceAgent {
 
     /// Adds a remote candidate.
     ///
-    /// Returns `false` if the candidate was not added because it is redundant.
-    /// Adding loopback addresses or multicast/broadcast addresses causes
-    /// an error.
+    /// Candidates with port 0 or an unspecified IP address (`0.0.0.0` or `::`)
+    /// are ignored, since neither can reach the remote peer.
     pub fn add_remote_candidate(&mut self, mut c: Candidate) {
         // This is a a:rtcp-mux-only implementation. The only component
         // we accept is 1 for RTP.
         if c.component_id() != 1 {
             debug!("Reject candidate for component other than 1: {:?}", Pii(&c));
+            return;
+        }
+
+        if !is_valid_peer_addr(c.addr()) {
+            debug!("Reject candidate that can't reach the peer: {:?}", Pii(&c));
             return;
         }
 
@@ -1163,6 +1182,15 @@ impl IceAgent {
     pub fn handle_packet(&mut self, now: Instant, packet: StunPacket) -> bool {
         trace!("Handle receive: {:?}", &packet.message);
 
+        // We can't reply to such an address, nor use it as a peer-reflexive candidate.
+        if !is_valid_peer_addr(packet.source) {
+            debug!(
+                "Drop STUN message from invalid address: {}",
+                Pii(packet.source)
+            );
+            return false;
+        }
+
         // Regardless of whether we have remote_creds at this point, we can
         // at least check the message integrity.
         if !self.accepts_message(&packet.message) {
@@ -1224,7 +1252,7 @@ impl IceAgent {
 
         self.last_now = Some(now);
 
-        self.evaluate_nomination();
+        self.evaluate_nomination(now);
 
         // prune failed candidates.
         let mut any_pruned = false;
@@ -1241,7 +1269,7 @@ impl IceAgent {
             keep
         });
         if any_pruned {
-            self.evaluate_nomination();
+            self.evaluate_nomination(now);
             self.evaluate_state(now);
         }
 
@@ -1337,7 +1365,34 @@ impl IceAgent {
             last_now + Duration::from_secs(3)
         };
 
+        let next = if self.ice_lite && !self.controlling {
+            self.ice_lite_nomination_timeout(last_now)
+                .map_or(next, |expiry| next.min(expiry))
+        } else {
+            next
+        };
         Some(next)
+    }
+
+    fn ice_lite_nomination_timeout(&self, now: Instant) -> Option<Instant> {
+        let last = self.nominated_pair()?.remote_nomination_time()?;
+        let expiry = last + RECENT_NOMINATION;
+        if expiry <= now {
+            return None;
+        }
+
+        // A newer nomination can take over as soon as the current one expires,
+        // even if neither path receives another check before then.
+        self.candidate_pairs
+            .iter()
+            .any(|pair| {
+                pair.is_nominated()
+                    && pair.state() == CheckState::Succeeded
+                    && pair
+                        .remote_nomination_time()
+                        .is_some_and(|time| time > last)
+            })
+            .then_some(expiry)
     }
 
     fn emit_event(&mut self, event: IceAgentEvent) {
@@ -1367,12 +1422,12 @@ impl IceAgent {
     fn stun_server_handle_message(&mut self, now: Instant, packet: &StunPacket) {
         let message = &packet.message;
         // BILBYCAST PATCH (2026-04-09 for is 0.8.0; lost in the 0.9.0 re-vendor,
-        // restored for is 0.11.1 on 2026-10-08): the second half of the PRIORITY
-        // patch in `src/stun.rs`. That hunk lets a Binding Request without
-        // PRIORITY (ffmpeg's WHIP muxer, n8.0 through n8.0.3) past the parser;
-        // without this one the `expect` below panicked on the very same packet,
-        // out through `Rtc::handle_input`, as soon as the request also passed
-        // the integrity check.
+        // restored for is 0.11.1 on 2026-10-08, re-applied for is 0.12.1 on
+        // 2026-11-23): the second half of the PRIORITY patch in `src/stun.rs`.
+        // That hunk lets a Binding Request without PRIORITY (ffmpeg's WHIP muxer,
+        // n8.0 through n8.0.3) past the parser; without this one the `expect`
+        // below panicked on the very same packet, out through `Rtc::handle_input`,
+        // as soon as the request also passed the integrity check.
         //
         // The substitute is the priority RFC 8445 says the request should have
         // carried. §7.1.1: a Binding request's PRIORITY is the §5.1.2 priority
@@ -1631,6 +1686,10 @@ impl IceAgent {
         pair.increase_remote_binding_requests(req.now);
 
         if self.ice_lite && !self.controlling {
+            if req.use_candidate {
+                pair.record_remote_nomination(req.now);
+            }
+
             // ice-lite sends no checks of its own, so this pair can never be
             // promoted by a binding response and stays `Waiting` for its
             // whole life. `has_viable_remote_candidate` therefore never
@@ -1662,7 +1721,7 @@ impl IceAgent {
 
         if self.controlling && pair.state() == CheckState::Succeeded {
             // See if we can nominate something now.
-            self.evaluate_nomination();
+            self.evaluate_nomination(req.now);
         }
 
         let (_, password) = self.stun_credentials(true);
@@ -1940,15 +1999,19 @@ impl IceAgent {
 
         pair.record_binding_response(now, trans_id, valid_idx);
 
-        if self.controlling {
-            self.evaluate_nomination();
-        }
+        // For a controlled agent, a successful check can make a nominated pair valid.
+        self.evaluate_nomination(now);
 
         // State might change when we get a response.
         self.evaluate_state(now);
     }
 
-    fn evaluate_nomination(&mut self) {
+    fn evaluate_nomination(&mut self, now: Instant) {
+        if self.ice_lite && !self.controlling {
+            self.evaluate_ice_lite_nomination(now);
+            return;
+        }
+
         let nominated_pair_priority = self.nominated_pair_priority();
 
         let best_prio = if self.controlling {
@@ -1960,10 +2023,13 @@ impl IceAgent {
                 .max_by_key(|p| p.prio())
         } else {
             // For controlled agents, we pick the best pair from what the controlling
-            // agent has indicated with USE-CANDIDATE stun attribute.
+            // agent has indicated with USE-CANDIDATE stun attribute. RFC 8445 §7.3.1.5
+            // lets us act on a nomination only once the pair is valid, i.e. our own
+            // check on it succeeded, so a pair the peer nominated but we cannot reach
+            // never becomes the send path.
             self.candidate_pairs
                 .iter_mut()
-                .filter(|p| p.is_nominated())
+                .filter(|p| p.is_nominated() && p.state() == CheckState::Succeeded)
                 .max_by_key(|p| p.prio())
         };
 
@@ -1986,13 +2052,62 @@ impl IceAgent {
             let local = best_prio.local_candidate(&self.local_candidates);
             let remote = best_prio.remote_candidate(&self.remote_candidates);
 
-            self.nominated_send = Some(best_prio.id());
-            self.emit_event(IceAgentEvent::NominatedSend {
-                proto: local.proto(),
-                source: local.base(),
-                destination: remote.addr(),
-            })
+            let id = best_prio.id();
+            let (proto, source, destination) = (local.proto(), local.base(), remote.addr());
+            self.set_nominated_send(id, proto, source, destination);
         }
+    }
+
+    fn evaluate_ice_lite_nomination(&mut self, now: Instant) {
+        // libWebRTC sends USE-CANDIDATE on its selected path, including after
+        // switching paths without the ICE restart required by RFC 8445 §8.1.1.
+        // Prefer recent nominations so a new path can take over even while the
+        // peer still probes the old one. Preserve priority among recent pairs
+        // and break ties by recency so a NAT port change can take effect.
+        let rank = |pair: &CandidatePair| {
+            let last = pair.remote_nomination_time();
+            match last {
+                Some(t) if now.saturating_duration_since(t) < RECENT_NOMINATION => {
+                    (true, None, pair.prio(), last)
+                }
+                // Once all nominations are stale, keep favoring the last one.
+                _ => (false, last, pair.prio(), None),
+            }
+        };
+
+        let best = self
+            .candidate_pairs
+            .iter()
+            .filter(|p| p.is_nominated() && p.state() == CheckState::Succeeded)
+            .max_by_key(|p| rank(p));
+        let Some(best) = best else {
+            return;
+        };
+        if self
+            .nominated_pair()
+            .is_some_and(|pair| rank(pair) == rank(best))
+        {
+            return;
+        }
+
+        let local = best.local_candidate(&self.local_candidates);
+        let remote = best.remote_candidate(&self.remote_candidates);
+        self.set_nominated_send(best.id(), local.proto(), local.base(), remote.addr());
+    }
+
+    fn set_nominated_send(
+        &mut self,
+        id: PairId,
+        proto: Protocol,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) {
+        self.nominated_send = Some(id);
+        self.emit_event(IceAgentEvent::NominatedSend {
+            proto,
+            source,
+            destination,
+        });
     }
 
     fn nominated_pair_priority(&self) -> Option<u64> {
@@ -2066,7 +2181,10 @@ impl IceAgent {
         let mut any_still_possible = false;
 
         for p in &self.candidate_pairs {
-            if p.is_nominated() {
+            // A nominated pair counts once it is valid (RFC 8445 §8.1.1), which is
+            // also when `evaluate_nomination` can make it the send path. Until then
+            // it is just another pair being checked.
+            if p.is_nominated() && p.state() == CheckState::Succeeded {
                 any_nomination = true;
             } else if p.is_still_possible(now, &self.timing_config) {
                 any_still_possible = true;
@@ -2219,6 +2337,36 @@ mod test {
         // this is redundant given we have the direct host candidate above.
         let x1 = agent.add_local_candidate(Candidate::test_peer_rflx(ipv4_1(), ipv4_1(), "udp"));
         assert!(x1.is_none());
+    }
+
+    #[test]
+    fn re_adding_invalidated_local_candidate_updates_ufrag() {
+        let mut agent = IceAgent::new(IceCreds {
+            ufrag: "generation-a".into(),
+            pass: "password-a".into(),
+        });
+        let host = Candidate::host(ipv4_1(), "udp").unwrap();
+        let mut expected = agent.add_local_candidate(host.clone()).unwrap().clone();
+        assert_eq!(expected.ufrag(), Some("generation-a"));
+
+        agent.add_remote_candidate(Candidate::host(ipv4_2(), "udp").unwrap());
+        assert_eq!(agent.pair_indexes(), [(0, 0)]);
+
+        agent.set_local_credentials(IceCreds {
+            ufrag: "generation-b".into(),
+            pass: "password-b".into(),
+        });
+        assert!(agent.invalidate_candidate(&host));
+        assert_eq!(agent.local_candidates().count(), 0);
+        assert_eq!(agent.pair_indexes(), []);
+
+        expected.set_ufrag("generation-b");
+        let reactivated = agent.add_local_candidate(host).unwrap();
+        assert_eq!(reactivated.ufrag(), Some("generation-b"));
+        assert_eq!(reactivated, &expected);
+        assert_eq!(agent.local_candidates().collect::<Vec<_>>(), [expected]);
+        assert_eq!(agent.local_candidates.len(), 1);
+        assert_eq!(agent.pair_indexes(), [(0, 0)]);
     }
 
     #[test]
@@ -2794,6 +2942,72 @@ mod test {
     }
 
     #[test]
+    fn ignores_remote_candidates_that_cant_reach_the_peer() {
+        for addr in [
+            "3.4.5.6 0",
+            "0.0.0.0 5000",
+            ":: 5000",
+            "::ffff:0.0.0.0 5000",
+        ] {
+            let mut agent = new_test_agent();
+            agent.set_remote_credentials(IceCreds::new());
+            for local in [ipv4_1(), ipv6_1()] {
+                agent
+                    .add_local_candidate(Candidate::host(local, "udp").unwrap())
+                    .unwrap();
+            }
+
+            let sdp = format!("candidate:1 1 udp 2130706431 {addr} typ host");
+            agent.add_remote_candidate(Candidate::from_sdp_string(&sdp).unwrap());
+
+            assert_eq!(agent.remote_candidates().count(), 0, "{addr}");
+            assert_eq!(agent.num_candidate_pairs(), 0, "{addr}");
+            agent.handle_timeout(Instant::now());
+            assert!(agent.poll_transmit().is_none(), "{addr}");
+        }
+    }
+
+    #[test]
+    fn ignores_binding_requests_from_addresses_that_cant_be_replied_to() {
+        for (source, destination) in [
+            ("3.4.5.6:0", ipv4_1()),
+            ("0.0.0.0:5000", ipv4_1()),
+            ("[::]:5000", ipv6_1()),
+            ("[::ffff:0.0.0.0]:5000", ipv6_1()),
+        ] {
+            let mut agent = new_test_agent();
+            for local in [ipv4_1(), ipv6_1()] {
+                agent
+                    .add_local_candidate(Candidate::host(local, "udp").unwrap())
+                    .unwrap();
+            }
+            let remote_creds = IceCreds::new();
+            agent.set_remote_credentials(remote_creds.clone());
+
+            let request = make_serialized_binding_request(
+                &agent.local_credentials,
+                &remote_creds,
+                !agent.controlling(),
+                1,
+            );
+
+            agent.handle_packet(
+                Instant::now(),
+                StunPacket {
+                    proto: Protocol::Udp,
+                    source: source.parse().unwrap(),
+                    destination,
+                    message: StunMessage::parse(&request).unwrap(),
+                },
+            );
+
+            // Neither a peer-reflexive candidate nor a reply.
+            assert_eq!(agent.remote_candidates().count(), 0, "{source}");
+            assert!(agent.poll_transmit().is_none(), "{source}");
+        }
+    }
+
+    #[test]
     pub fn no_disconnect_missing_local_candidates() {
         let mut agent = new_test_agent();
         agent.set_remote_credentials(IceCreds::new().clone());
@@ -2964,6 +3178,382 @@ mod test {
                 .any(|e| matches!(e, IceAgentEvent::NominatedSend { .. })),
             "a single binding request must not choose the send address"
         );
+    }
+
+    #[test]
+    fn controlled_sends_only_on_a_nominated_pair_whose_check_succeeded() {
+        // RFC 8445 §7.3.1.5: the controlled agent acts on USE-CANDIDATE only
+        // for a pair that is, or becomes, valid. Here the peer nominates the
+        // highest-priority pair first, but our checks on it are never
+        // answered (one-way connectivity). It then nominates a lower-priority
+        // pair whose check succeeds. Media must go to the second pair.
+        let mut agent = new_test_agent();
+        agent.set_controlling(false);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+
+        let mut dead =
+            Candidate::from_sdp_string("candidate:1 1 udp 2130706431 3.4.5.6 5000 typ host")
+                .unwrap();
+        dead.set_ufrag(&remote_creds.ufrag);
+        let mut alive =
+            Candidate::from_sdp_string("candidate:2 1 udp 1694498815 4.5.6.7 5000 typ host")
+                .unwrap();
+        alive.set_ufrag(&remote_creds.ufrag);
+        let (dead_prio, alive_prio) = (dead.prio(), alive.prio());
+        assert!(dead_prio > alive_prio);
+        agent.add_remote_candidate(dead);
+        agent.add_remote_candidate(alive);
+
+        let nominate = |agent: &mut IceAgent, now: Instant, source: SocketAddr, prio: u32| {
+            let username = format!("{}:{}", agent.local_credentials.ufrag, remote_creds.ufrag);
+            let req = StunMessage::binding_request(&username, TransId::new(), true, 0, prio, true);
+            let req = serialize_stun_msg(req, &agent.local_credentials.pass);
+            assert!(agent.handle_packet(
+                now,
+                StunPacket {
+                    message: StunMessage::parse(&req).unwrap(),
+                    source,
+                    destination: ipv4_1(),
+                    proto: Protocol::Udp,
+                },
+            ));
+        };
+
+        // Answer our checks toward `alive` only; drop everything else.
+        let answer_alive = |agent: &mut IceAgent, now: Instant| {
+            let mut replies = vec![];
+            while let Some(t) = agent.poll_transmit() {
+                let msg = StunMessage::parse(&t.contents).unwrap();
+                if t.destination == ipv4_4() && msg.is_binding_request() {
+                    replies.push(make_authenticated_stun_reply(
+                        msg.trans_id(),
+                        ipv4_1(),
+                        &remote_creds.pass,
+                    ));
+                }
+            }
+            for reply in replies {
+                agent.handle_packet(
+                    now,
+                    StunPacket {
+                        message: StunMessage::parse(&reply).unwrap(),
+                        source: ipv4_4(),
+                        destination: ipv4_1(),
+                        proto: Protocol::Udp,
+                    },
+                );
+            }
+        };
+
+        let nominated_sends = |agent: &mut IceAgent| {
+            let mut v = vec![];
+            while let Some(e) = agent.poll_event() {
+                if let IceAgentEvent::NominatedSend { destination, .. } = e {
+                    v.push(destination);
+                }
+            }
+            v
+        };
+
+        let mut now = Instant::now();
+        agent.handle_timeout(now);
+
+        nominate(&mut agent, now, ipv4_3(), dead_prio);
+        for _ in 0..20 {
+            answer_alive(&mut agent, now);
+            now += Duration::from_millis(50);
+            agent.handle_timeout(now);
+        }
+        assert_eq!(
+            nominated_sends(&mut agent),
+            vec![],
+            "a nominated pair whose check has not succeeded must not be used"
+        );
+
+        nominate(&mut agent, now, ipv4_4(), alive_prio);
+        for _ in 0..20 {
+            answer_alive(&mut agent, now);
+            now += Duration::from_millis(50);
+            agent.handle_timeout(now);
+        }
+        assert_eq!(nominated_sends(&mut agent), vec![ipv4_4()]);
+    }
+
+    #[test]
+    fn ice_lite_controlled_follows_nomination_to_a_rebound_nat_port() {
+        // The controlling peer sits behind a NAT that re-maps its UDP port
+        // mid-session. The peer's own candidate is unchanged, so its checks
+        // arrive from the new port with the same PRIORITY and USE-CANDIDATE,
+        // and our replies follow them there. The NAT drops anything sent to
+        // the old port, so every packet sent there after the peer has
+        // nominated the new port is lost.
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent.set_controlling(false);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let remote_creds = IceCreds::new();
+        agent.set_remote_credentials(remote_creds.clone());
+
+        let old_port: SocketAddr = "3.4.5.6:40000".parse().unwrap();
+        let new_port: SocketAddr = "3.4.5.6:40001".parse().unwrap();
+        let prio = 1_862_270_975;
+        // libWebRTC's `kStrongAndStableWritableConnectionPingInterval`.
+        let check_interval = Duration::from_millis(2500);
+        let rebind_at = Duration::from_secs(30);
+
+        let check = |agent: &mut IceAgent, now: Instant, source: SocketAddr| {
+            let username = format!("{}:{}", agent.local_credentials.ufrag, remote_creds.ufrag);
+            let req = StunMessage::binding_request(&username, TransId::new(), true, 0, prio, true);
+            let req = serialize_stun_msg(req, &agent.local_credentials.pass);
+            assert!(agent.handle_packet(
+                now,
+                StunPacket {
+                    message: StunMessage::parse(&req).unwrap(),
+                    source,
+                    destination: ipv4_1(),
+                    proto: Protocol::Udp,
+                },
+            ));
+            let reply = agent.poll_transmit().unwrap();
+            assert_eq!(reply.destination, source);
+        };
+
+        let start = Instant::now();
+        let mut since_start = Duration::ZERO;
+        let mut next_check = Duration::ZERO;
+        let mut nominated_sends = vec![];
+        while since_start < rebind_at + Duration::from_secs(20) {
+            let now = start + since_start;
+            if since_start >= next_check {
+                let source = if since_start < rebind_at {
+                    old_port
+                } else {
+                    new_port
+                };
+                check(&mut agent, now, source);
+                next_check += check_interval;
+            }
+            agent.handle_timeout(now);
+            while let Some(e) = agent.poll_event() {
+                if let IceAgentEvent::NominatedSend { destination, .. } = e {
+                    nominated_sends.push((since_start, destination));
+                }
+            }
+            since_start += Duration::from_millis(50);
+        }
+
+        assert_eq!(
+            nominated_sends,
+            [(Duration::ZERO, old_port), (rebind_at, new_port)],
+            "media must follow the first check from the new port"
+        );
+    }
+
+    #[test]
+    fn ice_lite_switches_to_relay_when_nominated_host_path_dies_one_way() {
+        // The browser nominates a host pair. At 5s a firewall starts
+        // dropping browser-bound traffic on the host path. The browser keeps
+        // pinging that pair, and its checks still reach us, but without
+        // USE-CANDIDATE once the pair is unwritable. At 7s it selects and
+        // nominates a TURN relay pair. Media must follow to the relay.
+        let (mut agent, peer) = ice_lite_agent_with_host_and_relay();
+
+        let start = Instant::now();
+        let host_dies = start + Duration::from_secs(5);
+        let relay_nominated = start + Duration::from_secs(7);
+        let mut now = start;
+        let mut sending_to = None;
+        agent.handle_timeout(now);
+
+        while now < relay_nominated + Duration::from_secs(4) {
+            if (now - start).as_millis().is_multiple_of(2000) {
+                peer.check(&mut agent, now, ipv4_3(), now < host_dies);
+                if now >= relay_nominated {
+                    peer.check(&mut agent, now, ipv4_4(), true);
+                }
+            }
+
+            agent.handle_timeout(now);
+            while agent.poll_transmit().is_some() {}
+            if let Some(&destination) = nominated_sends(&mut agent).last() {
+                sending_to = Some(destination);
+            }
+
+            if now < relay_nominated {
+                assert_eq!(sending_to, Some(ipv4_3()));
+            }
+
+            now += Duration::from_millis(100);
+        }
+
+        assert_eq!(
+            sending_to,
+            Some(ipv4_4()),
+            "must follow the nomination to the relay, state {:?}",
+            agent.state()
+        );
+    }
+
+    #[test]
+    fn ice_lite_wakes_when_host_nomination_expires() {
+        let (mut agent, peer) = ice_lite_agent_with_host_and_relay();
+        let start = Instant::now();
+
+        peer.check(&mut agent, start, ipv4_3(), true);
+        agent.handle_timeout(start);
+        assert_eq!(nominated_sends(&mut agent), vec![ipv4_3()]);
+        while agent.poll_transmit().is_some() {}
+
+        let relay_nominated = start + Duration::from_secs(5);
+        peer.check(&mut agent, relay_nominated, ipv4_4(), true);
+        agent.handle_timeout(relay_nominated);
+        assert!(nominated_sends(&mut agent).is_empty());
+        while agent.poll_transmit().is_some() {}
+
+        // No further packets arrive until after the old nomination expires.
+        let expires = start + Duration::from_secs(6);
+        let mut now = relay_nominated;
+        while now < expires {
+            let wake = agent.poll_timeout().unwrap();
+            assert!(wake > now);
+            assert!(wake <= expires, "missed the nomination expiry");
+            agent.handle_timeout(wake);
+            now = wake;
+        }
+        assert_eq!(nominated_sends(&mut agent), vec![ipv4_4()]);
+    }
+
+    #[test]
+    fn ice_lite_nomination_expiry_can_wake_before_timing_advance() {
+        let (mut agent, peer) = ice_lite_agent_with_host_and_relay();
+        let start = Instant::now();
+        let timing_advance = Duration::from_millis(50);
+        agent.set_timing_advance(timing_advance);
+
+        peer.check(&mut agent, start, ipv4_3(), true);
+        agent.handle_timeout(start);
+        assert_eq!(nominated_sends(&mut agent), vec![ipv4_3()]);
+
+        let relay_nominated = start + Duration::from_millis(5990);
+        peer.check(&mut agent, relay_nominated, ipv4_4(), true);
+        agent.handle_timeout(relay_nominated);
+        assert!(nominated_sends(&mut agent).is_empty());
+        while agent.poll_transmit().is_some() {}
+
+        let wake = agent.poll_timeout().unwrap();
+        assert_eq!(wake, start + Duration::from_secs(6));
+        assert!(wake < relay_nominated + timing_advance);
+        agent.handle_timeout(wake);
+        assert_eq!(nominated_sends(&mut agent), vec![ipv4_4()]);
+    }
+
+    #[test]
+    fn ice_lite_stays_on_highest_priority_of_repeatedly_nominated_pairs() {
+        // A controlling agent may set USE-CANDIDATE on every check of every
+        // pair it has nominated. That must not make us alternate between
+        // them.
+        let (mut agent, peer) = ice_lite_agent_with_host_and_relay();
+
+        let start = Instant::now();
+        let mut now = start;
+        let mut sends = vec![];
+        agent.handle_timeout(now);
+
+        while now < start + Duration::from_secs(60) {
+            if (now - start).as_millis().is_multiple_of(2000) {
+                peer.check(&mut agent, now, ipv4_4(), true);
+                peer.check(&mut agent, now, ipv4_3(), true);
+            }
+
+            agent.handle_timeout(now);
+            while agent.poll_transmit().is_some() {}
+            sends.extend(nominated_sends(&mut agent));
+
+            now += Duration::from_millis(100);
+        }
+
+        assert_eq!(sends, vec![ipv4_3()]);
+    }
+
+    /// The browser side of a controlled ice-lite agent with a local host
+    /// candidate on `ipv4_1()`, and remote candidates host on `ipv4_3()`
+    /// and TURN relay on `ipv4_4()`.
+    struct ControllingPeer {
+        creds: IceCreds,
+        host_prio: u32,
+        relay_prio: u32,
+    }
+
+    impl ControllingPeer {
+        fn check(&self, agent: &mut IceAgent, now: Instant, source: SocketAddr, nominate: bool) {
+            let prio = if source == ipv4_3() {
+                self.host_prio
+            } else {
+                self.relay_prio
+            };
+            let username = format!("{}:{}", agent.local_credentials.ufrag, self.creds.ufrag);
+            let req =
+                StunMessage::binding_request(&username, TransId::new(), true, 0, prio, nominate);
+            let req = serialize_stun_msg(req, &agent.local_credentials.pass);
+            assert!(agent.handle_packet(
+                now,
+                StunPacket {
+                    message: StunMessage::parse(&req).unwrap(),
+                    source,
+                    destination: ipv4_1(),
+                    proto: Protocol::Udp,
+                },
+            ));
+        }
+    }
+
+    fn ice_lite_agent_with_host_and_relay() -> (IceAgent, ControllingPeer) {
+        let mut agent = new_test_agent();
+        agent.set_ice_lite(true);
+        agent.set_controlling(false);
+        agent
+            .add_local_candidate(Candidate::host(ipv4_1(), "udp").unwrap())
+            .unwrap();
+
+        let creds = IceCreds::new();
+        agent.set_remote_credentials(creds.clone());
+
+        let mut host =
+            Candidate::from_sdp_string("candidate:1 1 udp 2130706431 3.4.5.6 5000 typ host")
+                .unwrap();
+        host.set_ufrag(&creds.ufrag);
+        let mut relay = Candidate::from_sdp_string(
+            "candidate:2 1 udp 41885439 4.5.6.7 5000 typ relay raddr 0.0.0.0 rport 0",
+        )
+        .unwrap();
+        relay.set_ufrag(&creds.ufrag);
+        let peer = ControllingPeer {
+            creds,
+            host_prio: host.prio(),
+            relay_prio: relay.prio(),
+        };
+        agent.add_remote_candidate(host);
+        agent.add_remote_candidate(relay);
+
+        (agent, peer)
+    }
+
+    fn nominated_sends(agent: &mut IceAgent) -> Vec<SocketAddr> {
+        let mut v = vec![];
+        while let Some(e) = agent.poll_event() {
+            if let IceAgentEvent::NominatedSend { destination, .. } = e {
+                v.push(destination);
+            }
+        }
+        v
     }
 
     fn make_serialized_binding_request(

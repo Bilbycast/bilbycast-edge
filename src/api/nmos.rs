@@ -113,6 +113,74 @@ fn nmos_version() -> String {
     format!("{}:{}", now.as_secs(), now.subsec_nanos())
 }
 
+/// The name this node goes by: the IS-04 node resource's `label` and
+/// `hostname`, and the name its NMOS mDNS-SD record's host is made from
+/// (`<name>-bilbycast.local.`, see `api::nmos_mdns`): `choose_hostname`
+/// of `$HOSTNAME`, `$HOST` and the system host name (`gethostname`).
+/// Neither variable reaches a systemd service unless its unit sets it,
+/// which the packaged unit does not, so a packaged edge takes the system
+/// host name. Read once, so every consumer carries the same name for the
+/// life of the process, as the mDNS record (registered once) does.
+pub fn node_hostname() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        choose_hostname(
+            std::env::var("HOSTNAME").ok().as_deref(),
+            std::env::var("HOST").ok().as_deref(),
+            system_hostname().as_deref(),
+        )
+    })
+}
+
+/// The node's name from its sources, in order: the first of `hostname`
+/// (`$HOSTNAME`), `host` (`$HOST`) and `system` (the system host name)
+/// that [`host_label`] makes a label of, else `bilbycast-edge`.
+fn choose_hostname(hostname: Option<&str>, host: Option<&str>, system: Option<&str>) -> String {
+    [hostname, host, system]
+        .into_iter()
+        .flatten()
+        .find_map(host_label)
+        .unwrap_or_else(|| "bilbycast-edge".to_owned())
+}
+
+/// The system host name, from `gethostname(2)`.
+fn system_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is valid for writes of the `buf.len()` bytes passed, and
+    // gethostname writes nothing past them.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    // POSIX leaves a name cut to the buffer unterminated.
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..len].to_vec()).ok()
+}
+
+/// `raw` made one DNS label, as the host of an mDNS record needs: its first
+/// dot-separated part (a fully qualified name's host), with every character
+/// but an ASCII letter, digit or hyphen made a hyphen, a run of hyphens made
+/// one, none leading or trailing, and no more than the 63 bytes a label
+/// holds. `None` when that leaves nothing.
+fn host_label(raw: &str) -> Option<String> {
+    let host = raw.trim().split('.').next().unwrap_or_default();
+    let mut label = String::with_capacity(host.len().min(63));
+    for c in host.chars() {
+        let c = if c.is_ascii_alphanumeric() { c } else { '-' };
+        if c == '-' && (label.is_empty() || label.ends_with('-')) {
+            continue;
+        }
+        if label.len() == 63 {
+            break;
+        }
+        label.push(c);
+    }
+    while label.ends_with('-') {
+        label.pop();
+    }
+    (!label.is_empty()).then_some(label)
+}
+
 fn input_transport(input: &InputConfig) -> &'static str {
     match input {
         InputConfig::Rtp(_) => "urn:x-nmos:transport:rtp",
@@ -490,9 +558,7 @@ async fn node_self(State(state): State<AppState>) -> Json<NmosNode> {
     let config = state.config.read().await;
     let nid = node_uuid(&config);
     let version = nmos_version();
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| "bilbycast-edge".into());
+    let hostname = node_hostname().to_owned();
     let listen = format!(
         "{}:{}",
         config.server.listen_addr, config.server.listen_port
@@ -834,9 +900,7 @@ pub fn build_node_value(
     https: bool,
 ) -> serde_json::Value {
     let nid = node_uuid(config);
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| "bilbycast-edge".into());
+    let hostname = node_hostname();
     let proto = if https { "https" } else { "http" };
     let listen = format!("{listen_host}:{listen_port}");
 
@@ -1082,4 +1146,110 @@ async fn get_receiver(
         }
     }
     Err(StatusCode::NOT_FOUND)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_host_name_is_its_own_label() {
+        assert_eq!(host_label("edge-01").as_deref(), Some("edge-01"));
+        assert_eq!(host_label("Studio7").as_deref(), Some("Studio7"));
+    }
+
+    #[test]
+    fn a_qualified_name_gives_its_host_part() {
+        assert_eq!(host_label("edge01.example.com").as_deref(), Some("edge01"));
+        assert_eq!(host_label("edge01.local").as_deref(), Some("edge01"));
+        assert_eq!(host_label(" edge01 \n").as_deref(), Some("edge01"));
+    }
+
+    #[test]
+    fn other_characters_become_one_hyphen_and_none_lead_or_trail() {
+        assert_eq!(
+            host_label("Studio A_edge").as_deref(),
+            Some("Studio-A-edge")
+        );
+        assert_eq!(host_label("a  __  b").as_deref(), Some("a-b"));
+        assert_eq!(host_label("-_edge_-").as_deref(), Some("edge"));
+        assert_eq!(host_label("régie").as_deref(), Some("r-gie"));
+    }
+
+    #[test]
+    fn a_label_is_cut_to_63_bytes_without_a_trailing_hyphen() {
+        let long = "a".repeat(70);
+        assert_eq!(host_label(&long).map(|l| l.len()), Some(63));
+        let hyphen_at_cut = format!("{}_{}", "b".repeat(62), "c".repeat(10));
+        assert_eq!(host_label(&hyphen_at_cut), Some("b".repeat(62)));
+    }
+
+    #[test]
+    fn nothing_usable_is_no_label() {
+        for raw in ["", "   ", ".", ".example.com", "---", "__", "ÉÈ"] {
+            assert_eq!(host_label(raw), None, "{raw:?}");
+        }
+    }
+
+    /// The kernel's host name, read through `gethostname` whole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_system_hostname_is_the_kernels() {
+        let kernel = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap();
+        assert_eq!(
+            system_hostname().as_deref(),
+            Some(kernel.trim_end_matches('\n'))
+        );
+    }
+
+    /// `$HOSTNAME` answers first, then `$HOST`, then the system host name,
+    /// each only when it makes a label.
+    #[test]
+    fn the_node_name_comes_from_the_first_usable_source_in_order() {
+        let sys = Some("edge03.example.com");
+        assert_eq!(
+            choose_hostname(Some("edge01"), Some("edge02"), sys),
+            "edge01"
+        );
+        assert_eq!(choose_hostname(None, Some("edge02"), sys), "edge02");
+        assert_eq!(choose_hostname(Some("--"), Some("edge02"), sys), "edge02");
+        assert_eq!(choose_hostname(Some("edge01.lan"), None, sys), "edge01");
+    }
+
+    /// Under the packaged systemd unit neither variable is set, so the
+    /// system host name answers — the case 0.117.0 got wrong, falling back
+    /// to `bilbycast-edge`.
+    #[test]
+    fn with_neither_variable_the_system_host_name_answers() {
+        let sys = Some("edge03.example.com");
+        assert_eq!(choose_hostname(None, None, sys), "edge03");
+        assert_eq!(choose_hostname(Some(""), Some(" . "), sys), "edge03");
+    }
+
+    #[test]
+    fn with_no_usable_source_the_name_is_bilbycast_edge() {
+        assert_eq!(choose_hostname(None, None, None), "bilbycast-edge");
+        assert_eq!(
+            choose_hostname(Some("_"), Some(""), Some("ÉÈ")),
+            "bilbycast-edge"
+        );
+    }
+
+    /// `node_hostname` is `choose_hostname` of this process's environment
+    /// and system host name, read once.
+    #[test]
+    fn the_node_hostname_is_chosen_from_this_process() {
+        let name = node_hostname();
+        let env = |key| std::env::var(key).ok();
+        assert_eq!(
+            name,
+            choose_hostname(
+                env("HOSTNAME").as_deref(),
+                env("HOST").as_deref(),
+                system_hostname().as_deref(),
+            )
+        );
+        assert_eq!(host_label(name).as_deref(), Some(name));
+        assert!(std::ptr::eq(name, node_hostname()));
+    }
 }

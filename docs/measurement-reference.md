@@ -94,7 +94,7 @@ for TS-layer loss visibility.
 | Uptime | `health.uptime_secs` (boot-time delta) | Matches | `uptime` | |
 | Active Flows / Tunnels / Alarms | counters off `FlowManager` / `TunnelManager` / driver | Matches | n/a (own data) | Lags by health interval (15 s). |
 | API Address / Monitor Address | from health payload | Matches | n/a | |
-| CPU % | [`engine/resource_monitor.rs:119–136`](../src/engine/resource_monitor.rs) (`sysinfo` crate) | Matches | `htop`, `top` | First sample after start may read 0 % — needs ≥ 2 refreshes for accuracy. |
+| CPU % | [`engine/resource_monitor.rs`](../src/engine/resource_monitor.rs) `resource_monitor_loop` (`sysinfo` crate) | Matches | `htop`, `top` | First sample after start may read 0 % — needs ≥ 2 refreshes for accuracy. |
 | RAM | same | Matches | `free -h`, `vm_stat` | |
 
 ## Per-flow card — Input section

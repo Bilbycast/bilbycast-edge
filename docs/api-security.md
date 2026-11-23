@@ -359,6 +359,21 @@ Add the `tls` block to the `server` section of your config file:
 
 Both paths must be non-empty and point to readable PEM files. The server validates these at startup.
 
+**The private key's PEM label must match its encoding.** The edge takes the key's type from the label: `-----BEGIN PRIVATE KEY-----` is PKCS#8, `-----BEGIN RSA PRIVATE KEY-----` is PKCS#1 RSA, `-----BEGIN EC PRIVATE KEY-----` is SEC1 EC. A key whose label names another encoding (a PKCS#8 key under `BEGIN RSA PRIVATE KEY`, say) does not load, and the edge stops at startup with `Failed to load TLS cert/key`. v0.117.0 read the type from the key itself, so such a file loaded there. Keys OpenSSL writes (`openssl req`, as above, or `openssl genpkey`) carry the right label. To repair one, rewrite it as PKCS#8 under `BEGIN PRIVATE KEY`:
+
+```bash
+openssl pkey -in key.pem -out key-fixed.pem
+```
+
+That reads a PKCS#8 key under any of the three labels, and an RSA or EC key under its own. If it cannot read the key, the file holds an RSA (PKCS#1) or EC (SEC1) key under another type's label, typically `BEGIN PRIVATE KEY`. Give it back its own label as you convert it: try the RSA line, and if that fails too, the EC one. A wrong guess fails and writes nothing.
+
+```bash
+sed -E 's/^-----(BEGIN|END) .*PRIVATE KEY-----/-----\1 RSA PRIVATE KEY-----/' key.pem | openssl pkey -out key-fixed.pem
+sed -E 's/^-----(BEGIN|END) .*PRIVATE KEY-----/-----\1 EC PRIVATE KEY-----/' key.pem | openssl pkey -out key-fixed.pem
+```
+
+Then point `server.tls.key_path` at `key-fixed.pem`, or copy it over `key.pem` (only when the key has a file of its own — copied over a combined certificate-and-key PEM it would drop the certificate). `openssl` writes the new file readable by its owner only, and the packaged unit runs the edge as user `bilbycast`; copying it over the old file keeps that file's owner and mode.
+
 ### Verifying TLS
 
 ```bash

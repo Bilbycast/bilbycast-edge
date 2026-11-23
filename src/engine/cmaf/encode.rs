@@ -1401,12 +1401,14 @@ mod reencoder_tests {
         assert!(r.silent_fallback_track().is_none());
     }
 
-    #[test]
+    // A runtime, because a build without fdk-aac encodes AAC through an
+    // ffmpeg subprocess, whose supervisor is a tokio task.
+    #[tokio::test]
     #[cfg_attr(
         not(any(feature = "fdk-aac", feature = "media-codecs")),
         ignore = "audio_encode requires an in-process encoder backend or ffmpeg in PATH"
     )]
-    fn silent_fallback_on_builds_eager_encoder() {
+    async fn silent_fallback_on_builds_eager_encoder() {
         let cancel = CancellationToken::new();
         let r = AudioReencoder::new(&ae("aac_lc", true), None, &cancel, "out2", "flow2");
         // Accept ffmpeg-missing as a skip when no in-process backend is

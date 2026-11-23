@@ -11,17 +11,20 @@
 //!   CA. The cert's SAN extensions bind the ephemeral pubkey to the
 //!   specific GitHub workflow run that produced it (issuer, repo, ref,
 //!   workflow path).
-//! * `rekorBundle` — Rekor inclusion proof + signed entry timestamp,
-//!   binding the signing event to a specific public-log entry. Rekor
-//!   is the public transparency log that makes any unauthorised release
-//!   forensically detectable after the fact.
+//! * `rekorBundle` — the Rekor log entry's payload (`body`,
+//!   `integratedTime`, `logIndex`, `logID`) and its Signed Entry
+//!   Timestamp, Rekor's signature over that payload, binding the signing
+//!   event to a specific public-log entry. It carries no Merkle inclusion
+//!   proof, and none is checked. Rekor is the public transparency log that
+//!   makes any unauthorised release forensically detectable after the fact.
 //!
 //! Verification steps (all must succeed):
 //!
 //! 1. Parse the bundle JSON and extract the cert + signature + Rekor
 //!    payload.
-//! 2. Verify the leaf cert chains to (is signed by) a compiled-in/TUF
-//!    Fulcio CA. This is the load-bearing anti-forgery check.
+//! 2. Verify the leaf cert chains to (is signed by) a Fulcio CA from the
+//!    TUF-verified Sigstore trust root. This is the load-bearing
+//!    anti-forgery check.
 //! 3. Verify the cert's SAN URI matches one of the entries in
 //!    [`super::trust::ALLOWED_SIGNERS`].
 //! 4. Verify the Rekor entry: (a) the entry body binds this manifest's
@@ -31,22 +34,72 @@
 //! 5. Verify the signature is valid over the manifest bytes using the
 //!    pubkey embedded in the cert.
 //!
-//! Implementation note: sigstore-rs 0.14 keeps its chain / Rekor
+//! Implementation note: sigstore-rs 0.15 keeps its chain / Rekor
 //! verifiers `pub(crate)`, so the checks above are performed in-tree
 //! against the crate's public primitives (`SigstoreTrustRoot::{fulcio_certs,
 //! rekor_keys}`, `CosignVerificationKey`). `verify_manifest_bundle` is the
-//! single entry point and returns clear `error_code`-friendly errors so the
-//! manager UI can render targeted failures. Any failure — including an
-//! unreachable/malformed trust root — is fatal (fail-closed).
+//! single entry point. Any failure — including an unreachable/malformed
+//! trust root — is fatal (fail-closed), and every one carries a `Refused`
+//! naming the kind of check that failed (`Check`), from which the
+//! coordinator picks the `error_code` the manager UI renders.
 
-use anyhow::{anyhow, bail, Context, Result};
+use std::borrow::Cow;
+use std::future::Future;
+
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use sigstore::trust::sigstore::SigstoreTrustRoot;
 
 use super::trust::{ref_matches, AllowedSigner};
 
+/// The kind of check that refused a bundle. The upgrade coordinator turns it
+/// into the `error_code` (`super::map_verify_error`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Check {
+    /// Sigstore's trust root could not be loaded: its TUF repository was
+    /// unreachable, or what it served did not verify or held no Fulcio CA.
+    /// Nothing about the release itself has been checked yet.
+    TrustRoot,
+    /// The bundle did not parse, its certificate does not chain to a trusted
+    /// Fulcio CA, or the manifest signature does not verify under it.
+    Signature,
+    /// The signer's identity claims do not match the allowlist (or there is
+    /// no allowlist to match).
+    Identity,
+    /// The Rekor entry is missing, was logged outside the certificate's
+    /// validity window, does not bind this manifest and certificate, or
+    /// carries a Signed Entry Timestamp no trusted Rekor key verifies.
+    Rekor,
+}
+
+/// The context every failing step of the verification attaches to its error.
+/// It displays as `reason`, and the coordinator finds it again by type —
+/// `anyhow::Error::downcast_ref` walks the whole context chain — so the
+/// `error_code` never depends on how a message is worded.
+#[derive(Debug)]
+pub(crate) struct Refused {
+    pub check: Check,
+    reason: Cow<'static, str>,
+}
+
+impl Refused {
+    fn new(check: Check, reason: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            check,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
 /// Top-level entry point. Returns `Ok(())` only when **every** check
-/// passes; on any failure the message string contains the specific
-/// reason so the caller can map it to an `error_code`.
+/// passes; on any failure the error chain names the specific reason and
+/// carries a `Refused` the caller maps to an `error_code`.
 ///
 /// `manifest_bytes` is the **raw, byte-for-byte** content of
 /// `manifest.json` as fetched from the GitHub release. The bundle binds
@@ -57,22 +110,56 @@ pub async fn verify_manifest_bundle(
     bundle_bytes: &[u8],
     allowed_signers: &[AllowedSigner],
 ) -> Result<()> {
+    // Sigstore's trust root: TUF metadata fetched from Sigstore's TUF
+    // repository (starting from the TUF root embedded in the `sigstore`
+    // crate) vouches for `trusted_root.json`, the Fulcio CA certs + Rekor
+    // public keys every check below runs against. Fetched on every call and
+    // never stored, so Fulcio and Rekor key rotations land without a code
+    // change or a rebuild. No network, no trust root: the call fails closed.
+    verify_against(
+        manifest_bytes,
+        bundle_bytes,
+        allowed_signers,
+        SigstoreTrustRoot::new(None),
+    )
+    .await
+}
+
+/// [`verify_manifest_bundle`] against the trust root `trust_root` resolves
+/// to. It is awaited only once the bundle has parsed, so a malformed bundle
+/// never reaches the network; the tests hand it a fixed root or a failure.
+async fn verify_against(
+    manifest_bytes: &[u8],
+    bundle_bytes: &[u8],
+    allowed_signers: &[AllowedSigner],
+    trust_root: impl Future<Output = sigstore::errors::Result<SigstoreTrustRoot>>,
+) -> Result<()> {
     if allowed_signers.is_empty() {
-        bail!("identity allowlist is empty — refusing to verify any signature");
+        bail!(Refused::new(
+            Check::Identity,
+            "identity allowlist is empty — refusing to verify any signature",
+        ));
     }
 
-    let bundle: CosignBundle = serde_json::from_slice(bundle_bytes)
-        .context("failed to parse cosign Sigstore bundle JSON")?;
+    let bundle: CosignBundle = serde_json::from_slice(bundle_bytes).context(Refused::new(
+        Check::Signature,
+        "failed to parse cosign Sigstore bundle JSON",
+    ))?;
 
     // 1. Parse cert + check chain to Fulcio root.
-    let cert_pem = bundle
-        .cert
-        .as_deref()
-        .ok_or_else(|| anyhow!("bundle missing 'cert' (X.509 PEM)"))?;
-    let signature_b64 = bundle
-        .base64_signature
-        .as_deref()
-        .ok_or_else(|| anyhow!("bundle missing 'base64Signature'"))?;
+    let cert_pem = bundle.cert.as_deref().context(Refused::new(
+        Check::Signature,
+        "bundle missing 'cert' (X.509 PEM)",
+    ))?;
+    let signature_b64 = bundle.base64_signature.as_deref().context(Refused::new(
+        Check::Signature,
+        "bundle missing 'base64Signature'",
+    ))?;
+
+    let trust_root = trust_root.await.context(Refused::new(
+        Check::TrustRoot,
+        "failed to load Sigstore trust root (Fulcio + Rekor)",
+    ))?;
 
     // 2. Chain the cert to a trusted Fulcio CA, check its validity window
     //    against the Rekor integrated time, and bind the Rekor entry to THIS
@@ -81,23 +168,32 @@ pub async fn verify_manifest_bundle(
         cert_pem,
         manifest_bytes,
         bundle.rekor_bundle.as_ref(),
-    )
-    .await
-    .context("Sigstore Fulcio + Rekor verification failed")?;
+        &trust_root,
+    )?;
 
     // 3. SAN identity match against `allowed_signers`.
-    let identity = sigstore_inner::extract_identity_claims(cert_pem)
-        .context("could not extract identity claims from Fulcio cert")?;
+    let identity = sigstore_inner::extract_identity_claims(cert_pem).context(Refused::new(
+        Check::Identity,
+        "could not extract identity claims from Fulcio cert",
+    ))?;
     if !identity_matches_allowlist(&identity, allowed_signers) {
-        bail!(
-            "Sigstore cert identity {identity:?} is not in the upgrade ALLOWED_SIGNERS allowlist \
-             — refusing to install (the binary may have been signed by an unauthorised workflow)"
-        );
+        bail!(Refused::new(
+            Check::Identity,
+            format!(
+                "Sigstore cert identity {identity:?} is not in the upgrade ALLOWED_SIGNERS \
+                 allowlist — refusing to install (the binary may have been signed by an \
+                 unauthorised workflow)"
+            ),
+        ));
     }
 
     // 4. Verify signature over the raw manifest bytes.
-    sigstore_inner::verify_blob_signature(cert_pem, signature_b64, manifest_bytes)
-        .context("manifest signature does not verify under the cert's pubkey")?;
+    sigstore_inner::verify_blob_signature(cert_pem, signature_b64, manifest_bytes).context(
+        Refused::new(
+            Check::Signature,
+            "manifest signature does not verify under the cert's pubkey",
+        ),
+    )?;
 
     Ok(())
 }
@@ -113,9 +209,10 @@ struct CosignBundle {
     rekor_bundle: Option<RekorBundle>,
 }
 
-/// Rekor inclusion proof payload from cosign's bundle. The
-/// `SignedEntryTimestamp` is a Rekor-signed assertion that the entry
-/// was included in the public transparency log at `Payload.integratedTime`.
+/// The Rekor entry from cosign's bundle: the log entry's `Payload` and its
+/// `SignedEntryTimestamp`, Rekor's signature over that payload, which
+/// asserts that the entry was logged in the public transparency log at
+/// `Payload.integratedTime`. It carries no Merkle inclusion proof.
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct RekorBundle {
     #[serde(rename = "SignedEntryTimestamp")]
@@ -174,80 +271,97 @@ fn identity_matches_allowlist(claims: &CertIdentity, allowed: &[AllowedSigner]) 
 ///
 /// **Implementation note**: the sigstore-rs crate has churned across
 /// 0.x releases. We use a small set of stable primitives here:
-/// * `sigstore::trust::sigstore::SigstoreTrustRoot` for the Fulcio root.
+/// * `sigstore::trust::sigstore::SigstoreTrustRoot` for the Fulcio CA
+///   certificates and Rekor public keys.
 /// * X.509 parsing via `x509-cert`, our own direct dependency — sigstore-rs
 ///   does NOT re-export it, so this is not a redundant dep to "simplify"
-///   away. It is held at 0.2 to match sigstore's own `^0.2`; see the
-///   HELD note in Cargo.toml.
-/// * RustCrypto's `p256` / `ed25519-dalek` for signature verification.
+///   away. It moves in lockstep with sigstore's own requirement (0.3 for
+///   sigstore 0.15); see the lockstep note in Cargo.toml.
+/// * sigstore's `CosignVerificationKey` for every signature check, on its
+///   aws-lc-rs backend (the `rustls-tls` feature).
 ///
-/// Because Sigstore Fulcio always issues ECDSA-P256 certs and cosign's
-/// blob signatures are also P-256 by default, we only need ECDSA-P256
-/// verification here. If the upstream defaults ever change (Ed25519
-/// long-term keys, P-384), the verifier returns a clear error rather
-/// than silently accepting an unverified blob.
+/// Two ECDSA schemes are in play. Fulcio's intermediate CA is P-384 and
+/// signs leaf certificates ecdsa-with-SHA384 (the chain check maps the
+/// leaf's signature-algorithm OID to the scheme); the ephemeral leaf key
+/// that signs the blob and Rekor's log key are both P-256, checked as
+/// ECDSA-P256-SHA256. Anything else (Ed25519 long-term keys, another curve)
+/// is refused with an error rather than silently accepting an unverified
+/// blob.
 pub(crate) mod sigstore_inner {
     use anyhow::{anyhow, bail, Context, Result};
     use base64::Engine;
+    use sigstore::trust::sigstore::SigstoreTrustRoot;
 
-    use super::CertIdentity;
+    use super::{CertIdentity, Check, Refused};
 
-    /// Verify the cert chain to the compiled-in Fulcio root **and** the
-    /// Rekor inclusion proof against the compiled-in Rekor pubkey.
-    ///
-    /// Both pieces are delegated to the `sigstore` crate's
-    /// `SigstoreTrustRoot` so that root rotations land via routine
-    /// `cargo update` without code changes.
-    pub async fn verify_cert_and_rekor(
+    /// Verify the cert chain to a trusted Fulcio CA **and** the Rekor entry
+    /// — its binding to this manifest and certificate, and its Signed Entry
+    /// Timestamp under a trusted Rekor public key — both key sets taken from
+    /// `trust_root`.
+    pub fn verify_cert_and_rekor(
         cert_pem: &str,
         manifest_bytes: &[u8],
         rekor_bundle: Option<&super::RekorBundle>,
+        trust_root: &SigstoreTrustRoot,
     ) -> Result<()> {
         use sigstore::trust::TrustRoot;
 
-        // Build the trust root — loads the Fulcio CA certs + Rekor public
-        // keys from the sigstore crate's TUF data (embedded snapshot,
-        // refreshed from the Sigstore TUF repo). These are the roots of
-        // trust; verification below is entirely against them.
-        let trust_root = sigstore::trust::sigstore::SigstoreTrustRoot::new(None)
-            .await
-            .context("failed to load Sigstore trust root (Fulcio + Rekor)")?;
-        let fulcio_certs = trust_root
-            .fulcio_certs()
-            .map_err(|e| anyhow!("Fulcio cert bundle unavailable: {e}"))?;
-        let rekor_keys = trust_root
-            .rekor_keys()
-            .map_err(|e| anyhow!("Rekor public key unavailable: {e}"))?;
+        // The roots of trust: the Fulcio CA certs + Rekor public keys of the
+        // TUF-verified `trusted_root.json`. Verification below is entirely
+        // against them.
+        let fulcio_certs = trust_root.fulcio_certs().context(Refused::new(
+            Check::TrustRoot,
+            "Fulcio cert bundle unavailable",
+        ))?;
+        let rekor_keys = trust_root.rekor_keys().context(Refused::new(
+            Check::TrustRoot,
+            "Rekor public key unavailable",
+        ))?;
 
         // Rekor inclusion is mandatory — a bundle without it cannot be
         // transparency-verified, and its absence must never pass.
-        let rekor = rekor_bundle
-            .ok_or_else(|| anyhow!("rekor bundle missing — every release must be logged in Rekor"))?;
+        let rekor = rekor_bundle.context(Refused::new(
+            Check::Rekor,
+            "rekor bundle missing — every release must be logged in Rekor",
+        ))?;
 
-        let leaf_der = pem_to_der(cert_pem)?;
+        let leaf_der = pem_to_der(cert_pem).context(Refused::new(
+            Check::Signature,
+            "bundle 'cert' does not decode to a certificate",
+        ))?;
 
         // (a) Chain: the leaf MUST be signed by a trusted Fulcio CA. This is
         //     the load-bearing anti-forgery check — without it an attacker can
         //     self-sign a certificate carrying the allowed workflow identity
         //     and pass the SAN allowlist below.
-        verify_cert_chain(&leaf_der, &fulcio_certs)
-            .context("Fulcio certificate-chain verification failed")?;
+        verify_cert_chain(&leaf_der, &fulcio_certs).context(Refused::new(
+            Check::Signature,
+            "Fulcio certificate-chain verification failed",
+        ))?;
 
         // (b) The signing cert's validity window must contain the Rekor
         //     integrated time (the cosign/Fulcio short-lived-cert model).
-        verify_validity_window(&leaf_der, rekor.payload.integrated_time)
-            .context("certificate validity window does not contain the Rekor integrated time")?;
+        verify_validity_window(&leaf_der, rekor.payload.integrated_time).context(Refused::new(
+            Check::Rekor,
+            "certificate validity window does not contain the Rekor integrated time",
+        ))?;
 
         // (c) The Rekor entry body must bind THIS manifest hash AND THIS
         //     certificate — otherwise a valid entry for some other artifact
         //     could be replayed alongside a forged manifest.
-        verify_rekor_body_binding(&rekor.payload.body, manifest_bytes, &leaf_der)
-            .context("Rekor entry body does not bind this manifest and certificate")?;
+        verify_rekor_body_binding(&rekor.payload.body, manifest_bytes, &leaf_der).context(
+            Refused::new(
+                Check::Rekor,
+                "Rekor entry body does not bind this manifest and certificate",
+            ),
+        )?;
 
         // (d) The Signed Entry Timestamp must verify under a trusted Rekor
         //     public key (proves Rekor actually logged this entry).
-        verify_rekor_set(rekor, &rekor_keys)
-            .context("Rekor SignedEntryTimestamp verification failed")?;
+        verify_rekor_set(rekor, &rekor_keys).context(Refused::new(
+            Check::Rekor,
+            "Rekor SignedEntryTimestamp verification failed",
+        ))?;
 
         Ok(())
     }
@@ -268,27 +382,37 @@ pub(crate) mod sigstore_inner {
     /// requiring one success is a sound chain check for Fulcio's short chain.
     fn verify_cert_chain<C: AsRef<[u8]>>(leaf_der: &[u8], fulcio_certs: &[C]) -> Result<()> {
         use sigstore::crypto::{CosignVerificationKey, Signature};
-        use x509_cert::der::{Decode, Encode};
+        use x509_cert::der::{Any, Decode, Encode};
         use x509_cert::Certificate;
 
         let leaf = Certificate::from_der(leaf_der)
             .map_err(|e| anyhow!("leaf X.509 DER parse error: {e}"))?;
-        // The exact bytes Fulcio signed: the leaf's TBSCertificate DER.
-        let tbs_der = leaf
-            .tbs_certificate
+        // The exact bytes Fulcio signed: the leaf's TBSCertificate DER *as
+        // received* — the first element of the outer Certificate SEQUENCE.
+        // Never re-encode the parsed TBSCertificate: x509-cert 0.3 rewrites a
+        // pre-2050 GeneralizedTime validity as UTCTime on encode, so for such
+        // a certificate the re-encoding is not what the CA signed and a
+        // genuine release would fail closed. The parse above is strict DER
+        // (one encoding per value), which is what ties the fields the later
+        // checks read to these signed bytes.
+        let leaf_fields = Vec::<Any>::from_der(leaf_der)
+            .map_err(|e| anyhow!("leaf X.509 outer SEQUENCE: {e}"))?;
+        let tbs_der = leaf_fields
+            .first()
+            .ok_or_else(|| anyhow!("leaf has no TBSCertificate"))?
             .to_der()
-            .map_err(|e| anyhow!("re-encode leaf TBSCertificate: {e}"))?;
+            .map_err(|e| anyhow!("leaf TBSCertificate bytes: {e}"))?;
         let sig = leaf
-            .signature
+            .signature()
             .as_bytes()
             .ok_or_else(|| anyhow!("leaf signature is not octet-aligned"))?;
-        let scheme = scheme_for_oid(&leaf.signature_algorithm.oid.to_string())?;
+        let scheme = scheme_for_oid(&leaf.signature_algorithm().oid.to_string())?;
 
         for ca_der in fulcio_certs {
             let Ok(ca) = Certificate::from_der(ca_der.as_ref()) else {
                 continue;
             };
-            let Ok(spki_der) = ca.tbs_certificate.subject_public_key_info.to_der() else {
+            let Ok(spki_der) = ca.tbs_certificate().subject_public_key_info().to_der() else {
                 continue;
             };
             let Ok(key) = CosignVerificationKey::from_der(&spki_der, &scheme) else {
@@ -312,14 +436,14 @@ pub(crate) mod sigstore_inner {
         let leaf = Certificate::from_der(leaf_der)
             .map_err(|e| anyhow!("leaf X.509 DER parse error: {e}"))?;
         let nb = leaf
-            .tbs_certificate
-            .validity
+            .tbs_certificate()
+            .validity()
             .not_before
             .to_unix_duration()
             .as_secs() as i64;
         let na = leaf
-            .tbs_certificate
-            .validity
+            .tbs_certificate()
+            .validity()
             .not_after
             .to_unix_duration()
             .as_secs() as i64;
@@ -434,7 +558,7 @@ pub(crate) mod sigstore_inner {
         use x509_cert::der::Decode;
         let cert = x509_cert::Certificate::from_der(&cert_der)
             .map_err(|e| anyhow!("X.509 DER parse error: {e}"))?;
-        let spki = &cert.tbs_certificate.subject_public_key_info;
+        let spki = cert.tbs_certificate().subject_public_key_info();
         let spki_der = x509_cert::der::Encode::to_der(spki)
             .map_err(|e| anyhow!("SPKI encode error: {e}"))?;
 
@@ -486,7 +610,7 @@ pub(crate) mod sigstore_inner {
         // SAN URI carries the workflow + ref combined; we parse it below.
 
         let (mut issuer_v1, mut repo_v1, mut ref_v1) = (None, None, None);
-        if let Some(exts) = &cert.tbs_certificate.extensions {
+        if let Some(exts) = cert.tbs_certificate().extensions() {
             for e in exts {
                 let oid = e.extn_id.to_string();
                 let bytes = e.extn_value.as_bytes();
@@ -725,6 +849,96 @@ YWzC7nACIBXD/yRzFUPRFLc9i6BWdgKLnH0Q63jwgsuDIfcgcppk
             assert!(verify_validity_window(&leaf, 100).is_err()); // 1970, before notBefore
             assert!(verify_validity_window(&leaf, 1_900_000_000).is_err()); // after notAfter
         }
+
+        /// A real Fulcio leaf against the real CA that issued it. The synthetic
+        /// fixtures above are P-256 / ecdsa-with-SHA256; real releases are
+        /// signed ecdsa-with-SHA384 by Fulcio's P-384 intermediate, a path no
+        /// other offline test runs.
+        ///
+        /// `testdata/sigstore-intermediate.pem` is `O=sigstore.dev,
+        /// CN=sigstore-intermediate` (serial
+        /// 00b9d58957e75346eb25ab264641eb9ff5277da4, valid 2022-04-13 to
+        /// 2031-10-05), PEM-wrapped from
+        /// `certificateAuthorities[1].certChain.certificates[0].rawBytes` of the
+        /// Sigstore public-good `trusted_root.json` that `sigstore-0.15.1`
+        /// embeds (`trust_root/prod/trusted_root.json`). The leaf is the
+        /// bilbycast-edge v0.114.0 release certificate.
+        #[test]
+        fn real_fulcio_leaf_chains_to_the_sigstore_intermediate() {
+            let leaf = pem_to_der(include_str!("testdata/fulcio-edge-v0.114.0.pem")).unwrap();
+            let intermediate =
+                pem_to_der(include_str!("testdata/sigstore-intermediate.pem")).unwrap();
+            assert!(verify_cert_chain(&leaf, std::slice::from_ref(&intermediate)).is_ok());
+
+            // One letter of the repository name changed inside the signed
+            // TBSCertificate: still a well-formed certificate, no longer the
+            // one Fulcio signed.
+            let mut tampered = leaf.clone();
+            let at = tampered
+                .windows(b"bilbycast-edge".len())
+                .position(|w| w == b"bilbycast-edge")
+                .unwrap();
+            tampered[at] = b'B';
+            let err = verify_cert_chain(&tampered, &[intermediate]).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("does not chain"),
+                "expected the signature check to refuse it, got: {err:#}"
+            );
+        }
+
+        // A leaf whose validity is GeneralizedTime before 2050 — RFC 5280 says
+        // UTCTime, some CAs write GeneralizedTime anyway. Built offline:
+        // GT_CA_PEM with `openssl req -x509` (P-256); the leaf's TBSCertificate
+        // assembled by hand, because OpenSSL's `-not_before` always writes
+        // UTCTime for 1950-2049, then signed ecdsa-with-SHA256 with GT_CA's key
+        // (`openssl dgst -sha256 -sign`). `openssl verify` accepts the pair.
+        const GT_CA_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBmDCCAT+gAwIBAgIUKcNYqTNKMpbXd2mfbdJtpa5PGSAwCgYIKoZIzj0EAwIw
+IjEgMB4GA1UEAwwXVGVzdCBHZW5lcmFsaXplZFRpbWUgQ0EwHhcNMjYxMTIzMDAw
+NjQ1WhcNMzYxMTIwMDAwNjQ1WjAiMSAwHgYDVQQDDBdUZXN0IEdlbmVyYWxpemVk
+VGltZSBDQTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABKlS9hq3dxouZ3Oy6GA+
+2E+9C120rXBjsVISdJgx2RKb2qLhkp3SaTh739HYgMWXjgHI7Gcm5QlSJLWvnZbN
+D7ajUzBRMB0GA1UdDgQWBBSrCY4cnz5M9XoBHE1Dwjs9o+zVBzAfBgNVHSMEGDAW
+gBSrCY4cnz5M9XoBHE1Dwjs9o+zVBzAPBgNVHRMBAf8EBTADAQH/MAoGCCqGSM49
+BAMCA0cAMEQCID6ikufpoJDbbWmbTPAxCLO2PJnjV8YMz5qUlaPBVAuWAiAPY6Mj
+PugDFTldQPQHGE+H3m1Ad854X7jmCxkW4qlmUQ==
+-----END CERTIFICATE-----"#;
+
+        const GT_LEAF_PEM: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBJjCBzKADAgECAgJqHDAKBggqhkjOPQQDAjAiMSAwHgYDVQQDDBdUZXN0IEdl
+bmVyYWxpemVkVGltZSBDQTAiGA8yMDI2MDEwMTAwMDAwMFoYDzIwMjcwMTAxMDAw
+MDAwWjASMRAwDgYDVQQDDAdndC1sZWFmMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD
+QgAEWqPq65qgufcUDlQMlN55hqHTptD4kwgdJQLTY1v/Vj9acQbnFpb3QGPKmGIy
+jPrI3sWpIXQBx7W1gvTn7/GISzAKBggqhkjOPQQDAgNJADBGAiEA9BwKUEpyzhHu
+bpXwon4K5RU/sBryQuC9JUiExTB6hPACIQD+fW2UJzROfOeAydcCXTzKwkgKC0kg
+DBlyousmSRzpyg==
+-----END CERTIFICATE-----"#;
+
+        /// x509-cert 0.3 rewrites such a validity as UTCTime when it encodes, so
+        /// a chain check that hashed a re-encoded TBSCertificate would refuse
+        /// this genuine leaf. The chain check must use the bytes as received.
+        #[test]
+        fn leaf_with_generalized_time_validity_chains() {
+            use x509_cert::der::{Any, Decode, Encode};
+            let leaf = pem_to_der(GT_LEAF_PEM).unwrap();
+            let ca = pem_to_der(GT_CA_PEM).unwrap();
+
+            // The fixture must be one x509-cert does not re-encode byte for
+            // byte, or this test proves nothing.
+            let as_received = Vec::<Any>::from_der(&leaf).unwrap()[0].to_der().unwrap();
+            let reencoded = x509_cert::Certificate::from_der(&leaf)
+                .unwrap()
+                .tbs_certificate()
+                .to_der()
+                .unwrap();
+            assert_ne!(as_received, reencoded);
+
+            assert!(verify_cert_chain(&leaf, &[ca]).is_ok());
+            // GT_LEAF validity: 2026-01-01 .. 2027-01-01 (unix 1_767_225_600 ..
+            // 1_798_761_600).
+            assert!(verify_validity_window(&leaf, 1_780_000_000).is_ok());
+            assert!(verify_validity_window(&leaf, 1_800_000_000).is_err());
+        }
     }
 }
 
@@ -915,5 +1129,347 @@ mod tests {
                 crate::upgrade::trust::ALLOWED_SIGNERS
             ));
         }
+    }
+}
+
+/// Which `error_code` each way of refusing a bundle reports. Run through the
+/// whole pipeline against a fixed trust root, so no test reaches the network:
+/// a genuine release and the trust root it chains to, then that release with
+/// one thing wrong at a time, each through `super::map_verify_error`.
+#[cfg(test)]
+mod refusal_tests {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+    use serde_json::Value;
+    use sigstore::errors::SigstoreError;
+
+    use super::*;
+    use crate::upgrade::{error_codes, map_verify_error, UpgradeError};
+
+    /// `manifest.json` and `manifest.sig.bundle` as published with
+    /// bilbycast-edge v0.117.0, byte for byte: the Rekor entry binds the
+    /// manifest's SHA-256 (`96d1fed0…`), and the certificate was issued to the
+    /// edge's `nightly-release.yml` at `refs/tags/v0.117.0`.
+    const RELEASE_MANIFEST: &[u8] = include_bytes!("testdata/release-edge-v0.117.0.manifest.json");
+    const RELEASE_BUNDLE: &[u8] =
+        include_bytes!("testdata/release-edge-v0.117.0.manifest.sig.bundle");
+
+    /// `trust_root/prod/trusted_root.json` as `sigstore-0.15.1` embeds it
+    /// (SHA-256 `f44a1b88…`): Sigstore's public-good Fulcio CAs and Rekor key.
+    const TRUSTED_ROOT: &[u8] = include_bytes!("testdata/sigstore-trusted-root.json");
+
+    /// The allowlist the release above was signed under: this binary's own.
+    const RELEASE_SIGNERS: &[AllowedSigner] = crate::upgrade::trust::ALLOWED_SIGNERS;
+
+    /// Another binary's allowlist, which the release above must not satisfy.
+    const OTHER_SIGNERS: &[AllowedSigner] = &[AllowedSigner {
+        issuer: "https://token.actions.githubusercontent.com",
+        repo: "https://github.com/Bilbycast/bilbycast-appear-x-api-gateway",
+        ref_pattern: "refs/tags/v*",
+        workflow: "https://github.com/Bilbycast/bilbycast-appear-x-api-gateway/.github/workflows/nightly-release.yml",
+    }];
+
+    async fn offline_root() -> sigstore::errors::Result<SigstoreTrustRoot> {
+        SigstoreTrustRoot::from_trusted_root_json_unchecked(TRUSTED_ROOT)
+    }
+
+    async fn never_loaded() -> sigstore::errors::Result<SigstoreTrustRoot> {
+        panic!("the trust root is loaded only for a bundle that parses")
+    }
+
+    /// Verify, expecting a refusal; return the check it names and what the
+    /// coordinator reports for it.
+    async fn refuse(
+        manifest: &[u8],
+        bundle: &[u8],
+        signers: &[AllowedSigner],
+        trust_root: impl Future<Output = sigstore::errors::Result<SigstoreTrustRoot>>,
+    ) -> (Check, UpgradeError) {
+        let err = verify_against(manifest, bundle, signers, trust_root)
+            .await
+            .expect_err("the bundle must be refused");
+        let check = err
+            .downcast_ref::<Refused>()
+            .expect("every refusal names the check that failed")
+            .check;
+        (check, map_verify_error(err))
+    }
+
+    /// The release bundle with `edit` applied to its JSON.
+    fn edited_bundle(edit: impl FnOnce(&mut Value)) -> Vec<u8> {
+        let mut bundle: Value = serde_json::from_slice(RELEASE_BUNDLE).unwrap();
+        edit(&mut bundle);
+        serde_json::to_vec(&bundle).unwrap()
+    }
+
+    /// Flip the last byte of a base64 field's decoded value.
+    fn flip_last_byte(field: &mut Value) {
+        let mut bytes = B64.decode(field.as_str().unwrap()).unwrap();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        *field = Value::String(B64.encode(bytes));
+    }
+
+    #[tokio::test]
+    async fn a_genuine_release_verifies_against_the_trust_root_it_chains_to() {
+        verify_against(
+            RELEASE_MANIFEST,
+            RELEASE_BUNDLE,
+            RELEASE_SIGNERS,
+            offline_root(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("genuine release refused: {e:#}"));
+    }
+
+    /// With no route to Sigstore's TUF repository `SigstoreTrustRoot::new`
+    /// fails with "root metadata is expired": tough takes a next root it
+    /// cannot fetch for the end of the chain, and the embedded TUF root has
+    /// expired. That error wraps a `tough` error, and `tough` is not a
+    /// dependency here, so a `TufMetadataError` with the same text stands in
+    /// for it. The release was never checked: a network error, not a bad
+    /// signature — and the message carries the cause, not only the outermost
+    /// context.
+    #[tokio::test]
+    async fn a_trust_root_that_does_not_load_is_a_network_error() {
+        let unreachable = async {
+            Err(SigstoreError::TufMetadataError(
+                "root metadata is expired".into(),
+            ))
+        };
+        let (check, e) = refuse(
+            RELEASE_MANIFEST,
+            RELEASE_BUNDLE,
+            RELEASE_SIGNERS,
+            unreachable,
+        )
+        .await;
+        assert_eq!(check, Check::TrustRoot);
+        assert_eq!(e.code, error_codes::UPGRADE_NETWORK_ERROR);
+        assert_eq!(
+            e.message,
+            "failed to load Sigstore trust root (Fulcio + Rekor): root metadata is expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trust_root_without_a_fulcio_ca_is_a_network_error() {
+        let mut root: Value = serde_json::from_slice(TRUSTED_ROOT).unwrap();
+        root["certificateAuthorities"] = Value::Array(Vec::new());
+        let root = serde_json::to_vec(&root).unwrap();
+        let no_ca = async move { SigstoreTrustRoot::from_trusted_root_json_unchecked(&root) };
+        let (check, e) = refuse(RELEASE_MANIFEST, RELEASE_BUNDLE, RELEASE_SIGNERS, no_ca).await;
+        assert_eq!(check, Check::TrustRoot);
+        assert_eq!(e.code, error_codes::UPGRADE_NETWORK_ERROR);
+        assert!(
+            e.message.starts_with("Fulcio cert bundle unavailable"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_release_with_no_rekor_entry_is_rekor_invalid() {
+        let bundle = edited_bundle(|b| {
+            b.as_object_mut().unwrap().remove("rekorBundle");
+        });
+        let (check, e) = refuse(RELEASE_MANIFEST, &bundle, RELEASE_SIGNERS, offline_root()).await;
+        assert_eq!(check, Check::Rekor);
+        assert_eq!(e.code, error_codes::UPGRADE_REKOR_INVALID);
+        assert!(
+            e.message.starts_with("rekor bundle missing"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// One byte of the manifest changed: the Rekor entry no longer binds it.
+    #[tokio::test]
+    async fn a_manifest_the_rekor_entry_does_not_bind_is_rekor_invalid() {
+        let mut manifest = RELEASE_MANIFEST.to_vec();
+        let at = manifest
+            .windows(9)
+            .position(|w| w == b"\"0.117.0\"")
+            .unwrap();
+        manifest[at + 7] = b'1';
+        let (check, e) = refuse(&manifest, RELEASE_BUNDLE, RELEASE_SIGNERS, offline_root()).await;
+        assert_eq!(check, Check::Rekor);
+        assert_eq!(e.code, error_codes::UPGRADE_REKOR_INVALID);
+        assert!(
+            e.message
+                .starts_with("Rekor entry body does not bind this manifest and certificate"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signed_entry_timestamp_no_rekor_key_verifies_is_rekor_invalid() {
+        let bundle =
+            edited_bundle(|b| flip_last_byte(&mut b["rekorBundle"]["SignedEntryTimestamp"]));
+        let (check, e) = refuse(RELEASE_MANIFEST, &bundle, RELEASE_SIGNERS, offline_root()).await;
+        assert_eq!(check, Check::Rekor);
+        assert_eq!(e.code, error_codes::UPGRADE_REKOR_INVALID);
+        assert!(
+            e.message
+                .starts_with("Rekor SignedEntryTimestamp verification failed"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rekor_entry_logged_outside_the_certificate_validity_is_rekor_invalid() {
+        let bundle = edited_bundle(|b| {
+            let t = &mut b["rekorBundle"]["Payload"]["integratedTime"];
+            *t = Value::from(t.as_i64().unwrap() + 86_400);
+        });
+        let (check, e) = refuse(RELEASE_MANIFEST, &bundle, RELEASE_SIGNERS, offline_root()).await;
+        assert_eq!(check, Check::Rekor);
+        assert_eq!(e.code, error_codes::UPGRADE_REKOR_INVALID);
+        assert!(
+            e.message
+                .starts_with("certificate validity window does not contain"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// One letter of the repository name changed inside the certificate's
+    /// signed TBSCertificate: well-formed, but not what Fulcio signed.
+    #[tokio::test]
+    async fn a_certificate_no_fulcio_ca_signed_is_signature_invalid() {
+        let bundle = edited_bundle(|b| {
+            let pem = String::from_utf8(B64.decode(b["cert"].as_str().unwrap()).unwrap()).unwrap();
+            let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+            let mut der = B64.decode(body).unwrap();
+            let at = der
+                .windows(b"bilbycast-edge".len())
+                .position(|w| w == b"bilbycast-edge")
+                .unwrap();
+            der[at] = b'B';
+            let pem = format!(
+                "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+                B64.encode(der)
+            );
+            b["cert"] = Value::String(B64.encode(pem));
+        });
+        let (check, e) = refuse(RELEASE_MANIFEST, &bundle, RELEASE_SIGNERS, offline_root()).await;
+        assert_eq!(check, Check::Signature);
+        assert_eq!(e.code, error_codes::UPGRADE_SIGNATURE_INVALID);
+        assert!(e.message.contains("does not chain"), "{}", e.message);
+    }
+
+    /// Every check before it passes — the chain, the Rekor entry, the
+    /// identity — so only the signature over the manifest refuses it. The
+    /// Rekor entry's `hashedrekord` body does carry the signature
+    /// (`spec.signature.content`) beside the manifest's SHA-256 and the
+    /// signing certificate, but the Rekor check matches only the hash and
+    /// the certificate, never the logged signature against
+    /// `base64Signature`; and the Signed Entry Timestamp signs that body,
+    /// which this edit leaves alone.
+    #[tokio::test]
+    async fn a_signature_that_does_not_cover_the_manifest_is_signature_invalid() {
+        let bundle = edited_bundle(|b| flip_last_byte(&mut b["base64Signature"]));
+        let (check, e) = refuse(RELEASE_MANIFEST, &bundle, RELEASE_SIGNERS, offline_root()).await;
+        assert_eq!(check, Check::Signature);
+        assert_eq!(e.code, error_codes::UPGRADE_SIGNATURE_INVALID);
+        assert!(
+            e.message.starts_with("manifest signature does not verify"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_genuine_release_under_another_binarys_allowlist_is_identity_not_allowed() {
+        let (check, e) = refuse(
+            RELEASE_MANIFEST,
+            RELEASE_BUNDLE,
+            OTHER_SIGNERS,
+            offline_root(),
+        )
+        .await;
+        assert_eq!(check, Check::Identity);
+        assert_eq!(e.code, error_codes::UPGRADE_IDENTITY_NOT_ALLOWED);
+        assert!(e.message.contains("bilbycast-edge"), "{}", e.message);
+    }
+
+    #[tokio::test]
+    async fn an_empty_allowlist_is_identity_not_allowed_before_any_fetch() {
+        let (check, e) = refuse(RELEASE_MANIFEST, RELEASE_BUNDLE, &[], never_loaded()).await;
+        assert_eq!(check, Check::Identity);
+        assert_eq!(e.code, error_codes::UPGRADE_IDENTITY_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_that_does_not_parse_is_signature_invalid_before_any_fetch() {
+        let (check, e) = refuse(
+            RELEASE_MANIFEST,
+            b"not-json",
+            RELEASE_SIGNERS,
+            never_loaded(),
+        )
+        .await;
+        assert_eq!(check, Check::Signature);
+        assert_eq!(e.code, error_codes::UPGRADE_SIGNATURE_INVALID);
+    }
+
+    #[tokio::test]
+    async fn a_bundle_with_no_certificate_is_signature_invalid_before_any_fetch() {
+        let bundle = edited_bundle(|b| {
+            b.as_object_mut().unwrap().remove("cert");
+        });
+        let (check, e) = refuse(RELEASE_MANIFEST, &bundle, RELEASE_SIGNERS, never_loaded()).await;
+        assert_eq!(check, Check::Signature);
+        assert_eq!(e.code, error_codes::UPGRADE_SIGNATURE_INVALID);
+        assert!(
+            e.message.starts_with("bundle missing 'cert'"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bundle_with_no_signature_is_signature_invalid_before_any_fetch() {
+        let bundle = edited_bundle(|b| {
+            b.as_object_mut().unwrap().remove("base64Signature");
+        });
+        let (check, e) = refuse(RELEASE_MANIFEST, &bundle, RELEASE_SIGNERS, never_loaded()).await;
+        assert_eq!(check, Check::Signature);
+        assert_eq!(e.code, error_codes::UPGRADE_SIGNATURE_INVALID);
+        assert!(
+            e.message.starts_with("bundle missing 'base64Signature'"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// The `cert` field still has cosign's shape, base64 of a PEM block, but
+    /// the block's body is not base64. It is decoded only once the trust root
+    /// has loaded, so this one needs the trust root.
+    #[tokio::test]
+    async fn a_certificate_that_does_not_decode_is_signature_invalid() {
+        let bundle = edited_bundle(|b| {
+            let pem = "-----BEGIN CERTIFICATE-----\nnot base64!\n-----END CERTIFICATE-----\n";
+            b["cert"] = Value::String(B64.encode(pem));
+        });
+        let (check, e) = refuse(RELEASE_MANIFEST, &bundle, RELEASE_SIGNERS, offline_root()).await;
+        assert_eq!(check, Check::Signature);
+        assert_eq!(e.code, error_codes::UPGRADE_SIGNATURE_INVALID);
+        assert!(
+            e.message.starts_with(
+                "bundle 'cert' does not decode to a certificate: PEM body is not valid base64"
+            ),
+            "{}",
+            e.message
+        );
+    }
+
+    /// No step fails without naming its check, but an error that did would
+    /// still be a refusal, and must fail closed as one.
+    #[test]
+    fn an_unclassified_failure_is_still_signature_invalid() {
+        let e = map_verify_error(anyhow::anyhow!("unclassified"));
+        assert_eq!(e.code, error_codes::UPGRADE_SIGNATURE_INVALID);
     }
 }

@@ -30,7 +30,9 @@ output as a push. The edge then only ever *originates* connections.
 
 - **Inbound:** none.
 - **Outbound:** 443/8443 TCP to the manager, 4433 UDP to the relay, plus
-  whatever your sources/destinations listen on.
+  whatever your sources/destinations listen on. An edge that takes
+  manager-driven upgrades also needs 443 TCP to GitHub's release hosts and
+  to `tuf-repo-cdn.sigstore.dev` (see the matrix).
 - Firewall: `default deny incoming`, `default allow outgoing`. Done.
 
 This is the recommended shape for edges on the public internet or in
@@ -77,6 +79,7 @@ input/output/server config — the values below are the common defaults.
 | Outbound | 443 / 8443 | TCP | Edge → manager (WSS) | Always (control plane) |
 | Outbound | 4433 | UDP (QUIC) | Edge → relay tunnel | Only with relay/direct tunnels |
 | Outbound | *operator-configured* | UDP (incl. QUIC) | Bonded **output** legs → the far edge (`remote`, or the QUIC leg's `addr`, or `relay_addrs` on a relay leg) | Only for bonded outputs |
+| Outbound | 443 | TCP (HTTPS) | Edge → GitHub and Sigstore, for a manager-driven upgrade: the release manifest, its signature bundle and the binary tarball from `github.com`, which redirects each download to its release CDN, `release-assets.githubusercontent.com` (older GitHub flows used `objects.githubusercontent.com`; the edge follows a redirect only to `github.com` or a `*.githubusercontent.com` host); and Sigstore's TUF repository, `tuf-repo-cdn.sigstore.dev`, for the TUF metadata vouching for the Fulcio and Rekor keys the signature is checked against, fetched on every verification | Only with `upgrades.enabled: true`, while an upgrade runs. Blocked, the upgrade fails closed — see [`upgrade.md`](upgrade.md#three-trust-roots) |
 | Inbound | *operator-configured* | UDP | SRT **listener** input | Only for SRT listener-mode inputs |
 | Inbound | *operator-configured* | UDP | RTP / UDP receiver input | Only for RTP/UDP inputs |
 | Inbound | 1935 (operator-configured) | TCP | RTMP ingest | Only for RTMP listener inputs |
@@ -88,7 +91,7 @@ input/output/server config — the values below are the common defaults.
 | Inbound | *operator-configured* (even) **and that port + 1** | UDP | Bonded **input** leg, `transport: rist` — `local_bind` carries RTP, `local_bind + 1` carries RTCP (derived, not configurable) | Only for bonded inputs with a RIST leg |
 | Inbound | *operator-configured* | UDP (QUIC) | Bonded **input** leg, `transport: quic` — the leg's `addr`; a bonded input is **always** the QUIC server whatever `role` the config carries | Only for bonded inputs with a QUIC leg |
 | In/out | 319, 320 | UDP | PTP (IEEE 1588) | Only for ST 2110 / PTP-disciplined setups |
-| In/out | 5353 | UDP (mcast) | NMOS / mDNS-SD **discovery** only — the IS-04/IS-05/IS-08 APIs themselves ride the 8080 API listener under `/x-nmos/**` | Only for NMOS environments |
+| In/out | 5353 | UDP (mcast) | NMOS / mDNS-SD **discovery** only — the IS-04/IS-05/IS-08 APIs themselves ride the 8080 API listener under `/x-nmos/**` | Announced whenever the API listens on a non-loopback address (see [nmos.md](nmos.md)); a loopback-only bind keeps it on loopback |
 | Inbound | 8080 (operator-configured) | TCP | Edge local HTTP API + setup wizard | Optional, on-site access only — see note |
 | Inbound | *operator-configured* (examples use 9090) | TCP | Edge monitor dashboard — a **second** HTTP server, separate from the 8080 API | Only when a `monitor` block is present |
 

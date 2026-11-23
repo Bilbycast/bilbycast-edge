@@ -8,8 +8,11 @@
 //! the output rate under AAC-LC).
 
 use super::*;
-use crate::engine::aac_config::AacConfig;
-use crate::engine::ts_test_fixtures::{aac_program_ts, he_aac_adts, pce_signalled_adts, sine_aac_lc_frames};
+use crate::engine::ts_test_fixtures::{aac_program_ts, pce_signalled_adts, sine_aac_lc_frames};
+// Used by the fdk-aac tests below alone (`he_aac_adts` is built with the fdk
+// encoder).
+#[cfg(feature = "fdk-aac")]
+use crate::engine::{aac_config::AacConfig, ts_test_fixtures::he_aac_adts};
 use crate::manager::events::Event;
 
 fn config(audio_encode: Option<serde_json::Value>) -> CmafOutputConfig {
@@ -52,6 +55,7 @@ fn run(ts: &[u8], config: &CmafOutputConfig) -> (CmafState, Vec<bool>, Vec<Event
 }
 
 /// The track's AudioSpecificConfig and its buffered samples' bodies.
+#[cfg(feature = "fdk-aac")]
 fn track_and_samples(state: &mut CmafState) -> (Vec<u8>, u16, Vec<Vec<u8>>) {
     let seg = state.audio_seg.as_mut().expect("an audio track");
     let asc = seg.track.aac_asc().expect("an AAC track").to_vec();

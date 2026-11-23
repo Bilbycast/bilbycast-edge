@@ -28,16 +28,18 @@ The trust model is described in [docs/security.md](security.md). This document i
 | Actor | What it can do | What it can't do |
 |---|---|---|
 | **Bilbycast (publisher)** | Mint releases by running the GitHub Actions workflow on `Bilbycast/bilbycast-edge`. Holds **no long-lived signing key**. | Sign anything outside a workflow run on the pinned repo + workflow path. |
-| **Customer's manager** | Schedule an upgrade by naming a `(version, channel)` tuple. | Influence URL, hash, or bytes. Forge a Sigstore signature. Reach inside the trust roots compiled into the edge. |
-| **The edge** | Decide whether to install. Verify Sigstore signature against compiled-in trust roots. Atomically swap symlink. Roll back on failed boot. | Install anything that isn't a real Bilbycast release matching the compiled-in identity allowlist. |
+| **Customer's manager** | Schedule an upgrade by naming a `(version, channel)` tuple. | Influence URL, hash, or bytes. Forge a Sigstore signature. Change the edge's trust roots (Sigstore's TUF root embedded in the binary, and the compiled-in identity allowlist). |
+| **The edge** | Decide whether to install. Verify the Sigstore signature against Sigstore's TUF-verified trust root and the compiled-in identity allowlist. Atomically swap symlink. Roll back on failed boot. | Install anything that isn't a real Bilbycast release matching the compiled-in identity allowlist. |
 
-### Three trust roots compiled into the edge
+### Three trust roots
 
 | Root | Source | Rotation |
 |---|---|---|
-| **Sigstore Fulcio CA root cert** | `sigstore` Rust crate | Routine `cargo update` — rotates rarely (years). Sigstore announces in advance. |
-| **Rekor public key** | `sigstore` Rust crate | Same. |
-| **`ALLOWED_SIGNERS` identity allowlist** | [`src/upgrade/trust.rs`](../src/upgrade/trust.rs) | Only when the release workflow path itself changes (essentially never). |
+| **Sigstore Fulcio CA certificates** | Sigstore's `trusted_root.json`, fetched and verified through Sigstore's TUF repository (`tuf-repo-cdn.sigstore.dev`) at every verification. The only Sigstore anchor compiled into the edge is the TUF root (`root.json`, embedded in the `sigstore` crate) that the fetch starts from; the crate's embedded copy of `trusted_root.json` is used only while its hash matches the TUF-signed one. | Through TUF — a Fulcio rotation reaches a deployed edge without a new release, and a TUF root rotation is followed by walking Sigstore's signed root chain forward from the embedded root. |
+| **Rekor public key** | Same `trusted_root.json`, same TUF check. | Same. |
+| **`ALLOWED_SIGNERS` identity allowlist** | [`src/upgrade/trust.rs`](../src/upgrade/trust.rs), compiled in. | Only when the release workflow path itself changes (essentially never). |
+
+Because the Sigstore keys are fetched rather than compiled in, an upgrading edge needs outbound HTTPS to `tuf-repo-cdn.sigstore.dev` as well as to GitHub. With no route to it the trust root cannot load and the upgrade fails closed. An edge on a release after v0.117.0 reports that as `upgrade_network_error`, the code a failed manifest or bundle fetch also reports, and the ack's message names the Sigstore trust root; v0.117.0 and earlier report it, and a failed Rekor check too, as `upgrade_signature_invalid` with the message `Sigstore Fulcio + Rekor verification failed`. The code comes from the edge doing the verifying, which is the edge being upgraded, so an upgrade from v0.117.0 onto a later release still reports the old code. The TUF timestamp, snapshot and targets metadata that vouch for the keys are fetched on every verification and never stored, so there is no offline mode. Offline, the message can read `root metadata is expired` rather than name a failed fetch: tough takes a next root it cannot fetch for the end of the root chain, and the TUF root embedded in the binary has expired (sigstore 0.15.1 embeds version 12, which expired 2025-08-19), so a live edge depends on walking the chain forward.
 
 The allowlist pins four claims that **all** must match for a Sigstore-signed manifest to be accepted:
 
@@ -119,15 +121,26 @@ Edge UpgradeCoordinator (src/upgrade/mod.rs)
     │
     ├── 5. Verify Sigstore bundle (src/upgrade/verify.rs):
     │        a. parse cosign bundle JSON
-    │        b. cert chains to compiled-in Fulcio root
+    │        b. load Sigstore's trust root: TUF metadata from
+    │           tuf-repo-cdn.sigstore.dev, walked forward from the embedded TUF
+    │           root, vouches for trusted_root.json (Fulcio CAs + Rekor keys);
+    │           unreachable ⇒ fail closed. The cert must be signed by one of
+    │           those Fulcio CAs (ecdsa-with-SHA384 by the P-384
+    │           sigstore-intermediate today)
     │        c. cert SAN identity claims (issuer, repo, ref, workflow)
     │           match an entry in ALLOWED_SIGNERS
-    │        d. Rekor inclusion proof valid against compiled-in Rekor pubkey;
-    │           integratedTime within cert validity window
+    │        d. Rekor entry: its body binds this manifest's SHA-256 and
+    │           this cert; its Signed Entry Timestamp verifies under a
+    │           Rekor key from that trust root; its integratedTime falls
+    │           within the cert's validity window
     │        e. ECDSA-P256 signature over manifest bytes verifies under
     │           the cert's pubkey
-    │      Failure ⇒ upgrade_signature_invalid / upgrade_identity_not_allowed /
-    │      upgrade_rekor_invalid Critical event, abort.
+    │      Failure ⇒ abort, with the code on the command_ack (an edge
+    │      after v0.117.0; v0.117.0 and earlier report b and d as
+    │      upgrade_signature_invalid):
+    │      upgrade_network_error (b: the trust root did not load) /
+    │      upgrade_signature_invalid (a, the chain in b, e) /
+    │      upgrade_identity_not_allowed (c) / upgrade_rekor_invalid (d).
     │
     ├── 6. Cross-check verified manifest:
     │        - manifest.version == requested version
@@ -204,14 +217,14 @@ When both conditions hold the watchdog flips the status to `stable` and emits `u
 
 | Concern | Defence |
 |---|---|
-| Compromised manager force-installs malicious code | Edge constructs URL deterministically from `(version, channel)`. Manager has no input on URL or hash. Manifest must verify against compiled-in trust roots before any tarball is fetched. Worst a bad manager can do: install a real Bilbycast release. |
+| Compromised manager force-installs malicious code | Edge constructs URL deterministically from `(version, channel)`. Manager has no input on URL or hash. Manifest must verify against Sigstore's TUF-verified trust root and the compiled-in identity allowlist before any tarball is fetched. Worst a bad manager can do: install a real Bilbycast release. |
 | Compromised manager forces vulnerable old release | `min_version` + `rollback_grace` + `manifest.sequence > state.last_sequence` reject it. |
 | Compromised manager forces wrong channel / variant | `allowed_channels` config; manifest carries `channel`; per-(arch, variant) artefact lookup must succeed. |
 | MITM on download | TLS to GitHub via system rustls roots **plus** the Sigstore signature check — both layers must break. |
 | Tampered tarball at rest on GitHub | SHA-256 inside the signed manifest must match the streamed digest. Tampering invalidates the signature. |
 | Stolen GitHub PAT / rogue org admin overwrites a release | Bytes can be uploaded but no valid Sigstore signature can be produced without running a workflow on `Bilbycast/bilbycast-edge`. If that happens, the signing event is permanently logged in Rekor against a specific commit + tag — forensically detectable, never silent. |
 | Workflow run hijack (e.g. malicious PR triggering the release workflow) | Workflow gated on `on: push: tags: ['v*']` plus `workflow_dispatch` restricted to maintainers via GitHub `environments`. PR-triggered runs cannot reach the signing step. |
-| Sigstore Fulcio root or Rekor pubkey compromised / rotated | Edge ships with constants from the `sigstore` crate; routine `cargo update` picks up rotations. Standard rotation path; Sigstore announces well in advance. |
+| Sigstore Fulcio root or Rekor pubkey compromised / rotated | Not compiled in: the edge fetches Sigstore's `trusted_root.json` through Sigstore's TUF repository at every verification and trusts it only once TUF metadata — walked forward from the TUF root embedded in the binary — vouches for it, so Sigstore rotates or revokes a key there and deployed edges follow without a release. A network attacker cannot substitute keys (TUF signatures), and an unreachable TUF repository fails the upgrade closed. |
 | Crash-loop after upgrade | Boot watchdog reverts after `max_boot_attempts` (default 3) failed boots. |
 | New binary boots but never authenticates to manager | Periodic watchdog times out at `boot_health_window_secs` (default 120 s); state stays `pending_health`, manager UI surfaces it, operator can manually roll back. |
 | Power loss mid-stage | Atomic `rename(2)` for partial → final and current.tmp → current. fsync'd state.json + parent dir. Partial extractions live under `versions/<new>.partial/` and are GC'd on next boot. |
@@ -253,7 +266,7 @@ When both conditions hold the watchdog flips the status to `stable` and emits `u
 |---|---|
 | `src/upgrade/mod.rs` | `UpgradeCoordinator` lifecycle, single-flight guard, `error_codes` constants, global handle for the manager dispatch arm. |
 | `src/upgrade/manifest.rs` | Manifest schema, URL host whitelist, `derive_release_base_url`, `check_version_window`. |
-| `src/upgrade/verify.rs` | Sigstore bundle verify — Fulcio cert chain + identity allowlist + Rekor inclusion proof + ECDSA-P256 signature over manifest. |
+| `src/upgrade/verify.rs` | Sigstore bundle verify — Fulcio cert chain + identity allowlist + Rekor entry (body binding + Signed Entry Timestamp) + ECDSA-P256 signature over manifest. Each refusal names its `Check`, which `map_verify_error` in `mod.rs` turns into the `error_code`. |
 | `src/upgrade/trust.rs` | Compile-time `ALLOWED_SIGNERS` allowlist + `ref_matches` glob helper. |
 | `src/upgrade/download.rs` | `reqwest`-based fetch with strict TLS + `https_only`, streaming SHA-256, retry with backoff (3 attempts, 250 ms / 500 ms / 1 s). Manifest cap 1 MiB, tarball cap 512 MiB. |
 | `src/upgrade/apply.rs` | Tarball extraction (with `..` segment + absolute-path rejection), atomic symlink swap, partial-dir GC. |

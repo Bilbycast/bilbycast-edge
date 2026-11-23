@@ -144,17 +144,17 @@ impl<'a> StunMessage<'a> {
         let method = Method::from_typ(typ);
         let trans_id = TransId::from_slice(&buf[8..20]);
 
-        let mut message_integrity_offset = 0;
+        let mut message_integrity_offset = None;
 
         let attrs = Attributes::parse(&buf[20..], trans_id, &mut message_integrity_offset)?;
 
         // length including message integrity attribute
-        let (integrity_len, integrity) = if message_integrity_offset > 0 {
-            let integrity_len = (message_integrity_offset + 4 + 20) as u16;
+        let (integrity_len, integrity) = if let Some(off) = message_integrity_offset {
+            let integrity_len = (off + 4 + 20) as u16;
 
             // password as key is called "short-term credentials"
             // buffer from beginning including header (+20) to where message-integrity starts.
-            let integrity = &buf[0..(message_integrity_offset + 20)];
+            let integrity = &buf[0..(off + 20)];
 
             (integrity_len, integrity)
         } else {
@@ -164,7 +164,7 @@ impl<'a> StunMessage<'a> {
         if method == Method::Binding && class == Class::Success {
             // // message-integrity only includes the length up until and including
             // // the message-integrity attribute.
-            if message_integrity_offset == 0 {
+            if message_integrity_offset.is_none() {
                 return Err(StunError::Parse(
                     "No message integrity in incoming STUN binding reply".into(),
                 ));
@@ -176,7 +176,7 @@ impl<'a> StunMessage<'a> {
         } else if method == Method::Binding && class == Class::Request {
             // // message-integrity only includes the length up until and including
             // // the message-integrity attribute.
-            if message_integrity_offset == 0 {
+            if message_integrity_offset.is_none() {
                 return Err(StunError::Parse(
                     "No message integrity in incoming STUN binding request".into(),
                 ));
@@ -187,7 +187,8 @@ impl<'a> StunMessage<'a> {
             }
             // BILBYCAST PATCH (2026-04-09; re-applied for is 0.9.0 on 2026-05-12,
             // for is 0.11.0 on 2026-08-11 alongside the str0m 0.19 -> 0.22 bump,
-            // and for is 0.11.1 on 2026-10-07 alongside the str0m 0.23 -> 0.24 bump):
+            // for is 0.11.1 on 2026-10-07 alongside the str0m 0.23 -> 0.24 bump,
+            // and for is 0.12.1 on 2026-11-23 alongside the str0m 0.24 -> 0.26 bump):
             // upstream `is` hard-rejects every ICE Binding Request that lacks the
             // PRIORITY attribute. RFC 5245 §7.1.2.1 makes PRIORITY mandatory on
             // connectivity-check requests, but ffmpeg's WHIP muxer omits it in every
@@ -198,8 +199,10 @@ impl<'a> StunMessage<'a> {
             // <bilbycast-edge/Cargo.toml> "WHEN UPGRADING str0m". When the upstream
             // `is` crate accepts such a request end to end (this parser AND the ICE
             // agent, see below) this entire vendor/ tree can be deleted along with
-            // the [patch.crates-io] entry in Cargo.toml. Checked again at 0.11.1:
-            // the rejection is still there, byte-identical.
+            // the [patch.crates-io] entry in Cargo.toml. Checked again at 0.12.1:
+            // the rejection is still there, unchanged. (0.12 did change the lines
+            // around it: the MESSAGE-INTEGRITY offset became an `Option`, #1073, so
+            // an integrity attribute that comes first is no longer taken for none.)
             //
             // THIS IS ONE OF TWO HUNKS, and it is unsafe on its own. A PRIORITY-less
             // request that passes this parser and the integrity check reaches
@@ -423,20 +426,17 @@ impl<'a> StunMessage<'a> {
     /// Verify the integrity of this message against the provided password.
     #[must_use]
     pub fn verify(&self, password: &[u8], sha1_hmac: impl Fn(&[u8], &[&[u8]]) -> [u8; 20]) -> bool {
-        if let Some(integ) = self.attrs.message_integrity {
-            let comp = sha1_hmac(
-                password,
-                &[
-                    &self.integrity[..2],
-                    &[(self.integrity_len >> 8) as u8, self.integrity_len as u8],
-                    &self.integrity[4..],
-                ],
-            );
+        let (Some(integ), Some(typ), Some(rest)) = (
+            self.attrs.message_integrity,
+            self.integrity.get(..2),
+            self.integrity.get(4..),
+        ) else {
+            return false;
+        };
 
-            comp[..].ct_eq(integ).into()
-        } else {
-            false
-        }
+        let comp = sha1_hmac(password, &[typ, &self.integrity_len.to_be_bytes(), rest]);
+
+        comp[..].ct_eq(integ).into()
     }
 
     /// Serialize this message into the provided buffer, returning the final length of the message.
@@ -924,7 +924,7 @@ impl<'a> Attributes<'a> {
     fn parse(
         mut buf: &'a [u8],
         trans_id: TransId,
-        msg_integrity_off: &mut usize,
+        msg_integrity_off: &mut Option<usize>,
     ) -> Result<Attributes<'a>, StunError> {
         let mut attributes = Attributes::default();
 
@@ -969,7 +969,7 @@ impl<'a> Attributes<'a> {
                         }
                         // message integrity is up until, but not including the message
                         // integrity attribute.
-                        *msg_integrity_off = off;
+                        *msg_integrity_off = Some(off);
                         ignore_rest = true;
                         attributes.message_integrity = Some(&buf[4..24]);
                     }
@@ -1502,7 +1502,7 @@ mod test {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     fn sha1_hmac(key: &[u8], payloads: &[&[u8]]) -> [u8; 20] {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha1_::Sha1;
         let mut mac = Hmac::<Sha1>::new_from_slice(key).unwrap();
         for p in payloads {
@@ -1764,6 +1764,49 @@ network_cost: (10, 10) \
         );
         assert_eq!(parsed.attrs.data, Some(&[0xDE, 0xAD, 0xBE][..]));
         assert!(parsed.verify(b"password", sha1_hmac));
+    }
+
+    #[test]
+    fn verify_integrity_as_first_attribute() {
+        let message = StunMessage {
+            method: Method::Binding,
+            class: Class::Failure,
+            trans_id: TransId::new(),
+            attrs: Attributes::default(),
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        let mut buf = [0u8; 1024];
+        let len = message
+            .to_bytes(Some(b"password"), &mut buf, sha1_hmac)
+            .unwrap();
+        let serialized = &buf[..len];
+
+        // Header followed directly by MESSAGE-INTEGRITY.
+        assert_eq!(&serialized[20..22], &[0x00, 0x08]);
+
+        let parsed = StunMessage::parse(serialized).unwrap();
+
+        assert!(parsed.verify(b"password", sha1_hmac));
+        assert!(!parsed.verify(b"wrong", sha1_hmac));
+    }
+
+    #[test]
+    fn verify_without_covered_bytes_is_false() {
+        let message = StunMessage {
+            method: Method::Binding,
+            class: Class::Failure,
+            trans_id: TransId::new(),
+            attrs: Attributes {
+                message_integrity: Some(&[0; 20]),
+                ..Default::default()
+            },
+            integrity: &[],
+            integrity_len: 0,
+        };
+
+        assert!(!message.verify(b"password", sha1_hmac));
     }
 
     #[test]

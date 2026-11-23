@@ -3077,13 +3077,15 @@ fn packetize_ts(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
 }
 
 /// Test builders for other modules' chain tests: an MPEG audio PES (stream
-/// id 0xC0) and its TS packetisation.
-#[cfg(test)]
+/// id 0xC0) and its TS packetisation. Gated like their only callers, which
+/// re-encode an ADTS AAC source: this replacer decodes ADTS AAC through
+/// fdk-aac alone (AAC-LATM goes through libavcodec).
+#[cfg(all(test, feature = "media-codecs", feature = "fdk-aac"))]
 pub(crate) fn test_build_audio_pes(es: &[u8], pts: u64) -> Vec<u8> {
     build_audio_pes(0xC0, es, pts)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "media-codecs", feature = "fdk-aac"))]
 pub(crate) fn test_packetize(pid: u16, pes: &[u8], cc: &mut u8) -> Vec<[u8; 188]> {
     packetize_ts(pid, pes, cc)
 }
@@ -5944,6 +5946,7 @@ mod tests {
 
     // ── PCR on the audio PID (defect x) and the pre-PMT gate (4) ──
 
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     fn adts_frames() -> Vec<&'static [u8]> {
         const ADTS: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");
         let mut v = Vec::new();
@@ -5962,6 +5965,7 @@ mod tests {
     }
 
     /// Put a PCR into a packet's stuffing adaptation field (≥ 7 bytes).
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     fn put_pcr_in_stuffing(pkt: &mut [u8; 188], pcr: u64) -> bool {
         if pkt[3] & 0x20 == 0 || pkt[4] < 7 {
             return false;
@@ -5970,6 +5974,8 @@ mod tests {
         crate::engine::ts_parse::write_pcr(pkt, pcr)
     }
 
+    // An AAC (0x0F) source: this replacer decodes AAC through fdk-aac alone.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     #[test]
     fn a_pcr_on_the_audio_pid_survives_as_af_only_with_continuous_cc() {
         use crate::engine::ts_parse::{extract_pcr, pcr_only_packet, ts_cc};

@@ -76,7 +76,7 @@ needless_range_loop = "allow"
 [dependencies]
 # Async runtime
 tokio = { version = "1.52", features = ["full"] }
-tokio-util = "0.7.19"
+tokio-util = "0.7.20"
 # Bridges `tokio::sync::mpsc::Receiver<T>` to `futures::Stream<Item=T>`,
 # which reqwest::Body::wrap_stream expects (used by CMAF-LL chunked PUT).
 tokio-stream = "0.1.19"
@@ -87,14 +87,14 @@ tower-http = { version = "0.7.1", features = ["cors", "trace"] }
 
 # Serialization
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 
 # Logging
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # CLI
-clap = { version = "4.6.7", features = ["derive"] }
+clap = { version = "4.6.9", features = ["derive"] }
 
 # Time
 chrono = "0.4.45"
@@ -133,15 +133,11 @@ dashmap = "=7.0.0-rc2"
 arc-swap = "1.9"
 
 # Byte buffers
-bytes = "1.12.1"
-
-# Enum utilities
-strum = { version = "0.28.0", features = ["derive"] }
-strum_macros = "0.28.0"
+bytes = "1.12.2"
 
 # Socket config
 socket2 = "0.6.5"
-libc = "0.2.190"
+libc = "0.2.191"
 
 # Network interface enumeration (used by util::network_interfaces to populate
 # HealthPayload.network_interfaces — name, IPv4/IPv6, MAC, MTU, loopback).
@@ -150,53 +146,73 @@ libc = "0.2.190"
 if-addrs = "0.15"
 
 # Random
-rand = "0.10.3"
+rand = "0.10.4"
 
 # Pure-Rust audio sample rate conversion (used by the per-output PCM
 # transcode stage in `engine::audio_transcode` to bridge mismatched
 # ST 2110-30 / -31 / rtp_audio formats and feed the SMPTE 302M-over-SRT
 # pipeline). No C deps.
-rubato = "5.0.1"
+rubato = "5.1.0"
 
-# Pure-Rust audio codec decoder (used by `engine::audio_decode` to convert
 # ── AAC backend ─────────────────────────────────────────────────────────
 # Default: fdk-aac (C library via FFI). Supports AAC-LC, HE-AAC v1/v2,
 # multichannel up to 7.1, AAC-LD/ELD. Used for both decode and encode.
-# Fallback: symphonia (pure Rust, AAC-LC mono/stereo only).
+# Fallback: symphonia (pure Rust, AAC-LC mono/stereo only), behind the opt-in
+# `aac-symphonia` feature. A build needs one of the two: with neither,
+# `engine::audio_decode` stops the build with a `compile_error!` naming both.
 #
-# To disable fdk-aac: cargo build --no-default-features --features tls,webrtc
+# To build without fdk-aac:
+#   cargo build --no-default-features --features tls,webrtc,media-codecs,replay,aac-symphonia
 # ────────────────────────────────────────────────────────────────────────
 aac-audio = { path = "../bilbycast-fdk-aac-rs/aac-audio", optional = true }
 aac-codec = { path = "../bilbycast-fdk-aac-rs/aac-codec", optional = true }
+# Optional, behind `aac-symphonia`, because Cargo cannot say "only when fdk-aac
+# is off": as a plain dependency it was compiled into every build and used by
+# none that shipped, so cargo's `unused_dependencies` lint flagged it on every
+# default and release build. The decoder is compiled only under
+# `all(feature = "aac-symphonia", not(feature = "fdk-aac"))`, so a build that
+# turns both features on decodes with fdk-aac and leaves symphonia unused (and
+# cargo says so).
+#
 # 0.6.0 reworked the audio API wholesale — `AudioBufferRef` -> `GenericAudioBufferRef`,
 # `Signal` -> `Audio`, `SignalSpec` -> `AudioSpec`, `Channels` from a bitflags set to
 # an enum wrapping `Position`, and the codec types split into `codecs::audio::*`
 # (`CodecParameters` -> `AudioCodecParameters`, `DecoderOptions` -> `AudioDecoderOptions`,
 # `CODEC_TYPE_AAC` -> `well_known::CODEC_ID_AAC`). The port lives in the
-# `#[cfg(not(feature = "fdk-aac"))]` half of `engine::audio_decode`.
+# symphonia half of `engine::audio_decode`.
 #
 # This was previously held on the claim that the fallback "does NOT compile at
 # present" because a bare `--no-default-features` build fails on unrelated
 # `media-codecs` gating. That conflated two different configurations. The
 # symphonia decoder needs `fdk-aac` off, NOT `media-codecs` off, and
-# `--no-default-features --features tls,webrtc,media-codecs,replay` builds and
-# its tests pass. (Note `display` implies `fdk-aac`, so it must be dropped too —
-# leaving it on silently re-enables fdk-aac and hides the symphonia path.)
-# That config is not warning-clean — it carries ~12 pre-existing dead-code
-# warnings — and it is not CI-gated; CI checks default features only.
+# `--no-default-features --features tls,webrtc,media-codecs,replay,aac-symphonia`
+# builds, and its `engine::audio_decode` tests pass, symphonia's real-bitstream
+# decode among them. So does its whole lib suite, with the tests that need
+# fdk-aac gated on it: the TS audio replacer (`engine::ts_audio_replace`, behind
+# every TS output's and the ingress transcoder's `audio_encode`) decodes an ADTS
+# AAC source (stream_type 0x0F) and encodes an AAC target through fdk-aac alone,
+# with no symphonia or ffmpeg fallback, so without it such a re-encode carries
+# no audio; an AAC-LATM source (0x11) it decodes through libavcodec. (Note
+# `display` implies `fdk-aac`, so it must be dropped too — leaving it on
+# silently re-enables fdk-aac and hides the symphonia path.) That config is
+# not warning-clean — 12 pre-existing warnings on the lib and 25 on the bin
+# (11 of them duplicates): dead code, unused imports and unused variables —
+# and no CI job builds it.
 #
 # The `media-codecs`-off gating defects that motivated the original hold are
 # fixed here (stub `ResolvedBackendCell` + `ProbeUnavailable`, two `#[cfg]`
 # corrections in `thumbnail.rs`), so `--no-default-features --features
-# tls,webrtc,replay` now compiles where it previously did not. A *bare*
-# `--no-default-features` build still fails, but the remaining ~29 errors are
-# `webrtc` gating in `engine::output_webrtc` plus one E0308 in
-# `manager::client` — no longer a media-codecs problem. Tracked separately.
+# tls,webrtc,replay,aac-symphonia` now compiles where it previously did not. A
+# *bare* `--no-default-features` build still fails: it has no AAC decoder (the
+# `compile_error!` in `engine::audio_decode`), and with `aac-symphonia` added it
+# still fails on `webrtc` gating in `engine::output_webrtc` (53 errors) and
+# `replay` gating in `engine::cmaf::clips` (1) — no longer a media-codecs
+# problem (counted 2026-11-23). Tracked separately.
 #
 # Still true, and the reason this stays a fallback: no shipped release artefact
 # exercises it. All three publish with `display` on, which forces `fdk-aac`, so
 # fdk-aac is the active AAC decoder everywhere in production.
-symphonia = { version = "0.6.1", features = ["aac"], default-features = false }
+symphonia = { version = "0.6.1", features = ["aac"], default-features = false, optional = true }
 
 # ── FFmpeg / libav base codec layer (the `media-codecs` feature) ──────
 # In-process video decode, JPEG thumbnail encode, audio decode/encode
@@ -245,14 +261,14 @@ decklink-rs = { path = "../bilbycast-decklink-rs/decklink-rs", optional = true }
 rga-rs = { path = "../bilbycast-rga-rs/rga-rs", optional = true }
 
 # System resource monitoring (CPU, RAM)
-sysinfo = "0.39.6"
+sysinfo = "0.40.4"
 
 # Error handling
 anyhow = "1.0.104"
 
 # Auth (JWT / HMAC-SHA256)
 hmac = "0.13.0"
-sha2 = "0.11.0"
+sha2 = "0.11.1"
 base64 = "0.23.1"
 serde_urlencoded = "0.7.1"
 subtle = "2.6"
@@ -260,20 +276,22 @@ subtle = "2.6"
 # Secrets encryption at rest (AES-256-GCM for secrets.json)
 aes-gcm = "0.11.1"
 # Pure-Rust CENC ciphers for CMAF output (Common Encryption ISO/IEC 23001-7):
-#   cenc scheme → AES-128-CTR, cbcs scheme → AES-128-CBC with 1:9 block
-#   pattern. RustCrypto audited crates, MIT/Apache-2.0. Tiny binary cost.
+#   cenc scheme → AES-128-CTR (`ctr`), cbcs scheme → AES-128-CBC with 1:9
+#   block pattern, chained by hand over the `aes` block cipher in
+#   `engine::cmaf::cenc` (the `cbc` crate was declared here but never used,
+#   and was dropped). RustCrypto audited crates, MIT/Apache-2.0. Tiny binary
+#   cost.
 aes = "0.9"
 ctr = "0.10"
-cbc = "0.2"
 
 # UUID for flow IDs
-uuid = { version = "1.27.0", features = ["v4", "v5", "serde"] }
+uuid = { version = "1.29.3", features = ["v4", "v5", "serde"] }
 
 # WebSocket client for manager connection
 tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
-webpki-roots = "1.0.9"
+webpki-roots = "1.0.12"
 futures-util = "0.3.34"
-url = "2.5.8"
+url = "2.5.9"
 
 # Netlink (gateway-mode bonded-path policy routing — engine::bond_routing).
 # Pure Rust; uses the edge process's CAP_NET_ADMIN at runtime.
@@ -287,36 +305,87 @@ url = "2.5.8"
 #     rtnetlink 0.21 -> netlink-packet-route ^0.30
 #     rtnetlink 0.22 -> netlink-packet-route ^0.32.1
 #     rtnetlink 0.23 -> netlink-packet-route ^0.33
+#     rtnetlink 0.24 -> netlink-packet-route ^0.34 (and netlink-packet-core ^0.9,
+#                       netlink-proto ^0.14.1, netlink-sys ^0.9, nix ^0.31.3)
 # Bump ours only in lockstep with rtnetlink's requirement, never ahead of it.
+#
+# netlink-packet-route / -core 1.0.0-rc2 (2026-11-15) are HELD: rtnetlink
+# 0.24.0, the latest published, requires netlink-packet-route ^0.34 and
+# netlink-packet-core ^0.9, which no 1.0 prerelease satisfies, so naming the rc
+# here would resolve two netlink-packet-route copies and break the type
+# unification above (E0308). Move only when a PUBLISHED rtnetlink requires 1.0,
+# and re-audit is_intact / del_* / gc_reserved then: upstream rtnetlink main
+# makes request streams fallible ("adapt to fallible netlink-proto request
+# streams"), and netlink-proto 1.0.0-rc1 surfaces connection errors in the
+# handle and changes how packed datagrams are split.
 #
 # Moving rtnetlink 0.21 -> 0.23 drags THREE more 0.x majors that we never name
 # in this manifest: netlink-packet-core 0.8.2 -> 0.9.0, netlink-proto
 # 0.12.1 -> 0.13.0 and netlink-sys 0.8.8 -> 0.9.0. Those own the socket and the
 # async framing under rtnetlink, and they were resolved, not source-audited —
-# so the bench verification below is covering five crates, not two.
+# so the bench verification below is covering five crates, not two. Moving
+# 0.23 -> 0.24 drags netlink-proto 0.13.0 -> 0.14.1 (0.14.0 was yanked) and
+# nix 0.30.1 -> 0.31.x (reached only through rtnetlink's namespace and tc
+# helpers, which we do not call); netlink-packet-core and netlink-sys stay at
+# 0.9.0. netlink-proto 0.14.1 WAS source-diffed: codecs.rs (the per-message
+# decode path described below) is byte-identical to 0.13.0's, and rtnetlink's
+# route/get.rs, rule/get.rs and try_rtnl! are unchanged.
 #
-# 0.30 -> 0.33 carried no source edits here: the 0.31/0.32/0.33 breaking changes
+# 0.30 -> 0.34 carried no source edits here. The 0.31/0.32/0.33 breaking changes
 # are in the link / vxlan / tc modules plus a zerocopy rewrite of the *buffer*
-# parsing types, and RouteMessage, RouteHeader, RouteAttribute, RuleMessage,
-# RuleHeader, RuleAction and RuleAttribute — the whole of what we touch — are
-# unchanged. That zerocopy rewrite is nonetheless the one thing to watch: it
+# parsing types; the 0.34 ones (rule TunId u32 -> u64, RTAX_CC_ALGO -> String,
+# a new RouteAttribute::NewDestinationAddress, vxlan / erspan options,
+# TTL_PROPAGATE values, CAN, tc) touch nothing we name. RouteMessage,
+# RouteHeader, RuleMessage, RuleHeader and RuleAction are unchanged, and so are
+# the only attribute variants we name, RouteAttribute::Table(u32) and
+# RuleAttribute::Priority(u32); both enums are #[non_exhaustive] and matched
+# with a wildcard. The zerocopy rewrite is nonetheless the one thing to watch: it
 # rewrote the parse path that feeds `route_table()` and `rule_priority()`, and a
 # regression there would be SILENT (a healthy leg reported dead by `is_intact`,
-# a GC sweep that removes nothing) rather than a crash — `is_intact` and
-# `del_*` drive their dumps with `while let Ok(Some(..))`, which cannot tell a
-# failed dump from an empty one. And the exposure is wider than the two fields
-# we read: `del_rules_with_priority` / `del_routes_in_table` / `gc_reserved`
-# hand the DUMPED message straight back to the kernel as RTM_DELRULE /
-# RTM_DELROUTE, so every attribute round-trips through the new parser, not just
-# `route_table()` and `rule_priority()`. The netlink calls need a live kernel +
-# CAP_NET_ADMIN and no unit test covers them, so a green build is not evidence.
-# Verify on a bench host that also carries a nexthop-group or multipath route
-# (the 0.32 additions most likely to round-trip differently): program a
-# gateway-mode leg, check `ip rule show` / `ip route show table <T>` against
-# what `program()` claims, then kill the edge and confirm the startup GC sweep
-# removes the orphans on the next boot.
-rtnetlink = "0.23"
-netlink-packet-route = "0.33"
+# a GC sweep that removes nothing) rather than a crash. `is_intact` drives its
+# dump with `while let Ok(Some(..))`, which cannot tell a failed dump from an
+# empty one; `del_rules_with_priority` / `del_routes_in_table` / `gc_reserved`
+# use `while let Some(..) = try_next().await?`, which propagates a dump ERROR,
+# but teardown and program() discard it and global() only logs it. A
+# per-message PARSE failure reaches neither shape: netlink-proto's
+# NetlinkCodec::decode logs "failed to decode packet" at ERROR (target
+# netlink_proto::codecs) and skips that message, so a route our parser rejects
+# is simply absent from the dump; a framing failure (a bad nlmsg_len) drops the
+# rest of that datagram, not just the one message.
+#
+# 0.34 changes which FOREIGN messages that hits. It now parses some that 0.33
+# dropped (a rule carrying tun_id, a route whose `congctl` metric name is not
+# three characters long, an empty multipath), so such a rule or route inside
+# our reserved table / priority ranges is now seen, and deleted, by
+# gc_reserved / del_*. And it parses lwtunnel encaps (ip, ip6, xfrm, rpl,
+# ioam6, seg6local) that 0.33 kept opaque, so a malformed one on a foreign
+# route can now vanish from a dump. Our own rules and routes carry none of these.
+#
+# And the exposure is wider than the two fields we read:
+# `del_rules_with_priority` / `del_routes_in_table` / `gc_reserved` hand the
+# DUMPED message straight back to the kernel as RTM_DELRULE / RTM_DELROUTE, so
+# every attribute round-trips through the new parser, not just `route_table()`
+# and `rule_priority()`. The netlink calls need a live kernel + CAP_NET_ADMIN
+# and no unit test covers them, so a green build is not evidence. STILL OWED,
+# for 0.24 / 0.34 as for every bump since 0.21: verify on a bench host that also
+# carries a nexthop-group or multipath route (the 0.32 additions), plus the 0.34
+# parse changes (a `congctl` metric route, an `encap ip / ip6 / xfrm / rpl /
+# ioam6 / seg6local` route, a rule carrying `tun_id`): program a gateway-mode
+# leg, check `ip rule show` / `ip route show table <T>` against what
+# `program()` claims, run past several 5 s reassert ticks with no "was missing
+# ... re-programmed" churn, then kill the edge and confirm the startup GC sweep
+# removes the orphans on the next boot. examples/bond_route_smoke.rs and the
+# netns rig testbed/bond-gateway-smoke/run.sh already drive exactly this; both
+# need root.
+#
+# Do not switch to `rtnetlink::new_connection_with_strict_check()` (new in 0.24)
+# without rewriting every route dump filter first: they are built with
+# `RouteMessageBuilder::new().build()`, whose header names the main table,
+# protocol static and type unicast, and the kernel honours those only under
+# strict check — `is_intact` would never pass and the GC would never see our
+# tables.
+rtnetlink = "0.24"
+netlink-packet-route = "0.34"
 
 # ── SRT backend ──────────────────────────────────────────────────────────
 # Haivision libsrt wrapper. Native SRT bonding, guaranteed FEC/encryption
@@ -386,21 +455,32 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # tarball, semver comparison for `min_version` / `rollback_grace`, file
 # locks for `state.json`, and Sigstore keyless-signature verification
 # (Fulcio cert chain, identity allowlist, Rekor inclusion proof).
-# All pure-Rust crates — `flate2` defaults to its `miniz_oxide` backend so
-# we don't pull zlib at link time; `sigstore` ships the Fulcio CA root +
-# Rekor public key as compiled-in constants.
+# `flate2` defaults to its `miniz_oxide` backend so we don't pull zlib at
+# link time. `sigstore` verifies with aws-lc-rs (already linked by rustls)
+# against Sigstore's `trusted_root.json`, which it checks on every
+# verification against TUF metadata fetched online, walked forward from the
+# TUF root embedded in the crate — no Fulcio or Rekor key is trusted from the
+# binary alone, and with no route to the TUF repository the upgrade fails
+# closed.
 tar = "0.4"
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 semver = { version = "1.0", features = ["serde"] }
 fs2 = "0.4"
-sigstore = { version = "0.14", default-features = false, features = ["sigstore-trust-root", "cached-client"] }
-# HELD at 0.2 deliberately — x509-cert 0.3.0 is out, but sigstore 0.14 (the
-# latest) still requires ^0.2. Bumping ours alone resolves BOTH into the graph,
-# putting a second X.509 parser in the upgrade-signature verification path for
-# no functional gain (we only need `Certificate::from_der` + extension access,
-# and we hand sigstore raw SPKI/signature bytes, never a shared type). Move
-# this in lockstep with sigstore, not ahead of it.
-x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+# sigstore 0.15 selects its crypto backend by TLS feature and refuses to
+# compile with neither: `rustls-tls` = aws-lc-rs (already linked via rustls and
+# tough), the backend 0.14 hard-wired. Never `native-tls`: it moves signature
+# verification to OpenSSL and links system libssl — and because Cargo features
+# unify, any crate in the graph that turns it on (a plain `sigstore = "0.15"`
+# does, through sigstore's defaults) silently moves this verifier to OpenSSL
+# too. `cached-client` is off: it only caches the cosign OCI registry client,
+# which we never compile.
+sigstore = { version = "0.15.1", default-features = false, features = ["sigstore-trust-root", "rustls-tls"] }
+# Lockstep with sigstore: 0.15 requires x509-cert ^0.3. A different minor here
+# would resolve a second X.509 parser into the upgrade-signature verification
+# path, and it would compile silently, because we hand sigstore raw
+# SPKI/signature bytes, never a shared type. Move the two together, never this
+# one ahead of sigstore.
+x509-cert = { version = "0.3.1", default-features = false, features = ["std"] }
 
 [features]
 # `display` is in the default feature set: every Linux release variant
@@ -418,8 +498,20 @@ default = ["tls", "webrtc", "fdk-aac", "media-codecs", "replay", "display"]
 # Pure-Rust, no new C deps. See `src/replay/` and `docs/replay.md`.
 replay = []
 # Enable in-process AAC decode/encode via Fraunhofer FDK AAC (C library).
-# Replaces symphonia (decode) and ffmpeg subprocess (AAC encode).
+# Without it, AAC decode needs `aac-symphonia` and AAC encode falls back to an
+# ffmpeg subprocess (RTMP, CMAF, a PCM/SDI input's `audio_encode`), except in
+# two in-process re-encoders that have neither: the TS audio replacer, which
+# then decodes no ADTS AAC source (stream_type 0x0F; AAC-LATM, 0x11, it
+# decodes through libavcodec under `media-codecs`) and encodes no AAC target,
+# and, under `media-codecs`, the HLS segment remuxer, where an HE-AAC target
+# refuses to start and a segment it cannot re-encode is skipped.
+# With both on, fdk-aac decodes and symphonia goes unused.
 fdk-aac = ["dep:aac-audio", "dep:aac-codec"]
+# Pure-Rust AAC decode via symphonia (AAC-LC mono/stereo only), for a build
+# without `fdk-aac`. Off by default: no release artefact uses it, since every
+# one carries `display`, which implies `fdk-aac`. A build must enable one of
+# the two (`engine::audio_decode` refuses to compile with neither).
+aac-symphonia = ["dep:symphonia"]
 # FFmpeg / libav base codec layer. Bundles:
 #   - Universal CPU video decode (H.264 / HEVC / MPEG-2) via libavcodec —
 #     used by transcode input decode, content analysis (video_full),
@@ -675,17 +767,96 @@ version = "0.26.6"
 optional = true
 
 [dependencies.axum-server]
-version = "0.8.0"
+# 0.9.2, up from 0.8.0. One behaviour change reaches operators: the server TLS
+# private key's type now comes from its PEM label (`PRIVATE KEY` = PKCS#8,
+# `RSA PRIVATE KEY` = PKCS#1, `EC PRIVATE KEY` = SEC1, rustls-pki-types'
+# `PemObject`), where 0.8.0 re-read the type from the DER itself
+# (`PrivateKeyDer::try_from` in `config_from_der`). A `server.tls.key_path`
+# whose label does not match its body — a PKCS#8 key under `BEGIN RSA PRIVATE
+# KEY`, say — loaded on 0.8.0 and now fails `RustlsConfig::from_pem_file`, so
+# the edge stops at startup with "Failed to load TLS cert/key". `openssl pkey
+# -in key.pem -out fixed.pem` rewrites such a key with the right label (see
+# docs/api-security.md, TLS/HTTPS Setup).
+version = "0.9.2"
 features = ["tls-rustls"]
 optional = true
 
 [dependencies.str0m]
-# 0.24.1, up from 0.23.1. The edge compiles against it unchanged. The only
-# other lock movement is the vendored `is`: str0m 0.24 requires `is ^0.11.1`,
-# which the 0.11.0 vendor tree cannot satisfy, so it was re-vendored (see
-# [patch.crates-io] below). str0m's other raised floors (dimpl ^0.7.4,
-# sctp-proto ^0.10.5) were already locked. Feature table (`openssl`,
-# `vendored`) and MSRV (1.85.0) are unchanged.
+# 0.26.0, up from 0.24.1. 0.25.0 already carries every change that needed an
+# edit here; 0.26.0 adds #1159 and #1168 below, TWCC fixes and a filter for
+# port-0 candidates. Lock movement: str0m-openssl 0.6.0 -> 0.7.0 (still openssl
+# ^0.10.78 / openssl-sys ^0.9.80), str0m-proto 0.7.0 -> 0.8.0, dimpl 0.7 ->
+# 0.9.0 (no default features; everything it needs was locked already), and the
+# vendored `is` 0.11.1 -> 0.12.1: str0m 0.26 requires `is ^0.12.1`, so it was
+# re-vendored with both hunks (see [patch.crates-io] below). The feature table
+# (`openssl`, `vendored`) is unchanged; MSRV rises from 1.85.0 to 1.89.0.
+#
+# The one compile break: `RtcConfig::set_reordering_timeout_video` is gone
+# (#1078). Everything else we call is signature-identical, and str0m's
+# built-in H.264 table, Opus PT and default extmap are byte-identical, so the
+# codec set below is unchanged.
+#
+# Visible on the wire or in behaviour:
+#   * Video receive (WHIP input, WHEP input) can no longer be count-only
+#     (#1078). An incomplete video frame is held until a complete one has
+#     arrived after it and its missing packets have had their NACK attempts
+#     (up to five, an RTT apart) plus three RTTs, or, with no RTX negotiated,
+#     three RTTs from that complete frame's arrival (100 ms RTT until one is
+#     measured); then it is dropped. An incomplete frame with no complete one
+#     after it has no deadline. A frame whose last packet carries no RTP marker
+#     bit counts as incomplete and can never set a deadline itself, so an
+#     H.264 sender that never sets the marker is delivered NO video at all;
+#     0.24's count-only release took such a frame at the timestamp change.
+#     Chrome, ffmpeg, OBS and str0m set the marker. Audio stays count-only
+#     (`set_reordering_timeout_audio(None)`). The loss stalls of 0.26 are not
+#     measured; the 1.02 s / 2.03 s below are 0.23 / 0.24 figures.
+#   * H.264 filler data (NAL unit type 12) is packetized and sent (#1079);
+#     0.24 dropped it in its packetizer. `session::write_media` strips it
+#     first (`strip_h264_filler`), so the padding of a CBR source does not
+#     reach a viewer as bitrate.
+#   * SDP consistency is enforced, on offers and on answers (#1100, #1097,
+#     #1113). 0.24.1 already checked each m-line as it parsed it (one mid,
+#     exactly one direction, an `a=rtpmap` for each dynamic PT), but its
+#     session-level check returned at the first consistent m-line, so the
+#     BUNDLE group was never checked against the m-lines. New in 0.26: mids
+#     must be unique, the BUNDLE group must list the m-lines in number and in
+#     order, and an RTX PT must repair one PT only (its `apt` values may not
+#     conflict, checked per m-line as it is parsed); a rejected m-line with no
+#     PT is now accepted.
+#     A third-party peer's SDP that 0.24.1 took can now be refused:
+#     an offer with a 400, an answer (WHIP output, WHEP input) as a failed
+#     publish or a `whep_answer_unusable`. The Chrome 124 fixtures and the
+#     ffmpeg 8.0 / 9.0 offer templates pass (ffmpeg's phantom BUNDLE mid is
+#     normalised away first); OBS, GStreamer and hardware encoders are
+#     untested.
+#   * No panic a peer's SDP reaches is known any more. An RTX PT repairing two
+#     PTs is refused by the SDP parser (#1113: "PT 103 has conflicting apt
+#     values 102 and 104 for mid: 0", in the log; the peer is told only that
+#     its SDP is not valid), and two local entries claiming one remote PT are
+#     warned about and ignored (#1159; "Pt locked multiple times" before).
+#     `isolate_negotiation` stays, as defence in depth.
+#   * A rejected m-line is written `m=<media> 0 <proto> 0` by str0m itself
+#     (#1101), where 0.24 left the format list empty and the edge put the 0 in.
+#   * ICE-lite (WHIP input, WHEP output) ranks the nominations of the last 6 s
+#     first (`is` 0.12, #1168), so a NAT port rebind is followed; a spoofed
+#     nomination now has to be repeated to hold the stream (see the
+#     `engine::webrtc::session` header).
+#   * NACK / RTX: retries paced by the receive-side RTT (#1070), a NACKed
+#     packet resent at most once per RTT (#1134), the RTX replay window cut to
+#     128 sequence numbers (#1089), recovered RTX left out of jitter reports
+#     (#1121). TWCC feedback to Chrome publishers is corrected (#1143, #1144,
+#     #1150-#1152), which changes what their bandwidth estimate is fed.
+#   * Remote SHA-1 DTLS fingerprints are accepted (#1072); fmtp names match
+#     case-insensitively and may carry spaces and a trailing ';' (#1076,
+#     #1077); transport attributes come from the BUNDLE-tag m-line ahead of
+#     session-level defaults (#1158). `poll_output` skips idle work (#1011).
+#
+# NOT verified live, now four bumps deep: WHIP/WHEP interop against ffmpeg
+# (8.0.x exercises the vendored `is`), OBS and a browser, the loss stalls and a
+# CBR source with filler above, and quality gates 3 / 7 / 9.
+#
+# 0.24.1 (2026-10, up from 0.23.1). str0m's raised floors (dimpl ^0.7.4,
+# sctp-proto ^0.10.5) were already locked, and `is` was re-vendored at 0.11.1.
 #
 # Correction to the previous entry here: 0.23.0 -> 0.23.1 was not only the
 # sctp-proto floor. It also shipped #1029, which hardens SRTP/SRTCP and RTCP
@@ -720,9 +891,9 @@ optional = true
 #     complete frames had queued behind it — so a packet lost for good inside a
 #     multi-packet frame stalled video for up to 2 s instead of about 1 s
 #     (measured on the relay: 1.02 s -> 2.03 s without RTX, 67 ms either way
-#     with it). `engine::webrtc::session` therefore sets
-#     `set_reordering_timeout_{video,audio}(None)`, which restores 0.23's
-#     count-only release exactly.
+#     with it). `engine::webrtc::session` therefore set
+#     `set_reordering_timeout_{video,audio}(None)`, which restored 0.23's
+#     count-only release exactly, until 0.25 removed the video one (above).
 #   * A receive stream for SSRC 0 (libwebrtc's pre-media bandwidth probes) no
 #     longer counts toward RTCP report scheduling (#1052). On 0.23 it never
 #     sent a report, so its report deadline stayed in the past and the
@@ -739,12 +910,8 @@ optional = true
 # 0.19 -> 0.22 only `MediaData.data` becoming `Arc<[u8]>` (0.20) reached us,
 # handled in `engine::webrtc::session`.
 #
-# NOT verified live, now three bumps deep: WHIP/WHEP interop against ffmpeg,
-# OBS and a browser, and quality gates 3 / 7 / 9. 0.23 changed the RTCP we
-# send and 0.24 the SDP we answer and the receive timing.
-#
-# The codec set, fixed after this bump (the defect predates it and reproduced
-# in a standalone probe on 0.23.1 and on 0.24.1). `engine::webrtc::session`
+# The codec set, fixed after the 0.24.1 bump (the defect predates it and
+# reproduced in a standalone probe on 0.23.1 and on 0.24.1). `engine::webrtc::session`
 # used to keep str0m's default set and add four level-5.1 `add_h264` entries
 # beside the level-3.1 built-ins. Since str0m 0.22 (#1016) a level mismatch
 # only lowers the match score, so where the peer's PTs are binding both
@@ -763,11 +930,11 @@ optional = true
 # 0x33). Answers carry H.264 and Opus only, at level 5.1; `get_pt` picks the
 # H.264 / Opus PT by codec; and every negotiation step runs under
 # `catch_unwind`, so a str0m panic fails that peer alone with a
-# `webrtc_negotiation_panic` Warning. One is still reachable on 0.24.1 with
+# `webrtc_negotiation_panic` Warning. One was still reachable on 0.24.1 with
 # any H.264 set str0m ships: an offer (or answer) whose one RTX PT repairs two
-# H.264 PTs locks that RTX PT twice. The tests keep it as a fixture
-# (`engine/webrtc/testdata/rtx-repairing-two-pts.sdp`); when a str0m bump
-# stops panicking on it, those tests say so. bilbycast-relay's
+# H.264 PTs locked that RTX PT twice. The tests keep it as a fixture
+# (`engine/webrtc/testdata/rtx-repairing-two-pts.sdp`) and now pin 0.25's
+# refusal of it (above). bilbycast-relay's
 # `distribution::webrtc::session` must register exactly the same set. Checked
 # against captured real SDP (Chrome 124 WHEP and WHIP offers) and FFmpeg's
 # own WHIP offer template in unit tests, then live in the 2026-10 interop run
@@ -788,9 +955,9 @@ optional = true
 #
 # The vendored `is` PRIORITY patch used to let a PRIORITY-less Binding Request
 # reach a panicking `expect`, in the media path after negotiation, where the
-# isolation above does not reach. Also fixed after the bump, in the vendored
-# tree itself (see [patch.crates-io] below).
-version = "0.24.1"
+# isolation above does not reach. Also fixed after the 0.24.1 bump, in the
+# vendored tree itself (see [patch.crates-io] below).
+version = "0.26.0"
 optional = true
 # Use OpenSSL DTLS backend instead of the default aws-lc-rs + dimpl. The
 # pure-Rust dimpl DTLS implementation stalls when the active side (WHEP
@@ -840,14 +1007,48 @@ features = ["rustls", "stream", "http2"]
 # answer the latter with `400`). All three widen what connects; none changes a
 # stream that already worked.
 #
+# 0.4.22 (2026-11-23 sweep): MSRV 1.96, and a new private dependency set
+# (h264-reader 0.8 -> 0.9, sdp-types 0.1 -> 0.2, bitstream-io 2 -> 4, plus
+# no_std_io2) that no type of ours crosses. The API `engine::input_rtsp` uses is
+# unchanged, but what it delivers is not, and every change below reaches the
+# wire or the session:
+#   * Open-GOP keyframes are now random access points: an H.264 picture
+#     carrying a recovery-point SEI (recovery_frame_cnt 0) and an H.265 CRA /
+#     BLA. `is_random_access_point()` decides which frames the RTSP input's
+#     muxer marks random_access_indicator (with a PAT / PMT ahead), and the
+#     replay writer indexes its seek points on that bit, so replay cues and
+#     clip cuts can now land on such pictures.
+#   * `FrameFormat::SIMPLE` prepends the parameter sets to any frame that
+#     changes them, not only to keyframes.
+#   * ADTS framing (`SIMPLE` uses it) now fails a frame ADTS cannot represent —
+#     an audio object type outside 1-4 of those retina parses (6, 7, 17 and
+#     19-23: AAC-LD and the other error-resilient / scalable types, and
+#     TwinVQ), an explicit sampling frequency, a frame over 8184 bytes — where
+#     0.4.21 wrote a corrupt header. `input_rtsp` turns any demux error into a
+#     session teardown, so such a camera now tears down the whole session,
+#     video included, and reconnects. AAC-ELD (39) is not among them: both
+#     versions refuse its config when they parse the DESCRIBE SDP, so
+#     `demuxed()` fails at play start, before and after.
+#   * An RTP packet whose payload type is not the SDP rtpmap's is now dropped
+#     (one warning) unless its SSRC is already known — 0.4.21 dropped only
+#     PT 50. A camera whose RTP PT differs from its SDP and whose SETUP
+#     `Transport` names no usable ssrc therefore connects ("RTSP connected")
+#     and delivers no media at all, and `input_rtsp` has no receive watchdog
+#     to notice: the input sits connected and silent with no reconnect.
+#   * AAC `au-headers-length` must now be a multiple of 16 bits (was 8); any
+#     other value is a depacketize error, i.e. a session teardown.
+#   * Not retina's own change, but on this path: url 2.5.9 (same sweep)
+#     serialises a '^' in a URL path as %5E, so an `rtsp_url` containing one
+#     now goes out percent-encoded in DESCRIBE / SETUP.
+#
 # NOT verified on a real camera. RTSP ingest wants a live run before a release.
-version = "0.4.21"
+version = "0.4.22"
 
 # Pure-Rust mDNS-SD service registration for NMOS IS-04 discovery
 # (`_nmos-node._tcp`). Best-effort: registration is gated at runtime so
 # environments without multicast on the chosen interface degrade cleanly.
 [dependencies.mdns-sd]
-version = "0.21.5"
+version = "0.22.0"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -879,23 +1080,45 @@ alsa = { version = "0.12", optional = true }
 
 # Pure-Rust D-Bus client for reading cellular modem state from ModemManager
 # (org.freedesktop.ModemManager1) — powers util::cellular's zero-config USB /
-# PCIe modem telemetry. The `tokio` feature runs it on the existing runtime;
-# no C deps, so testbed/check-binary-purity.sh stays green. Linux-only (D-Bus
-# + ModemManager); the RutOS HTTP source (reqwest) is cross-platform.
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+# PCIe modem telemetry. No C deps, so testbed/check-binary-purity.sh stays
+# green. Linux-only (D-Bus + ModemManager); the RutOS HTTP source (reqwest) is
+# cross-platform.
+#
+# zbus 6 (up from 5) absorbed zvariant and zbus_names (as `zbus::wire` /
+# `zbus::names`), so neither is declared here, and put more behind features:
+# `tokio` runs connections on the current Tokio runtime (one must be current
+# when the connection is built — the poller is `tokio::spawn`ed — or zbus
+# returns Error::Unsupported, since `default-rt` stays off), `proxy` provides
+# `zbus::Proxy` (behind a feature from 6.0; without it this does not compile),
+# and `tracing` keeps zbus's own log events, which 6.x compiles out without it.
+# Property reads now go through serde (`DeserializeOwned + Type`) instead of
+# `TryFrom<OwnedValue>`: still signature-strict for scalars, and an `a{sv}`
+# value still has its one `v` wrapper stripped, as zvariant 5 did. Every
+# get_property in util::cellular swallows its error into a default, so a
+# conversion regression blanks telemetry without an error; 6.1.0 already
+# shipped an API break in a minor, so check modem telemetry against `mmcli`
+# after any zbus move. Checked on 6.5.0 (2026-11-23) against a live
+# ModemManager with a Quectel RG520N-EB: registration state, access tech,
+# operator, PLMN, SIM slot, band and the LTE `a{sv}` signal dict (RSRP / RSRQ /
+# SINR / RSSI) all read, and the signal figures matched `mmcli --signal-get`.
+# The reconnect path (system bus or ModemManager restarted) was not exercised.
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy", "tracing"] }
 
 # ---------------------------------------------------------------------------
-# BILBYCAST PATCH: vendored `is` 0.11.1, patched in two places so an ICE
+# BILBYCAST PATCH: vendored `is` 0.12.1, patched in two places so an ICE
 # Binding Request without the PRIORITY attribute is answered rather than
 # rejected (src/stun.rs) or panicked on (src/agent.rs). Originally vendored
 # against `is` 0.8.0 (2026-04-09); re-vendored against 0.9.0 (2026-05-12,
-# str0m 0.19), 0.11.0 (2026-08-11, str0m 0.22) and 0.11.1 (2026-10-07, str0m
-# 0.24, which requires ^0.11.1). Upstream still hard-rejects PRIORITY-less
-# Binding Requests in 0.11.1: its `src/stun.rs` is byte-identical to 0.11.0's.
-# 0.11.1 changed only agent.rs and pair.rs — candidate invalidation now also
-# matches the transport protocol (#1035), and an ICE-lite controlled agent
-# marks a pair succeeded when it answers a Binding Request (#1039; read only by
-# `Rtc::accepts`, which we never call).
+# str0m 0.19), 0.11.0 (2026-08-11, str0m 0.22), 0.11.1 (2026-10-07, str0m
+# 0.24, which requires ^0.11.1) and 0.12.1 (2026-11-23, str0m 0.26, which
+# requires ^0.12.1). Upstream still hard-rejects PRIORITY-less Binding
+# Requests in 0.12.1 (src/stun.rs:188-190) and still `expect`s the attribute
+# (src/agent.rs:1424-1427). 0.12 did change the code around both: stun.rs
+# takes a MESSAGE-INTEGRITY that is the first attribute (#1073), the ICE agent
+# ignores port-0 and unspecified-address candidates and STUN (#1148), a
+# controlled full agent acts on a nomination only once its own check on the
+# pair succeeded (#1066; every full agent of ours is the controlling one), and
+# an ICE-lite agent prefers the nominations of the last 6 s (#1168).
 #
 # Why: ffmpeg's WHIP muxer sends ICE connectivity-check Binding Requests
 # without the PRIORITY attribute in every 8.0.x release (n8.0 through n8.0.3;
@@ -932,7 +1155,8 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 #   2. If it is not, cargo warns `patch `is v...` was not used in the crate
 #      graph` and silently builds against the registry `is`. Either:
 #        a) re-vendor the matching `is` version (copy from
-#           ~/.cargo/registry/src/index.crates.io-*/is-X.Y.Z, re-apply BOTH
+#           ~/.cargo/registry/src/index.crates.io-*/is-X.Y.Z, which a
+#           `cargo fetch` unpacks while the patch is unused, re-apply BOTH
 #           hunks — vendor/is/src/stun.rs and vendor/is/src/agent.rs — and
 #           update this comment), then run the `engine::webrtc::session`
 #           tests, OR

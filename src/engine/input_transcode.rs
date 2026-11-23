@@ -1092,6 +1092,9 @@ mod tests {
     /// their source lead and the PCR stage never needs more than its
     /// initial 80 ms: no re-encoded PES is ever behind the PCR, and the PCR
     /// keeps the input's positions and cadence.
+    // An AAC (0x0F) source re-encoded to MP2 by the TS audio replacer, which
+    // decodes AAC through fdk-aac alone and encodes MP2 through libavcodec.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     #[test]
     fn audio_only_transcode_keeps_every_re_encoded_pes_ahead_of_the_pcr() {
         use crate::engine::ts_parse::{
@@ -1208,6 +1211,9 @@ mod tests {
     /// stage took every re-encoded PES after the reset for a frame of the
     /// previous epoch and dropped it, for as long as the reset was deep
     /// (a loop's length, for good on a looping source).
+    // An AAC (0x0F) source re-encoded to MP2 by the TS audio replacer, which
+    // decodes AAC through fdk-aac alone and encodes MP2 through libavcodec.
+    #[cfg(all(feature = "media-codecs", feature = "fdk-aac"))]
     #[test]
     fn re_encoded_audio_follows_a_backward_source_reset() {
         use crate::engine::ts_parse::{extract_pcr, extract_pes_pts, pcr_only_packet, ts_pid, ts_pusi};

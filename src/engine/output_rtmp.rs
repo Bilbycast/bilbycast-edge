@@ -7399,6 +7399,9 @@ pub(crate) mod tests {
     /// opened in stereo, the stage pinned to that found the block's mono
     /// did not fit and fell back to the default conversion: stereo out, the
     /// routing dropped.
+    // fdk-aac, like `silent_fallback_state`: without it the AAC encoder is an
+    // ffmpeg subprocess, which needs a runtime and an ffmpeg on PATH.
+    #[cfg(feature = "fdk-aac")]
     #[test]
     fn a_silent_fallback_encoder_takes_the_transcode_blocks_format() {
         let cfg: RtmpOutputConfig = serde_json::from_value(serde_json::json!({

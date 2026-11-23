@@ -468,16 +468,28 @@ fn default_variant() -> &'static str {
     }
 }
 
+/// The `error_code` for a refused bundle, chosen by the [`verify::Check`] the
+/// verifier attached to the failing step, not by the words of the message.
+/// The message is the whole chain (`{e:#}`): the outermost context alone
+/// names the step that failed but not why.
 fn map_verify_error(e: anyhow::Error) -> UpgradeError {
-    let s = e.to_string();
-    let code = if s.contains("identity") {
-        error_codes::UPGRADE_IDENTITY_NOT_ALLOWED
-    } else if s.contains("rekor") {
-        error_codes::UPGRADE_REKOR_INVALID
-    } else {
-        error_codes::UPGRADE_SIGNATURE_INVALID
+    use verify::{Check, Refused};
+    let code = match e.downcast_ref::<Refused>().map(|r| r.check) {
+        // Sigstore's TUF repository could not be reached, or what it served
+        // did not verify: the release itself was never checked, so this is
+        // not a bad signature. The two causes cannot be told apart reliably —
+        // tough takes a next root it cannot fetch for the end of the root
+        // chain, so with no route it can report the embedded TUF root as
+        // expired rather than the fetch — and both point at the path to
+        // Sigstore's TUF repository (tuf-repo-cdn.sigstore.dev).
+        Some(Check::TrustRoot) => error_codes::UPGRADE_NETWORK_ERROR,
+        Some(Check::Identity) => error_codes::UPGRADE_IDENTITY_NOT_ALLOWED,
+        Some(Check::Rekor) => error_codes::UPGRADE_REKOR_INVALID,
+        // Every failing step attaches a `Refused`; an error without one is
+        // still a refusal, and fails closed as one.
+        Some(Check::Signature) | None => error_codes::UPGRADE_SIGNATURE_INVALID,
     };
-    UpgradeError::new(code, s)
+    UpgradeError::new(code, format!("{e:#}"))
 }
 
 fn map_download_error(e: anyhow::Error) -> UpgradeError {

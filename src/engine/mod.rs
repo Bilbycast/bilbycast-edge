@@ -282,8 +282,9 @@ pub mod audio_transcode;
 /// SMPTE 302M) and the re-encoders. Fraunhofer FDK AAC with the default
 /// `fdk-aac` feature: AAC-LC, HE-AAC v1/v2, every channel up to 7.1, a
 /// PCE-signalled layout from its full AudioSpecificConfig. Without it, pure
-/// Rust via `symphonia-codec-aac`: AAC-LC mono/stereo only, the rest
-/// refused with a clear error.
+/// Rust via `symphonia-codec-aac` under the opt-in `aac-symphonia` feature:
+/// AAC-LC mono/stereo only, the rest refused with a clear error. A build
+/// needs one of the two.
 pub mod audio_decode;
 
 /// Audio access-unit framing (ADTS / LOAS / MPEG audio / AC-3 / E-AC-3

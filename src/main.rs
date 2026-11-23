@@ -263,7 +263,8 @@ const DEFAULT_HEAP_TRIM_SECS: u64 = 60;
 ///
 /// `packaging/bilbycast-edge.service` allows the whole stop `TimeoutStopSec=20`
 /// before it sends SIGKILL. The API server's graceful close comes first —
-/// bounded at 5 s on the TLS listener — and the tunnels and the bond policy
+/// bounded at 5 s on the TLS listener — then the NMOS mDNS-SD withdrawal
+/// (bounded at 1 s, normally milliseconds), and the tunnels and the bond policy
 /// routes torn down after the flows need what is left. A flow's own stop waits
 /// up to 10 s for its recorder to finish closing segments, and on a stalled
 /// replay volume it waits all of it; flows stop concurrently, so this is that
@@ -1075,26 +1076,6 @@ async fn real_main() -> anyhow::Result<()> {
     let router = build_router(state.clone(), &nmos_browser_control);
     tracing::info!("API server listening on {listen_addr}");
 
-    // Best-effort NMOS mDNS-SD registration. Kept alive for the lifetime of
-    // the process; dropped on shutdown to unregister cleanly. Failures are
-    // logged inside the helper and never block flow startup.
-    let _nmos_mdns = {
-        let node_id = app_config
-            .node_id
-            .clone()
-            .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".into());
-        let hostname = std::env::var("HOSTNAME")
-            .or_else(|_| std::env::var("HOST"))
-            .unwrap_or_else(|_| "bilbycast-edge".into());
-        let https = app_config.server.tls.is_some();
-        api::nmos_mdns::spawn_nmos_node_advertisement(
-            &node_id,
-            &hostname,
-            app_config.server.listen_port,
-            https,
-        )
-    };
-
     // Cellular uplink telemetry — auto-detects ModemManager modems and polls
     // any configured RutOS routers, off the data path. The cache is shared with
     // the manager client (joined onto network_interfaces + drives the
@@ -1298,8 +1279,9 @@ async fn real_main() -> anyhow::Result<()> {
 
     // Resolve effective bind list. `server.listen_addrs` (when set) takes
     // precedence over the legacy single-address `server.listen_addr`.
-    // Default is dual-stack (`0.0.0.0,[::]`); v6 listeners get
-    // IPV6_V6ONLY=1 so they coexist with the v4 listener on the same port.
+    // A fresh config binds loopback only (`127.0.0.1`, `[::1]`); v6
+    // listeners get IPV6_V6ONLY=1 so they coexist with the v4 listener on
+    // the same port.
     let bind_entries = app_config.server.effective_listen_addrs();
     let bind_ips = config::validation::parse_listen_addrs(&bind_entries, "server")
         .map_err(|e| anyhow::anyhow!("server bind addresses: {e}"))?;
@@ -1308,6 +1290,26 @@ async fn real_main() -> anyhow::Result<()> {
         .iter()
         .map(|ip| std::net::SocketAddr::new(*ip, listen_port))
         .collect();
+
+    // Best-effort NMOS mDNS-SD registration, naming the addresses the API
+    // server is about to listen on (see `api::nmos_mdns`). Kept alive for the
+    // lifetime of the process and withdrawn on a graceful shutdown, once the
+    // API server has stopped (`NmosMdnsHandle::shutdown` below). Failures are
+    // logged inside the helper and never block flow startup.
+    let nmos_mdns = {
+        let node_id = app_config
+            .node_id
+            .clone()
+            .unwrap_or_else(|| "00000000-0000-0000-0000-000000000000".into());
+        let https = app_config.server.tls.is_some();
+        api::nmos_mdns::spawn_nmos_node_advertisement(
+            &node_id,
+            api::nmos::node_hostname(),
+            listen_port,
+            https,
+            &bind_ips,
+        )
+    };
 
     // Start API server (with or without TLS)
     #[cfg(feature = "tls")]
@@ -1375,6 +1377,15 @@ async fn real_main() -> anyhow::Result<()> {
             tracing::warn!("TLS is configured but the 'tls' feature is not enabled. Build with --features tls to enable HTTPS.");
         }
         run_multi_listener_plain(bind_addrs.as_slice(), router, shutdown_token).await?;
+    }
+
+    // The API server has stopped, so withdraw the NMOS mDNS-SD record that
+    // advertises it now rather than leave controllers pointed at it while
+    // the flows stop. Bounded at `nmos_mdns::SHUTDOWN_WAIT` (1 s). The process
+    // leaves through `_exit`, so a record left to the handle's drop would
+    // most likely never be withdrawn.
+    if let Some(mdns) = nmos_mdns {
+        mdns.shutdown().await;
     }
 
     // Graceful shutdown: stop all flows and tunnels — the flows within a

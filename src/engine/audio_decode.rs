@@ -13,9 +13,15 @@
 //!   AAC-LC, HE-AAC v1 (SBR), HE-AAC v2 (PS), AAC-LD, AAC-ELD, and
 //!   multichannel up to 7.1. This is the recommended backend.
 //!
-//! - **Fallback (no `fdk-aac` feature)**: `symphonia-codec-aac` (pure Rust).
-//!   AAC-LC mono/stereo only. Build with
-//!   `--no-default-features --features tls,webrtc` to use this.
+//! - **Fallback (`aac-symphonia` feature, `fdk-aac` off)**:
+//!   `symphonia-codec-aac` (pure Rust). AAC-LC mono/stereo only. Build with
+//!   `--no-default-features --features tls,webrtc,media-codecs,replay,aac-symphonia`
+//!   to use this. With both features on, fdk-aac is the decoder.
+//!
+//! One of the two is required. [`AacDecoder`]'s callers carry no backend
+//! gate — the SMPTE 302M, ST 2110 and `rtp_audio` PCM bridges, the RTMP and
+//! WebRTC audio re-encoders, the SDI output — so a build with neither would
+//! fail on each of them; it stops here with a `compile_error!` instead.
 //!
 //! ## Layering
 //!
@@ -44,19 +50,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Backend-specific imports ────────────────────────────────────────────────
 
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(not(any(feature = "fdk-aac", feature = "aac-symphonia")))]
+compile_error!(
+    "bilbycast-edge needs an AAC decoder: enable the `fdk-aac` feature (default) \
+     or, for a build without it, `aac-symphonia`"
+);
+
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 use symphonia::core::audio::{Audio, AudioSpec, Channels, GenericAudioBufferRef, Position};
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 use symphonia::core::errors::Error as SymphoniaError;
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 use symphonia::core::packet::PacketRef;
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 use symphonia::core::units::{Duration as SymphoniaDuration, Timestamp};
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 use symphonia::default::codecs::AacDecoder as SymphoniaAacDecoder;
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -85,7 +97,7 @@ pub enum AacDecodeError {
     FdkAac(aac_codec::AacError),
 
     /// The underlying symphonia decoder returned an error.
-    #[cfg(not(feature = "fdk-aac"))]
+    #[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
     Symphonia(String),
 }
 
@@ -98,7 +110,7 @@ impl std::fmt::Display for AacDecodeError {
                     f,
                     "unsupported AAC profile: ADTS profile={profile} (AOT={aot})"
                 )?;
-                #[cfg(not(feature = "fdk-aac"))]
+                #[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
                 write!(
                     f,
                     "unsupported AAC profile: ADTS profile={profile} (AOT={aot}). \
@@ -115,7 +127,7 @@ impl std::fmt::Display for AacDecodeError {
                     f,
                     "unsupported AAC channel config: {c} (only 1-7 supported)"
                 )?;
-                #[cfg(not(feature = "fdk-aac"))]
+                #[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
                 write!(
                     f,
                     "unsupported AAC channel config: {c} (only mono and stereo supported)"
@@ -124,7 +136,7 @@ impl std::fmt::Display for AacDecodeError {
             }
             #[cfg(feature = "fdk-aac")]
             AacDecodeError::FdkAac(e) => write!(f, "fdk-aac decoder error: {e}"),
-            #[cfg(not(feature = "fdk-aac"))]
+            #[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
             AacDecodeError::Symphonia(s) => write!(f, "symphonia AAC decoder error: {s}"),
         }
     }
@@ -1053,10 +1065,10 @@ impl AacDecoder {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// symphonia fallback (when fdk-aac feature is disabled)
+// symphonia fallback (`aac-symphonia` feature, `fdk-aac` disabled)
 // ══════════════════════════════════════════════════════════════════════════════
 
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 pub struct AacDecoder {
     inner: SymphoniaAacDecoder,
     sample_rate: u32,
@@ -1066,7 +1078,7 @@ pub struct AacDecoder {
     config: crate::engine::aac_config::AacConfig,
 }
 
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 impl std::fmt::Debug for AacDecoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AacDecoder")
@@ -1078,7 +1090,7 @@ impl std::fmt::Debug for AacDecoder {
     }
 }
 
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 impl AacDecoder {
     /// Construct an AAC-LC decoder from the demuxer-cached ADTS config.
     ///
@@ -1180,7 +1192,7 @@ impl AacDecoder {
     }
 }
 
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 fn audio_buffer_ref_to_planar_f32(buf_ref: &GenericAudioBufferRef<'_>) -> Vec<Vec<f32>> {
     match buf_ref {
         // `plane` replaces 0.5's `Signal::chan` and returns `Option` rather than
@@ -1199,7 +1211,7 @@ fn audio_buffer_ref_to_planar_f32(buf_ref: &GenericAudioBufferRef<'_>) -> Vec<Ve
     }
 }
 
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 #[inline]
 fn extract_planar_f32<'a, F>(spec: &AudioSpec, frames: usize, get_chan: F) -> Vec<Vec<f32>>
 where
@@ -1221,7 +1233,7 @@ where
         .collect()
 }
 
-#[cfg(not(feature = "fdk-aac"))]
+#[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
 #[inline]
 fn extract_planar_with<'a, S, F, M>(
     spec: &AudioSpec,
@@ -1675,7 +1687,7 @@ mod tests {
     // With fdk-aac: all standard profiles are accepted, only reserved values rejected.
     // Without fdk-aac: only AAC-LC (profile=1) accepted.
 
-    #[cfg(not(feature = "fdk-aac"))]
+    #[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
     #[test]
     fn rejects_aac_main() {
         let err = AacDecoder::from_adts_config(0, 3, 2).unwrap_err();
@@ -1685,7 +1697,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "fdk-aac"))]
+    #[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
     #[test]
     fn rejects_aac_ssr() {
         let err = AacDecoder::from_adts_config(2, 3, 2).unwrap_err();
@@ -1695,7 +1707,7 @@ mod tests {
         ));
     }
 
-    #[cfg(not(feature = "fdk-aac"))]
+    #[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
     #[test]
     fn rejects_aac_ltp() {
         let err = AacDecoder::from_adts_config(3, 3, 2).unwrap_err();
@@ -1733,35 +1745,13 @@ mod tests {
         assert!(matches!(err, AacDecodeError::UnsupportedSampleRateIndex(13)));
     }
 
-    #[cfg(not(feature = "fdk-aac"))]
+    #[cfg(all(feature = "aac-symphonia", not(feature = "fdk-aac")))]
     #[test]
     fn rejects_multichannel_symphonia() {
         let err = AacDecoder::from_adts_config(1, 3, 6).unwrap_err();
         assert!(matches!(err, AacDecodeError::UnsupportedChannelConfig(6)));
     }
 
-    /// A real AAC-LC bitstream, decoded and checked for content — deliberately
-    /// NOT gated on a backend, so it covers fdk-aac AND symphonia.
-    ///
-    /// Until this existed, the symphonia half of this module had no test that
-    /// decoded a single frame: the two round-trip tests are `#[cfg(feature =
-    /// "fdk-aac")]` because they need the fdk *encoder*, and the only
-    /// symphonia-specific test is a rejection test. So the pure-Rust fallback
-    /// could have emitted silence, noise, or half a stream and every test would
-    /// still have passed. That gap predated the 0.5.5 -> 0.6.0 bump and was the
-    /// real reason the bump looked unverifiable.
-    ///
-    /// The fixture is 0.5 s of a 1 kHz sine at amplitude 0.5, 48 kHz stereo,
-    /// AAC-LC 128 kbps in ADTS framing. Cross-checked against an independent
-    /// decoder (ffmpeg 8.0.1) which resolves it to RMS 0.3494 over the same
-    /// post-priming window — i.e. the tolerance below is calibrated against a
-    /// second implementation, not just against our own arithmetic.
-    ///
-    /// Beware regenerating it: ffmpeg's `sine` lavfi source defaults to
-    /// amplitude 0.125, not full scale. The first cut of this fixture was
-    /// built with `volume=0.5` on top of that and came out 18 dB down, which
-    /// read as a decoder fault until ffmpeg agreed with us to 4 decimal places.
-    /// The correct chain is `sine=...,volume=4.0` for a 0.5 peak.
     /// A PCE-signalled stream (channel configuration 0, ISDB-T 1seg) decodes
     /// from its whole configuration, the program_config_element in the
     /// AudioSpecificConfig — every frame, those that carry no PCE of their own
@@ -1840,6 +1830,28 @@ mod tests {
         assert_eq!(dec.channels(), 8, "after it");
     }
 
+    /// A real AAC-LC bitstream, decoded and checked for content — deliberately
+    /// NOT gated on a backend, so it covers fdk-aac AND symphonia.
+    ///
+    /// Until this existed, the symphonia half of this module had no test that
+    /// decoded a single frame: the two round-trip tests are `#[cfg(feature =
+    /// "fdk-aac")]` because they need the fdk *encoder*, and the only
+    /// symphonia-specific test is a rejection test. So the pure-Rust fallback
+    /// could have emitted silence, noise, or half a stream and every test would
+    /// still have passed. That gap predated the 0.5.5 -> 0.6.0 bump and was the
+    /// real reason the bump looked unverifiable.
+    ///
+    /// The fixture is 0.5 s of a 1 kHz sine at amplitude 0.5, 48 kHz stereo,
+    /// AAC-LC 128 kbps in ADTS framing. Cross-checked against an independent
+    /// decoder (ffmpeg 8.0.1) which resolves it to RMS 0.3494 over the same
+    /// post-priming window — i.e. the tolerance below is calibrated against a
+    /// second implementation, not just against our own arithmetic.
+    ///
+    /// Beware regenerating it: ffmpeg's `sine` lavfi source defaults to
+    /// amplitude 0.125, not full scale. The first cut of this fixture was
+    /// built with `volume=0.5` on top of that and came out 18 dB down, which
+    /// read as a decoder fault until ffmpeg agreed with us to 4 decimal places.
+    /// The correct chain is `sine=...,volume=4.0` for a 0.5 peak.
     #[test]
     fn decodes_real_aac_lc_sine_to_expected_rms() {
         const FIXTURE: &[u8] = include_bytes!("testdata/sine1k_aac_lc_48k_stereo.adts");

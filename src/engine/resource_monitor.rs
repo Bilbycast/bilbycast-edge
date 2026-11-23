@@ -66,9 +66,11 @@ impl SystemResourceState {
 
 /// Spawn the system resource monitor task.
 ///
-/// Returns a `JoinHandle` that runs until the cancellation token is cancelled.
-/// If `config` is `None`, the task still samples metrics (for stats/Prometheus)
-/// but does not evaluate thresholds or fire events. When `live_gpu` is
+/// Returns a `JoinHandle` that runs until the cancellation token is cancelled,
+/// or ends at once, with a warning, on a platform sysinfo does not support
+/// (none the edge ships for). If `config` is `None`, the task still samples
+/// metrics (for stats/Prometheus) but does not evaluate thresholds or fire
+/// events. When `live_gpu` is
 /// provided, the same 5 s loop additionally samples NVIDIA NVENC / NVDEC
 /// utilization via NVML — silently skipped on non-NVIDIA hosts and on
 /// builds without the `hardware-monitor-nvml` feature.
@@ -99,7 +101,15 @@ async fn resource_monitor_loop(
     event_sender: EventSender,
     cancel: CancellationToken,
 ) {
-    let mut sys = System::new();
+    let mut sys = match System::new() {
+        Ok(sys) => sys,
+        Err(e) => {
+            tracing::warn!(
+                "System resource monitor not started: sysinfo is unavailable here ({e})"
+            );
+            return;
+        }
+    };
 
     let mut ticker = interval(Duration::from_secs(5));
 

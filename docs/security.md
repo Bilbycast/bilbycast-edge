@@ -10,10 +10,10 @@ Each customer runs their own manager. The manager has authority over **schedulin
 
 ## Trust roots
 
-The edge embeds three pieces of trust at compile time:
+The edge verifies against three pieces of trust. Only the third, and the TUF root the first two are fetched from, are compiled in:
 
-1. **Sigstore Fulcio CA root certificate** — provided by the `sigstore` Rust crate as a constant. Refreshed via routine `cargo update`. Rotates rarely (years).
-2. **Rekor public key** — same provenance, same crate.
+1. **Sigstore Fulcio CA certificates** — from Sigstore's `trusted_root.json`, which the `sigstore` Rust crate fetches and verifies through Sigstore's TUF repository (`tuf-repo-cdn.sigstore.dev`) at every verification, walking Sigstore's signed root chain forward from the TUF root (`root.json`) embedded in the crate. The crate's embedded copy of `trusted_root.json` is used only while its hash matches the TUF-signed one. A key rotation therefore reaches a deployed edge without a new release; with no route to the TUF repository the trust root cannot load and the upgrade fails closed.
+2. **Rekor public key** — same `trusted_root.json`, same TUF check.
 3. **`ALLOWED_SIGNERS` identity allowlist** — Bilbycast-specific. Lives in [`src/upgrade/trust.rs`](../src/upgrade/trust.rs). Pins the OIDC issuer (`token.actions.githubusercontent.com`), the source repo (`Bilbycast/bilbycast-edge`), the workflow path (`.github/workflows/nightly-release.yml`), and the ref pattern (`refs/tags/v*`).
 
 Updates to the identity allowlist land only when the release workflow path itself changes — essentially never.
@@ -30,7 +30,7 @@ Updates to the identity allowlist land only when the release workflow path itsel
 | Stolen GitHub release PAT / rogue org admin overwrites a release | Attacker can upload bytes but cannot produce a valid Sigstore signature without running a workflow on the Bilbycast repo. If they manage that, the workflow run + signing event is publicly logged in Rekor and tied to a specific commit / tag — forensically detectable, not silent. |
 | Workflow run hijack (e.g. malicious PR triggering the release workflow) | Release workflow triggers only on `push` of a `v*` tag or a manual `workflow_dispatch` — a PR can trigger neither. Manual dispatch is gated by repository write access, **not** by a GitHub `environment` — no job in `nightly-release.yml`, in any other bilbycast-edge workflow, or in the manager / relay / sidecar release workflows declares one (the only `environment:` anywhere in the org is the `github-pages` deploy job on bilbycast-website, which signs nothing). The binding control is the Sigstore identity pin: `ALLOWED_SIGNERS` requires `ref_pattern = refs/tags/v*` ([`src/upgrade/trust.rs`](../src/upgrade/trust.rs)), so a run dispatched from a branch mints a `refs/heads/*` Fulcio SAN that every deployed edge rejects. |
 | Build pipeline poisoned (legitimate signing of evil bytes via tampered source) | Out of scope at the upgrade-protocol layer — addressed by branch protection on `main`, required reviews, signed commits, restricted release-trigger workflows. The Rekor entry still records *which commit* was built, so post-incident attribution is exact. |
-| Sigstore Fulcio root or Rekor pubkey compromised / rotated | Edge ships with constants for current Fulcio + Rekor roots (provided by the `sigstore` crate, updated via routine dependency bumps). New edge release carries new constants. Standard rotation path; Sigstore announces well in advance. |
+| Sigstore Fulcio root or Rekor pubkey compromised / rotated | The keys are not compiled in: the edge fetches them through Sigstore's TUF repository at every verification and trusts them only once TUF metadata, walked forward from the TUF root embedded in the binary, vouches for them — so Sigstore rotates or revokes a key there and deployed edges follow without a release. A network attacker cannot substitute keys (TUF signatures); an unreachable TUF repository fails the upgrade closed. |
 | Crash-loop after upgrade | Boot watchdog flips symlink back to `previous` after `max_boot_attempts` failed boots. |
 | Power loss mid-stage | Atomic symlink rename + state.json fsync; partial extraction lives under `versions/<new>.partial/` and is GC'd on next boot. |
 | Operator wants high-value site to refuse all auto-upgrades | `upgrades.enabled = false` — the edge rejects every `upgrade_binary` with `error_code: upgrade_disabled` before anything is downloaded. [^manual-only] |

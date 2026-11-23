@@ -4095,15 +4095,17 @@ mod whep_server_tests {
     /// The real Chrome 124 WHEP offer that panicked str0m inside
     /// `whep_server_loop` in the 2026-10-07 interop run.
     const CHROME_WHEP_OFFER: &str = include_str!("webrtc/testdata/chrome124-whep-recvonly.sdp");
-    /// An offer str0m 0.24.1 still panics on, whatever H.264 set is
-    /// registered: one RTX PT repairing two H.264 PTs.
+    /// An offer str0m's SDP parser refuses (since 0.25; up to 0.24 str0m
+    /// panicked on it, whatever H.264 set was registered): one RTX PT
+    /// repairing two H.264 PTs.
     const RTX_REPAIRING_TWO_PTS: &str = include_str!("webrtc/testdata/rtx-repairing-two-pts.sdp");
 
     /// The WHEP output negotiates every viewer inline, in one task: a viewer
-    /// whose negotiation fails — str0m panicking on its offer included — must
-    /// cost that viewer its answer and nothing more. A Chrome offer used to
-    /// panic str0m there, which ended the task: every later viewer's request
-    /// found the reply dropped until the flow restarted.
+    /// whose negotiation fails must cost that viewer its answer and nothing
+    /// more. A Chrome offer used to panic str0m there, which ended the task:
+    /// every later viewer's request found the reply dropped until the flow
+    /// restarted. A panic is caught now (`engine::webrtc::session`'s tests
+    /// raise one), and str0m refuses the offer that panicked it last.
     #[tokio::test]
     async fn a_failed_viewer_negotiation_leaves_the_whep_output_serving() {
         let config: WebrtcOutputConfig = serde_json::from_value(serde_json::json!({
@@ -4122,7 +4124,7 @@ mod whep_server_tests {
             config, &broadcast_tx, stats, cancel.clone(), Some(session_rx), events, "flow-w".into(), false,
         );
 
-        // A viewer whose offer panics str0m, a Chrome viewer, a viewer whose
+        // A viewer whose offer str0m refuses, a Chrome viewer, a viewer whose
         // offer is unusable, another Chrome viewer.
         let offers = [RTX_REPAIRING_TWO_PTS, CHROME_WHEP_OFFER, "v=0\r\nnot an offer\r\n", CHROME_WHEP_OFFER];
         for (viewer, offer) in offers.into_iter().enumerate() {
@@ -4138,7 +4140,7 @@ mod whep_server_tests {
             match viewer {
                 0 => {
                     let err = answer.expect_err("str0m cannot negotiate this offer");
-                    assert!(err.to_string().contains("str0m panicked during SDP offer"), "{err}");
+                    assert_eq!(err.to_string(), "SDP parse error: the offer is not valid SDP");
                 }
                 2 => assert!(answer.is_err(), "garbage was answered"),
                 _ => {
@@ -4149,18 +4151,11 @@ mod whep_server_tests {
         }
         assert!(!task.is_finished());
 
-        // The panic, and only the panic, raised a Warning.
-        let mut panics = Vec::new();
+        // A refusal is no str0m panic, and raises no panic Warning.
         while let Ok(ev) = raised.try_recv() {
-            if let Some(d) = ev.details.filter(|d| d["error_code"] == "webrtc_negotiation_panic") {
-                assert_eq!(ev.severity, EventSeverity::Warning);
-                assert_eq!(ev.flow_id.as_deref(), Some("flow-w"));
-                panics.push(d);
-            }
+            let details = ev.details.unwrap_or_default();
+            assert_ne!(details["error_code"], "webrtc_negotiation_panic", "{details}");
         }
-        assert_eq!(panics.len(), 1, "{panics:?}");
-        assert_eq!(panics[0]["peer"], "WHEP viewer");
-        assert_eq!(panics[0]["step"], "SDP offer");
         cancel.cancel();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
     }
@@ -5293,13 +5288,9 @@ mod whip_client_tests {
                             .enable_opus(true, false)
                             .build(std::time::Instant::now());
                         let offer = str0m::change::SdpOffer::from_sdp_string(&offer).unwrap();
+                        // The video is rejected on port 0 with format 0, as
+                        // Pion rejects it too (str0m since 0.25).
                         let answer = rtc.sdp_api().accept_offer(offer).unwrap().to_sdp_string();
-                        // The video rejected as a server outside str0m
-                        // rejects it (Pion: port 0, format 0); str0m's own
-                        // empty format list is not SDP.
-                        let rejected = "m=video 0 UDP/TLS/RTP/SAVPF \r\n";
-                        assert!(answer.contains(rejected), "{answer}");
-                        let answer = answer.replace(rejected, "m=video 0 UDP/TLS/RTP/SAVPF 0\r\n");
                         (
                             StatusCode::CREATED,
                             [(header::LOCATION, format!("/whip/res-{n}")), (header::CONTENT_TYPE, "application/sdp".to_string())],

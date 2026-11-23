@@ -285,9 +285,10 @@ impl Default for AppConfig {
 /// Remote-upgrade configuration. See `bilbycast-edge/docs/upgrade.md` for the
 /// operator guide and the trust model.
 ///
-/// Trust roots (Fulcio CA root, Rekor public key, identity allowlist) are
-/// **compiled into the binary** — operators never configure them. The fields
-/// here only gate operator-controlled scheduling.
+/// Trust roots are never operator-configured: the identity allowlist is
+/// **compiled into the binary**, and the Fulcio CA and Rekor keys come from
+/// Sigstore's TUF repository, verified against the TUF root the binary embeds.
+/// The fields here only gate operator-controlled scheduling.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UpgradeConfig {
     /// Master switch. Default `false` — operators opt in per node. Even when

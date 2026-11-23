@@ -955,13 +955,14 @@ category event to the manager (Critical severity) when:
   in-process backend is compiled out): outputs with `audio_encode` set
   refuse to start (HLS) or drop audio for the rest of the output's
   lifetime after logging once (RTMP / WebRTC). With the default features
-  (`fdk-aac` + `media-codecs`), AAC and MP2 / AC-3 are encoded in-process
-  and do **not** require ffmpeg; only Opus (WebRTC) does. Outputs without
+  (`fdk-aac` + `media-codecs`), AAC, Opus, MP2 and AC-3 are all encoded
+  in-process and do **not** require ffmpeg. Outputs without
   `audio_encode` keep working without ffmpeg installed.
 - **Input audio is unsupported**: with the default `fdk-aac` feature,
   the decoder supports AAC-LC, HE-AAC v1/v2, and multichannel up to
-  7.1. Without `fdk-aac`, the pure-Rust fallback supports AAC-LC
-  mono/stereo only — other profiles are rejected. The output drops
+  7.1. Without `fdk-aac`, the pure-Rust fallback (the opt-in
+  `aac-symphonia` feature) supports AAC-LC mono/stereo only — other
+  profiles are rejected. The output drops
   audio and emits the failure event so the operator sees the problem.
 - **`compressed_audio_input` is false**: the flow input cannot carry
   TS audio (e.g. ST 2110-30, `rtp_audio` are PCM-only). The output

@@ -52,8 +52,9 @@ encode use Fraunhofer FDK AAC in-process (via `bilbycast-fdk-aac-rs`) —
 AAC-LC, HE-AAC v1/v2, multichannel up to 7.1. Opus / MP2 / AC-3 use
 in-process libavcodec (via `bilbycast-ffmpeg-video-rs`). **No external
 ffmpeg binary required.** **Fallback (features disabled):** decode uses
-`symphonia-codec-aac` (pure Rust, AAC-LC mono/stereo only); encode uses
-ffmpeg subprocess. The marquee chain is **AAC RTMP contribution → Opus
+`symphonia-codec-aac` (pure Rust, AAC-LC mono/stereo only), which needs the
+opt-in `aac-symphonia` feature in place of `fdk-aac`; encode uses ffmpeg
+subprocess. The marquee chain is **AAC RTMP contribution → Opus
 WebRTC distribution** in a single bilbycast-edge process. See
 [`docs/audio-gateway.md`](docs/audio-gateway.md).
 

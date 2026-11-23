@@ -1864,9 +1864,17 @@ fn probe_videotoolbox_decoder(_: &str) -> bool {
 }
 
 fn probe_cpu_info() -> CpuInfo {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu_all();
-    let cpus = sys.cpus();
+    // `System::new()` fails only on a platform sysinfo does not support;
+    // there the CPU list stays empty, as sysinfo 0.39 left it, so the brand
+    // reads "unknown" and the core counts fall to their floors below.
+    let mut sys = sysinfo::System::new().ok();
+    if let Some(sys) = sys.as_mut() {
+        sys.refresh_cpu_all();
+    }
+    let cpus: &[sysinfo::Cpu] = match &sys {
+        Some(sys) => sys.cpus(),
+        None => &[],
+    };
     let brand = cpus
         .first()
         .map(|c| c.brand().trim().to_string())

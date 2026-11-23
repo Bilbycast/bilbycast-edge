@@ -78,10 +78,82 @@ controller exceeding these returns 413 PAYLOAD_TOO_LARGE.
 
 On startup the edge calls
 `api::nmos_mdns::spawn_nmos_node_advertisement` to register
-`_nmos-node._tcp` on the local link. Failures (no multicast on the
-selected interface, or `mdns-sd` daemon errors) are logged once and
-swallowed; flow startup is never blocked. The handle is dropped on
-process exit, which unregisters the service cleanly.
+`_nmos-node._tcp` on the local link, naming the addresses the API
+server listens on (`server.listen_addrs`, else `server.listen_addr`,
+after any `--bind` / `--bind-addrs` override), so that a controller
+following the record reaches the API:
+
+| API bind address | Addresses the record names |
+|---|---|
+| `0.0.0.0` | every IPv4 address of every interface that is up |
+| `[::]` | every IPv6 address of every interface that is up, except link-local (`fe80::/10`) addresses (the edge binds `[::]` IPv6-only) |
+| any other address, loopback included | that address |
+
+`mdns-sd` looks the addresses up on the host's interfaces at
+registration and follows them as they come and go; an address on a
+point-to-point link is never named. The record is announced, and
+queries for it are answered, only on an interface holding a named
+address, with the named addresses in that interface's subnets: `mdns-sd`
+keeps one address set for the record and decides which addresses belong
+on an interface by prefix alone. Every interface's IPv6 link-local
+address is in `fe80::/64`, so a link-local address named would be
+announced on every IPv6 interface, where only its own link can reach it;
+that is why `[::]` leaves them out. An interface whose only IPv6 address
+is link-local therefore announces no IPv6 address: with an IPv4 bind it
+announces the record with its IPv4 addresses alone, and without one not
+at all. A `0.0.0.0` bind does name IPv4 link-local addresses
+(`169.254.0.0/16`), so on a host where more than one interface holds
+one, each of those interfaces announces them all.
+
+The default bind, `127.0.0.1` and `[::1]`, keeps the record on
+loopback: only this host can reach the API, and only this host sees the
+record. The record is kept there rather than not registered, so a
+controller on the same host still finds the node. The startup log line
+`NMOS mDNS-SD: registered ... on host ... naming ...` gives the record's
+host and lists what the record names.
+
+Up to v0.117.0 the record named `127.0.0.1` whatever the bind, so it was
+seen on loopback alone and no controller on the network could discover
+a node through it.
+
+The record's host is `<name>-bilbycast.local.`, where `<name>` is the
+node's name, which the IS-04 node resource carries as its `label` and
+`hostname`: `$HOSTNAME`, else `$HOST`, else the system host name, cut to
+its first dot-separated part and made a valid DNS label (any character
+but an ASCII letter, digit or hyphen becomes a hyphen, at most 63
+bytes), else `bilbycast-edge`. Where `<name>-bilbycast` would pass the
+63 bytes a label holds, `<name>` is cut short in the host. systemd
+passes neither variable to a service unless its unit sets one, and the
+packaged unit does not, so a packaged edge goes by its system host
+name. Up to v0.117.0 it fell straight back to `bilbycast-edge`, and the
+record's host was `bilbycast-edge.local.` on every packaged edge.
+
+The host is not `<name>.local.` because the machine's own mDNS
+responder, where one runs (avahi-daemon, or systemd-resolved with
+MulticastDNS on), already answers for that name with the addresses of
+its interfaces, not all of which the record names (it never names an
+IPv6 link-local address). The record would lose its conflict probe to
+that responder at every start and go out as `<name>-2.local.`. A rename
+can still happen between records for the same host that name different
+addresses: two edges on one host whose APIs listen on different
+addresses, or edges on two hosts of the same name on one link. The one
+that probes second, which depends on the order they start, loses:
+`mdns-sd` renames its host (`<name>-bilbycast-2.local.`) and the edge
+logs a warning naming the new name, once per name. Two edges on one
+host whose APIs both listen on `0.0.0.0` name the same addresses and
+keep the one host name. Discovery works either way, since the record's
+SRV follows the rename; the IS-04 `hostname` stays `<name>`.
+
+Failures (no multicast on the selected interface, or `mdns-sd` daemon
+errors) are logged once and swallowed; flow startup is never blocked.
+
+On a graceful shutdown (SIGTERM / SIGINT) the record is withdrawn once
+the API server has stopped, before the flows stop: the daemon sends its
+goodbye packets (TTL 0, so browsers drop the record) and exits, and the
+edge waits up to 1 s for it to confirm. A process that is killed, or
+that fails before reaching that point, can leave the record cached by
+browsers until its TTLs run out: 2 minutes for the address and SRV
+records, 75 minutes for the PTR and TXT records (`mdns-sd`'s defaults).
 
 ## Registration client (push to an NMOS registry)
 

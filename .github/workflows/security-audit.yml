@@ -9,6 +9,7 @@ on:
       - ".github/workflows/security-audit.yml"
       - ".github/scripts/check-vendored-c-libs.sh"
       - "deny.toml"
+      - ".cargo/audit.toml"
   pull_request:
     paths:
       - "**/Cargo.toml"
@@ -16,6 +17,7 @@ on:
       - ".github/workflows/security-audit.yml"
       - ".github/scripts/check-vendored-c-libs.sh"
       - "deny.toml"
+      - ".cargo/audit.toml"
   schedule:
     # Daily at 07:00 AEST (21:00 UTC) — catch new RUSTSEC advisories
     - cron: "0 21 * * *"
@@ -61,16 +63,16 @@ jobs:
           - advisories
           - bans licenses sources
     steps:
-      # bilbycast-edge/Cargo.toml has path dependencies on seven sibling
+      # bilbycast-edge/Cargo.toml has path dependencies on eight sibling
       # repos (../bilbycast-fdk-aac-rs, ../bilbycast-ffmpeg-video-rs,
       # ../bilbycast-libsrt-rs, ../bilbycast-rist, ../bilbycast-bonding,
-      # ../bilbycast-mxl-rs, ../bilbycast-decklink-rs). `cargo metadata`
-      # must read every path dependency's manifest to build the dependency
-      # graph — including `optional = true` ones whose feature is off — so
-      # a missing sibling directory fails the run outright, not just under
-      # --all-features. Mirror the nightly-release layout: check everything
-      # out into peer directories of the workspace root, then point
-      # cargo-deny at ./bilbycast-edge/Cargo.toml so the relative `..`
+      # ../bilbycast-mxl-rs, ../bilbycast-decklink-rs, ../bilbycast-rga-rs).
+      # `cargo metadata` must read every path dependency's manifest to build
+      # the dependency graph — including `optional = true` ones whose feature
+      # is off — so a missing sibling directory fails the run outright, not
+      # just under --all-features. Mirror the nightly-release layout: check
+      # everything out into peer directories of the workspace root, then
+      # point cargo-deny at ./bilbycast-edge/Cargo.toml so the relative `..`
       # references resolve correctly. No checkout keeps its credential: the
       # container action below reads the workspace, and only needs files.
       - name: Checkout bilbycast-libsrt-rs (path dependency)
@@ -136,18 +138,19 @@ jobs:
           path: bilbycast-edge
           persist-credentials: false
 
-      # Pinned to the commit tag v2.1.1 points at, not the moving `v2` tag, so
-      # a retagged major cannot swap the Dockerfile and entrypoint this job
-      # builds and runs. The trailing `# vX.Y.Z` is the form Dependabot reads:
-      # it bumps the SHA and the comment together, so this pin keeps moving
-      # with upstream releases.
+      # Pinned to the commit of the release the trailing `# vX.Y.Z` names, not
+      # the moving `v2` tag, so a retagged major cannot swap the Dockerfile and
+      # entrypoint this job builds and runs. That trailing comment is the form
+      # Dependabot reads: it bumps the SHA and the comment together, so this
+      # pin keeps moving with upstream releases.
       - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2.1.3
         with:
           command: check ${{ matrix.checks }}
           manifest-path: ./bilbycast-edge/Cargo.toml
 
-  # cargo-audit and cargo-deny read the *Rust* dependency graph via
-  # `cargo metadata`. Neither has any concept of a git submodule holding C
+  # cargo-audit and cargo-deny read only *Rust* crates: cargo audit every
+  # package in Cargo.lock, cargo-deny the graph `cargo metadata` resolves (see
+  # deny.toml). Neither has any concept of a git submodule holding C
   # source, so neither can flag a vulnerable libsrt / FFmpeg / opus pin —
   # regardless of whether the submodule content is checked out. That blind
   # spot let libsrt v1.5.5 stay vendored for 9 days after v1.5.6 patched

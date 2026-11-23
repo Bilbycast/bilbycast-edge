@@ -1,16 +1,26 @@
 # cargo-audit configuration. Mirrors the [advisories] ignore list in
 # deny.toml — both checks run side-by-side in the Security audit
-# workflow and need to share an allowlist or the run goes red.
+# workflow and need to share an allowlist: an advisory missing from
+# deny.toml fails the cargo-deny job, one missing here has the scheduled
+# cargo-audit run open an issue for it (cargo audit fails a check only on a
+# vulnerability), and an entry nothing matches makes cargo-deny warn
+# `advisory-not-detected`.
+#
+# The two do not read the same crates. cargo audit reads every package in
+# Cargo.lock; cargo-deny reads only the graph deny.toml's [graph] resolves
+# (default features, every target), which leaves out the crates only a
+# non-default feature or a weak `dep?/feature` brings into the lock. An
+# advisory on one of those is ignored here alone: in deny.toml it would raise
+# `advisory-not-detected`.
 
 [advisories]
 ignore = [
     # rustls-pemfile 2.2.0 — crate archived August 2025, code lives on
     # inside rustls-pki-types via the PemObject trait. Not a CVE.
     "RUSTSEC-2025-0134",
-    # zvariant / zbus_names / zvariant_derive — unmaintained since zbus
-    # 6.0.0 absorbed them; reached only through zbus 5 (util::cellular).
-    # Not a CVE. TODO: move to zbus 6, then drop all three.
-    "RUSTSEC-2026-0370",
-    "RUSTSEC-2026-0371",
-    "RUSTSEC-2026-0372",
+    # chrono — unmaintained; its maintainer soft-deprecated it
+    # (chronotope/chrono#1768) and filed the advisory himself. Not a CVE, no
+    # patched release. Required by the edge and by sigstore (0.15.1, the
+    # latest). TODO: move the edge to jiff, then drop once sigstore does too.
+    "RUSTSEC-2026-0543",
 ]

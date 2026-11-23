@@ -1,17 +1,21 @@
 // Copyright (c) 2026 Softside Tech Pty Ltd. All rights reserved.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Compile-time trust roots for upgrade verification.
+//! Trust roots for upgrade verification.
 //!
 //! Layered defence:
 //!
-//! 1. **Sigstore Fulcio CA root** — provided by the `sigstore` crate's
-//!    `SigstoreTrustRoot`, refreshed via routine `cargo update`. The
-//!    edge binary embeds whatever Fulcio root the crate version ships
-//!    with at build time. Sigstore announces rotations well in
-//!    advance; the bilbycast-edge release flow picks them up on its
-//!    nightly cargo update.
-//! 2. **Rekor public key** — same provenance, same crate.
+//! 1. **Sigstore Fulcio CA certificates** — from Sigstore's
+//!    `trusted_root.json`, which the `sigstore` crate's
+//!    `SigstoreTrustRoot` checks at every verification against TUF
+//!    metadata fetched from Sigstore's TUF repository
+//!    (`tuf-repo-cdn.sigstore.dev`). The TUF root is compiled in,
+//!    embedded in the crate, beside a copy of `trusted_root.json` that is
+//!    trusted only once its hash matches the TUF-signed one; a Fulcio or
+//!    Rekor key rotation reaches a running binary through TUF, without a
+//!    rebuild. No network at
+//!    verification time, no trust root: the upgrade fails closed.
+//! 2. **Rekor public key** — same provenance, same `trusted_root.json`.
 //! 3. **Identity allowlist (this file)** — Bilbycast-specific. Pins
 //!    which GitHub Actions workflow runs may produce a manifest that
 //!    this binary will trust. The allowlist names the OIDC issuer
