@@ -373,7 +373,9 @@ jobs:
               --test-threads=1 --nocapture 2>&1)" || { echo "${out}"; echo "::endgroup::"; return 1; }
             echo "${out}"
             echo "::endgroup::"
-            if grep -q '^skipped:' <<<"${out}" || ! grep -q 'test result: ok. 1 passed' <<<"${out}"; then
+            # The skip notice follows `test <name> ... ` on the same line.
+            if grep -q 'skipped: set BILBYCAST_NETNS_TEST' <<<"${out}" \
+              || ! grep -q 'test result: ok. 1 passed' <<<"${out}"; then
               echo "::error title=bond_routing netns::${test} $* did not run" >&2
               return 1
             fi
