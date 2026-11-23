@@ -1636,13 +1636,27 @@ one the WebRTC stack cannot apply fails the pull: either raises a Warning
 `whep_answer_unusable` once per episode (until a pull connects), and the
 pull is tried again after the backoff. However a pull ends — the session
 closes, its handshake or answer fails, the input stops — its resource on the
-server is released with a `DELETE` to the answer's `Location`, in the
-background and bounded to 10 s, so it never holds up the retry; the input
-used to leave every resource to the server's own timeout. Until
-2026-10 the input muxed the video alone, on its raw RTP timestamps: an A/V
-pull lost its audio, and a pull from a server sending no video — another
+server is released with a `DELETE` to the answer's `Location`, waited for in
+the input's task for up to 2 s, so a stopping flow and a node shutting down
+send it before they finish (a stopping flow gives each input task 5 s). A
+server answering 404 or 410 has ended the session already — bilbycast-relay
+once the stream it served has closed — and that is a release like any other,
+logged at debug. Until 2026-11 the DELETE went out in the background, which a
+shutdown cut short, and before 2026-10 there was none: the server kept every
+dead pull until its own timeout.
+
+Until 2026-10 the input muxed the video alone, on its raw RTP timestamps: an
+A/V pull lost its audio, and a pull from a server sending no video — another
 edge's WHEP output on an audio-only flow — published nothing, its flow
 sending NULL keepalives and reporting the input stalled.
+
+A pull of a server that sends its video first — bilbycast-relay primes each
+viewer with its cached IDR, its first Opus packet 60–130 ms behind on a
+loopback rig — holds that video until the first Opus packet says whether it
+is mono or stereo (300 ms at most), so the first PMT already names the
+channel count and the IDR goes out behind it; see
+[supported-protocols.md](supported-protocols.md) ("Audio") for why the first
+PMT's count is the one ffmpeg and GStreamer keep.
 
 ### Media Player Input
 
@@ -2962,7 +2976,7 @@ Viewers POST an SDP offer to `/api/v1/flows/{flow_id}/whep` and receive an SDP a
 
 An answered viewer that does not complete ICE + DTLS is closed with a Warning `webrtc_setup_timeout` within **15–30 s**: at the 30 s deadline, or sooner when ICE gives up on the candidates its offer carried, 15 s after its answer (`details.reason` `ice_failed`). A viewer that leaves without a `DELETE` is let go when it closes its session (DTLS `close_notify`, which a browser's `pc.close()` sends) — at once — or, when it simply vanishes (a closed tab, a lost network), once ICE has not heard from it for 15 s and a 15 s grace has run: about 30 s. A viewer whose ICE checks resume within the grace is kept — a browser that was suspended or backgrounded, or a network back before the browser itself gave up (Chrome does so about 15 s into unanswered checks, for good) — and nothing is sent to a viewer while its ICE is down. Its audio and video are still encoded meanwhile, so one that comes back is sent both on one clock, and its keyframe request (PLI) is answered with an IDR when `video_encode` runs on libx264 or VAAPI; NVENC and QSV code a non-IDR intra picture, which a browser does not take as a keyframe, and RKMPP ignores the request (see [codec-matrix.md](codec-matrix.md)), so those viewers wait for the encoder's next natural IDR. Until 2026-10 a viewer that left without a `DELETE` was sent the stream, its task and socket held, until the flow stopped, and one that never connected was held the same way.
 
-In **WHIP client** mode the endpoint's answer must accept H.264, the only video the output sends. An answer that does not leaves nothing to publish: the output deletes the session's resource (`DELETE` to the answer's `Location`), raises a Warning `webrtc_no_h264`, and retries after its exponential backoff (1 s, doubling to 30 s). It used to connect over the audio alone and start over at once, without end. A handshake that fails (ICE or DTLS) is left the same way — resource deleted, publish retried after the backoff — where it used to go straight back to a new POST. A session that ends after connecting — the endpoint closes it, or the output's own ICE agent gives the endpoint up (a full agent, it does so about 24 s after the last answered check, and the session ends there: there is no grace on this side, since an ICE-Lite endpoint never re-creates the pair) — is published again after the backoff: 1 s after a session that lasted 10 s, doubling to 30 s across sessions that ended sooner, so an endpoint that accepts each publish and closes it is not published to once a second for good. Until 2026-10 an endpoint's close went unnoticed, and nothing was published again until the flow restarted.
+In **WHIP client** mode the endpoint's answer must accept H.264, the only video the output sends. An answer that does not leaves nothing to publish: the output deletes the session's resource (`DELETE` to the answer's `Location`), raises a Warning `webrtc_no_h264`, and retries after its exponential backoff (1 s, doubling to 30 s). It used to connect over the audio alone and start over at once, without end. A handshake that fails (ICE or DTLS) is left the same way — resource deleted, publish retried after the backoff — where it used to go straight back to a new POST. A session that ends after connecting — the endpoint closes it, or the output's own ICE agent gives the endpoint up (a full agent, it does so about 24 s after the last answered check, and the session ends there: there is no grace on this side, since an ICE-Lite endpoint never re-creates the pair) — is published again after the backoff: 1 s after a session that lasted 10 s, doubling to 30 s across sessions that ended sooner, so an endpoint that accepts each publish and closes it is not published to once a second for good. Until 2026-10 an endpoint's close went unnoticed, and nothing was published again until the flow restarted. Every session the output opens is ended with a `DELETE` to the answer's `Location` (RFC 9725 §4.2) however it ends — an answer the output cannot use, a failed handshake, a session that ends, and the output stopping (a flow stop, its removal, a node shutdown). The output waits up to 2 s for the endpoint's reply (`WHIP_DELETE_BOUND`) inside its own task, so a stopping flow and a node shutting down wait for it and a dead endpoint costs a stop no more than that. Until 2026-11 a stopping output sent no `DELETE`, and the endpoint held the dead session until its ICE timed out — the relay's WHIP ingest about 15 s after an edge restart.
 
 > **Upgrade order.** Upgrade every edge carrying a **WHIP client** output
 > *before* the relay or edge it publishes into. An edge from before the

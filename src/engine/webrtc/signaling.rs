@@ -92,9 +92,17 @@ pub async fn whep_post(
 ///
 /// Per RFC 9725, sending DELETE to the resource URL tears down the session.
 /// Bounded to 10 s as a whole, not only its connect: a teardown is
-/// best-effort and must not hold up the retry behind it. Used by the WHIP
-/// output to drop a session it will not publish on (an answer without
-/// H.264).
+/// best-effort and must not hold up the retry behind it (the WHIP output and
+/// the WHEP input bound it tighter still). Used by the WHIP output and the
+/// WHEP input to end every session they open.
+///
+/// `Ok` when the resource is gone: deleted (2xx), or not there to delete —
+/// 404 or 410, which is what a server answers for a session it has already
+/// ended (bilbycast-relay, for one, once the stream it served has closed),
+/// so a release that finds nothing to release is a debug line, not a
+/// warning. Any other status is an error, which the caller logs with the
+/// resource. Every status used to be `Ok`, after a warning here that named
+/// neither the resource nor the caller — a 404 included.
 pub async fn delete_session(
     resource_url: &str,
     bearer_token: Option<&str>,
@@ -111,19 +119,100 @@ pub async fn delete_session(
     }
 
     let response = request.send().await?;
-    if !response.status().is_success() {
-        tracing::warn!(
-            "WHIP/WHEP DELETE returned HTTP {}",
-            response.status().as_u16()
-        );
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
     }
-
-    Ok(())
+    if matches!(status, reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE) {
+        tracing::debug!("WHIP/WHEP DELETE {resource_url}: HTTP {}, the session is gone already", status.as_u16());
+        return Ok(());
+    }
+    bail!("HTTP {}", status.as_u16())
 }
 
 #[cfg(test)]
 mod tests {
     use super::resolve_resource_url;
+    use std::sync::{Arc, Mutex};
+
+    /// Formatted `tracing` output, collected for a test to read.
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A DELETE answered 404 or 410 — a server that has already ended the
+    /// session, as bilbycast-relay has once the stream it served closed —
+    /// releases it as surely as a 200: `Ok`, and a debug line, not a
+    /// warning. Any other refusal is an error the caller logs with the
+    /// resource. Every status was `Ok`, after a warning naming neither the
+    /// resource nor the caller — a 404 included.
+    #[tokio::test]
+    async fn a_session_already_gone_is_released() {
+        use axum::http::StatusCode;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let app = axum::Router::new()
+            .route("/whep/ok", axum::routing::delete(|| async { StatusCode::OK }))
+            .route("/whep/gone", axum::routing::delete(|| async { StatusCode::NOT_FOUND }))
+            .route("/whep/gone-for-good", axum::routing::delete(|| async { StatusCode::GONE }))
+            .route("/whep/broken", axum::routing::delete(|| async { StatusCode::INTERNAL_SERVER_ERROR }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let tls = crate::util::tls::TlsTrust { accept_self_signed: false, fingerprint: None };
+        let delete = |path: &'static str| {
+            let tls = tls.clone();
+            async move { super::delete_session(&format!("http://{addr}/whep/{path}"), None, &tls).await }
+        };
+
+        // Logged at any level, read back; a first pass registers the
+        // callsites against a subscriber (see the RTMP server's stream-key
+        // log test: one first hit with none installed can cache "never").
+        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = || {
+            let writer = captured.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .finish(),
+            )
+        };
+        drop({
+            let warm = subscriber();
+            for path in ["ok", "gone", "broken"] {
+                let _ = delete(path).await;
+            }
+            warm
+        });
+        let _guard = subscriber();
+        let mut logged = Vec::new();
+        for path in ["ok", "gone", "gone-for-good", "broken"] {
+            captured.0.lock().unwrap().clear();
+            let result = delete(path).await;
+            let text = String::from_utf8_lossy(&captured.0.lock().unwrap()).into_owned();
+            let ours: Vec<String> = text.lines().filter(|l| l.contains("WHIP/WHEP DELETE")).map(String::from).collect();
+            logged.push((path, result.map_err(|e| e.to_string()), ours));
+        }
+        server.abort();
+
+        assert!(matches!(&logged[0], (_, Ok(()), l) if l.is_empty()), "{:?}", logged[0]);
+        for gone in &logged[1..3] {
+            let (_, result, lines) = gone;
+            assert_eq!(result, &Ok(()), "{gone:?}");
+            assert!(lines.len() == 1 && lines[0].contains("DEBUG") && lines[0].contains("gone already"), "{gone:?}");
+        }
+        assert!(matches!(&logged[3], (_, Err(e), l) if e == "HTTP 500" && l.is_empty()), "{:?}", logged[3]);
+    }
 
     /// A relative `Location` — what the edge's own WHIP endpoint answers —
     /// resolves against the endpoint it was POSTed to; an absolute one is

@@ -870,27 +870,41 @@ fn opus_through_audio_encode(
     }
 }
 
-/// Count one frame handed to `write_media` as sent — `packets` RTP packets
-/// of `bytes`, and its latency from `recv_time_us` when it came from the
-/// source — unless ICE was down as it was handed over (`on_wire` false):
-/// `WebrtcSession::write_media` then put nothing on the wire. The frame was
-/// still encoded, so the encoders keep their timelines (see there).
+/// Count one frame as sent: `handed`, what `WebrtcSession::write_media`
+/// handed str0m (an access unit after its filler strip), in `packets(handed)`
+/// RTP packets, and its latency from `recv_time_us` when it came from the
+/// source. `None` — ICE was down, or the write failed — counts nothing: the
+/// frame went nowhere, though it was still encoded, so the encoders keep
+/// their timelines (see `write_media`). Until 2026-11 an access unit counted
+/// as the send loop had it, filler included.
 #[cfg(feature = "webrtc")]
 fn count_sent(
     stats: &OutputStatsAccumulator,
-    on_wire: bool,
-    packets: u64,
-    bytes: usize,
+    handed: Option<usize>,
+    packets: impl FnOnce(usize) -> u64,
     recv_time_us: Option<u64>,
 ) {
-    if !on_wire {
+    let Some(bytes) = handed else {
         return;
-    }
-    stats.packets_sent.fetch_add(packets, Ordering::Relaxed);
+    };
+    stats.packets_sent.fetch_add(packets(bytes), Ordering::Relaxed);
     stats.bytes_sent.fetch_add(bytes as u64, Ordering::Relaxed);
     if let Some(recv_time_us) = recv_time_us {
         stats.record_latency(recv_time_us);
     }
+}
+
+/// One RTP packet per frame: an Opus frame.
+#[cfg(feature = "webrtc")]
+fn one_packet(_: usize) -> u64 {
+    1
+}
+
+/// The RTP packets an H.264 access unit of `bytes` goes out in,
+/// approximately: the 1200-byte payloads it splits into.
+#[cfg(feature = "webrtc")]
+fn video_packets(bytes: usize) -> u64 {
+    bytes.div_ceil(1_200) as u64
 }
 
 /// Pass one Opus-in-TS PES through to the session's audio track: each Opus
@@ -915,13 +929,15 @@ async fn write_opus_passthrough(
 
     for (packet, rtp_time) in timeline.place(pes, pts) {
         let media_time = MediaTime::new(rtp_time, Frequency::FORTY_EIGHT_KHZ);
-        let on_wire = !session.ice_down();
-        if let Err(e) = session.write_media(audio_mid, audio_pt, Instant::now(), media_time, packet) {
-            tracing::debug!("WebRTC output '{}' Opus passthrough write error: {}", output_id, e);
-        }
+        let handed = session
+            .write_media(audio_mid, audio_pt, Instant::now(), media_time, packet)
+            .unwrap_or_else(|e| {
+                tracing::debug!("WebRTC output '{}' Opus passthrough write error: {}", output_id, e);
+                None
+            });
         // str0m requires poll_output between consecutive writes.
         session.drain_outputs().await;
-        count_sent(stats, on_wire, 1, packet.len(), Some(recv_time_us));
+        count_sent(stats, handed, one_packet, Some(recv_time_us));
     }
 }
 
@@ -1070,15 +1086,16 @@ async fn handle_webrtc_video_frame(
         // each fragment arrived as its own frame, every one marker-bit.
         let au = annex_b_access_unit(send_nalus);
         let media_time = MediaTime::new(*frame_pts, Frequency::NINETY_KHZ);
-        let on_wire = !session.ice_down();
-        if let Err(e) = session.write_media(video_mid, video_pt, Instant::now(), media_time, &au) {
-            tracing::debug!("WebRTC output '{}' write error: {}", output_id, e);
-        }
+        let handed = session
+            .write_media(video_mid, video_pt, Instant::now(), media_time, &au)
+            .unwrap_or_else(|e| {
+                tracing::debug!("WebRTC output '{}' write error: {}", output_id, e);
+                None
+            });
         // str0m requires poll_output between consecutive writes —
         // drain or the next write_media is silently rejected.
         session.drain_outputs().await;
-        // RTP packets, approximately: the 1200-byte payloads a frame splits into.
-        count_sent(stats, on_wire, au.len().div_ceil(1_200) as u64, au.len(), Some(recv_time_us));
+        count_sent(stats, handed, video_packets, Some(recv_time_us));
     }
 }
 
@@ -1889,21 +1906,24 @@ async fn whep_viewer_loop(
                                                 frame.pts * 48_000 / 90_000,
                                                 str0m::media::Frequency::FORTY_EIGHT_KHZ,
                                             );
-                                            let on_wire = !session.ice_down();
-                                            if let Err(e) = session.write_media(
+                                            let handed = match session.write_media(
                                                 audio_mid,
                                                 audio_pt,
                                                 Instant::now(),
                                                 media_time,
                                                 &frame.data,
                                             ) {
-                                                tracing::debug!(
-                                                    "WHEP viewer '{}' audio write error: {}",
-                                                    session_id, e
-                                                );
-                                            }
+                                                Ok(handed) => handed,
+                                                Err(e) => {
+                                                    tracing::debug!(
+                                                        "WHEP viewer '{}' audio write error: {}",
+                                                        session_id, e
+                                                    );
+                                                    None
+                                                }
+                                            };
                                             session.drain_outputs().await;
-                                            count_sent(&stats, on_wire, 1, frame.data.len(), Some(recv_time_us));
+                                            count_sent(&stats, handed, one_packet, Some(recv_time_us));
                                         }
                                     }
                                 }
@@ -1962,21 +1982,24 @@ async fn whep_viewer_loop(
                                             frame.pts * 48_000 / 90_000,
                                             str0m::media::Frequency::FORTY_EIGHT_KHZ,
                                         );
-                                        let on_wire = !session.ice_down();
-                                        if let Err(e) = session.write_media(
+                                        let handed = match session.write_media(
                                             audio_mid,
                                             audio_pt,
                                             Instant::now(),
                                             media_time,
                                             &frame.data,
                                         ) {
-                                            tracing::debug!(
-                                                "WHEP viewer '{}' audio write error: {}",
-                                                session_id, e
-                                            );
-                                        }
+                                            Ok(handed) => handed,
+                                            Err(e) => {
+                                                tracing::debug!(
+                                                    "WHEP viewer '{}' audio write error: {}",
+                                                    session_id, e
+                                                );
+                                                None
+                                            }
+                                        };
                                         session.drain_outputs().await;
-                                        count_sent(&stats, on_wire, 1, frame.data.len(), Some(recv_time_us));
+                                        count_sent(&stats, handed, one_packet, Some(recv_time_us));
                                     }
                                 }
                                 #[cfg(not(feature = "media-codecs"))]
@@ -2042,8 +2065,48 @@ async fn whep_viewer_loop(
     events.emit_flow(EventSeverity::Info, category::WEBRTC, "WHEP viewer disconnected", flow_id);
 }
 
-/// Leave a WHIP session the output will not publish on: DELETE its
-/// `resource` (when there is one to delete) and wait out `backoff_secs`.
+/// How long the WHIP output waits for an endpoint to answer the DELETE that
+/// ends a session ([`whip_release`]). A live endpoint answers in a few round
+/// trips; this bounds what a dead one costs. It is waited out inside the
+/// output's task, so a stopping flow and a node shutting down wait for it —
+/// within the 5 s a stopping flow gives each output task
+/// (`FlowRuntime::stop`, `remove_output`), with room left for the rest of
+/// the task's teardown.
+#[cfg(feature = "webrtc")]
+const WHIP_DELETE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// End the WHIP session at `resource` (when there is one): DELETE it (RFC
+/// 9725 §4.2), waiting up to [`WHIP_DELETE_BOUND`] for the answer. Best
+/// effort — a failure is a log line. Awaited rather than spawned, and never
+/// cut short by the output's cancel: a spawned DELETE does not outlive a
+/// process shutting down (it leaves through `_exit` once the flows have
+/// stopped), and the output used to send none at all when it stopped, so an
+/// endpoint kept the dead session until its ICE timed out (the relay's
+/// ingest, about 15 s after a node restart).
+#[cfg(feature = "webrtc")]
+async fn whip_release(
+    resource: Option<&str>,
+    config: &WebrtcOutputConfig,
+    tls: &crate::util::tls::TlsTrust,
+) {
+    let Some(resource) = resource else {
+        return;
+    };
+    let delete = super::webrtc::signaling::delete_session(resource, config.bearer_token.as_deref(), tls);
+    match tokio::time::timeout(WHIP_DELETE_BOUND, delete).await {
+        Ok(Ok(())) => tracing::debug!("WHIP client '{}': released {}", config.id, resource),
+        Ok(Err(e)) => tracing::warn!("WHIP client '{}': DELETE {} failed: {}", config.id, resource, e),
+        Err(_) => tracing::warn!(
+            "WHIP client '{}': DELETE {} unanswered after {} s; left to the endpoint's own timeout",
+            config.id,
+            resource,
+            WHIP_DELETE_BOUND.as_secs(),
+        ),
+    }
+}
+
+/// Leave a WHIP session the output will not publish on, or that has ended:
+/// DELETE its `resource` ([`whip_release`]) and wait out `backoff_secs`.
 /// `false` when `cancel` fired meanwhile — the output is stopping.
 #[cfg(feature = "webrtc")]
 async fn whip_leave_and_back_off(
@@ -2053,16 +2116,7 @@ async fn whip_leave_and_back_off(
     backoff_secs: u64,
     cancel: &CancellationToken,
 ) -> bool {
-    if let Some(resource) = resource {
-        tokio::select! {
-            _ = cancel.cancelled() => return false,
-            r = super::webrtc::signaling::delete_session(resource, config.bearer_token.as_deref(), tls) => {
-                if let Err(e) = r {
-                    tracing::warn!("WHIP client '{}': DELETE {} failed: {}", config.id, resource, e);
-                }
-            }
-        }
-    }
+    whip_release(resource, config, tls).await;
     tokio::select! {
         _ = cancel.cancelled() => false,
         _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => true,
@@ -2195,9 +2249,9 @@ async fn whip_client_loop(
             report_negotiation_panic(&e, events, flow_id, "WHIP endpoint");
             // Back off before retrying — a bare `continue` here spins the
             // session/offer/POST loop with no delay on a persistent SDP fault.
-            tokio::select! {
-                _ = cancel.cancelled() => break 'outer,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+            // The endpoint made a resource for the offer: it goes too.
+            if !whip_leave_and_back_off(resource_url.as_deref(), &config, &tls, backoff_secs, &cancel).await {
+                break 'outer;
             }
             backoff_secs = (backoff_secs * 2).min(30);
             continue;
@@ -2252,6 +2306,7 @@ async fn whip_client_loop(
                 }
                 SessionEvent::Disconnected => {
                     if cancel.is_cancelled() {
+                        whip_release(resource_url.as_deref(), &config, &tls).await;
                         break 'outer;
                     }
                     // ICE or DTLS failed. The session is left — its resource
@@ -2369,8 +2424,9 @@ async fn whip_client_loop(
                 // A floor under the republish, doubling from one session to
                 // the next unless one lasted: an endpoint that closes each
                 // session as it opens would otherwise be published to in a
-                // tight loop.
-                if !whip_leave_and_back_off(None, &config, &tls, backoff_secs, &cancel).await {
+                // tight loop. The session is DELETEd first, in case the
+                // endpoint still holds it.
+                if !whip_leave_and_back_off(resource_url.as_deref(), &config, &tls, backoff_secs, &cancel).await {
                     break 'outer;
                 }
                 backoff_secs = (backoff_secs * 2).min(30);
@@ -2383,7 +2439,14 @@ async fn whip_client_loop(
                 }
             };
             tokio::select! {
-                _ = cancel.cancelled() => break 'outer,
+                // The output is stopping (flow stop, output removal, node
+                // shutdown): its session is ended with a DELETE before the
+                // task returns. It used to break out without one, and the
+                // endpoint held the session until its ICE timed out.
+                _ = cancel.cancelled() => {
+                    whip_release(resource_url.as_deref(), &config, &tls).await;
+                    break 'outer;
+                }
 
                 _ = idle.tick() => {
                     session.drive_udp_io().await;
@@ -2589,20 +2652,23 @@ async fn whip_client_loop(
                                                     frame.pts * 48_000 / 90_000,
                                                     str0m::media::Frequency::FORTY_EIGHT_KHZ,
                                                 );
-                                                let on_wire = !session.ice_down();
-                                                if let Err(e) = session.write_media(
+                                                let handed = match session.write_media(
                                                     audio_mid,
                                                     audio_pt,
                                                     Instant::now(),
                                                     media_time,
                                                     &frame.data,
                                                 ) {
-                                                    tracing::debug!(
-                                                        "WHIP audio write error: {}", e
-                                                    );
-                                                }
+                                                    Ok(handed) => handed,
+                                                    Err(e) => {
+                                                        tracing::debug!(
+                                                            "WHIP audio write error: {}", e
+                                                        );
+                                                        None
+                                                    }
+                                                };
                                                 session.drain_outputs().await;
-                                                count_sent(&stats, on_wire, 1, frame.data.len(), Some(recv_time_us));
+                                                count_sent(&stats, handed, one_packet, Some(recv_time_us));
                                             }
                                         }
                                     }
@@ -2658,20 +2724,23 @@ async fn whip_client_loop(
                                                 frame.pts * 48_000 / 90_000,
                                                 str0m::media::Frequency::FORTY_EIGHT_KHZ,
                                             );
-                                            let on_wire = !session.ice_down();
-                                            if let Err(e) = session.write_media(
+                                            let handed = match session.write_media(
                                                 audio_mid,
                                                 audio_pt,
                                                 Instant::now(),
                                                 media_time,
                                                 &frame.data,
                                             ) {
-                                                tracing::debug!(
-                                                    "WHIP '{}' audio write error: {}",
-                                                    config.id, e
-                                                );
-                                            }
-                                            count_sent(&stats, on_wire, 1, frame.data.len(), Some(recv_time_us));
+                                                Ok(handed) => handed,
+                                                Err(e) => {
+                                                    tracing::debug!(
+                                                        "WHIP '{}' audio write error: {}",
+                                                        config.id, e
+                                                    );
+                                                    None
+                                                }
+                                            };
+                                            count_sent(&stats, handed, one_packet, Some(recv_time_us));
                                         }
                                     }
                                     #[cfg(not(feature = "media-codecs"))]
@@ -2723,7 +2792,10 @@ async fn whip_client_loop(
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             stats.packets_dropped.fetch_add(n, Ordering::Relaxed);
                         }
-                        Err(broadcast::error::RecvError::Closed) => break 'outer,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            whip_release(resource_url.as_deref(), &config, &tls).await;
+                            break 'outer;
+                        }
                     }
                 }
             }
@@ -3269,19 +3341,21 @@ async fn emit_webrtc_silence_if_needed(
             frame.pts * 48_000 / 90_000,
             str0m::media::Frequency::FORTY_EIGHT_KHZ,
         );
-        let on_wire = !session.ice_down();
-        if let Err(e) = session.write_media(
+        let handed = match session.write_media(
             audio_mid,
             audio_pt,
             Instant::now(),
             media_time,
             &frame.data,
         ) {
-            tracing::debug!("WebRTC output '{}' silent audio write error: {}", output_id, e);
-            continue;
-        }
+            Ok(handed) => handed,
+            Err(e) => {
+                tracing::debug!("WebRTC output '{}' silent audio write error: {}", output_id, e);
+                continue;
+            }
+        };
         session.drain_outputs().await;
-        count_sent(stats, on_wire, 1, frame.data.len(), None);
+        count_sent(stats, handed, one_packet, None);
     }
 }
 
@@ -5252,6 +5326,111 @@ mod whep_server_tests {
         .await;
         assert!(slip.abs() < 0.5, "audio slipped {slip:.3} s against video across the outage");
     }
+    /// The H.264 access unit [`view_h264`] feeds: an x264-style Main SPS
+    /// (`4d 40`), a PPS, an IDR slice, and a filler data NAL unit far larger
+    /// than all three.
+    fn main_au_with_filler() -> Vec<u8> {
+        const SC: &[u8] = &[0, 0, 0, 1];
+        let mut filler = vec![0x0c];
+        filler.resize(6_000, 0xff);
+        filler.push(0x80);
+        [
+            SC,
+            &[0x67, 0x4d, 0x40, 0x1f, 0xec][..],
+            SC,
+            &[0x68, 0xeb, 0xe3, 0xcb],
+            SC,
+            &[0x65, 0x88, 0x84, 0x21],
+            SC,
+            &filler,
+        ]
+        .concat()
+    }
+
+    /// The bytes of [`main_au_with_filler`] that go out: without the filler.
+    const MAIN_AU_WITHOUT_FILLER: usize = 4 * 3 + 5 + 4 + 4;
+
+    /// A WHEP output fed [`main_au_with_filler`] every 40 ms, and a
+    /// video-only viewer (offering this edge's own H.264 set: Baseline on
+    /// PT 127, Constrained Baseline 108, Main 123, High 114) driven until it
+    /// has heard `frames` of it: the PTs they came on, and the output's
+    /// stats.
+    async fn view_h264(frames: usize) -> (Vec<u8>, Arc<OutputStatsAccumulator>) {
+        use super::super::webrtc::session::SessionEvent;
+        let (broadcast_tx, session_tx, _raised, cancel, _task, stats) =
+            whep_output_with_stats(serde_json::json!({}), WHEP_SETUP_DEADLINE);
+        let feed = tokio::spawn({
+            let (tx, stop) = (broadcast_tx.clone(), cancel.child_token());
+            async move {
+                let au = main_au_with_filler();
+                let mut mux = crate::engine::rtmp::ts_mux::TsMuxer::new();
+                let (mut pts, mut seq) = (90_000u64, 0u16);
+                while !stop.is_cancelled() {
+                    for data in crate::engine::packet::bundle_ts_packets(mux.mux_video(&au, pts, pts, true)) {
+                        let _ = tx.send(RtpPacket {
+                            data,
+                            sequence_number: seq,
+                            rtp_timestamp: 0,
+                            recv_time_us: 0,
+                            is_raw_ts: true,
+                            upstream_seq: None,
+                            upstream_leg_id: None,
+                            sender_timestamp_us: None,
+                        });
+                        seq = seq.wrapping_add(1);
+                    }
+                    pts += 3_600;
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                }
+            }
+        });
+        let mut viewer = viewer().await;
+        let (offer, pending) = viewer.create_offer(true, false, false).unwrap();
+        let (answer, _session, _cancel) = offer_to(&session_tx, offer).await.expect("admitted");
+        viewer.apply_answer(&answer, pending).unwrap();
+        let video_mid = viewer.video_mid.unwrap();
+        let listening = CancellationToken::new();
+        let pts = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut pts = Vec::new();
+            while pts.len() < frames {
+                match viewer.poll_event(&listening).await {
+                    SessionEvent::MediaData { mid, pt, .. } if mid == video_mid => pts.push(*pt),
+                    SessionEvent::Disconnected => panic!("the viewer was disconnected"),
+                    _ => {}
+                }
+            }
+            pts
+        })
+        .await
+        .expect("the viewer heard too little video in 15 s");
+        cancel.cancel();
+        let _ = feed.await;
+        (pts, stats)
+    }
+
+    /// A Main-profile stream goes out on the viewer's Main PT (123 in this
+    /// edge's set), chosen from its SPS — it went out on the first
+    /// packetization-mode=1 PT, Baseline (127), whatever its profile.
+    #[tokio::test]
+    async fn a_main_profile_stream_goes_out_on_the_main_pt() {
+        let (pts, _stats) = view_h264(10).await;
+        assert!(pts.iter().all(|&pt| pt == 123), "video came on PTs {pts:?}");
+    }
+
+    /// What a viewer is counted as sent is what went to str0m: each access
+    /// unit without its filler, in one packet here. It used to be the unit
+    /// as demuxed, filler included, in `len / 1200` packets — 4.4 % of
+    /// this unit went out, and 100 % was counted.
+    #[tokio::test]
+    async fn a_viewer_is_counted_what_is_sent_it_not_the_filler() {
+        let (_pts, stats) = view_h264(10).await;
+        let (packets, bytes) = (
+            stats.packets_sent.load(Ordering::Relaxed),
+            stats.bytes_sent.load(Ordering::Relaxed),
+        );
+        assert!(packets >= 10, "{packets} packets");
+        assert_eq!(bytes, packets * MAIN_AU_WITHOUT_FILLER as u64, "{packets} packets");
+    }
 }
 
 #[cfg(all(test, feature = "webrtc"))]
@@ -5359,6 +5538,11 @@ mod whip_client_tests {
         /// Connects, then closes the session (DTLS close_notify), as a
         /// server dropping its publisher does.
         ClosesOnConnect,
+        /// Connects and keeps the session.
+        Keeps,
+        /// Connects and keeps the session, and never answers a DELETE (its
+        /// handler notes the request, then hangs): a dead endpoint.
+        KeepsAndHangsOnDelete,
     }
 
     /// A WHIP endpoint on loopback answering every publish with a real
@@ -5439,6 +5623,9 @@ mod whip_client_tests {
                     let deleted = deleted.clone();
                     move |Path(resource): Path<String>| async move {
                         deleted.lock().unwrap().push(resource);
+                        if let Endpoint::KeepsAndHangsOnDelete = mode {
+                            std::future::pending::<()>().await;
+                        }
                         StatusCode::OK
                     }
                 }),
@@ -5579,5 +5766,82 @@ mod whip_client_tests {
             lost += usize::from(ev.message == "WHIP client disconnected");
         }
         assert!(lost >= 3, "{lost} sessions lost: not the connected path");
+    }
+
+    /// Wait for the output's session to connect: its "WHIP session
+    /// established" event.
+    async fn established(raised: &mut tokio::sync::mpsc::Receiver<crate::manager::events::Event>) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = raised.recv().await {
+                if ev.message == "WHIP session established" {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the session connected");
+    }
+
+    /// An output stopping while it publishes — a flow stop, the output's
+    /// removal, a node shutting down: its cancel — ends its session with a
+    /// DELETE, and has sent it by the time its task returns, which is what
+    /// a stopping flow and a shutdown wait for. It used to stop without one,
+    /// and the endpoint (the relay's WHIP ingest) held the dead session
+    /// until its ICE timed out, ~15 s later.
+    #[tokio::test]
+    async fn a_stopping_output_deletes_its_session_before_it_returns() {
+        let (addr, posts, deleted, server) = webrtc_endpoint(Endpoint::Keeps).await;
+        let (_source, cancel, mut raised, task) = whip_output(addr);
+        established(&mut raised).await;
+        assert!(deleted.lock().unwrap().is_empty(), "nothing deleted while publishing");
+
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the output stopped")
+            .unwrap();
+        assert_eq!(*deleted.lock().unwrap(), ["res-0"], "deleted before the task returned");
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// The same when the flow's channel closes under the output.
+    #[tokio::test]
+    async fn an_output_whose_source_closes_deletes_its_session() {
+        let (addr, _posts, deleted, server) = webrtc_endpoint(Endpoint::Keeps).await;
+        let (source, _cancel, mut raised, task) = whip_output(addr);
+        established(&mut raised).await;
+
+        drop(source);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the output stopped")
+            .unwrap();
+        assert_eq!(*deleted.lock().unwrap(), ["res-0"]);
+        server.abort();
+    }
+
+    /// An endpoint that never answers the DELETE holds the stop no longer
+    /// than `WHIP_DELETE_BOUND`: a dead server must not stall a flow stop or
+    /// a node shutdown (a stopping flow gives each output task 5 s).
+    #[tokio::test]
+    async fn an_unanswered_delete_holds_the_stop_only_to_its_bound() {
+        let (addr, _posts, deleted, server) = webrtc_endpoint(Endpoint::KeepsAndHangsOnDelete).await;
+        let (_source, cancel, mut raised, task) = whip_output(addr);
+        established(&mut raised).await;
+
+        let stopping = std::time::Instant::now();
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("the output stopped")
+            .unwrap();
+        let took = stopping.elapsed();
+        assert_eq!(*deleted.lock().unwrap(), ["res-0"], "the DELETE was sent");
+        assert!(
+            took >= WHIP_DELETE_BOUND && took < WHIP_DELETE_BOUND + std::time::Duration::from_secs(1),
+            "stopped after {took:?}"
+        );
+        server.abort();
     }
 }
