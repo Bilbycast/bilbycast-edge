@@ -938,13 +938,18 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                 .programs
                 .iter_mut()
                 .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
-                && let Some((fps, new_rate)) = v.ts_rate.observe(ts)
+                && let Some((fps, note)) = v.ts_rate.observe(ts)
             {
-                if new_rate {
-                    tracing::info!(
+                match note {
+                    Some(RateNote::Settled) => tracing::info!(
                         "Media analysis: PID 0x{:04X} frame rate measured from DTS/PTS: {:.2} fps",
                         pid, fps
-                    );
+                    ),
+                    Some(RateNote::Changing) => tracing::debug!(
+                        "Media analysis: PID 0x{:04X} frame rate changing (DTS/PTS): {:.2} fps",
+                        pid, fps
+                    ),
+                    None => {}
                 }
                 v.frame_rate = Some(fps);
             }
@@ -957,10 +962,40 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
 /// windows read ±1.8 %.
 const RATE_WINDOW_90K: u64 = 180_000;
 
-/// A window further than this from the rate measured since the last change
-/// (3 %) is a new rate: past a window's jitter, inside the 4 % between the
-/// two closest standard rate families (24 / 25, 48 / 50).
+/// Windows the reported rate covers: the last ~10 s. Contiguous windows
+/// share their ends, so the span's jitter is its two ends' over 10 s
+/// (±0.2 % on Chromium's stamps), and a change too small to restart the
+/// measurement — 30 to 29.97, a 1000/1001 step — has left it whole within
+/// 10 s of the first window wholly past it.
+const RATE_WINDOWS: usize = 5;
+
+/// A window further than this from the reported rate (3 %) is a new rate,
+/// and the windows before it are dropped: past a window's jitter, inside the
+/// 4 % between the two closest standard rate families (24 / 25, 48 / 50).
 const RATE_CHANGE: f64 = 0.03;
+
+/// Windows this close to their mean (0.05 %, half a 1000/1001 step) are
+/// steady: stamps clean enough that a change under [`RATE_CHANGE`] — 30 to
+/// 29.97 — is a change worth a log line, and not the jitter of a capture
+/// clock.
+const RATE_STEADY: f64 = 0.0005;
+
+/// Stream time (90 kHz) after one logged rate change before another is
+/// logged at INFO: 60 s. A source that keeps changing (variable frame rate)
+/// is logged at debug in between.
+const RATE_LOG_HOLDOFF_90K: u64 = 60 * 90_000;
+
+/// What a [`TimestampFrameRate`] reading says beyond the rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateNote {
+    /// A rate that has held for [`RATE_WINDOWS`] windows and differs from
+    /// the last one noted so: logged at INFO.
+    Settled,
+    /// A window more than [`RATE_CHANGE`] off: the measurement starts again.
+    /// Logged at debug — a variable-frame-rate source does it every few
+    /// seconds.
+    Changing,
+}
 
 /// Frame rate of a video PID whose bitstream states none (no VUI timing —
 /// WebRTC's OpenH264, many cameras), measured from its PES timestamps.
@@ -968,28 +1003,40 @@ const RATE_CHANGE: f64 = 0.03;
 /// It was the mean step of the first 30 PES, set once for the life of the
 /// flow: a WHIP publish from Chromium, which sends its first nine frames at
 /// 15 fps before settling at 30, read 23.08 fps for the whole session and
-/// for every publisher after it. Now each window of [`RATE_WINDOW_90K`] is
-/// measured; the rate reported is the frames over the span of every window
-/// since the rate last changed, so it settles rather than wandering with
-/// each window's jitter, and a window more than [`RATE_CHANGE`] off it
-/// starts it afresh. A step outside 1 200..=90 000 ticks (75 fps to 1 fps)
-/// is no frame — a parameter-set PES at its picture's time, a gap, a
-/// timeline jump — and counts towards nothing.
+/// for every publisher after it. Each window of [`RATE_WINDOW_90K`] is now
+/// measured, and the rate reported is the frames over the span of the last
+/// [`RATE_WINDOWS`] (~10 s): it settles through stamp jitter, a window more
+/// than [`RATE_CHANGE`] off drops the windows before it (25 to 50 fps is
+/// followed at the next window), and a smaller change (30 to 29.97) is
+/// followed in full within ~10 s as the old windows roll out. A step
+/// outside 1 200..=90 000 ticks (75 fps to 1 fps) is no frame — a
+/// parameter-set PES at its picture's time, a gap, a timeline jump — and
+/// counts towards nothing.
+///
+/// A new rate is noted ([`RateNote::Settled`], an INFO line) once it has
+/// held for the whole span, and only when it differs from the rate noted
+/// last — by [`RATE_CHANGE`], or by [`RATE_STEADY`] when every window
+/// agrees that closely — and at most once in [`RATE_LOG_HOLDOFF_90K`] of
+/// stream time; an INFO line every window as a variable-rate source moved
+/// was what the measurement since the last change produced.
 #[derive(Debug, Default)]
 pub struct TimestampFrameRate {
     last_ts: Option<u64>,
     window_ticks: u64,
     window_frames: u64,
-    /// Since the rate last changed.
-    ticks: u64,
-    frames: u64,
+    /// `(ticks, frames)` of the last [`RATE_WINDOWS`] windows since the
+    /// last change.
+    windows: std::collections::VecDeque<(u64, u64)>,
+    /// The rate last noted [`RateNote::Settled`].
+    noted: Option<f64>,
+    /// Stream time since then.
+    since_noted_90k: u64,
 }
 
 impl TimestampFrameRate {
     /// One PES's timestamp (DTS, else PTS). Returns the rate when it closes
-    /// a window, and whether that is a new rate rather than a refinement of
-    /// the one before.
-    pub fn observe(&mut self, ts: u64) -> Option<(f64, bool)> {
+    /// a window, with what that reading says beyond it.
+    pub fn observe(&mut self, ts: u64) -> Option<(f64, Option<RateNote>)> {
         let last = self.last_ts.replace(ts)?;
         let step = ts.wrapping_sub(last) & (PTS_MODULUS_90KHZ - 1);
         if !(1_200..=90_000).contains(&step) {
@@ -1000,18 +1047,45 @@ impl TimestampFrameRate {
         if self.window_ticks < RATE_WINDOW_90K {
             return None;
         }
-        let (ticks, frames) = (self.window_ticks, self.window_frames);
+        let window = (self.window_ticks, self.window_frames);
         (self.window_ticks, self.window_frames) = (0, 0);
-        let rate = |ticks: u64, frames: u64| frames as f64 * 90_000.0 / ticks as f64;
-        let new_rate = self.frames == 0
-            || (rate(ticks, frames) / rate(self.ticks, self.frames) - 1.0).abs() > RATE_CHANGE;
-        if new_rate {
-            (self.ticks, self.frames) = (ticks, frames);
-        } else {
-            self.ticks += ticks;
-            self.frames += frames;
+        self.since_noted_90k = self.since_noted_90k.saturating_add(window.0);
+
+        let rate = |(ticks, frames): (u64, u64)| frames as f64 * 90_000.0 / ticks as f64;
+        let off = |a: f64, b: f64| (a / b - 1.0).abs();
+        let changing = self.reported().is_some_and(|reported| off(rate(window), reported) > RATE_CHANGE);
+        if changing {
+            self.windows.clear();
         }
-        Some((rate(self.ticks, self.frames), new_rate))
+        self.windows.push_back(window);
+        if self.windows.len() > RATE_WINDOWS {
+            self.windows.pop_front();
+        }
+        let reported = self.reported()?;
+
+        let note = if changing {
+            Some(RateNote::Changing)
+        } else if self.windows.len() == RATE_WINDOWS {
+            let steady = self.windows.iter().all(|&w| off(rate(w), reported) <= RATE_STEADY);
+            let differs = self.noted.is_none_or(|noted| {
+                let by = off(reported, noted);
+                by > RATE_CHANGE || (steady && by > RATE_STEADY)
+            });
+            let due = self.noted.is_none() || self.since_noted_90k >= RATE_LOG_HOLDOFF_90K;
+            (differs && due).then(|| {
+                (self.noted, self.since_noted_90k) = (Some(reported), 0);
+                RateNote::Settled
+            })
+        } else {
+            None
+        };
+        Some((reported, note))
+    }
+
+    /// Frames over span of the windows held.
+    fn reported(&self) -> Option<f64> {
+        let (ticks, frames) = self.windows.iter().fold((0, 0), |(t, f), &(wt, wf)| (t + wt, f + wf));
+        (ticks > 0).then(|| frames as f64 * 90_000.0 / ticks as f64)
     }
 }
 
@@ -2403,6 +2477,87 @@ mod tests {
         assert_eq!(reported[250], Some(25.0), "25 fps before the change");
         let last = reported.last().unwrap().expect("a rate");
         assert!((last - 50.0).abs() < 1e-9, "read {last} fps for 50");
+    }
+
+    /// Every reading a [`TimestampFrameRate`] gives for a stream stamped
+    /// `steps` ticks apart: `(stream seconds, rate, note)`.
+    fn meter_readings(steps: impl IntoIterator<Item = u64>) -> Vec<(f64, f64, Option<RateNote>)> {
+        let mut meter = TimestampFrameRate::default();
+        let mut ts = 1_000_000u64;
+        meter.observe(ts);
+        let mut at = 0u64;
+        let mut readings = Vec::new();
+        for step in steps {
+            ts += step;
+            at += step;
+            if let Some((fps, note)) = meter.observe(ts) {
+                readings.push((at as f64 / 90_000.0, fps, note));
+            }
+        }
+        readings
+    }
+
+    fn settled(readings: &[(f64, f64, Option<RateNote>)]) -> Vec<(f64, f64)> {
+        readings.iter().filter(|r| r.2 == Some(RateNote::Settled)).map(|r| (r.0, r.1)).collect()
+    }
+
+    /// A 1000/1001 change — 30 to 29.97, under the 3 % that restarts the
+    /// measurement — is followed in full within ~12 s (the window it falls
+    /// in, then ten seconds of windows) and noted once. Measured since the
+    /// last restart, the rate crept towards the new one by dilution: 29.995
+    /// twelve seconds on after a minute at 30, never 29.97.
+    #[test]
+    fn a_1000_1001_rate_change_is_followed_within_a_bounded_time() {
+        let readings = meter_readings(std::iter::repeat_n(3_000, 30 * 90).chain(std::iter::repeat_n(3_003, 30 * 60)));
+        let ntsc = 30_000.0 / 1_001.0;
+        for &(at, fps, _) in &readings {
+            if at <= 90.0 {
+                assert!((fps - 30.0).abs() < 1e-9, "{at:.1} s: {fps}");
+            } else if at >= 90.0 + 12.0 {
+                assert!((fps - ntsc).abs() < 1e-9, "{at:.1} s: {fps} for {ntsc}");
+            }
+        }
+        let noted = settled(&readings);
+        assert_eq!(noted.len(), 2, "30, then 29.97, each once: {noted:?}");
+        assert!((noted[0].1 - 30.0).abs() < 1e-9 && noted[0].0 <= 12.0, "{noted:?}");
+        assert!((noted[1].1 - ntsc).abs() < 1e-4 && noted[1].0 <= 90.0 + 12.0, "{noted:?}");
+        assert!(readings.iter().all(|r| r.2 != Some(RateNote::Changing)), "never restarted");
+    }
+
+    /// Capture-clock jitter of up to half a frame (Chromium's stamps)
+    /// neither moves the rate more than 0.5 % once the windows are full nor
+    /// notes a change: one INFO line for ten minutes, where a window's
+    /// measurement 3 % off would have noted one every 2 s.
+    #[test]
+    fn jitter_does_not_flap_the_rate() {
+        let jitter = [3_060, 2_970, 2_970, 3_150, 2_880, 1_440, 4_560, 2_970];
+        let readings = meter_readings(jitter.into_iter().cycle().take(30 * 600));
+        for &(at, fps, _) in readings.iter().filter(|r| r.0 >= 10.0) {
+            assert!((fps / 30.0 - 1.0).abs() < 0.005, "{at:.1} s: {fps}");
+        }
+        assert_eq!(settled(&readings).len(), 1, "{:?}", settled(&readings));
+        assert!(readings.iter().all(|r| r.2 != Some(RateNote::Changing)));
+    }
+
+    /// A variable-rate source flipping between 30 and 24 fps every 4 s
+    /// never holds a rate for the whole span: each flip is noted at debug
+    /// (`Changing`), none at INFO. One flipping every 20 s is noted at INFO
+    /// at most once a minute.
+    #[test]
+    fn a_variable_rate_source_is_noted_at_debug() {
+        let flips = |secs: usize| {
+            (0..).flat_map(move |i| {
+                let step = if i % 2 == 0 { 3_000 } else { 3_750 };
+                std::iter::repeat_n(step, secs * 90_000 / step as usize)
+            })
+        };
+        let fast = meter_readings(flips(4).take(30 * 120));
+        assert!(settled(&fast).is_empty(), "{:?}", settled(&fast));
+        assert!(fast.iter().filter(|r| r.2 == Some(RateNote::Changing)).count() >= 20);
+
+        let slow = meter_readings(flips(20).take(30 * 300));
+        let noted = settled(&slow);
+        assert!(!noted.is_empty() && noted.windows(2).all(|w| w[1].0 - w[0].0 >= 60.0), "{noted:?}");
     }
 
     #[test]
