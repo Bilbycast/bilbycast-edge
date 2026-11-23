@@ -358,7 +358,10 @@ jobs:
         run: |
           set -euo pipefail
           # Located as the test file's header does; built by the step above.
-          BIN="$(cargo test --locked --test bond_routing_netns --no-run 2>&1 \
+          # Without colour: the workflow's CARGO_TERM_COLOR=always puts an
+          # escape code between `Executable` and its space, and the sed then
+          # matches nothing.
+          BIN="$(CARGO_TERM_COLOR=never cargo test --locked --test bond_routing_netns --no-run 2>&1 \
             | sed -n 's/.*Executable .*(\(.*\))/\1/p')"
           if [ -z "${BIN}" ] || [ ! -x "${BIN}" ]; then
             echo "::error title=bond_routing netns::bond_routing_netns test binary not found" >&2

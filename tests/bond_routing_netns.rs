@@ -17,10 +17,11 @@
 //! `sudo unshare --net`, once per set of bases that step lists, each in a
 //! fresh namespace (`.github/workflows/ci.yml`). Locally, a container gives one
 //! without root on the host. The binary is glibc-linked, so on a musl image
-//! run it through the host's loader:
+//! run it through the host's loader. The lookup turns colour off: a coloured
+//! `Executable` line does not match the `sed`.
 //!
 //! ```text
-//! BIN=$(cargo test --test bond_routing_netns --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))/\1/p')
+//! BIN=$(CARGO_TERM_COLOR=never cargo test --test bond_routing_netns --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))/\1/p')
 //! docker run --rm --cap-add NET_ADMIN --network none -e BILBYCAST_NETNS_TEST=1 \
 //!   -v /usr/lib/x86_64-linux-gnu:/hostlib:ro -v "$PWD/$BIN:/t/bond_routing_netns:ro" \
 //!   alpine:latest /hostlib/ld-linux-x86-64.so.2 --library-path /hostlib \
