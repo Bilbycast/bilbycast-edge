@@ -248,7 +248,7 @@ async fn whip_input_loop(
         // The tracks' frames onto the input's TS (`WhipMux`): one timeline
         // for both, the parameter sets ahead of every IDR, the Opus in the
         // FFmpeg-compatible carriage, no payload-less frame.
-        whip.session(sdp_declares_stereo_opus(&msg.offer_sdp));
+        whip.session(audio_pt.is_some(), sdp_declares_stereo_opus(&msg.offer_sdp));
         // The publish's layout — which of video and audio its offer carried
         // — is settled from the session's tracks on the first media
         // (`WhipLayout`). The muxer used to assume video and no audio: an
@@ -263,7 +263,15 @@ async fn whip_input_loop(
         // Receive media from the WebRTC session
         loop {
             let event = if connected {
-                session.poll_event(&child_cancel).await
+                tokio::select! {
+                    event = session.poll_event(&child_cancel) => event,
+                    _ = hold_expiry(whip.hold_deadline()) => {
+                        for (ts_chunks, pts_90khz) in whip.release_due(std::time::Instant::now()) {
+                            publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
+                        }
+                        continue;
+                    }
+                }
             } else {
                 tokio::select! {
                     event = session.poll_event(&child_cancel) => event,
@@ -307,16 +315,15 @@ async fn whip_input_loop(
                     if !data.is_empty() {
                         layout.frame(&mut whip.muxer, !is_audio_stream, network_time, flow_id);
                     }
-                    let Some((ts_chunks, pts_90khz)) = whip.frame(
+                    for (ts_chunks, pts_90khz) in whip.frame(
                         !is_audio_stream,
                         &data,
                         rtp_time.numer(),
                         rtp_time.denom() as u64,
                         network_time,
-                    ) else {
-                        continue;
-                    };
-                    publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
+                    ) {
+                        publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
+                    }
                 }
                 SessionEvent::MediaAdded { .. } => {
                     // A track negotiated after media began: the layout
@@ -340,6 +347,21 @@ async fn whip_input_loop(
                 _ => {}
             }
         }
+        // Whatever the session held for its channel count goes out with it.
+        for (ts_chunks, pts_90khz) in whip.end_session() {
+            publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
+        }
+    }
+}
+
+/// Resolves at `deadline` — when a [`WhipMux`] holding video for its
+/// session's channel count is due to release it — and never when there is
+/// none.
+#[cfg(feature = "webrtc")]
+async fn hold_expiry(deadline: Option<std::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -598,7 +620,7 @@ async fn whep_input_loop(
                     Some(e.to_string()),
                 );
             }
-            release();
+            release().await;
             // Back off before retrying — a bare `continue` spins the loop.
             if !whep_back_off(&mut backoff_secs, &cancel).await {
                 return;
@@ -620,7 +642,7 @@ async fn whep_input_loop(
                        the only media this input takes";
             tracing::warn!("{msg} ({}); retrying after the backoff", config.whep_url);
             report_whep_answer(events, flow_id, &mut answer_fault, "no_h264_or_opus", msg.to_string(), None);
-            release();
+            release().await;
             if !whep_back_off(&mut backoff_secs, &cancel).await {
                 return;
             }
@@ -652,7 +674,7 @@ async fn whep_input_loop(
             }
         }
         if !connected {
-            release();
+            release().await;
             // Backed off like any other failed attempt: it used to retry at
             // once, against a server whose handshake always fails, without
             // end.
@@ -675,12 +697,20 @@ async fn whep_input_loop(
         // server actually sends (`WhipLayout`). Only the video was muxed: the
         // Opus was dropped, and a pull of a server sending no video
         // published nothing at all.
-        whep.session(sdp_declares_stereo_opus(&answer_sdp));
+        whep.session(tracks.1, sdp_declares_stereo_opus(&answer_sdp));
         let mut layout = WhipLayout::new("WHEP pull");
 
         // Receive loop
         loop {
-            let event = session.poll_event(&cancel).await;
+            let event = tokio::select! {
+                event = session.poll_event(&cancel) => event,
+                _ = hold_expiry(whep.hold_deadline()) => {
+                    for (ts_chunks, pts_90khz) in whep.release_due(std::time::Instant::now()) {
+                        publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
+                    }
+                    continue;
+                }
+            };
             match event {
                 SessionEvent::MediaData { mid, data, rtp_time, network_time, .. } => {
                     let video = session.video_mid == Some(mid);
@@ -694,16 +724,15 @@ async fn whep_input_loop(
                     if !data.is_empty() {
                         layout.frame(&mut whep.muxer, video, network_time, flow_id);
                     }
-                    let Some((ts_chunks, pts_90khz)) = whep.frame(
+                    for (ts_chunks, pts_90khz) in whep.frame(
                         video,
                         &data,
                         rtp_time.numer(),
                         rtp_time.denom() as u64,
                         network_time,
-                    ) else {
-                        continue;
-                    };
-                    publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
+                    ) {
+                        publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
+                    }
                 }
                 SessionEvent::Disconnected => {
                     tracing::warn!("WHEP disconnected, reconnecting...");
@@ -713,8 +742,12 @@ async fn whep_input_loop(
                 _ => {}
             }
         }
+        // Whatever the pull held for its channel count goes out with it.
+        for (ts_chunks, pts_90khz) in whep.end_session() {
+            publish_frame(ts_chunks, pts_90khz, &mut seq_num, &stats, &broadcast_tx, transcoder, post);
+        }
 
-        release();
+        release().await;
         // Reconnect after the backoff, which starts over only if the session
         // lasted (`BACKOFF_RESET_AFTER`). It was reset as soon as the answer
         // applied and nothing slept here, so a server that accepts each pull
@@ -773,14 +806,29 @@ fn report_whep_answer(
     );
 }
 
-/// Release a WHEP pull's resource on the server — a DELETE to the answer's
-/// `Location` (`resource`) — in a task of its own, so neither the retry
-/// behind it nor a stopping input waits on it (`delete_session` bounds it to
-/// 10 s). Best effort: a failure is a log line. The input used to leave every
-/// pull's resource to the server's own timeout, so a server that counts its
-/// viewers, or caps them, kept a dead one for each reconnect.
+/// How long the WHEP input waits for a server to answer the DELETE that
+/// releases a pull's resource ([`whep_release`]). A live server answers in a
+/// few round trips; this bounds what a dead one costs. It is waited out in
+/// the input's task, so a stopping flow and a node shutting down wait for
+/// it: within the 5 s a stopping flow gives each input task
+/// (`FlowRuntime::stop`, `remove_input`), and — beside the WHIP output's
+/// own 2 s (`WHIP_DELETE_BOUND`) on a flow carrying both — well within the
+/// 10 s a shutdown gives its flows (`SHUTDOWN_FLOW_STOP_BUDGET`).
 #[cfg(feature = "webrtc")]
-fn whep_release(
+const WHEP_DELETE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Release a WHEP pull's resource on the server — a DELETE to the answer's
+/// `Location` (`resource`) — waiting up to [`WHEP_DELETE_BOUND`] for the
+/// answer. Best effort: a failure is a log line, and a resource the server
+/// no longer has (404: it closed the stream, say) is released already.
+/// Awaited rather than spawned, and never cut short by the input's cancel:
+/// a spawned DELETE does not outlive a process shutting down (it leaves
+/// through `_exit` once the flows have stopped), so a server that counts
+/// its viewers, or caps them, kept the dead pull of every edge restart
+/// until its own timeout. The input used to leave every pull's resource to
+/// that timeout, then spawned the DELETE (until 2026-11).
+#[cfg(feature = "webrtc")]
+async fn whep_release(
     resource: Option<String>,
     bearer_token: Option<String>,
     tls: crate::util::tls::TlsTrust,
@@ -788,14 +836,15 @@ fn whep_release(
     let Some(resource) = resource else {
         return;
     };
-    tokio::spawn(async move {
-        match crate::engine::webrtc::signaling::delete_session(&resource, bearer_token.as_deref(), &tls)
-            .await
-        {
-            Ok(()) => tracing::debug!("WHEP: released {resource}"),
-            Err(e) => tracing::warn!("WHEP: DELETE {resource} failed: {e}"),
-        }
-    });
+    let delete = crate::engine::webrtc::signaling::delete_session(&resource, bearer_token.as_deref(), &tls);
+    match tokio::time::timeout(WHEP_DELETE_BOUND, delete).await {
+        Ok(Ok(())) => tracing::debug!("WHEP: released {resource}"),
+        Ok(Err(e)) => tracing::warn!("WHEP: DELETE {resource} failed: {e}"),
+        Err(_) => tracing::warn!(
+            "WHEP: DELETE {resource} unanswered after {} s; left to the server's own timeout",
+            WHEP_DELETE_BOUND.as_secs(),
+        ),
+    }
 }
 
 /// How long a track a WebRTC session negotiated may carry nothing while the
@@ -1021,10 +1070,50 @@ struct WhipMux {
     /// The last audio PTS: a frame whose RTP clock rate is unknown (0)
     /// takes it.
     last_audio_pts_90khz: u64,
-    /// The session's Opus is listed as stereo in the PMT (`channel_config_code`
-    /// 2, else 1).
+    /// The TS lists its Opus as stereo (`channel_config_code` 2, else 1),
+    /// from the first session that sent or declared stereo on, for the
+    /// input's life.
     opus_stereo: bool,
+    /// The session's Opus channel count is still to be read off its first
+    /// packet ([`Self::session`]): its video is held meanwhile.
+    count_open: bool,
+    /// The session's video held while its channel count is open: each
+    /// access unit (Annex B, its PTS, whether it is a keyframe), in order.
+    held: Vec<(Vec<u8>, u64, bool)>,
+    held_bytes: usize,
+    /// When the first frame held arrived.
+    held_since: Option<std::time::Instant>,
 }
+
+/// One frame's TS packets and the PTS (90 kHz) they were stamped at, as
+/// [`WhipMux`] hands them out to publish.
+#[cfg(any(feature = "webrtc", test))]
+type MuxedFrame = (Vec<bytes::Bytes>, u64);
+
+/// How long a session's video is held for its first Opus packet to settle
+/// the channel count before the first PMT goes out ([`WhipMux::session`]).
+/// The first Opus packet is due one packet time after the first picture
+/// when the sender sends both: 20 ms from Chrome, ffmpeg's WHIP muxer and
+/// str0m (the edge's and the relay's senders), at most 120 ms under RFC
+/// 6716 §3.2.5; and bilbycast-relay primes a WHEP viewer with its cached
+/// IDR and then forwards the live stream, whose next Opus packet follows
+/// within a packet time (20 ms on the rig). 300 ms is that longest packet
+/// twice over plus a network's jitter. What it costs is paid by a sender
+/// that negotiated audio and sends none, or sends it later than that: its
+/// first pictures go out together 300 ms late, behind a PMT listing the
+/// Opus as the TS did before (mono, unless an earlier session sent
+/// stereo), and a stereo packet after that lists it so with a version
+/// bump, as every undeclared stereo sender did without the hold.
+#[cfg(any(feature = "webrtc", test))]
+const OPUS_COUNT_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The most video [`WhipMux`] holds for a session's channel count: past it
+/// what is held goes out at once, as when [`OPUS_COUNT_WAIT`] passes. 2 MiB
+/// is 300 ms of a 50 Mbit/s stream — a WebRTC sender runs at a tenth of
+/// that — and bounds what a sender pouring out video can make the input
+/// keep.
+#[cfg(any(feature = "webrtc", test))]
+const HOLD_MAX_BYTES: usize = 2 * 1024 * 1024;
 
 #[cfg(any(feature = "webrtc", test))]
 impl WhipMux {
@@ -1035,6 +1124,10 @@ impl WhipMux {
             param_sets: H264ParamSets::default(),
             last_audio_pts_90khz: 0,
             opus_stereo: false,
+            count_open: false,
+            held: Vec::new(),
+            held_bytes: 0,
+            held_since: None,
         }
     }
 
@@ -1045,24 +1138,81 @@ impl WhipMux {
     /// — the wall-clock gap between the sessions, which no PCR spanned —
     /// carries `discontinuity_indicator` (`TsMuxer::mark_discontinuity`):
     /// TR 101 290 counts any PCR step past 100 ms without one, and the
-    /// flow's source-discontinuity watcher put one on the PCR after it. Its
-    /// Opus is listed as `opus_stereo` says ([`sdp_declares_stereo_opus`])
-    /// until a stereo packet says otherwise ([`Self::frame`]).
+    /// flow's source-discontinuity watcher put one on the PCR after it.
+    ///
+    /// Its Opus (`audio`: the session negotiated it) is listed as stereo
+    /// when the sender's description declares it (`declared_stereo`,
+    /// [`sdp_declares_stereo_opus`]), and otherwise by its first packet: the
+    /// session's video is held until then ([`Self::frame`]) — for
+    /// [`OPUS_COUNT_WAIT`] and [`HOLD_MAX_BYTES`] at most — so the first PMT
+    /// the session sends already says what that packet does. ffmpeg and
+    /// GStreamer's tsdemux keep the channel count of the PMT they start on
+    /// across a version bump, and a WHEP pull from bilbycast-relay always
+    /// starts with video (the relay primes a viewer with its cached IDR),
+    /// so a stereo feed listed mono until its first packet, 20 ms later, was
+    /// read as mono throughout. The TS never goes back to mono (a stereo
+    /// decoder plays a mono packet on both channels, where a mono one folds
+    /// a stereo packet down), so nothing is held once it lists stereo: a
+    /// reconnecting pull of a stereo feed runs on without a version bump,
+    /// where it went stereo, mono and stereo again within a frame.
     ///
     /// Each session used to get a muxer and clock of its own: CC, PTS and
     /// PCR started again from zero with no discontinuity_indicator.
-    fn session(&mut self, opus_stereo: bool) {
+    fn session(&mut self, audio: bool, declared_stereo: bool) {
+        debug_assert!(self.held.is_empty(), "the last session's video was released");
+        self.held.clear();
+        self.held_bytes = 0;
+        self.held_since = None;
         self.muxer.mark_discontinuity();
         self.clock.session();
         self.param_sets = H264ParamSets::default();
-        self.opus_stereo = opus_stereo;
-        self.muxer.change_opus_channels(if opus_stereo { 2 } else { 1 });
+        if declared_stereo && !self.opus_stereo {
+            self.opus_stereo = true;
+            self.muxer.change_opus_channels(2);
+        }
+        self.count_open = audio && !self.opus_stereo;
+    }
+
+    /// Until when the session's video is held for its channel count, if it
+    /// is: [`Self::release_due`] then.
+    fn hold_deadline(&self) -> Option<std::time::Instant> {
+        self.held_since.map(|since| since + OPUS_COUNT_WAIT)
+    }
+
+    /// The video held for the session's channel count, muxed, once
+    /// [`OPUS_COUNT_WAIT`] has passed since the first of it arrived (`now`):
+    /// the Opus is listed as it was, and a stereo packet later lists it so
+    /// with a version bump.
+    fn release_due(&mut self, now: std::time::Instant) -> Vec<MuxedFrame> {
+        match self.hold_deadline() {
+            Some(due) if now >= due => self.release(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The session has ended: what it held, muxed.
+    fn end_session(&mut self) -> Vec<MuxedFrame> {
+        self.release()
+    }
+
+    /// The held video muxed, in order, and the channel count closed for the
+    /// session.
+    fn release(&mut self) -> Vec<MuxedFrame> {
+        self.count_open = false;
+        self.held_bytes = 0;
+        self.held_since = None;
+        std::mem::take(&mut self.held)
+            .into_iter()
+            .map(|(annex_b, pts, is_keyframe)| (self.muxer.mux_video(&annex_b, pts, pts, is_keyframe), pts))
+            .collect()
     }
 
     /// One depayloaded frame of the video (`video`) or the audio track —
     /// RTP timestamp `rtp` on a `rate` Hz clock, arrived at `arrival` — as
-    /// TS packets and the PTS it was stamped at; `None` for a frame with no
-    /// payload.
+    /// the frames to publish now, each as TS packets and the PTS it was
+    /// stamped at: none for a frame with no payload, or a picture held for
+    /// the session's channel count ([`Self::session`]); the held pictures
+    /// ahead of the Opus packet that settles it.
     fn frame(
         &mut self,
         video: bool,
@@ -1070,28 +1220,38 @@ impl WhipMux {
         rtp: u64,
         rate: u64,
         arrival: std::time::Instant,
-    ) -> Option<(Vec<bytes::Bytes>, u64)> {
+    ) -> Vec<MuxedFrame> {
         if data.is_empty() {
-            return None;
+            return Vec::new();
         }
         if video {
             // A depayloaded access unit, Annex B, with the parameter sets
-            // ahead of every IDR (`H264ParamSets`).
+            // ahead of every IDR (`H264ParamSets`), timed as it arrives.
             let pts = self.clock.pts_90k(true, rtp, rate, arrival);
             let (annex_b, is_keyframe) = self.param_sets.access_unit(data);
-            Some((self.muxer.mux_video(&annex_b, pts, pts, is_keyframe), pts))
+            if !self.count_open {
+                return vec![(self.muxer.mux_video(&annex_b, pts, pts, is_keyframe), pts)];
+            }
+            let since = *self.held_since.get_or_insert(arrival);
+            self.held_bytes += annex_b.len();
+            self.held.push((annex_b, pts, is_keyframe));
+            if self.held_bytes > HOLD_MAX_BYTES || arrival.saturating_duration_since(since) >= OPUS_COUNT_WAIT {
+                return self.release();
+            }
+            Vec::new()
         } else {
             // A stereo packet (its TOC's `s` bit, RFC 6716 §3.1) lists the
-            // Opus as stereo from here on: before the PMT first goes out when
-            // the audio leads, else with a version bump. Never back to mono:
-            // a stereo decoder plays a mono packet on both channels, where a
-            // mono one folds a stereo packet down.
+            // Opus as stereo from here on. The session's first packet
+            // settles the count before its first PMT goes out, the video
+            // held for it going out behind that PMT; a later one lists it
+            // with a version bump.
             if !self.opus_stereo && data[0] & 0x04 != 0 {
                 self.opus_stereo = true;
                 if self.muxer.change_opus_channels(2) {
                     tracing::info!("WebRTC Opus is stereo: the PMT lists it so (channel_config_code 2)");
                 }
             }
+            let mut out = if self.count_open { self.release() } else { Vec::new() };
             // Opus: the RTP timestamp on the Opus clock (48 kHz, carried in
             // MediaTime.denom) onto the publish's 90 kHz timeline.
             let pts = if rate == 0 {
@@ -1100,7 +1260,8 @@ impl WhipMux {
                 self.clock.pts_90k(false, rtp, rate, arrival)
             };
             self.last_audio_pts_90khz = pts;
-            Some((self.muxer.mux_audio_opus(data, pts), pts))
+            out.push((self.muxer.mux_audio_opus(data, pts), pts));
+            out
         }
     }
 }
@@ -1129,7 +1290,10 @@ impl WhipMux {
 /// the same timeline — at their first frames' arrival after the input's
 /// first frame — so the timeline runs on across sessions as the wall clock
 /// did, never before a PTS the last session issued. It used to start again
-/// at the lead, 20 s back after a 20 s publish.
+/// at the lead, 20 s back after a 20 s publish. When a session would start
+/// before that (the last one's sender clock ran fast), the whole session
+/// is moved past it, both tracks by the same distance: their offset is
+/// still their first frames' arrival difference.
 #[cfg(any(feature = "webrtc", test))]
 #[derive(Debug, Default)]
 struct WhipClock {
@@ -1146,6 +1310,11 @@ struct WhipClock {
     /// session's latest. A long session whose sender's clock ran fast would
     /// otherwise leave the next one, anchored on the wall clock, behind it.
     floor: u64,
+    /// How far the session's tracks are moved past their arrival anchors
+    /// to start at the floor: `floor` less the anchor of its first frame,
+    /// the earliest of its tracks', or 0. Set by that first frame, and the
+    /// same for both tracks.
+    lift: Option<u64>,
 }
 
 #[cfg(any(feature = "webrtc", test))]
@@ -1155,12 +1324,16 @@ impl WhipClock {
     /// `arrival`.
     fn pts_90k(&mut self, video: bool, rtp: u64, rate: u64, arrival: std::time::Instant) -> u64 {
         let origin = *self.origin.get_or_insert(arrival);
-        let floor = self.floor;
         let slot = if video { &mut self.video } else { &mut self.audio };
-        let (first, base) = *slot.get_or_insert_with(|| {
-            let late_us = arrival.saturating_duration_since(origin).as_micros() as u64;
-            (rtp, (crate::engine::rtmp::ts_mux::PCR_LEAD_90K + late_us * 9 / 100).max(floor))
-        });
+        let (first, base) = match *slot {
+            Some(anchor) => anchor,
+            None => {
+                let late_us = arrival.saturating_duration_since(origin).as_micros() as u64;
+                let at = crate::engine::rtmp::ts_mux::PCR_LEAD_90K + late_us * 9 / 100;
+                let lift = *self.lift.get_or_insert(self.floor.saturating_sub(at));
+                *slot.insert((rtp, at + lift))
+            }
+        };
         let ticks = (rtp as i128 - first as i128) * 90_000 / rate.max(1) as i128;
         let pts = (base as i128 + ticks).max(0) as u64;
         self.latest = self.latest.max(pts);
@@ -1172,6 +1345,7 @@ impl WhipClock {
     fn session(&mut self) {
         self.video = None;
         self.audio = None;
+        self.lift = None;
         if self.origin.is_some() {
             self.floor = self.latest + 1;
         }
@@ -1299,6 +1473,192 @@ mod tests {
         assert_eq!(c.pts_90k(false, 77 + 480_000, 48_000, t0 + s(8)), LEAD + 1_170_000);
         c.session();
         assert_eq!(c.pts_90k(false, 3, 48_000, t0 + s(9)), LEAD + 1_170_001, "past the last session's end");
+    }
+
+    /// A session the floor lifts — the last one's sender clock ran fast, so
+    /// its tracks' arrival anchors fall behind a PTS already issued — is
+    /// lifted whole: both tracks by the distance that puts its first frame
+    /// on the floor, so the video still starts the 400 ms after the audio
+    /// that it arrived. Each track lifted to the floor on its own put the
+    /// audio there and left the video, past it, where it was: 300 ms closer
+    /// together than they arrived, for the whole session.
+    #[test]
+    fn a_lifted_session_keeps_its_tracks_apart_as_they_arrived() {
+        use super::WhipClock;
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut c = WhipClock::default();
+        // Session 1: 10.5 s of the sender's clock in 10 s.
+        assert_eq!(c.pts_90k(true, 0, 90_000, t0), LEAD);
+        assert_eq!(c.pts_90k(true, 945_000, 90_000, t0 + ms(10_000)), LEAD + 945_000);
+        c.session();
+        // Session 2: audio at 10.2 s, video at 10.6 s on the wall clock.
+        let audio = c.pts_90k(false, 7, 48_000, t0 + ms(10_200));
+        assert_eq!(audio, LEAD + 945_001, "the session starts on the floor");
+        let video = c.pts_90k(true, 50, 90_000, t0 + ms(10_600));
+        assert_eq!(video - audio, 36_000, "400 ms apart, as they arrived");
+        assert_eq!(c.pts_90k(false, 7 + 48_000, 48_000, t0 + ms(11_200)), audio + 90_000);
+        // A session the floor does not reach is not lifted.
+        c.session();
+        let at = c.pts_90k(true, 1, 90_000, t0 + ms(60_000));
+        assert_eq!(at, LEAD + 5_400_000);
+        assert_eq!(c.pts_90k(false, 1, 48_000, t0 + ms(60_020)), at + 1_800);
+    }
+
+    /// An access unit of the video, at `ms` in, for [`WhipMux::frame`].
+    fn video_at(w: &mut super::WhipMux, t0: std::time::Instant, ms: u64, nal: &[u8]) -> Vec<super::MuxedFrame> {
+        w.frame(true, nal, 1_000 + ms * 90, 90_000, t0 + std::time::Duration::from_millis(ms))
+    }
+
+    /// An Opus packet with TOC `toc`, at `ms` in.
+    fn opus_at(w: &mut super::WhipMux, t0: std::time::Instant, ms: u64, toc: u8) -> Vec<super::MuxedFrame> {
+        let mut packet = vec![toc];
+        packet.resize(40, 0xA5);
+        w.frame(false, &packet, 77 + ms * 48, 48_000, t0 + std::time::Duration::from_millis(ms))
+    }
+
+    /// The Opus `channel_config_code` of every PMT in `muxed`, in turn.
+    fn pmt_codes(muxed: &[super::MuxedFrame]) -> Vec<Option<u8>> {
+        let ts: Vec<bytes::Bytes> = muxed.iter().flat_map(|(ts, _)| ts.iter().cloned()).collect();
+        ts.iter()
+            .filter(|p| crate::engine::ts_parse::ts_pid(p) == 0x1000)
+            .map(|pmt| {
+                let sec = &pmt[5..];
+                let mut pos = 12 + ((((sec[10] & 0x0F) as usize) << 8) | sec[11] as usize);
+                let end = 3 + ((((sec[1] & 0x0F) as usize) << 8) | sec[2] as usize) - 4;
+                let mut code = None;
+                while pos + 5 <= end {
+                    let info = (((sec[pos + 3] & 0x0F) as usize) << 8) | sec[pos + 4] as usize;
+                    if sec[pos] == 0x06 {
+                        code = crate::engine::ts_parse::opus_channel_config_code(&sec[pos + 5..pos + 5 + info]);
+                    }
+                    pos += 5 + info;
+                }
+                code
+            })
+            .collect()
+    }
+
+    /// A WebRTC input's muxer as [`super::opus_ts_muxer`] sets it up, laid
+    /// out for video and audio.
+    fn av_whip_mux() -> super::WhipMux {
+        let mut muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
+        muxer.set_audio_stream(0x06, Some(*b"Opus"));
+        muxer.change_opus_channels(1);
+        muxer.set_has_video(true);
+        muxer.set_has_audio(true);
+        super::WhipMux::new(muxer)
+    }
+
+    const IDR: &[u8] = &[0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1F, 0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88];
+    const P: &[u8] = &[0, 0, 0, 1, 0x41, 0x9A];
+
+    /// A session whose video leads — a WHEP pull from bilbycast-relay, primed
+    /// with its cached IDR — holds that video until its first Opus packet
+    /// settles the channel count, then sends it behind a PMT that already
+    /// says so: one PMT, stereo, ahead of the IDR, nothing lost. The video
+    /// went out at once behind a PMT listing mono, stereo following as a
+    /// version bump the receivers that started on it ignore.
+    #[test]
+    fn a_session_led_by_video_holds_it_for_its_channel_count() {
+        let t0 = std::time::Instant::now();
+        let mut w = av_whip_mux();
+        w.session(true, false);
+        assert!(video_at(&mut w, t0, 0, IDR).is_empty(), "the IDR is held");
+        assert_eq!(w.hold_deadline(), Some(t0 + super::OPUS_COUNT_WAIT));
+        assert!(w.release_due(t0 + std::time::Duration::from_millis(15)).is_empty());
+        let out = opus_at(&mut w, t0, 20, 0xFC);
+        assert_eq!(out.len(), 2, "the IDR, then the Opus");
+        assert_eq!(out[0].1, crate::engine::rtmp::ts_mux::PCR_LEAD_90K, "the IDR at the session's start");
+        assert_eq!(pmt_codes(&out), [Some(2)], "one PMT, stereo");
+        assert_eq!(w.hold_deadline(), None);
+        // Then as ever: each frame out as it comes.
+        assert_eq!(video_at(&mut w, t0, 40, P).len(), 1);
+        assert_eq!(opus_at(&mut w, t0, 40, 0xFC).len(), 1);
+        // A mono first packet settles it mono.
+        let mut w = av_whip_mux();
+        w.session(true, false);
+        assert!(video_at(&mut w, t0, 0, IDR).is_empty());
+        assert_eq!(pmt_codes(&opus_at(&mut w, t0, 20, 0x78)), [Some(1)]);
+    }
+
+    /// A session whose audio does not come within `OPUS_COUNT_WAIT` has its
+    /// video sent then, as it was before the hold — on the next picture or
+    /// the input's timer (`release_due`), whichever comes first — and one
+    /// whose video outgrows `HOLD_MAX_BYTES` at once.
+    #[test]
+    fn a_held_session_is_released_by_its_bounds() {
+        let t0 = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        let mut w = av_whip_mux();
+        w.session(true, false);
+        assert!(video_at(&mut w, t0, 0, IDR).is_empty());
+        assert!(video_at(&mut w, t0, 280, P).is_empty());
+        assert!(w.release_due(t0 + ms(299)).is_empty());
+        let out = w.release_due(t0 + ms(300));
+        assert_eq!(out.iter().map(|f| f.1).collect::<Vec<_>>(), [crate::engine::rtmp::ts_mux::PCR_LEAD_90K, crate::engine::rtmp::ts_mux::PCR_LEAD_90K + 25_200]);
+        assert_eq!(pmt_codes(&out), [Some(1)], "listed as before the hold");
+        // A stereo packet later bumps it, as it always did.
+        assert_eq!(pmt_codes(&opus_at(&mut w, t0, 320, 0xFC)), [Some(2)]);
+
+        // The next picture past the wait releases it too.
+        let mut w = av_whip_mux();
+        w.session(true, false);
+        assert!(video_at(&mut w, t0, 0, IDR).is_empty());
+        assert_eq!(video_at(&mut w, t0, 300, P).len(), 2);
+
+        // So does more than `HOLD_MAX_BYTES` of it.
+        let mut w = av_whip_mux();
+        w.session(true, false);
+        let mut big = IDR.to_vec();
+        big.resize(super::HOLD_MAX_BYTES / 2, 0x11);
+        assert!(video_at(&mut w, t0, 0, &big).is_empty());
+        assert!(video_at(&mut w, t0, 40, &big).is_empty());
+        assert_eq!(video_at(&mut w, t0, 80, P).len(), 3, "past the byte bound");
+
+        // And the session ending (`end_session`).
+        let mut w = av_whip_mux();
+        w.session(true, false);
+        assert!(video_at(&mut w, t0, 0, IDR).is_empty());
+        assert_eq!(w.end_session().len(), 1);
+    }
+
+    /// Nothing is held where the count is known or there is no count to
+    /// wait for: a sender declaring stereo (`sprop-stereo=1`), a session
+    /// negotiating no audio, and a session onto a TS that lists stereo
+    /// already — a reconnecting pull of a stereo feed, which runs on with
+    /// no version bump. It went stereo, mono and stereo again within a
+    /// frame of every reconnect.
+    #[test]
+    fn nothing_is_held_where_the_count_is_settled() {
+        let t0 = std::time::Instant::now();
+        let mut w = av_whip_mux();
+        w.session(true, true);
+        let out = video_at(&mut w, t0, 0, IDR);
+        assert_eq!(pmt_codes(&out), [Some(2)], "declared stereo, at once");
+        let mut w = av_whip_mux();
+        w.session(false, false);
+        assert_eq!(pmt_codes(&video_at(&mut w, t0, 0, IDR)), [Some(1)], "no audio: at once");
+
+        let mut w = av_whip_mux();
+        w.session(true, false);
+        assert!(video_at(&mut w, t0, 0, IDR).is_empty());
+        let mut sent = opus_at(&mut w, t0, 20, 0xFC);
+        assert!(w.end_session().is_empty());
+        w.session(true, false);
+        sent.extend(video_at(&mut w, t0, 5_000, IDR));
+        sent.extend(opus_at(&mut w, t0, 5_020, 0x78));
+        assert_eq!(sent.len(), 4, "the reconnect's IDR out at once");
+        assert_eq!(pmt_codes(&sent), [Some(2), Some(2)], "stereo throughout");
+        let versions: std::collections::BTreeSet<u8> = sent
+            .iter()
+            .flat_map(|(ts, _)| ts.iter())
+            .filter(|p| crate::engine::ts_parse::ts_pid(p) == 0x1000)
+            .map(|p| (p[10] >> 1) & 0x1F)
+            .collect();
+        assert_eq!(versions.len(), 1, "no version bump: {versions:?}");
     }
 
     /// The sender's description of its Opus says stereo with
@@ -1555,7 +1915,7 @@ mod tests {
                 } else {
                     (&[0xFC; 80], at_ms * 48, 48_000)
                 };
-                self.ts.extend(self.mux.frame(video, data, rtp, rate, at).unwrap().0);
+                self.ts.extend(self.mux.frame(video, data, rtp, rate, at).into_iter().flat_map(|(ts, _)| ts));
             }
 
             /// Audio every 20 ms and, where `video` says so, video every
@@ -1852,15 +2212,21 @@ mod tests {
         let mut mux = TsMuxer::new();
         mux.set_audio_stream(0x06, Some(*b"Opus"));
         let mut w = WhipMux::new(mux);
-        assert!(w.frame(false, &[], 123_456, 48_000, t0).is_none(), "a probe on the audio");
-        assert!(w.frame(true, &[], 3_000_000_000, 90_000, t0).is_none(), "and on the video");
+        assert!(w.frame(false, &[], 123_456, 48_000, t0).is_empty(), "a probe on the audio");
+        assert!(w.frame(true, &[], 3_000_000_000, 90_000, t0).is_empty(), "and on the video");
         // The media, 40 ms on: the publish's timeline opens at its first
         // frame, not at the probes.
         let at = t0 + Duration::from_millis(40);
-        let (ts, pts) = w.frame(true, &[0, 0, 0, 1, 0x65, 0x88], 3_000_003_600, 90_000, at).unwrap();
+        let [(ts, pts)] = &w.frame(true, &[0, 0, 0, 1, 0x65, 0x88], 3_000_003_600, 90_000, at)[..] else {
+            panic!("one frame")
+        };
+        let (ts, pts) = (ts.clone(), *pts);
         assert_eq!(pts, LEAD);
         assert!(!ts.is_empty());
-        let (ts, pts) = w.frame(false, &[0xFC; 80], 123_456 + 1_920, 48_000, at).unwrap();
+        let [(ts, pts)] = &w.frame(false, &[0xFC; 80], 123_456 + 1_920, 48_000, at)[..] else {
+            panic!("one frame")
+        };
+        let (ts, pts) = (ts.clone(), *pts);
         assert_eq!(pts, LEAD);
         // The Opus AU carries its 80 bytes: control header 0x7F 0xE0, then
         // au_size.
@@ -1868,7 +2234,7 @@ mod tests {
         let pkt = pkt.expect("the audio PES");
         let es = crate::engine::ts_parse::pes_payload_offset(pkt).expect("a PES header");
         assert_eq!(&pkt[es..es + 3], &[0x7F, 0xE0, 80]);
-        assert!(w.frame(false, &[], 123_456 + 3_840, 48_000, at).is_none(), "a probe mid-stream");
+        assert!(w.frame(false, &[], 123_456 + 3_840, 48_000, at).is_empty(), "a probe mid-stream");
     }
 
     fn nal_types(annex_b: &[u8]) -> Vec<u8> {
@@ -2218,7 +2584,12 @@ mod tests {
     /// 20 ms Opus frame every 20 ms — for `for_ms`.
     #[cfg(feature = "webrtc")]
     async fn serve_whep(edit: fn(String) -> String, send: (bool, bool), for_ms: u64) -> WhepServer {
-        serve_whep_sending(edit, send, for_ms, None).await
+        serve_whep_scripted(
+            edit,
+            WhepScript { video: send.0, audio: send.1, for_ms, ..WhepScript::default() },
+            None,
+        )
+        .await
     }
 
     /// [`serve_whep`] sending `opus` (real Opus packets, in turn) as its
@@ -2228,6 +2599,46 @@ mod tests {
         edit: fn(String) -> String,
         send: (bool, bool),
         for_ms: u64,
+        opus: Option<Arc<Vec<Vec<u8>>>>,
+    ) -> WhepServer {
+        serve_whep_scripted(
+            edit,
+            WhepScript { video: send.0, audio: send.1, for_ms, ..WhepScript::default() },
+            opus,
+        )
+        .await
+    }
+
+    /// What a [`serve_whep_scripted`] server does with each pull.
+    #[cfg(feature = "webrtc")]
+    #[derive(Clone, Copy, Default)]
+    struct WhepScript {
+        /// Send H.264 (a picture every 40 ms) and / or Opus (a 20 ms frame
+        /// every 20 ms) once connected, for `for_ms`.
+        video: bool,
+        audio: bool,
+        for_ms: u64,
+        /// The Opus starts this far in (the video at once): a server priming
+        /// its viewer with a cached IDR, as bilbycast-relay does.
+        audio_from_ms: u64,
+        /// Only the first picture is an IDR (SPS + PPS + IDR slice), the
+        /// rest P slices; else every picture is an IDR.
+        gop: bool,
+        /// End the session (DTLS close_notify) once `for_ms` is up, as a
+        /// server whose stream closes does.
+        close: bool,
+        /// Answer a DELETE after this long (0: at once).
+        delete_after_ms: u64,
+        /// Never answer a DELETE (note it, then hang): a dead server.
+        delete_hangs: bool,
+    }
+
+    /// A WHEP server on loopback answering each pull as `script` says (see
+    /// [`serve_whep`]).
+    #[cfg(feature = "webrtc")]
+    async fn serve_whep_scripted(
+        edit: fn(String) -> String,
+        script: WhepScript,
         opus: Option<Arc<Vec<Vec<u8>>>>,
     ) -> WhepServer {
         use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
@@ -2240,6 +2651,7 @@ mod tests {
             0, 0, 0, 1, 0x67, 0x42, 0xC0, 0x1F, 0xDA, 0, 0, 0, 1, 0x68, 0xCE, 0x3C, 0x80, 0, 0, 0, 1,
             0x65, 0x88, 0x84, 0x00, 0x33,
         ];
+        const P: &[u8] = &[0, 0, 0, 1, 0x41, 0x9A, 0x02, 0x04];
 
         // What `main` installs before any TLS client is built.
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2250,6 +2662,11 @@ mod tests {
             axum::routing::delete({
                 let deletes = deletes.clone();
                 move |axum::extract::Path(resource): axum::extract::Path<String>| async move {
+                    if script.delete_hangs {
+                        deletes.lock().unwrap().push(resource.clone());
+                        std::future::pending::<()>().await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(script.delete_after_ms)).await;
                     deletes.lock().unwrap().push(resource);
                     StatusCode::OK
                 }
@@ -2287,20 +2704,24 @@ mod tests {
                         server.drain_pending_events();
                         let video = server.video_mid.and_then(|mid| Some((mid, server.get_pt(mid)?)));
                         let audio = server.audio_mid.and_then(|mid| Some((mid, server.get_pt(mid)?)));
-                        for k in 0..for_ms / 20 {
-                            if let (true, Some((mid, pt))) = (send.1, audio) {
+                        for k in 0..script.for_ms / 20 {
+                            if let (true, Some((mid, pt))) = (script.audio && k * 20 >= script.audio_from_ms, audio) {
                                 let at = MediaTime::new(k * 960, Frequency::FORTY_EIGHT_KHZ);
                                 let packet = opus.as_ref().map(|p| &p[k as usize % p.len()][..]);
                                 let _ = server.write_media(mid, pt, Instant::now(), at, packet.unwrap_or(&[0xFC; 80]));
                                 server.drain_outputs().await;
                             }
-                            if let (true, 0, Some((mid, pt))) = (send.0, k % 2, video) {
+                            if let (true, 0, Some((mid, pt))) = (script.video, k % 2, video) {
                                 let at = MediaTime::new(k / 2 * 3_600, Frequency::NINETY_KHZ);
-                                let _ = server.write_media(mid, pt, Instant::now(), at, IDR);
+                                let picture = if k == 0 || !script.gop { IDR } else { P };
+                                let _ = server.write_media(mid, pt, Instant::now(), at, picture);
                                 server.drain_outputs().await;
                             }
                             tokio::time::sleep(Duration::from_millis(20)).await;
                             let _ = server.drive_udp_io().await;
+                        }
+                        if script.close {
+                            server.close().await;
                         }
                     });
                     (
@@ -2338,6 +2759,18 @@ mod tests {
         run_ms: u64,
         extra: serde_json::Value,
     ) -> (Vec<bytes::Bytes>, Vec<crate::manager::events::Event>) {
+        let (ts, raised, _) = pull_whep_timed(addr, run_ms, extra).await;
+        (ts, raised)
+    }
+
+    /// [`pull_whep_with`], and how long the input took to stop: from its
+    /// cancel to its task's return (at most 5 s, as a stopping flow waits).
+    #[cfg(feature = "webrtc")]
+    async fn pull_whep_timed(
+        addr: std::net::SocketAddr,
+        run_ms: u64,
+        extra: serde_json::Value,
+    ) -> (Vec<bytes::Bytes>, Vec<crate::manager::events::Event>, std::time::Duration) {
         use std::time::Duration;
         use tokio_util::sync::CancellationToken;
 
@@ -2366,8 +2799,10 @@ mod tests {
             }
         });
         tokio::time::sleep(Duration::from_millis(run_ms)).await;
+        let stopping = std::time::Instant::now();
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let took = stopping.elapsed();
         let mut ts = Vec::new();
         while let Ok(pkt) = published.try_recv() {
             ts.extend(pkt.data.chunks(188).map(bytes::Bytes::copy_from_slice));
@@ -2376,7 +2811,7 @@ mod tests {
         while let Ok(ev) = raised.try_recv() {
             raised_events.push(ev);
         }
-        (ts, raised_events)
+        (ts, raised_events, took)
     }
 
     /// An edge-to-edge pull of a WHEP output that sends audio alone — the
@@ -2518,5 +2953,224 @@ mod tests {
             assert_eq!(text.lines().count(), 1, "{text}");
         }
         assert_eq!(deleted, vec!["res-0".to_string(), "res-1".to_string()]);
+    }
+
+    /// Each video PES on PID 0x0100 of `ts`: its PTS and the NAL unit types
+    /// of its access unit.
+    #[cfg(feature = "webrtc")]
+    fn video_pes_of(ts: &[bytes::Bytes]) -> Vec<(u64, Vec<u8>)> {
+        use crate::engine::ts_parse::{extract_pes_pts, pes_payload_offset, ts_payload_offset, ts_pid};
+        let mut pes: Vec<(u64, Vec<u8>)> = Vec::new();
+        for p in ts.iter().filter(|p| ts_pid(p) == 0x0100) {
+            if (p[1] & 0x40) != 0 {
+                let (Some(pts), Some(at)) = (extract_pes_pts(p), pes_payload_offset(p)) else {
+                    continue;
+                };
+                pes.push((pts, p[at..].to_vec()));
+            } else if let Some(last) = pes.last_mut()
+                && p[3] & 0x10 != 0
+            {
+                last.1.extend_from_slice(&p[ts_payload_offset(p)..]);
+            }
+        }
+        pes.into_iter().map(|(pts, au)| (pts, nal_types(&au))).collect()
+    }
+
+    /// The WHEP pull of a stereo feed from bilbycast-relay, and of every
+    /// server priming a viewer with its cached IDR: video first, the first
+    /// Opus 20 ms on. Its first PMT already lists the Opus as stereo
+    /// (`channel_config_code` 2), the IDR held for that packet and sent
+    /// behind it, not dropped — and after the server closes the stream, the
+    /// next pull of it runs on stereo with no version bump, its IDR sent at
+    /// once. The first PMT listed mono and stereo followed as a version bump,
+    /// which ffmpeg and GStreamer's tsdemux ignore: they read the feed as
+    /// mono throughout. Each reconnect then went mono and stereo again.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whep_pull_led_by_video_lists_its_stereo_from_the_first_pmt() {
+        let script = WhepScript {
+            video: true,
+            audio: true,
+            for_ms: 800,
+            audio_from_ms: 20,
+            gop: true,
+            close: true,
+            ..WhepScript::default()
+        };
+        let server = serve_whep_scripted(|a| a, script, None).await;
+        // Pulls at 0 s and, after the 1 s backoff, at ~1.9 s.
+        let (ts, _) = pull_whep(server.addr, 3_300).await;
+        server.task.abort();
+        let pulls = server.posts.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(pulls, 2, "two pulls");
+        assert!(carries_opus(&ts), "no Opus was published ({} packets)", ts.len());
+        assert_eq!(opus_channels_of(&ts), [(0, Some(2))], "stereo from the first PMT, one version");
+        let pes = video_pes_of(&ts);
+        let idrs: Vec<usize> = (0..pes.len()).filter(|&i| pes[i].1.contains(&5)).collect();
+        assert_eq!(idrs.len(), pulls, "each pull's IDR published: {pes:?}");
+        assert_eq!(idrs[0], 0, "the first picture published is the IDR");
+        assert_eq!(pes[0].0, crate::engine::rtmp::ts_mux::PCR_LEAD_90K, "at the timeline's origin");
+        let gap = (1..pes.len()).max_by_key(|&i| pes[i].0 - pes[i - 1].0).unwrap();
+        assert_eq!(idrs[1], gap, "the second pull's first picture is its IDR: {pes:?}");
+    }
+
+    /// A server whose answer declares its Opus stereo (`sprop-stereo=1`)
+    /// is listed stereo from the first PMT with nothing held, its video out
+    /// as it comes though it sends no audio at all.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whep_server_declaring_stereo_is_listed_so_at_once() {
+        let declared = |a: String| a.replace("useinbandfec=1", "useinbandfec=1;sprop-stereo=1");
+        let script = WhepScript { video: true, for_ms: 1_000, gop: true, ..WhepScript::default() };
+        let server = serve_whep_scripted(declared, script, None).await;
+        let (ts, _) = pull_whep(server.addr, 1_300).await;
+        server.task.abort();
+        assert_eq!(opus_channels_of(&ts), [(0, Some(2))]);
+        let pes = video_pes_of(&ts);
+        assert!(pes.first().is_some_and(|(pts, nals)| *pts == crate::engine::rtmp::ts_mux::PCR_LEAD_90K
+            && nals.contains(&5)), "{pes:?}");
+    }
+
+    /// A WHEP input stopping — a flow stop, the input's removal, a node
+    /// shutting down: its cancel — has released its pull (the server has
+    /// answered the DELETE) by the time its task returns, which is what a
+    /// stopping flow and a shutdown wait for. The DELETE was spawned, and the
+    /// task returned before it was answered: a shutdown's `_exit` cut it
+    /// short, and the server kept the dead pull until its own timeout.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_stopping_whep_input_has_released_its_pull_when_it_returns() {
+        let script = WhepScript { video: true, audio: true, for_ms: 5_000, delete_after_ms: 300, ..WhepScript::default() };
+        let server = serve_whep_scripted(|a| a, script, None).await;
+        let (ts, _, took) = pull_whep_timed(server.addr, 1_000, serde_json::json!({})).await;
+        let deleted = server.deletes.lock().unwrap().clone();
+        server.task.abort();
+        assert!(!ts.is_empty(), "the pull published nothing");
+        assert_eq!(deleted, ["res-0"], "answered before the task returned (in {took:?})");
+        assert!(took >= std::time::Duration::from_millis(300), "stopped in {took:?}");
+    }
+
+    /// A server that never answers the DELETE holds the input's stop no
+    /// longer than `WHEP_DELETE_BOUND`: a dead server must not stall a flow
+    /// stop or a node shutdown (a stopping flow gives each input task 5 s).
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn an_unanswered_whep_release_holds_the_stop_only_to_its_bound() {
+        let script = WhepScript { video: true, audio: true, for_ms: 5_000, delete_hangs: true, ..WhepScript::default() };
+        let server = serve_whep_scripted(|a| a, script, None).await;
+        let (_, _, took) = pull_whep_timed(server.addr, 1_000, serde_json::json!({})).await;
+        let deleted = server.deletes.lock().unwrap().clone();
+        server.task.abort();
+        assert_eq!(deleted, ["res-0"], "the DELETE was sent");
+        assert!(
+            took >= super::WHEP_DELETE_BOUND && took < super::WHEP_DELETE_BOUND + std::time::Duration::from_secs(1),
+            "stopped after {took:?}"
+        );
+    }
+
+    /// Two WHIP publishers in turn, the first's sender clock running four
+    /// times fast (4 s of RTP time in 1 s), so the second's arrival anchors
+    /// fall behind the last PTS issued and the floor lifts its session. The
+    /// second sends its audio first and its video 200 ms later: on the TS
+    /// they are still 200 ms apart, and both run on past the first
+    /// publisher's last PTS. Each track lifted to the floor on its own put
+    /// both on the floor, the video 200 ms early against the audio; a
+    /// publisher per muxer started the second again at the lead, behind the
+    /// first.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_republish_lifted_past_a_fast_clock_keeps_its_tracks_apart() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::engine::ts_parse::{extract_pes_pts, pes_payload_offset, ts_pid};
+        use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+        use std::time::{Duration, Instant};
+        use str0m::media::{Frequency, MediaTime};
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(16_384);
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config, "flow-w", broadcast_tx, stats, cancel, session_rx, &events,
+                    &mut transcoder, &mut post, Duration::from_secs(10),
+                )
+                .await;
+            }
+        });
+
+        let mut ts = Vec::new();
+        // Publisher 1: audio alone, TOC 0x78, 80 ms of RTP time every 20 ms.
+        // Publisher 2: audio (TOC 0x68) from the start, an IDR every 40 ms
+        // from 200 ms on, on its own clock.
+        for second in [false, true] {
+            let peer = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: false };
+            let mut publisher = WebrtcSession::new(&peer).await.unwrap();
+            let (offer, pending) = publisher.create_offer(second, true, true).unwrap();
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            session_tx.send(NewSessionMsg { offer_sdp: offer, reply }).await.unwrap();
+            let (answer, _session, _cancel) = answer.await.unwrap().unwrap();
+            publisher.apply_answer(&answer, pending).unwrap();
+            let connected = tokio::time::timeout(Duration::from_secs(10), async {
+                while !matches!(publisher.poll_event(&cancel).await, SessionEvent::Connected) {}
+            })
+            .await;
+            assert!(connected.is_ok(), "the publisher never connected");
+            publisher.drain_pending_events();
+            let audio_mid = publisher.audio_mid.unwrap();
+            let audio_pt = publisher.get_pt(audio_mid).expect("Opus accepted");
+            let video = publisher.video_mid.and_then(|mid| Some((mid, publisher.get_pt(mid)?)));
+            let mut opus = vec![if second { 0x68 } else { 0x78 }];
+            opus.resize(80, 0xA5);
+            for k in 0..50u64 {
+                let step = if second { 960 } else { 3_840 };
+                let at = MediaTime::new(k * step, Frequency::FORTY_EIGHT_KHZ);
+                publisher.write_media(audio_mid, audio_pt, Instant::now(), at, &opus).unwrap();
+                if let (true, true, Some((mid, pt))) = (second, k >= 10 && k % 2 == 0, video) {
+                    let at = MediaTime::new(5_000 + (k - 10) / 2 * 3_600, Frequency::NINETY_KHZ);
+                    publisher.write_media(mid, pt, Instant::now(), at, IDR).unwrap();
+                }
+                publisher.drain_outputs().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let _ = publisher.drive_udp_io().await;
+                while let Ok(pkt) = published.try_recv() {
+                    ts.extend(pkt.data.chunks(188).map(bytes::Bytes::copy_from_slice));
+                }
+            }
+            publisher.close().await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        while let Ok(pkt) = published.try_recv() {
+            ts.extend(pkt.data.chunks(188).map(bytes::Bytes::copy_from_slice));
+        }
+
+        // Each audio PES: its PTS and its Opus TOC (after the control
+        // header 0x7F 0xE0 and the one-byte size).
+        let audio: Vec<(u64, u8)> = ts
+            .iter()
+            .filter(|p| ts_pid(p) == 0x0101 && (p[1] & 0x40) != 0)
+            .filter_map(|p| Some((extract_pes_pts(p)?, p[pes_payload_offset(p)? + 3])))
+            .collect();
+        let first: Vec<u64> = audio.iter().filter(|a| a.1 == 0x78).map(|a| a.0).collect();
+        let second: Vec<u64> = audio.iter().filter(|a| a.1 == 0x68).map(|a| a.0).collect();
+        let video = video_pes_of(&ts);
+        assert!(first.len() > 40 && second.len() > 40 && video.len() > 10, "{} / {} / {}", first.len(), second.len(), video.len());
+        let last = *first.iter().max().unwrap();
+        assert!(last > 300_000, "the first publisher ran 4 s of PTS: {last}");
+        assert_eq!(second[0], last + 1, "the second session starts on the floor");
+        let apart = video[0].0 as i64 - second[0] as i64;
+        assert!((14_400..=27_000).contains(&apart), "video {apart} ticks after the audio, sent 200 ms after");
     }
 }
