@@ -8,11 +8,11 @@
 //! `program`, `is_intact`, `teardown`, `teardown_all` and `program_dish_route` —
 //! and reads back what the kernel holds through a netlink connection of its own.
 //!
-//! It needs `CAP_NET_ADMIN` in a network namespace it may wreck, so it is
-//! `#[ignore]`d and also skips unless `BILBYCAST_NETNS_TEST=1`, and it refuses
-//! a namespace holding any link but `lo`. A container gives it one without
-//! root on the host. The binary is glibc-linked, so on a musl image run it
-//! through the host's loader:
+//! It needs `CAP_NET_ADMIN` in a network namespace it may wreck, so both tests
+//! are `#[ignore]`d and also skip unless `BILBYCAST_NETNS_TEST` asks for them,
+//! and they refuse a namespace holding any link but `lo`. A container gives
+//! one without root on the host. The binary is glibc-linked, so on a musl
+//! image run it through the host's loader:
 //!
 //! ```text
 //! BIN=$(cargo test --test bond_routing_netns --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))/\1/p')
@@ -22,15 +22,26 @@
 //!   /t/bond_routing_netns --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! Add `-e BILBYCAST_BOND_RT_TABLE_BASE=… -e BILBYCAST_BOND_RT_PRIO_BASE=…` to
-//! run it against moved ranges (each base at least 1, clear of 253–255 and of
-//! priorities 32766–32767). Everything runs in one test: the manager is a
+//! `BILBYCAST_NETNS_TEST=1` runs `gateway_routing_against_a_real_kernel`. Add
+//! `-e BILBYCAST_BOND_RT_TABLE_BASE=… -e BILBYCAST_BOND_RT_PRIO_BASE=…` to run
+//! it against moved ranges (a table base from 256 to 4294967040, a priority
+//! base from 1 to 32510). Everything it checks runs in one test: the manager is a
 //! process-wide `OnceCell` and sweeps only on its first use.
+//!
+//! A refused base therefore needs a process of its own:
+//! `-e BILBYCAST_NETNS_TEST=unsafe-bases` with at least one unsafe base runs
+//! `refused_bases_touch_nothing` instead, which checks the manager sweeps and
+//! programs nothing. Run it once per kind of refusal, e.g. with
+//! `-e BILBYCAST_BOND_RT_TABLE_BASE=200 -e BILBYCAST_BOND_RT_PRIO_BASE=32600`
+//! (tables 253–255, the kernel's `lookup main` / `lookup default` rules),
+//! `BILBYCAST_BOND_RT_TABLE_BASE=4294967200` (past `u32::MAX`),
+//! `BILBYCAST_BOND_RT_TABLE_BASE=0xBD00` (unparseable) and
+//! `BILBYCAST_BOND_RT_PRIO_BASE=40000` (after `lookup main`).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 
-use bilbycast_edge::engine::bond_routing::{BondRouteManager, SlotAllocator, SourceNet};
+use bilbycast_edge::engine::bond_routing::{BondRouteManager, MAX_SLOTS, SlotAllocator, SourceNet};
 use futures_util::TryStreamExt;
 use netlink_packet_route::address::AddressAttribute;
 use netlink_packet_route::link::LinkAttribute;
@@ -53,88 +64,44 @@ async fn gateway_routing_against_a_real_kernel() {
         );
         return;
     }
-    let slots = SlotAllocator::new(
-        base("BILBYCAST_BOND_RT_TABLE_BASE", 48128),
-        base("BILBYCAST_BOND_RT_PRIO_BASE", 10000),
-    );
+    let slots = SlotAllocator::from_env()
+        .expect("the bases are refused; run them with BILBYCAST_NETNS_TEST=unsafe-bases");
     let (t_lo, t_hi) = slots.table_range();
     let (p_lo, p_hi) = slots.prio_range();
     let ranges = (p_lo..=p_hi, t_lo..=t_hi);
 
-    let (conn, h, _) = rtnetlink::new_connection().expect("netlink socket");
-    tokio::spawn(conn);
-    let links: Vec<String> = h
-        .link()
-        .get()
-        .execute()
-        .map_ok(|l| {
-            l.attributes
-                .into_iter()
-                .find_map(|a| match a {
-                    LinkAttribute::IfName(n) => Some(n),
-                    _ => None,
-                })
-                .unwrap_or_default()
-        })
-        .try_collect()
-        .await
-        .expect("link dump");
-    assert_eq!(links, ["lo"], "refusing to run outside a fresh network namespace");
-
-    // A NIC with an operator address in each family, so gateways resolve.
-    h.link()
-        .add(LinkVeth::new(IFACE, PEER).build())
-        .execute()
-        .await
-        .expect("create veth pair");
-    for name in [IFACE, PEER] {
-        h.link()
-            .set(LinkUnspec::new_with_name(name).up().build())
-            .execute()
-            .await
-            .expect("link up");
-    }
-    let oif = h
-        .link()
-        .get()
-        .match_name(IFACE)
-        .execute()
-        .try_next()
-        .await
-        .expect("link lookup")
-        .expect("veth exists")
-        .header
-        .index;
+    let (h, oif) = fresh_namespace().await;
     let gw4: IpAddr = "192.0.2.1".parse().unwrap();
     let gw6: IpAddr = "2001:db8:bc::1".parse().unwrap();
-    for (addr, prefix) in [("192.0.2.10", 24), ("2001:db8:bc::10", 64)] {
-        h.address()
-            .add(oif, addr.parse().unwrap(), prefix)
-            .execute()
-            .await
-            .expect("operator address");
-    }
 
     // ── Startup GC: seed a crashed instance's leftovers in the reserved
     // ranges (lowest-but-five and topmost slot), and operator state one step
-    // outside each end. Seeded before the first `global()`, which sweeps.
+    // outside each end — none above a range ending at the last table id.
+    // Seeded before the first `global()`, which sweeps.
     seed(&h, p_lo + 5, "192.0.2.99".parse().unwrap(), t_lo + 5, gw4, oif).await;
     seed(&h, p_hi, "2001:db8:bc::99".parse().unwrap(), t_hi, gw6, oif).await;
     seed(&h, p_lo - 1, "192.0.2.98".parse().unwrap(), t_lo - 1, gw4, oif).await;
-    seed(&h, p_hi + 1, "2001:db8:bc::98".parse().unwrap(), t_hi + 1, gw6, oif).await;
+    let above = t_hi.checked_add(1);
+    if let Some(t) = above {
+        seed(&h, p_hi + 1, "2001:db8:bc::98".parse().unwrap(), t, gw6, oif).await;
+    }
     let mgr = BondRouteManager::global().await.expect("global() opens netlink");
     assert_eq!(reserved(&h, &ranges).await, (vec![], vec![]), "GC left orphans");
     let (all_rules, all_routes) = (rules(&h).await, routes(&h).await);
+    let rules_above = above.map(|t| rule(p_hi + 1, "2001:db8:bc::98/128", t));
     for kept in [
         rule(0, "all", 255),
         rule(32766, "all", MAIN_TABLE),
         rule(32767, "all", 253),
         rule(p_lo - 1, "192.0.2.98/32", t_lo - 1),
-        rule(p_hi + 1, "2001:db8:bc::98/128", t_hi + 1),
-    ] {
+    ]
+    .into_iter()
+    .chain(rules_above)
+    {
         assert!(has(&all_rules, &kept), "GC removed `{kept}`: {all_rules:#?}");
     }
-    for kept in [route(t_lo - 1, gw4, oif), route(t_hi + 1, gw6, oif)] {
+    let routes_above = above.map(|t| route(t, gw6, oif));
+    for kept in [route(t_lo - 1, gw4, oif)].into_iter().chain(routes_above) {
         assert!(has(&all_routes, &kept), "GC removed `{kept}`: {all_routes:#?}");
     }
 
@@ -164,29 +131,201 @@ async fn gateway_routing_against_a_real_kernel() {
     assert_eq!(reserved(&h, &ranges).await, both, "re-program moved or doubled the leg");
     assert_eq!(addresses(&h, oif).await, addrs, "re-program changed the addresses");
 
+    // ── is_intact checks the leg's rule too: an `ip rule flush`, or a network
+    // manager removing rules it did not create, leaves the table alone. The
+    // rule is deleted, or replaced by one that differs in one respect.
+    let src: IpAddr = src4.addr;
+    for (why, stand_in) in [
+        ("deleted", None),
+        ("at another priority", Some((p_lo + 7, src, 32, t_lo))),
+        ("looking up another table", Some((p_lo, src, 32, t_lo + 7))),
+        ("from another source", Some((p_lo, "192.0.2.3".parse().unwrap(), 32, t_lo))),
+        ("from a wider prefix", Some((p_lo, src, 31, t_lo))),
+    ] {
+        del_rule(&h, &leg4.0).await;
+        let stand_in = match stand_in {
+            Some((priority, from, len, table)) => {
+                Some(add_rule(&h, priority, from, len, table).await)
+            }
+            None => None,
+        };
+        assert!(!mgr.is_intact(FLOW, 0).await, "rule {why}: still reported intact");
+        assert!(mgr.is_intact(FLOW, 1).await, "rule {why}: the other leg lost its standing");
+        if let Some(line) = stand_in {
+            del_rule(&h, &line).await;
+        }
+        mgr.program(FLOW, 0, IFACE, src4, gw4).await.expect("re-program after the rule went");
+        assert!(mgr.is_intact(FLOW, 0).await, "rule {why}: not intact after re-program");
+        assert_eq!(reserved(&h, &ranges).await, both, "rule {why}: re-program left the wrong state");
+    }
+
     // ── teardown removes the rule and flushes the table, keeps the address.
     mgr.teardown(FLOW, 0).await;
     assert!(!mgr.is_intact(FLOW, 0).await);
-    assert_eq!(reserved(&h, &ranges).await, (vec![leg6.0], vec![leg6.1]));
+    assert_eq!(reserved(&h, &ranges).await, (vec![leg6.0.clone()], vec![leg6.1.clone()]));
     mgr.teardown_all().await;
     assert_eq!(reserved(&h, &ranges).await, (vec![], vec![]), "teardown_all left state");
     assert_eq!(addresses(&h, oif).await, addrs, "teardown removed an address");
 
+    // ── A failed program() leaves nothing behind, in the kernel or the
+    // allocator: one whose rule is already there (the rule add fails after
+    // the route went in), one against an unreachable gateway (the route add
+    // fails), and MAX_SLOTS against a missing interface (a modem unplugged
+    // through 21 min of 5 s re-asserts). Another leg then still gets slot 0.
+    add_rule(&h, p_lo, src, 32, t_lo).await;
+    let e = mgr.program(FLOW, 5, IFACE, src4, gw4).await.expect_err("rule already present");
+    assert!(e.to_string().contains("add rule"), "{e}");
+    assert!(!mgr.is_intact(FLOW, 5).await, "a failed program() is reported intact");
+    let nowhere: IpAddr = "198.51.100.1".parse().unwrap();
+    mgr.program(FLOW, 5, IFACE, src4, nowhere).await.expect_err("unreachable gateway");
+    for _ in 0..MAX_SLOTS {
+        let e = mgr.program(FLOW, 6, "bvgone0", src4, gw4).await.expect_err("missing interface");
+        assert!(e.to_string().contains("'bvgone0' not found"), "{e}");
+    }
+    assert_eq!(reserved(&h, &ranges).await, (vec![], vec![]), "a failed program() left state");
+    let after = mgr.program(FLOW, 2, IFACE, src4, gw4).await;
+    assert!(after.is_ok(), "the failed program()s leaked slots: {after:?}");
+    let one = (vec![leg4.0.clone()], vec![leg4.1.clone()]);
+    assert_eq!(reserved(&h, &ranges).await, one, "the failed program()s leaked slots");
+
+    // ── program / teardown run whole per key: two re-programs of one leg
+    // racing each other leave one leg in its slot, and a teardown racing a
+    // program() returns with the leg gone — as when an output stops while
+    // its re-assert task is re-programming the leg.
+    let (a, b) = tokio::join!(
+        mgr.program(FLOW, 2, IFACE, src4, gw4),
+        mgr.program(FLOW, 2, IFACE, src4, gw4)
+    );
+    a.and(b).expect("racing re-programs");
+    assert_eq!(reserved(&h, &ranges).await, one, "racing re-programs left two slots");
+    let (c, ()) = tokio::join!(mgr.program(FLOW, 3, IFACE, src6, gw6), mgr.teardown(FLOW, 3));
+    c.expect("program racing a teardown");
+    assert_eq!(reserved(&h, &ranges).await, one, "teardown returned before the program() it raced");
+    assert!(!mgr.is_intact(FLOW, 3).await, "the raced leg is still active after its teardown");
+    mgr.teardown_all().await;
+    assert_eq!(reserved(&h, &ranges).await, (vec![], vec![]), "teardown_all left state");
+    assert_eq!(addresses(&h, oif).await, addrs, "the failures changed the addresses");
+
     // ── program_dish_route: a scoped route in main, replaced, never doubled.
+    assert_eq!(dish_routes(&h, mgr).await, [dish_route(oif)]);
+}
+
+/// Bases the manager refuses: nothing is swept, nothing is programmed, and
+/// the dish route — which needs no reserved range — still works.
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN in a throwaway network namespace; see the file header"]
+async fn refused_bases_touch_nothing() {
+    if std::env::var("BILBYCAST_NETNS_TEST").as_deref() != Ok("unsafe-bases") {
+        eprintln!(
+            "skipped: set BILBYCAST_NETNS_TEST=unsafe-bases and an unsafe base, in a throwaway \
+             network namespace (see the header of tests/bond_routing_netns.rs)"
+        );
+        return;
+    }
+    let refused = SlotAllocator::from_env()
+        .expect_err("these bases are accepted; set an unsafe one (see the file header)");
+    eprintln!("refused: {refused:#}");
+
+    let (h, oif) = fresh_namespace().await;
+    let gw4: IpAddr = "192.0.2.1".parse().unwrap();
+    // A leg-shaped rule + route in the default ranges, as a crashed edge or
+    // an operator who moved the bases away from them would leave them.
+    seed(&h, 10005, "192.0.2.99".parse().unwrap(), 48133, gw4, oif).await;
+    let before = everything(&h, oif).await;
+    for kernel in [rule(32766, "all", MAIN_TABLE), rule(32767, "all", 253)] {
+        assert!(has(&before.0, &kernel), "no `{kernel}` to watch: {:#?}", before.0);
+    }
+
+    let mgr = BondRouteManager::global().await.expect("global() opens netlink");
+    assert_eq!(everything(&h, oif).await, before, "the sweep ran on a refused range");
+    let src4 = SourceNet::parse("192.0.2.2/24").unwrap();
+    let e = mgr.program(FLOW, 0, IFACE, src4, gw4).await.expect_err("program() with refused bases");
+    assert!(e.to_string().contains(&format!("{refused:#}")), "{e}");
+    assert!(!mgr.is_intact(FLOW, 0).await);
+    mgr.teardown(FLOW, 0).await;
+    mgr.teardown_all().await;
+    assert_eq!(everything(&h, oif).await, before, "refused bases touched the kernel");
+
+    assert_eq!(dish_routes(&h, mgr).await, [dish_route(oif)]);
+}
+
+/// A netlink handle on a namespace holding only `lo`, given a veth pair
+/// whose `IFACE` end (returned by index) carries an operator address in
+/// each family, so gateways resolve.
+async fn fresh_namespace() -> (Handle, u32) {
+    let (conn, h, _) = rtnetlink::new_connection().expect("netlink socket");
+    tokio::spawn(conn);
+    let links: Vec<String> = h
+        .link()
+        .get()
+        .execute()
+        .map_ok(|l| {
+            l.attributes
+                .into_iter()
+                .find_map(|a| match a {
+                    LinkAttribute::IfName(n) => Some(n),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        })
+        .try_collect()
+        .await
+        .expect("link dump");
+    assert_eq!(links, ["lo"], "refusing to run outside a fresh network namespace");
+
+    h.link()
+        .add(LinkVeth::new(IFACE, PEER).build())
+        .execute()
+        .await
+        .expect("create veth pair");
+    for name in [IFACE, PEER] {
+        h.link()
+            .set(LinkUnspec::new_with_name(name).up().build())
+            .execute()
+            .await
+            .expect("link up");
+    }
+    let oif = h
+        .link()
+        .get()
+        .match_name(IFACE)
+        .execute()
+        .try_next()
+        .await
+        .expect("link lookup")
+        .expect("veth exists")
+        .header
+        .index;
+    for (addr, prefix) in [("192.0.2.10", 24), ("2001:db8:bc::10", 64)] {
+        h.address()
+            .add(oif, addr.parse().unwrap(), prefix)
+            .execute()
+            .await
+            .expect("operator address");
+    }
+    (h, oif)
+}
+
+/// Program the Starlink dish route twice and return the main table's routes
+/// to it: one, replaced rather than doubled.
+async fn dish_routes(h: &Handle, mgr: &BondRouteManager) -> Vec<String> {
     let dish = Ipv4Addr::new(192, 168, 100, 0);
     for _ in 0..2 {
         mgr.program_dish_route(dish, 24, Ipv4Addr::new(192, 0, 2, 1), IFACE)
             .await
             .expect("program dish route");
     }
-    let main = within(&routes(&h).await, &(MAIN_TABLE..=MAIN_TABLE));
-    let dish_routes: Vec<&String> = main.iter().filter(|r| r.contains("192.168.100.0")).collect();
-    assert_eq!(dish_routes, [&format!("table 254 192.168.100.0/24 via 192.0.2.1 oif {oif}")]);
+    let main = within(&routes(h).await, &(MAIN_TABLE..=MAIN_TABLE));
+    main.into_iter().filter(|r| r.contains("192.168.100.0")).collect()
 }
 
-/// A reserved-range base, read the way `engine::bond_routing` reads it.
-fn base(var: &str, default: u32) -> u32 {
-    std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+fn dish_route(oif: u32) -> String {
+    format!("table 254 192.168.100.0/24 via 192.0.2.1 oif {oif}")
+}
+
+/// Every rule and route, and the addresses on `oif`.
+async fn everything(h: &Handle, oif: u32) -> (Vec<(u32, String)>, Vec<(u32, String)>, Vec<String>) {
+    (rules(h).await, routes(h).await, addresses(h, oif).await)
 }
 
 /// Install a leg-shaped rule + default route, as a crashed edge or an
@@ -215,6 +354,32 @@ async fn seed(h: &Handle, priority: u32, from: IpAddr, table: u32, via: IpAddr, 
         _ => unreachable!("one family per seed"),
     };
     h.route().add(default_route).execute().await.expect("seed route");
+}
+
+/// Add `priority: from <from>/<len> lookup <table>`, as an operator would,
+/// and return it as [`rule`] writes it.
+async fn add_rule(h: &Handle, priority: u32, from: IpAddr, len: u8, table: u32) -> String {
+    let add = h.rule().add().table_id(table).priority(priority).action(RuleAction::ToTable);
+    match from {
+        IpAddr::V4(v4) => add.v4().source_prefix(v4, len).execute().await,
+        IpAddr::V6(v6) => add.v6().source_prefix(v6, len).execute().await,
+    }
+    .expect("add rule");
+    rule(priority, &format!("{from}/{len}"), table)
+}
+
+/// Delete every rule [`rule`] would write as `line`, as `ip rule del` does.
+async fn del_rule(h: &Handle, line: &str) {
+    let mut found = false;
+    for v in [IpVersion::V4, IpVersion::V6] {
+        let dump: Vec<RuleMessage> =
+            h.rule().get(v).execute().try_collect().await.expect("rule dump");
+        for r in dump.into_iter().filter(|r| describe_rule(r).1 == line) {
+            h.rule().del(r).execute().await.expect("delete rule");
+            found = true;
+        }
+    }
+    assert!(found, "no `{line}` to delete");
 }
 
 /// Delete every route in `table`, as a link-down does.
