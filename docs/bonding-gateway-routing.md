@@ -71,7 +71,8 @@ The netlink calls run against a real kernel in
 `CAP_NET_ADMIN` in a throwaway network namespace. CI runs it on every pull
 request and push to `main`, as root under `sudo unshare --net`, once per set of
 bases (default, moved, the highest, either side of the kernel's VRF rule,
-an unparseable value, and four refused ones); its header holds the docker
+two unparseable values — one a number with a space before it — and four
+refused ones); its header holds the docker
 command for a local run. It covers the startup sweep (which must leave the
 kernel's own rules, the VRF one included, alone), `program`, `is_intact`
 (emptied table; rule deleted or altered), `teardown`, `teardown_all`,
@@ -230,14 +231,20 @@ range must hold nothing the kernel owns:
   be consulted for a source the main table routes, which with a default route
   there is every source — a cosmetic bond.
 
-What each value does:
+What each value does. Nothing is trimmed: a value is read exactly as the
+environment holds it.
 
 - **Unset, empty or only whitespace** (a systemd `Environment=VAR=` line):
   the default, silently.
-- **Not a whole number** (`0xBD00`, `7000x`, a value that is not UTF-8):
-  discarded for the default, as every release did, but no longer silently —
-  at boot a Warning `bond_rt_base_unparseable` event (category `config`)
-  names the variable, the value, the default in use and the bounds.
+- **Not a whole number as written** (`0xBD00`, `7000x`, a value that is not
+  UTF-8, or a number with spaces around it such as `" 7000"`): discarded for
+  the default, as every release did, but no longer silently — at boot a
+  Warning `bond_rt_base_unparseable` event (category `config`) names the
+  variable, the value with its spaces, the default in use and the bounds. A
+  padded number never moves the range and is never refused, whatever the
+  number: `" 900"` runs on the default range, as it always did.
+- **A whole number within the bounds**, digits with an optional leading `+`
+  and nothing around them: the range moves there, as it always did.
 - **A whole number outside the bounds**, past `u32` included (`4294967296`,
   `-1`): **refused**, and gateway routing is disabled for the process. At
   boot a Critical `bond_rt_base_refused` event (category `config`) names each
@@ -253,12 +260,17 @@ What each value does:
 
 The bases are read at boot for that report and again at the manager's first
 use (the first gateway leg, leg probe or dish route), so a change needs an
-edge restart. Before this release any `u32` was taken: a table base of 200
-with a priority base of 32600 emptied the `local`, `main` and `default`
-tables and deleted the `lookup main` and `lookup default` rules at that first
-use, a priority base from 745 to 1000 deleted a VRF host's `l3mdev` rule, a
-table base within 255 of `u32::MAX` overflowed, and an unparseable value fell
-back to the default range without a word.
+edge restart. Before this release a value was taken exactly when it parsed
+as a `u32` as written (digits, an optional leading `+`, no spaces), with no
+bounds: a table base of 200 with a priority base of 32600 emptied the
+`local`, `main` and `default` tables and deleted the `lookup main` and
+`lookup default` rules at that first use, a priority base from 745 to 1000
+deleted a VRF host's `l3mdev` rule, and a table base within 255 of
+`u32::MAX` overflowed. Every other value — empty, blank, padded with spaces,
+not a number, negative or past `u32` — fell back to the default range
+without a word. All of those still mean the default range, a padded or
+non-numeric one now with a Warning, except a negative number or one past
+`u32`, which is now refused.
 
 `slot` = a per-host index allocated from an in-process slab keyed by
 `(flow_id, path_id)`, freed on teardown. Max 256 concurrent gateway-mode legs
@@ -300,7 +312,7 @@ New dependency: a netlink crate (`rtnetlink` or `neli`).
 | Route or rule disappears after start (link flap, device re-plug, route flush, `ip rule flush`, a network manager removing rules it did not create) | The 5 s re-assert task re-programs it (`is_intact` checks the rule's priority, source and table as well as the table's route). If that fails it emits **Critical** `media` with `error_code: "bond_gateway_route_lost"` (details `output_id` / `path_id` / `path_name` / `gateway`), latched once per failing streak, and says plainly that the leg rides the default route — a cosmetic bond — until it succeeds. UDP gateway legs only; relay legs are not re-asserted (§1). |
 | Netlink unavailable | Same as cap-missing. |
 | Range bases refused (§4) | **Critical** `config` event `bond_rt_base_refused` at boot, naming each refused variable, its value and its bounds. No sweep runs. Every gateway path fails to program with the same text, through the failed-program **Critical** `media` event (no cap hint, no `error_code`); a relay or tunnel leg through a **Warning** `tunnel_gateway_route_failed`. |
-| Range base not a whole number (§4) | The default range is used; **Warning** `config` event `bond_rt_base_unparseable` at boot, naming the variable, its value, the default and the bounds. |
+| Range base not a whole number as written, spaces around a number included (§4) | The default range is used; **Warning** `config` event `bond_rt_base_unparseable` at boot, naming the variable, its value, the default and the bounds. |
 
 > **As-built:** the two flow-start failures above go out through `emit_flow`
 > with **no details object**, so they carry no `error_code` and cannot be

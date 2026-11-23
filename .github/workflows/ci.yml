@@ -396,6 +396,10 @@ jobs:
           # Not a whole number: discarded for the default range.
           run gateway_routing_against_a_real_kernel BILBYCAST_NETNS_TEST=1 \
             BILBYCAST_BOND_RT_TABLE_BASE=0xBD00
+          # Nor is a number with a space before it, which no release read as
+          # one: the default range again, never 900 (refused).
+          run gateway_routing_against_a_real_kernel BILBYCAST_NETNS_TEST=1 \
+            "BILBYCAST_BOND_RT_PRIO_BASE= 900"
           run refused_bases_touch_nothing BILBYCAST_NETNS_TEST=unsafe-bases \
             BILBYCAST_BOND_RT_TABLE_BASE=200 BILBYCAST_BOND_RT_PRIO_BASE=32600
           run refused_bases_touch_nothing BILBYCAST_NETNS_TEST=unsafe-bases \

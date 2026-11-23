@@ -32,7 +32,8 @@
 //! `-e BILBYCAST_BOND_RT_TABLE_BASE=… -e BILBYCAST_BOND_RT_PRIO_BASE=…` to run
 //! it against moved ranges (a table base from 256 to 4294967040, a priority
 //! base from 1 to 744 or from 1001 to 32510). A value that is not a whole
-//! number (`0xBD00`) takes its default, so it runs against the default range.
+//! number as written (`0xBD00`, or `" 900"` with its space — nothing is
+//! trimmed) takes its default, so it runs against the default range.
 //! Everything it checks runs in one test: the manager is a process-wide
 //! `OnceCell` and sweeps only on its first use.
 //!

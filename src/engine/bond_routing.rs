@@ -34,15 +34,16 @@
 //! [`BondRouteManager::program`] fails naming each refused variable, its
 //! value and its bounds — rather than falling back to the default range,
 //! which may be the very range the operator moved away from. A value that
-//! is not a whole number is discarded for its default, as it always was,
-//! and an empty one is unset. Both are reported at boot
-//! ([`Bases::report`]). On its first use [`BondRouteManager::global`]
-//! runs a **GC sweep** that deletes any rule/route left in those
-//! ranges by a prior crash before any leg is programmed, and runs it
-//! only on ranges that passed. Per-path teardown removes that path's rule +
-//! flushes its table. Addresses the edge adds are left in place on
-//! teardown (cheap, and avoids tearing down an address another leg or
-//! the operator may rely on).
+//! is not, as written, a whole number (`0xBD00`, or `" 7000"` with its
+//! spaces — nothing is trimmed) is discarded for its default, as it always
+//! was, and an empty or blank one is unset. Refusals and discards are
+//! reported at boot ([`Bases::report`]). On its first use
+//! [`BondRouteManager::global`] runs a **GC sweep** that deletes any
+//! rule/route left in those ranges by a prior crash before any leg is
+//! programmed, and runs it only on ranges that passed. Per-path teardown
+//! removes that path's rule + flushes its table. Addresses the edge adds
+//! are left in place on teardown (cheap, and avoids tearing down an
+//! address another leg or the operator may rely on).
 //!
 //! Each `program` / `teardown` runs whole under the manager's one lock,
 //! so two calls for one `(flow_id, path_id)` never interleave. That
@@ -283,23 +284,28 @@ impl SlotAllocator {
 
 // ── The two base variables ───────────────────────────────────────────────────
 
-/// How one base variable reads.
+/// How one base variable reads. Nothing is trimmed: a number with spaces
+/// around it (`" 7000"`) is not a whole number as written, and every
+/// release before this one took it for the default, so it still does
+/// (reported, as [`BaseRead::Unparseable`]) rather than moving the range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BaseRead<'a> {
     /// Unset, empty or only whitespace — what a systemd `Environment=VAR=`
     /// line or an empty `EnvironmentFile` entry gives: the default.
     Unset,
-    /// A whole number that fits a `u32`.
+    /// A whole number that fits a `u32`, exactly as written (digits, a
+    /// leading `+` allowed, which is what `u32`'s parser always took).
     Value(u32),
     /// A whole number past `u32` either way (`4294967296`, `-1`), as
     /// written: out of range, so refused like any other unsafe base.
     OutOfRange(&'a str),
-    /// Not a whole number at all (`0xBD00`, `7000x`), as written.
+    /// Anything else, as written: not a whole number (`0xBD00`, `7000x`),
+    /// or a number with spaces around it (`" 7000"`).
     Unparseable(&'a str),
 }
 
 fn read_base(raw: Option<&str>) -> BaseRead<'_> {
-    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+    let Some(raw) = raw.filter(|r| !r.trim().is_empty()) else {
         return BaseRead::Unset;
     };
     if let Ok(v) = raw.parse::<u32>() {
@@ -313,13 +319,14 @@ fn read_base(raw: Option<&str>) -> BaseRead<'_> {
     }
 }
 
-/// A base variable set to something that is not a whole number. Its value
-/// is discarded for the default, which is what every release did; this
+/// A base variable set to something that is not, as written, a whole
+/// number — spaces around a number included. Its value is discarded for
+/// the default, as every release did (`u32`'s parser refuses it); this
 /// release says so ([`Bases::report`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnparseableBase {
     pub var: &'static str,
-    /// The value as the host sets it, trimmed.
+    /// The value exactly as the host sets it.
     pub value: String,
     /// The default used in its place.
     pub default: u32,
@@ -333,7 +340,8 @@ pub struct UnparseableBase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedBase {
     pub var: &'static str,
-    /// The value as the host sets it, trimmed.
+    /// The number the value parsed to, or for one past `u32` the value
+    /// exactly as the host sets it.
     pub value: String,
     /// The sentence naming the variable, its value, why, and its bounds.
     pub reason: String,
@@ -450,9 +458,9 @@ impl Bases {
             .map(|u| BaseFinding {
                 severity: EventSeverity::Warning,
                 message: format!(
-                    "{} is set to {:?}, which is not a whole number. It has been DISCARDED and \
-                     the default base {} is in use, as if it were unset. To move the range, set \
-                     a whole number {}; to keep the default, remove the variable.",
+                    "{} is set to {:?}, which is not a whole number as written. It has been \
+                     DISCARDED and the default base {} is in use, as if it were unset. To move \
+                     the range, set a whole number {}; to keep the default, remove the variable.",
                     u.var, u.value, u.default, u.accepted
                 ),
                 details: serde_json::json!({
@@ -1253,9 +1261,9 @@ mod tests {
     }
 
     /// Unset, empty or blank takes the default silently; a value that is
-    /// not a whole number takes the default and is reported; a whole
-    /// number outside the bounds — past `u32` included — is refused,
-    /// naming the bounds.
+    /// not a whole number as written — spaces around a number included —
+    /// takes the default and is reported; a whole number outside the
+    /// bounds — past `u32` included — is refused, naming the bounds.
     #[test]
     fn settings_default_unset_and_garbage_and_refuse_unsafe_numbers() {
         let bases = |t: Option<&str>, p: Option<&str>| {
@@ -1267,27 +1275,44 @@ mod tests {
                 .map_err(String::clone);
             (ranges, b)
         };
-        for blank in [None, Some(""), Some("   "), Some("\t")] {
+        for blank in [None, Some(""), Some("   "), Some("\t"), Some(" \n ")] {
             let (ranges, b) = bases(blank, blank);
             assert_eq!(ranges, Ok((48128, 10000)), "{blank:?}");
             assert!(b.unparseable.is_empty() && b.findings().is_empty(), "{blank:?}");
         }
-        let (ranges, b) = bases(Some(" 7000 "), Some("+20000"));
+        let (ranges, b) = bases(Some("7000"), Some("+20000"));
         assert_eq!(ranges, Ok((7000, 20000)));
         assert!(b.findings().is_empty());
 
         let (ranges, b) = bases(Some("0xBD00"), Some(" 7000x "));
         assert_eq!(ranges, Ok((48128, 10000)), "unparseable values take the defaults");
         let got: Vec<_> = b.unparseable.iter().map(|u| (u.var, u.value.as_str(), u.default)).collect();
-        assert_eq!(got, [(TABLE_BASE_VAR, "0xBD00", 48128), (PRIO_BASE_VAR, "7000x", 10000)]);
+        assert_eq!(got, [(TABLE_BASE_VAR, "0xBD00", 48128), (PRIO_BASE_VAR, " 7000x ", 10000)]);
         assert!(b.refused.is_empty());
+
+        // Spaces around a number: no release read it as a number, so it
+        // keeps the default range (reported) — never moves it, never
+        // refuses it. Whatever the number would have been: a base in
+        // bounds, one out of them, one past `u32`.
+        for (table, prio) in [
+            (Some(" 7000"), Some("20000 ")),
+            (Some("\t300\n"), Some(" 900 ")),
+            (Some(" 4294967296"), Some(" -1")),
+        ] {
+            let (ranges, b) = bases(table, prio);
+            assert_eq!(ranges, Ok((48128, 10000)), "{table:?} {prio:?}");
+            assert!(b.refused.is_empty(), "{:?}", b.refused);
+            let got: Vec<_> = b.unparseable.iter().map(|u| (u.var, u.value.as_str())).collect();
+            assert_eq!(got, [(TABLE_BASE_VAR, table.unwrap()), (PRIO_BASE_VAR, prio.unwrap())]);
+        }
 
         for (table, prio, var, why) in [
             (Some("4294967296"), None, TABLE_BASE_VAR, "=4294967296 is refused: it is out of range. Use a base from 256 to 4294967040"),
             (Some("-1"), None, TABLE_BASE_VAR, "=-1 is refused: it is out of range. Use a base"),
             (None, Some("99999999999999999999999"), PRIO_BASE_VAR, "=99999999999999999999999 is refused: it is out of range. Use a base from 1 to 744"),
             (Some("200"), None, TABLE_BASE_VAR, "=200 is refused: its 256 tables"),
-            (None, Some(" 900 "), PRIO_BASE_VAR, "=900 is refused: its 256 rule priorities"),
+            (None, Some("900"), PRIO_BASE_VAR, "=900 is refused: its 256 rule priorities"),
+            (None, Some("+900"), PRIO_BASE_VAR, "=900 is refused: its 256 rule priorities"),
         ] {
             let (ranges, b) = bases(table, prio);
             let e = ranges.expect_err("accepted");
@@ -1320,6 +1345,7 @@ mod tests {
         assert_eq!(d["value"], "0xBD00");
         assert_eq!(d["default"], 48128);
         assert_eq!(d["accepted"], "from 256 to 4294967040");
+        assert!(warn.message.contains("which is not a whole number as written."), "{}", warn.message);
 
         let crit = rx.try_recv().expect("refusal event");
         assert_eq!(crit.severity, EventSeverity::Critical);
@@ -1340,9 +1366,19 @@ mod tests {
         assert_eq!(crit.details.expect("details")["refused"].as_array().map(Vec::len), Some(2));
         assert!(rx.try_recv().is_err());
 
+        // A padded number is reported with its spaces, and refuses nothing.
+        Bases::from_settings(None, Some(" 900")).report(&events);
+        let warn = rx.try_recv().expect("unparseable event");
+        assert_eq!(warn.severity, EventSeverity::Warning);
+        assert!(warn.message.starts_with(&format!("{PRIO_BASE_VAR} is set to \" 900\"")), "{}", warn.message);
+        assert!(warn.message.contains("the default base 10000 is in use"), "{}", warn.message);
+        assert_eq!(warn.details.expect("details")["value"], " 900");
+        assert!(rx.try_recv().is_err(), "a padded number refuses nothing");
+
         // Nothing set, nothing raised: a false alarm here would be on every
         // node of the fleet at every boot.
         Bases::from_settings(None, Some("")).report(&events);
+        Bases::from_settings(Some("  "), Some("\t")).report(&events);
         assert!(rx.try_recv().is_err());
     }
 
