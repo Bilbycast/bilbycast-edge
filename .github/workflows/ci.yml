@@ -341,6 +341,65 @@ jobs:
         working-directory: bilbycast-edge
         run: cargo test --all-targets --locked
 
+      # ─── bond_routing against a real kernel ──────────────────────────────
+      # tests/bond_routing_netns.rs drives engine::bond_routing's netlink half
+      # (the orphan sweep, program, is_intact, teardown, failed programs,
+      # racing calls, refused range bases) against a real kernel. It needs
+      # CAP_NET_ADMIN in a namespace it may wreck, so its two tests are
+      # #[ignore]d, skip unless BILBYCAST_NETNS_TEST asks for them, and the
+      # step above runs neither. GitHub-hosted runners have passwordless sudo
+      # and veth, so each run below gets a fresh network namespace from
+      # `unshare --net` as root. One process per set of bases: the route
+      # manager is a process-wide OnceCell that reads them and sweeps once.
+      # A run that skips (its environment lost on the way in) fails here
+      # rather than passing as `1 passed`.
+      - name: bond_routing against a real kernel
+        working-directory: bilbycast-edge
+        run: |
+          set -euo pipefail
+          # Located as the test file's header does; built by the step above.
+          BIN="$(cargo test --locked --test bond_routing_netns --no-run 2>&1 \
+            | sed -n 's/.*Executable .*(\(.*\))/\1/p')"
+          if [ -z "${BIN}" ] || [ ! -x "${BIN}" ]; then
+            echo "::error title=bond_routing netns::bond_routing_netns test binary not found" >&2
+            exit 1
+          fi
+          BIN="$(realpath "${BIN}")"
+          run() { # run <test> <VAR=value>...
+            local test="$1" out
+            shift
+            echo "::group::${test} $*"
+            out="$(sudo unshare --net env "$@" "${BIN}" --ignored --exact "${test}" \
+              --test-threads=1 --nocapture 2>&1)" || { echo "${out}"; echo "::endgroup::"; return 1; }
+            echo "${out}"
+            echo "::endgroup::"
+            if grep -q '^skipped:' <<<"${out}" || ! grep -q 'test result: ok. 1 passed' <<<"${out}"; then
+              echo "::error title=bond_routing netns::${test} $* did not run" >&2
+              return 1
+            fi
+          }
+          run gateway_routing_against_a_real_kernel BILBYCAST_NETNS_TEST=1
+          run gateway_routing_against_a_real_kernel BILBYCAST_NETNS_TEST=1 \
+            BILBYCAST_BOND_RT_TABLE_BASE=7000 BILBYCAST_BOND_RT_PRIO_BASE=20000
+          run gateway_routing_against_a_real_kernel BILBYCAST_NETNS_TEST=1 \
+            BILBYCAST_BOND_RT_TABLE_BASE=4294967040 BILBYCAST_BOND_RT_PRIO_BASE=32510
+          # Either side of the kernel's VRF rule at 1000, which must survive.
+          run gateway_routing_against_a_real_kernel BILBYCAST_NETNS_TEST=1 \
+            BILBYCAST_BOND_RT_TABLE_BASE=256 BILBYCAST_BOND_RT_PRIO_BASE=744
+          run gateway_routing_against_a_real_kernel BILBYCAST_NETNS_TEST=1 \
+            BILBYCAST_BOND_RT_PRIO_BASE=1001
+          # Not a whole number: discarded for the default range.
+          run gateway_routing_against_a_real_kernel BILBYCAST_NETNS_TEST=1 \
+            BILBYCAST_BOND_RT_TABLE_BASE=0xBD00
+          run refused_bases_touch_nothing BILBYCAST_NETNS_TEST=unsafe-bases \
+            BILBYCAST_BOND_RT_TABLE_BASE=200 BILBYCAST_BOND_RT_PRIO_BASE=32600
+          run refused_bases_touch_nothing BILBYCAST_NETNS_TEST=unsafe-bases \
+            BILBYCAST_BOND_RT_PRIO_BASE=900
+          run refused_bases_touch_nothing BILBYCAST_NETNS_TEST=unsafe-bases \
+            BILBYCAST_BOND_RT_TABLE_BASE=4294967296
+          run refused_bases_touch_nothing BILBYCAST_NETNS_TEST=unsafe-bases \
+            BILBYCAST_BOND_RT_PRIO_BASE=40000
+
       # Run the multiviewer suite. Until this step, `engine::input_mosaic`'s 13
       # tests were type-checked by the gate above and executed nowhere.
       #
