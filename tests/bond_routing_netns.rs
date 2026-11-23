@@ -10,9 +10,14 @@
 //!
 //! It needs `CAP_NET_ADMIN` in a network namespace it may wreck, so both tests
 //! are `#[ignore]`d and also skip unless `BILBYCAST_NETNS_TEST` asks for them,
-//! and they refuse a namespace holding any link but `lo`. A container gives
-//! one without root on the host. The binary is glibc-linked, so on a musl
-//! image run it through the host's loader:
+//! and they refuse a namespace holding any link but `lo`.
+//!
+//! **CI** runs them on every pull request and push to `main`: the `check` job's
+//! "bond_routing against a real kernel" step runs this binary as root under
+//! `sudo unshare --net`, once per set of bases that step lists, each in a
+//! fresh namespace (`.github/workflows/ci.yml`). Locally, a container gives one
+//! without root on the host. The binary is glibc-linked, so on a musl image
+//! run it through the host's loader:
 //!
 //! ```text
 //! BIN=$(cargo test --test bond_routing_netns --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\))/\1/p')
@@ -25,8 +30,10 @@
 //! `BILBYCAST_NETNS_TEST=1` runs `gateway_routing_against_a_real_kernel`. Add
 //! `-e BILBYCAST_BOND_RT_TABLE_BASE=… -e BILBYCAST_BOND_RT_PRIO_BASE=…` to run
 //! it against moved ranges (a table base from 256 to 4294967040, a priority
-//! base from 1 to 32510). Everything it checks runs in one test: the manager is a
-//! process-wide `OnceCell` and sweeps only on its first use.
+//! base from 1 to 744 or from 1001 to 32510). A value that is not a whole
+//! number (`0xBD00`) takes its default, so it runs against the default range.
+//! Everything it checks runs in one test: the manager is a process-wide
+//! `OnceCell` and sweeps only on its first use.
 //!
 //! A refused base therefore needs a process of its own:
 //! `-e BILBYCAST_NETNS_TEST=unsafe-bases` with at least one unsafe base runs
@@ -34,18 +41,22 @@
 //! programs nothing. Run it once per kind of refusal, e.g. with
 //! `-e BILBYCAST_BOND_RT_TABLE_BASE=200 -e BILBYCAST_BOND_RT_PRIO_BASE=32600`
 //! (tables 253–255, the kernel's `lookup main` / `lookup default` rules),
+//! `BILBYCAST_BOND_RT_PRIO_BASE=900` (the VRF `l3mdev` rule at 1000),
 //! `BILBYCAST_BOND_RT_TABLE_BASE=4294967200` (past `u32::MAX`),
-//! `BILBYCAST_BOND_RT_TABLE_BASE=0xBD00` (unparseable) and
+//! `BILBYCAST_BOND_RT_TABLE_BASE=4294967296` (a whole number past `u32`) and
 //! `BILBYCAST_BOND_RT_PRIO_BASE=40000` (after `lookup main`).
+//!
+//! Some assertions here are guards rather than regression checks: they hold
+//! on every release, and say so where they stand.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 
-use bilbycast_edge::engine::bond_routing::{BondRouteManager, MAX_SLOTS, SlotAllocator, SourceNet};
+use bilbycast_edge::engine::bond_routing::{Bases, BondRouteManager, MAX_SLOTS, SourceNet};
 use futures_util::TryStreamExt;
 use netlink_packet_route::address::AddressAttribute;
 use netlink_packet_route::link::LinkAttribute;
-use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol};
 use netlink_packet_route::rule::{RuleAction, RuleAttribute, RuleMessage};
 use rtnetlink::{Handle, IpVersion, LinkUnspec, LinkVeth, RouteMessageBuilder};
 
@@ -64,7 +75,7 @@ async fn gateway_routing_against_a_real_kernel() {
         );
         return;
     }
-    let slots = SlotAllocator::from_env()
+    let slots = Bases::from_env().slots
         .expect("the bases are refused; run them with BILBYCAST_NETNS_TEST=unsafe-bases");
     let (t_lo, t_hi) = slots.table_range();
     let (p_lo, p_hi) = slots.prio_range();
@@ -85,6 +96,8 @@ async fn gateway_routing_against_a_real_kernel() {
     if let Some(t) = above {
         seed(&h, p_hi + 1, "2001:db8:bc::98".parse().unwrap(), t, gw6, oif).await;
     }
+    // The rule the kernel's VRF driver adds at 1000, one per family.
+    seed_l3mdev(&h).await;
     let mgr = BondRouteManager::global().await.expect("global() opens netlink");
     assert_eq!(reserved(&h, &ranges).await, (vec![], vec![]), "GC left orphans");
     let (all_rules, all_routes) = (rules(&h).await, routes(&h).await);
@@ -100,6 +113,8 @@ async fn gateway_routing_against_a_real_kernel() {
     {
         assert!(has(&all_rules, &kept), "GC removed `{kept}`: {all_rules:#?}");
     }
+    let l3mdev = all_rules.iter().filter(|(_, l)| *l == l3mdev_rule()).count();
+    assert_eq!(l3mdev, 2, "GC removed the VRF `{}`: {all_rules:#?}", l3mdev_rule());
     let routes_above = above.map(|t| route(t, gw6, oif));
     for kept in [route(t_lo - 1, gw4, oif)].into_iter().chain(routes_above) {
         assert!(has(&all_routes, &kept), "GC removed `{kept}`: {all_routes:#?}");
@@ -175,6 +190,7 @@ async fn gateway_routing_against_a_real_kernel() {
     add_rule(&h, p_lo, src, 32, t_lo).await;
     let e = mgr.program(FLOW, 5, IFACE, src4, gw4).await.expect_err("rule already present");
     assert!(e.to_string().contains("add rule"), "{e}");
+    // Guard: no release reported a failed program() intact.
     assert!(!mgr.is_intact(FLOW, 5).await, "a failed program() is reported intact");
     let nowhere: IpAddr = "198.51.100.1".parse().unwrap();
     mgr.program(FLOW, 5, IFACE, src4, nowhere).await.expect_err("unreachable gateway");
@@ -189,9 +205,13 @@ async fn gateway_routing_against_a_real_kernel() {
     assert_eq!(reserved(&h, &ranges).await, one, "the failed program()s leaked slots");
 
     // ── program / teardown run whole per key: two re-programs of one leg
-    // racing each other leave one leg in its slot, and a teardown racing a
-    // program() returns with the leg gone — as when an output stops while
-    // its re-assert task is re-programming the leg.
+    // racing each other leave one leg in its slot, and a teardown made
+    // while a program() of its leg holds the lock waits for it and returns
+    // with the leg gone (`join!` polls the program() first, so it takes the
+    // lock first). A program() made AFTER a teardown installs the leg
+    // again, as it should; that a stopped bonded output's re-assert task
+    // makes none is the output's job, tested in `output_bonded` with a
+    // fake route manager.
     let (a, b) = tokio::join!(
         mgr.program(FLOW, 2, IFACE, src4, gw4),
         mgr.program(FLOW, 2, IFACE, src4, gw4)
@@ -201,12 +221,14 @@ async fn gateway_routing_against_a_real_kernel() {
     let (c, ()) = tokio::join!(mgr.program(FLOW, 3, IFACE, src6, gw6), mgr.teardown(FLOW, 3));
     c.expect("program racing a teardown");
     assert_eq!(reserved(&h, &ranges).await, one, "teardown returned before the program() it raced");
+    // Guard: holds whenever the kernel check above does.
     assert!(!mgr.is_intact(FLOW, 3).await, "the raced leg is still active after its teardown");
     mgr.teardown_all().await;
     assert_eq!(reserved(&h, &ranges).await, (vec![], vec![]), "teardown_all left state");
     assert_eq!(addresses(&h, oif).await, addrs, "the failures changed the addresses");
 
     // ── program_dish_route: a scoped route in main, replaced, never doubled.
+    // Unchanged behaviour, checked as a guard.
     assert_eq!(dish_routes(&h, mgr).await, [dish_route(oif)]);
 }
 
@@ -222,17 +244,18 @@ async fn refused_bases_touch_nothing() {
         );
         return;
     }
-    let refused = SlotAllocator::from_env()
+    let refused = Bases::from_env().slots
         .expect_err("these bases are accepted; set an unsafe one (see the file header)");
-    eprintln!("refused: {refused:#}");
+    eprintln!("refused: {refused}");
 
     let (h, oif) = fresh_namespace().await;
     let gw4: IpAddr = "192.0.2.1".parse().unwrap();
     // A leg-shaped rule + route in the default ranges, as a crashed edge or
     // an operator who moved the bases away from them would leave them.
     seed(&h, 10005, "192.0.2.99".parse().unwrap(), 48133, gw4, oif).await;
+    seed_l3mdev(&h).await;
     let before = everything(&h, oif).await;
-    for kernel in [rule(32766, "all", MAIN_TABLE), rule(32767, "all", 253)] {
+    for kernel in [rule(32766, "all", MAIN_TABLE), rule(32767, "all", 253), l3mdev_rule()] {
         assert!(has(&before.0, &kernel), "no `{kernel}` to watch: {:#?}", before.0);
     }
 
@@ -240,12 +263,15 @@ async fn refused_bases_touch_nothing() {
     assert_eq!(everything(&h, oif).await, before, "the sweep ran on a refused range");
     let src4 = SourceNet::parse("192.0.2.2/24").unwrap();
     let e = mgr.program(FLOW, 0, IFACE, src4, gw4).await.expect_err("program() with refused bases");
-    assert!(e.to_string().contains(&format!("{refused:#}")), "{e}");
+    assert!(e.to_string().contains(&refused), "{e}");
+    // Guard: a failed program() was never reported intact.
     assert!(!mgr.is_intact(FLOW, 0).await);
     mgr.teardown(FLOW, 0).await;
     mgr.teardown_all().await;
     assert_eq!(everything(&h, oif).await, before, "refused bases touched the kernel");
 
+    // The dish route needs no reserved range, so refused bases must not
+    // take it down with them (a guard on this design: `global()` succeeds).
     assert_eq!(dish_routes(&h, mgr).await, [dish_route(oif)]);
 }
 
@@ -356,6 +382,30 @@ async fn seed(h: &Handle, priority: u32, from: IpAddr, table: u32, via: IpAddr, 
     h.route().add(default_route).execute().await.expect("seed route");
 }
 
+/// Add the rule `drivers/net/vrf.c` adds, in each family, when a
+/// namespace's first VRF device is created: `1000: from all lookup
+/// [l3mdev-table]`. Added directly, as no VRF module need be loaded.
+async fn seed_l3mdev(h: &Handle) {
+    fn l3mdev(m: &mut RuleMessage) {
+        m.header.table = 0;
+        m.attributes.push(RuleAttribute::L3MDev(true));
+        m.attributes.push(RuleAttribute::Protocol(RouteProtocol::Kernel));
+    }
+    let add = || h.rule().add().priority(1000).action(RuleAction::ToTable);
+    let why = "seed the VRF l3mdev rule (needs CONFIG_NET_L3_MASTER_DEV)";
+    let mut v4 = add().v4();
+    l3mdev(v4.message_mut());
+    v4.execute().await.expect(why);
+    let mut v6 = add().v6();
+    l3mdev(v6.message_mut());
+    v6.execute().await.expect(why);
+}
+
+/// The VRF rule as [`describe_rule`] writes it.
+fn l3mdev_rule() -> String {
+    "1000: from all lookup [l3mdev-table]".to_string()
+}
+
 /// Add `priority: from <from>/<len> lookup <table>`, as an operator would,
 /// and return it as [`rule`] writes it.
 async fn add_rule(h: &Handle, priority: u32, from: IpAddr, len: u8, table: u32) -> String {
@@ -432,13 +482,18 @@ async fn rules(h: &Handle) -> Vec<(u32, String)> {
 
 fn describe_rule(r: &RuleMessage) -> (u32, String) {
     let (mut priority, mut table, mut from) = (0, u32::from(r.header.table), "all".to_string());
+    let mut l3mdev = false;
     for a in &r.attributes {
         match a {
             RuleAttribute::Priority(p) => priority = *p,
             RuleAttribute::Table(t) => table = *t,
             RuleAttribute::Source(ip) => from = format!("{ip}/{}", r.header.src_len),
+            RuleAttribute::L3MDev(on) => l3mdev = *on,
             _ => {}
         }
+    }
+    if l3mdev {
+        return (priority, format!("{priority}: from {from} lookup [l3mdev-table]"));
     }
     (priority, rule(priority, &from, table))
 }

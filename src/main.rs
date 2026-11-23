@@ -800,6 +800,11 @@ async fn real_main() -> anyhow::Result<()> {
             output_id: None,
         });
     }
+    // The bond routing-table bases are host-level variables that stay, so
+    // they are not among the stale ones above; a value that is not a whole
+    // number, or one refused as unsafe (which disables gateway routing),
+    // is reported here at boot rather than first at a gateway leg's start.
+    engine::bond_routing::Bases::from_env().report(&event_sender);
 
     // System resource monitoring (CPU, RAM)
     let resource_state = Arc::new(engine::resource_monitor::SystemResourceState::new());

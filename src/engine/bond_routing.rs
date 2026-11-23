@@ -28,12 +28,15 @@
 //! `[PRIO_BASE, PRIO_BASE+MAX_SLOTS)`. Bases are env-overridable
 //! (host-level OS tuning), within bounds [`SlotAllocator::new`] enforces:
 //! the tables must clear the kernel's 0 and 253–255, and the priorities
-//! must sit between the kernel's `lookup local` rule (0) and its
-//! `lookup main` rule (32766). A value outside them, or one that does
-//! not parse, disables gateway routing for the process — every
-//! [`BondRouteManager::program`] fails naming the variable — rather than
-//! falling back to the default range, which may be the very range the
-//! operator moved away from. On its first use [`BondRouteManager::global`]
+//! must hold none of the kernel's own rules ([`KERNEL_RULE_PRIORITIES`])
+//! and end before its `lookup main` rule (32766). A whole number outside
+//! them disables gateway routing for the process — every
+//! [`BondRouteManager::program`] fails naming each refused variable, its
+//! value and its bounds — rather than falling back to the default range,
+//! which may be the very range the operator moved away from. A value that
+//! is not a whole number is discarded for its default, as it always was,
+//! and an empty one is unset. Both are reported at boot
+//! ([`Bases::report`]). On its first use [`BondRouteManager::global`]
 //! runs a **GC sweep** that deletes any rule/route left in those
 //! ranges by a prior crash before any leg is programmed, and runs it
 //! only on ranges that passed. Per-path teardown removes that path's rule +
@@ -42,20 +45,28 @@
 //! the operator may rely on).
 //!
 //! Each `program` / `teardown` runs whole under the manager's one lock,
-//! so two calls for one `(flow_id, path_id)` never interleave.
+//! so two calls for one `(flow_id, path_id)` never interleave. That
+//! orders calls already made; a `program` made after a `teardown`
+//! installs the leg again, so a leg's owner stops whatever re-programs it
+//! before it tears it down (`output_bonded`'s re-assert task).
 //!
 //! The netlink half needs a live kernel + `CAP_NET_ADMIN`, so only the
-//! pure [`SlotAllocator`] is unit-tested here; `tests/bond_routing_netns.rs`
-//! (`#[ignore]`d, run in a throwaway network namespace) drives the rest.
+//! pure [`SlotAllocator`] and [`Bases`] are unit-tested here;
+//! `tests/bond_routing_netns.rs` (`#[ignore]`d, run in a throwaway network
+//! namespace, and by CI under `unshare --net`) drives the rest.
+//! [`LegRoutes`] is the seam the callers' own tests put a fake behind.
 //! See `docs/bonding-gateway-routing.md`.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::RangeInclusive;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryStreamExt;
 use tokio::sync::{Mutex, OnceCell};
+
+use crate::manager::events::{EventSender, EventSeverity, category};
 
 /// Moves the reserved routing tables, if they collide with existing host
 /// routing tables.
@@ -73,12 +84,95 @@ pub const MAX_SLOTS: u32 = 256;
 /// the last table id. No base under 256 can: its range would reach
 /// 253–255, and the startup sweep would empty those tables.
 const TABLE_BASES: RangeInclusive<u32> = 256..=u32::MAX - (MAX_SLOTS - 1);
-/// Priority bases whose `MAX_SLOTS` rules sit after the kernel's
-/// `lookup local` rule (priority 0) and before its `lookup main` (32766)
-/// and `lookup default` (32767) rules: the sweep would delete a kernel
-/// rule in range, and a leg's rule after `lookup main` is never consulted
-/// for a source the main table routes.
-const PRIO_BASES: RangeInclusive<u32> = 1..=32766 - MAX_SLOTS;
+/// The rule priorities the kernel installs by itself, which the sweep and
+/// a leg's teardown (both delete every rule at a priority they own,
+/// whatever it does) must never own:
+///
+/// - 0 `lookup local` and 32766 `lookup main`, in every namespace, for
+///   IPv4 and IPv6 (`fib_default_rule_add` in `net/ipv4/fib_rules.c` and
+///   `net/ipv6/fib6_rules.c`);
+/// - 32767 `lookup default`, for IPv4 (`net/ipv4/fib_rules.c`), and the one
+///   rule of the IPMR / IP6MR families (`net/ipv4/ipmr.c`,
+///   `net/ipv6/ip6mr.c`);
+/// - 1000, the `l3mdev` rule `drivers/net/vrf.c` adds for each family
+///   (`FIB_RULE_PREF`) when a namespace's first VRF device is created.
+///
+/// Nothing else in the kernel adds a rule at a fixed priority: those four
+/// files are the only callers of `fib_default_rule_add`, and `vrf.c` the
+/// only driver that sets `FRA_PRIORITY`. A rule added with no priority
+/// takes one just below the second rule in the list
+/// (`fib_default_rule_pref`, `net/core/fib_rules.c`); that is a rule some
+/// program asked for, not the kernel's.
+pub const KERNEL_RULE_PRIORITIES: [u32; 4] = [0, 1000, 32766, 32767];
+/// The kernel's `lookup main` rule. A leg's rule after it is never
+/// consulted for a source the main table routes, which with a default
+/// route there is every source.
+const LOOKUP_MAIN_PRIORITY: u32 = 32766;
+
+/// Whether `base`'s `MAX_SLOTS` rule priorities hold none of
+/// [`KERNEL_RULE_PRIORITIES`] and end before `lookup main`.
+fn prio_base_ok(base: u32) -> bool {
+    base.checked_add(MAX_SLOTS - 1).is_some_and(|last| {
+        last < LOOKUP_MAIN_PRIORITY && !KERNEL_RULE_PRIORITIES.iter().any(|k| (base..=last).contains(k))
+    })
+}
+
+/// The bases [`prio_base_ok`] accepts, as an error states them: the runs
+/// either side of the VRF rule at 1000 (a unit test holds the two equal).
+const PRIO_BASES: [RangeInclusive<u32>; 2] = [1..=1000 - MAX_SLOTS, 1001..=LOOKUP_MAIN_PRIORITY - MAX_SLOTS];
+
+/// How [`TABLE_BASES`] reads in an error.
+fn table_bounds() -> String {
+    format!("Use a base from {} to {}", TABLE_BASES.start(), TABLE_BASES.end())
+}
+
+/// How [`PRIO_BASES`] reads in an error.
+fn prio_bounds() -> String {
+    let [low, high] = &PRIO_BASES;
+    format!(
+        "Use a base from {} to {} or from {} to {}",
+        low.start(),
+        low.end(),
+        high.start(),
+        high.end()
+    )
+}
+
+/// Why `base` cannot be the table base, or `None` when it can. `None` for
+/// `base` is a whole number past `u32`; `shown` is the value as written.
+fn table_refusal(base: Option<u32>, shown: &str) -> Option<String> {
+    match base {
+        Some(b) if TABLE_BASES.contains(&b) => None,
+        Some(_) => Some(format!(
+            "{TABLE_BASE_VAR}={shown} is refused: its {MAX_SLOTS} tables must clear the kernel's \
+             tables 0 and 253-255 and end at or below {}. {}",
+            u32::MAX,
+            table_bounds()
+        )),
+        None => Some(format!(
+            "{TABLE_BASE_VAR}={shown} is refused: it is out of range. {}",
+            table_bounds()
+        )),
+    }
+}
+
+/// Why `base` cannot be the priority base, or `None` when it can, as
+/// [`table_refusal`].
+fn prio_refusal(base: Option<u32>, shown: &str) -> Option<String> {
+    match base {
+        Some(b) if prio_base_ok(b) => None,
+        Some(_) => Some(format!(
+            "{PRIO_BASE_VAR}={shown} is refused: its {MAX_SLOTS} rule priorities must hold none \
+             of the kernel's own rules (0 `lookup local`, 1000 the VRF `l3mdev` rule, 32766 \
+             `lookup main`, 32767 `lookup default`) and end before `lookup main`. {}",
+            prio_bounds()
+        )),
+        None => Some(format!(
+            "{PRIO_BASE_VAR}={shown} is refused: it is out of range. {}",
+            prio_bounds()
+        )),
+    }
+}
 
 /// A parsed source address with prefix length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,28 +231,18 @@ pub struct Slot {
 
 impl SlotAllocator {
     /// An allocator over `MAX_SLOTS` tables from `table_base` and as many
-    /// rule priorities from `prio_base`, or why either base is refused
-    /// (see [`TABLE_BASES`] and [`PRIO_BASES`]).
+    /// rule priorities from `prio_base`, or why the bases are refused
+    /// (see [`TABLE_BASES`] and [`PRIO_BASES`]) — both, when both are.
     pub fn new(table_base: u32, prio_base: u32) -> Result<Self> {
-        let last = MAX_SLOTS - 1;
-        if !TABLE_BASES.contains(&table_base) {
-            bail!(
-                "{TABLE_BASE_VAR}={table_base} is refused: its {MAX_SLOTS} tables must clear the \
-                 kernel's tables 0 and 253-255 and end at or below {}. Use a base from {} to {}",
-                u32::MAX,
-                TABLE_BASES.start(),
-                TABLE_BASES.end()
-            );
-        }
-        if !PRIO_BASES.contains(&prio_base) {
-            bail!(
-                "{PRIO_BASE_VAR}={prio_base} is refused: its {MAX_SLOTS} rule priorities must sit \
-                 between the kernel's `lookup local` rule (0) and its `lookup main` rule (32766). \
-                 Use a base from {} to {} (priorities up to {})",
-                PRIO_BASES.start(),
-                PRIO_BASES.end(),
-                PRIO_BASES.end() + last
-            );
+        let refusals: Vec<String> = [
+            table_refusal(Some(table_base), &table_base.to_string()),
+            prio_refusal(Some(prio_base), &prio_base.to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if !refusals.is_empty() {
+            return Err(anyhow!("{}", refusals.join("; ")));
         }
         Ok(Self {
             table_base,
@@ -167,28 +251,6 @@ impl SlotAllocator {
         })
     }
 
-    /// The allocator for the bases this host sets: each variable unset
-    /// takes its default, and a value that does not parse is refused like
-    /// an out-of-range one — never replaced by the default.
-    pub fn from_settings(table_base: Option<&str>, prio_base: Option<&str>) -> Result<Self> {
-        let base = |var: &str, raw: Option<&str>, default: u32| match raw {
-            None => Ok(default),
-            Some(raw) => raw
-                .trim()
-                .parse::<u32>()
-                .map_err(|_| anyhow!("{var}={raw:?} is refused: it is not a whole number")),
-        };
-        Self::new(
-            base(TABLE_BASE_VAR, table_base, DEFAULT_TABLE_BASE)?,
-            base(PRIO_BASE_VAR, prio_base, DEFAULT_PRIO_BASE)?,
-        )
-    }
-
-    /// [`SlotAllocator::from_settings`] over this process's environment.
-    pub fn from_env() -> Result<Self> {
-        let var = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
-        Self::from_settings(var(TABLE_BASE_VAR).as_deref(), var(PRIO_BASE_VAR).as_deref())
-    }
 
     /// Allocate the lowest free slot, or `None` if the reserved range
     /// is exhausted.
@@ -216,6 +278,229 @@ impl SlotAllocator {
     /// Inclusive `(low, high)` of the reserved priority range.
     pub fn prio_range(&self) -> (u32, u32) {
         (self.prio_base, self.prio_base + (MAX_SLOTS - 1))
+    }
+}
+
+// ── The two base variables ───────────────────────────────────────────────────
+
+/// How one base variable reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseRead<'a> {
+    /// Unset, empty or only whitespace — what a systemd `Environment=VAR=`
+    /// line or an empty `EnvironmentFile` entry gives: the default.
+    Unset,
+    /// A whole number that fits a `u32`.
+    Value(u32),
+    /// A whole number past `u32` either way (`4294967296`, `-1`), as
+    /// written: out of range, so refused like any other unsafe base.
+    OutOfRange(&'a str),
+    /// Not a whole number at all (`0xBD00`, `7000x`), as written.
+    Unparseable(&'a str),
+}
+
+fn read_base(raw: Option<&str>) -> BaseRead<'_> {
+    let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
+        return BaseRead::Unset;
+    };
+    if let Ok(v) = raw.parse::<u32>() {
+        return BaseRead::Value(v);
+    }
+    let digits = raw.strip_prefix(['+', '-']).unwrap_or(raw);
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        BaseRead::OutOfRange(raw)
+    } else {
+        BaseRead::Unparseable(raw)
+    }
+}
+
+/// A base variable set to something that is not a whole number. Its value
+/// is discarded for the default, which is what every release did; this
+/// release says so ([`Bases::report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnparseableBase {
+    pub var: &'static str,
+    /// The value as the host sets it, trimmed.
+    pub value: String,
+    /// The default used in its place.
+    pub default: u32,
+    /// The bases that variable accepts, as an error states them.
+    pub accepted: String,
+}
+
+/// A base variable refused: a whole number whose range would reach the
+/// kernel's own tables or rules, or past `u32`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusedBase {
+    pub var: &'static str,
+    /// The value as the host sets it, trimmed.
+    pub value: String,
+    /// The sentence naming the variable, its value, why, and its bounds.
+    pub reason: String,
+    /// The bases that variable accepts, as `reason` states them.
+    pub accepted: String,
+}
+
+/// What this host's two base variables come to.
+#[derive(Debug)]
+pub struct Bases {
+    /// The allocator over them, or — when any is refused — every refused
+    /// variable's [`RefusedBase::reason`] in one message.
+    pub slots: std::result::Result<SlotAllocator, String>,
+    /// The refused variables (empty when `slots` is `Ok`).
+    pub refused: Vec<RefusedBase>,
+    /// The variables discarded for their defaults.
+    pub unparseable: Vec<UnparseableBase>,
+}
+
+/// One line of the boot report: an event and its log line.
+#[derive(Debug, Clone)]
+pub struct BaseFinding {
+    pub severity: EventSeverity,
+    pub message: String,
+    pub details: serde_json::Value,
+}
+
+impl Bases {
+    /// What `table_base` and `prio_base`, as the host sets them (`None`
+    /// unset), come to.
+    pub fn from_settings(table_base: Option<&str>, prio_base: Option<&str>) -> Self {
+        let mut refused = Vec::new();
+        let mut unparseable = Vec::new();
+        let mut resolve = |var: &'static str,
+                           raw: Option<&str>,
+                           default: u32,
+                           refusal: fn(Option<u32>, &str) -> Option<String>,
+                           accepted: String| {
+            let (base, shown) = match read_base(raw) {
+                BaseRead::Unset => return default,
+                BaseRead::Unparseable(raw) => {
+                    unparseable.push(UnparseableBase {
+                        var,
+                        value: raw.to_string(),
+                        default,
+                        accepted,
+                    });
+                    return default;
+                }
+                BaseRead::Value(v) => (Some(v), v.to_string()),
+                BaseRead::OutOfRange(raw) => (None, raw.to_string()),
+            };
+            if let Some(reason) = refusal(base, &shown) {
+                refused.push(RefusedBase {
+                    var,
+                    value: shown,
+                    reason,
+                    accepted,
+                });
+            }
+            base.unwrap_or(default)
+        };
+        let table = resolve(
+            TABLE_BASE_VAR,
+            table_base,
+            DEFAULT_TABLE_BASE,
+            table_refusal,
+            table_bounds(),
+        );
+        let prio = resolve(
+            PRIO_BASE_VAR,
+            prio_base,
+            DEFAULT_PRIO_BASE,
+            prio_refusal,
+            prio_bounds(),
+        );
+        let slots = if refused.is_empty() {
+            SlotAllocator::new(table, prio).map_err(|e| format!("{e:#}"))
+        } else {
+            Err(refused
+                .iter()
+                .map(|r| r.reason.as_str())
+                .collect::<Vec<_>>()
+                .join("; "))
+        };
+        Self {
+            slots,
+            refused,
+            unparseable,
+        }
+    }
+
+    /// [`Bases::from_settings`] over this process's environment. A value
+    /// that is not UTF-8 reads as not a whole number.
+    pub fn from_env() -> Self {
+        let var = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
+        Self::from_settings(var(TABLE_BASE_VAR).as_deref(), var(PRIO_BASE_VAR).as_deref())
+    }
+
+    /// The boot report: a Warning per variable discarded for its default,
+    /// and one Critical naming every refused variable. Empty when the host
+    /// sets neither, or sets both to bases that pass.
+    ///
+    /// Not `deprecated_env_var`, though `config::env_compat` reports an
+    /// unparseable value under that code: these variables are host-level
+    /// and stay, and that event's message tells the operator to move the
+    /// knob into the node's configuration and remove the variable. Removing
+    /// a moved base puts the reserved range back on the default, which the
+    /// next start then sweeps — the tables the operator moved it to protect.
+    pub fn findings(&self) -> Vec<BaseFinding> {
+        let mut out: Vec<BaseFinding> = self
+            .unparseable
+            .iter()
+            .map(|u| BaseFinding {
+                severity: EventSeverity::Warning,
+                message: format!(
+                    "{} is set to {:?}, which is not a whole number. It has been DISCARDED and \
+                     the default base {} is in use, as if it were unset. To move the range, set \
+                     a whole number ({}); to keep the default, remove the variable.",
+                    u.var, u.value, u.default, u.accepted
+                ),
+                details: serde_json::json!({
+                    "error_code": "bond_rt_base_unparseable",
+                    "env_var": u.var,
+                    "value": u.value,
+                    "status": "unparseable",
+                    "default": u.default,
+                    "accepted": u.accepted,
+                }),
+            })
+            .collect();
+        if let Err(why) = &self.slots
+            && !self.refused.is_empty()
+        {
+            out.push(BaseFinding {
+                severity: EventSeverity::Critical,
+                message: format!(
+                    "bond gateway routing is disabled for this process: {why}. No gateway-mode \
+                     leg (bonded output, relay or direct tunnel, leg test) can be programmed, \
+                     and no orphan sweep runs, until the value is fixed and the edge restarted."
+                ),
+                details: serde_json::json!({
+                    "error_code": "bond_rt_base_refused",
+                    "status": "refused",
+                    "refused": self.refused.iter().map(|r| serde_json::json!({
+                        "env_var": r.var,
+                        "value": r.value,
+                        "accepted": r.accepted,
+                    })).collect::<Vec<_>>(),
+                }),
+            });
+        }
+        out
+    }
+
+    /// Log [`Bases::findings`] and raise each as a `config` event. Called
+    /// once at boot, so the operator learns of a refused base before any
+    /// gateway leg runs into it; the events queue until the manager
+    /// connects.
+    pub fn report(&self, events: &EventSender) {
+        for f in self.findings() {
+            if f.severity == EventSeverity::Critical {
+                tracing::error!("{}", f.message);
+            } else {
+                tracing::warn!("{}", f.message);
+            }
+            events.emit_with_details(f.severity, category::CONFIG, f.message, None, f.details);
+        }
     }
 }
 
@@ -266,7 +551,8 @@ impl BondRouteManager {
                 let (conn, handle, _) = rtnetlink::new_connection()
                     .context("open netlink connection for bond gateway routing")?;
                 tokio::spawn(conn);
-                let routes = match SlotAllocator::from_env() {
+                // Reported at boot (`Bases::report`); read again here.
+                let routes = match Bases::from_env().slots {
                     Ok(slots) => {
                         // Sweep orphans from a prior crash before any flow runs.
                         if let Err(e) =
@@ -279,11 +565,11 @@ impl BondRouteManager {
                             active: HashMap::new(),
                         }))
                     }
-                    Err(e) => {
+                    Err(why) => {
                         tracing::error!(
-                            "bond gateway routing disabled, and no orphan sweep run: {e:#}"
+                            "bond gateway routing disabled, and no orphan sweep run: {why}"
                         );
-                        Err(format!("{e:#}"))
+                        Err(why)
                     }
                 };
                 let mgr = BondRouteManager { handle, routes };
@@ -330,8 +616,9 @@ impl BondRouteManager {
     /// Program a gateway-mode leg: ensure the source address is on the
     /// NIC, install `default via <gateway>` in a fresh table, and a
     /// `from <source>` rule pointing at it. Idempotent per
-    /// `(flow_id, path_id)`; on failure nothing of the leg is left, in
-    /// the kernel or the allocator.
+    /// `(flow_id, path_id)`. On failure the leg's rule, route and slot
+    /// are all gone again, and a source address step 1 added stays on the
+    /// NIC, as it does on teardown.
     pub async fn program(
         &self,
         flow_id: &str,
@@ -624,6 +911,128 @@ impl BondRouteManager {
     }
 }
 
+/// What the owner of a gateway leg asks of the route manager. The bonded
+/// output's re-assert task and the native-UDP tunnels take it rather than
+/// [`BondRouteManager`] itself, so their tests can stand a fake in for the
+/// kernel ([`fake::FakeRoutes`]).
+pub(crate) trait LegRoutes: Sync {
+    /// [`BondRouteManager::program`].
+    fn program(
+        &self,
+        flow_id: &str,
+        path_id: u8,
+        interface: &str,
+        source: SourceNet,
+        gateway: IpAddr,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// [`BondRouteManager::is_intact`].
+    fn is_intact(&self, flow_id: &str, path_id: u8) -> impl Future<Output = bool> + Send;
+    /// [`BondRouteManager::teardown`].
+    fn teardown(&self, flow_id: &str, path_id: u8) -> impl Future<Output = ()> + Send;
+}
+
+impl LegRoutes for BondRouteManager {
+    fn program(
+        &self,
+        flow_id: &str,
+        path_id: u8,
+        interface: &str,
+        source: SourceNet,
+        gateway: IpAddr,
+    ) -> impl Future<Output = Result<()>> + Send {
+        BondRouteManager::program(self, flow_id, path_id, interface, source, gateway)
+    }
+    fn is_intact(&self, flow_id: &str, path_id: u8) -> impl Future<Output = bool> + Send {
+        BondRouteManager::is_intact(self, flow_id, path_id)
+    }
+    fn teardown(&self, flow_id: &str, path_id: u8) -> impl Future<Output = ()> + Send {
+        BondRouteManager::teardown(self, flow_id, path_id)
+    }
+}
+
+/// A [`LegRoutes`] that records every call and touches no kernel.
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+
+    pub(crate) struct FakeRoutes {
+        /// Every call, in order: `"program 3"`, `"is_intact 0"`,
+        /// `"teardown 1"`. A `program` is recorded when it returns — when
+        /// its leg is in place — the others when they are called.
+        log: std::sync::Mutex<Vec<String>>,
+        /// The call (`"is_intact"` / `"program"`) and path that waits for
+        /// [`FakeRoutes::release`] before it answers.
+        hold: Option<(&'static str, u8)>,
+        gate: tokio::sync::Semaphore,
+        /// What `program` fails with, if it does.
+        program_err: Option<String>,
+    }
+
+    impl FakeRoutes {
+        /// Every leg broken: `is_intact` answers `false`, `program` succeeds.
+        pub(crate) fn new() -> Self {
+            Self {
+                log: std::sync::Mutex::default(),
+                hold: None,
+                gate: tokio::sync::Semaphore::new(0),
+                program_err: None,
+            }
+        }
+        /// As [`FakeRoutes::new`], with `call` (`"is_intact"` or
+        /// `"program"`) of `path` waiting for [`FakeRoutes::release`]
+        /// before it answers.
+        pub(crate) fn holding(call: &'static str, path: u8) -> Self {
+            Self { hold: Some((call, path)), ..Self::new() }
+        }
+        /// `program` fails with `why`.
+        pub(crate) fn failing(why: &str) -> Self {
+            Self { program_err: Some(why.to_string()), ..Self::new() }
+        }
+        /// Let the held `is_intact` answer.
+        pub(crate) fn release(&self) {
+            self.gate.add_permits(1);
+        }
+        pub(crate) fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+        fn record(&self, call: &str, path_id: u8) {
+            self.log.lock().unwrap().push(format!("{call} {path_id}"));
+        }
+        /// Wait if `call` of `path_id` is the held one.
+        async fn wait_if_held(&self, call: &'static str, path_id: u8) {
+            if self.hold == Some((call, path_id)) {
+                let _ = self.gate.acquire().await;
+            }
+        }
+    }
+
+    impl LegRoutes for FakeRoutes {
+        async fn program(
+            &self,
+            _flow_id: &str,
+            path_id: u8,
+            _interface: &str,
+            _source: SourceNet,
+            _gateway: IpAddr,
+        ) -> Result<()> {
+            self.wait_if_held("program", path_id).await;
+            self.record("program", path_id);
+            match &self.program_err {
+                Some(why) => Err(anyhow!("{why}")),
+                None => Ok(()),
+            }
+        }
+        async fn is_intact(&self, _flow_id: &str, path_id: u8) -> bool {
+            self.record("is_intact", path_id);
+            self.wait_if_held("is_intact", path_id).await;
+            false
+        }
+        async fn teardown(&self, _flow_id: &str, path_id: u8) {
+            self.record("teardown", path_id);
+        }
+    }
+}
+
 /// Startup sweep: delete any rule/route left in the reserved ranges by a
 /// prior crashed instance. Only ever run on ranges [`SlotAllocator::new`]
 /// accepted.
@@ -776,7 +1185,7 @@ mod tests {
     }
 
     /// Every base whose range would reach a kernel table (0, 253-255) or a
-    /// kernel rule (0, 32766, 32767), or run past `u32::MAX`, is refused —
+    /// kernel rule (0, 1000, 32766, 32767), or run past `u32::MAX`, is refused —
     /// the startup sweep deletes whatever its ranges hold — and the bases
     /// either side of each boundary are told apart.
     #[test]
@@ -784,14 +1193,37 @@ mod tests {
         for table in [0, 1, 200, 252, 253, 255, u32::MAX - 254, u32::MAX] {
             let e = SlotAllocator::new(table, 10000).expect_err("table base accepted");
             assert!(e.to_string().starts_with(&format!("{TABLE_BASE_VAR}={table} ")), "{e}");
+            assert!(e.to_string().ends_with("Use a base from 256 to 4294967040"), "{e}");
         }
-        for prio in [0, 32511, 32600, 32766, 32767, 32768, u32::MAX - 255, u32::MAX] {
+        // 745..=1000 reach the VRF `l3mdev` rule at 1000.
+        for prio in [0, 745, 900, 1000, 32511, 32600, 32766, 32767, 32768, u32::MAX - 255, u32::MAX] {
             let e = SlotAllocator::new(48128, prio).expect_err("priority base accepted");
             assert!(e.to_string().starts_with(&format!("{PRIO_BASE_VAR}={prio} ")), "{e}");
+            assert!(
+                e.to_string().ends_with("Use a base from 1 to 744 or from 1001 to 32510"),
+                "{e}"
+            );
         }
-        for (table, prio) in [(256, 1), (u32::MAX - 255, 32510), (48128, 10000)] {
+        for (table, prio) in [(256, 1), (256, 744), (256, 1001), (u32::MAX - 255, 32510), (48128, 10000)] {
             assert!(SlotAllocator::new(table, prio).is_ok(), "({table}, {prio}) refused");
         }
+    }
+
+    /// The bounds an error states are exactly the bases accepted, and
+    /// none of those reaches a kernel rule or `lookup main`.
+    #[test]
+    fn priority_bounds_state_exactly_the_bases_accepted() {
+        let stated = |base: u32| PRIO_BASES.iter().any(|r| r.contains(&base));
+        let extremes = [u32::MAX - 256, u32::MAX - 255, u32::MAX - 1, u32::MAX];
+        for base in (0..=70_000).chain(extremes) {
+            assert_eq!(prio_refusal(Some(base), "x").is_none(), stated(base), "base {base}");
+            if stated(base) {
+                let range = base..=base + (MAX_SLOTS - 1);
+                assert!(KERNEL_RULE_PRIORITIES.iter().all(|k| !range.contains(k)), "{range:?}");
+                assert!(*range.end() < 32766, "{range:?}");
+            }
+        }
+        assert_eq!(prio_bounds(), "Use a base from 1 to 744 or from 1001 to 32510");
     }
 
     /// The highest table base hands out tables up to `u32::MAX` itself
@@ -805,25 +1237,111 @@ mod tests {
         assert_eq!((last.table, last.priority), (u32::MAX, 32765));
     }
 
-    /// Unset takes the default; a value that does not parse is refused,
-    /// never replaced by the default range it may have been set to avoid.
+    /// Both bases refused: one message names both, each with its bounds.
     #[test]
-    fn settings_default_when_unset_and_refuse_garbage() {
-        let a = SlotAllocator::from_settings(None, None).unwrap();
-        assert_eq!((a.table_range().0, a.prio_range().0), (48128, 10000));
-        let a = SlotAllocator::from_settings(Some(" 7000 "), Some("20000")).unwrap();
-        assert_eq!((a.table_range().0, a.prio_range().0), (7000, 20000));
-        for (table, prio, var) in [
-            (Some("0xBD00"), None, TABLE_BASE_VAR),
-            (Some(""), None, TABLE_BASE_VAR),
-            (None, Some("-1"), PRIO_BASE_VAR),
-            (Some("4294967296"), None, TABLE_BASE_VAR),
-            (Some("200"), None, TABLE_BASE_VAR),
-            (None, Some("32600"), PRIO_BASE_VAR),
-        ] {
-            let e = SlotAllocator::from_settings(table, prio).expect_err("accepted");
-            assert!(e.to_string().starts_with(&format!("{var}=")), "{e}");
+    fn both_refused_bases_are_named_at_once() {
+        let e = SlotAllocator::new(200, 32600).expect_err("accepted").to_string();
+        assert!(e.starts_with(&format!("{TABLE_BASE_VAR}=200 is refused")), "{e}");
+        assert!(e.contains(&format!("; {PRIO_BASE_VAR}=32600 is refused")), "{e}");
+        assert!(e.contains("Use a base from 256 to 4294967040;"), "{e}");
+        assert!(e.ends_with("Use a base from 1 to 744 or from 1001 to 32510"), "{e}");
+        let b = Bases::from_settings(Some("200"), Some("32600"));
+        assert_eq!(b.slots.expect_err("accepted"), e);
+        let vars: Vec<_> = b.refused.iter().map(|r| r.var).collect();
+        assert_eq!(vars, [TABLE_BASE_VAR, PRIO_BASE_VAR]);
+    }
+
+    /// Unset, empty or blank takes the default silently; a value that is
+    /// not a whole number takes the default and is reported; a whole
+    /// number outside the bounds — past `u32` included — is refused,
+    /// naming the bounds.
+    #[test]
+    fn settings_default_unset_and_garbage_and_refuse_unsafe_numbers() {
+        let bases = |t: Option<&str>, p: Option<&str>| {
+            let b = Bases::from_settings(t, p);
+            let ranges = b
+                .slots
+                .as_ref()
+                .map(|a| (a.table_range().0, a.prio_range().0))
+                .map_err(String::clone);
+            (ranges, b)
+        };
+        for blank in [None, Some(""), Some("   "), Some("\t")] {
+            let (ranges, b) = bases(blank, blank);
+            assert_eq!(ranges, Ok((48128, 10000)), "{blank:?}");
+            assert!(b.unparseable.is_empty() && b.findings().is_empty(), "{blank:?}");
         }
+        let (ranges, b) = bases(Some(" 7000 "), Some("+20000"));
+        assert_eq!(ranges, Ok((7000, 20000)));
+        assert!(b.findings().is_empty());
+
+        let (ranges, b) = bases(Some("0xBD00"), Some(" 7000x "));
+        assert_eq!(ranges, Ok((48128, 10000)), "unparseable values take the defaults");
+        let got: Vec<_> = b.unparseable.iter().map(|u| (u.var, u.value.as_str(), u.default)).collect();
+        assert_eq!(got, [(TABLE_BASE_VAR, "0xBD00", 48128), (PRIO_BASE_VAR, "7000x", 10000)]);
+        assert!(b.refused.is_empty());
+
+        for (table, prio, var, why) in [
+            (Some("4294967296"), None, TABLE_BASE_VAR, "=4294967296 is refused: it is out of range. Use a base from 256 to 4294967040"),
+            (Some("-1"), None, TABLE_BASE_VAR, "=-1 is refused: it is out of range. Use a base"),
+            (None, Some("99999999999999999999999"), PRIO_BASE_VAR, "=99999999999999999999999 is refused: it is out of range. Use a base from 1 to 744"),
+            (Some("200"), None, TABLE_BASE_VAR, "=200 is refused: its 256 tables"),
+            (None, Some(" 900 "), PRIO_BASE_VAR, "=900 is refused: its 256 rule priorities"),
+        ] {
+            let (ranges, b) = bases(table, prio);
+            let e = ranges.expect_err("accepted");
+            assert!(e.starts_with(&format!("{var}{why}")), "{e}");
+            assert!(b.unparseable.is_empty(), "{:?}", b.unparseable);
+        }
+
+        // One of each: the garbage is reported, the unsafe one refused.
+        let (ranges, b) = bases(Some("0xBD00"), Some("32600"));
+        assert!(ranges.expect_err("accepted").starts_with(&format!("{PRIO_BASE_VAR}=32600 ")));
+        assert_eq!(b.unparseable.len(), 1);
+    }
+
+    /// The boot report: a Warning per discarded value naming its default
+    /// and bounds, one Critical naming every refused base, raised as
+    /// `config` events.
+    #[test]
+    fn boot_report_names_each_variable_its_value_and_its_bounds() {
+        let (events, mut rx) = crate::manager::events::event_channel();
+        Bases::from_settings(Some("0xBD00"), Some("900")).report(&events);
+        let warn = rx.try_recv().expect("unparseable event");
+        assert_eq!(warn.severity, EventSeverity::Warning);
+        assert_eq!(warn.category, category::CONFIG);
+        assert!(warn.message.starts_with(&format!("{TABLE_BASE_VAR} is set to \"0xBD00\"")), "{}", warn.message);
+        assert!(warn.message.contains("the default base 48128 is in use"), "{}", warn.message);
+        let d = warn.details.expect("details");
+        assert_eq!(d["error_code"], "bond_rt_base_unparseable");
+        assert_eq!(d["env_var"], TABLE_BASE_VAR);
+        assert_eq!(d["value"], "0xBD00");
+        assert_eq!(d["default"], 48128);
+        assert_eq!(d["accepted"], "Use a base from 256 to 4294967040");
+
+        let crit = rx.try_recv().expect("refusal event");
+        assert_eq!(crit.severity, EventSeverity::Critical);
+        assert_eq!(crit.category, category::CONFIG);
+        assert!(crit.message.contains(&format!("{PRIO_BASE_VAR}=900 is refused")), "{}", crit.message);
+        assert!(crit.message.contains("Use a base from 1 to 744 or from 1001 to 32510"), "{}", crit.message);
+        let d = crit.details.expect("details");
+        assert_eq!(d["error_code"], "bond_rt_base_refused");
+        assert_eq!(d["refused"][0]["env_var"], PRIO_BASE_VAR);
+        assert_eq!(d["refused"][0]["value"], "900");
+        assert!(rx.try_recv().is_err(), "one event per finding");
+
+        // Both refused: one Critical naming both.
+        Bases::from_settings(Some("200"), Some("32600")).report(&events);
+        let crit = rx.try_recv().expect("refusal event");
+        assert!(crit.message.contains(&format!("{TABLE_BASE_VAR}=200 is refused")), "{}", crit.message);
+        assert!(crit.message.contains(&format!("{PRIO_BASE_VAR}=32600 is refused")), "{}", crit.message);
+        assert_eq!(crit.details.expect("details")["refused"].as_array().map(Vec::len), Some(2));
+        assert!(rx.try_recv().is_err());
+
+        // Nothing set, nothing raised: a false alarm here would be on every
+        // node of the fleet at every boot.
+        Bases::from_settings(None, Some("")).report(&events);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
