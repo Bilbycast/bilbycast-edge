@@ -1293,8 +1293,10 @@ impl WhipMux {
 /// did, never before a PTS the last session issued. It used to start again
 /// at the lead, 20 s back after a 20 s publish. When a session would start
 /// before that (the last one's sender clock ran fast), the whole session
-/// is moved past it, both tracks by the same distance: their offset is
-/// still their first frames' arrival difference.
+/// is moved past it, both tracks by the same distance ([`Self::lift`]):
+/// their offset is still their first frames' arrival difference — unless a
+/// track's first frame arrived before the first frame processed, which
+/// can put it behind the floor even so; that track starts on the floor.
 #[cfg(any(feature = "webrtc", test))]
 #[derive(Debug, Default)]
 struct WhipClock {
@@ -1311,10 +1313,18 @@ struct WhipClock {
     /// session's latest. A long session whose sender's clock ran fast would
     /// otherwise leave the next one, anchored on the wall clock, behind it.
     floor: u64,
-    /// How far the session's tracks are moved past their arrival anchors
-    /// to start at the floor: `floor` less the anchor of its first frame,
-    /// the earliest of its tracks', or 0. Set by that first frame, and the
-    /// same for both tracks.
+    /// How far the session's tracks are moved past their arrival anchors:
+    /// `floor` less the arrival anchor of the session's first frame
+    /// *processed*, or 0 when that anchor is on or past the floor. Set by
+    /// that frame, and added to both tracks' anchors. Each track's anchor
+    /// plus the lift is then held at the floor at least, so no PTS goes
+    /// behind one already issued: the first frame processed need not be
+    /// the earliest to arrive, since str0m hands a picture over once it is
+    /// complete, anchored at the arrival of its first packet, and an Opus
+    /// packet at once — one that arrived while a multi-packet IDR was
+    /// still arriving is processed first though the IDR's anchor is
+    /// earlier. That IDR starts on the floor, closer to the audio than it
+    /// arrived by at most the time it arrived ahead of it.
     lift: Option<u64>,
 }
 
@@ -1332,7 +1342,7 @@ impl WhipClock {
                 let late_us = arrival.saturating_duration_since(origin).as_micros() as u64;
                 let at = crate::engine::rtmp::ts_mux::PCR_LEAD_90K + late_us * 9 / 100;
                 let lift = *self.lift.get_or_insert(self.floor.saturating_sub(at));
-                *slot.insert((rtp, at + lift))
+                *slot.insert((rtp, (at + lift).max(self.floor)))
             }
         };
         let ticks = (rtp as i128 - first as i128) * 90_000 / rate.max(1) as i128;
@@ -1506,6 +1516,45 @@ mod tests {
         let at = c.pts_90k(true, 1, 90_000, t0 + ms(60_000));
         assert_eq!(at, LEAD + 5_400_000);
         assert_eq!(c.pts_90k(false, 1, 48_000, t0 + ms(60_020)), at + 1_800);
+    }
+
+    /// A lifted session whose first frame processed is not its earliest:
+    /// an Opus packet handed over while a multi-packet IDR, whose first
+    /// packet arrived 5 ms before it, was still arriving (str0m hands a
+    /// picture over once it is complete, anchored at its first packet).
+    /// The lift the Opus sets put that IDR 5 ms behind the floor — behind a
+    /// PTS the last session issued — and it starts on the floor instead. So
+    /// does a track behind the floor in a session the floor did not lift,
+    /// its first frame processed having arrived just past it.
+    #[test]
+    fn a_track_anchored_before_the_first_frame_processed_starts_on_the_floor() {
+        use super::WhipClock;
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut c = WhipClock::default();
+        // Session 1: 10.5 s of the sender's clock in 10 s.
+        assert_eq!(c.pts_90k(true, 0, 90_000, t0), LEAD);
+        assert_eq!(c.pts_90k(true, 945_000, 90_000, t0 + ms(10_000)), LEAD + 945_000);
+        c.session();
+        let floor = LEAD + 945_001;
+        // Session 2: the Opus (arrived at 10.2 s) processed first, then the
+        // IDR whose first packet arrived at 10.195 s.
+        assert_eq!(c.pts_90k(false, 7, 48_000, t0 + ms(10_200)), floor, "the audio on the floor");
+        assert_eq!(c.pts_90k(true, 50, 90_000, t0 + ms(10_195)), floor, "on the floor, not 5 ms behind it");
+        assert_eq!(c.pts_90k(true, 50 + 3_600, 90_000, t0 + ms(10_235)), floor + 3_600, "then on its own clock");
+
+        // An input whose first session ran on time, to 10.5 s; the next one's
+        // Opus, processed first, arrived at 10.6 s, past the floor, so the
+        // session is not lifted; its IDR's first packet arrived at 10.49 s.
+        let mut c = WhipClock::default();
+        assert_eq!(c.pts_90k(true, 0, 90_000, t0), LEAD);
+        assert_eq!(c.pts_90k(true, 945_000, 90_000, t0 + ms(10_500)), LEAD + 945_000);
+        c.session();
+        let floor = LEAD + 945_001;
+        assert_eq!(c.pts_90k(false, 7, 48_000, t0 + ms(10_600)), LEAD + 954_000, "not lifted");
+        assert_eq!(c.pts_90k(true, 50, 90_000, t0 + ms(10_490)), floor, "on the floor, not 10 ms behind it");
     }
 
     /// An access unit of the video, at `ms` in, for [`WhipMux::frame`].
