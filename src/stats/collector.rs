@@ -2494,10 +2494,12 @@ pub struct VideoStreamState {
     pub profile: Option<String>,
     pub level: Option<String>,
     pub sps_detected: bool,
-    // PTS-based frame rate detection fallback (when VUI timing is absent)
-    pub last_pts: Option<u64>,
-    pub pts_frame_count: u32,
-    pub pts_interval_sum: u64,
+    /// `frame_rate` is the one the bitstream states (VUI timing, an MPEG-2
+    /// sequence header) rather than [`Self::ts_rate`]'s measurement.
+    pub rate_from_bitstream: bool,
+    /// The frame rate measured from PES timestamps, for a stream whose
+    /// bitstream does not state one.
+    pub ts_rate: crate::engine::media_analysis::TimestampFrameRate,
 }
 
 /// Internal state for a detected audio stream.

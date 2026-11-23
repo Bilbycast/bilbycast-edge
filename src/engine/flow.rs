@@ -4589,7 +4589,7 @@ fn derive_audio_full_mode(
     }
 }
 
-fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::InputConfigMeta {
+pub(super) fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::InputConfigMeta {
     use crate::stats::collector::InputConfigMeta;
     match input {
         // A mosaic has no transport addresses of its own to report.
@@ -4630,7 +4630,7 @@ fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::Inpu
             mode: Some(format!("{:?}", c.transport).to_lowercase()),
             local_addr: None, remote_addr: None,
             listen_addr: None, bind_addr: None,
-            rtsp_url: Some(c.rtsp_url.clone()), whep_url: None,
+            rtsp_url: Some(super::input_rtsp::shown_url(&c.rtsp_url)), whep_url: None,
         },
         InputConfig::Webrtc(_) => InputConfigMeta {
             mode: Some("whip_server".to_string()), local_addr: None, remote_addr: None,

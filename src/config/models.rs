@@ -3077,7 +3077,12 @@ pub enum RtspTransport {
 /// muxed into MPEG-TS and published to the flow's broadcast channel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtspInputConfig {
-    /// RTSP source URL, e.g. "rtsp://camera.local:554/stream1"
+    /// RTSP source URL, e.g. "rtsp://camera.local:554/stream1". Userinfo in
+    /// it is presented as the session's credentials (`username` +
+    /// `password` win) and never shown: logs, events and stats carry the
+    /// URL with everything between `://` and its last `@` left out. An edit
+    /// of the input refuses `rtsps://` and userinfo url::Url does not read
+    /// as written; a whole config keeps such a URL and warns.
     pub rtsp_url: String,
     /// Username for RTSP authentication (Digest or Basic).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3088,7 +3093,10 @@ pub struct RtspInputConfig {
     /// RTP transport mode: "tcp" (interleaved, default) or "udp".
     #[serde(default)]
     pub transport: RtspTransport,
-    /// Connection timeout in seconds (default: 10).
+    /// Bound on a session's setup — connection, DESCRIBE, SETUP and PLAY —
+    /// in seconds, 1-300 (default: 10). Past it the attempt is retried after
+    /// `reconnect_delay_secs`. An edit refuses a value outside the range; a
+    /// whole config has it set to 300 (`repair_rtsp_inputs`).
     #[serde(default = "default_rtsp_timeout")]
     pub timeout_secs: u64,
     /// Reconnect delay in seconds after connection loss (default: 5).
