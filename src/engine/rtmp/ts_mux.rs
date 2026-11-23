@@ -1377,13 +1377,6 @@ mod tests {
         assert_eq!(crate::engine::audio_decode::split_opus_frames(es), vec![&opus[..]]);
     }
 
-    /// Bug #11 (2026-04-09): RTMP-ingest → RTP transmux emitted
-    /// non-monotonic audio DTS because the source publisher fed
-    /// millisecond-rounded timestamps that occasionally regressed by
-    /// 1 tick when AAC's 21.333 ms frame interval crossed a ms boundary.
-    /// This test pumps a deliberately non-monotonic sequence through
-    /// `clamp_audio_pts` and asserts every clamped value is strictly
-    /// greater than the previous one.
     /// An Opus PMT entry carries the channel count beside the "Opus"
     /// registration: the Opus extension descriptor (`7F 02 80 code`), as
     /// ffmpeg writes it — every reader here still takes it for one mono or
@@ -1447,6 +1440,13 @@ mod tests {
         assert!(pcrs[2].0 >= unmarked);
     }
 
+    /// Bug #11 (2026-04-09): RTMP-ingest → RTP transmux emitted
+    /// non-monotonic audio DTS because the source publisher fed
+    /// millisecond-rounded timestamps that occasionally regressed by
+    /// 1 tick when AAC's 21.333 ms frame interval crossed a ms boundary.
+    /// This test pumps a deliberately non-monotonic sequence through
+    /// `clamp_audio_pts` and asserts every clamped value is strictly
+    /// greater than the previous one.
     #[test]
     fn clamp_audio_pts_is_strictly_monotonic_under_regression() {
         let mut muxer = TsMuxer::new();
