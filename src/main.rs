@@ -8,7 +8,6 @@
 //! runs a background task that publishes stats to WebSocket subscribers every
 //! second.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1142,10 +1141,10 @@ async fn real_main() -> anyhow::Result<()> {
     // Spawn background stats WebSocket publisher (1/sec)
     {
         let ws_tx = ws_stats_tx.clone();
-        let stats_fm = flow_manager.clone();
+        let collector = flow_manager.stats().clone();
         let stats_config = state.config.clone();
         tokio::spawn(async move {
-            stats_publisher_loop(ws_tx, stats_fm, stats_config).await;
+            stats_publisher_loop(ws_tx, collector, stats_config).await;
         });
     }
 
@@ -1412,52 +1411,38 @@ async fn real_main() -> anyhow::Result<()> {
 
 /// Background task that runs on a 1-second interval to publish live statistics.
 ///
-/// Each tick:
-/// 1. Snapshots all flow stats from the atomic accumulators
-/// 2. Computes bitrates using per-flow `ThroughputEstimator`s (delta bytes / elapsed * 8)
-/// 3. Serializes the enriched snapshots to JSON
-/// 4. Broadcasts to all connected WebSocket clients via the broadcast channel
+/// Each tick snapshots every flow, whether or not anyone is listening, and
+/// then — only for the WebSocket subscribers, when there are any — adds the
+/// configured flows that are not running, serialises the lot to JSON and
+/// broadcasts it.
 ///
-/// Estimators are lazily created per flow and per output, and persist across
-/// ticks for accurate delta-based throughput computation.
+/// That snapshot is the clock of the flow stats: it rolls the per-interval
+/// TR 101 290 windows (see `FlowStatsAccumulator::snapshot`) and samples
+/// every rate estimator — output, flow input, per input, per ES, bond path —
+/// each of which reports the bytes since its previous sample over the time
+/// since it. The tick used to be skipped outright while nobody listened, so
+/// on a standalone edge read over REST alone the first read after a quiet
+/// spell reported the mean over the whole spell: an output idle for 26 s
+/// read `active` at 455 kbit/s, its average since a read 7.8 min before.
+/// Sampled every second, the rate any reader sees covers the last second or
+/// two. (This loop also kept a second set of estimators of its own, which it
+/// wrote over the snapshot's `bitrate_bps` while `state` stayed derived from
+/// the snapshot's — now both come from the one set.)
 async fn stats_publisher_loop(
     ws_tx: broadcast::Sender<String>,
-    flow_manager: Arc<FlowManager>,
+    collector: Arc<StatsCollector>,
     app_config: Arc<RwLock<config::models::AppConfig>>,
 ) {
     use stats::models::FlowStats;
-    use stats::throughput::ThroughputEstimator;
 
     let mut interval = tokio::time::interval(Duration::from_secs(1));
-
-    // Per-flow throughput estimators: flow_id -> (input_estimator, output_id -> output_estimator)
-    let mut estimators: HashMap<String, (ThroughputEstimator, HashMap<String, ThroughputEstimator>)> =
-        HashMap::new();
 
     loop {
         interval.tick().await;
 
-        // Skip all work when nobody is listening to stats
+        let mut snapshots = collector.all_snapshots();
         if ws_tx.receiver_count() == 0 {
             continue;
-        }
-
-        let mut snapshots = flow_manager.stats().all_snapshots();
-
-        // Enrich snapshots with computed bitrates
-        for snapshot in &mut snapshots {
-            let (input_est, output_ests) = estimators
-                .entry(snapshot.flow_id.clone())
-                .or_insert_with(|| (ThroughputEstimator::new(), HashMap::new()));
-
-            snapshot.input.bitrate_bps = input_est.sample(snapshot.input.bytes_received);
-
-            for output in &mut snapshot.outputs {
-                let out_est = output_ests
-                    .entry(output.output_id.clone())
-                    .or_insert_with(ThroughputEstimator::new);
-                output.bitrate_bps = out_est.sample(output.bytes_sent);
-            }
         }
 
         // Include configured-but-not-running flows as idle so they remain
@@ -1564,4 +1549,44 @@ async fn run_multi_listener_plain(
         res??;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// With nobody subscribed to the stats WebSocket — a standalone edge,
+    /// read over REST — an input and an output that have gone idle read 0
+    /// bit/s a couple of seconds on, however long since anyone last read
+    /// them. The publisher skipped its tick with no subscriber, so a read
+    /// after a quiet spell averaged the bytes over the whole spell, and the
+    /// output said `active`.
+    #[tokio::test]
+    async fn an_idle_output_reads_idle_with_no_stats_subscriber() {
+        let collector = Arc::new(StatsCollector::new());
+        let flow = collector.register_flow("f".into(), "flow".into(), "udp".into());
+        let output = flow.register_output("o".into(), "out".into(), "udp".into());
+        // A burst, then nothing.
+        flow.input_packets.fetch_add(1_000, Ordering::Relaxed);
+        flow.input_bytes.fetch_add(1_316_000, Ordering::Relaxed);
+        output.packets_sent.fetch_add(1_000, Ordering::Relaxed);
+        output.bytes_sent.fetch_add(1_316_000, Ordering::Relaxed);
+
+        let (ws_tx, _) = broadcast::channel::<String>(4);
+        assert_eq!(ws_tx.receiver_count(), 0);
+        let publisher = tokio::spawn(stats_publisher_loop(
+            ws_tx,
+            collector.clone(),
+            Arc::new(RwLock::new(config::models::AppConfig::default())),
+        ));
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+
+        let snapshot = collector.flow_snapshot_read_only("f").expect("the flow");
+        assert_eq!(snapshot.input.bitrate_bps, 0, "the input, idle for over 2 s, reads 0 bit/s");
+        let out = &snapshot.outputs[0];
+        assert_eq!(out.bitrate_bps, 0, "an output idle for over 2 s reads 0 bit/s");
+        assert_eq!(out.state, "idle", "and idle, not active");
+        publisher.abort();
+    }
 }
