@@ -36,12 +36,28 @@ green (the full edge debug binary links):
   wiring task; the field is a graceful free-text until then).
 
 - **Failure and concurrency.** A `program` that fails removes whatever
-  part of the leg it had installed and frees its slot, so a leg retried
-  every 5 s against an unplugged modem no longer uses up the node's 256
-  slots (each failed try used to keep one). `program` and `teardown` run
-  whole under the manager's one lock, so two calls for one leg never
-  interleave: two racing re-programs leave one slot, and a `teardown`
-  racing a `program` returns with the leg gone.
+  part of the leg's rule and route it had installed and frees its slot,
+  so a leg retried every 5 s against an unplugged modem no longer uses up
+  the node's 256 slots (each failed try used to keep one). A source
+  address it added stays on the NIC, as on teardown. `program` and
+  `teardown` run whole under the manager's one lock, so two calls for one
+  leg never interleave: two racing re-programs leave one slot, and a
+  `teardown` made while a `program` of its leg is in flight waits for it
+  and returns with the leg gone.
+- **Stopping a bonded output.** A `program` made *after* a `teardown`
+  installs the leg again, as it should, so the output must make none once
+  it stops. It stops its 5 s re-assert task first — cancels the task's own
+  token and waits for it, at most 2 s — and only then tears its legs down.
+  The task prefers its token to a due tick or a socket-rebuild event and
+  checks it before every leg and every `program`. Past the 2 s the task
+  is left to finish, not aborted: it can then only be inside an integrity
+  check, after which it returns, or inside a `program` that asked for the
+  lock before the teardown, which therefore runs after it and removes
+  what it installed. Before this the task was never stopped or waited
+  for: a re-assert that reached a leg after its teardown re-installed the
+  leg's rule, route and slot for an output that had stopped, steering
+  that source address through the dead output's gateway until the same
+  leg was programmed again, a clean shutdown, or a restart's sweep.
 - **Integrity check.** `is_intact`, which the 5 s re-assert uses, checks
   the leg's `from <source>` rule (its priority, its source as a host
   prefix and its table) as well as the route in its table. It used to
@@ -52,12 +68,20 @@ green (the full edge debug binary links):
 
 The netlink calls run against a real kernel in
 `tests/bond_routing_netns.rs`, which is `#[ignore]`d because it needs
-`CAP_NET_ADMIN` in a throwaway network namespace (its header holds the
-docker command). It covers the startup sweep, `program`, `is_intact`
+`CAP_NET_ADMIN` in a throwaway network namespace. CI runs it on every pull
+request and push to `main`, as root under `sudo unshare --net`, once per set of
+bases (default, moved, the highest, either side of the kernel's VRF rule,
+an unparseable value, and four refused ones); its header holds the docker
+command for a local run. It covers the startup sweep (which must leave the
+kernel's own rules, the VRF one included, alone), `program`, `is_intact`
 (emptied table; rule deleted or altered), `teardown`, `teardown_all`,
 failed programs, racing calls on one leg, refused bases and the dish
-route, in both families. Gateway mode has still **not** run on real
-hardware with modems and routers; that live validation is pending.
+route, in both families. Stopping an output's re-assert task before its
+teardown is tested in `engine::output_bonded` against a fake route
+manager (`bond_routing::LegRoutes`), since a namespace cannot land an
+output's stop inside a re-assert on purpose. Gateway mode has still
+**not** run on real hardware with modems and routers; that live
+validation is pending.
 
 ---
 
@@ -91,13 +115,16 @@ automatically.
 **As-built exception — `relay` legs.** Gateway mode is valid on **both** ends of
 a relay leg: both ends dial *out* to the relay, so each can pin its own egress
 uplink. The route is programmed by
-`tunnel::udp_relay_client::program_tunnel_gateway`, keyed `(tunnel_id, 0)`. Two
+`tunnel::udp_relay_client::program_tunnel_gateway`, keyed `(tunnel_id, 0)`, for
+relay bond legs and for native-UDP relay and direct tunnels alike. Two
 behavioural differences from the bonded-output path an operator will otherwise
-trip on: it is **best-effort** (a netlink or program failure logs a warning and
-the tunnel continues *without* the policy route, so a silently un-pinned relay
-leg is possible), and it is **not covered by the 5 s route-integrity
-re-assert** — `gateway_legs` in `output_bonded.rs` matches `udp` transports
-only.
+trip on: it is **best-effort** — a netlink or program failure (refused range
+bases included) leaves the tunnel running *without* the policy route, and
+raises a Warning `tunnel_gateway_route_failed` event (category `tunnel`,
+details `tunnel_id` / `interface` / `source` / `gateway` / `error`) besides the
+log line; until this release only the log line said so — and it is **not
+covered by the 5 s route-integrity re-assert**: `gateway_legs` in
+`output_bonded.rs` matches `udp` transports only.
 
 ## 2. The addressing reality (read first — there's no free lunch)
 
@@ -168,7 +195,7 @@ touches `main`/`local`/`default` tables.
 | Resource | Reserved range (default) | Env override | Per-path value |
 |----------|--------------------------|--------------|----------------|
 | Route table id | `48128‑48383` (`0xBC00 + slot`) | `BILBYCAST_BOND_RT_TABLE_BASE`, a base from 256 to 4294967040 | base + slot |
-| `ip rule` priority | `10000‑10255` | `BILBYCAST_BOND_RT_PRIO_BASE`, a base from 1 to 32510 | base + slot |
+| `ip rule` priority | `10000‑10255` | `BILBYCAST_BOND_RT_PRIO_BASE`, a base from 1 to 744 or from 1001 to 32510 | base + slot |
 
 (`0xBC` echoes the bond wire magic, making our entries recognizable. Ranges are
 **host-level OS tuning** → env-configurable, per the project convention that
@@ -183,33 +210,55 @@ behavior knobs are manager-config but host/OS knobs are env.)
 > operator who sets it to dodge a collision believes they have.
 
 **Bounds on the overrides (as built).** The startup sweep below deletes every
-route in the table range and every rule in the priority range, so each range
-must hold nothing the kernel owns:
+route in the table range and every rule in the priority range, and a leg's
+teardown deletes every rule at its priority, whatever the rule does, so each
+range must hold nothing the kernel owns:
 
 - the 256 tables must clear the kernel's tables 0 (unspec), 253 (`default`),
   254 (`main`) and 255 (`local`) — no base under 256 can — and end at or below
   table 4294967295, the last id;
-- the 256 priorities must sit after the kernel's `lookup local` rule
-  (priority 0) and before its `lookup main` (32766) and `lookup default`
-  (32767) rules. Past `lookup main` a leg's rule would never be consulted for
-  a source the main table routes, which with a default route there is every
-  source.
+- the 256 priorities must hold none of the rules the kernel installs itself —
+  0 `lookup local` and 32766 `lookup main` in every namespace and family,
+  32767 `lookup default` (IPv4, and the multicast-routing families' default
+  rule), and 1000, the `l3mdev` rule the VRF driver adds in each family when
+  a namespace's first VRF device is created — and must end before
+  `lookup main`. That leaves bases 1–744 and 1001–32510. Those four are every
+  rule the kernel adds at a fixed priority: `net/ipv4/fib_rules.c`,
+  `net/ipv6/fib6_rules.c`, `net/ipv4/ipmr.c` and `net/ipv6/ip6mr.c` are the
+  only callers of `fib_default_rule_add`, and `drivers/net/vrf.c` the only
+  driver that sets `FRA_PRIORITY`. Past `lookup main` a leg's rule would never
+  be consulted for a source the main table routes, which with a default route
+  there is every source — a cosmetic bond.
 
-A base outside those bounds, or a value that is not a whole number, is
-**refused**, and gateway routing is disabled for the process: no sweep runs,
-and every gateway-mode leg fails to program with an error naming the variable
-and its bounds (a Critical `media` event on a bonded output, a warning log on
-a relay leg's best-effort route, a failed `test_bond_leg` reachability or
-capacity report). The edge does not fall back to the default range, which may
-be the range the operator moved away from and would then be swept. The
-Starlink dish route uses no reserved range and keeps working. The bases are
-read once, at the manager's first use (the first gateway leg, leg probe or
-dish route), so a change needs an edge restart. Before this, any `u32` was
-taken: a table base of 200 with a priority base of 32600 emptied the `local`,
-`main` and `default` tables and deleted the `lookup main` and
-`lookup default` rules at that first use, a table base within 255 of
-`u32::MAX` overflowed, and an unparseable value silently fell back to the
-default range.
+What each value does:
+
+- **Unset, empty or only whitespace** (a systemd `Environment=VAR=` line):
+  the default, silently.
+- **Not a whole number** (`0xBD00`, `7000x`, a value that is not UTF-8):
+  discarded for the default, as every release did, but no longer silently —
+  at boot a Warning `bond_rt_base_unparseable` event (category `config`)
+  names the variable, the value, the default in use and the bounds.
+- **A whole number outside the bounds**, past `u32` included (`4294967296`,
+  `-1`): **refused**, and gateway routing is disabled for the process. At
+  boot a Critical `bond_rt_base_refused` event (category `config`) names each
+  refused variable, its value and its bounds — both in one message when both
+  are refused. No sweep runs, and every gateway-mode leg fails to program
+  with the same text: a Critical `media` event on a bonded output, which does
+  not start; a Warning `tunnel_gateway_route_failed` event on a relay bond leg
+  or a native-UDP relay or direct tunnel, which runs on without its route
+  (§1); a failed `test_bond_leg` reachability or capacity report. The edge
+  does not fall back to the default range, which may be the range the
+  operator moved away from and would then be swept. The Starlink dish route
+  uses no reserved range and keeps working.
+
+The bases are read at boot for that report and again at the manager's first
+use (the first gateway leg, leg probe or dish route), so a change needs an
+edge restart. Before this release any `u32` was taken: a table base of 200
+with a priority base of 32600 emptied the `local`, `main` and `default`
+tables and deleted the `lookup main` and `lookup default` rules at that first
+use, a priority base from 745 to 1000 deleted a VRF host's `l3mdev` rule, a
+table base within 255 of `u32::MAX` overflowed, and an unparseable value fell
+back to the default range without a word.
 
 `slot` = a per-host index allocated from an in-process slab keyed by
 `(flow_id, path_id)`, freed on teardown. Max 256 concurrent gateway-mode legs
@@ -232,10 +281,10 @@ external tags needed.
 | Event | Action |
 |-------|--------|
 | **First use of the manager** (first gateway leg, leg probe or dish route) | **GC first:** scan netlink; delete any rule/route in our reserved ranges (orphans from a prior crash) before programming any leg. Never on refused bases (§4); addresses are never swept. |
-| **Bonded-output flow start** | For each gateway path: allocate slot → program addr/route/rule → bring up bond socket bound to `source`. |
-| **Flow stop / path remove** | Drop socket → delete rule, route, flush table, (optionally) remove edge-added addr → free slot. Order: socket first, then routing teardown. |
+| **Bonded-output flow start** | For each gateway path: resolve the interface → allocate slot → program addr/route/rule (a failure removes whatever of the rule and route went in and frees the slot) → bring up bond socket bound to `source` → start the 5 s re-assert task. |
+| **Flow stop / path remove** | Close socket → stop the re-assert task (cancel, wait at most 2 s) → delete rule, flush table → free slot. Edge-added addresses stay. Order: socket first, then the re-assert task, then routing teardown. |
 | **Hot-swap** (`UpdateFlow`, add/remove path) | Allocate/free incrementally; untouched paths keep their (slot, route, rule). |
-| **Edge crash / SIGKILL** | Entries linger until next startup GC (step 1). Idempotent. |
+| **Edge crash / SIGKILL** | Entries linger until the next process's first use of the manager (first row), which sweeps them; a process that never uses gateway routing never sweeps. Idempotent. |
 
 New edge module: `engine::bond_routing` (or `net::policy_routes`) owns the slab +
 netlink handle + GC. `output_bonded.rs` calls it around socket bring-up/teardown.
@@ -250,7 +299,8 @@ New dependency: a netlink crate (`rtnetlink` or `neli`).
 | Gateway reachable but dead uplink | Route installs, packets blackhole → bond keepalive marks the path dead (existing health path). No new code. |
 | Route or rule disappears after start (link flap, device re-plug, route flush, `ip rule flush`, a network manager removing rules it did not create) | The 5 s re-assert task re-programs it (`is_intact` checks the rule's priority, source and table as well as the table's route). If that fails it emits **Critical** `media` with `error_code: "bond_gateway_route_lost"` (details `output_id` / `path_id` / `path_name` / `gateway`), latched once per failing streak, and says plainly that the leg rides the default route — a cosmetic bond — until it succeeds. UDP gateway legs only; relay legs are not re-asserted (§1). |
 | Netlink unavailable | Same as cap-missing. |
-| Range bases refused (§4) | No sweep runs. Every gateway path fails to program with an error naming the variable and its bounds, through the failed-program **Critical** `media` event (no cap hint, no `error_code`). |
+| Range bases refused (§4) | **Critical** `config` event `bond_rt_base_refused` at boot, naming each refused variable, its value and its bounds. No sweep runs. Every gateway path fails to program with the same text, through the failed-program **Critical** `media` event (no cap hint, no `error_code`); a relay or tunnel leg through a **Warning** `tunnel_gateway_route_failed`. |
+| Range base not a whole number (§4) | The default range is used; **Warning** `config` event `bond_rt_base_unparseable` at boot, naming the variable, its value, the default and the bounds. |
 
 > **As-built:** the two flow-start failures above go out through `emit_flow`
 > with **no details object**, so they carry no `error_code` and cannot be
