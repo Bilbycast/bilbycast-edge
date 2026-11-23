@@ -2607,12 +2607,14 @@ mod tests {
     }
 
     /// A local WHEP server (`serve_whep`): its address, how many pulls it has
-    /// had, and the resources DELETEd from it.
+    /// had, the resources DELETEd from it, and when it wrote its first
+    /// picture to a pull.
     #[cfg(feature = "webrtc")]
     struct WhepServer {
         addr: std::net::SocketAddr,
         posts: Arc<AtomicUsize>,
         deletes: Arc<std::sync::Mutex<Vec<String>>>,
+        first_picture: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -2677,6 +2679,9 @@ mod tests {
         /// End the session (DTLS close_notify) once `for_ms` is up, as a
         /// server whose stream closes does.
         close: bool,
+        /// Send the first picture, an IDR, and no other: a server priming
+        /// its viewer with a cached IDR whose source has stalled.
+        one_picture: bool,
         /// Answer a DELETE after this long (0: at once).
         delete_after_ms: u64,
         /// Never answer a DELETE (note it, then hang): a dead server.
@@ -2707,6 +2712,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let posts = Arc::new(AtomicUsize::new(0));
         let deletes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let first_picture = Arc::new(std::sync::Mutex::new(None));
         let app = axum::Router::new().route(
             "/whep/{resource}",
             axum::routing::delete({
@@ -2726,6 +2732,7 @@ mod tests {
             "/whep",
             axum::routing::post({
                 let posts = posts.clone();
+                let first_picture = first_picture.clone();
                 move |offer: String| async move {
                     let n = posts.fetch_add(1, Ordering::SeqCst);
                     let config = SessionConfig {
@@ -2761,11 +2768,14 @@ mod tests {
                                 let _ = server.write_media(mid, pt, Instant::now(), at, packet.unwrap_or(&[0xFC; 80]));
                                 server.drain_outputs().await;
                             }
-                            if let (true, 0, Some((mid, pt))) = (script.video, k % 2, video) {
+                            let more = k == 0 || !script.one_picture;
+                            if let (true, 0, true, Some((mid, pt))) = (script.video, k % 2, more, video) {
                                 let at = MediaTime::new(k / 2 * 3_600, Frequency::NINETY_KHZ);
                                 let picture = if k == 0 || !script.gop { IDR } else { P };
-                                let _ = server.write_media(mid, pt, Instant::now(), at, picture);
+                                let written = Instant::now();
+                                let _ = server.write_media(mid, pt, written, at, picture);
                                 server.drain_outputs().await;
+                                first_picture.lock().unwrap().get_or_insert(written);
                             }
                             tokio::time::sleep(Duration::from_millis(20)).await;
                             let _ = server.drive_udp_io().await;
@@ -2788,7 +2798,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        WhepServer { addr, posts, deletes, task }
+        WhepServer { addr, posts, deletes, first_picture, task }
     }
 
     /// Run the WHEP input against `addr` for `run_ms`: what it published, as
@@ -3118,6 +3128,114 @@ mod tests {
         );
     }
 
+    /// What a WebRTC input published (`published`) for a session holding its
+    /// one picture for the Opus channel count, the picture written by its
+    /// sender at `written`: 50 ms on, by the wall clock, nothing — the
+    /// picture has reached the input, which the sender and the test share a
+    /// thread with, and is held; then, on tokio's paused clock, which moves
+    /// only to the next timer due, what went out first, when it went (`at`),
+    /// and when the clock was paused, after the picture arrived.
+    #[cfg(feature = "webrtc")]
+    async fn published_once_the_hold_runs_out(
+        published: &mut tokio::sync::broadcast::Receiver<crate::engine::packet::RtpPacket>,
+        written: std::time::Instant,
+    ) -> (Vec<bytes::Bytes>, tokio::time::Instant, tokio::time::Instant) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        use tokio::time::Instant;
+        tokio::time::sleep_until(Instant::from_std(written + std::time::Duration::from_millis(50))).await;
+        assert!(matches!(published.try_recv(), Err(TryRecvError::Empty)), "the picture was not held");
+        tokio::time::pause();
+        let paused = Instant::now();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), published.recv()).await;
+        let at = Instant::now();
+        tokio::time::resume();
+        let first = first
+            .unwrap_or_else(|_| panic!("nothing published within 1 s of the pause: the held picture was never released"))
+            .unwrap();
+        let mut ts: Vec<bytes::Bytes> = first.data.chunks(188).map(bytes::Bytes::copy_from_slice).collect();
+        while let Ok(pkt) = published.try_recv() {
+            ts.extend(pkt.data.chunks(188).map(bytes::Bytes::copy_from_slice));
+        }
+        (ts, at, paused)
+    }
+
+    /// The held picture went out as its wait ran out ([`published_once_the_hold_runs_out`]):
+    /// no sooner than `OPUS_COUNT_WAIT` after it was written, no later than
+    /// that after the pause (it had arrived by then), as the IDR at the
+    /// timeline's origin behind the first PMT, which lists the Opus as the TS
+    /// did before the hold — mono.
+    #[cfg(feature = "webrtc")]
+    fn assert_sent_as_the_wait_ran_out(
+        ts: &[bytes::Bytes],
+        written: std::time::Instant,
+        at: tokio::time::Instant,
+        paused: tokio::time::Instant,
+    ) {
+        let wait = super::OPUS_COUNT_WAIT;
+        let written = tokio::time::Instant::from_std(written);
+        assert!(at >= written + wait, "out {:?} after it was written, inside the wait", at - written);
+        // A timer fires on the first millisecond tick at or past its deadline.
+        let tick = std::time::Duration::from_millis(1);
+        assert!(at <= paused + wait + tick, "out {:?} after the pause, past the wait", at - paused);
+        let both = vec![(0x1B, 0x0100), (0x06, 0x0101)];
+        assert_eq!(pmts_of(ts), vec![(0, 0x0100, both)], "the first PMT");
+        assert_eq!(opus_channels_of(ts), [(0, Some(1))], "the Opus listed as before the hold");
+        let pes = video_pes_of(ts);
+        assert!(
+            pes.len() == 1 && pes[0].0 == crate::engine::rtmp::ts_mux::PCR_LEAD_90K && pes[0].1.contains(&5),
+            "the IDR at the timeline's origin: {pes:?}"
+        );
+    }
+
+    /// A WHEP server that negotiates Opus without declaring its channel
+    /// count, sends one IDR — a primed cached picture — and then nothing:
+    /// the input holds the IDR for the Opus packet that never comes, and its
+    /// receive loop's timer sends it, behind the first PMT, as
+    /// `OPUS_COUNT_WAIT` runs out. Without that timer the IDR waited for a
+    /// next picture, audio or the end of the pull, however long that took.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whep_pull_whose_audio_never_comes_sends_its_held_idr_as_the_wait_runs_out() {
+        use std::time::Duration;
+        let script = WhepScript { video: true, for_ms: 30_000, one_picture: true, ..WhepScript::default() };
+        let server = serve_whep_scripted(|a| a, script, None).await;
+        let config: crate::config::models::WhepInputConfig =
+            serde_json::from_value(serde_json::json!({ "whep_url": format!("http://{}/whep", server.addr) })).unwrap();
+        let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(16_384);
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHEP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whep_input_loop(
+                    config, broadcast_tx, stats, cancel, &events, "flow-w", &mut transcoder, &mut post,
+                )
+                .await;
+            }
+        });
+        let written = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(at) = *server.first_picture.lock().unwrap() {
+                    break at;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the server never sent its picture");
+        let (ts, at, paused) = published_once_the_hold_runs_out(&mut published, written).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        server.task.abort();
+        assert_sent_as_the_wait_ran_out(&ts, written, at, paused);
+    }
+
     /// Two WHIP publishers in turn, the first's sender clock running four
     /// times fast (4 s of RTP time in 1 s), so the second's arrival anchors
     /// fall behind the last PTS issued and the floor lifts its session. The
@@ -3222,5 +3340,70 @@ mod tests {
         assert_eq!(second[0], last + 1, "the second session starts on the floor");
         let apart = video[0].0 as i64 - second[0] as i64;
         assert!((14_400..=27_000).contains(&apart), "video {apart} ticks after the audio, sent 200 ms after");
+    }
+
+    /// A WHIP publisher that negotiates Opus without declaring its channel
+    /// count (as Chrome does), sends one IDR and then nothing: the input
+    /// holds the IDR for the Opus packet that never comes, and its receive
+    /// loop's timer sends it, behind the first PMT, as `OPUS_COUNT_WAIT` runs
+    /// out. Without that timer the IDR waited for a next picture, audio or
+    /// the end of the publish, however long that took.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whip_publish_whose_audio_never_comes_sends_its_held_idr_as_the_wait_runs_out() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+        use std::time::{Duration, Instant};
+        use str0m::media::{Frequency, MediaTime};
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(16_384);
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config, "flow-w", broadcast_tx, stats, cancel, session_rx, &events,
+                    &mut transcoder, &mut post, Duration::from_secs(10),
+                )
+                .await;
+            }
+        });
+
+        let peer = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: false };
+        let mut publisher = WebrtcSession::new(&peer).await.unwrap();
+        let (offer, pending) = publisher.create_offer(true, true, true).unwrap();
+        assert!(!super::sdp_declares_stereo_opus(&offer), "the offer declares no channel count");
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        session_tx.send(NewSessionMsg { offer_sdp: offer, reply }).await.unwrap();
+        let (answer, _session, _cancel) = answer.await.unwrap().unwrap();
+        publisher.apply_answer(&answer, pending).unwrap();
+        let connected = tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(publisher.poll_event(&cancel).await, SessionEvent::Connected) {}
+        })
+        .await;
+        assert!(connected.is_ok(), "the publisher never connected");
+        publisher.drain_pending_events();
+        assert!(publisher.audio_mid.and_then(|mid| publisher.get_pt(mid)).is_some(), "Opus negotiated");
+        let mid = publisher.video_mid.unwrap();
+        let pt = publisher.get_pt(mid).expect("H.264 accepted");
+        let written = Instant::now();
+        publisher.write_media(mid, pt, written, MediaTime::new(5_000, Frequency::NINETY_KHZ), IDR).unwrap();
+        publisher.drain_outputs().await;
+
+        let (ts, at, paused) = published_once_the_hold_runs_out(&mut published, written).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        drop(publisher);
+        assert_sent_as_the_wait_ran_out(&ts, written, at, paused);
     }
 }
