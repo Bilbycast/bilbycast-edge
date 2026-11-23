@@ -148,7 +148,11 @@ pub(crate) fn prepare_relay_leg(
 /// bridge drains `from_bond` → relay and pumps relay → `to_bond`, drop-on-full
 /// both directions; it self-redials the relay on failover without tearing down
 /// the leg channels.
-pub(crate) fn spawn_relay_leg_bridges(bridges: Vec<RelayLegBridge>, cancel: &CancellationToken) {
+pub(crate) fn spawn_relay_leg_bridges(
+    bridges: Vec<RelayLegBridge>,
+    cancel: &CancellationToken,
+    events: &EventSender,
+) {
     for b in bridges {
         let RelayLegBridge {
             params,
@@ -159,9 +163,10 @@ pub(crate) fn spawn_relay_leg_bridges(bridges: Vec<RelayLegBridge>, cancel: &Can
         } = b;
         let AttachedBridgeEnds { to_bond, from_bond } = bridge;
         let leg_cancel = cancel.child_token();
+        let events = events.clone();
         tokio::spawn(async move {
             if let Err(e) = crate::tunnel::udp_relay_client::run_native_relay_leg_inproc(
-                params, leg_cancel, stats, cipher, to_bond, from_bond,
+                params, leg_cancel, stats, cipher, to_bond, from_bond, events,
             )
             .await
             {
@@ -263,7 +268,7 @@ pub fn spawn_bonded_input(
         // and pumps the attached leg's channels with no loopback hop. The
         // bridge task lives under the input's cancel token; relay rotation
         // re-Registers on a fresh socket but the leg channels persist.
-        spawn_relay_leg_bridges(bridges, &cancel);
+        spawn_relay_leg_bridges(bridges, &cancel, &event_sender);
 
         let socket = match BondSocket::receiver_attached(socket_cfg, attachments).await {
             Ok(s) => s,

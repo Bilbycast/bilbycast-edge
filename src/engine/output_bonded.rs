@@ -118,11 +118,78 @@ async fn bonded_output_loop(
     // table) BEFORE the socket binds to that source. Teardown runs on
     // every exit path so a stopped flow leaves no orphan routes.
     let programmed = program_gateway_paths(config, flow_id, events).await?;
-    let result = bonded_output_run(config, rx, stats, cancel, events, flow_id).await;
-    if !programmed.is_empty() {
-        teardown_gateway_paths(flow_id, &programmed).await;
-    }
+    let mut reassert = ReassertTask {
+        cancel: cancel.child_token(),
+        handle: None,
+    };
+    let result = bonded_output_run(config, rx, stats, cancel, events, flow_id, &mut reassert).await;
+    let routes = if programmed.is_empty() {
+        None
+    } else {
+        super::bond_routing::BondRouteManager::global().await.ok()
+    };
+    end_gateway_routes(routes, reassert, flow_id, &programmed).await;
     result
+}
+
+/// How long a stopping bonded output waits for its route re-assert task
+/// before it tears the legs down regardless. Within the 5 s a flow gives an
+/// output to exit after its cancel, so the teardown still runs.
+const GATEWAY_REASSERT_STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A running output's route re-assert task ([`run_gateway_route_reprogram`]),
+/// under a token of its own so the output can stop it before the teardown.
+struct ReassertTask {
+    cancel: CancellationToken,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ReassertTask {
+    /// Cancel the task and wait for it, at most [`GATEWAY_REASSERT_STOP_WAIT`].
+    ///
+    /// Past the wait the task is left to finish, never aborted. It checks
+    /// its token before every `program()`, so by then it can only be inside
+    /// an integrity check, after which it returns, or inside a `program()`
+    /// that asked for the route manager's lock before the teardown does —
+    /// the lock is granted in order, so the teardown runs after it and
+    /// removes what it installed. An abort could cut that `program()`
+    /// between its netlink steps and leave a slot and part of a leg that
+    /// nothing removes.
+    async fn stop(mut self) {
+        self.cancel.cancel();
+        let Some(mut handle) = self.handle.take() else {
+            return;
+        };
+        tokio::select! {
+            biased;
+            _ = &mut handle => {}
+            _ = tokio::time::sleep(GATEWAY_REASSERT_STOP_WAIT) => tracing::warn!(
+                "bonded output: the gateway route re-assert task did not stop within {} s; \
+                 tearing the legs down after whatever it is programming",
+                GATEWAY_REASSERT_STOP_WAIT.as_secs()
+            ),
+        }
+    }
+}
+
+/// End a bonded output's gateway routing: stop its re-assert task, THEN
+/// tear down each leg it programmed. The other order lets a re-assert that
+/// runs after a leg's teardown install that leg again for an output that
+/// has stopped, steering its source address through the dead output's
+/// gateway until the same leg is programmed again, a clean shutdown, or a
+/// restart's sweep.
+async fn end_gateway_routes<R: super::bond_routing::LegRoutes>(
+    routes: Option<&R>,
+    reassert: ReassertTask,
+    flow_id: &str,
+    programmed: &[u8],
+) {
+    reassert.stop().await;
+    if let Some(routes) = routes {
+        for id in programmed {
+            routes.teardown(flow_id, *id).await;
+        }
+    }
 }
 
 /// Program the policy route for every gateway-mode leg. Returns the
@@ -258,7 +325,13 @@ const GATEWAY_ROUTE_REASSERT_INTERVAL: std::time::Duration =
 /// only rebuilds when the target RETURNS) and `PathRebuilt` can never
 /// fire. Re-running `program()` (idempotent) re-adds the address; the
 /// watcher's next tick then sees it restored and rebuilds the socket.
-async fn run_gateway_route_reprogram(
+///
+/// `cancel` is the output's [`ReassertTask`] token, which the output
+/// cancels and waits on before it tears the legs down. The task therefore
+/// prefers it to a ready tick or event, and checks it before every leg and
+/// every `program()`: once the output has stopped it programs nothing.
+async fn run_gateway_route_reprogram<R: super::bond_routing::LegRoutes>(
+    routes: &R,
     mut rx: broadcast::Receiver<PathEvent>,
     legs: Vec<GatewayLeg>,
     output_id: String,
@@ -275,17 +348,22 @@ async fn run_gateway_route_reprogram(
     reassert.tick().await; // swallow the immediate t=0 tick
     loop {
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => return,
             _ = reassert.tick() => {
-                let Ok(mgr) = super::bond_routing::BondRouteManager::global().await else {
-                    continue;
-                };
                 for (i, leg) in legs.iter().enumerate() {
-                    if mgr.is_intact(&flow_id, leg.path_id).await {
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    if routes.is_intact(&flow_id, leg.path_id).await {
                         reassert_failed[i] = false;
                         continue;
                     }
-                    match mgr
+                    // The output may have stopped during that check.
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                    match routes
                         .program(&flow_id, leg.path_id, &leg.interface, leg.source, leg.gateway)
                         .await
                     {
@@ -341,19 +419,12 @@ async fn run_gateway_route_reprogram(
                         continue;
                     };
                     let cause = if rebuilt { "socket rebuild" } else { "interface lost" };
-                    let result = match super::bond_routing::BondRouteManager::global().await {
-                        Ok(mgr) => {
-                            mgr.program(
-                                &flow_id,
-                                leg.path_id,
-                                &leg.interface,
-                                leg.source,
-                                leg.gateway,
-                            )
-                            .await
-                        }
-                        Err(e) => Err(e),
-                    };
+                    // No token check: nothing has awaited since the select
+                    // read it, and a stopping output waits for this task
+                    // before its teardown.
+                    let result = routes
+                        .program(&flow_id, leg.path_id, &leg.interface, leg.source, leg.gateway)
+                        .await;
                     match result {
                         Ok(()) => tracing::info!(
                             "bonded output '{output_id}': re-programmed gateway route for \
@@ -539,6 +610,7 @@ async fn bonded_output_run(
     cancel: CancellationToken,
     events: &EventSender,
     flow_id: &str,
+    reassert: &mut ReassertTask,
 ) -> anyhow::Result<()> {
     // Register this output's legs as "in use" so a per-leg capacity probe
     // refuses to saturate a physical link this flow is using (zero-impact
@@ -560,7 +632,7 @@ async fn bonded_output_run(
     // attached leg's channels with no loopback hop. The bridge tasks live under
     // the output's cancel token; a relay rotation re-Registers on a fresh socket
     // but the leg channels persist (the bond leg is never torn down).
-    spawn_relay_leg_bridges(bridges, &cancel);
+    spawn_relay_leg_bridges(bridges, &cancel, events);
 
     // Shared handles to the adaptive scheduler's discovered per-leg
     // capacity (bits/sec) — empty for the non-adaptive policies.
@@ -850,17 +922,28 @@ async fn bonded_output_run(
     // else ever re-adds it and the watcher's rebuild is gated on its
     // return), plus a periodic is_intact re-assert for kernel-silent
     // route flushes. `program()` is idempotent per (flow_id, path_id)
-    // and re-ensures the source address on the NIC.
+    // and re-ensures the source address on the NIC. The task runs under
+    // `reassert`'s token, which the output stops before its teardown.
     let gw_legs = gateway_legs(config);
     if !gw_legs.is_empty() {
-        tokio::spawn(run_gateway_route_reprogram(
-            socket.subscribe_events(),
-            gw_legs,
-            config.id.clone(),
-            flow_id.to_string(),
-            events.clone(),
-            cancel.clone(),
-        ));
+        // Initialised already: `program_gateway_paths` programmed these legs.
+        match super::bond_routing::BondRouteManager::global().await {
+            Ok(routes) => {
+                reassert.handle = Some(tokio::spawn(run_gateway_route_reprogram(
+                    routes,
+                    socket.subscribe_events(),
+                    gw_legs,
+                    config.id.clone(),
+                    flow_id.to_string(),
+                    events.clone(),
+                    reassert.cancel.clone(),
+                )));
+            }
+            Err(e) => tracing::warn!(
+                "bonded output '{}': no gateway route re-assert ({e})",
+                config.id
+            ),
+        }
     }
 
     // Per-leg bond protocol-version alarm: warn (once per leg) if we stamp v2
@@ -1724,5 +1807,158 @@ mod bonded_output_tests {
         assert_eq!(s.equalization, Tx::Off);
         let s = build(&format!(r#"{{ "id":"o","name":"b","bond_flow_id":1, "equalization":false, {legs} }}"#));
         assert_eq!(s.equalization, Tx::Off);
+    }
+
+    // ── Stopping the gateway route re-assert ──────────────────────────────
+    //
+    // Driven through `LegRoutes` with a fake, so no kernel: the netns test
+    // cannot land an output's stop inside a re-assert on purpose.
+
+    use crate::engine::bond_routing::{SourceNet, fake::FakeRoutes};
+
+    fn gateway_legs_for_test(n: u8) -> Vec<GatewayLeg> {
+        (0..n)
+            .map(|id| GatewayLeg {
+                path_id: id,
+                name: format!("leg{id}"),
+                interface: "eth9".into(),
+                source: SourceNet::parse(&format!("192.0.2.{}/24", 10 + id)).unwrap(),
+                gateway: "192.0.2.1".parse().unwrap(),
+            })
+            .collect()
+    }
+
+    /// The re-assert task as `bonded_output_run` spawns it, over `routes`.
+    /// The event sender is returned because the task stops when every
+    /// sender is gone.
+    fn spawn_reassert(
+        routes: &'static FakeRoutes,
+        legs: u8,
+    ) -> (ReassertTask, broadcast::Sender<PathEvent>) {
+        let (tx, rx) = broadcast::channel(4);
+        let (events, _) = crate::manager::events::event_channel();
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(run_gateway_route_reprogram(
+            routes,
+            rx,
+            gateway_legs_for_test(legs),
+            "out".into(),
+            "flow".into(),
+            events,
+            cancel.clone(),
+        ));
+        (ReassertTask { cancel, handle: Some(handle) }, tx)
+    }
+
+    /// [`end_gateway_routes`], failing rather than hanging should it never
+    /// return.
+    async fn end_routes(routes: &FakeRoutes, task: ReassertTask, programmed: &[u8]) {
+        let end = end_gateway_routes(Some(routes), task, "flow", programmed);
+        tokio::time::timeout(GATEWAY_REASSERT_STOP_WAIT * 10, end)
+            .await
+            .expect("the output's stop never returned");
+    }
+
+    /// Let the first re-assert run until it has asked for leg 0's state.
+    async fn reach_first_reassert(routes: &FakeRoutes) {
+        tokio::time::sleep(GATEWAY_ROUTE_REASSERT_INTERVAL).await;
+        for _ in 0..100 {
+            if !routes.log().is_empty() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the re-assert never ran");
+    }
+
+    /// Not stopped, the re-assert re-programs every broken leg.
+    #[tokio::test(start_paused = true)]
+    async fn the_reassert_reprograms_each_broken_leg() {
+        let routes: &'static FakeRoutes = Box::leak(Box::new(FakeRoutes::new()));
+        let (task, _tx) = spawn_reassert(routes, 2);
+        reach_first_reassert(routes).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert_eq!(routes.log(), ["is_intact 0", "program 0", "is_intact 1", "program 1"]);
+        end_routes(routes, task, &[]).await;
+    }
+
+    /// An output that stops while its re-assert is checking a leg: the
+    /// teardown waits for the task, and the task programs nothing once
+    /// stopped — before, the teardown ran at once and the task then
+    /// re-installed both legs for the stopped output.
+    #[tokio::test(start_paused = true)]
+    async fn an_output_stopping_mid_reassert_programs_nothing_after_its_teardown() {
+        let routes: &'static FakeRoutes = Box::leak(Box::new(FakeRoutes::holding("is_intact", 0)));
+        let (task, _tx) = spawn_reassert(routes, 2);
+        reach_first_reassert(routes).await;
+        assert_eq!(routes.log(), ["is_intact 0"]);
+        // Leg 0's check answers 100 ms after the output stops.
+        let answer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            routes.release();
+        });
+        let stopped_at = tokio::time::Instant::now();
+        end_routes(routes, task, &[0, 1]).await;
+        assert!(stopped_at.elapsed() < GATEWAY_REASSERT_STOP_WAIT, "waited out the bound");
+        answer.await.unwrap();
+        tokio::time::sleep(GATEWAY_ROUTE_REASSERT_INTERVAL * 2).await;
+        assert_eq!(routes.log(), ["is_intact 0", "teardown 0", "teardown 1"]);
+    }
+
+    /// An output that stops while its re-assert is re-programming a leg:
+    /// the teardown runs only once that program has returned (and so
+    /// removes the leg it installed), and the task checks no further leg.
+    #[tokio::test(start_paused = true)]
+    async fn an_output_stopping_mid_program_checks_no_further_leg() {
+        let routes: &'static FakeRoutes = Box::leak(Box::new(FakeRoutes::holding("program", 0)));
+        let (task, _tx) = spawn_reassert(routes, 2);
+        reach_first_reassert(routes).await;
+        tokio::task::yield_now().await;
+        assert_eq!(routes.log(), ["is_intact 0"], "leg 0's program is in flight");
+        let answer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            routes.release();
+        });
+        end_routes(routes, task, &[0, 1]).await;
+        answer.await.unwrap();
+        tokio::time::sleep(GATEWAY_ROUTE_REASSERT_INTERVAL * 2).await;
+        assert_eq!(routes.log(), ["is_intact 0", "program 0", "teardown 0", "teardown 1"]);
+    }
+
+    /// A re-assert task stuck past the bound does not hold the teardown
+    /// up, and still programs nothing when it comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_reassert_holds_the_teardown_up_only_for_the_bound() {
+        let routes: &'static FakeRoutes = Box::leak(Box::new(FakeRoutes::holding("is_intact", 0)));
+        let (task, _tx) = spawn_reassert(routes, 1);
+        reach_first_reassert(routes).await;
+        let stopped_at = tokio::time::Instant::now();
+        end_routes(routes, task, &[0]).await;
+        assert_eq!(stopped_at.elapsed(), GATEWAY_REASSERT_STOP_WAIT);
+        assert_eq!(routes.log(), ["is_intact 0", "teardown 0"]);
+        routes.release();
+        tokio::time::sleep(GATEWAY_ROUTE_REASSERT_INTERVAL * 2).await;
+        assert_eq!(routes.log(), ["is_intact 0", "teardown 0"], "programmed after the teardown");
+    }
+
+    /// A stop and a socket-rebuild event ready together: the stop wins.
+    /// Unbiased, `select!` would take the event about half the time and
+    /// re-program the leg, so this is tried 64 times.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_beats_an_event_that_is_ready_with_it() {
+        for _ in 0..64 {
+            let routes: &'static FakeRoutes = Box::leak(Box::new(FakeRoutes::new()));
+            let (mut task, tx) = spawn_reassert(routes, 1);
+            tokio::task::yield_now().await; // parked in its select
+            tx.send(PathEvent {
+                path_id: 0,
+                path_name: "leg0".into(),
+                kind: PathEventKind::InterfaceLost,
+            })
+            .unwrap();
+            task.cancel.cancel();
+            task.handle.take().unwrap().await.unwrap();
+            assert!(routes.log().is_empty(), "{:?}", routes.log());
+        }
     }
 }

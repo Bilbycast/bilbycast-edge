@@ -565,16 +565,24 @@ async fn connect_any(
 /// the NIC, install `default via <gateway>` in a private table, and a
 /// `from <source>` rule. The tunnel socket binds `source` so its packets
 /// match the rule. Returns `true` if a route was programmed (caller must
-/// tear it down on exit). On error logs a warning and returns `false` — the
-/// host may already have policy routing, so we never hard-fail the tunnel.
+/// tear it down on exit). On error it returns `false` and the tunnel runs
+/// on — the host may already have policy routing, so we never hard-fail
+/// the tunnel — but not quietly: a Warning `tunnel_gateway_route_failed`
+/// event says the tunnel is not pinned to its gateway, which is what an
+/// operator otherwise learns only from a bond that collapses onto one
+/// router (refused range bases, a missing interface, no `CAP_NET_ADMIN`).
 ///
-/// `path_id` is always `0` for a tunnel (one leg per tunnel); the
-/// `(tunnel_id, 0)` key namespaces it within `BondRouteManager`.
-async fn program_tunnel_gateway(
+/// `routes` is the route manager, or why it is unavailable
+/// (`BondRouteManager::global()`). `path_id` is always `0` for a tunnel
+/// (one leg per tunnel); the `(tunnel_id, 0)` key namespaces it within
+/// the manager.
+async fn program_tunnel_gateway<R: crate::engine::bond_routing::LegRoutes>(
+    routes: Result<&R>,
     tunnel_id: &Uuid,
     interface: &str,
     source: &str,
     gateway: &str,
+    events: &EventSender,
 ) -> bool {
     let gw_ip: std::net::IpAddr = match gateway.parse() {
         Ok(ip) => ip,
@@ -584,25 +592,36 @@ async fn program_tunnel_gateway(
         Ok(n) => n,
         Err(_) => return false,
     };
-    let mgr = match crate::engine::bond_routing::BondRouteManager::global().await {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(
-                %tunnel_id,
-                "native-UDP tunnel: gateway routing unavailable ({e}) — continuing without \
-                 policy route (host may already route {source} via {gateway})"
-            );
-            return false;
-        }
+    let programmed = match routes {
+        Ok(routes) => routes
+            .program(&tunnel_id.to_string(), 0u8, interface, src_net, gw_ip)
+            .await
+            .map_err(|e| format!("{e:#}")),
+        Err(e) => Err(format!("gateway routing unavailable: {e:#}")),
     };
-    if let Err(e) = mgr
-        .program(&tunnel_id.to_string(), 0u8, interface, src_net, gw_ip)
-        .await
-    {
+    if let Err(e) = programmed {
         tracing::warn!(
             %tunnel_id,
             "native-UDP tunnel: failed to program gateway route ({source} via {gateway} dev \
              {interface}): {e} — continuing (host may already route it)"
+        );
+        events.emit_with_details(
+            EventSeverity::Warning,
+            category::TUNNEL,
+            format!(
+                "Tunnel {tunnel_id}: gateway route {source} via {gateway} dev {interface} not \
+                 programmed: {e}. The tunnel runs without it, so its packets follow the host's \
+                 own routing, which need not be via {gateway}."
+            ),
+            None,
+            serde_json::json!({
+                "error_code": "tunnel_gateway_route_failed",
+                "tunnel_id": tunnel_id.to_string(),
+                "interface": interface,
+                "source": source,
+                "gateway": gateway,
+                "error": e,
+            }),
         );
         return false;
     }
@@ -632,7 +651,7 @@ pub async fn run_native_relay_tunnel(
     cancel: CancellationToken,
     stats: Arc<UdpForwarderStats>,
     cipher: Option<Arc<TunnelCipher>>,
-    _event_sender: EventSender,
+    event_sender: EventSender,
 ) -> Result<()> {
     if params.relay_addrs.is_empty() {
         anyhow::bail!("native-UDP relay tunnel requires at least one relay address");
@@ -654,7 +673,8 @@ pub async fn run_native_relay_tunnel(
         params.interface.as_deref(),
     ) {
         (Some(gw), Some(src), Some(iface)) => {
-            program_tunnel_gateway(&params.tunnel_id, iface, src, gw).await
+            let routes = crate::engine::bond_routing::BondRouteManager::global().await;
+            program_tunnel_gateway(routes, &params.tunnel_id, iface, src, gw, &event_sender).await
         }
         _ => false,
     };
@@ -863,6 +883,7 @@ pub async fn run_native_relay_leg_inproc(
     cipher: Option<Arc<TunnelCipher>>,
     to_bond: mpsc::Sender<Bytes>,
     mut from_bond: mpsc::Receiver<Bytes>,
+    events: EventSender,
 ) -> Result<()> {
     if params.relay_addrs.is_empty() {
         anyhow::bail!("native-UDP relay bond leg requires at least one relay address");
@@ -886,7 +907,8 @@ pub async fn run_native_relay_leg_inproc(
         params.interface.as_deref(),
     ) {
         (Some(gw), Some(src), Some(iface)) => {
-            program_tunnel_gateway(&params.tunnel_id, iface, src, gw).await
+            let routes = crate::engine::bond_routing::BondRouteManager::global().await;
+            program_tunnel_gateway(routes, &params.tunnel_id, iface, src, gw, &events).await
         }
         _ => false,
     };
@@ -1113,7 +1135,8 @@ pub async fn run_native_direct_tunnel(
                 interface.as_deref(),
             ) {
                 (Some(gw), Some(src), Some(iface)) => {
-                    program_tunnel_gateway(&tunnel_id, iface, src, gw).await
+                    let routes = crate::engine::bond_routing::BondRouteManager::global().await;
+                    program_tunnel_gateway(routes, &tunnel_id, iface, src, gw, &event_sender).await
                 }
                 _ => false,
             };
@@ -2295,5 +2318,53 @@ mod carrier_socket_buffer_tests {
             let sock = bind_direct_listener("127.0.0.1:0".parse().unwrap()).unwrap();
             assert_eq!(stored_rcvbuf(&sock), expected_rcvbuf());
         });
+    }
+}
+
+#[cfg(test)]
+mod gateway_route_event_tests {
+    //! A native-UDP tunnel whose gateway route cannot be programmed runs on
+    //! unpinned; it used to say so only in a log line.
+    use super::*;
+    use crate::engine::bond_routing::fake::FakeRoutes;
+    use crate::manager::events::event_channel;
+
+    #[tokio::test]
+    async fn a_gateway_route_the_tunnel_cannot_program_raises_an_event() {
+        let (events, mut rx) = event_channel();
+        let id = Uuid::new_v4();
+        let program = |routes, events| {
+            program_tunnel_gateway(routes, &id, "eth9", "192.0.2.2/24", "192.0.2.1", events)
+        };
+
+        // Refused range bases, as `BondRouteManager::program` reports them.
+        let refused = "bond gateway routing is disabled: BILBYCAST_BOND_RT_PRIO_BASE=900 is \
+                       refused: its 256 rule priorities must hold none of the kernel's own rules";
+        let fake = FakeRoutes::failing(refused);
+        assert!(!program(Ok(&fake), &events).await);
+        assert_eq!(fake.log(), ["program 0"]);
+        let ev = rx.try_recv().expect("an event for the unpinned tunnel");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::TUNNEL);
+        assert!(ev.message.contains(refused), "{}", ev.message);
+        let d = ev.details.expect("details");
+        assert_eq!(d["error_code"], "tunnel_gateway_route_failed");
+        assert_eq!(d["tunnel_id"], id.to_string());
+        assert_eq!(d["interface"], "eth9");
+        assert_eq!(d["source"], "192.0.2.2/24");
+        assert_eq!(d["gateway"], "192.0.2.1");
+        assert_eq!(d["error"], refused);
+        assert!(rx.try_recv().is_err());
+
+        // No route manager at all (no netlink): the same event.
+        assert!(!program(Err::<&FakeRoutes, _>(anyhow::anyhow!("no netlink")), &events).await);
+        let d = rx.try_recv().expect("an event").details.expect("details");
+        assert_eq!(d["error_code"], "tunnel_gateway_route_failed");
+        assert_eq!(d["error"], "gateway routing unavailable: no netlink");
+
+        // Programmed: nothing raised.
+        let fine = FakeRoutes::new();
+        assert!(program(Ok(&fine), &events).await);
+        assert!(rx.try_recv().is_err());
     }
 }
