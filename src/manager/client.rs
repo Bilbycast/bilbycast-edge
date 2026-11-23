@@ -2377,7 +2377,7 @@ async fn wait_for_first_bind_failure(
     spawn_started_at: std::time::Instant,
 ) -> Option<CommandError> {
     poll_for_bind_failure(spawn_started_at, || {
-        events.take_recent_critical_for_flow(flow_id, spawn_started_at)
+        events.take_recent_bind_failure_for_flow(flow_id, spawn_started_at)
     })
     .await
 }
@@ -2392,13 +2392,17 @@ async fn wait_for_input_bind_failure(
     spawn_started_at: std::time::Instant,
 ) -> Option<CommandError> {
     poll_for_bind_failure(spawn_started_at, || {
-        events.take_recent_critical_for_input(flow_id, input_id, spawn_started_at)
+        events.take_recent_bind_failure_for_input(flow_id, input_id, spawn_started_at)
     })
     .await
 }
 
-/// The polling loop behind both waits; `take` reads the tracker in the
-/// caller's scope.
+/// The polling loop behind both waits; `take` reads the tracker's bind
+/// failures in the caller's scope. Only those are surfaced on the ack —
+/// other critical events (codec init failure, an RTSP input's unplayable
+/// URL, etc.) ride through the generic flow error path, and the tracker
+/// keeps them apart so they cannot stand in for a bind failure either
+/// ([`super::events::surfaces_as_bind_failure`]).
 async fn poll_for_bind_failure(
     spawn_started_at: std::time::Instant,
     mut take: impl FnMut() -> Option<super::events::RecentCritical>,
@@ -2407,12 +2411,7 @@ async fn poll_for_bind_failure(
     loop {
         if let Some(critical) = take() {
             let code = critical.error_code.unwrap_or_else(|| "bind_failed".to_string());
-            // Only surface bind-related critical events on the ack — other
-            // critical events (codec init failure, etc.) ride through the
-            // generic flow error path.
-            if code == "port_conflict" || code == "bind_failed" {
-                return Some(CommandError::with_code(critical.event.message.clone(), code));
-            }
+            return Some(CommandError::with_code(critical.event.message.clone(), code));
         }
         if std::time::Instant::now() >= deadline {
             return None;
@@ -8546,6 +8545,49 @@ mod add_input_hitless_tests {
         assert_eq!(running, ["a", "in-b"]);
         assert_eq!(p_inputs().await, ["a", "in-b"]);
         let _ = fm.destroy_flow("p").await;
+    }
+}
+
+#[cfg(test)]
+mod bind_failure_wait_tests {
+    //! A command's wait for the bind failure of what it spawned.
+    use super::*;
+
+    /// An output's port conflict, then the Critical an RTSP input with an
+    /// `rtsps://` URL raises as it starts — in the same spawn window, both
+    /// flow-scoped: the wait surfaces the port conflict. The RTSP Critical
+    /// replaced it in the one slot the wait read, and the wait, finding no
+    /// bind failure there, let the command ack success.
+    #[tokio::test]
+    async fn a_port_conflict_is_surfaced_past_an_rtsp_inputs_critical() {
+        let (events, _rx) = crate::manager::events::event_channel();
+        let started = std::time::Instant::now();
+        events.send(crate::manager::events::Event {
+            severity: crate::manager::events::EventSeverity::Critical,
+            category: crate::manager::events::category::PORT_CONFLICT.to_string(),
+            message: "Port conflict: UDP output 127.0.0.1:5004 is already in use".into(),
+            details: Some(serde_json::json!({ "error_code": "port_conflict" })),
+            flow_id: Some("f".into()),
+            input_id: None,
+            output_id: Some("o".into()),
+        });
+        let cfg: crate::config::models::RtspInputConfig =
+            serde_json::from_value(serde_json::json!({ "rtsp_url": "rtsps://camera.local/s" })).expect("RTSP config");
+        let (tx, _media) = tokio::sync::broadcast::channel(16);
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new("f".into(), "flow".into(), "rtsp".into()));
+        let input = crate::engine::input_rtsp::spawn_rtsp_input(
+            cfg, tx, stats, tokio_util::sync::CancellationToken::new(), events.clone(), "f".into(), "cam".into(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)), None,
+        );
+        tokio::time::timeout(Duration::from_secs(2), input).await.expect("the input fails once and ends").unwrap();
+
+        let err = wait_for_first_bind_failure(&events, "f", started).await.expect("the port conflict is surfaced");
+        assert_eq!(err.code.as_deref(), Some("port_conflict"));
+        assert!(err.message.contains("127.0.0.1:5004"), "{}", err.message);
+        assert!(
+            wait_for_input_bind_failure(&events, "f", "cam", started).await.is_none(),
+            "the RTSP Critical is no bind failure of the input's"
+        );
     }
 }
 

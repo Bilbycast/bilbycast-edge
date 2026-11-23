@@ -73,18 +73,37 @@ pub struct RecentCritical {
 
 /// Per-scope ring of the most recent critical event keyed by flow id.
 /// Old entries are evicted lazily when a fresher one is pushed for the same
-/// flow — there is no background sweeper, since the only consumer (command
-/// handler post-spawn polling) clears its own scope on read.
+/// flow — there is no background sweeper, since the consumers (command
+/// handler post-spawn polling, the assembly swap's error code) clear their
+/// own scope on read.
 #[derive(Debug, Default)]
 struct RecentCriticalTracker {
+    /// The latest Critical of any kind per flow — the assembly swap reads
+    /// the `pid_bus_*` code of the one it raised.
     by_flow: std::sync::RwLock<HashMap<String, RecentCritical>>,
+    /// The latest per flow that a command ack surfaces as a bind failure
+    /// ([`surfaces_as_bind_failure`]). Kept apart from `by_flow`, where a
+    /// Critical of another kind raised in the same spawn window — an RTSP
+    /// input's `rtsps_unsupported` at its first poll — replaced a bind
+    /// failure before the command polling for it read it, and the command
+    /// acked success.
+    bind_by_flow: std::sync::RwLock<HashMap<String, RecentCritical>>,
     /// The same, for each input of a flow — keyed `(flow_id, input_id)` and
-    /// filled only by events that name both. `by_flow` keeps one slot per
-    /// flow, so whichever member raised a Critical last owns it: one input's
+    /// filled only by events that name both. `bind_by_flow` keeps one slot
+    /// per flow, so whichever member raised one last owns it: one input's
     /// bind failure can stand in for another's, or be overwritten by the
     /// flow-scoped "input lost" that follows it. `update_input` has to know
     /// whether the input it edited is the one that failed, so it reads this.
     by_input: std::sync::RwLock<HashMap<(String, String), RecentCritical>>,
+}
+
+/// Whether a command ack surfaces a Critical with this `error_code` as the
+/// bind failure of what it spawned: `port_conflict`, `bind_failed`, or no
+/// code at all (which the ack has always read as `bind_failed`). Any other
+/// code is the failure of something else, and rides the flow's own error
+/// path.
+pub(crate) fn surfaces_as_bind_failure(code: Option<&str>) -> bool {
+    matches!(code, None | Some("port_conflict" | "bind_failed"))
 }
 
 /// Clonable handle for sending events from any component.
@@ -158,9 +177,9 @@ impl EventSender {
         }
         // Stash flow-scoped Critical events so the WS command handler can
         // poll for a runtime bind failure that happened just after spawn —
-        // per flow, and per input of the flow when the event names one. An
-        // input event with no flow (a standby listener's) is not kept: no
-        // command polls for it.
+        // per flow, and per input of the flow when the event names one — and
+        // the assembly swap for the code of its own. An input event with no
+        // flow (a standby listener's) is not kept: no command polls for it.
         if event.severity == EventSeverity::Critical
             && let Some(fid) = &event.flow_id
         {
@@ -168,15 +187,21 @@ impl EventSender {
                 .details
                 .as_ref()
                 .and_then(|d| d.get("error_code").and_then(|v| v.as_str()).map(String::from));
+            let bind = surfaces_as_bind_failure(code.as_deref());
             let entry = RecentCritical {
                 event: event.clone(),
                 error_code: code,
                 captured_at: Instant::now(),
             };
-            if let Some(iid) = &event.input_id
-                && let Ok(mut g) = self.recent.by_input.write()
-            {
-                g.insert((fid.clone(), iid.clone()), entry.clone());
+            if bind {
+                if let Some(iid) = &event.input_id
+                    && let Ok(mut g) = self.recent.by_input.write()
+                {
+                    g.insert((fid.clone(), iid.clone()), entry.clone());
+                }
+                if let Ok(mut g) = self.recent.bind_by_flow.write() {
+                    g.insert(fid.clone(), entry.clone());
+                }
             }
             if let Ok(mut g) = self.recent.by_flow.write() {
                 g.insert(fid.clone(), entry);
@@ -194,10 +219,29 @@ impl EventSender {
     }
 
     /// Consume and return the most recent critical event for `flow_id` whose
-    /// `captured_at >= since`. Used by command handlers to wait for the result
-    /// of a spawn that races the runtime bind path.
+    /// `captured_at >= since`, of any kind. Used by the assembly swap to
+    /// recover the `error_code` of the Critical it raised.
     pub fn take_recent_critical_for_flow(&self, flow_id: &str, since: Instant) -> Option<RecentCritical> {
-        let mut g = self.recent.by_flow.write().ok()?;
+        Self::take(&self.recent.by_flow, flow_id, since)
+    }
+
+    /// Consume and return the most recent Critical for `flow_id`, since
+    /// `since`, that a command ack surfaces as a bind failure
+    /// ([`surfaces_as_bind_failure`]). Used by command handlers to wait for
+    /// the result of a spawn that races the runtime bind path; a Critical
+    /// of another kind raised after it does not hide it.
+    pub fn take_recent_bind_failure_for_flow(&self, flow_id: &str, since: Instant) -> Option<RecentCritical> {
+        Self::take(&self.recent.bind_by_flow, flow_id, since)
+    }
+
+    /// Take `flow_id`'s entry from `slots` when it was captured at or after
+    /// `since`.
+    fn take(
+        slots: &std::sync::RwLock<HashMap<String, RecentCritical>>,
+        flow_id: &str,
+        since: Instant,
+    ) -> Option<RecentCritical> {
+        let mut g = slots.write().ok()?;
         if let Some(entry) = g.get(flow_id).cloned()
             && entry.captured_at >= since
         {
@@ -207,10 +251,11 @@ impl EventSender {
         None
     }
 
-    /// [`Self::take_recent_critical_for_flow`] narrowed to one input of the
-    /// flow: only a Critical that names both `flow_id` and `input_id` is
-    /// returned, so another member's failure never answers for this one.
-    pub fn take_recent_critical_for_input(
+    /// [`Self::take_recent_bind_failure_for_flow`] narrowed to one input of
+    /// the flow: only a bind failure that names both `flow_id` and
+    /// `input_id` is returned, so another member's failure never answers
+    /// for this one.
+    pub fn take_recent_bind_failure_for_input(
         &self,
         flow_id: &str,
         input_id: &str,
@@ -1084,21 +1129,67 @@ mod tests {
         sender.emit_flow(EventSeverity::Critical, category::FLOW, "Flow input lost", "f1");
 
         assert!(
-            sender.take_recent_critical_for_input("f1", "a", since).is_none(),
+            sender.take_recent_bind_failure_for_input("f1", "a", since).is_none(),
             "b's failure must not answer for a"
         );
         let b = sender
-            .take_recent_critical_for_input("f1", "b", since)
+            .take_recent_bind_failure_for_input("f1", "b", since)
             .expect("b's own failure");
         assert_eq!(b.error_code.as_deref(), Some("port_conflict"));
         assert!(
-            sender.take_recent_critical_for_input("f1", "b", since).is_none(),
+            sender.take_recent_bind_failure_for_input("f1", "b", since).is_none(),
             "taken on read"
         );
         let flow = sender
             .take_recent_critical_for_flow("f1", since)
             .expect("the flow slot");
         assert_eq!(flow.event.message, "Flow input lost");
+    }
+
+    /// A Critical of another kind raised after a bind failure — an RTSP
+    /// input's unplayable URL, at its first poll in the same spawn window —
+    /// does not hide it: the bind slots keep the bind failure for the
+    /// command polling for one, and the flow slot, which the assembly swap
+    /// reads, has the latest. It replaced the bind failure in the one slot
+    /// both read, and the command acked success.
+    #[test]
+    fn a_bind_failure_outlasts_a_later_critical_of_another_kind() {
+        let (sender, _rx) = event_channel();
+        let since = Instant::now();
+        let output_conflict = Event {
+            severity: EventSeverity::Critical,
+            category: category::PORT_CONFLICT.to_string(),
+            message: "Port conflict: UDP output 127.0.0.1:5004".into(),
+            details: Some(serde_json::json!({ "error_code": "port_conflict" })),
+            flow_id: Some("f1".into()),
+            input_id: None,
+            output_id: Some("o1".into()),
+        };
+        sender.send(output_conflict);
+        sender.emit_port_conflict(
+            "UDP input",
+            "127.0.0.1:5002",
+            BindProto::Udp,
+            BindScope::flow_input("f1", "cam"),
+            "address already in use",
+        );
+        sender.send(Event {
+            severity: EventSeverity::Critical,
+            category: category::RTSP.to_string(),
+            message: "RTSP input 'cam' cannot connect".into(),
+            details: Some(serde_json::json!({ "error_code": "rtsps_unsupported" })),
+            flow_id: Some("f1".into()),
+            input_id: Some("cam".into()),
+            output_id: None,
+        });
+
+        let input = sender.take_recent_bind_failure_for_input("f1", "cam", since).expect("cam's bind failure");
+        assert_eq!(input.error_code.as_deref(), Some("port_conflict"));
+        let flow = sender.take_recent_bind_failure_for_flow("f1", since).expect("the flow's last bind failure");
+        assert_eq!((flow.error_code.as_deref(), flow.event.input_id.as_deref()), (Some("port_conflict"), Some("cam")));
+        let latest = sender.take_recent_critical_for_flow("f1", since).expect("the latest Critical");
+        assert_eq!(latest.error_code.as_deref(), Some("rtsps_unsupported"));
+        assert!(sender.take_recent_bind_failure_for_flow("f1", since).is_none(), "taken on read");
     }
 
     /// `emit_bind_failed` is the non-EADDRINUSE counterpart — same shape but
