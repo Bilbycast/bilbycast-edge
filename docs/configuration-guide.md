@@ -1404,21 +1404,38 @@ two stay aligned.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `type` | string | Yes | - | Must be `"rtsp"`. |
-| `rtsp_url` | string | Yes | - | RTSP source URL. Must start with `rtsp://`; `rtsps://` (RTSP over TLS) is refused, since the RTSP client speaks no TLS. Credentials in the URL (`rtsp://user:pass@camera/…`, percent-encoded as a URL carries them) are taken off the URL and presented as the session's credentials, unless `username` and `password` are both set, which win. |
+| `rtsp_url` | string | Yes | - | RTSP source URL, `rtsp://`. Credentials in the URL (`rtsp://user:pass@camera/…`) are taken off it and presented as the session's credentials, unless `username` and `password` are both set, which win. A `#`, `/`, `?` or `@` in a username or password must be percent-encoded (`%23`, `%2F`, `%3F`, `%40`), or put the credentials in the two fields instead. An edit of the input refuses `rtsps://` (the RTSP client speaks no TLS), a URL that does not parse, and userinfo the URL parser does not read as written; a whole config keeps such a URL and warns — see [RTSP inputs a whole config keeps](#rtsp-inputs-a-whole-config-keeps). |
 | `username` | string | No | `null` | RTSP authentication username (Digest or Basic). |
 | `password` | string | No | `null` | RTSP authentication password. |
 | `transport` | string | No | `"tcp"` | `"tcp"` (interleaved, reliable) or `"udp"` (lower latency). |
-| `timeout_secs` | integer | No | `10` | 1–300. How long a session's setup — the connection, DESCRIBE, SETUP and PLAY together — may take. Past it the attempt is abandoned and retried after `reconnect_delay_secs`, as a lost session is. It does not bound a session once it plays. |
+| `timeout_secs` | integer | No | `10` | 1–300. How long a session's setup — the connection, DESCRIBE, SETUP and PLAY together — may take. Past it the attempt is abandoned and retried after `reconnect_delay_secs`, as a lost session is. It does not bound a session once it plays. An edit of the input refuses a value outside the range; a whole config has it clamped. |
 | `reconnect_delay_secs` | integer | No | `5` | Delay between reconnection attempts on failure. |
+| `ingress_delay_ms` | integer | No | `null` | Fixed ingress delay line, 0–1000 ms — a pure delay that preserves jitter rather than removing it. See [RTP Input](#rtp-input) above. |
+| `passthrough_clock` | boolean | No | `false` | Opt out of muxer-mode PCR + PES PTS/DTS regeneration — see [RTP Input](#rtp-input) above. |
 
-The URL's userinfo is never shown: a log line, an event's `url`, and the
-stats' `rtsp_url` all carry the URL without it (`GET /api/v1/config`, which
-returns flow credentials in full by design, still has it as configured).
-Until 2026-11 such a URL was passed to the RTSP client as it was, which
-refused it, so the input retried every `reconnect_delay_secs` for good and
-logged the password at INFO with each start; `rtsps://` passed validation and
-did the same; and `timeout_secs` was read nowhere, so a server that took the
-connection and never answered held the input in DESCRIBE indefinitely.
+**What is shown of the URL.** Everything in `rtsp_url` between its `://` and
+its last `@` is left out of what the edge shows: its own log lines (the
+start, connected and lost lines), the `rtsp` events' message and
+`details.url`, and the stats' `rtsp_url` (`input.rtsp_url` and each
+`inputs_live[]` entry's); the error text a log line or event quotes has that
+part taken out wherever it appears verbatim. The cut is found in the text, not by parsing the URL, so a password with an
+unencoded `#`, `/` or `?` — which a URL parser takes for the end of the host:
+`rtsp://admin:1234#5@cam/live` reads as host `admin`, port 1234, no
+credentials — is hidden as well. An `@` in a path or query hides the host and
+path ahead of it too (`rtsp://cam/live?token=a@b` is shown as `rtsp://b`).
+`GET /api/v1/config`, which returns flow credentials in full by design, has
+the URL as configured. The RTSP client is given the URL without its
+userinfo; a URL whose userinfo the parser misreads (only a whole config can
+hold one) is given to it as the parser reads it, password fragments in its
+port, path, query or fragment included, and the client's own debug log lines
+may quote it.
+
+Until 2026-11 a URL with credentials was passed to the RTSP client as it
+was, which refused it, so the input retried every `reconnect_delay_secs` for
+good and logged the password at INFO with each start; `rtsps://` passed
+validation and did the same; and `timeout_secs` was read nowhere, so a server
+that took the connection and never answered held the input in DESCRIBE
+indefinitely.
 
 Each reconnect continues the TS's continuity counters where the last session
 left them, PAT, PMT, video and audio alike. A reconnect's fresh muxer used to
@@ -1429,8 +1446,46 @@ timestamps still restart, which a PCR's `discontinuity_indicator` announces:
 the muxer-mode rewriter's on the step itself, or — with
 `passthrough_clock: true` — the flow's source-discontinuity watch's, on the
 PCR after it.
-| `ingress_delay_ms` | integer | No | `null` | Fixed ingress delay line, 0–1000 ms — a pure delay that preserves jitter rather than removing it. See [RTP Input](#rtp-input) above. |
-| `passthrough_clock` | boolean | No | `false` | Opt out of muxer-mode PCR + PES PTS/DTS regeneration — see [RTP Input](#rtp-input) above. |
+
+#### RTSP inputs a whole config keeps
+
+The edits that name an input — `POST` and
+`PUT /api/v1/inputs`, the WS `create_input`, `update_input` and `add_input` —
+refuse (HTTP 400, `command_ack.error_code: validation_error`) an `rtsps://`
+URL, a URL that does not parse, userinfo the parser does not read as written
+(the message says to percent-encode it or use the `username` and `password`
+fields), and a `timeout_secs` outside 1–300. A whole config — the load,
+`POST /api/v1/config/reload`, `PUT /api/v1/config` and the WS
+`update_config` — is refused for none of them, because a config refused at
+load is a node that does not start, and a node that does not start has no
+manager connection to be fixed over:
+
+- `timeout_secs` outside 1–300 is clamped — 0 to 1, anything above 300 to
+  300 — with a Warning `config` event naming the input
+  (`rtsp_timeout_repaired`), and the load and the reload write the clamped
+  value back to `config.json`.
+- An `rtsps://` URL, a URL that does not parse, and misread userinfo are kept
+  as configured, with a Warning `config` event naming the input
+  (`rtsps_unsupported`, `rtsp_url_unparseable`, `rtsp_userinfo_misread`)
+  each time a whole config holding one is taken. An input whose URL is
+  `rtsps://` or does not parse raises one Critical `rtsp` event when it
+  starts and does not retry until its configuration changes. One whose
+  userinfo is misread connects to what the parser reads, which for an `@` in
+  a path or query is what was meant.
+
+**Upgrading** an edge whose `config.json` holds such an RTSP input:
+
+- `timeout_secs` 0 or above 300 — accepted and ignored by earlier releases —
+  no longer stops anything: the node starts, the value is clamped and written
+  back, and the input now gives up on a setup that takes longer. A value of
+  0 becomes 1 s, which a camera slower than that to answer will not meet; set
+  the value wanted.
+- An `rtsps://` input, which never connected, raises one Critical event at
+  each start instead of retrying every `reconnect_delay_secs`, and the
+  manager's next edit of it is refused until the URL is `rtsp://`.
+- An input whose userinfo the parser misreads runs as before, warned of; an
+  edit of it is refused until the userinfo is percent-encoded or moved into
+  `username` and `password` (and an `@` in a path or query encoded as `%40`).
 
 ### WebRTC/WHIP Input
 
