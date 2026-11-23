@@ -3096,7 +3096,7 @@ pub struct RtspInputConfig {
     /// Bound on a session's setup — connection, DESCRIBE, SETUP and PLAY —
     /// in seconds, 1-300 (default: 10). Past it the attempt is retried after
     /// `reconnect_delay_secs`. An edit refuses a value outside the range; a
-    /// whole config has it clamped (`repair_rtsp_inputs`).
+    /// whole config has it set to 300 (`repair_rtsp_inputs`).
     #[serde(default = "default_rtsp_timeout")]
     pub timeout_secs: u64,
     /// Reconnect delay in seconds after connection loss (default: 5).

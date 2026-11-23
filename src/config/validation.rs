@@ -708,9 +708,12 @@ pub fn validate_input_definition(def: &InputDefinition) -> Result<()> {
 }
 
 /// [`validate_input_definition`], plus what only an edit that names the
-/// input refuses: an RTSP input's `rtsp_url` that is `rtsps://`, that
-/// url::Url cannot read, or whose username and password it does not read as
-/// written ([`crate::engine::input_rtsp::RtspUrlProblem`]). Called by
+/// input refuses: an RTSP input's `rtsp_url` that is `rtsps://` or that
+/// url::Url cannot read ([`crate::engine::input_rtsp::RtspUrlProblem`]). A
+/// URL url::Url reads but whose password it may not read as written is not
+/// refused: the same text can be a port ahead of an `@` in a path or query,
+/// which plays as meant, so the input warns of it when it starts
+/// ([`crate::engine::input_rtsp::userinfo_may_be_misread`]). Called by
 /// `POST` / `PUT /api/v1/inputs` and the WS `create_input`, `update_input`
 /// and `add_input`. A whole config holding such an input is warned of
 /// instead ([`repair_rtsp_inputs`]): refused at load, it stopped the node.
@@ -1496,8 +1499,8 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             )?;
         }
         InputConfig::Rtsp(rtsp) => {
-            // `rtsps://`, and a URL url::Url does not read as written, pass
-            // here: this is also the boot gate, and a whole config keeps such
+            // `rtsps://`, and a URL url::Url cannot read, pass here: this
+            // is also the boot gate, and a whole config keeps such
             // an input with a Warning (`repair_rtsp_inputs`) rather than stop
             // the node. The edits that name the input refuse them
             // (`validate_input_edit`).
@@ -1515,7 +1518,7 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 && pass.len() > 256 {
                     bail!("RTSP input: password must be at most 256 characters");
                 }
-            // A whole config has it clamped into range first
+            // A whole config has it repaired first, to 300
             // (`repair_rtsp_inputs`): earlier releases read it nowhere.
             if !RTSP_TIMEOUT_SECS.contains(&rtsp.timeout_secs) {
                 bail!(
@@ -5098,7 +5101,7 @@ pub fn repair_aac_channel_counts(config: &mut crate::config::models::AppConfig) 
 /// The `timeout_secs` an RTSP input takes: the manager form's range.
 pub const RTSP_TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 1..=300;
 
-/// One RTSP input's `timeout_secs` [`repair_rtsp_inputs`] clamped.
+/// One RTSP input's `timeout_secs` [`repair_rtsp_inputs`] repaired.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepairedRtspTimeout {
     pub input_id: String,
@@ -5110,7 +5113,7 @@ pub struct RepairedRtspTimeout {
 /// and warns of.
 #[derive(Debug, Default)]
 pub struct RtspInputRepairs {
-    /// `timeout_secs` clamped into [`RTSP_TIMEOUT_SECS`].
+    /// `timeout_secs` outside [`RTSP_TIMEOUT_SECS`], set to its end.
     pub timeouts: Vec<RepairedRtspTimeout>,
     /// Inputs whose `rtsp_url` an edit naming them would refuse. Reported,
     /// not repaired — no rewrite of a URL keeps what it means (an
@@ -5132,9 +5135,10 @@ impl RtspInputRepairs {
         use crate::manager::events::{EventSeverity, category};
         for t in &self.timeouts {
             let message = format!(
-                "input '{}': timeout_secs {} is outside 1-300, so set to {}. It now bounds the RTSP \
-                 session setup (connection, DESCRIBE, SETUP, PLAY), past which the input retries; \
-                 earlier releases read it nowhere. Set another value if that is not the one wanted.",
+                "input '{}': timeout_secs {} is outside 1-300, so set to {}, the most time the bound \
+                 allows. It now bounds the RTSP session setup (connection, DESCRIBE, SETUP, PLAY), \
+                 past which the input retries; earlier releases read it nowhere. Set another value if \
+                 that is not the one wanted.",
                 t.input_id, t.was, t.now
             );
             tracing::warn!("{message}");
@@ -5152,13 +5156,9 @@ impl RtspInputRepairs {
             );
         }
         for (input_id, problem) in &self.url_problems {
-            let fate = if problem.is_fatal() {
-                "It is kept, and the input reports it and does not connect"
-            } else {
-                "It is kept, and the input connects to what the URL parser reads"
-            };
             let message = format!(
-                "input '{input_id}': {}. {fate}; an edit of the input is refused until it is changed.",
+                "input '{input_id}': {}. It is kept, and the input reports it and does not connect; \
+                 an edit of the input is refused until it is changed.",
                 problem.describe()
             );
             tracing::warn!("{message}");
@@ -5185,14 +5185,16 @@ impl RtspInputRepairs {
 /// route that takes a whole config runs this before validating — the load,
 /// `POST /api/v1/config/reload`, `PUT /api/v1/config` and the WS
 /// `update_config`, the first two writing the repair back to `config.json`
-/// — and the value is clamped into [`RTSP_TIMEOUT_SECS`] (0 to 1, past 300
-/// to 300).
+/// — and the value is set to 300, the end of [`RTSP_TIMEOUT_SECS`]. A
+/// value past 300 is brought down to it; 0, which bounded nothing, is
+/// given the most time the bound allows rather than its least: clamped to
+/// 1, an input that played on a camera slow to answer — or over a
+/// cellular or satellite path — stopped connecting at the upgrade.
 ///
-/// An `rtsp_url` that is `rtsps://`, that url::Url cannot read, or whose
-/// userinfo it misreads has no repair that keeps what it means, so the
-/// input is kept as it is and reported
-/// ([`crate::engine::input_rtsp::RtspUrlProblem`]). The edits that name an
-/// input still refuse both ([`validate_input_edit`]).
+/// An `rtsp_url` that is `rtsps://` or that url::Url cannot read has no
+/// repair that keeps what it means, so the input is kept as it is and
+/// reported ([`crate::engine::input_rtsp::RtspUrlProblem`]). The edits that
+/// name an input still refuse both ([`validate_input_edit`]).
 pub fn repair_rtsp_inputs(config: &mut crate::config::models::AppConfig) -> RtspInputRepairs {
     let mut repairs = RtspInputRepairs::default();
     for input in &mut config.inputs {
@@ -5200,8 +5202,8 @@ pub fn repair_rtsp_inputs(config: &mut crate::config::models::AppConfig) -> Rtsp
             continue;
         };
         let was = rtsp.timeout_secs;
-        let now = was.clamp(*RTSP_TIMEOUT_SECS.start(), *RTSP_TIMEOUT_SECS.end());
-        if now != was {
+        if !RTSP_TIMEOUT_SECS.contains(&was) {
+            let now = *RTSP_TIMEOUT_SECS.end();
             rtsp.timeout_secs = now;
             repairs.timeouts.push(RepairedRtspTimeout { input_id: input.id.clone(), was, now });
         }
@@ -16273,7 +16275,7 @@ mod tests {
 
     /// `timeout_secs` bounds the session setup: 1..=300, the manager form's
     /// range. 0 would give up on every attempt before it began. A whole
-    /// config has it clamped first (`repair_rtsp_inputs`).
+    /// config has it repaired first (`repair_rtsp_inputs`).
     #[test]
     fn rtsp_input_timeout_secs_is_bounded() {
         for secs in [1, 10, 300] {
@@ -16286,20 +16288,22 @@ mod tests {
         }
     }
 
-    /// An edit refuses an `rtsp_url` whose username and password url::Url
-    /// does not read as written — an unencoded `#`, `/` or `?` ends the
-    /// authority early, and the input dialled host `admin`, port 1234, or
-    /// failed "invalid port number" for good — telling the user to
-    /// percent-encode them or use the username and password fields, and
-    /// never printing them. Userinfo the parser reads as written, encoded or
-    /// not, is accepted: the input lifts it into the session's credentials.
+    /// An edit refuses an `rtsp_url` url::Url cannot read — an unencoded
+    /// `#` in a password ahead of a letter is read as a port that is not
+    /// one — telling the user to percent-encode or use the username and
+    /// password fields, and never printing the password. A URL url::Url
+    /// reads is accepted, whatever it reads of the userinfo: an `@` in a
+    /// path or query (`rtsp://cam/live?x@y`, `rtsp://mediaserver/live/cam@1`,
+    /// `rtsp://user:pw@cam/stream@1`) and a password read as a port
+    /// (`rtsp://admin:1234#5@cam/live`) are the same text, and the first
+    /// plays as meant, so an edit of an input holding one is not refused —
+    /// the input warns of the second when it starts
+    /// (`input_rtsp::userinfo_may_be_misread`).
     #[test]
-    fn an_edit_refuses_an_rtsp_url_whose_userinfo_is_not_read_as_written() {
+    fn an_edit_refuses_only_an_rtsp_url_the_parser_cannot_read() {
         for (url, secret) in [
-            ("rtsp://admin:1234#5@camera.local/live", "1234#5"),
-            ("rtsp://admin:1234/x@camera.local/live", "1234/x"),
-            ("rtsp://admin:5555?q@camera.local/live", "5555?q"),
             ("rtsp://admin:pa#ss@camera.local/live", "pa#ss"),
+            ("rtsp://admin:pa/ss@camera.local/live", "pa/ss"),
         ] {
             let def = rtsp_def("cam", serde_json::json!({ "rtsp_url": url }));
             let msg = validate_input_edit(&def).expect_err(url).to_string();
@@ -16311,17 +16315,26 @@ mod tests {
             "rtsp://admin:s3cret@camera.local/live",
             "rtsp://admin:1234%235@camera.local/live",
             "rtsp://ad%40min:p%2Fss@camera.local/live",
+            "rtsp://cam/live?x@y",
+            "rtsp://mediaserver/live/cam@1",
+            "rtsp://user:pw@cam/stream@1",
+            "rtsp://admin:1234#5@cam/live",
+            "rtsp://admin:1234/x@camera.local/live",
+            "rtsp://admin:5555?q@camera.local/live",
         ] {
             validate_input_edit(&rtsp_def("cam", serde_json::json!({ "rtsp_url": url }))).expect(url);
         }
     }
 
     /// A whole config an earlier release accepted — RTSP `timeout_secs` 0
-    /// and 600, which it read nowhere, an `rtsps://` input and a password
-    /// url::Url misreads — validates once repaired: the timeouts clamped to
-    /// 1 and 300, the URLs kept, and each reported as a Warning `config`
-    /// event naming the input. Only the clamps count as a repair to write
-    /// back.
+    /// and 600, which it read nowhere, an `rtsps://` input and a URL
+    /// url::Url cannot read — validates once repaired: both timeouts set to
+    /// 300 (0 bounded nothing, so it gets the most time the bound allows,
+    /// not the least), the URLs kept, and each reported as a Warning
+    /// `config` event naming the input. Only the timeouts count as a repair
+    /// to write back. A password url::Url may misread is not a config
+    /// matter: it is kept with no event here, and the input warns as it
+    /// starts.
     #[test]
     fn a_whole_config_has_its_rtsp_inputs_repaired_or_warned_of() {
         let mut config = crate::config::models::AppConfig {
@@ -16329,6 +16342,7 @@ mod tests {
                 rtsp_def("zero", serde_json::json!({"timeout_secs": 0})),
                 rtsp_def("long", serde_json::json!({"timeout_secs": 600})),
                 rtsp_def("tls", serde_json::json!({"rtsp_url": "rtsps://cam:hunter2@camera.local/s"})),
+                rtsp_def("bad", serde_json::json!({"rtsp_url": "rtsp://admin:pa#ss@camera.local/live"})),
                 rtsp_def("hash", serde_json::json!({"rtsp_url": "rtsp://admin:1234#5@camera.local/live"})),
                 rtsp_def("fine", serde_json::json!({"timeout_secs": 30})),
             ],
@@ -16339,16 +16353,19 @@ mod tests {
         let repairs = repair_rtsp_inputs(&mut config);
         validate_config(&config).expect("a repaired config validates, rtsps:// and all");
         let timeouts: Vec<_> = repairs.timeouts.iter().map(|t| (t.input_id.as_str(), t.was, t.now)).collect();
-        assert_eq!(timeouts, [("zero", 0, 1), ("long", 600, 300)]);
+        assert_eq!(timeouts, [("zero", 0, 300), ("long", 600, 300)]);
         let timeout = |id: &str| match &config.inputs.iter().find(|i| i.id == id).unwrap().config {
             InputConfig::Rtsp(r) => r.timeout_secs,
             _ => unreachable!(),
         };
-        assert_eq!((timeout("zero"), timeout("long"), timeout("fine")), (1, 300, 30));
+        assert_eq!((timeout("zero"), timeout("long"), timeout("fine")), (300, 300, 30));
         use crate::engine::input_rtsp::RtspUrlProblem;
         assert_eq!(
             repairs.url_problems,
-            [("tls".to_string(), RtspUrlProblem::Rtsps), ("hash".to_string(), RtspUrlProblem::UserinfoMisread)]
+            [
+                ("tls".to_string(), RtspUrlProblem::Rtsps),
+                ("bad".to_string(), RtspUrlProblem::Unparseable(url::ParseError::InvalidPort)),
+            ]
         );
 
         let (sender, mut events) = crate::manager::events::event_channel();
@@ -16364,15 +16381,15 @@ mod tests {
                 ("zero", "rtsp_timeout_repaired"),
                 ("long", "rtsp_timeout_repaired"),
                 ("tls", "rtsps_unsupported"),
-                ("hash", "rtsp_userinfo_misread"),
+                ("bad", "rtsp_url_unparseable"),
             ]
         );
         for e in &reported {
             assert_eq!((e.severity, e.category.as_str()), (crate::manager::events::EventSeverity::Warning, "config"));
-            assert!(!e.message.contains("hunter2") && !e.message.contains("1234#5"), "{}", e.message);
+            assert!(!e.message.contains("hunter2") && !e.message.contains("pa#ss"), "{}", e.message);
         }
         assert_eq!(reported[0].details.as_ref().unwrap()["was"], 0);
-        assert_eq!(reported[0].details.as_ref().unwrap()["now"], 1);
+        assert_eq!(reported[0].details.as_ref().unwrap()["now"], 300);
 
         let again = repair_rtsp_inputs(&mut config);
         assert!(again.is_empty() && again.url_problems.len() == 2, "nothing left to repair; the URLs still reported");

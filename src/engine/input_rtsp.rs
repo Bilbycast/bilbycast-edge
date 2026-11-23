@@ -122,7 +122,7 @@ async fn rtsp_input_loop(
     // such a URL; a whole config keeps it with a Warning
     // (`repair_rtsp_inputs`), so a node holding one still starts. A config
     // change respawns the input, which judges it afresh.
-    if let Some(problem) = RtspUrlProblem::of(&config.rtsp_url).filter(|p| p.is_fatal()) {
+    if let Some(problem) = RtspUrlProblem::of(&config.rtsp_url) {
         let message = format!(
             "RTSP input '{input_id}' cannot connect: {}. It is not retried until its \
              configuration changes",
@@ -142,6 +142,30 @@ async fn rtsp_input_loop(
             output_id: None,
         });
         return;
+    }
+    // A password url::Url may not read as written is played as read, and
+    // said once per start: the same text can be a port ahead of an `@` in a
+    // path or query, which plays as meant, so no edit refuses it.
+    if userinfo_may_be_misread(&config.rtsp_url) {
+        let message = format!(
+            "RTSP input '{input_id}': rtsp_url has a ':' before its last '@' that the URL parser \
+             does not read as a username and password, so the input takes no credentials from it and \
+             connects to the host and port the parser reads. If that text holds a password, \
+             {ENCODE_USERINFO}"
+        );
+        tracing::warn!("{message}");
+        event_sender.send(Event {
+            severity: EventSeverity::Warning,
+            category: category::RTSP.to_string(),
+            message,
+            details: Some(serde_json::json!({
+                "error_code": "rtsp_userinfo_misread",
+                "url": shown_url(&config.rtsp_url),
+            })),
+            flow_id: Some(flow_id.clone()),
+            input_id: Some(input_id.clone()),
+            output_id: None,
+        });
     }
     let reconnect_delay = std::time::Duration::from_secs(config.reconnect_delay_secs);
     // Track whether we need to emit a disconnect event. Set to true when
@@ -489,28 +513,32 @@ fn strip_userinfo(url: &mut url::Url) {
 
 /// The byte range of `rtsp_url` that [`shown_url`] and [`scrub`] hide:
 /// from just past its `://` (or its start, when it has none before the `@`)
-/// to its last `@`.
+/// to its last `@` — when a `:` lies in it.
 ///
 /// Found in the text, not by url::Url: an unencoded `#`, `/` or `?` in a
 /// password ends the authority early for the parser, which then reads
 /// `rtsp://admin:1234#5@cam/live` as host `admin`, port 1234 and no userinfo
 /// at all — and a redaction that cleared the parsed userinfo printed the
-/// password whole. Everything a URL can carry as userinfo, however it is
-/// written, lies before its last `@`. An `@` in a path or query hides the
-/// host and path ahead of it as well: hiding a host is the safe error.
+/// password whole. Only a `:` there can mean a password is there: with
+/// none, the `@` is a path's or a query's (`rtsp://cam/live?x@y`), or ends
+/// a username alone, and nothing is hidden. With one, a password may run to
+/// the last `@` — written unencoded, a `/`, `?` or `@` in it reads as a
+/// path's or query's — so all of it is hidden, and when that `@` is a path's
+/// or a query's (`rtsp://user:pw@cam/stream@1`) the host and path ahead of
+/// it with it: hiding a host is the safe error.
 fn secret_span(rtsp_url: &str) -> Option<std::ops::Range<usize>> {
     let at = rtsp_url.rfind('@')?;
     let start = match rtsp_url.find("://") {
         Some(i) if i + 3 <= at => i + 3,
         _ => 0,
     };
-    Some(start..at)
+    rtsp_url[start..at].contains(':').then_some(start..at)
 }
 
 /// `rtsp_url` as a log line, an event, the stats or the health may show it:
 /// without its userinfo, which is a camera's password as often as not —
-/// everything between its `://` and its last `@` is left out
-/// ([`secret_span`]).
+/// everything between its `://` and its last `@` is left out when a `:` lies
+/// there ([`secret_span`]).
 pub(crate) fn shown_url(rtsp_url: &str) -> String {
     match secret_span(rtsp_url) {
         Some(span) => format!("{}{}", &rtsp_url[..span.start], &rtsp_url[span.end + 1..]),
@@ -527,7 +555,7 @@ fn scrub(text: &str, rtsp_url: &str) -> String {
     }
 }
 
-/// What stops an `rtsp_url` being played as it is written.
+/// What stops an `rtsp_url` being played at all.
 ///
 /// The edits that name an input refuse each
 /// ([`crate::config::validation::validate_input_edit`]); a whole config — the
@@ -535,9 +563,11 @@ fn scrub(text: &str, rtsp_url: &str) -> String {
 /// the input and warns of it
 /// ([`crate::config::validation::repair_rtsp_inputs`]), since refusing it
 /// there stopped a node at boot, and a node that will not start has no
-/// manager WebSocket to be fixed over. Such an input that can never connect
-/// ([`Self::is_fatal`]) then fails once when it starts, rather than every
-/// `reconnect_delay_secs`.
+/// manager WebSocket to be fixed over. Such an input then fails once when
+/// it starts, rather than every `reconnect_delay_secs`.
+///
+/// A URL url::Url reads, but whose password it may not read as written, is
+/// not one of these: see [`userinfo_may_be_misread`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RtspUrlProblem {
     /// `rtsps://`: the RTSP client (retina) speaks no TLS.
@@ -545,12 +575,6 @@ pub enum RtspUrlProblem {
     /// url::Url cannot read it at all — `rtsp://admin:pa#ss@cam/live`
     /// is read as port `pa`.
     Unparseable(url::ParseError),
-    /// url::Url reads it, but not the text before its last `@` as the
-    /// username and password that text spells — `rtsp://admin:1234#5@cam/live`
-    /// is host `admin`, port 1234 and fragment `5@cam/live`. The same text
-    /// as an `@` in a path or query (`rtsp://cam/live?x@y`), which no parser
-    /// can tell from it.
-    UserinfoMisread,
 }
 
 impl RtspUrlProblem {
@@ -559,29 +583,14 @@ impl RtspUrlProblem {
         if rtsp_url.starts_with("rtsps://") {
             return Some(Self::Rtsps);
         }
-        let url = match url::Url::parse(rtsp_url) {
-            Ok(url) => url,
-            Err(e) => return Some(Self::Unparseable(e)),
-        };
-        let written = &rtsp_url[secret_span(rtsp_url)?];
-        let (user, pass) = written.split_once(':').unwrap_or((written, ""));
-        let decode = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned();
-        let read_as_written =
-            decode(url.username()) == decode(user) && decode(url.password().unwrap_or_default()) == decode(pass);
-        (!read_as_written).then_some(Self::UserinfoMisread)
+        url::Url::parse(rtsp_url).err().map(Self::Unparseable)
     }
 
     /// Why, for a refusal, a log line or an event. Never quotes the URL.
     pub fn describe(self) -> String {
-        const ENCODE: &str = "percent-encode a '#', '/', '?' or '@' in a username or password \
-                              (%23, %2F, %3F, %40), or put them in the username and password fields";
         match self {
             Self::Rtsps => "rtsp_url: rtsps:// (RTSP over TLS) is not supported; use rtsp://".to_string(),
-            Self::Unparseable(e) => format!("rtsp_url is not a URL the RTSP client can read ({e}): {ENCODE}"),
-            Self::UserinfoMisread => format!(
-                "rtsp_url: the text before its last '@' is not read as the username and password it \
-                 spells: {ENCODE}; an '@' in the path or query reads the same way, so encode it as %40"
-            ),
+            Self::Unparseable(e) => format!("rtsp_url is not a URL the RTSP client can read ({e}): {ENCODE_USERINFO}"),
         }
     }
 
@@ -590,16 +599,28 @@ impl RtspUrlProblem {
         match self {
             Self::Rtsps => "rtsps_unsupported",
             Self::Unparseable(_) => "rtsp_url_unparseable",
-            Self::UserinfoMisread => "rtsp_userinfo_misread",
         }
     }
+}
 
-    /// Whether an input with this URL can never connect. One whose userinfo
-    /// is misread still connects to what url::Url reads, which for an `@` in
-    /// a path or query is what was meant.
-    pub fn is_fatal(self) -> bool {
-        !matches!(self, Self::UserinfoMisread)
-    }
+/// What a user is told to do about a password a URL parser misreads.
+const ENCODE_USERINFO: &str = "percent-encode a '#', '/', '?' or '@' in a username or password \
+                               (%23, %2F, %3F, %40), or put them in the username and password fields";
+
+/// Whether `rtsp_url` may carry a password url::Url does not read: a `:`
+/// lies between its `://` and its last `@` ([`secret_span`]), yet url::Url
+/// reads no username or password at all. `rtsp://admin:1234#5@cam/live` is
+/// such a URL — read as host `admin`, port 1234 and fragment `5@cam/live` —
+/// and so is a port ahead of an `@` in a path or query
+/// (`rtsp://cam:554/live?x@y`), which plays as meant; no parser can tell the
+/// two apart. So neither is refused: the input connects to what url::Url
+/// reads and warns once as it starts, telling the operator to percent-encode
+/// a password. One url::Url reads a username in
+/// (`rtsp://user:pw@cam/stream@1`) is not flagged: its credentials are
+/// presented as read.
+pub(crate) fn userinfo_may_be_misread(rtsp_url: &str) -> bool {
+    secret_span(rtsp_url).is_some()
+        && url::Url::parse(rtsp_url).is_ok_and(|url| url.username().is_empty() && url.password().is_none())
 }
 
 /// A retina frame's PES timestamp (90 kHz): its time since the stream's
@@ -632,11 +653,13 @@ mod tests {
     }
 
     /// What a log line, an event or the stats show of the URL leaves out
-    /// everything between its `://` and its last `@`, whether or not
-    /// url::Url reads that as userinfo. A digits-first password with an
-    /// unencoded `#`, `/` or `?` parses, as host `admin` and port 1234 with
-    /// no userinfo at all, and a redaction that cleared the parsed userinfo
-    /// printed it whole; one that does not parse (`s3/cret`) is cut too.
+    /// everything between its `://` and its last `@` when a `:` lies there,
+    /// whether or not url::Url reads that as userinfo. A digits-first
+    /// password with an unencoded `#`, `/` or `?` parses, as host `admin`
+    /// and port 1234 with no userinfo at all, and a redaction that cleared
+    /// the parsed userinfo printed it whole; one that does not parse
+    /// (`s3/cret`) is cut too. With no `:` there, no password can be, and
+    /// the URL is shown as it is.
     #[test]
     fn a_shown_url_never_carries_its_userinfo() {
         for (url, shown, secret) in [
@@ -651,33 +674,45 @@ mod tests {
             ),
             ("rtsp://ad%40min:p%3Ass@camera.local/live", "rtsp://camera.local/live", "p%3Ass"),
             ("rtsp://ad@min:pw1@camera.local/live", "rtsp://camera.local/live", "pw1"),
-            ("rtsp://admin@camera.local/live", "rtsp://camera.local/live", "admin"),
+            ("rtsp://:hunter2@camera.local/live", "rtsp://camera.local/live", "hunter2"),
             ("rtsps://admin:hunter2@camera.local/s", "rtsps://camera.local/s", "hunter2"),
             ("admin:hunter2@camera.local/s", "camera.local/s", "hunter2"),
+            // An `@` in the path after a password: hidden to it, the host
+            // with it — the safe way to be wrong.
+            ("rtsp://user:pw@cam/stream@1", "rtsp://1", "pw"),
         ] {
             assert_eq!(shown_url(url), shown, "{url}");
             assert!(!shown_url(url).contains(secret), "{url}");
         }
-        // No `@`, nothing hidden.
-        assert_eq!(shown_url("rtsp://camera.local:554/live"), "rtsp://camera.local:554/live");
-        // An `@` in a path or query reads the same as a misplaced password:
-        // the host ahead of it is hidden too, the safe way to be wrong.
-        assert_eq!(shown_url("rtsp://camera.local/live?token=ab@cd"), "rtsp://cd");
+        // No `:` before the last `@`: no password, nothing hidden — an `@`
+        // in a path or query, or after a username alone.
+        for url in [
+            "rtsp://camera.local:554/live",
+            "rtsp://cam/live?x@y",
+            "rtsp://mediaserver/live/cam@1",
+            "rtsp://admin@camera.local/live",
+        ] {
+            assert_eq!(shown_url(url), url);
+        }
+        // A port ahead of an `@` in a query reads the same as a misplaced
+        // password: hidden.
+        assert_eq!(shown_url("rtsp://camera.local:554/live?token=ab@cd"), "rtsp://cd");
     }
 
-    /// An error that quotes the URL loses what [`shown_url`] hides.
+    /// An error that quotes the URL loses what [`shown_url`] hides, and
+    /// nothing when it hides nothing.
     #[test]
     fn an_error_is_scrubbed_of_the_userinfo() {
         let url = "rtsp://admin:1234#5@cam/live";
         assert_eq!(scrub("Must specify host in rtsp url rtsp://admin:1234#5@cam/live", url), "Must specify host in rtsp url rtsp://@cam/live");
         assert_eq!(scrub("RTSP stream ended", url), "RTSP stream ended");
         assert_eq!(scrub("RTSP stream ended", "rtsp://cam/live"), "RTSP stream ended");
+        assert_eq!(scrub("404 for rtsp://cam/live?x@y", "rtsp://cam/live?x@y"), "404 for rtsp://cam/live?x@y");
     }
 
-    /// The URLs an input cannot play as written, and why — never quoting
-    /// the URL — and those it can, percent-encoded userinfo, an unencoded
-    /// `@` in the username and a `:` in the password included (url::Url
-    /// reads those as written).
+    /// The URLs an input can never play, and why — never quoting the URL:
+    /// `rtsps://` and what url::Url cannot read. A URL it reads is not one,
+    /// whatever it reads of the userinfo.
     #[test]
     fn an_rtsp_url_problem_is_found_in_the_text() {
         use RtspUrlProblem::*;
@@ -685,18 +720,15 @@ mod tests {
             ("rtsps://admin:hunter2@camera.local/s", Some(Rtsps)),
             ("rtsps://camera.local/s", Some(Rtsps)),
             ("rtsp://admin:pa#ss@cam/live", Some(Unparseable(url::ParseError::InvalidPort))),
-            ("rtsp://admin:1234#5@cam/live", Some(UserinfoMisread)),
-            ("rtsp://admin:1234/x@cam/live", Some(UserinfoMisread)),
-            ("rtsp://admin:5555?q@cam/live", Some(UserinfoMisread)),
-            ("rtsp://cam/live?token=ab@cd", Some(UserinfoMisread)),
+            ("rtsp://admin:1234#5@cam/live", None),
+            ("rtsp://admin:1234/x@cam/live", None),
+            ("rtsp://admin:5555?q@cam/live", None),
+            ("rtsp://cam/live?x@y", None),
+            ("rtsp://mediaserver/live/cam@1", None),
+            ("rtsp://user:pw@cam/stream@1", None),
             ("rtsp://camera.local:554/live", None),
             ("rtsp://admin:s3cret@camera.local:554/live", None),
-            ("rtsp://admin@camera.local/live", None),
             ("rtsp://ad%40min:p%23ss%2Fw%3F@camera.local/live", None),
-            ("rtsp://ad@min:pw@camera.local/live", None),
-            ("rtsp://admin:a:b@camera.local/live", None),
-            ("rtsp://admin:@camera.local/live", None),
-            ("rtsp://admin:pw@[::1]:554/live", None),
         ] {
             let got = RtspUrlProblem::of(url);
             assert_eq!(got, want, "{url}");
@@ -705,8 +737,107 @@ mod tests {
                 assert!(!said.contains(&url["rtsp://".len()..]) && !said.contains("hunter2"), "{said}");
             }
         }
-        assert!(Rtsps.is_fatal() && Unparseable(url::ParseError::InvalidPort).is_fatal());
-        assert!(!UserinfoMisread.is_fatal(), "it connects to what url::Url reads");
+    }
+
+    /// A URL whose password url::Url may not read as written: a `:` before
+    /// the last `@` and no username or password read. A port ahead of an
+    /// `@` in a query is the same text, and flagged with it. No `:`, or
+    /// userinfo url::Url reads — however much of the rest it puts in the
+    /// path — is not.
+    #[test]
+    fn a_password_the_parser_may_misread_is_found() {
+        for (url, want) in [
+            ("rtsp://admin:1234#5@cam/live", true),
+            ("rtsp://admin:1234/x@cam/live", true),
+            ("rtsp://admin:5555?q@cam/live", true),
+            ("rtsp://cam:554/live?x@y", true),
+            ("rtsp://cam/live?x@y", false),
+            ("rtsp://mediaserver/live/cam@1", false),
+            ("rtsp://user:pw@cam/stream@1", false),
+            ("rtsp://admin:s3cret@camera.local:554/live", false),
+            ("rtsp://:pw@camera.local/live", false),
+            ("rtsp://admin@camera.local/live", false),
+            ("rtsp://ad@min:pw@camera.local/live", false),
+            ("rtsp://admin:a:b@camera.local/live", false),
+            ("rtsp://admin:pw@[::1]:554/live", false),
+            ("rtsp://camera.local:554/live", false),
+            ("rtsp://admin:pa#ss@cam/live", false),
+        ] {
+            assert_eq!(userinfo_may_be_misread(url), want, "{url}");
+        }
+    }
+
+    /// An input whose password url::Url may misread is not refused: it
+    /// warns once as it starts — a Warning `rtsp` event naming the flow and
+    /// the input, with the redacted URL, telling the operator to
+    /// percent-encode the password and never quoting it — and connects to
+    /// what url::Url reads, retrying as any input does with no second
+    /// Warning. One url::Url reads userinfo in is not warned of.
+    #[tokio::test]
+    async fn a_password_the_parser_may_misread_is_warned_of_once() {
+        let run = async |url: String, accepts: usize| {
+            let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = url.replace("ADDR", &server.local_addr().unwrap().to_string());
+            let cfg = config(serde_json::json!({ "rtsp_url": url, "timeout_secs": 1, "reconnect_delay_secs": 1 }));
+            let (tx, _rx) = broadcast::channel(16);
+            let stats = Arc::new(FlowStatsAccumulator::new("f".into(), "flow".into(), "rtsp".into()));
+            let cancel = CancellationToken::new();
+            let (events, mut raised) = crate::manager::events::event_channel();
+            let input = spawn_rtsp_input(
+                cfg, tx, stats, cancel.clone(), events, "f".into(), "in".into(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)), None,
+            );
+            // Each connection taken and dropped: the setup fails, and the
+            // input retries after `reconnect_delay_secs`.
+            for _ in 0..accepts {
+                let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), server.accept()).await;
+                drop(accepted.expect("the input dials the host and port url::Url reads").unwrap());
+            }
+            cancel.cancel();
+            tokio::time::timeout(std::time::Duration::from_secs(2), input).await.expect("a cancel ends the input").unwrap();
+            std::iter::from_fn(|| raised.try_recv().ok()).collect::<Vec<_>>()
+        };
+
+        // `127.0.0.1:<port>#5` is a user and a password to the eye and a
+        // host, a port and a fragment to url::Url: dialled as read.
+        let raised = run("rtsp://ADDR#5@cam/live".into(), 2).await;
+        let warned: Vec<_> = raised.iter().filter(|e| e.severity == EventSeverity::Warning).collect();
+        assert_eq!(warned.len(), 1, "one Warning per start, not per attempt: {raised:?}");
+        let event = warned[0];
+        assert_eq!(event.category, "rtsp");
+        assert_eq!((event.flow_id.as_deref(), event.input_id.as_deref()), (Some("f"), Some("in")));
+        let details = event.details.as_ref().unwrap();
+        assert_eq!(details["error_code"], "rtsp_userinfo_misread");
+        assert_eq!(details["url"], "rtsp://cam/live");
+        assert!(event.message.contains("percent-encode") && !event.message.contains("#5"), "{}", event.message);
+
+        // The URL the review named: warned of, the password never shown.
+        // Its host is `admin`, so the Warning — raised before the dial —
+        // is all that is waited for.
+        let cfg = config(serde_json::json!({ "rtsp_url": "rtsp://admin:1234#5@cam/live", "reconnect_delay_secs": 1 }));
+        let (tx, _rx) = broadcast::channel(16);
+        let stats = Arc::new(FlowStatsAccumulator::new("f".into(), "flow".into(), "rtsp".into()));
+        let cancel = CancellationToken::new();
+        let (events, mut raised) = crate::manager::events::event_channel();
+        let input = spawn_rtsp_input(
+            cfg, tx, stats, cancel.clone(), events, "f".into(), "in".into(),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)), None,
+        );
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), raised.recv())
+            .await
+            .expect("the Warning comes at the start")
+            .unwrap();
+        cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), input).await.expect("a cancel ends the input").unwrap();
+        assert_eq!((event.severity, event.details.as_ref().unwrap()["error_code"].as_str()), (EventSeverity::Warning, Some("rtsp_userinfo_misread")));
+        assert_eq!(event.details.as_ref().unwrap()["url"], "rtsp://cam/live");
+        let all = format!("{event:?} {:?}", std::iter::from_fn(|| raised.try_recv().ok()).collect::<Vec<_>>());
+        assert!(!all.contains("1234#5") && !all.contains(":1234"), "{all}");
+
+        // Userinfo url::Url reads, ahead of an `@` in the path: dialled,
+        // not warned of.
+        let raised = run("rtsp://user:pw@ADDR/stream@1".into(), 1).await;
+        assert!(raised.iter().all(|e| e.severity != EventSeverity::Warning), "{raised:?}");
     }
 
     /// An input whose URL can never be played fails once — one Critical

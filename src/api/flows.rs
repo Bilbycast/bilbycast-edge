@@ -1467,7 +1467,8 @@ mod whole_config_tests {
         serde_json::from_value(config).expect("config fixture")
     }
 
-    /// The timeouts clamped in memory and on disk, the URL kept, and both
+    /// The timeouts set to 300 in memory and on disk — 0 bounded nothing,
+    /// so it gets the most time the bound allows — the URL kept, and both
     /// reported.
     async fn assert_rtsp_repaired(state: &AppState, events: &mut mpsc::Receiver<Event>) {
         let kept: Vec<_> = state
@@ -1483,11 +1484,11 @@ mod whole_config_tests {
             .collect();
         assert_eq!(
             kept,
-            [("rtsp://camera.local/s".to_string(), 1), ("rtsps://camera.local/s".to_string(), 300)]
+            [("rtsp://camera.local/s".to_string(), 300), ("rtsps://camera.local/s".to_string(), 300)]
         );
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&state.config_path).expect("persisted")).expect("json");
-        assert_eq!((saved["inputs"][0]["timeout_secs"].as_u64(), saved["inputs"][1]["timeout_secs"].as_u64()), (Some(1), Some(300)));
+        assert_eq!((saved["inputs"][0]["timeout_secs"].as_u64(), saved["inputs"][1]["timeout_secs"].as_u64()), (Some(300), Some(300)));
         assert_eq!(saved["inputs"][1]["rtsp_url"], "rtsps://camera.local/s");
         let codes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
             .filter_map(|e| Some((e.input_id?, e.details?["error_code"].as_str()?.to_string())))
@@ -1497,7 +1498,7 @@ mod whole_config_tests {
         }
     }
 
-    /// `POST /api/v1/config/reload` of such a config: clamped, written back,
+    /// `POST /api/v1/config/reload` of such a config: repaired, written back,
     /// kept and reported. It was refused with 400.
     #[tokio::test]
     async fn reload_repairs_rtsp_timeouts_and_keeps_rtsps() {
@@ -1510,7 +1511,7 @@ mod whole_config_tests {
         assert_rtsp_repaired(&state, &mut events).await;
     }
 
-    /// `PUT /api/v1/config` of such a config: clamped, saved, kept and
+    /// `PUT /api/v1/config` of such a config: repaired, saved, kept and
     /// reported. It was refused with 400.
     #[tokio::test]
     async fn put_config_repairs_rtsp_timeouts_and_keeps_rtsps() {

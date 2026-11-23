@@ -8654,12 +8654,13 @@ mod reserved_input_id_tests {
     }
 
     /// The WS commands that name an input — `create_input`, `update_input`,
-    /// `add_input` — refuse an RTSP input's `rtsps://`, an `rtsp_url` whose
-    /// password url::Url misreads, and a `timeout_secs` outside 1-300, with
+    /// `add_input` — refuse an RTSP input's `rtsps://`, an `rtsp_url`
+    /// url::Url cannot read, and a `timeout_secs` outside 1-300, with
     /// `validation_error` and nothing saved; `update_config`, which takes a
     /// whole config — a manager may be replaying what it cached before the
-    /// upgrade — keeps the URLs, clamps the timeout, saves and warns. It
-    /// refused the push for any of them.
+    /// upgrade — keeps the URLs, sets the timeout to 300, saves and warns.
+    /// It refused the push for any of them. A URL url::Url reads is
+    /// created and edited whatever it reads of a userinfo.
     #[tokio::test]
     async fn input_edits_refuse_what_a_whole_config_keeps_of_an_rtsp_input() {
         let (event_sender, mut events) = crate::manager::events::event_channel();
@@ -8698,7 +8699,7 @@ mod reserved_input_id_tests {
         };
         let refused = [
             rtsp("cam", "rtsps://camera.local/s", 10),
-            rtsp("cam", "rtsp://admin:1234#5@camera.local/s", 10),
+            rtsp("cam", "rtsp://admin:pa#ss@camera.local/s", 10),
             rtsp("cam", "rtsp://camera.local/s", 0),
         ];
         for input in &refused {
@@ -8709,15 +8710,23 @@ mod reserved_input_id_tests {
             ] {
                 let err = run(action, body).await.expect_err(action);
                 assert_eq!(err.code.as_deref(), Some("validation_error"), "{action}: {}", err.message);
-                assert!(!err.message.contains("1234#5"), "{}", err.message);
+                assert!(!err.message.contains("pa#ss"), "{}", err.message);
             }
         }
         assert!(cfg.read().await.inputs.is_empty(), "nothing saved");
 
+        for url in ["rtsp://user:pw@camera.local/stream@1", "rtsp://admin:1234#5@camera.local/s"] {
+            run("create_input", serde_json::json!({ "input": rtsp("amb", url, 10) })).await.expect(url);
+            let renamed = serde_json::json!({ "id": "amb", "name": "renamed", "type": "rtsp", "rtsp_url": url });
+            run("update_input", serde_json::json!({ "input_id": "amb", "input": renamed })).await.expect(url);
+            assert_eq!(cfg.read().await.inputs.iter().find(|i| i.id == "amb").map(|i| i.name.as_str()), Some("renamed"));
+            cfg.write().await.inputs.clear();
+        }
+
         let mut push = serde_json::to_value(AppConfig::default()).expect("serialise");
         push["inputs"] = serde_json::json!([
             rtsp("tls", "rtsps://camera.local/s", 10),
-            rtsp("hash", "rtsp://admin:1234#5@camera.local/s", 10),
+            rtsp("bad", "rtsp://admin:pa#ss@camera.local/s", 10),
             rtsp("zero", "rtsp://camera.local/s", 0),
         ]);
         run("update_config", serde_json::json!({ "config": push })).await.expect("a whole config is kept");
@@ -8730,14 +8739,14 @@ mod reserved_input_id_tests {
             kept.iter().map(rtsp_of).collect::<Vec<_>>(),
             [
                 ("rtsps://camera.local/s".to_string(), 10),
-                ("rtsp://admin:1234#5@camera.local/s".to_string(), 10),
-                ("rtsp://camera.local/s".to_string(), 1),
+                ("rtsp://admin:pa#ss@camera.local/s".to_string(), 10),
+                ("rtsp://camera.local/s".to_string(), 300),
             ]
         );
         let codes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
             .filter_map(|e| Some((e.input_id?, e.details?["error_code"].as_str()?.to_string())))
             .collect();
-        for want in [("tls", "rtsps_unsupported"), ("hash", "rtsp_userinfo_misread"), ("zero", "rtsp_timeout_repaired")] {
+        for want in [("tls", "rtsps_unsupported"), ("bad", "rtsp_url_unparseable"), ("zero", "rtsp_timeout_repaired")] {
             assert!(codes.iter().any(|(i, c)| (i.as_str(), c.as_str()) == want), "{want:?} in {codes:?}");
         }
     }

@@ -365,9 +365,12 @@ mod update_input_tests {
     }
 
     /// `POST` and `PUT /api/v1/inputs` refuse an RTSP input's `rtsps://`,
-    /// an `rtsp_url` whose password url::Url misreads, and a `timeout_secs`
-    /// outside 1-300 with 400, nothing saved — what a whole config keeps
-    /// and warns of (`repair_rtsp_inputs`).
+    /// an `rtsp_url` url::Url cannot read, and a `timeout_secs` outside
+    /// 1-300 with 400, nothing saved — what a whole config keeps and warns
+    /// of (`repair_rtsp_inputs`). A URL url::Url reads stays editable,
+    /// whatever it reads of a userinfo: an `@` in a path after a password,
+    /// or a password read as a port (the input warns of that one as it
+    /// starts).
     #[tokio::test]
     async fn post_and_put_refuse_an_unplayable_rtsp_input() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -381,18 +384,29 @@ mod update_input_tests {
         state.config.write().await.inputs.push(ok.clone());
         for (edit, says) in [
             (rtsp("rtsps://camera.local/s", 10), "rtsps://"),
-            (rtsp("rtsp://admin:1234#5@camera.local/s", 10), "percent-encode"),
+            (rtsp("rtsp://admin:pa#ss@camera.local/s", 10), "percent-encode"),
             (rtsp("rtsp://camera.local/s", 0), "timeout_secs"),
         ] {
             let posted = create_input(State(state.clone()), RequireAdmin, Json(InputDefinition { id: "cam2".into(), ..edit.clone() })).await;
-            assert!(matches!(&posted, Err(ApiError::BadRequest(m)) if m.contains(says) && !m.contains("1234#5")), "POST {says}");
+            assert!(matches!(&posted, Err(ApiError::BadRequest(m)) if m.contains(says) && !m.contains("pa#ss")), "POST {says}");
             let put = put(&state, edit).await;
-            assert!(matches!(&put, Err(ApiError::BadRequest(m)) if m.contains(says) && !m.contains("1234#5")), "PUT {says}");
+            assert!(matches!(&put, Err(ApiError::BadRequest(m)) if m.contains(says) && !m.contains("pa#ss")), "PUT {says}");
         }
         let config = state.config.read().await;
         assert!(!config.inputs.iter().any(|i| i.id == "cam2"), "nothing created");
         assert_eq!(config.inputs.iter().find(|i| i.id == "cam"), Some(&ok), "nothing edited");
         drop(config);
+
+        for url in ["rtsp://user:pw@camera.local/stream@1", "rtsp://admin:1234#5@camera.local/s", "rtsp://cam/live?x@y"] {
+            let edit = rtsp(url, 10);
+            put(&state, edit.clone()).await.unwrap_or_else(|_| panic!("PUT {url}"));
+            let config = state.config.read().await;
+            assert_eq!(config.inputs.iter().find(|i| i.id == "cam"), Some(&edit), "{url} saved");
+        }
+        let created = create_input(State(state.clone()), RequireAdmin, Json(InputDefinition { id: "cam2".into(), ..rtsp("rtsp://mediaserver/live/cam@1", 10) }))
+            .await
+            .unwrap_or_else(|_| panic!("POST of an `@` in the path"));
+        assert_eq!(created.0.data.map(|i| i.id).as_deref(), Some("cam2"));
         let _ = state.flow_manager.destroy_flow("f1").await;
     }
 
