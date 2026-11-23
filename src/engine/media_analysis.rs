@@ -2524,19 +2524,40 @@ mod tests {
         assert!(readings.iter().all(|r| r.2 != Some(RateNote::Changing)), "never restarted");
     }
 
-    /// Capture-clock jitter of up to half a frame (Chromium's stamps)
-    /// neither moves the rate more than 0.5 % once the windows are full nor
-    /// notes a change: one INFO line for ten minutes, where a window's
-    /// measurement 3 % off would have noted one every 2 s.
+    /// Capture-clock jitter — Chromium's stamps, steps of 1 440 to 4 560
+    /// ticks, and stamps ±10 ms off a 30 fps grid at random — neither moves
+    /// the rate more than 0.5 % once the windows are full nor notes a
+    /// change: one INFO line in ten minutes. The ±10 ms stamps move the
+    /// 10 s rate by up to 0.2 %, past the 0.05 % a steady source's change is
+    /// noted at, so only the windows' own spread (up to 1 %) keeps it from
+    /// noting one every minute.
     #[test]
     fn jitter_does_not_flap_the_rate() {
-        let jitter = [3_060, 2_970, 2_970, 3_150, 2_880, 1_440, 4_560, 2_970];
-        let readings = meter_readings(jitter.into_iter().cycle().take(30 * 600));
-        for &(at, fps, _) in readings.iter().filter(|r| r.0 >= 10.0) {
-            assert!((fps / 30.0 - 1.0).abs() < 0.005, "{at:.1} s: {fps}");
+        let chromium = [3_060, 2_970, 2_970, 3_150, 2_880, 1_440, 4_560, 2_970];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut jitter = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % 1_801) as i64 - 900
+        };
+        let mut previous = jitter();
+        let grid: Vec<u64> = (0..30 * 600)
+            .map(|_| {
+                let next = jitter();
+                let step = 3_000 + next - previous;
+                previous = next;
+                step as u64
+            })
+            .collect();
+        for steps in [chromium.into_iter().cycle().take(30 * 600).collect(), grid] {
+            let readings = meter_readings(steps);
+            for &(at, fps, _) in readings.iter().filter(|r| r.0 >= 10.0) {
+                assert!((fps / 30.0 - 1.0).abs() < 0.005, "{at:.1} s: {fps}");
+            }
+            assert_eq!(settled(&readings).len(), 1, "{:?}", settled(&readings));
+            assert!(readings.iter().all(|r| r.2 != Some(RateNote::Changing)));
         }
-        assert_eq!(settled(&readings).len(), 1, "{:?}", settled(&readings));
-        assert!(readings.iter().all(|r| r.2 != Some(RateNote::Changing)));
     }
 
     /// A variable-rate source flipping between 30 and 24 fps every 4 s
