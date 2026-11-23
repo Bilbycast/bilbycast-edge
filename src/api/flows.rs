@@ -738,7 +738,9 @@ pub async fn get_config(
 /// refuses is repaired first, as at load
 /// ([`crate::config::validation::repair_hitless_slots`]), and reported; so is
 /// an AAC channel count the encoder has no mode for
-/// ([`crate::config::validation::repair_aac_channel_counts`]).
+/// ([`crate::config::validation::repair_aac_channel_counts`]), and an RTSP
+/// `timeout_secs` outside 1-300 ([`crate::config::validation::repair_rtsp_inputs`],
+/// which also reports an `rtsp_url` an edit of the input would refuse).
 ///
 /// # Infrastructure secrets
 ///
@@ -814,11 +816,12 @@ pub async fn replace_config(
     // for its nulls: see "Infrastructure secrets" above.
     let mut new_config =
         AppConfig::deserialize(&body).map_err(|e| ApiError::BadRequest(format!("not a valid config: {e}")))?;
-    // A whole config repairs the Hitless slots and AAC channel counts
-    // earlier releases accepted rather than being refused for them, as at
-    // load.
+    // A whole config repairs the Hitless slots, AAC channel counts and RTSP
+    // timeouts earlier releases accepted rather than being refused for them,
+    // as at load.
     let repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
     let aac_repairs = crate::config::validation::repair_aac_channel_counts(&mut new_config);
+    let rtsp_repairs = crate::config::validation::repair_rtsp_inputs(&mut new_config);
 
     // Held from here to the swap: see "Infrastructure secrets" above.
     let mut config = state.config.write().await;
@@ -829,6 +832,7 @@ pub async fn replace_config(
     validate_changed_tunnels(&config.tunnels, &new_config.tunnels)?;
     repairs.report(state.flow_manager.event_sender());
     aac_repairs.report(state.flow_manager.event_sender());
+    rtsp_repairs.report(state.flow_manager.event_sender());
 
     // Stop all running flows
     state.flow_manager.stop_all().await;
@@ -897,9 +901,10 @@ fn validate_changed_tunnels(
 /// currently running flows, replaces the in-memory config with the disk version,
 /// and starts all flows that have `enabled: true`. This is useful after manual
 /// edits to the config file or after deploying a new config via external tooling.
-/// Its Hitless slots and AAC channel counts are repaired as at load
-/// ([`crate::config::validation::repair_hitless_slots`],
-/// [`crate::config::validation::repair_aac_channel_counts`]), the repair written
+/// Its Hitless slots, AAC channel counts and RTSP timeouts are repaired as at
+/// load ([`crate::config::validation::repair_hitless_slots`],
+/// [`crate::config::validation::repair_aac_channel_counts`],
+/// [`crate::config::validation::repair_rtsp_inputs`]), the repair written
 /// back to the file and reported.
 ///
 /// # Errors
@@ -919,8 +924,9 @@ pub async fn reload_config(
     // Repaired, and the repair written back, as at load.
     let repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
     let aac_repairs = crate::config::validation::repair_aac_channel_counts(&mut new_config);
+    let rtsp_repairs = crate::config::validation::repair_rtsp_inputs(&mut new_config);
     validate_config(&new_config).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if !(repairs.is_empty() && aac_repairs.is_empty())
+    if !(repairs.is_empty() && aac_repairs.is_empty() && rtsp_repairs.is_empty())
         && let Err(e) = save_config_split_async(
             state.config_path.clone(),
             state.secrets_path.clone(),
@@ -936,6 +942,7 @@ pub async fn reload_config(
     }
     repairs.report(state.flow_manager.event_sender());
     aac_repairs.report(state.flow_manager.event_sender());
+    rtsp_repairs.report(state.flow_manager.event_sender());
 
     // Stop all running flows
     state.flow_manager.stop_all().await;
@@ -1446,6 +1453,73 @@ mod whole_config_tests {
         let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
         assert!(replaced.is_ok(), "a whole config is repaired, not refused: {}", refusal(replaced));
         assert_repaired(&state, &mut events).await;
+    }
+
+    /// A config an earlier release accepted with RTSP inputs an edit now
+    /// refuses: `timeout_secs` 0 and 600, which it read nowhere, and an
+    /// `rtsps://` URL, which never connected.
+    fn pre_upgrade_rtsp_config() -> AppConfig {
+        let mut config = serde_json::to_value(AppConfig::default()).expect("serialise");
+        config["inputs"] = serde_json::json!([
+            { "id": "cam-a", "name": "cam-a", "type": "rtsp", "rtsp_url": "rtsp://camera.local/s", "timeout_secs": 0 },
+            { "id": "cam-b", "name": "cam-b", "type": "rtsp", "rtsp_url": "rtsps://camera.local/s", "timeout_secs": 600 }
+        ]);
+        serde_json::from_value(config).expect("config fixture")
+    }
+
+    /// The timeouts clamped in memory and on disk, the URL kept, and both
+    /// reported.
+    async fn assert_rtsp_repaired(state: &AppState, events: &mut mpsc::Receiver<Event>) {
+        let kept: Vec<_> = state
+            .config
+            .read()
+            .await
+            .inputs
+            .iter()
+            .map(|i| match &i.config {
+                crate::config::models::InputConfig::Rtsp(r) => (r.rtsp_url.clone(), r.timeout_secs),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            [("rtsp://camera.local/s".to_string(), 1), ("rtsps://camera.local/s".to_string(), 300)]
+        );
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state.config_path).expect("persisted")).expect("json");
+        assert_eq!((saved["inputs"][0]["timeout_secs"].as_u64(), saved["inputs"][1]["timeout_secs"].as_u64()), (Some(1), Some(300)));
+        assert_eq!(saved["inputs"][1]["rtsp_url"], "rtsps://camera.local/s");
+        let codes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| Some((e.input_id?, e.details?["error_code"].as_str()?.to_string())))
+            .collect();
+        for want in [("cam-a", "rtsp_timeout_repaired"), ("cam-b", "rtsp_timeout_repaired"), ("cam-b", "rtsps_unsupported")] {
+            assert!(codes.iter().any(|(i, c)| (i.as_str(), c.as_str()) == want), "{want:?} in {codes:?}");
+        }
+    }
+
+    /// `POST /api/v1/config/reload` of such a config: clamped, written back,
+    /// kept and reported. It was refused with 400.
+    #[tokio::test]
+    async fn reload_repairs_rtsp_timeouts_and_keeps_rtsps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, mut events) = state(dir.path());
+        crate::config::persistence::save_config_split(&state.config_path, &state.secrets_path, &pre_upgrade_rtsp_config())
+            .expect("write the config to reload");
+        let reloaded = reload_config(RequireAdmin, State(state.clone())).await;
+        assert!(reloaded.is_ok(), "a whole config is repaired, not refused: {}", refusal(reloaded));
+        assert_rtsp_repaired(&state, &mut events).await;
+    }
+
+    /// `PUT /api/v1/config` of such a config: clamped, saved, kept and
+    /// reported. It was refused with 400.
+    #[tokio::test]
+    async fn put_config_repairs_rtsp_timeouts_and_keeps_rtsps() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, mut events) = state(dir.path());
+        let body = serde_json::to_value(pre_upgrade_rtsp_config()).expect("serialise");
+        let replaced = replace_config(RequireAdmin, State(state.clone()), Json(body)).await;
+        assert!(replaced.is_ok(), "a whole config is repaired, not refused: {}", refusal(replaced));
+        assert_rtsp_repaired(&state, &mut events).await;
     }
 
     // ── Infrastructure secrets ─────────────────────────────────────

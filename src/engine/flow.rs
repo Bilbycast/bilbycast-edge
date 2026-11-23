@@ -4589,7 +4589,7 @@ fn derive_audio_full_mode(
     }
 }
 
-fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::InputConfigMeta {
+pub(super) fn build_input_config_meta(input: &InputConfig) -> crate::stats::collector::InputConfigMeta {
     use crate::stats::collector::InputConfigMeta;
     match input {
         // A mosaic has no transport addresses of its own to report.

@@ -24,7 +24,7 @@ use crate::config::models::{AppConfig, FlowAssembly, FlowConfig, FlowGroupConfig
 use crate::config::persistence::{save_config_split_async, save_split_config_async, save_split_secrets_async};
 use crate::config::secrets::SecretsConfig;
 use crate::config::validation::{
-    validate_config, validate_flow, validate_input_definition, validate_output,
+    validate_config, validate_flow, validate_input_edit, validate_output,
     validate_port_conflicts_with_input, validate_port_conflicts_with_output,
     validate_port_conflicts_with_tunnel, validate_tunnel,
 };
@@ -3433,7 +3433,7 @@ async fn execute_command(
             let input: InputDefinition =
                 serde_json::from_value(action["input"].clone())
                     .map_err(|e| format!("Invalid input config: {e}"))?;
-            validate_input_definition(&input)
+            validate_input_edit(&input)
                 .map_err(|e| CommandError::from_validation("Invalid input config", e))?;
             // What the node's config must allow of the input: an id that is
             // not reserved, if the input is new; no other flow holding it; no
@@ -3601,7 +3601,7 @@ async fn execute_command(
         "create_input" => {
             let input: InputDefinition = serde_json::from_value(action["input"].clone())
                 .map_err(|e| format!("Invalid input config: {e}"))?;
-            validate_input_definition(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
+            validate_input_edit(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
             crate::config::validation::validate_new_input_id(&input.id).map_err(|e| {
                 CommandError::with_code(format!("Invalid input: {e}"), "input_id_reserved")
             })?;
@@ -3637,7 +3637,7 @@ async fn execute_command(
             // substitutes by id) would exclude the wrong entity and reject a
             // rename against the entity it is meant to be replacing.
             input.id = input_id.to_string();
-            validate_input_definition(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
+            validate_input_edit(&input).map_err(|e| CommandError::from_validation("Invalid input", e))?;
             tracing::info!("Manager command: update input '{input_id}'");
             let mut cfg = app_config.write().await;
             let idx = cfg.inputs.iter().position(|i| i.id == input_id)
@@ -4126,9 +4126,13 @@ async fn execute_command(
             let hitless_repairs = crate::config::validation::repair_hitless_slots(&mut new_config);
             // So are the AAC channel counts validation began refusing.
             let aac_repairs = crate::config::validation::repair_aac_channel_counts(&mut new_config);
+            // And the RTSP `timeout_secs`; an `rtsp_url` an edit would
+            // refuse is kept and reported.
+            let rtsp_repairs = crate::config::validation::repair_rtsp_inputs(&mut new_config);
             validate_config(&new_config).map_err(|e| CommandError::from_validation("Invalid config", e))?;
             hitless_repairs.report(flow_manager.event_sender());
             aac_repairs.report(flow_manager.event_sender());
+            rtsp_repairs.report(flow_manager.event_sender());
             tracing::info!("Manager command: update_config (diff-based)");
 
             tracing::info!("Config diff: old={} flows/{} tunnels, new={} flows/{} tunnels",
@@ -8605,6 +8609,95 @@ mod reserved_input_id_tests {
             .await
             .expect_err("no flow f");
         assert_ne!(err.code.as_deref(), Some("input_id_reserved"), "{}", err.message);
+    }
+
+    /// The WS commands that name an input — `create_input`, `update_input`,
+    /// `add_input` — refuse an RTSP input's `rtsps://`, an `rtsp_url` whose
+    /// password url::Url misreads, and a `timeout_secs` outside 1-300, with
+    /// `validation_error` and nothing saved; `update_config`, which takes a
+    /// whole config — a manager may be replaying what it cached before the
+    /// upgrade — keeps the URLs, clamps the timeout, saves and warns. It
+    /// refused the push for any of them.
+    #[tokio::test]
+    async fn input_edits_refuse_what_a_whole_config_keeps_of_an_rtsp_input() {
+        let (event_sender, mut events) = crate::manager::events::event_channel();
+        let fm = Arc::new(FlowManager::new(
+            Arc::new(StatsCollector::new()),
+            false,
+            event_sender.clone(),
+            Arc::new(SystemResourceState::new()),
+            None,
+            None,
+            #[cfg(all(feature = "display", target_os = "linux"))]
+            crate::display::claim_registry::DisplayClaimRegistry::new(),
+            #[cfg(feature = "webrtc")]
+            None,
+        ));
+        let tm = Arc::new(TunnelManager::new(event_sender));
+        let cfg = Arc::new(RwLock::new(AppConfig::default()));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = async |action: &str, body: serde_json::Value| {
+            execute_command(
+                action,
+                &body,
+                &fm,
+                &tm,
+                &cfg,
+                &dir.path().join("config.json"),
+                &dir.path().join("secrets.json"),
+                &WebrtcRegistry::default(),
+            )
+            .await
+        };
+        let rtsp = |id: &str, url: &str, timeout_secs: u64| {
+            serde_json::json!({
+                "id": id, "name": id, "type": "rtsp", "rtsp_url": url, "timeout_secs": timeout_secs
+            })
+        };
+        let refused = [
+            rtsp("cam", "rtsps://camera.local/s", 10),
+            rtsp("cam", "rtsp://admin:1234#5@camera.local/s", 10),
+            rtsp("cam", "rtsp://camera.local/s", 0),
+        ];
+        for input in &refused {
+            for (action, body) in [
+                ("create_input", serde_json::json!({ "input": input })),
+                ("update_input", serde_json::json!({ "input_id": "cam", "input": input })),
+                ("add_input", serde_json::json!({ "flow_id": "f", "input": input })),
+            ] {
+                let err = run(action, body).await.expect_err(action);
+                assert_eq!(err.code.as_deref(), Some("validation_error"), "{action}: {}", err.message);
+                assert!(!err.message.contains("1234#5"), "{}", err.message);
+            }
+        }
+        assert!(cfg.read().await.inputs.is_empty(), "nothing saved");
+
+        let mut push = serde_json::to_value(AppConfig::default()).expect("serialise");
+        push["inputs"] = serde_json::json!([
+            rtsp("tls", "rtsps://camera.local/s", 10),
+            rtsp("hash", "rtsp://admin:1234#5@camera.local/s", 10),
+            rtsp("zero", "rtsp://camera.local/s", 0),
+        ]);
+        run("update_config", serde_json::json!({ "config": push })).await.expect("a whole config is kept");
+        let kept = cfg.read().await.inputs.clone();
+        let rtsp_of = |i: &InputDefinition| match &i.config {
+            crate::config::models::InputConfig::Rtsp(r) => (r.rtsp_url.clone(), r.timeout_secs),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            kept.iter().map(rtsp_of).collect::<Vec<_>>(),
+            [
+                ("rtsps://camera.local/s".to_string(), 10),
+                ("rtsp://admin:1234#5@camera.local/s".to_string(), 10),
+                ("rtsp://camera.local/s".to_string(), 1),
+            ]
+        );
+        let codes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| Some((e.input_id?, e.details?["error_code"].as_str()?.to_string())))
+            .collect();
+        for want in [("tls", "rtsps_unsupported"), ("hash", "rtsp_userinfo_misread"), ("zero", "rtsp_timeout_repaired")] {
+            assert!(codes.iter().any(|(i, c)| (i.as_str(), c.as_str()) == want), "{want:?} in {codes:?}");
+        }
     }
 
     /// `add_input` refuses an input another enabled flow holds, before

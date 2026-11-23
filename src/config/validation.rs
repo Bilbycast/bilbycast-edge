@@ -707,6 +707,23 @@ pub fn validate_input_definition(def: &InputDefinition) -> Result<()> {
     Ok(())
 }
 
+/// [`validate_input_definition`], plus what only an edit that names the
+/// input refuses: an RTSP input's `rtsp_url` that is `rtsps://`, that
+/// url::Url cannot read, or whose username and password it does not read as
+/// written ([`crate::engine::input_rtsp::RtspUrlProblem`]). Called by
+/// `POST` / `PUT /api/v1/inputs` and the WS `create_input`, `update_input`
+/// and `add_input`. A whole config holding such an input is warned of
+/// instead ([`repair_rtsp_inputs`]): refused at load, it stopped the node.
+pub fn validate_input_edit(def: &InputDefinition) -> Result<()> {
+    validate_input_definition(def)?;
+    if let InputConfig::Rtsp(rtsp) = &def.config
+        && let Some(problem) = crate::engine::input_rtsp::RtspUrlProblem::of(&rtsp.rtsp_url)
+    {
+        bail!("RTSP input: {}", problem.describe());
+    }
+    Ok(())
+}
+
 /// Refuse `id` for a new input when it starts with
 /// [`crate::engine::ts_es_hitless::HITLESS_INPUT_PREFIX`], the prefix of the
 /// PID-bus keys Hitless slots' mergers publish onto. An input id of their
@@ -1479,16 +1496,12 @@ fn validate_input(input: &InputConfig) -> Result<()> {
             )?;
         }
         InputConfig::Rtsp(rtsp) => {
-            // rtsps:// was accepted here and refused by the RTSP client
-            // (retina speaks no TLS), so such an input retried every
-            // `reconnect_delay_secs` for good.
-            if rtsp.rtsp_url.starts_with("rtsps://") {
-                bail!(
-                    "RTSP input: rtsp_url: rtsps:// (RTSP over TLS) is not supported; \
-                     use rtsp://"
-                );
-            }
-            if !rtsp.rtsp_url.starts_with("rtsp://") {
+            // `rtsps://`, and a URL url::Url does not read as written, pass
+            // here: this is also the boot gate, and a whole config keeps such
+            // an input with a Warning (`repair_rtsp_inputs`) rather than stop
+            // the node. The edits that name the input refuse them
+            // (`validate_input_edit`).
+            if !rtsp.rtsp_url.starts_with("rtsp://") && !rtsp.rtsp_url.starts_with("rtsps://") {
                 bail!("RTSP input: rtsp_url must start with rtsp://");
             }
             if rtsp.rtsp_url.len() > 2048 {
@@ -1502,7 +1515,9 @@ fn validate_input(input: &InputConfig) -> Result<()> {
                 && pass.len() > 256 {
                     bail!("RTSP input: password must be at most 256 characters");
                 }
-            if !(1..=300).contains(&rtsp.timeout_secs) {
+            // A whole config has it clamped into range first
+            // (`repair_rtsp_inputs`): earlier releases read it nowhere.
+            if !RTSP_TIMEOUT_SECS.contains(&rtsp.timeout_secs) {
                 bail!(
                     "RTSP input: timeout_secs must be between 1 and 300 (got {})",
                     rtsp.timeout_secs
@@ -5078,6 +5093,123 @@ pub fn repair_aac_channel_counts(config: &mut crate::config::models::AppConfig) 
         }
     }
     AacChannelRepairs(repaired)
+}
+
+/// The `timeout_secs` an RTSP input takes: the manager form's range.
+pub const RTSP_TIMEOUT_SECS: std::ops::RangeInclusive<u64> = 1..=300;
+
+/// One RTSP input's `timeout_secs` [`repair_rtsp_inputs`] clamped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairedRtspTimeout {
+    pub input_id: String,
+    pub was: u64,
+    pub now: u64,
+}
+
+/// What [`repair_rtsp_inputs`] changed in a whole config, and what it kept
+/// and warns of.
+#[derive(Debug, Default)]
+pub struct RtspInputRepairs {
+    /// `timeout_secs` clamped into [`RTSP_TIMEOUT_SECS`].
+    pub timeouts: Vec<RepairedRtspTimeout>,
+    /// Inputs whose `rtsp_url` an edit naming them would refuse. Reported,
+    /// not repaired — no rewrite of a URL keeps what it means (an
+    /// `rtsps://` made `rtsp://` drops its TLS) — so not counted by
+    /// [`RtspInputRepairs::is_empty`], which decides whether a repaired
+    /// config is written back.
+    pub url_problems: Vec<(String, crate::engine::input_rtsp::RtspUrlProblem)>,
+}
+
+impl RtspInputRepairs {
+    /// Whether nothing was repaired.
+    pub fn is_empty(&self) -> bool {
+        self.timeouts.is_empty()
+    }
+
+    /// Say what was repaired and what was kept: a warning log line each and
+    /// a Warning `config` event naming the input.
+    pub fn report(&self, events: &crate::manager::events::EventSender) {
+        use crate::manager::events::{EventSeverity, category};
+        for t in &self.timeouts {
+            let message = format!(
+                "input '{}': timeout_secs {} is outside 1-300, so set to {}. It now bounds the RTSP \
+                 session setup (connection, DESCRIBE, SETUP, PLAY), past which the input retries; \
+                 earlier releases read it nowhere. Set another value if that is not the one wanted.",
+                t.input_id, t.was, t.now
+            );
+            tracing::warn!("{message}");
+            events.emit_input_with_details(
+                EventSeverity::Warning,
+                category::CONFIG,
+                message,
+                &t.input_id,
+                serde_json::json!({
+                    "error_code": "rtsp_timeout_repaired",
+                    "field": "timeout_secs",
+                    "was": t.was,
+                    "now": t.now,
+                }),
+            );
+        }
+        for (input_id, problem) in &self.url_problems {
+            let fate = if problem.is_fatal() {
+                "It is kept, and the input reports it and does not connect"
+            } else {
+                "It is kept, and the input connects to what the URL parser reads"
+            };
+            let message = format!(
+                "input '{input_id}': {}. {fate}; an edit of the input is refused until it is changed.",
+                problem.describe()
+            );
+            tracing::warn!("{message}");
+            events.emit_input_with_details(
+                EventSeverity::Warning,
+                category::CONFIG,
+                message,
+                input_id,
+                serde_json::json!({ "error_code": problem.error_code() }),
+            );
+        }
+    }
+}
+
+/// Repair, in a whole config, the RTSP inputs whose `timeout_secs`
+/// validation began refusing, and find those whose `rtsp_url` an edit
+/// naming them refuses.
+///
+/// `timeout_secs` was read nowhere before it bounded the session setup, so
+/// any value sat in configs harmlessly — 0 ("no timeout") or 600 from the
+/// manager form, which checks nothing. Refused at load, it turned the
+/// upgrade into a node that exits at boot, every flow down and no manager
+/// WebSocket to repair it over. Like [`repair_aac_channel_counts`], every
+/// route that takes a whole config runs this before validating — the load,
+/// `POST /api/v1/config/reload`, `PUT /api/v1/config` and the WS
+/// `update_config`, the first two writing the repair back to `config.json`
+/// — and the value is clamped into [`RTSP_TIMEOUT_SECS`] (0 to 1, past 300
+/// to 300).
+///
+/// An `rtsp_url` that is `rtsps://`, that url::Url cannot read, or whose
+/// userinfo it misreads has no repair that keeps what it means, so the
+/// input is kept as it is and reported
+/// ([`crate::engine::input_rtsp::RtspUrlProblem`]). The edits that name an
+/// input still refuse both ([`validate_input_edit`]).
+pub fn repair_rtsp_inputs(config: &mut crate::config::models::AppConfig) -> RtspInputRepairs {
+    let mut repairs = RtspInputRepairs::default();
+    for input in &mut config.inputs {
+        let InputConfig::Rtsp(rtsp) = &mut input.config else {
+            continue;
+        };
+        let was = rtsp.timeout_secs;
+        let now = was.clamp(*RTSP_TIMEOUT_SECS.start(), *RTSP_TIMEOUT_SECS.end());
+        if now != was {
+            rtsp.timeout_secs = now;
+            repairs.timeouts.push(RepairedRtspTimeout { input_id: input.id.clone(), was, now });
+        }
+        if let Some(problem) = crate::engine::input_rtsp::RtspUrlProblem::of(&rtsp.rtsp_url) {
+            repairs.url_problems.push((input.id.clone(), problem));
+        }
+    }
+    repairs
 }
 
 /// The Cargo feature a codec name needs, when this build lacks it.
@@ -16114,23 +16246,34 @@ mod tests {
         serde_json::from_value(v).expect("RTSP input fixture")
     }
 
+    fn rtsp_def(id: &str, extra: serde_json::Value) -> InputDefinition {
+        let mut v = serde_json::json!({
+            "id": id, "name": id, "type": "rtsp", "rtsp_url": "rtsp://camera.local:554/stream1"
+        });
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(v).expect("RTSP input definition fixture")
+    }
+
     /// The RTSP client speaks no TLS, so an rtsps:// input retried every
-    /// `reconnect_delay_secs` for good. It is refused, naming the scheme
-    /// that works.
+    /// `reconnect_delay_secs` for good. An edit naming the input refuses it,
+    /// naming the scheme that works; a whole config keeps it, since refused
+    /// there it stopped the node at boot (`repair_rtsp_inputs` warns).
     #[test]
-    fn rtsp_input_refuses_rtsps() {
-        let err = validate_input(&rtsp_input(serde_json::json!({"rtsp_url": "rtsps://camera.local:322/s"})))
-            .expect_err("rtsps:// must be refused");
+    fn rtsps_is_refused_by_an_edit_and_kept_by_a_whole_config() {
+        let def = rtsp_def("cam", serde_json::json!({"rtsp_url": "rtsps://camera.local:322/s"}));
+        let err = validate_input_edit(&def).expect_err("rtsps:// must be refused");
         let msg = err.to_string();
         assert!(msg.contains("rtsps://") && msg.contains("not supported") && msg.contains("use rtsp://"), "{msg}");
-        assert!(validate_input(&rtsp_input(serde_json::json!({}))).is_ok());
+        validate_input_definition(&def).expect("what a whole config checks keeps it");
+        validate_input_edit(&rtsp_def("cam", serde_json::json!({}))).expect("rtsp://");
         let err = validate_input(&rtsp_input(serde_json::json!({"rtsp_url": "http://camera.local/s"})))
             .expect_err("another scheme is refused");
         assert!(err.to_string().contains("must start with rtsp://"), "{err}");
     }
 
     /// `timeout_secs` bounds the session setup: 1..=300, the manager form's
-    /// range. 0 would give up on every attempt before it began.
+    /// range. 0 would give up on every attempt before it began. A whole
+    /// config has it clamped first (`repair_rtsp_inputs`).
     #[test]
     fn rtsp_input_timeout_secs_is_bounded() {
         for secs in [1, 10, 300] {
@@ -16143,18 +16286,95 @@ mod tests {
         }
     }
 
-    /// Credentials in the URL are the form cameras document; the input lifts
-    /// them into the session's credentials, and no refusal may print them.
+    /// An edit refuses an `rtsp_url` whose username and password url::Url
+    /// does not read as written — an unencoded `#`, `/` or `?` ends the
+    /// authority early, and the input dialled host `admin`, port 1234, or
+    /// failed "invalid port number" for good — telling the user to
+    /// percent-encode them or use the username and password fields, and
+    /// never printing them. Userinfo the parser reads as written, encoded or
+    /// not, is accepted: the input lifts it into the session's credentials.
     #[test]
-    fn rtsp_input_accepts_url_userinfo_and_never_prints_it() {
-        assert!(
-            validate_input(&rtsp_input(serde_json::json!({"rtsp_url": "rtsp://admin:s3cret@camera.local/s"})))
-                .is_ok()
+    fn an_edit_refuses_an_rtsp_url_whose_userinfo_is_not_read_as_written() {
+        for (url, secret) in [
+            ("rtsp://admin:1234#5@camera.local/live", "1234#5"),
+            ("rtsp://admin:1234/x@camera.local/live", "1234/x"),
+            ("rtsp://admin:5555?q@camera.local/live", "5555?q"),
+            ("rtsp://admin:pa#ss@camera.local/live", "pa#ss"),
+        ] {
+            let def = rtsp_def("cam", serde_json::json!({ "rtsp_url": url }));
+            let msg = validate_input_edit(&def).expect_err(url).to_string();
+            assert!(msg.contains("percent-encode") && msg.contains("username and password fields"), "{msg}");
+            assert!(!msg.contains(secret), "{msg}");
+            validate_input_definition(&def).expect("what a whole config checks keeps it");
+        }
+        for url in [
+            "rtsp://admin:s3cret@camera.local/live",
+            "rtsp://admin:1234%235@camera.local/live",
+            "rtsp://ad%40min:p%2Fss@camera.local/live",
+        ] {
+            validate_input_edit(&rtsp_def("cam", serde_json::json!({ "rtsp_url": url }))).expect(url);
+        }
+    }
+
+    /// A whole config an earlier release accepted — RTSP `timeout_secs` 0
+    /// and 600, which it read nowhere, an `rtsps://` input and a password
+    /// url::Url misreads — validates once repaired: the timeouts clamped to
+    /// 1 and 300, the URLs kept, and each reported as a Warning `config`
+    /// event naming the input. Only the clamps count as a repair to write
+    /// back.
+    #[test]
+    fn a_whole_config_has_its_rtsp_inputs_repaired_or_warned_of() {
+        let mut config = crate::config::models::AppConfig {
+            inputs: vec![
+                rtsp_def("zero", serde_json::json!({"timeout_secs": 0})),
+                rtsp_def("long", serde_json::json!({"timeout_secs": 600})),
+                rtsp_def("tls", serde_json::json!({"rtsp_url": "rtsps://cam:hunter2@camera.local/s"})),
+                rtsp_def("hash", serde_json::json!({"rtsp_url": "rtsp://admin:1234#5@camera.local/live"})),
+                rtsp_def("fine", serde_json::json!({"timeout_secs": 30})),
+            ],
+            ..Default::default()
+        };
+        let err = validate_config(&config).expect_err("refused as it stands");
+        assert!(err.to_string().contains("timeout_secs"), "{err}");
+        let repairs = repair_rtsp_inputs(&mut config);
+        validate_config(&config).expect("a repaired config validates, rtsps:// and all");
+        let timeouts: Vec<_> = repairs.timeouts.iter().map(|t| (t.input_id.as_str(), t.was, t.now)).collect();
+        assert_eq!(timeouts, [("zero", 0, 1), ("long", 600, 300)]);
+        let timeout = |id: &str| match &config.inputs.iter().find(|i| i.id == id).unwrap().config {
+            InputConfig::Rtsp(r) => r.timeout_secs,
+            _ => unreachable!(),
+        };
+        assert_eq!((timeout("zero"), timeout("long"), timeout("fine")), (1, 300, 30));
+        use crate::engine::input_rtsp::RtspUrlProblem;
+        assert_eq!(
+            repairs.url_problems,
+            [("tls".to_string(), RtspUrlProblem::Rtsps), ("hash".to_string(), RtspUrlProblem::UserinfoMisread)]
         );
-        let err = validate_input(&rtsp_input(serde_json::json!({
-            "rtsp_url": "rtsps://admin:s3cret@camera.local/s"
-        })))
-        .expect_err("rtsps:// is refused whatever the userinfo");
-        assert!(!err.to_string().contains("s3cret"), "{err}");
+
+        let (sender, mut events) = crate::manager::events::event_channel();
+        repairs.report(&sender);
+        let reported: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let got: Vec<_> = reported
+            .iter()
+            .map(|e| (e.input_id.as_deref().unwrap(), e.details.as_ref().unwrap()["error_code"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("zero", "rtsp_timeout_repaired"),
+                ("long", "rtsp_timeout_repaired"),
+                ("tls", "rtsps_unsupported"),
+                ("hash", "rtsp_userinfo_misread"),
+            ]
+        );
+        for e in &reported {
+            assert_eq!((e.severity, e.category.as_str()), (crate::manager::events::EventSeverity::Warning, "config"));
+            assert!(!e.message.contains("hunter2") && !e.message.contains("1234#5"), "{}", e.message);
+        }
+        assert_eq!(reported[0].details.as_ref().unwrap()["was"], 0);
+        assert_eq!(reported[0].details.as_ref().unwrap()["now"], 1);
+
+        let again = repair_rtsp_inputs(&mut config);
+        assert!(again.is_empty() && again.url_problems.len() == 2, "nothing left to repair; the URLs still reported");
     }
 }

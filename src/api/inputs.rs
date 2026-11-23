@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 
 use crate::config::models::InputDefinition;
 use crate::config::persistence::save_config_split_async;
-use crate::config::validation::{validate_input_definition, validate_port_conflicts_with_input};
+use crate::config::validation::{validate_input_edit, validate_port_conflicts_with_input};
 use crate::manager::client::restart_flow_for_input_update;
 
 use super::auth::RequireAdmin;
@@ -57,7 +57,7 @@ pub async fn create_input(
     _admin: RequireAdmin,
     Json(input): Json<InputDefinition>,
 ) -> Result<Json<ApiResponse<InputDefinition>>, ApiError> {
-    validate_input_definition(&input)
+    validate_input_edit(&input)
         .and_then(|()| crate::config::validation::validate_new_input_id(&input.id))
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
@@ -114,7 +114,7 @@ pub async fn update_input(
     // Ensure path ID matches body ID
     input.id = input_id.clone();
 
-    validate_input_definition(&input)
+    validate_input_edit(&input)
         .map_err(|e| ApiError::BadRequest(format!("Validation failed: {e}")))?;
 
     let mut config = state.config.write().await;
@@ -361,6 +361,38 @@ mod update_input_tests {
         assert!(!state.config.read().await.inputs.iter().any(|i| i.id == "hitless:cam1"));
         let created = post("cam1").await.unwrap_or_else(|_| panic!("any other id is created"));
         assert_eq!(created.0.data.map(|i| i.id).as_deref(), Some("cam1"));
+        let _ = state.flow_manager.destroy_flow("f1").await;
+    }
+
+    /// `POST` and `PUT /api/v1/inputs` refuse an RTSP input's `rtsps://`,
+    /// an `rtsp_url` whose password url::Url misreads, and a `timeout_secs`
+    /// outside 1-300 with 400, nothing saved — what a whole config keeps
+    /// and warns of (`repair_rtsp_inputs`).
+    #[tokio::test]
+    async fn post_and_put_refuse_an_unplayable_rtsp_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = running_flow(dir.path(), vec![udp_input("a", 41871)]).await;
+        let rtsp = |url: &str, timeout_secs: u64| {
+            input(serde_json::json!({
+                "id": "cam", "name": "cam", "type": "rtsp", "rtsp_url": url, "timeout_secs": timeout_secs
+            }))
+        };
+        let ok = rtsp("rtsp://camera.local/s", 10);
+        state.config.write().await.inputs.push(ok.clone());
+        for (edit, says) in [
+            (rtsp("rtsps://camera.local/s", 10), "rtsps://"),
+            (rtsp("rtsp://admin:1234#5@camera.local/s", 10), "percent-encode"),
+            (rtsp("rtsp://camera.local/s", 0), "timeout_secs"),
+        ] {
+            let posted = create_input(State(state.clone()), RequireAdmin, Json(InputDefinition { id: "cam2".into(), ..edit.clone() })).await;
+            assert!(matches!(&posted, Err(ApiError::BadRequest(m)) if m.contains(says) && !m.contains("1234#5")), "POST {says}");
+            let put = put(&state, edit).await;
+            assert!(matches!(&put, Err(ApiError::BadRequest(m)) if m.contains(says) && !m.contains("1234#5")), "PUT {says}");
+        }
+        let config = state.config.read().await;
+        assert!(!config.inputs.iter().any(|i| i.id == "cam2"), "nothing created");
+        assert_eq!(config.inputs.iter().find(|i| i.id == "cam"), Some(&ok), "nothing edited");
+        drop(config);
         let _ = state.flow_manager.destroy_flow("f1").await;
     }
 
