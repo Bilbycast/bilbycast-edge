@@ -542,11 +542,11 @@ Pulls H.264 or H.265/HEVC video and AAC audio from RTSP sources (IP cameras, med
 | Field                 | Type     | Default  | Description                                     |
 |-----------------------|----------|----------|-------------------------------------------------|
 | `type`                | `"rtsp"` | --       | Input type discriminator                        |
-| `rtsp_url`            | `string` | --       | RTSP source URL, e.g. `"rtsp://camera:554/stream1"`. `rtsp://` only. Credentials in the URL are presented as the session's credentials unless `username` + `password` are both set; percent-encode a `#` `/` `?` `@` in them. An edit of the input refuses `rtsps://`, an unparseable URL and misread userinfo; a whole config keeps them with a Warning (see the configuration guide, "RTSP inputs a whole config keeps"). Logs, events and stats show it with everything between `://` and the last `@` left out |
+| `rtsp_url`            | `string` | --       | RTSP source URL, e.g. `"rtsp://camera:554/stream1"`. `rtsp://` only. Credentials in the URL are presented as the session's credentials unless `username` + `password` are both set; percent-encode a `#` `/` `?` `@` in them (unencoded, the input warns as it starts, `rtsp_userinfo_misread`). An edit of the input refuses `rtsps://` and an unparseable URL; a whole config keeps them with a Warning (see the configuration guide, "RTSP inputs a whole config keeps"). Logs, events and stats show it with everything between `://` and the last `@` left out when a `:` lies there |
 | `username`            | `string?`| `null`   | Username for RTSP authentication                 |
 | `password`            | `string?`| `null`   | Password for RTSP authentication                 |
 | `transport`           | `string` | `"tcp"`  | `"tcp"` (interleaved, default) or `"udp"`        |
-| `timeout_secs`        | `u64`    | `10`     | 1–300. Bound on a session's setup (connect, DESCRIBE, SETUP, PLAY); past it the input retries. An edit refuses a value outside the range; a whole config has it clamped (0 to 1, above 300 to 300) and warns |
+| `timeout_secs`        | `u64`    | `10`     | 1–300. Bound on a session's setup (connect, DESCRIBE, SETUP, PLAY); past it the input retries. An edit refuses a value outside the range; a whole config has it set to 300 (0, which bounded nothing, and above 300 alike) and warns. Earlier releases read it nowhere, so a low value (1–3 s) that was harmless now applies |
 | `reconnect_delay_secs`| `u64`    | `5`      | Delay between reconnection attempts              |
 
 ### WebRTC/WHIP Input (`"type": "webrtc"`)
