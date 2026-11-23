@@ -121,16 +121,16 @@ fn prio_base_ok(base: u32) -> bool {
 /// either side of the VRF rule at 1000 (a unit test holds the two equal).
 const PRIO_BASES: [RangeInclusive<u32>; 2] = [1..=1000 - MAX_SLOTS, 1001..=LOOKUP_MAIN_PRIORITY - MAX_SLOTS];
 
-/// How [`TABLE_BASES`] reads in an error.
+/// [`TABLE_BASES`] in words: "from 256 to 4294967040".
 fn table_bounds() -> String {
-    format!("Use a base from {} to {}", TABLE_BASES.start(), TABLE_BASES.end())
+    format!("from {} to {}", TABLE_BASES.start(), TABLE_BASES.end())
 }
 
-/// How [`PRIO_BASES`] reads in an error.
+/// [`PRIO_BASES`] in words: "from 1 to 744 or from 1001 to 32510".
 fn prio_bounds() -> String {
     let [low, high] = &PRIO_BASES;
     format!(
-        "Use a base from {} to {} or from {} to {}",
+        "from {} to {} or from {} to {}",
         low.start(),
         low.end(),
         high.start(),
@@ -145,12 +145,12 @@ fn table_refusal(base: Option<u32>, shown: &str) -> Option<String> {
         Some(b) if TABLE_BASES.contains(&b) => None,
         Some(_) => Some(format!(
             "{TABLE_BASE_VAR}={shown} is refused: its {MAX_SLOTS} tables must clear the kernel's \
-             tables 0 and 253-255 and end at or below {}. {}",
+             tables 0 and 253-255 and end at or below {}. Use a base {}",
             u32::MAX,
             table_bounds()
         )),
         None => Some(format!(
-            "{TABLE_BASE_VAR}={shown} is refused: it is out of range. {}",
+            "{TABLE_BASE_VAR}={shown} is refused: it is out of range. Use a base {}",
             table_bounds()
         )),
     }
@@ -164,11 +164,11 @@ fn prio_refusal(base: Option<u32>, shown: &str) -> Option<String> {
         Some(_) => Some(format!(
             "{PRIO_BASE_VAR}={shown} is refused: its {MAX_SLOTS} rule priorities must hold none \
              of the kernel's own rules (0 `lookup local`, 1000 the VRF `l3mdev` rule, 32766 \
-             `lookup main`, 32767 `lookup default`) and end before `lookup main`. {}",
+             `lookup main`, 32767 `lookup default`) and end before `lookup main`. Use a base {}",
             prio_bounds()
         )),
         None => Some(format!(
-            "{PRIO_BASE_VAR}={shown} is refused: it is out of range. {}",
+            "{PRIO_BASE_VAR}={shown} is refused: it is out of range. Use a base {}",
             prio_bounds()
         )),
     }
@@ -323,7 +323,8 @@ pub struct UnparseableBase {
     pub value: String,
     /// The default used in its place.
     pub default: u32,
-    /// The bases that variable accepts, as an error states them.
+    /// The bases that variable accepts, in words ("from 256 to
+    /// 4294967040").
     pub accepted: String,
 }
 
@@ -336,7 +337,7 @@ pub struct RefusedBase {
     pub value: String,
     /// The sentence naming the variable, its value, why, and its bounds.
     pub reason: String,
-    /// The bases that variable accepts, as `reason` states them.
+    /// The bases that variable accepts, in words, as `reason` states them.
     pub accepted: String,
 }
 
@@ -451,7 +452,7 @@ impl Bases {
                 message: format!(
                     "{} is set to {:?}, which is not a whole number. It has been DISCARDED and \
                      the default base {} is in use, as if it were unset. To move the range, set \
-                     a whole number ({}); to keep the default, remove the variable.",
+                     a whole number {}; to keep the default, remove the variable.",
                     u.var, u.value, u.default, u.accepted
                 ),
                 details: serde_json::json!({
@@ -1223,7 +1224,7 @@ mod tests {
                 assert!(*range.end() < 32766, "{range:?}");
             }
         }
-        assert_eq!(prio_bounds(), "Use a base from 1 to 744 or from 1001 to 32510");
+        assert_eq!(prio_bounds(), "from 1 to 744 or from 1001 to 32510");
     }
 
     /// The highest table base hands out tables up to `u32::MAX` itself
@@ -1312,12 +1313,13 @@ mod tests {
         assert_eq!(warn.category, category::CONFIG);
         assert!(warn.message.starts_with(&format!("{TABLE_BASE_VAR} is set to \"0xBD00\"")), "{}", warn.message);
         assert!(warn.message.contains("the default base 48128 is in use"), "{}", warn.message);
+        assert!(warn.message.contains("set a whole number from 256 to 4294967040;"), "{}", warn.message);
         let d = warn.details.expect("details");
         assert_eq!(d["error_code"], "bond_rt_base_unparseable");
         assert_eq!(d["env_var"], TABLE_BASE_VAR);
         assert_eq!(d["value"], "0xBD00");
         assert_eq!(d["default"], 48128);
-        assert_eq!(d["accepted"], "Use a base from 256 to 4294967040");
+        assert_eq!(d["accepted"], "from 256 to 4294967040");
 
         let crit = rx.try_recv().expect("refusal event");
         assert_eq!(crit.severity, EventSeverity::Critical);
