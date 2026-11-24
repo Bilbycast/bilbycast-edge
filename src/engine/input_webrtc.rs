@@ -1319,9 +1319,11 @@ struct H264Order {
 
 #[cfg(any(feature = "webrtc", test))]
 impl H264Order {
-    /// Of `sps`, an SPS NAL unit; `None` if it does not parse.
+    /// Of `sps`, an SPS NAL unit; `None` if it does not parse, a scaling
+    /// list's `delta_scale` outside −128..=127 included.
     fn of(sps: &[u8]) -> Option<Self> {
         use crate::engine::content_analysis::bitreader::{BitReader, unescape_rbsp};
+        use crate::engine::h264_sps::skip_scaling_list;
         let rbsp = unescape_rbsp(sps.get(1..)?);
         let mut br = BitReader::new(&rbsp);
         let profile_idc = br.read_bits(8)?;
@@ -1342,13 +1344,7 @@ impl H264Order {
                     if br.read_bit()? == 0 {
                         continue;
                     }
-                    let (mut last, mut next) = (8, 8);
-                    for _ in 0..if list < 6 { 16 } else { 64 } {
-                        if next != 0 {
-                            next = (last + br.read_se()? + 256) % 256;
-                        }
-                        last = if next == 0 { last } else { next };
-                    }
+                    skip_scaling_list(if list < 6 { 16 } else { 64 }, || br.read_se())?;
                 }
             }
         }
@@ -4412,6 +4408,32 @@ mod tests {
         assert!(H264Order::of(&[vec![0x67], wide].concat()).is_none(), "a frame_num of 17 bits");
         assert_eq!(order.frame_num(&[0x41, 0x88]), None);
         assert_eq!(order.frame_num(&[0, 0, 0, 1, 0x09, 0xF0]), None, "no slice");
+    }
+
+    /// edge#213: an SPS with a `delta_scale` out of range says nothing of the
+    /// order its pictures come in; its size is not read. Nothing random
+    /// panics.
+    #[test]
+    fn an_h264_order_is_not_read_off_an_sps_out_of_range() {
+        use super::H264Order;
+        use crate::engine::h264_sps::tests::{RANDOM, Sps, edge_213, random_sps};
+        let [width, height, crop, scaling_list] = edge_213();
+        for sps in [width, height, crop] {
+            assert_eq!(H264Order::of(&sps.nal()).map(|o| (o.frame_num_bits, o.in_order)), Some((4, true)));
+        }
+        assert!(H264Order::of(&scaling_list.nal()).is_none());
+        let high = |deltas| Sps { profile: 100, scaling_list: Some(deltas), ..Sps::default() };
+        assert!(H264Order::of(&high(&[-128, 127, -7]).nal()).is_some());
+        assert!(H264Order::of(&high(&[-129, 121]).nal()).is_none());
+        assert!(H264Order::of(&high(&[-129, -128, -8]).nal()).is_none());
+        let mut read = 0;
+        for sps in random_sps(RANDOM) {
+            if let Some(order) = H264Order::of(&sps) {
+                read += 1;
+                let _ = order.frame_num(&[&[0, 0, 0, 1, 0x41], &sps[1..]].concat());
+            }
+        }
+        assert!(read > RANDOM / 10, "{read} read");
     }
 
     /// Where the second picture's `frame_num` says that reference pictures

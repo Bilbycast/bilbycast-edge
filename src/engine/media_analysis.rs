@@ -25,6 +25,7 @@ use crate::stats::collector::{
     AudioStreamState, MediaAnalysisAccumulator, MediaAnalysisState, ProgramState, VideoStreamState,
 };
 
+use super::h264_sps::{picture_size, skip_scaling_list};
 use super::packet::RtpPacket;
 use super::ts_parse::*;
 
@@ -1316,7 +1317,9 @@ fn find_and_parse_h264_sps(data: &[u8]) -> Option<SpsInfo> {
     None
 }
 
-/// Parse H.264 SPS NAL unit (starting from the NAL header byte).
+/// Parse H.264 SPS NAL unit (starting from the NAL header byte). `None`, and
+/// so no resolution, profile or frame rate off it, also for a size, crop or
+/// scaling list out of range (`engine::h264_sps`).
 fn parse_h264_sps(data: &[u8]) -> Option<SpsInfo> {
     if data.len() < 4 {
         return None;
@@ -1345,7 +1348,7 @@ fn parse_h264_sps(data: &[u8]) -> Option<SpsInfo> {
             for i in 0..count {
                 let present = reader.read_bits(1)?;
                 if present == 1 {
-                    skip_scaling_list(&mut reader, if i < 6 { 16 } else { 64 })?;
+                    skip_scaling_list(if i < 6 { 16 } else { 64 }, || reader.read_signed_exp_golomb())?;
                 }
             }
         }
@@ -1379,7 +1382,7 @@ fn parse_h264_sps(data: &[u8]) -> Option<SpsInfo> {
     reader.read_bits(1)?; // direct_8x8_inference_flag
 
     let frame_cropping_flag = reader.read_bits(1)?;
-    let (crop_left, crop_right, crop_top, crop_bottom) = if frame_cropping_flag == 1 {
+    let crop = if frame_cropping_flag == 1 {
         (
             reader.read_exp_golomb()?,
             reader.read_exp_golomb()?,
@@ -1400,10 +1403,13 @@ fn parse_h264_sps(data: &[u8]) -> Option<SpsInfo> {
         sub_height_c * (2 - frame_mbs_only_flag)
     };
 
-    let width = ((pic_width_in_mbs_minus1 + 1) * 16
-        - crop_unit_x * (crop_left + crop_right)) as u16;
-    let height = ((2 - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1) * 16
-        - crop_unit_y * (crop_top + crop_bottom)) as u16;
+    let (width, height) = picture_size(
+        pic_width_in_mbs_minus1,
+        pic_height_in_map_units_minus1,
+        frame_mbs_only_flag == 1,
+        crop,
+        (crop_unit_x, crop_unit_y),
+    )?;
 
     // Try to get timing info (VUI parameters)
     let mut frame_rate = None;
@@ -1426,30 +1432,13 @@ fn parse_h264_sps(data: &[u8]) -> Option<SpsInfo> {
     let level = format!("{}.{}", level_idc / 10, level_idc % 10);
 
     Some(SpsInfo {
-        width,
-        height,
+        // At most 16384.
+        width: width as u16,
+        height: height as u16,
         frame_rate,
         profile: profile.to_string(),
         level,
     })
-}
-
-/// Skip a scaling list in H.264 SPS.
-fn skip_scaling_list(reader: &mut BitReader, size: usize) -> Option<()> {
-    let mut last_scale = 8i32;
-    let mut next_scale = 8i32;
-    for _ in 0..size {
-        if next_scale != 0 {
-            let delta = reader.read_signed_exp_golomb()?;
-            next_scale = (last_scale + delta + 256) % 256;
-        }
-        last_scale = if next_scale == 0 {
-            last_scale
-        } else {
-            next_scale
-        };
-    }
-    Some(())
 }
 
 /// Parse VUI timing info from H.264 SPS to extract frame rate.
@@ -2791,5 +2780,33 @@ mod tests {
         assert_eq!(reader.read_signed_exp_golomb(), Some(1)); // ue=1 → se=1
         assert_eq!(reader.read_signed_exp_golomb(), Some(-1)); // ue=2 → se=-1
         assert_eq!(reader.read_signed_exp_golomb(), Some(2)); // ue=3 → se=2
+    }
+
+    /// edge#213: an SPS whose size, crop or scaling list is out of range is
+    /// not read.
+    #[test]
+    fn an_h264_sps_out_of_range_is_not_read() {
+        use super::super::h264_sps::tests::{Sps, crops, edge_213, sizes};
+        let size_of = |sps: &Sps| {
+            find_and_parse_h264_sps(&sps.annex_b()).map(|i| (u32::from(i.width), u32::from(i.height)))
+        };
+        for (i, sps) in edge_213().iter().enumerate() {
+            assert_eq!(size_of(sps), None, "{i}");
+        }
+        for (sps, size) in sizes().into_iter().chain(crops()) {
+            assert_eq!(size_of(&sps), size);
+        }
+        let high = |deltas| Sps { profile: 100, scaling_list: Some(deltas), ..Sps::default() };
+        assert_eq!(size_of(&high(&[-128, -128, -8])), Some((1920, 1088)));
+        assert_eq!(size_of(&high(&[-129, 121])), None);
+        assert_eq!(size_of(&high(&[-129, -128, -8])), None);
+    }
+
+    #[test]
+    fn a_random_h264_sps_never_panics() {
+        use super::super::h264_sps::tests::{RANDOM, random_sps};
+        for sps in random_sps(RANDOM) {
+            let _ = parse_h264_sps(&sps);
+        }
     }
 }

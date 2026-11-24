@@ -15,6 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::engine::content_analysis::bitreader::{BitReader, unescape_rbsp};
+use crate::engine::h264_sps::picture_size;
 use crate::engine::ts_parse::{
     TS_PACKET_SIZE, TS_SYNC_BYTE, extract_pcr, ts_has_adaptation, ts_pid, ts_pusi,
 };
@@ -564,7 +565,7 @@ fn parse_avc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
     }
     br.read_bit()?; // direct_8x8_inference_flag
     let crop_flag = br.read_bit()?;
-    let (cl, cr, ct, cb) = if crop_flag == 1 {
+    let crop = if crop_flag == 1 {
         (
             br.read_ue()?,
             br.read_ue()?,
@@ -574,13 +575,7 @@ fn parse_avc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
     } else {
         (0, 0, 0, 0)
     };
-    let width = (pic_w_mbs_m1 + 1) * 16 - (cl + cr) * 2;
-    let height = (2 - frame_mbs_only_flag as u32) * (pic_h_units_m1 + 1) * 16
-        - (ct + cb) * 2;
-    if width == 0 || height == 0 {
-        return None;
-    }
-    Some((width, height))
+    picture_size(pic_w_mbs_m1, pic_h_units_m1, frame_mbs_only_flag == 1, crop, (2, 2))
 }
 
 fn parse_hevc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
@@ -789,5 +784,28 @@ mod tests {
         assert_eq!(counts.get(&0x101), Some(&1));
         assert_eq!(counts.get(&0x1FFF), Some(&2));
         assert_eq!(counts.get(&0x200), None);
+    }
+
+    /// edge#213: an SPS whose size or crop is out of range has no size, and
+    /// the next one is looked at.
+    #[test]
+    fn an_avc_sps_out_of_range_has_no_size() {
+        use crate::engine::h264_sps::tests::{Sps, crops, edge_213, sizes};
+        for (i, sps) in edge_213().iter().enumerate() {
+            assert_eq!(find_avc_sps_dims(&sps.annex_b()), None, "{i}");
+            let two = [sps.annex_b(), Sps::default().annex_b()].concat();
+            assert_eq!(find_avc_sps_dims(&two), Some((1920, 1088)), "{i}");
+        }
+        for (sps, size) in sizes().into_iter().chain(crops()) {
+            assert_eq!(find_avc_sps_dims(&sps.annex_b()), size);
+        }
+    }
+
+    #[test]
+    fn a_random_avc_sps_never_panics() {
+        use crate::engine::h264_sps::tests::{RANDOM, random_sps};
+        for sps in random_sps(RANDOM) {
+            let _ = parse_avc_sps_dims(&sps[1..]);
+        }
     }
 }

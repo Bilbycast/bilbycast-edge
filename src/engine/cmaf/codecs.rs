@@ -17,6 +17,7 @@
 use super::box_writer::BoxWriter;
 use super::nalu::{H265_NAL_PPS, H265_NAL_SPS, H265_NAL_VPS};
 use super::param_sets::ParamSet;
+use crate::engine::h264_sps::{picture_size, skip_scaling_list};
 
 // ────────────────────────────────────────────────────────────────────────
 //  H.264 avcC box
@@ -106,6 +107,11 @@ pub(crate) fn push_avcc_record(out: &mut Vec<u8>, sps_list: &[ParamSet], pps_lis
 /// `chroma_format_idc` + `separate_colour_plane_flag` +
 /// `bit_depth_luma_minus8` + `bit_depth_chroma_minus8` + scaling lists
 /// that we must skip past to reach the dimension fields.
+///
+/// `None` also for a width or height over 16384 px, a crop that leaves no
+/// picture, and a scaling list's `delta_scale` outside −128..=127
+/// (`engine::h264_sps`). The track is then 1280x720
+/// (`VideoTrack::with_param_sets`), as on any SPS that does not parse.
 pub fn parse_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
     if sps.len() < 4 {
         return None;
@@ -133,7 +139,7 @@ pub fn parse_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
                     let present = r.bit()?;
                     if present {
                         let sz = if i < 6 { 16 } else { 64 };
-                        r.skip_scaling_list(sz)?;
+                        skip_scaling_list(sz, || r.se())?;
                     }
                 }
             }
@@ -170,15 +176,11 @@ pub fn parse_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
     }
     let _direct_8x8_inference_flag = r.bit()?;
     let frame_cropping_flag = r.bit()?;
-    let (crop_left, crop_right, crop_top, crop_bottom) = if frame_cropping_flag {
+    let crop = if frame_cropping_flag {
         (r.ue()?, r.ue()?, r.ue()?, r.ue()?)
     } else {
         (0, 0, 0, 0)
     };
-
-    // Dimensions in macroblocks × 16.
-    let width_mb = (pic_width_in_mbs_minus1 + 1) * 16;
-    let height_mb = (pic_height_in_map_units_minus1 + 1) * 16 * if frame_mbs_only_flag { 1 } else { 2 };
 
     // Crop units depend on chroma_format_idc (ITU-T H.264 Table 6-1).
     let (sub_w, sub_h) = match chroma_format_idc {
@@ -187,15 +189,13 @@ pub fn parse_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
         3 => (1, 1), // 4:4:4
         _ => (2, 2),
     };
-    let (crop_unit_x, crop_unit_y) = if chroma_format_idc == 0 || separate_colour_plane_flag {
+    let crop_unit = if chroma_format_idc == 0 || separate_colour_plane_flag {
         (1, 2 - frame_mbs_only_flag as u32)
     } else {
         (sub_w, sub_h * (2 - frame_mbs_only_flag as u32))
     };
 
-    let width = width_mb.saturating_sub((crop_left + crop_right) * crop_unit_x);
-    let height = height_mb.saturating_sub((crop_top + crop_bottom) * crop_unit_y);
-    Some((width, height))
+    picture_size(pic_width_in_mbs_minus1, pic_height_in_map_units_minus1, frame_mbs_only_flag, crop, crop_unit)
 }
 
 /// Minimal bit reader with Exp-Golomb helpers and emulation-prevention
@@ -327,19 +327,6 @@ impl<'a> BitReader<'a> {
         } else {
             -((v / 2) as i32)
         })
-    }
-
-    fn skip_scaling_list(&mut self, size: u32) -> Option<()> {
-        let mut last_scale: i32 = 8;
-        let mut next_scale: i32 = 8;
-        for _ in 0..size {
-            if next_scale != 0 {
-                let delta_scale = self.se()?;
-                next_scale = (last_scale + delta_scale + 256) % 256;
-            }
-            last_scale = if next_scale == 0 { last_scale } else { next_scale };
-        }
-        Some(())
     }
 }
 
@@ -1598,5 +1585,71 @@ mod tests {
         let mut r = BitReader::new(&data[3..]);
         r.bit().unwrap();
         assert_eq!(r.skip_bytes(1), None, "off a byte boundary");
+    }
+
+    /// edge#213: an SPS whose size, crop or scaling list is out of range has
+    /// no size, and the track built of it the default one.
+    #[test]
+    fn an_sps_out_of_range_has_no_size() {
+        use super::super::fmp4::VideoTrack;
+        use crate::engine::h264_sps::tests::{Sps, crops, edge_213, sizes};
+        for (i, sps) in edge_213().iter().enumerate() {
+            assert_eq!(parse_sps_resolution(&sps.nal()), None, "{i}");
+            let track = VideoTrack::from_h264(sps.nal(), vec![0x68, 0xCE, 0x3C, 0x80]);
+            assert_eq!((track.width, track.height), (1280, 720), "{i}");
+        }
+        for (sps, size) in sizes().into_iter().chain(crops()) {
+            // 4:2:0: the crop unit is 2x2.
+            assert_eq!(parse_sps_resolution(&sps.nal()), size);
+            let track = VideoTrack::from_h264(sps.nal(), vec![0x68, 0xCE, 0x3C, 0x80]);
+            assert_eq!((track.width, track.height), size.unwrap_or((1280, 720)));
+        }
+        let high = |deltas| Sps { profile: 100, scaling_list: Some(deltas), ..Sps::default() };
+        for deltas in [&[-128, -128, -8][..], &[127, 127, -6]] {
+            assert_eq!(parse_sps_resolution(&high(deltas).nal()), Some((1920, 1088)), "{deltas:?}");
+        }
+        for deltas in [&[-129, 121][..], &[-129, -128, -8], &[128, -136], &[1, i32::MAX], &[-i32::MAX]] {
+            assert_eq!(parse_sps_resolution(&high(deltas).nal()), None, "{deltas:?}");
+        }
+    }
+
+    /// Real SPS, x264's and two captures', each with its size as ffprobe
+    /// reads it.
+    #[test]
+    fn a_real_sps_has_the_size_ffprobe_reads() {
+        for (what, sps, size) in [
+            ("Baseline 720p", "6742c01fdc05005bb011000003000100000300320f183380", (1280, 720)),
+            ("Main, interlaced SD", "674d401ef816849b011000000300100000030321f142b8", (720, 576)),
+            ("Main, interlaced 1440", "674d4028f80b4089fbc044000003000400000300c87c58be", (1440, 1080)),
+            ("High, PAFF capture", "67640029ac133140780447de03ea020203e000000300200000065280", (1920, 1080)),
+            (
+                "High, MBAFF capture with scaling lists",
+                concat!(
+                    "67640028ad843588742050b041074421ac47361882a210ffa69a4d5a31526c862c92c8a431cb104111251c",
+                    "28c716161d1e09050b05d06d087fd7af93f11fd7e6f8af0870d608a0a0b290078044fde036a02020280000",
+                    "0300080000030194a0",
+                ),
+                (1920, 1080),
+            ),
+            ("High 4:2:2 10-bit, interlaced", "677a1028b6cf01e0113f2e022000000300200000064280", (1920, 1080)),
+            ("High 4:2:2 10-bit 4K", "677a1033b6cb80780087d80880000003008000001902", (3840, 2160)),
+            ("High 10 8K", "676e103ca6cb803c0010ed80880000030008000003019020", (7680, 4320)),
+            ("High 4:2:2, 8192 wide", "677a103cbcb801000043b6022000000300200000064080", (8192, 4320)),
+            ("16384 wide, the widest taken", "6742c03cdc0040011b011000000300100000030320f0804380", (16384, 128)),
+            ("High 4:4:4, cropped by 14 each way", "67f4100d919705421e3e3f01100000030010000003032040", (322, 242)),
+        ] {
+            let sps = super::super::param_sets::tests::hx(sps);
+            assert_eq!(parse_sps_resolution(&sps), Some(size), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_random_sps_never_panics() {
+        use crate::engine::h264_sps::tests::{RANDOM, random_sps};
+        for sps in random_sps(RANDOM) {
+            if let Some((w, h)) = parse_sps_resolution(&sps) {
+                assert!((1..=16384).contains(&w) && (1..=16384).contains(&h), "{w}x{h}");
+            }
+        }
     }
 }

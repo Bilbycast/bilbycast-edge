@@ -49,6 +49,7 @@
 use std::time::{Duration, Instant};
 
 use crate::engine::content_analysis::bitreader::{unescape_rbsp, BitReader};
+use crate::engine::h264_sps::picture_size;
 use crate::engine::ts_parse::{extract_pes_pts, pes_payload_offset, ts_pusi};
 
 /// Default splice budget for audio in milliseconds. ≥8 audio frames at
@@ -845,7 +846,8 @@ fn extract_sps_rbsp(pkt: &[u8], stream_type: u8) -> Option<Vec<u8>> {
 /// `None`) on any failure mode the bit reader hits — out-of-buffer,
 /// malformed Exp-Golomb, scaling-list flag set (would require parsing
 /// large variable-length scaling lists; the sentinel doesn't need that
-/// data and the splice falls through to a PTS-only commit). The
+/// data and the splice falls through to a PTS-only commit), a width or
+/// height over 16384 px, a bit depth over 14. The
 /// `expected_profile` byte at `rbsp[0]` is taken at face value; the
 /// `level_idc` byte is at `rbsp[2]`.
 pub fn parse_avc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
@@ -869,8 +871,8 @@ pub fn parse_avc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
         if cf == 3 {
             br.read_bit()?; // separate_colour_plane_flag
         }
-        bit_depth_luma = 8 + (br.read_ue()? as u8);
-        bit_depth_chroma = 8 + (br.read_ue()? as u8);
+        bit_depth_luma = bit_depth(br.read_ue()?, 6)?;
+        bit_depth_chroma = bit_depth(br.read_ue()?, 6)?;
         br.read_bit()?; // qpprime_y_zero_transform_bypass_flag
         let seq_scaling = br.read_bit()?;
         if seq_scaling == 1 {
@@ -916,8 +918,14 @@ pub fn parse_avc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
     let pic_height_in_map_units_minus1 = br.read_ue()?;
     let frame_mbs_only_flag = br.read_bit()?;
 
-    let width = (pic_width_in_mbs_minus1 + 1) * 16;
-    let height = (2 - frame_mbs_only_flag as u32) * (pic_height_in_map_units_minus1 + 1) * 16;
+    // Coded size: the cropping is not read.
+    let (width, height) = picture_size(
+        pic_width_in_mbs_minus1,
+        pic_height_in_map_units_minus1,
+        frame_mbs_only_flag == 1,
+        (0, 0, 0, 0),
+        (1, 1),
+    )?;
 
     Some(VideoCodecParams {
         codec: VideoCodec::Avc,
@@ -929,6 +937,14 @@ pub fn parse_avc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
         width,
         height,
     })
+}
+
+/// The bit depth a `bit_depth_*_minus8` states: at most 6 in H.264 (ITU-T
+/// H.264 §7.4.2.1.1), 8 in HEVC (H.265 §7.4.3.2.1); `None` past `max`. Until
+/// 2026-11 (edge#213) it was cut to its low byte before the 8 was added:
+/// 256 read as 8-bit, and from 248 the sum overflowed.
+fn bit_depth(minus8: u32, max: u8) -> Option<u8> {
+    u8::try_from(minus8).ok().filter(|depth| *depth <= max).map(|depth| 8 + depth)
 }
 
 /// Parse an HEVC SPS RBSP into [`VideoCodecParams`]. Same shape /
@@ -995,8 +1011,8 @@ pub fn parse_hevc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
         br.read_ue()?;
         br.read_ue()?;
     }
-    let bit_depth_luma = 8 + (br.read_ue()? as u8);
-    let bit_depth_chroma = 8 + (br.read_ue()? as u8);
+    let bit_depth_luma = bit_depth(br.read_ue()?, 8)?;
+    let bit_depth_chroma = bit_depth(br.read_ue()?, 8)?;
 
     Some(VideoCodecParams {
         codec: VideoCodec::Hevc,
@@ -2738,5 +2754,68 @@ mod tests {
         // default for the new active leg (B is now A for next splice).
         let later = pkt_with_video_pes(100_000, true, &[(4, avc_nal(1))]);
         assert_eq!(s.observe_a_packet(&later), FromPacketAction::Forward);
+    }
+
+    /// edge#213: the parameters an SPS out of range states are not taken. The
+    /// cropping is not read, and an SPS with scaling lists is not read as far
+    /// as its size, so those two keep the snapshot they had.
+    #[test]
+    fn an_avc_sps_out_of_range_has_no_params() {
+        use crate::engine::h264_sps::tests::{Sps, crops, edge_213, sizes};
+        let size_of = |sps: &Sps| parse_avc_sps_params(&sps.rbsp()).map(|p| (p.width, p.height));
+        let [width, height, crop, scaling_list] = edge_213();
+        assert_eq!(size_of(&width), None);
+        assert_eq!(size_of(&height), None);
+        assert_eq!(size_of(&crop), Some((1920, 1088)));
+        assert_eq!(size_of(&scaling_list), Some((0, 0)));
+        for (sps, size) in sizes() {
+            let size = if sps.crop.is_some() { size.and(Some((1920, 1088))) } else { size };
+            assert_eq!(size_of(&sps), size);
+        }
+        for (sps, _) in crops() {
+            assert_eq!(size_of(&sps), Some((1920, 1088)));
+        }
+        // An out-of-range SPS on either leg leaves the splice to the PTS.
+        let pkt = pkt_with_avc_idr_pes(93_600, &width.rbsp());
+        assert_eq!(extract_video_params_from_pes(&pkt, 0x1B), None);
+    }
+
+    /// edge#213: a bit depth is bounded before it is narrowed to a byte. 256
+    /// read as 8-bit, and from 248 the sum overflowed.
+    #[test]
+    fn a_bit_depth_out_of_range_has_no_params() {
+        use crate::engine::cmaf::param_sets::tests::{HevcSpsSpec, hevc_sps_full};
+        use crate::engine::h264_sps::tests::Sps;
+        let avc = |bit_depths| {
+            let sps = Sps { profile: 110, bit_depths, ..Sps::default() };
+            parse_avc_sps_params(&sps.rbsp()).map(|p| (p.bit_depth_luma, p.bit_depth_chroma))
+        };
+        let hevc = |bit_depths| {
+            let nal = hevc_sps_full(HevcSpsSpec { bit_depths, ..HevcSpsSpec::default() });
+            parse_hevc_sps_params(&unescape_rbsp(&nal[2..])).map(|p| (p.bit_depth_luma, p.bit_depth_chroma))
+        };
+        assert_eq!(avc((0, 2)), Some((8, 10)));
+        assert_eq!(avc((6, 6)), Some((14, 14)));
+        assert_eq!(hevc((0, 2)), Some((8, 10)));
+        assert_eq!(hevc((8, 8)), Some((16, 16)));
+        for over in [9, 247, 248, 255, 256, 258, u32::MAX - 1] {
+            for bit_depths in [(over, 0), (0, over)] {
+                assert_eq!(avc(bit_depths), None, "{bit_depths:?}");
+                assert_eq!(hevc(bit_depths), None, "{bit_depths:?}");
+            }
+        }
+        for bit_depths in [(7, 0), (0, 7)] {
+            assert_eq!(avc(bit_depths), None, "{bit_depths:?}");
+            assert!(hevc(bit_depths).is_some(), "{bit_depths:?}");
+        }
+    }
+
+    #[test]
+    fn a_random_sps_never_panics() {
+        use crate::engine::h264_sps::tests::{RANDOM, random_sps};
+        for sps in random_sps(RANDOM) {
+            let _ = parse_avc_sps_params(&sps[1..]);
+            let _ = parse_hevc_sps_params(&sps[1..]);
+        }
     }
 }

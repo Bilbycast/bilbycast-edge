@@ -49,6 +49,9 @@ pub mod display_cadence;
 /// [`epoch_lock`] for the clock-domain reasoning.
 pub mod epoch_lock;
 pub mod flow;
+/// The checked arithmetic the H.264 SPS parsers share: picture size and
+/// scaling lists. See [`h264_sps`].
+pub mod h264_sps;
 /// Hardware probe + CPU class + software-encode capacity estimate. Powers
 /// the `resource_budget` block on the manager `HealthPayload`. One-shot
 /// probe at startup, no async / no I/O. See [`hardware_probe`].

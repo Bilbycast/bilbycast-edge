@@ -338,16 +338,16 @@ pub(crate) mod tests {
     /// whose fields are known. It inserts no emulation-prevention bytes, so
     /// what it builds must not hold `00 00 0x` (x ≤ 3) — the patterns used
     /// here do not.
-    pub(in crate::engine::cmaf) struct Bits {
+    pub(crate) struct Bits {
         out: Vec<u8>,
         n: usize,
     }
 
     impl Bits {
-        pub(in crate::engine::cmaf) fn new(head: &[u8]) -> Self {
+        pub(crate) fn new(head: &[u8]) -> Self {
             Self { out: head.to_vec(), n: head.len() * 8 }
         }
-        pub(in crate::engine::cmaf) fn put(&mut self, v: u64, width: u32) -> &mut Self {
+        pub(crate) fn put(&mut self, v: u64, width: u32) -> &mut Self {
             for i in (0..width).rev() {
                 if self.n.is_multiple_of(8) {
                     self.out.push(0);
@@ -359,14 +359,14 @@ pub(crate) mod tests {
             }
             self
         }
-        pub(in crate::engine::cmaf) fn ue(&mut self, v: u32) -> &mut Self {
+        pub(crate) fn ue(&mut self, v: u32) -> &mut Self {
             let code = u64::from(v) + 1;
             let len = 64 - code.leading_zeros();
             self.put(0, len - 1).put(code, len)
         }
         /// The stop bit, alignment, and a tail of payload, so no NAL built
         /// here is "too short".
-        pub(in crate::engine::cmaf) fn done(&mut self) -> Vec<u8> {
+        pub(crate) fn done(&mut self) -> Vec<u8> {
             self.put(1, 1);
             while !self.n.is_multiple_of(8) {
                 self.put(0, 1);

@@ -64,14 +64,15 @@ impl<'a> BitReader<'a> {
         Some((1u32 << leading_zeros) - 1 + suffix)
     }
 
-    /// Exp-Golomb signed `se(v)` — H.264 §9.1.1.
+    /// Exp-Golomb signed `se(v)` — H.264 §9.1.1: code k is (−1)^(k+1)
+    /// Ceil(k ÷ 2), which no code [`Self::read_ue`] returns takes past
+    /// ±(2^31 − 1). Until 2026-11 (edge#213) the halving was done in `i32`:
+    /// code 2^31 − 1 overflowed, and every one above it came out with the
+    /// wrong sign.
     pub fn read_se(&mut self) -> Option<i32> {
         let ue = self.read_ue()?;
-        if ue & 1 != 0 {
-            Some((ue as i32 + 1) / 2)
-        } else {
-            Some(-((ue as i32) / 2))
-        }
+        let magnitude = ue.div_ceil(2) as i32;
+        Some(if ue & 1 == 1 { magnitude } else { -magnitude })
     }
 }
 
@@ -143,5 +144,50 @@ mod tests {
         let input = [0, 0, 3, 1, 0, 0, 3, 0, 2];
         let out = unescape_rbsp(&input);
         assert_eq!(out, vec![0, 0, 1, 0, 0, 0, 2]);
+    }
+
+    /// `code` as ue(v), and then `read_se` of it.
+    fn se_of(code: u32) -> Option<i32> {
+        let code = u64::from(code) + 1;
+        let len = 2 * code.ilog2() + 1;
+        let bits = code << (64 - len);
+        BitReader::new(&bits.to_be_bytes()).read_se()
+    }
+
+    /// §9.1.1's mapping over the whole range of a code. From 2^31 - 1 on, the
+    /// halving overflowed an `i32`.
+    #[test]
+    fn se_is_read_over_the_whole_range_of_a_code() {
+        for (code, value) in [
+            (0, 0),
+            (1, 1),
+            (2, -1),
+            (0x7FFF_FFFD, 0x3FFF_FFFF),
+            (0x7FFF_FFFE, -0x3FFF_FFFF),
+            (0x7FFF_FFFF, 0x4000_0000),
+            (0x8000_0000, -0x4000_0000),
+            (0x8000_0001, 0x4000_0001),
+            (u32::MAX - 2, i32::MAX),
+            (u32::MAX - 1, -i32::MAX),
+        ] {
+            assert_eq!(se_of(code), Some(value), "{code:#x}");
+        }
+        let mut code = 1_u32;
+        while code < u32::MAX - 1 {
+            let k = i64::from(code);
+            let value = if k % 2 == 1 { (k + 1) / 2 } else { -k / 2 };
+            assert_eq!(se_of(code).map(i64::from), Some(value), "{code:#x}");
+            code = code.saturating_add(code / 200 + 1);
+        }
+        // Thirty-two zeros: no code is that long.
+        assert_eq!(BitReader::new(&[0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).read_se(), None);
+    }
+
+    #[test]
+    fn random_bytes_never_panic() {
+        for bytes in crate::engine::h264_sps::tests::random_sps(crate::engine::h264_sps::tests::RANDOM) {
+            let mut r = BitReader::new(&bytes);
+            while r.read_se().is_some() {}
+        }
     }
 }
