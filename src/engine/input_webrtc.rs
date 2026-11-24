@@ -698,6 +698,9 @@ async fn whep_input_loop(
         // Opus was dropped, and a pull of a server sending no video
         // published nothing at all.
         whep.session(tracks.1, sdp_declares_stereo_opus(&answer_sdp));
+        // A server may prime the pull with a keyframe it had cached: the
+        // video is then timed from the live pictures (`PrimedIdr`).
+        whep.expect_primed_idr();
         let mut layout = WhipLayout::new("WHEP pull");
 
         // Receive loop
@@ -1083,6 +1086,10 @@ struct WhipMux {
     held_bytes: usize,
     /// When the first frame held arrived.
     held_since: Option<std::time::Instant>,
+    /// Whether the session's first picture is one its server had cached,
+    /// while that is open ([`PrimedIdr`]); `None` once it is settled, and for
+    /// a WHIP publish from the start.
+    primed: Option<PrimedIdr>,
 }
 
 /// One frame's TS packets and the PTS (90 kHz) they were stamped at, as
@@ -1116,6 +1123,287 @@ const OPUS_COUNT_WAIT: std::time::Duration = std::time::Duration::from_millis(30
 #[cfg(any(feature = "webrtc", test))]
 const HOLD_MAX_BYTES: usize = 2 * 1024 * 1024;
 
+/// How far (90 kHz) every picture that follows a pull's first must run ahead
+/// of it — its RTP distance from it less its arrival's — for that first
+/// picture to be one its server had cached ([`PrimedIdr`]): 100 ms.
+///
+/// A server whose first picture is live puts the picture shown next one frame
+/// period behind it on the RTP clock and, sent as they come, in arrival as
+/// well: it runs ahead only by what the first picture was held up by on its
+/// way — encoding and pacing it, tens of milliseconds. Reordering does not add
+/// to that. With N B-frames the picture sent next, shown N + 1 periods on,
+/// runs N periods ahead (80 ms at N = 2 and 120 ms at N = 3 in 25 fps), but
+/// the picture *shown* next is sent a period behind the IDR at the least and
+/// runs ahead of nothing, and where pictures may be reordered the check is on
+/// the least of those that came. Behind a cached IDR they run ahead by its
+/// age: with a 2 s GOP 0 to 2 s, less than this on one pull in twenty, which
+/// is left as it is.
+#[cfg(any(feature = "webrtc", test))]
+const PRIMED_LEAD_90K: i128 = 9_000;
+
+/// How long, and for how many pictures, a pull whose second picture ran ahead
+/// of its first is held while the pictures after it settle whether the first
+/// was cached. A source without B-frames settles it with its third picture,
+/// one with them by the end of the mini-GOP the second fell in: with seven
+/// B-frames at 25 fps, 320 ms at most.
+#[cfg(any(feature = "webrtc", test))]
+const PRIMED_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
+#[cfg(any(feature = "webrtc", test))]
+const PRIMED_MAX_PICTURES: usize = 10;
+
+/// How many pictures of an unfinished mini-GOP hold the one shown first: the
+/// reference decoded first, the B-frame in the middle of those before it, the
+/// one in the middle of the half before that, and so on — five, of up to
+/// fifteen B-frames.
+#[cfg(any(feature = "webrtc", test))]
+const PRIMED_FIRST_SHOWN_WITHIN: usize = 5;
+
+/// Whether a WHEP pull's first picture is a keyframe its server had cached,
+/// older than the live pictures that follow it: the pull's first pictures,
+/// until that is settled.
+///
+/// bilbycast-relay primes each viewer with the IDR it has cached, up to a
+/// source GOP old (minutes, of a browser that sends one only when asked),
+/// and then sends the live pictures. The IDR arrives when they do but is
+/// stamped when it was taken, and [`WhipClock`] times a track from its first
+/// frame: every live picture went out later than it came by the IDR's age,
+/// and so that far past the sound sent with it, for the whole pull, the PCR
+/// stepping by as much between the IDR and the first of them (past a second,
+/// with nothing to bridge it and no `discontinuity_indicator`). So the video
+/// is timed from the live pictures instead, as if the first of them had
+/// opened the session: once, as they show the IDR stale, the audio not
+/// touched. The IDR keeps its place at the session's start, where it arrived;
+/// a decoder is shown it until the first live picture.
+///
+/// It shows on the second picture, which runs ahead of the IDR
+/// ([`PRIMED_LEAD_90K`]). That alone does not say so. It does in a live
+/// stream too, where it is a P-frame sent ahead of the B-frames shown before
+/// it, or where a server sends what it queued for a connecting viewer in one
+/// go, each picture one frame period ahead of the last. And where B-frames
+/// are still to come, timing the video from it would put them ahead of the
+/// IDR. The IDR is cached
+///
+/// * if the second picture's `frame_num` says that reference pictures between
+///   the two were not sent, which a live stream's does not ([`H264Order`]);
+/// * or, where it cannot say, if the pictures that follow all run ahead of
+///   the IDR and the one of them shown first is more than a frame period
+///   behind it. A frame period is the least distance between two of them, of
+///   three at least unless it tells the first cached as it is.
+///
+/// And the video is timed from the live picture shown first. Of a stream whose
+/// pictures are shown in the order they are sent that is the second one, and
+/// where `frame_num` says the IDR is cached it is settled as that one comes.
+/// Otherwise the pull's frames are held from it on, in the order they arrive,
+/// until
+///
+/// * one does not run ahead of the first: the first is live;
+/// * a picture comes that is shown past all the others, so that every picture
+///   shown before them has come;
+/// * [`PRIMED_WAIT`], [`PRIMED_MAX_PICTURES`] or [`HOLD_MAX_BYTES`] is
+///   reached: what came is judged as it is, the first taken for live where too
+///   few pictures of a mini-GOP came to hold the one shown first
+///   ([`PRIMED_FIRST_SHOWN_WITHIN`]).
+///
+/// What is held then goes out as it came, through the same code as any
+/// session's frames: where the first picture was live, on the very same
+/// timestamps and in the same order as if nothing had been held. Where it is
+/// known cached by its `frame_num` and the one shown first is still to come,
+/// the PCR runs on meanwhile with the pictures' arrival
+/// ([`TsMuxer::run_pcr_on`]).
+///
+/// [`TsMuxer::run_pcr_on`]: crate::engine::rtmp::ts_mux::TsMuxer::run_pcr_on
+#[cfg(any(feature = "webrtc", test))]
+#[derive(Debug, Default)]
+struct PrimedIdr {
+    /// The pull's first picture, an IDR: its RTP time and its arrival.
+    first: Option<(u64, std::time::Instant)>,
+    /// Reference pictures between the first and the second were not sent.
+    skips: bool,
+    /// The stream's pictures are shown in the order they are sent.
+    in_order: bool,
+    /// The frames held, from the second picture on.
+    held: Vec<ArrivedFrame>,
+    held_bytes: usize,
+}
+
+/// What the pictures of a pull say of its first ([`PrimedIdr::verdict`]).
+#[cfg(any(feature = "webrtc", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstPicture {
+    /// Nothing yet.
+    Open,
+    /// It is live.
+    Live,
+    /// Its server had cached it, and whether the live picture shown first is
+    /// among those held.
+    Cached { first_shown: bool },
+}
+
+/// A depayloaded frame as [`WhipMux::frame`] takes it, kept.
+#[cfg(any(feature = "webrtc", test))]
+#[derive(Debug)]
+struct ArrivedFrame {
+    video: bool,
+    data: Vec<u8>,
+    rtp: u64,
+    rate: u64,
+    arrival: std::time::Instant,
+}
+
+/// A picture held behind a pull's first: how far (90 kHz) behind the first it
+/// is shown, on the RTP clock, how far ahead of it it runs, and the frame it
+/// came as.
+#[cfg(any(feature = "webrtc", test))]
+#[derive(Clone, Copy)]
+struct HeldPicture<'a> {
+    shown: i128,
+    ahead: i128,
+    frame: &'a ArrivedFrame,
+}
+
+#[cfg(any(feature = "webrtc", test))]
+impl PrimedIdr {
+    /// How far (90 kHz) a picture is shown behind the pull's first picture,
+    /// and how far ahead of it that runs: less what it arrived behind it by.
+    fn distance(first: (u64, std::time::Instant), rtp: u64, rate: u64, arrival: std::time::Instant) -> (i128, i128) {
+        let shown = (rtp as i128 - first.0 as i128) * 90_000 / rate.max(1) as i128;
+        let arrived = arrival.saturating_duration_since(first.1).as_micros() as i128 * 9 / 100;
+        (shown, shown - arrived)
+    }
+
+    /// The pictures held, as they came.
+    fn pictures(&self) -> Vec<HeldPicture<'_>> {
+        let Some(first) = self.first else {
+            return Vec::new();
+        };
+        self.held
+            .iter()
+            .filter(|frame| frame.video)
+            .map(|frame| {
+                let (shown, ahead) = Self::distance(first, frame.rtp, frame.rate, frame.arrival);
+                HeldPicture { shown, ahead, frame }
+            })
+            .collect()
+    }
+
+    /// When what is held is judged as it is, if anything is.
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.held.first().map(|f| f.arrival + PRIMED_WAIT)
+    }
+
+    /// What the pictures that have come say of the pull's first. `over`: they
+    /// are to be judged as they are, however few.
+    fn verdict(&self, over: bool) -> FirstPicture {
+        let pictures = self.pictures();
+        let Some((last, rest)) = pictures.split_last() else {
+            return FirstPicture::Live;
+        };
+        let least = pictures.iter().map(|p| p.ahead).min().unwrap_or(0);
+        if least <= PRIMED_LEAD_90K {
+            return FirstPicture::Live;
+        }
+        let over = over || pictures.len() >= PRIMED_MAX_PICTURES || self.held_bytes > HOLD_MAX_BYTES;
+        let mut shown: Vec<i128> = pictures.iter().map(|p| p.shown).collect();
+        shown.sort_unstable();
+        let period = shown.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0).min();
+        let cached = self.skips || period.is_some_and(|period| shown[0] * 2 > period * 3);
+        let mut first_shown = self.in_order || !rest.is_empty() && rest.iter().all(|p| p.shown < last.shown);
+        if !cached {
+            let live = over || first_shown && pictures.len() >= 3;
+            return if live { FirstPicture::Live } else { FirstPicture::Open };
+        }
+        if over && !first_shown {
+            first_shown = pictures.len() >= PRIMED_FIRST_SHOWN_WITHIN;
+            if !first_shown {
+                return FirstPicture::Live;
+            }
+        }
+        // Short of the picture shown first, the distances alone say nothing:
+        // a live stream's two B-frames sent the later first are more than a
+        // frame period behind the IDR until the other comes.
+        match first_shown || self.skips {
+            true => FirstPicture::Cached { first_shown },
+            false => FirstPicture::Open,
+        }
+    }
+}
+
+/// What an H.264 stream's SPS says of the order its pictures come in, and how
+/// to read a picture's `frame_num` (ITU-T H.264 §7.3.2.1.1, §7.3.3, §7.4.3):
+/// it counts the reference pictures from the last IDR, whose is 0, so that
+/// the picture sent right behind an IDR has 1 — or 0, the IDR's second field.
+#[cfg(any(feature = "webrtc", test))]
+#[derive(Debug)]
+struct H264Order {
+    frame_num_bits: u8,
+    separate_colour_planes: bool,
+    /// The pictures are shown in the order they are sent: Baseline, which has
+    /// no B-frames, or picture order count type 2, which allows none.
+    in_order: bool,
+}
+
+#[cfg(any(feature = "webrtc", test))]
+impl H264Order {
+    /// Of `sps`, an SPS NAL unit; `None` if it does not parse.
+    fn of(sps: &[u8]) -> Option<Self> {
+        use crate::engine::content_analysis::bitreader::{BitReader, unescape_rbsp};
+        let rbsp = unescape_rbsp(sps.get(1..)?);
+        let mut br = BitReader::new(&rbsp);
+        let profile_idc = br.read_bits(8)?;
+        br.read_bits(16)?; // constraint flags, level_idc
+        br.read_ue()?; // seq_parameter_set_id
+        let mut separate_colour_planes = false;
+        if [100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135].contains(&profile_idc) {
+            let chroma_format_idc = br.read_ue()?;
+            if chroma_format_idc == 3 {
+                separate_colour_planes = br.read_bit()? == 1;
+            }
+            br.read_ue()?; // bit_depth_luma_minus8
+            br.read_ue()?; // bit_depth_chroma_minus8
+            br.read_bit()?; // qpprime_y_zero_transform_bypass_flag
+            if br.read_bit()? == 1 {
+                // The scaling lists: each its deltas, until one ends it.
+                for list in 0..if chroma_format_idc == 3 { 12 } else { 8 } {
+                    if br.read_bit()? == 0 {
+                        continue;
+                    }
+                    let (mut last, mut next) = (8, 8);
+                    for _ in 0..if list < 6 { 16 } else { 64 } {
+                        if next != 0 {
+                            next = (last + br.read_se()? + 256) % 256;
+                        }
+                        last = if next == 0 { last } else { next };
+                    }
+                }
+            }
+        }
+        let frame_num_bits = u8::try_from(br.read_ue()?).ok().filter(|b| *b <= 12)? + 4;
+        let pic_order_cnt_type = br.read_ue()?;
+        let in_order = profile_idc == 66 || pic_order_cnt_type == 2;
+        Some(Self { frame_num_bits, separate_colour_planes, in_order })
+    }
+
+    /// The `frame_num` of the access unit `au`, off its first slice; `None`
+    /// for an IDR's, and one that does not parse.
+    fn frame_num(&self, au: &[u8]) -> Option<u32> {
+        use crate::engine::content_analysis::bitreader::{BitReader, unescape_rbsp};
+        let slice = nal_units(au).into_iter().find(|n| n.first().is_some_and(|b| matches!(b & 0x1F, 1 | 2 | 5)))?;
+        if slice[0] & 0x1F == 5 {
+            return None;
+        }
+        // Four ue(v) and two bits, at most, ahead of it.
+        let rbsp = unescape_rbsp(&slice[1..slice.len().min(40)]);
+        let mut br = BitReader::new(&rbsp);
+        br.read_ue()?; // first_mb_in_slice
+        br.read_ue()?; // slice_type
+        br.read_ue()?; // pic_parameter_set_id
+        if self.separate_colour_planes {
+            br.read_bits(2)?; // colour_plane_id
+        }
+        br.read_bits(self.frame_num_bits)
+    }
+}
+
 #[cfg(any(feature = "webrtc", test))]
 impl WhipMux {
     fn new(muxer: crate::engine::rtmp::ts_mux::TsMuxer) -> Self {
@@ -1129,6 +1417,7 @@ impl WhipMux {
             held: Vec::new(),
             held_bytes: 0,
             held_since: None,
+            primed: None,
         }
     }
 
@@ -1164,6 +1453,7 @@ impl WhipMux {
         self.held.clear();
         self.held_bytes = 0;
         self.held_since = None;
+        self.primed = None;
         self.muxer.mark_discontinuity();
         self.clock.session();
         self.param_sets = H264ParamSets::default();
@@ -1174,26 +1464,112 @@ impl WhipMux {
         self.count_open = audio && !self.opus_stereo;
     }
 
-    /// Until when the session's video is held for its channel count, if it
-    /// is: [`Self::release_due`] then.
-    fn hold_deadline(&self) -> Option<std::time::Instant> {
-        self.held_since.map(|since| since + OPUS_COUNT_WAIT)
+    /// The session just started ([`Self::session`]) is a WHEP pull, whose
+    /// server may prime it with a keyframe it had cached ([`PrimedIdr`]). A
+    /// WHIP publisher has none: its first picture is the one it has just
+    /// taken, however late it came.
+    fn expect_primed_idr(&mut self) {
+        self.primed = Some(PrimedIdr::default());
     }
 
-    /// The video held for the session's channel count, muxed, once
-    /// [`OPUS_COUNT_WAIT`] has passed since the first of it arrived (`now`):
-    /// the Opus is listed as it was, and a stereo packet later lists it so
-    /// with a version bump.
+    /// Until when the session's frames are held, if any are, for its channel
+    /// count or its first picture's age: [`Self::release_due`] then.
+    fn hold_deadline(&self) -> Option<std::time::Instant> {
+        let count = self.held_since.map(|since| since + OPUS_COUNT_WAIT);
+        let primed = self.primed.as_ref().and_then(PrimedIdr::deadline);
+        [count, primed].into_iter().flatten().min()
+    }
+
+    /// The frames held past their deadline (`now`), muxed: those held while
+    /// the pull's first picture was open, settled as it stands once
+    /// [`PRIMED_WAIT`] has passed; and the video held for the session's
+    /// channel count, once [`OPUS_COUNT_WAIT`] has since the first of it
+    /// arrived — the Opus is listed as it was, and a stereo packet later
+    /// lists it so with a version bump.
     fn release_due(&mut self, now: std::time::Instant) -> Vec<MuxedFrame> {
-        match self.hold_deadline() {
-            Some(due) if now >= due => self.release(),
-            _ => Vec::new(),
+        let mut out = Vec::new();
+        if self.primed.as_ref().and_then(PrimedIdr::deadline).is_some_and(|due| now >= due) {
+            out = self.settle_primed(now, true);
         }
+        if self.held_since.is_some_and(|since| now >= since + OPUS_COUNT_WAIT) {
+            out.extend(self.release());
+        }
+        out
     }
 
     /// The session has ended: what it held, muxed.
     fn end_session(&mut self) -> Vec<MuxedFrame> {
-        self.release()
+        let mut out = match &self.primed {
+            Some(primed) if !primed.held.is_empty() => self.settle_primed(std::time::Instant::now(), true),
+            _ => Vec::new(),
+        };
+        out.extend(self.release());
+        out
+    }
+
+    /// Settle whether the pull's first picture was one its server had cached,
+    /// if what has come by `now` does ([`PrimedIdr::verdict`]; `over`: it
+    /// must), and then the frames held since, muxed as they came: the video
+    /// timed from its live pictures if it was. Until it is settled, the PCR
+    /// run on to `now`, when the picture that has just come arrived, once the
+    /// first picture is known cached.
+    fn settle_primed(&mut self, now: std::time::Instant, over: bool) -> Vec<MuxedFrame> {
+        let verdict = self.primed.as_ref().map(|primed| primed.verdict(over));
+        let cached = match verdict {
+            None | Some(FirstPicture::Open) => return Vec::new(),
+            Some(FirstPicture::Cached { first_shown: false }) => return self.run_pcr_on(now),
+            Some(FirstPicture::Cached { first_shown: true }) => true,
+            Some(FirstPicture::Live) => false,
+        };
+        let Some(primed) = self.primed.take() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        if cached && let Some(live) = primed.pictures().into_iter().min_by_key(|p| p.shown) {
+            tracing::info!(
+                "WHEP: the pull's first picture is a keyframe its server had cached, {} ms old; \
+                 the video is timed from the live pictures",
+                live.ahead / 90
+            );
+            self.clock.retime_video(live.frame.rtp, live.frame.arrival);
+            // The PCR runs on from the IDR's by what passed until the live
+            // pictures arrived. Past what the muxer bridges with filler PCRs
+            // it is a step, and is marked as one. The IDR is ahead of it: the
+            // wait for its channel count ran out long since.
+            let opens = &primed.held[0];
+            if self.held_since.is_some_and(|since| opens.arrival.saturating_duration_since(since) >= OPUS_COUNT_WAIT) {
+                out = self.release();
+            }
+            if self.held.is_empty() {
+                let pts = self.clock.pts_90k(true, opens.rtp, opens.rate, opens.arrival);
+                self.muxer.mark_unbridged_step(pts);
+            }
+        }
+        for f in primed.held {
+            out.extend(self.mux(f.video, &f.data, f.rtp, f.rate, f.arrival));
+        }
+        out
+    }
+
+    /// The PCR run on as a picture arrives (`now`) that is held with the live
+    /// pictures of a pull whose first picture was cached, the one shown first
+    /// still to come. Not past the PCR the first of them will carry: that is
+    /// no earlier than the one shown first of those that have come puts it.
+    /// Nothing while the IDR itself is held, for the channel count.
+    fn run_pcr_on(&mut self, now: std::time::Instant) -> Vec<MuxedFrame> {
+        let Some(primed) = self.primed.as_ref().filter(|p| self.held.is_empty() && p.held.last().is_some_and(|f| f.video))
+        else {
+            return Vec::new();
+        };
+        let pictures = primed.pictures();
+        let (Some(opens), Some(live)) = (pictures.first(), pictures.iter().min_by_key(|p| p.shown)) else {
+            return Vec::new();
+        };
+        let behind = u64::try_from(opens.shown - live.shown).unwrap_or(0);
+        let shown_first_at = live.frame.arrival;
+        let ts = self.clock.start_90k(now).min(self.clock.start_90k(shown_first_at) + behind) & 0x1_FFFF_FFFF;
+        let packets = self.muxer.run_pcr_on(ts);
+        if packets.is_empty() { Vec::new() } else { vec![(packets, ts)] }
     }
 
     /// The held video muxed, in order, and the channel count closed for the
@@ -1211,9 +1587,10 @@ impl WhipMux {
     /// One depayloaded frame of the video (`video`) or the audio track —
     /// RTP timestamp `rtp` on a `rate` Hz clock, arrived at `arrival` — as
     /// the frames to publish now, each as TS packets and the PTS it was
-    /// stamped at: none for a frame with no payload, or a picture held for
-    /// the session's channel count ([`Self::session`]); the held pictures
-    /// ahead of the Opus packet that settles it.
+    /// stamped at: none for a frame with no payload, a picture held for the
+    /// session's channel count ([`Self::session`]) or a frame held while the
+    /// pull's first picture is open ([`PrimedIdr`]); the held frames ahead of
+    /// the one that settles it.
     fn frame(
         &mut self,
         video: bool,
@@ -1225,6 +1602,70 @@ impl WhipMux {
         if data.is_empty() {
             return Vec::new();
         }
+        let Some(primed) = &mut self.primed else {
+            return self.mux(video, data, rtp, rate, arrival);
+        };
+        match primed.first {
+            // The pull's first picture: a keyframe the pictures after it may
+            // show cached, or a picture nothing is to be told by.
+            None => {
+                if video && holds_idr(data) {
+                    primed.first = Some((rtp, arrival));
+                } else if video {
+                    self.primed = None;
+                }
+                return self.mux(video, data, rtp, rate, arrival);
+            }
+            // Until the second picture runs ahead of it, nothing is held.
+            Some(first) if primed.held.is_empty() => {
+                if !video {
+                    return self.mux(video, data, rtp, rate, arrival);
+                }
+                if PrimedIdr::distance(first, rtp, rate, arrival).1 <= PRIMED_LEAD_90K {
+                    self.primed = None;
+                    return self.mux(video, data, rtp, rate, arrival);
+                }
+                if let Some(order) = self.param_sets.sps.as_deref().and_then(H264Order::of) {
+                    primed.skips = order.frame_num(data).is_some_and(|n| n > 1);
+                    primed.in_order = order.in_order;
+                }
+            }
+            Some(_) => {}
+        }
+        primed.held.push(ArrivedFrame { video, data: data.to_vec(), rtp, rate, arrival });
+        primed.held_bytes += data.len();
+        // The session's first Opus packet settles its channel count whether
+        // or not it is held itself: the IDR held for it goes out.
+        let mut out = if video { Vec::new() } else { self.settle_count(data[0]) };
+        out.extend(self.settle_primed(arrival, false));
+        out
+    }
+
+    /// An Opus packet whose TOC byte is `toc` has come: the session's first
+    /// settles its channel count before its first PMT goes out, and the video
+    /// held for it goes out behind that PMT. A stereo packet (the TOC's `s`
+    /// bit, RFC 6716 §3.1) lists the Opus as stereo from here on, with a
+    /// version bump once a PMT has gone out.
+    fn settle_count(&mut self, toc: u8) -> Vec<MuxedFrame> {
+        if !self.opus_stereo && toc & 0x04 != 0 {
+            self.opus_stereo = true;
+            if self.muxer.change_opus_channels(2) {
+                tracing::info!("WebRTC Opus is stereo: the PMT lists it so (channel_config_code 2)");
+            }
+        }
+        if self.count_open { self.release() } else { Vec::new() }
+    }
+
+    /// One frame ([`Self::frame`]) muxed, or held for the session's channel
+    /// count.
+    fn mux(
+        &mut self,
+        video: bool,
+        data: &[u8],
+        rtp: u64,
+        rate: u64,
+        arrival: std::time::Instant,
+    ) -> Vec<MuxedFrame> {
         if video {
             // A depayloaded access unit, Annex B, with the parameter sets
             // ahead of every IDR (`H264ParamSets`), timed as it arrives.
@@ -1241,18 +1682,7 @@ impl WhipMux {
             }
             Vec::new()
         } else {
-            // A stereo packet (its TOC's `s` bit, RFC 6716 §3.1) lists the
-            // Opus as stereo from here on. The session's first packet
-            // settles the count before its first PMT goes out, the video
-            // held for it going out behind that PMT; a later one lists it
-            // with a version bump.
-            if !self.opus_stereo && data[0] & 0x04 != 0 {
-                self.opus_stereo = true;
-                if self.muxer.change_opus_channels(2) {
-                    tracing::info!("WebRTC Opus is stereo: the PMT lists it so (channel_config_code 2)");
-                }
-            }
-            let mut out = if self.count_open { self.release() } else { Vec::new() };
+            let mut out = self.settle_count(data[0]);
             // Opus: the RTP timestamp on the Opus clock (48 kHz, carried in
             // MediaTime.denom) onto the publish's 90 kHz timeline.
             let pts = if rate == 0 {
@@ -1285,7 +1715,10 @@ impl WhipMux {
 /// their first frames' arrival — the sender's capture-to-send latency
 /// difference and the network's, tens of milliseconds — not an arbitrary
 /// distance. (The RTCP sender reports' NTP ↔ RTP mapping would take out
-/// even that; str0m exposes them and doing so is a follow-up.)
+/// even that; str0m exposes them and doing so is a follow-up.) The video of a
+/// pull whose first picture its server had cached is timed from its live
+/// pictures instead ([`Self::retime_video`], [`PrimedIdr`]): that first
+/// picture's arrival says nothing of them.
 ///
 /// A later session's tracks ([`Self::session`]) are anchored the same way on
 /// the same timeline — at their first frames' arrival after the input's
@@ -1334,21 +1767,40 @@ impl WhipClock {
     /// its RTP timestamp `rtp` (unwrapped) on a `rate` Hz clock, arrived at
     /// `arrival`.
     fn pts_90k(&mut self, video: bool, rtp: u64, rate: u64, arrival: std::time::Instant) -> u64 {
-        let origin = *self.origin.get_or_insert(arrival);
-        let slot = if video { &mut self.video } else { &mut self.audio };
-        let (first, base) = match *slot {
+        let anchored = if video { self.video } else { self.audio };
+        let (first, base) = match anchored {
             Some(anchor) => anchor,
             None => {
-                let late_us = arrival.saturating_duration_since(origin).as_micros() as u64;
-                let at = crate::engine::rtmp::ts_mux::PCR_LEAD_90K + late_us * 9 / 100;
-                let lift = *self.lift.get_or_insert(self.floor.saturating_sub(at));
-                *slot.insert((rtp, (at + lift).max(self.floor)))
+                let anchor = (rtp, self.start_90k(arrival));
+                *if video { &mut self.video } else { &mut self.audio } = Some(anchor);
+                anchor
             }
         };
         let ticks = (rtp as i128 - first as i128) * 90_000 / rate.max(1) as i128;
         let pts = (base as i128 + ticks).max(0) as u64;
         self.latest = self.latest.max(pts);
         pts & 0x1_FFFF_FFFF
+    }
+
+    /// The PTS (90 kHz, unwrapped) a track whose first frame arrived at
+    /// `arrival` starts at: where that is on the timeline, moved past the
+    /// last session's end with the rest of the session, and never behind it.
+    fn start_90k(&mut self, arrival: std::time::Instant) -> u64 {
+        let origin = *self.origin.get_or_insert(arrival);
+        let late_us = arrival.saturating_duration_since(origin).as_micros() as u64;
+        let at = crate::engine::rtmp::ts_mux::PCR_LEAD_90K + late_us * 9 / 100;
+        let lift = *self.lift.get_or_insert(self.floor.saturating_sub(at));
+        (at + lift).max(self.floor)
+    }
+
+    /// Time the video from the picture with RTP time `rtp`, arrived at
+    /// `arrival`, as if it had been the session's first, and past the one
+    /// that was ([`PrimedIdr`]).
+    fn retime_video(&mut self, rtp: u64, arrival: std::time::Instant) {
+        let start = self.start_90k(arrival);
+        if let Some((_, first)) = self.video {
+            self.video = Some((rtp, start.max(first + 1)));
+        }
     }
 
     /// A new session's tracks start: each is anchored afresh, at its first
@@ -1380,6 +1832,25 @@ struct H264ParamSets {
     pps: Option<Vec<u8>>,
 }
 
+/// The NAL units of `data`, one depayloaded access unit: Annex B, start codes
+/// included, or a bare NAL unit.
+#[cfg(any(feature = "webrtc", test))]
+fn nal_units(data: &[u8]) -> Vec<Vec<u8>> {
+    if data.starts_with(&[0, 0, 1]) || data.starts_with(&[0, 0, 0, 1]) {
+        crate::engine::ts_demux::split_annex_b_nalus(data)
+    } else if data.is_empty() {
+        Vec::new()
+    } else {
+        vec![data.to_vec()]
+    }
+}
+
+/// Whether the access unit `data` holds an IDR slice.
+#[cfg(any(feature = "webrtc", test))]
+fn holds_idr(data: &[u8]) -> bool {
+    nal_units(data).iter().any(|n| n.first().is_some_and(|b| b & 0x1F == 5))
+}
+
 #[cfg(any(feature = "webrtc", test))]
 impl H264ParamSets {
     /// `data` (one depayloaded access unit) as Annex B, with the cached SPS /
@@ -1387,14 +1858,7 @@ impl H264ParamSets {
     /// holds an IDR slice. The unit's own parameter sets refresh the cache.
     fn access_unit(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
         const START: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
-        let starts_coded = data.starts_with(&[0, 0, 1]) || data.starts_with(&START);
-        let nalus = if starts_coded {
-            crate::engine::ts_demux::split_annex_b_nalus(data)
-        } else if data.is_empty() {
-            Vec::new()
-        } else {
-            vec![data.to_vec()]
-        };
+        let nalus = nal_units(data);
         let (mut idr, mut has_sps, mut has_pps) = (false, false, false);
         for n in &nalus {
             match n.first().map(|b| b & 0x1F) {
@@ -2682,6 +3146,9 @@ mod tests {
         /// Send the first picture, an IDR, and no other: a server priming
         /// its viewer with a cached IDR whose source has stalled.
         one_picture: bool,
+        /// Stamp the first picture this much older than it goes out: an IDR
+        /// the server had cached, as bilbycast-relay primes a viewer with.
+        cached_ms: u64,
         /// Answer a DELETE after this long (0: at once).
         delete_after_ms: u64,
         /// Never answer a DELETE (note it, then hang): a dead server.
@@ -2770,7 +3237,8 @@ mod tests {
                             }
                             let more = k == 0 || !script.one_picture;
                             if let (true, 0, true, Some((mid, pt))) = (script.video, k % 2, more, video) {
-                                let at = MediaTime::new(k / 2 * 3_600, Frequency::NINETY_KHZ);
+                                let newer = if k == 0 { 0 } else { script.cached_ms * 90 };
+                                let at = MediaTime::new(newer + k / 2 * 3_600, Frequency::NINETY_KHZ);
                                 let picture = if k == 0 || !script.gop { IDR } else { P };
                                 let written = Instant::now();
                                 let _ = server.write_media(mid, pt, written, at, picture);
@@ -3405,5 +3873,896 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         drop(publisher);
         assert_sent_as_the_wait_ran_out(&ts, written, at, paused);
+    }
+
+    // ── A pull primed with a cached IDR (`PrimedIdr`) ─────────────────
+
+    /// A frame as it came: when (µs), on the video or the audio track, its
+    /// RTP time, its payload.
+    type Came = (u64, bool, u64, Vec<u8>);
+
+    /// A lone 25 fps frame period, on the 90 kHz clock and in µs.
+    const PERIOD_90K: u64 = 3_600;
+    const PERIOD_US: u64 = 40_000;
+    /// The video's and the audio's RTP bases: a sender picks each at random.
+    const VIDEO_RTP: u64 = 3_456_789_012;
+    const AUDIO_RTP: u64 = 77_000;
+
+    /// The pictures of a source coding `b` B-frames between references, in
+    /// decode order, each as the number it is shown at: 0, the IDR, then the
+    /// pictures behind it — each reference ahead of the B-frames shown before
+    /// it, those as a pyramid, whose middle is the `earlier` or the later of
+    /// two.
+    fn decode_order(b: u64, earlier: bool, pictures: usize) -> Vec<u64> {
+        fn between(from: u64, to: u64, earlier: bool, out: &mut Vec<u64>) {
+            if to - from > 1 {
+                let mid = from + (to - from + u64::from(!earlier)) / 2;
+                out.push(mid);
+                between(from, mid, earlier, out);
+                between(mid, to, earlier, out);
+            }
+        }
+        let mut order = vec![0];
+        while order.len() < pictures {
+            let from = (order.len() as u64 - 1) / (b + 1) * (b + 1);
+            order.push(from + b + 1);
+            between(from, from + b + 1, earlier, &mut order);
+        }
+        order.truncate(pictures);
+        order
+    }
+
+    /// The pictures `order` (as they are shown), the first at `first_us` and
+    /// the rest arriving as `at` says of each one's place behind it.
+    fn pictures(order: &[u64], first_us: u64, period_90k: u64, at: impl Fn(u64) -> u64) -> Vec<Came> {
+        order
+            .iter()
+            .enumerate()
+            .map(|(k, &shown)| {
+                let nal = if shown == 0 { IDR } else { P };
+                // Its own number past the slice header, so every picture's
+                // bytes are its own.
+                let data = [nal, &shown.to_be_bytes()[..]].concat();
+                (first_us + at(k as u64), true, VIDEO_RTP + shown * period_90k, data)
+            })
+            .collect()
+    }
+
+    /// The SPS of a stream that says its pictures come as they are shown (x264
+    /// Main without B-frames: picture order count type 2), and of one that
+    /// does not (with them).
+    const SPS_IN_ORDER: &str = "674d400cda05067e7c0440000003004000000c83c50aa8";
+    const SPS_REORDERED: &str = "674d400ceca0a0cfcf80880000030008000003019078a14cb0";
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// `bits` — each a value and how many bits it has — as bytes, with the
+    /// RBSP's trailing bits.
+    fn bits(bits: &[(u32, u32)]) -> Vec<u8> {
+        let mut all: Vec<u8> = bits.iter().flat_map(|&(v, n)| (0..n).rev().map(move |i| (v >> i & 1) as u8)).collect();
+        all.push(1);
+        all.resize(all.len().next_multiple_of(8), 0);
+        all.chunks(8).map(|c| c.iter().fold(0, |byte, bit| byte << 1 | bit)).collect()
+    }
+
+    /// `v` as ue(v).
+    fn ue(v: u32) -> (u32, u32) {
+        (v + 1, 2 * (v + 1).ilog2() + 1)
+    }
+
+    /// A P slice with `frame_num`, of a stream whose SPS gives it four bits.
+    fn p_slice(frame_num: u32) -> Vec<u8> {
+        [vec![0, 0, 0, 1, 0x41], bits(&[ue(0), ue(5), ue(0), (frame_num % 16, 4)])].concat()
+    }
+
+    /// `frames` with their pictures coded as a source of `b` B-frames codes
+    /// them, its SPS `sps`: every picture with its `frame_num`.
+    fn coded(mut frames: Vec<Came>, b: u64, sps: &str, period_90k: u64) -> Vec<Came> {
+        let last = frames.iter().filter(|f| f.1).map(|f| (f.2 - VIDEO_RTP) / period_90k).max().unwrap_or(0);
+        // The references: what another picture between two is halved by.
+        let mut frame_nums = std::collections::HashMap::new();
+        let mut references = 0u64;
+        for shown in decode_order(b, true, last as usize + 2 * b as usize + 3) {
+            frame_nums.insert(shown, references as u32);
+            let at = shown % (b + 1);
+            let leaf = |from: u64, to: u64| {
+                let (mut from, mut to) = (from, to);
+                loop {
+                    let mid = from + (to - from) / 2;
+                    match at.cmp(&mid) {
+                        std::cmp::Ordering::Equal => break to - from <= 2,
+                        std::cmp::Ordering::Less => to = mid,
+                        std::cmp::Ordering::Greater => from = mid,
+                    }
+                }
+            };
+            if at == 0 || !leaf(0, b + 1) {
+                references += 1;
+            }
+        }
+        for f in frames.iter_mut().filter(|f| f.1) {
+            let shown = (f.2 - VIDEO_RTP) / period_90k;
+            f.3 = if shown == 0 {
+                [&[0, 0, 0, 1], &hex(sps)[..], &[0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88]].concat()
+            } else {
+                [p_slice(frame_nums[&shown]), shown.to_be_bytes().to_vec()].concat()
+            };
+        }
+        frames
+    }
+
+    /// `packets` Opus packets of 20 ms, the first at `first_us`, each arriving
+    /// as its time comes.
+    fn opus(first_us: u64, packets: u64, toc: u8) -> Vec<Came> {
+        (0..packets)
+            .map(|k| {
+                let mut data = vec![toc];
+                data.extend((0..40u64).map(|i| (k + i) as u8));
+                (first_us + k * 20_000, false, AUDIO_RTP + k * 960, data)
+            })
+            .collect()
+    }
+
+    /// `frames` in the order they arrive.
+    fn arriving(mut frames: Vec<Came>) -> Vec<Came> {
+        frames.sort_by_key(|f| f.0);
+        frames
+    }
+
+    /// `frames` through `w` as its input's loop puts them, its holds' timer
+    /// run out on the way, and the session's end.
+    fn fed(w: &mut super::WhipMux, t0: std::time::Instant, frames: &[Came]) -> Vec<super::MuxedFrame> {
+        let mut out = Vec::new();
+        for (us, video, rtp, data) in frames {
+            let arrival = t0 + std::time::Duration::from_micros(*us);
+            while let Some(due) = w.hold_deadline().filter(|due| *due < arrival) {
+                out.extend(w.release_due(due));
+            }
+            out.extend(w.frame(*video, data, *rtp, if *video { 90_000 } else { 48_000 }, arrival));
+        }
+        out.extend(w.end_session());
+        out
+    }
+
+    /// `frames` as a session of a fresh input: a WHEP pull (`pull`), whose
+    /// first picture may be a cached one, or a WHIP publish, whose frames are
+    /// timed as every session's were before that was looked for.
+    fn one_session(pull: bool, frames: &[Came]) -> Vec<super::MuxedFrame> {
+        let mut w = av_whip_mux();
+        w.session(frames.iter().any(|f| !f.1), false);
+        if pull {
+            w.expect_primed_idr();
+        }
+        fed(&mut w, std::time::Instant::now(), frames)
+    }
+
+    /// The PES of `muxed` on `pid`, as each one's PTS.
+    fn pts_on(muxed: &[super::MuxedFrame], pid: u16) -> Vec<u64> {
+        use crate::engine::ts_parse::{extract_pes_pts, ts_pid, ts_pusi};
+        muxed
+            .iter()
+            .flat_map(|(ts, _)| ts)
+            .filter(|p| ts_pid(p) == pid && ts_pusi(p))
+            .filter_map(|p| extract_pes_pts(p))
+            .collect()
+    }
+
+    /// The PCRs of `muxed` (90 kHz), each with its `discontinuity_indicator`.
+    fn pcrs_in(muxed: &[super::MuxedFrame]) -> Vec<(u64, bool)> {
+        use crate::engine::ts_parse::{extract_pcr, ts_discontinuity_indicator};
+        muxed
+            .iter()
+            .flat_map(|(ts, _)| ts)
+            .filter_map(|p| Some((extract_pcr(p)? / 300, ts_discontinuity_indicator(p))))
+            .collect()
+    }
+
+    /// Every step between consecutive `pcrs` (90 kHz, modulo the 33-bit
+    /// wrap; a step back comes out huge).
+    fn pcr_steps(pcrs: &[(u64, bool)]) -> Vec<u64> {
+        pcrs.windows(2).map(|w| w[1].0.wrapping_sub(w[0].0) & 0x1_FFFF_FFFF).collect()
+    }
+
+    /// `muxed` without its PAT and PMT, which repeat by the wall clock: the
+    /// TS packets, and the PTS each frame was published at.
+    fn essence(muxed: &[super::MuxedFrame]) -> (Vec<bytes::Bytes>, Vec<u64>) {
+        use crate::engine::ts_parse::ts_pid;
+        let ts = muxed.iter().flat_map(|(ts, _)| ts).filter(|p| ![0, 0x1000].contains(&ts_pid(p))).cloned().collect();
+        (ts, muxed.iter().map(|m| m.1).collect())
+    }
+
+    /// A pull primed with a cached IDR and then sent the live pictures has
+    /// its video and its sound as far apart as the live pictures and the
+    /// sound arrived, whatever the IDR's age (and the PCR their pace, with no
+    /// step to mark): every live picture is timed from the first of them. The
+    /// IDR stays where it arrived, at the start, ahead of them. Every live
+    /// picture used to be timed from the IDR instead, and so went out its age
+    /// late — the PCR stepping by that at the first of them.
+    #[test]
+    fn a_pull_primed_with_a_cached_idr_is_timed_from_its_live_pictures() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        // 160 ms old to ten minutes (a browser's only IDR so far).
+        for missed in [4u64, 5, 12, 37, 49, 15_000] {
+            for (stereo, sps) in [(0x78, None), (0xFC, None), (0x78, Some(SPS_IN_ORDER)), (0xFC, Some(SPS_REORDERED))] {
+                // The IDR at 0; the live pictures from 23 ms on, a period
+                // apart; the sound from 31 ms on.
+                let mut frames = pictures(&[0], 0, PERIOD_90K, |_| 0);
+                let live: Vec<u64> = (missed..missed + 100).collect();
+                frames.extend(pictures(&live, 23_000, PERIOD_90K, |k| k * PERIOD_US));
+                if let Some(sps) = sps {
+                    frames = coded(frames, 0, sps, PERIOD_90K);
+                }
+                frames.extend(opus(31_000, 200, stereo));
+                let muxed = one_session(true, &arriving(frames));
+
+                let video = pts_on(&muxed, 0x0100);
+                let expected: Vec<u64> =
+                    std::iter::once(LEAD).chain((0..100).map(|k| LEAD + 23 * 90 + k * PERIOD_90K)).collect();
+                assert_eq!(video, expected, "{missed} pictures missed");
+                let audio = pts_on(&muxed, 0x0101);
+                assert_eq!(audio, (0..200).map(|k| LEAD + 31 * 90 + k * 1_800).collect::<Vec<_>>());
+                // Nothing steps: 23 ms from the IDR's PCR to the next.
+                let pcrs = pcrs_in(&muxed);
+                assert!(pcrs.iter().all(|p| !p.1), "a DI: {pcrs:?}");
+                let steps = pcr_steps(&pcrs);
+                assert_eq!(steps[0], 23 * 90);
+                assert!(steps[1..].iter().all(|s| *s == PERIOD_90K), "{steps:?}");
+                // One PMT layout throughout, the channel count with it.
+                let codes: std::collections::BTreeSet<Option<u8>> = pmt_codes(&muxed).into_iter().collect();
+                assert_eq!(codes.len(), 1, "{codes:?}");
+            }
+        }
+        // 100 ms ahead or less is within what holds up a live first picture.
+        for (from_us, timed_from) in [(20_000u64, LEAD + 3 * PERIOD_90K), (19_000, LEAD + 19 * 90)] {
+            let mut frames = pictures(&[0], 0, PERIOD_90K, |_| 0);
+            frames.extend(pictures(&(3..40).collect::<Vec<_>>(), from_us, PERIOD_90K, |k| k * PERIOD_US));
+            assert_eq!(pts_on(&one_session(true, &frames), 0x0100)[1], timed_from);
+        }
+    }
+
+    /// The same of a source with B-frames, from whichever picture of a
+    /// mini-GOP the pull's live pictures start on: they keep the distances
+    /// from each other their RTP times say, to the tick — moved whole, none
+    /// clamped, reordered or dropped, only their distance from the IDR taken
+    /// out — and the first of them to be shown goes out as it arrived. They
+    /// are all past the IDR, where timing the video from the picture after
+    /// the IDR put the B-frames shown before that one ahead of it: before
+    /// the start of the timeline, the PCR wrapping.
+    #[test]
+    fn b_frames_behind_a_cached_idr_keep_their_order_and_times() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        for b in [1u64, 2, 3, 7] {
+            let order = decode_order(b, b != 2, 400);
+            for start in 120..=120 + b as usize {
+                // As they come, and the first few in one go: what the server
+                // queued for the viewer while it connected.
+                for queued in [0u64, 4, 12] {
+                    let live = &order[start..start + 60];
+                    let mut frames = pictures(&[0], 0, PERIOD_90K, |_| 0);
+                    frames.extend(pictures(live, 9_000, PERIOD_90K, |k| k.min(queued) * 300 + k.saturating_sub(queued) * PERIOD_US));
+                    if start % 2 == 0 {
+                        frames = coded(frames, b, SPS_REORDERED, PERIOD_90K);
+                    }
+                    frames.extend(opus(5_000, 120, 0xFC));
+                    let frames = arriving(frames);
+                    let muxed = one_session(true, &frames);
+                    let as_before = one_session(false, &frames);
+
+                    let (now, before) = (pts_on(&muxed, 0x0100), pts_on(&as_before, 0x0100));
+                    assert_eq!(now.len(), 61, "every picture, the IDR first");
+                    assert_eq!((now[0], before[0]), (LEAD, LEAD), "the IDR where it arrived");
+                    let moved: std::collections::BTreeSet<u64> =
+                        now[1..].iter().zip(&before[1..]).map(|(n, b)| b - n).collect();
+                    assert_eq!(moved.len(), 1, "moved whole (b {b}, start {start}, queued {queued}): {moved:?}");
+                    assert_eq!(pts_on(&muxed, 0x0101), pts_on(&as_before, 0x0101), "the sound not moved");
+                    // The first shown, of the mini-GOP they start in.
+                    let first = (0..=b as usize + 1).min_by_key(|&k| live[k]).unwrap();
+                    let arrived = frames.iter().filter(|f| f.1).nth(first + 1).unwrap().0;
+                    assert_eq!(now[1 + first], LEAD + arrived * 9 / 100, "as it arrived (b {b}, start {start}, queued {queued})");
+                    assert!(now[1..].iter().all(|pts| *pts > LEAD), "past the IDR: {now:?}");
+                    // The PCR follows them, as they step back and forward, and
+                    // the first of them is past all it had reached.
+                    let steps = pcr_steps(&pcrs_in(&muxed));
+                    assert!(steps.iter().all(|s| *s <= PERIOD_90K || *s > 1 << 32));
+                    let back = steps.iter().position(|s| *s > 1 << 32).unwrap();
+                    let reference = (1..).find(|&k| live[k] < live[k - 1]).unwrap();
+                    let at = pcrs_in(&muxed)[back].0;
+                    assert_eq!(at, now[reference] - LEAD, "the first step back is the first B-frame's");
+                }
+            }
+        }
+    }
+
+    /// A pull whose first picture is live goes out as it always did, to the
+    /// byte — B-frames or none, at their pace, jittered, in one go, the first
+    /// picture held up on its way, a frame a fifth of a second or a second
+    /// apart, no sound, no keyframe first, the sound first — and so does a
+    /// WHIP publish of anything, one with a cached IDR included: every
+    /// timestamp is the track's first frame's arrival plus the RTP time since.
+    #[test]
+    fn a_session_whose_first_picture_is_live_is_timed_as_it_was() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        // Arrival jitter, 0-60 ms, the same at every run.
+        let jitter = |k: u64| (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40) % 60_000;
+        let mut sessions: Vec<(String, Vec<Came>)> = Vec::new();
+        for (b, earlier) in [0u64, 1, 2, 3, 7].into_iter().flat_map(|b| [(b, true), (b, false)]) {
+            let order = decode_order(b, earlier, 120);
+            let av = |video: Vec<Came>| arriving([video, opus(12_000, 240, 0x78)].concat());
+            sessions.push((format!("at its pace, b {b}"), av(pictures(&order, 0, PERIOD_90K, |k| k * PERIOD_US))));
+            sessions.push((
+                format!("jittered, b {b}"),
+                av(pictures(&order, 60_000, PERIOD_90K, |k| k * PERIOD_US + jitter(k))),
+            ));
+            for queued in [2u64, 5, 30] {
+                // What the server queued while its viewer connected, an IDR
+                // first, in one go.
+                let at = move |k: u64| k.min(queued) * 250 + k.saturating_sub(queued) * PERIOD_US;
+                sessions.push((format!("{queued} in one go, b {b}"), av(pictures(&order, 0, PERIOD_90K, at))));
+            }
+            for late_ms in [15u64, 60, 95, 250] {
+                // The first picture held up on its way (encoding, pacing).
+                let at = move |k: u64| (k * PERIOD_US).max(late_ms * 1_000 + k * 500);
+                sessions.push((format!("first {late_ms} ms late, b {b}"), av(pictures(&order, 0, PERIOD_90K, at))));
+            }
+            sessions.push((
+                format!("no sound, b {b}"),
+                pictures(&order, 0, PERIOD_90K, |k| k.min(6) * 200 + k.saturating_sub(6) * PERIOD_US),
+            ));
+            // Joined part-way: no keyframe first, or the sound.
+            sessions.push((format!("mid-GOP, b {b}"), av(pictures(&order[7..], 4_000, PERIOD_90K, |k| k * 300))));
+            sessions.push((
+                format!("the sound first, b {b}"),
+                arriving([pictures(&order, 400_000, PERIOD_90K, |k| k * PERIOD_US), opus(0, 240, 0xFC)].concat()),
+            ));
+        }
+        for (fps, b) in [(1u64, 0u64), (2, 0), (5, 0), (10, 0), (15, 0), (15, 2), (10, 3), (5, 2)] {
+            let order = decode_order(b, b != 2, 40);
+            for queued in [0u64, 1, 2, 3, 6] {
+                let period = 1_000_000 / fps;
+                let at = move |k: u64| k.min(queued) * 400 + k.saturating_sub(queued) * period;
+                let video = pictures(&order, 0, 90_000 / fps, at);
+                let what = format!("{fps} fps, {queued} in one go, b {b}");
+                sessions.push((what, arriving([video, opus(3_000, 240, 0xFC)].concat())));
+            }
+        }
+        // No keyframe first, and a jump behind it.
+        let mut frames = pictures(&[5], 0, PERIOD_90K, |_| 0);
+        frames.extend(pictures(&(60..90).collect::<Vec<_>>(), 20_000, PERIOD_90K, |k| k * PERIOD_US));
+        sessions.push(("no keyframe first".into(), frames));
+        // Two B-frames at 15 fps, the later sent first, the one shown first
+        // lost, the IDR 60 ms late: the reference runs 193 ms ahead of it, the
+        // B-frame that came 60 ms.
+        let order: Vec<u64> = decode_order(2, false, 60).into_iter().filter(|shown| *shown != 1).collect();
+        let video = pictures(&order, 0, 6_000, |k| (k * 66_667).max(60_000));
+        sessions.push(("15 fps, the picture shown first lost, b 2".into(), video));
+        sessions.push(("no picture".into(), opus(0, 100, 0x78)));
+        sessions.push(("one picture".into(), pictures(&[0], 0, PERIOD_90K, |_| 0)));
+        sessions.push(("one picture and sound".into(), arriving([pictures(&[0], 0, PERIOD_90K, |_| 0), opus(9_000, 99, 0xFC)].concat())));
+
+        // Each as it is, and coded so that its SPS and slices parse.
+        let coded_too: Vec<(String, Vec<Came>)> = sessions
+            .iter()
+            .filter(|(_, frames)| frames.iter().any(|f| f.1 && f.2 == VIDEO_RTP))
+            .map(|(what, frames)| {
+                let b = what.split("b ").nth(1).and_then(|b| b.parse().ok()).unwrap_or(0);
+                let fps: u64 = what.split(" fps").next().and_then(|f| f.parse().ok()).unwrap_or(25);
+                let sps = if b == 0 { SPS_IN_ORDER } else { SPS_REORDERED };
+                (format!("{what}, coded"), coded(frames.clone(), b, sps, 90_000 / fps))
+            })
+            .collect();
+        sessions.extend(coded_too);
+
+        for (what, frames) in &sessions {
+            let muxed = one_session(true, frames);
+            assert_eq!(essence(&muxed), essence(&one_session(false, frames)), "{what}: not as a publish's");
+            for (video, pid, rate) in [(true, 0x0100u16, 90_000u64), (false, 0x0101, 48_000)] {
+                let track: Vec<&Came> = frames.iter().filter(|f| f.1 == video).collect();
+                let Some(first) = track.first() else { continue };
+                let base = LEAD as i128 + (first.0 - frames[0].0) as i128 * 9 / 100;
+                let expected: Vec<u64> = track
+                    .iter()
+                    .map(|f| (base + (f.2 as i128 - first.2 as i128) * 90_000 / rate as i128) as u64)
+                    .collect();
+                assert_eq!(pts_on(&muxed, pid), expected, "{what}");
+            }
+        }
+
+        // A WHIP publish is not looked at: its IDR, however old, opens it.
+        let mut frames = pictures(&[0], 0, PERIOD_90K, |_| 0);
+        frames.extend(pictures(&(40..140).collect::<Vec<_>>(), 23_000, PERIOD_90K, |k| k * PERIOD_US));
+        let published = pts_on(&one_session(false, &frames), 0x0100);
+        assert_eq!(published[1], LEAD + 40 * PERIOD_90K);
+    }
+
+    /// The order an H.264 stream's pictures come in, off the SPS, and their
+    /// `frame_num`, off their first slice: x264's (Main, Baseline, High with a
+    /// scaling matrix in its PPS, 4:2:2 and 4:4:4), against ffmpeg's
+    /// `trace_headers`; an SPS with scaling lists of its own and separate
+    /// colour planes; and nothing of what does not parse.
+    #[test]
+    fn an_h264_streams_order_is_read_off_its_sps_and_slices() {
+        use super::H264Order;
+        for (what, sps, in_order, slices) in [
+            (
+                "Main, no B-frames",
+                SPS_IN_ORDER,
+                true,
+                [("419a26223fb54cb25889147d", 1), ("419a66223fb91f76f85e7a31", 3), ("419a86223f2d73cda3d46e08", 4)],
+            ),
+            (
+                "Main, B-frames",
+                SPS_REORDERED,
+                false,
+                [("419a231888ffbab921f13817", 1), ("019e62442dfffeed7c9a6489", 3), ("419bb6393111ff2d73cd98ce", 13)],
+            ),
+            (
+                "Baseline",
+                "6742c00cda05067e7c0440000003004000000c83c50aa8",
+                true,
+                [("419a2047f0f569f29046d91e", 1), ("419a6047f0e67443718b6302", 3), ("419a8047297f7c2082fe00db", 4)],
+            ),
+            (
+                "High",
+                "6764000cacd941419f9f011000000300100000030320f1429960",
+                false,
+                [("419a24188affb7d2add76722", 1), ("019e61442dfffeed75ef6138", 3), ("419b77344c457f3bc0fec67e", 11)],
+            ),
+            (
+                "High 4:2:2",
+                "677a000cb6cd941419f8dc0440000003004000000c83c50a6580",
+                false,
+                [("419a231888ffbab911e58418", 1), ("019e62442dfffeed82f21378", 3), ("419bb6344c447f2d73cda3d3", 13)],
+            ),
+            (
+                "High 4:4:4",
+                "67f4000c919b282833f1b808800000030080000019078a14cb",
+                false,
+                [("419a23188affb4aa9fa281ab", 1), ("019e62442dfffe9db01bcf4b", 3), ("419bb6393115ff3bc0d6c8fd", 13)],
+            ),
+        ] {
+            let order = H264Order::of(&hex(sps)).expect(what);
+            assert_eq!(order.in_order, in_order, "{what}");
+            for (slice, frame_num) in slices {
+                let au = [&[0, 0, 0, 1, 0x06, 0x01, 0, 0, 1][..], &hex(slice)].concat();
+                assert_eq!(order.frame_num(&au), Some(frame_num), "{what}: {slice}");
+            }
+            assert_eq!(order.frame_num(&[0, 0, 0, 1, 0x65, 0x88, 0x84]), None, "{what}: an IDR");
+        }
+
+        // High 4:4:4 Predictive, separate colour planes, twelve scaling lists:
+        // absent, the default (its first delta ends it), one of two deltas and
+        // one spelt out; frame_num of 9 bits, picture order count type 0.
+        let mut sps: Vec<(u32, u32)> = vec![(244, 8), (0, 8), (40, 8), ue(0), ue(3), (1, 1), ue(0), ue(0), (0, 1), (1, 1)];
+        for list in 0..12 {
+            let size = if list < 6 { 16 } else { 64 };
+            match list % 4 {
+                0 => sps.push((0, 1)),
+                // delta_scale -8 (se): the next scale 0.
+                1 => sps.extend([(1, 1), ue(16)]),
+                // +4, then -12: 12, then 0.
+                2 => sps.extend([(1, 1), ue(7), ue(24)]),
+                // All of them the last again: 8.
+                _ => {
+                    sps.push((1, 1));
+                    sps.extend(std::iter::repeat_n(ue(0), size));
+                }
+            }
+        }
+        sps.extend([ue(5), ue(0), ue(4)]);
+        let order = H264Order::of(&[vec![0x67], bits(&sps)].concat()).unwrap();
+        assert_eq!((order.frame_num_bits, order.separate_colour_planes, order.in_order), (9, true, false));
+        let slice = [vec![0x41], bits(&[ue(0), ue(5), ue(0), (2, 2), (300, 9)])].concat();
+        assert_eq!(order.frame_num(&slice), Some(300), "a bare NAL unit");
+
+        for cut in 1..5 {
+            assert!(H264Order::of(&hex(SPS_IN_ORDER)[..cut]).is_none());
+        }
+        let wide = bits(&[(77, 8), (0, 8), (40, 8), ue(0), ue(13), ue(2)]);
+        assert!(H264Order::of(&[vec![0x67], wide].concat()).is_none(), "a frame_num of 17 bits");
+        assert_eq!(order.frame_num(&[0x41, 0x88]), None);
+        assert_eq!(order.frame_num(&[0, 0, 0, 1, 0x09, 0xF0]), None, "no slice");
+    }
+
+    /// Where the second picture's `frame_num` says that reference pictures
+    /// between it and the first were not sent, the first is cached, and a
+    /// stream shown as it is sent is timed from the second as it comes:
+    /// nothing is held. One that may reorder is held for the picture shown
+    /// first, the PCR running on as each picture comes. Where `frame_num`
+    /// says nothing — the picture right behind an IDR, its second field, or
+    /// an IDR — the pictures after it say.
+    #[test]
+    fn a_cached_idr_shows_on_the_picture_behind_it() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        let ms = std::time::Duration::from_millis;
+        let t0 = std::time::Instant::now();
+        let pull = |sps: &str| {
+            let mut w = av_whip_mux();
+            w.session(true, true);
+            w.expect_primed_idr();
+            let idr = [&[0, 0, 0, 1], &hex(sps)[..], &[0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88]].concat();
+            assert_eq!(w.frame(true, &idr, 1_000, 90_000, t0).len(), 1, "the IDR at once");
+            w
+        };
+        let put = |w: &mut super::WhipMux, at: u64, shown: u64, frame_num: u32| {
+            w.frame(true, &p_slice(frame_num), 1_000 + shown * 90, 90_000, t0 + ms(at))
+        };
+        let stamped = |out: Vec<super::MuxedFrame>| out.iter().map(|m| m.1).collect::<Vec<_>>();
+
+        let mut w = pull(SPS_IN_ORDER);
+        assert_eq!(stamped(put(&mut w, 20, 1_200, 14)), [LEAD + 1_800], "as it comes");
+        assert_eq!(w.hold_deadline(), None);
+        assert_eq!(stamped(put(&mut w, 60, 1_240, 15)), [LEAD + 1_800 + 3_600]);
+
+        // 100 ms ahead or less is within what holds up a live first picture,
+        // though one behind it was lost.
+        let mut w = pull(SPS_IN_ORDER);
+        assert_eq!(stamped(put(&mut w, 20, 120, 2)), [LEAD + 120 * 90]);
+
+        // A source a fifth of a second apart, in one go: the picture right
+        // behind the IDR, or its second field.
+        for frame_num in [1, 0] {
+            let mut w = pull(SPS_IN_ORDER);
+            assert!(put(&mut w, 1, 200, frame_num).is_empty());
+            assert!(put(&mut w, 2, 400, frame_num + 1).is_empty());
+            let out = put(&mut w, 3, 600, frame_num + 2);
+            assert_eq!(stamped(out), [200, 400, 600].map(|at| LEAD + at * 90));
+        }
+        // One the IDR's `frame_num` came round to again: 16 pictures missed.
+        let mut w = pull(SPS_IN_ORDER);
+        assert!(put(&mut w, 20, 680, 1).is_empty());
+        assert_eq!(stamped(put(&mut w, 60, 720, 2)), [LEAD + 1_800, LEAD + 5_400]);
+
+        // Reordered: the reference, the two B-frames shown before it, and the
+        // next. The PCR keeps the pictures' pace, 20 ms behind the IDR's.
+        let mut w = pull(SPS_REORDERED);
+        let mut pcrs = Vec::new();
+        for (at, shown, frame_num) in [(20u64, 1_200u64, 9), (60, 1_120, 10), (100, 1_160, 11)] {
+            let out = put(&mut w, at, shown, frame_num);
+            assert_eq!(pts_on(&out, 0x0100), [0u64; 0], "held");
+            assert!(pmt_codes(&out).is_empty());
+            pcrs.extend(pcrs_in(&out));
+            assert!(opus_at(&mut w, t0, at + 5, 0xFC).is_empty(), "and the sound, no PCR with it");
+        }
+        assert_eq!(pcrs, [20, 60, 100].map(|at| (at * 90, false)));
+        let out = put(&mut w, 140, 1_320, 11);
+        // Timed from the first shown, at 60 ms: the reference 80 ms past it.
+        let video = [140u64, 60, 100, 260].map(|at| LEAD + at * 90);
+        assert_eq!(pts_on(&out, 0x0100), video);
+        assert_eq!(pcrs_in(&out)[0], (140 * 90, false), "the first of them past it");
+
+        // The PCR is not run on past the reference's, though a B-frame comes
+        // late: 40 ms past the one shown first, which came 40 ms in.
+        let mut w = pull(SPS_REORDERED);
+        let mut pcrs = Vec::new();
+        for (at, shown, frame_num) in [(20u64, 1_200u64, 9), (40, 1_160, 10), (95, 1_180, 11)] {
+            pcrs.extend(pcrs_in(&put(&mut w, at, shown, frame_num)));
+        }
+        assert_eq!(pcrs, [20, 40, 80].map(|at| (at * 90, false)));
+        let out = put(&mut w, 120, 1_260, 11);
+        assert_eq!(pcrs_in(&out)[0], (80 * 90, false));
+    }
+
+    /// The live pictures come in the same instant as the cached IDR: it goes
+    /// out a tick ahead of them. And where they come a second behind it with
+    /// the input's timer yet to run — the IDR still held for a channel count
+    /// that never came — it goes out first, and the step to them is marked.
+    #[test]
+    fn a_cached_idr_goes_out_ahead_of_its_live_pictures() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        for (sps, b) in [(SPS_IN_ORDER, 0u64), (SPS_REORDERED, 2)] {
+            let live: Vec<u64> = decode_order(b, true, 200)[60..100].to_vec();
+            let mut frames = pictures(&[0], 0, PERIOD_90K, |_| 0);
+            frames.extend(pictures(&live, 0, PERIOD_90K, |k| k * PERIOD_US));
+            let frames = coded(frames, b, sps, PERIOD_90K);
+            let video = pts_on(&one_session(true, &frames), 0x0100);
+            assert_eq!(video[0], LEAD);
+            let first = video[1..].iter().min().unwrap();
+            assert!((LEAD + 1..=LEAD + b * PERIOD_90K + 1).contains(first), "b {b}: {video:?}");
+            assert!(b > 0 || *first == LEAD + 1);
+        }
+
+        let mut w = av_whip_mux();
+        w.session(true, false);
+        w.expect_primed_idr();
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::new();
+        let live = pictures(&(50..60).collect::<Vec<_>>(), 1_500_000, PERIOD_90K, |k| k * PERIOD_US);
+        for (us, _, rtp, data) in coded([pictures(&[0], 0, PERIOD_90K, |_| 0), live].concat(), 0, SPS_IN_ORDER, PERIOD_90K) {
+            out.extend(w.frame(true, &data, rtp, 90_000, t0 + std::time::Duration::from_micros(us)));
+        }
+        let video = pts_on(&out, 0x0100);
+        assert_eq!(video[..2], [LEAD, LEAD + 135_000]);
+        assert_eq!(pcrs_in(&out)[..3], [(0, false), (135_000, true), (135_000 + PERIOD_90K, false)]);
+    }
+
+    /// The frames held while a pull's first picture is open come out in the
+    /// order they arrived, and no later than their bounds: the first picture
+    /// settled by the third picture (a source without B-frames), by 400 ms or
+    /// by the end of the pull, whose frames are not lost.
+    #[test]
+    fn what_a_pulls_first_picture_holds_up_comes_out_within_its_bounds() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        let ms = std::time::Duration::from_millis;
+        let pull = |declared: bool| {
+            let mut w = av_whip_mux();
+            w.session(true, declared);
+            w.expect_primed_idr();
+            w
+        };
+        // Declared stereo, so nothing is held for the count.
+        let t0 = std::time::Instant::now();
+        let mut w = pull(true);
+        assert_eq!(video_at(&mut w, t0, 0, IDR).len(), 1, "the IDR at once");
+        let later = |w: &mut super::WhipMux, at: u64, shown: u64| w.frame(true, P, 1_000 + shown * 90, 90_000, t0 + ms(at));
+        assert!(later(&mut w, 20, 1_200).is_empty(), "the second picture runs 1.18 s ahead: held");
+        assert!(opus_at(&mut w, t0, 25, 0xFC).is_empty(), "and what comes behind it");
+        assert_eq!(w.hold_deadline(), Some(t0 + ms(420)));
+        assert!(w.release_due(t0 + ms(419)).is_empty());
+        let out = later(&mut w, 60, 1_240);
+        assert_eq!(w.hold_deadline(), None, "the third settles it");
+        assert_eq!(out.iter().map(|m| m.1).collect::<Vec<_>>(), [LEAD + 1_800, LEAD + 2_250, LEAD + 5_400]);
+        assert_eq!(later(&mut w, 100, 1_280).len(), 1, "then each as it comes");
+
+        // The Opus settles the channel count though it is held itself: the
+        // IDR held for that goes out behind a PMT that says stereo.
+        let mut w = pull(false);
+        assert!(video_at(&mut w, t0, 0, IDR).is_empty());
+        assert!(later(&mut w, 10, 1_500).is_empty());
+        let out = opus_at(&mut w, t0, 30, 0xFC);
+        assert_eq!(out.iter().map(|m| m.1).collect::<Vec<_>>(), [LEAD], "the IDR");
+        assert_eq!(pmt_codes(&out), [Some(2)]);
+        assert_eq!(later(&mut w, 50, 1_540).len(), 3);
+
+        // No third picture: 400 ms, then as it always was.
+        let mut w = pull(true);
+        assert_eq!(video_at(&mut w, t0, 0, IDR).len(), 1);
+        assert!(later(&mut w, 20, 1_200).is_empty());
+        assert!(w.release_due(t0 + ms(419)).is_empty());
+        let out = w.release_due(t0 + ms(420));
+        assert_eq!(out.iter().map(|m| m.1).collect::<Vec<_>>(), [LEAD + 1_200 * 90]);
+        assert_eq!(w.hold_deadline(), None);
+        // A mini-GOP cut short: judged by its pictures where they are enough
+        // to hold the one shown first, as a fifth is here (of seven B-frames
+        // at 10 fps, the reference first), and left alone where they are not.
+        for (came, moved) in [(4, false), (5, true)] {
+            let mut w = pull(true);
+            assert_eq!(video_at(&mut w, t0, 0, IDR).len(), 1);
+            for (k, shown) in [2_300u64, 1_900, 1_700, 1_600, 1_800].into_iter().take(came).enumerate() {
+                assert!(pts_on(&later(&mut w, 20 + k as u64, shown), 0x0100).is_empty());
+            }
+            let first = pts_on(&w.release_due(t0 + ms(420)), 0x0100)[0];
+            assert_eq!(first, if moved { LEAD + (23 + 700) * 90 } else { LEAD + 2_300 * 90 });
+        }
+
+        // Ten pictures of a mini-GOP, in one go: of fifteen B-frames, the
+        // one shown first the fifth.
+        let mut w = pull(true);
+        assert_eq!(video_at(&mut w, t0, 0, IDR).len(), 1);
+        let order = decode_order(15, true, 18);
+        for (k, shown) in order[1..=10].iter().enumerate() {
+            let out = later(&mut w, 20 + k as u64, 3_000 + shown * 40);
+            assert_eq!(pts_on(&out, 0x0100).len(), if k < 9 { 0 } else { 10 }, "picture {k}");
+            assert!(k < 9 || pts_on(&out, 0x0100)[4] == LEAD + 24 * 90, "the one shown first as it arrived");
+        }
+
+        // The pull ending, or `HOLD_MAX_BYTES` of it.
+        let mut w = pull(true);
+        assert_eq!(video_at(&mut w, t0, 0, IDR).len(), 1);
+        assert!(later(&mut w, 20, 1_200).is_empty());
+        assert!(opus_at(&mut w, t0, 25, 0xFC).is_empty());
+        assert_eq!(w.end_session().len(), 2);
+        let mut w = pull(true);
+        assert_eq!(video_at(&mut w, t0, 0, IDR).len(), 1);
+        assert!(later(&mut w, 20, 1_200).is_empty());
+        let mut big = P.to_vec();
+        big.resize(super::HOLD_MAX_BYTES + 1, 0x11);
+        assert_eq!(w.frame(true, &big, 1_000 + 1_180 * 90, 90_000, t0 + ms(60)).len(), 2);
+    }
+
+    /// The live pictures coming a while behind the cached IDR — its source
+    /// paused, or the PMT's next — the PCR runs on to them as it does over
+    /// any step: with fillers up to a second, and past that, where nothing
+    /// bridges it, marked with `discontinuity_indicator`, once, and not
+    /// bridged. It used to step by the pause and the IDR's age, unmarked.
+    #[test]
+    fn a_pause_behind_a_cached_idr_is_bridged_or_marked() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        for (pause_us, marked) in [(700_000u64, false), (1_000_000, false), (1_000_100, true), (9_000_000, true)] {
+            for sound in [false, true] {
+                let mut frames = pictures(&[0], 0, PERIOD_90K, |_| 0);
+                frames.extend(pictures(&(500..560).collect::<Vec<_>>(), pause_us, PERIOD_90K, |k| k * PERIOD_US));
+                if sound {
+                    frames.extend(opus(40_000, 600, 0xFC));
+                }
+                let muxed = one_session(true, &arriving(frames));
+                let video = pts_on(&muxed, 0x0100);
+                assert_eq!((video[0], video[1]), (LEAD, LEAD + pause_us * 9 / 100));
+                let pcrs = pcrs_in(&muxed);
+                let steps = pcr_steps(&pcrs);
+                let at = pcrs.iter().position(|p| p.1);
+                assert_eq!(at, marked.then_some(1), "{pause_us} µs: {pcrs:?}");
+                assert_eq!(pcrs.iter().filter(|p| p.1).count(), usize::from(marked));
+                let unmarked = steps.iter().enumerate().filter(|(k, _)| Some(k + 1) != at);
+                assert!(unmarked.clone().all(|(_, s)| *s <= PERIOD_90K), "{pause_us} µs: {steps:?}");
+            }
+        }
+    }
+
+    /// A pull after another on the same input, primed with a cached IDR as
+    /// well: the IDR goes past the last pull's end — lifted there, its
+    /// sender's clock having run fast — with `discontinuity_indicator` on its
+    /// PCR, the live pictures as far behind it as they arrived, and the sound
+    /// with them; nothing is behind what was sent.
+    #[test]
+    fn a_reconnecting_pull_is_timed_from_its_live_pictures_too() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        let t0 = std::time::Instant::now();
+        let primed = |from_us: u64, period_us: u64| {
+            let mut frames = pictures(&[0], from_us, PERIOD_90K, |_| 0);
+            let live: Vec<u64> = (45..120).collect();
+            frames.extend(pictures(&live, from_us + 15_000, PERIOD_90K, |k| k * period_us));
+            let packets = opus(from_us + 21_000, 150, 0xFC);
+            frames.extend(packets);
+            arriving(frames)
+        };
+        for lifted in [false, true] {
+            let mut w = av_whip_mux();
+            w.session(true, false);
+            w.expect_primed_idr();
+            // The sender's clock twice as fast as it should run, or not.
+            let first = fed(&mut w, t0, &primed(0, if lifted { PERIOD_US / 2 } else { PERIOD_US }));
+            let end = *pts_on(&first, 0x0100).iter().max().unwrap();
+            w.session(true, false);
+            w.expect_primed_idr();
+            let from_us = if lifted { 2_000_000 } else { 6_000_000 };
+            let second = fed(&mut w, t0, &primed(from_us, PERIOD_US));
+            let video = pts_on(&second, 0x0100);
+            let start = if lifted { video[0] } else { LEAD + from_us * 9 / 100 };
+            if lifted {
+                assert!(video[0] > end, "past the last pull's end: {} / {end}", video[0]);
+            }
+            assert_eq!(video[0], start);
+            assert_eq!(video[1..], (0..75).map(|k| start + 15 * 90 + k * PERIOD_90K).collect::<Vec<_>>()[..]);
+            assert_eq!(pts_on(&second, 0x0101)[0], start + 21 * 90);
+            let pcrs = pcrs_in(&second);
+            assert!(pcrs[0].1 && pcrs[1..].iter().all(|p| !p.1), "the new session's DI alone: {pcrs:?}");
+            assert!(pcr_steps(&pcrs).iter().all(|s| *s <= PERIOD_90K));
+        }
+    }
+
+    /// The same across the 33-bit wrap, between the IDR and its live
+    /// pictures and just behind the first of them.
+    #[test]
+    fn a_cached_idr_by_the_wrap_is_timed_as_anywhere() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        const WRAP: u64 = 1 << 33;
+        for before_us in [10_000u64, 30_000, 70_000, 180_000] {
+            let mut w = av_whip_mux();
+            w.session(false, false);
+            w.expect_primed_idr();
+            let t0 = std::time::Instant::now();
+            // The input's origin 26.5 h back, this pull `before_us` short of
+            // the wrap.
+            let _ = fed(&mut w, t0, &pictures(&[0], 0, PERIOD_90K, |_| 0));
+            w.session(false, false);
+            w.expect_primed_idr();
+            let from_us = (WRAP - LEAD) * 100 / 9 - before_us;
+            let mut frames = pictures(&[0], from_us, PERIOD_90K, |_| 0);
+            frames.extend(pictures(&(30..80).collect::<Vec<_>>(), from_us + 20_000, PERIOD_90K, |k| k * PERIOD_US));
+            let muxed = fed(&mut w, t0, &frames);
+            let video = pts_on(&muxed, 0x0100);
+            let idr = LEAD + from_us * 9 / 100;
+            let live = LEAD + (from_us + 20_000) * 9 / 100;
+            let expected: Vec<u64> =
+                std::iter::once(idr).chain((0..50).map(|k| live + k * PERIOD_90K)).map(|pts| pts % WRAP).collect();
+            assert_eq!(video, expected, "{before_us} µs short of the wrap");
+            assert!(pcr_steps(&pcrs_in(&muxed)).iter().all(|s| *s <= PERIOD_90K));
+        }
+    }
+
+    /// A WHIP publish is not looked at: one whose second picture is stamped
+    /// 1.5 s past its first, sent 40 ms after it, is timed from its first as
+    /// it always was — its PTS 1.5 s apart.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whip_publishs_first_picture_is_never_taken_for_cached() {
+        use crate::api::webrtc::registry::NewSessionMsg;
+        use crate::engine::webrtc::session::{SessionConfig, SessionEvent, WebrtcSession};
+        use std::time::{Duration, Instant};
+        use str0m::media::{Frequency, MediaTime};
+
+        let config: crate::config::models::WebrtcInputConfig =
+            serde_json::from_value(serde_json::json!({ "public_ip": "127.0.0.1" })).unwrap();
+        let (broadcast_tx, mut published) = tokio::sync::broadcast::channel(16_384);
+        let stats = Arc::new(crate::stats::collector::FlowStatsAccumulator::new(
+            "flow-w".into(),
+            "WHIP".into(),
+            "webrtc".into(),
+        ));
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (session_tx, session_rx) = tokio::sync::mpsc::channel(4);
+        let (events, _raised) = crate::manager::events::event_channel();
+        let task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                let (mut transcoder, mut post) = (None, None);
+                super::whip_input_loop(
+                    config, "flow-w", broadcast_tx, stats, cancel, session_rx, &events,
+                    &mut transcoder, &mut post, Duration::from_secs(10),
+                )
+                .await;
+            }
+        });
+
+        let peer = SessionConfig { bind_addr: "127.0.0.1:0".parse().unwrap(), public_ip: None, ice_lite: false };
+        let mut publisher = WebrtcSession::new(&peer).await.unwrap();
+        let (offer, pending) = publisher.create_offer(true, false, true).unwrap();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        session_tx.send(NewSessionMsg { offer_sdp: offer, reply }).await.unwrap();
+        let (answer, _session, _cancel) = answer.await.unwrap().unwrap();
+        publisher.apply_answer(&answer, pending).unwrap();
+        let connected = tokio::time::timeout(Duration::from_secs(10), async {
+            while !matches!(publisher.poll_event(&cancel).await, SessionEvent::Connected) {}
+        })
+        .await;
+        assert!(connected.is_ok(), "the publisher never connected");
+        publisher.drain_pending_events();
+        let mid = publisher.video_mid.unwrap();
+        let pt = publisher.get_pt(mid).expect("H.264 accepted");
+        let sps = hex(SPS_IN_ORDER);
+        let idr = [&[0, 0, 0, 1], &sps[..], &[0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88, 0x84]].concat();
+        let mut ts = Vec::new();
+        for k in 0..20u64 {
+            let at = if k == 0 { 5_000 } else { 5_000 + 135_000 + (k - 1) * 3_600 };
+            let at = MediaTime::new(at, Frequency::NINETY_KHZ);
+            let picture = if k == 0 { idr.clone() } else { p_slice(6 + k as u32) };
+            publisher.write_media(mid, pt, Instant::now(), at, &picture).unwrap();
+            publisher.drain_outputs().await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let _ = publisher.drive_udp_io().await;
+            while let Ok(pkt) = published.try_recv() {
+                ts.extend(pkt.data.chunks(188).map(bytes::Bytes::copy_from_slice));
+            }
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+        let pes = video_pes_of(&ts);
+        assert!(pes.len() > 10 && pes[0].1.contains(&5), "{pes:?}");
+        assert_eq!(pes[1].0 - pes[0].0, 135_000);
+    }
+
+    /// The whole input: a pull of a server that primes it with an IDR 1.5 s
+    /// old and then sends the live pictures and their sound carries the two
+    /// together — each picture within 200 ms of the packet sent with it,
+    /// where the pictures went out 1.5 s past theirs.
+    #[cfg(feature = "webrtc")]
+    #[tokio::test]
+    async fn a_whep_pull_primed_with_a_cached_idr_keeps_its_sound_with_its_pictures() {
+        use crate::engine::ts_parse::{extract_pes_pts, ts_pid, ts_pusi};
+        let script = WhepScript {
+            video: true,
+            audio: true,
+            for_ms: 1_200,
+            gop: true,
+            cached_ms: 1_500,
+            ..WhepScript::default()
+        };
+        let server = serve_whep_scripted(|a| a, script, None).await;
+        let (ts, _) = pull_whep(server.addr, 1_600).await;
+        server.task.abort();
+        let pictures = video_pes_of(&ts);
+        let packets: Vec<u64> =
+            ts.iter().filter(|p| ts_pid(p) == 0x0101 && ts_pusi(p)).filter_map(|p| extract_pes_pts(p)).collect();
+        assert!(pictures.len() > 10 && packets.len() > 20, "{} pictures, {} packets", pictures.len(), packets.len());
+        assert!(pictures[0].1.contains(&5), "the IDR first");
+        assert_eq!(pictures.iter().filter(|p| p.1.contains(&5)).count(), 1);
+        assert!(pictures.windows(2).all(|w| w[0].0 < w[1].0), "in order: {pictures:?}");
+        // Picture k was sent with packet 2k.
+        for k in 1..pictures.len().min(packets.len() / 2) {
+            let apart = pictures[k].0 as i64 - packets[2 * k] as i64;
+            assert!(apart.abs() < 18_000, "picture {k} {} ms past its sound", apart / 90);
+        }
     }
 }

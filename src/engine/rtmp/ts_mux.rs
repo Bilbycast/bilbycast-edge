@@ -469,6 +469,38 @@ impl TsMuxer {
         self.pcr_discontinuity_pending = self.last_pcr_90khz.is_some();
     }
 
+    /// [`Self::mark_discontinuity`] if the PCR of an access unit stamped
+    /// `ts_90khz`, muxed next, would step past the last one by more than the
+    /// filler PCRs bridge ([`PCR_FILL_MAX_GAP_90K`]), or back: a WHEP pull's
+    /// first live picture, a pause behind the cached one it was primed with.
+    pub fn mark_unbridged_step(&mut self, ts_90khz: u64) {
+        if let Some(last) = self.last_pcr_90khz
+            && ts_90khz.wrapping_sub(PCR_LEAD_90K).wrapping_sub(last) & MASK_33 > PCR_FILL_MAX_GAP_90K
+        {
+            self.mark_discontinuity();
+        }
+    }
+
+    /// The PCR run on to where an access unit stamped `ts_90khz` would put it,
+    /// without one: a PCR-only packet on the video PID, behind the fillers of
+    /// a step past 40 ms. For a caller that holds its video back and knows
+    /// the timeline meanwhile. Empty when the video does not carry the PCR,
+    /// before the first PCR or where the next starts a new timeline, for a
+    /// step back, and for one no filler bridges.
+    pub fn run_pcr_on(&mut self, ts_90khz: u64) -> Vec<Bytes> {
+        let mut packets = Vec::new();
+        let Some(last) = self.last_pcr_90khz.filter(|_| self.has_video && !self.pcr_discontinuity_pending) else {
+            return packets;
+        };
+        let step = ts_90khz.wrapping_sub(PCR_LEAD_90K).wrapping_sub(last) & MASK_33;
+        if (1..=PCR_FILL_MAX_GAP_90K).contains(&step) {
+            let pid = self.video_pid;
+            let pcr = self.programme_pcr(ts_90khz, pid, VIDEO_PCR_FILL_AFTER_90K, &mut packets);
+            packets.push(self.pcr_filler(pid, pcr));
+        }
+        packets
+    }
+
     /// Advertise a raw SCTE-35 section stream (`stream_type 0x86`) in the PMT.
     // Wired only into the SDI VANC SCTE-35 extraction path (`engine::sdi_io`,
     // `#[cfg(feature = "sdi-decklink")]`) + unit tests.
@@ -1438,6 +1470,61 @@ mod tests {
             "no fillers across the marked step"
         );
         assert!(pcrs[2].0 >= unmarked);
+    }
+
+    /// `run_pcr_on` carries the PCR on to where an access unit would put it,
+    /// with no access unit: one PCR-only packet, its CC the last payload
+    /// packet's, behind the fillers of a step past 40 ms, and the next access
+    /// unit's PCR steps on from there. Nothing where the PCR is there already
+    /// or past it, where no filler bridges the step, before the first PCR,
+    /// ahead of a marked discontinuity, and where the audio carries the PCR.
+    #[test]
+    fn the_pcr_runs_on_without_an_access_unit() {
+        use crate::engine::ts_parse::extract_pcr;
+        const AU: &[u8] = &[0, 0, 0, 1, 0x41, 0x9a];
+        let pcrs = |ts: &[Bytes]| ts.iter().filter_map(|p| extract_pcr(p)).map(|pcr| pcr / 300).collect::<Vec<_>>();
+        let mut muxer = TsMuxer::new();
+        let at = |ms: u64| PCR_LEAD_90K + ms * 90;
+        assert!(muxer.run_pcr_on(at(40)).is_empty(), "before the first PCR");
+        let ts = muxer.mux_video(AU, at(0), at(0), false);
+        let cc = ts.last().unwrap()[3] & 0x0F;
+        let on = muxer.run_pcr_on(at(40));
+        assert_eq!(pcrs(&on), [40 * 90]);
+        assert!(on.iter().all(|p| ts_pid(p) == VIDEO_PID && p[3] == 0x20 | cc), "adaptation field only");
+        assert_eq!(pcrs(&muxer.run_pcr_on(at(110))), [75 * 90, 110 * 90]);
+        assert!(muxer.run_pcr_on(at(110)).is_empty(), "there already");
+        assert!(muxer.run_pcr_on(at(100)).is_empty(), "past it");
+        assert!(muxer.run_pcr_on(at(1_111)).is_empty(), "past what fillers bridge");
+        assert_eq!(pcrs(&muxer.mux_video(AU, at(130), at(130), false)), [130 * 90]);
+        muxer.change_has_video(false);
+        assert!(muxer.run_pcr_on(at(150)).is_empty(), "the audio carries it");
+        muxer.change_has_video(true);
+        muxer.mark_discontinuity();
+        assert!(muxer.run_pcr_on(at(150)).is_empty(), "a new timeline next");
+    }
+
+    /// `mark_unbridged_step` marks the step to an access unit only where no
+    /// filler PCR bridges it: one past a second, or back. A step of a second
+    /// or less goes unmarked, with its fillers, across the 33-bit wrap too.
+    #[test]
+    fn only_a_step_no_filler_bridges_is_marked() {
+        use crate::engine::ts_parse::{extract_pcr, ts_discontinuity_indicator};
+        for start in [PCR_LEAD_90K, MASK_33 - 30_000] {
+            for (step, marked) in [(3_600u64, false), (90_000, false), (90_001, true), (9_000_000, true), (MASK_33, true)] {
+                let mut muxer = TsMuxer::new();
+                muxer.continue_timeline();
+                muxer.mark_unbridged_step(start);
+                let _ = muxer.mux_video(&[0, 0, 0, 1, 0x65, 0x88], start, start, true);
+                let next = (start + step) & MASK_33;
+                muxer.mark_unbridged_step(next);
+                let ts = muxer.mux_video(&[0, 0, 0, 1, 0x41, 0x9a], next, next, false);
+                let pcrs: Vec<bool> =
+                    ts.iter().filter(|p| extract_pcr(p).is_some()).map(|p| ts_discontinuity_indicator(p)).collect();
+                let fillers = if step == 90_000 { 28 } else { 0 };
+                assert_eq!(pcrs.len(), fillers + 1, "start {start}, step {step}");
+                assert_eq!(pcrs.contains(&true), marked, "start {start}, step {step}");
+            }
+        }
     }
 
     /// Bug #11 (2026-04-09): RTMP-ingest → RTP transmux emitted
