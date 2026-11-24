@@ -1681,9 +1681,10 @@ fn decode_worker(
         // A decoder that consumes AUs but never produces frames is the
         // silent-video failure shape: a wrong-codec PMT the sniffer
         // couldn't confirm, or a HW backend that opened but is broken
-        // on this host. Raise the event once, then retry with one
-        // forced-CPU reopen (the sniffer override path handles the
-        // confirmed-mismatch case independently).
+        // on this host. Raise the event once per decoder opened, then
+        // retry: one forced-CPU reopen, then one with the other codec
+        // (the sniffer override path handles the confirmed-mismatch
+        // case independently).
         if frames_since_open == 0 && aus_since_open >= EGRESS_DECODE_STALL_AUS {
             aus_since_open = 0;
             if !stalled {
