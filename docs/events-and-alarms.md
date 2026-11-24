@@ -463,7 +463,7 @@ and `redundancy_ssrc_mismatch` on a pair),
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
 | info | RTMP publisher connected | Client connected and started publishing | |
-| warning | RTMP publisher disconnected | The publish on air ended (its connection closed, or sent nothing for 300 s). Not raised for a publish a newer one has taken over from, or a connection that never published | |
+| warning | RTMP publisher disconnected | The publish on air ended (its connection closed, or sent nothing for 300 s), or, with none on air, one that had sent its headers. Not raised for a publish a newer one has taken over from, or a connection that never published | |
 | critical | RTMP server error: {error} | Server bind or accept failure | `{ error }` |
 
 #### RTMP Output (push to Twitch / YouTube / any RTMP ingest)

@@ -25,6 +25,7 @@
 //! }
 //! ```
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -223,249 +224,354 @@ async fn process_media(
     let mut layout = PublishLayout::default();
     // The publish on air: the newest whose media has come, until it ends.
     let mut on_air: Option<u64> = None;
+    // What each live publish has said of its media, and the publish whose
+    // word the muxer, the parameter sets and the layout now go by.
+    let mut configs: HashMap<u64, PublishConfig> = HashMap::new();
+    let mut configured: Option<u64> = None;
+    let mut queue: VecDeque<RtmpMediaMessage> = VecDeque::new();
 
     loop {
-        tokio::select! {
+        let received = tokio::select! {
             _ = cancel.cancelled() => {
                 tracing::info!("RTMP input shutting down");
                 return;
             }
-            msg = media_rx.recv() => {
-                let Some((publish, msg)) = msg else {
-                    // Channel closed
-                    tracing::info!("RTMP input channel closed");
-                    return;
-                };
-                // One publish is on air at a time. A newer one takes over
-                // from it, since a publisher whose network dropped ends only
-                // at its idle timeout, long after it has reconnected; what
-                // an older one still sends, and its end, go nowhere.
-                let disconnected = matches!(msg, RtmpMediaMessage::Disconnected);
-                let ends = match on_air {
-                    Some(current) if publish != current => {
-                        if disconnected || publish < current {
-                            continue;
-                        }
-                        tracing::info!("RTMP: a newer publish takes over from the one on air");
-                        true
-                    }
-                    _ => disconnected,
-                };
-                if ends {
-                    // The next publish restarts the audio's sample counter
-                    // from its own RTMP time, on the timeline past this one's
-                    // end, and states its own layout. The muxer keeps this
-                    // one's until it does.
-                    audio_anchor_90k = None;
-                    audio_frames_emitted = 0;
-                    timeline.ended();
+            msg = media_rx.recv() => msg,
+        };
+        let Some((publish, msg)) = received else {
+            // Channel closed
+            tracing::info!("RTMP input channel closed");
+            return;
+        };
+        let kind = MessageKind::of(&msg);
+        let ends = match (kind, on_air) {
+            // The end of the publish on air, or, with none, of the
+            // one that has got as far as its headers. Another's, one
+            // that a newer publish has taken over from included,
+            // moves nothing.
+            (MessageKind::End, _) => {
+                configs.remove(&publish);
+                if on_air.or(configured) != Some(publish) {
+                    continue;
+                }
+                on_air = None;
+                true
+            }
+            // One publish is on air at a time. A newer one takes over
+            // with its first frame, since a publisher whose network
+            // dropped ends only at its idle timeout, long after it
+            // has reconnected; what an older one still sends goes
+            // nowhere until the newer ends.
+            (MessageKind::Media, Some(current)) if publish != current => {
+                if publish < current {
+                    continue;
+                }
+                tracing::info!("RTMP: a newer publish takes over from the one on air");
+                on_air = Some(publish);
+                true
+            }
+            (MessageKind::Media, _) => {
+                on_air = Some(publish);
+                false
+            }
+            (MessageKind::Config(slot), _) => {
+                configs.entry(publish).or_default().keep(slot, &msg);
+                false
+            }
+            (MessageKind::Other, _) => false,
+        };
+        if ends {
+            // The next publish restarts the audio's sample counter
+            // from its own RTMP time, on the timeline past this one's
+            // end, and states its own layout. The muxer keeps this
+            // one's until it does.
+            audio_anchor_90k = None;
+            audio_frames_emitted = 0;
+            timeline.ended();
+            layout = PublishLayout::default();
+            configured = None;
+        }
+        match kind {
+            // Its first frame on air: what it said of its media, if
+            // that was kept back while another was.
+            MessageKind::Media if configured != Some(publish) => {
+                if configured.take().is_some() {
                     layout = PublishLayout::default();
                 }
-                on_air = (!disconnected).then_some(publish);
-                match msg {
-                    RtmpMediaMessage::Video { data, timestamp_ms } => {
-                        if data.len() < 5 {
-                            continue;
-                        }
+                queue.extend(configs.get(&publish).into_iter().flat_map(|c| c.messages.iter().cloned().map(|m| m.1)));
+                configured = Some(publish);
+            }
+            // With none on air the first to say anything is heard at
+            // once, as it will most likely be the one.
+            MessageKind::Config(_) | MessageKind::Other => match on_air.or(configured) {
+                Some(heard) if heard != publish => continue,
+                _ => configured = Some(publish),
+            },
+            _ => {}
+        }
+        queue.push_back(msg);
+        while let Some(msg) = queue.pop_front() {
+            match msg {
+                RtmpMediaMessage::Video { data, timestamp_ms } => {
+                    if data.len() < 5 {
+                        continue;
+                    }
 
-                        let frame_type = (data[0] >> 4) & 0x0F;
-                        let codec_id = data[0] & 0x0F;
-                        let avc_packet_type = data[1];
+                    let frame_type = (data[0] >> 4) & 0x0F;
+                    let codec_id = data[0] & 0x0F;
+                    let avc_packet_type = data[1];
 
-                        // Only handle AVC (H.264)
-                        if codec_id != 7 {
-                            continue;
-                        }
-                        // Video after all: a publish taken as audio-only
-                        // moves back (PMT version bump, PCR on video).
-                        apply_layout(&mut muxer, layout.on_video(), &flow_id);
+                    // Only handle AVC (H.264)
+                    if codec_id != 7 {
+                        continue;
+                    }
+                    // Video after all: a publish taken as audio-only
+                    // moves back (PMT version bump, PCR on video).
+                    apply_layout(&mut muxer, layout.on_video(), &flow_id);
 
-                        match avc_packet_type {
-                            0 => {
-                                // AVC sequence header (SPS/PPS)
-                                if let Some((s, p)) = parse_avc_decoder_config(&data[5..]) {
-                                    sps = Some(s);
-                                    pps = Some(p);
-                                    muxer.set_has_audio(true); // Assume audio until proven otherwise
-                                    tracing::info!("RTMP: received AVC sequence header (SPS+PPS)");
-                                    event_sender.emit_flow(
-                                        EventSeverity::Info,
-                                        category::RTMP,
-                                        "RTMP publisher connected",
-                                        &flow_id,
-                                    );
-                                }
+                    match avc_packet_type {
+                        0 => {
+                            // AVC sequence header (SPS/PPS)
+                            if let Some((s, p)) = parse_avc_decoder_config(&data[5..]) {
+                                sps = Some(s);
+                                pps = Some(p);
+                                muxer.set_has_audio(true); // Assume audio until proven otherwise
+                                tracing::info!("RTMP: received AVC sequence header (SPS+PPS)");
+                                event_sender.emit_flow(
+                                    EventSeverity::Info,
+                                    category::RTMP,
+                                    "RTMP publisher connected",
+                                    &flow_id,
+                                );
                             }
-                            1 => {
-                                // AVC NALU data
-                                let is_keyframe = frame_type == 1;
-                                let composition_time = (data[2] as i32) << 16 | (data[3] as i32) << 8 | data[4] as i32;
-                                // Sign extend 24-bit
-                                let composition_time = if composition_time & 0x800000 != 0 {
-                                    composition_time | !0xFFFFFF
-                                } else {
-                                    composition_time
+                        }
+                        1 => {
+                            // AVC NALU data
+                            let is_keyframe = frame_type == 1;
+                            let composition_time = (data[2] as i32) << 16 | (data[3] as i32) << 8 | data[4] as i32;
+                            // Sign extend 24-bit
+                            let composition_time = if composition_time & 0x800000 != 0 {
+                                composition_time | !0xFFFFFF
+                            } else {
+                                composition_time
+                            };
+
+                            let (dts_ms, opens) = timeline.frame(timestamp_ms, Instant::now());
+                            if opens {
+                                muxer.mark_discontinuity();
+                            }
+                            // No presentation ahead of RTMP time 0.
+                            let raw_ms = i64::from(timestamp_ms);
+                            let pts_ms = dts_ms + (raw_ms + composition_time as i64).max(0) - raw_ms;
+
+                            let dts_90khz = PublishTimeline::wire(timeline.at(dts_ms));
+                            let pts_90khz = PublishTimeline::wire(timeline.at(pts_ms));
+
+                            // Convert length-prefixed NALUs to Annex B,
+                            // with the sequence header's SPS / PPS ahead
+                            // of every IDR that does not carry its own
+                            // (`parameter_sets_to_prepend`). They went
+                            // ahead of the first IDR of a publish only, so
+                            // a receiver joining any output of the flow
+                            // after it never decoded a picture ("non-
+                            // existing PPS 0 referenced").
+                            let (with_sps, with_pps) =
+                                parameter_sets_to_prepend(&data[5..], is_keyframe, &sps, &pps);
+                            let annex_b = length_prefixed_to_annex_b(&data[5..], with_sps, with_pps);
+
+                            let ts_packets = muxer.mux_video(&annex_b, pts_90khz, dts_90khz, is_keyframe);
+
+                            // Bundle all TS packets from this frame into one RtpPacket
+                            if !ts_packets.is_empty() {
+                                let total_len: usize = ts_packets.iter().map(|c| c.len()).sum();
+                                let mut combined = bytes::BytesMut::with_capacity(total_len);
+                                for chunk in &ts_packets {
+                                    combined.extend_from_slice(chunk);
+                                }
+                                let recv_time = wall_clock_micros();
+                                let packet = RtpPacket {
+                                    data: combined.freeze(),
+                                    sequence_number: seq_num,
+                                    rtp_timestamp: dts_90khz as u32,
+                                    recv_time_us: recv_time,
+                                    is_raw_ts: true,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
+                                    sender_timestamp_us: None,
                                 };
-
-                                let (dts_ms, opens) = timeline.frame(timestamp_ms, Instant::now());
-                                if opens {
-                                    muxer.mark_discontinuity();
-                                }
-                                // No presentation ahead of RTMP time 0.
-                                let raw_ms = i64::from(timestamp_ms);
-                                let pts_ms = dts_ms + (raw_ms + composition_time as i64).max(0) - raw_ms;
-
-                                let dts_90khz = PublishTimeline::wire(timeline.at(dts_ms));
-                                let pts_90khz = PublishTimeline::wire(timeline.at(pts_ms));
-
-                                // Convert length-prefixed NALUs to Annex B,
-                                // with the sequence header's SPS / PPS ahead
-                                // of every IDR that does not carry its own
-                                // (`parameter_sets_to_prepend`). They went
-                                // ahead of the first IDR of a publish only, so
-                                // a receiver joining any output of the flow
-                                // after it never decoded a picture ("non-
-                                // existing PPS 0 referenced").
-                                let (with_sps, with_pps) =
-                                    parameter_sets_to_prepend(&data[5..], is_keyframe, &sps, &pps);
-                                let annex_b = length_prefixed_to_annex_b(&data[5..], with_sps, with_pps);
-
-                                let ts_packets = muxer.mux_video(&annex_b, pts_90khz, dts_90khz, is_keyframe);
-
-                                // Bundle all TS packets from this frame into one RtpPacket
-                                if !ts_packets.is_empty() {
-                                    let total_len: usize = ts_packets.iter().map(|c| c.len()).sum();
-                                    let mut combined = bytes::BytesMut::with_capacity(total_len);
-                                    for chunk in &ts_packets {
-                                        combined.extend_from_slice(chunk);
-                                    }
-                                    let recv_time = wall_clock_micros();
-                                    let packet = RtpPacket {
-                                        data: combined.freeze(),
-                                        sequence_number: seq_num,
-                                        rtp_timestamp: dts_90khz as u32,
-                                        recv_time_us: recv_time,
-                                        is_raw_ts: true,
-                                        upstream_seq: None,
-                                        upstream_leg_id: None,
-                                        sender_timestamp_us: None,
-                                    };
-                                    seq_num = seq_num.wrapping_add(1);
-                                    stats.input_packets.fetch_add(1, Ordering::Relaxed);
-                                    stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
-                                    if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                        crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, packet);
-                                    } else {
-                                        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
-                                    }
+                                seq_num = seq_num.wrapping_add(1);
+                                stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                                stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
+                                if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                                    crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, packet);
+                                } else {
+                                    stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                            _ => {}
                         }
+                        _ => {}
                     }
-                    RtmpMediaMessage::Audio { data, timestamp_ms } => {
-                        if data.len() < 2 {
-                            continue;
+                }
+                RtmpMediaMessage::Audio { data, timestamp_ms } => {
+                    if data.len() < 2 {
+                        continue;
+                    }
+
+                    let sound_format = (data[0] >> 4) & 0x0F;
+                    let aac_packet_type = data[1];
+
+                    // Only handle AAC
+                    if sound_format != 10 {
+                        continue;
+                    }
+
+                    match aac_packet_type {
+                        0 => {
+                            // AAC sequence header (AudioSpecificConfig)
+                            if data.len() >= 4 {
+                                let asc = &data[2..];
+                                // Parse AudioSpecificConfig (2 bytes min)
+                                // Bits: [audioObjectType:5][frequencyIndex:4][channelConfiguration:4]...
+                                let freq_idx = ((asc[0] & 0x07) << 1) | (asc[1] >> 7);
+                                let ch_cfg = (asc[1] >> 3) & 0x0F;
+                                audio_sample_rate_idx = freq_idx;
+                                audio_channels = ch_cfg;
+                                muxer.set_has_audio(true);
+                                tracing::info!("RTMP: received AAC sequence header (freq_idx={freq_idx}, channels={ch_cfg})");
+                            }
                         }
+                        1 => {
+                            // Raw AAC frame
+                            let raw_aac = &data[2..];
 
-                        let sound_format = (data[0] >> 4) & 0x0F;
-                        let aac_packet_type = data[1];
+                            // Sample-counter-derived PTS — see
+                            // `audio_anchor_90k` doc above for the
+                            // rationale (Bug #11). The first frame
+                            // anchors to its RTMP-supplied wall time;
+                            // subsequent frames are spaced exactly one
+                            // AAC frame duration apart at 90 kHz.
+                            let sample_rate_hz = aac_sample_rate_hz(audio_sample_rate_idx);
+                            let (ms, opens) = timeline.frame(timestamp_ms, Instant::now());
+                            if opens {
+                                muxer.mark_discontinuity();
+                            }
+                            let anchor = *audio_anchor_90k.get_or_insert_with(|| timeline.at(ms));
+                            let pts = anchor
+                                + (audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64) as i64;
+                            timeline.issued(pts);
+                            let pts_90khz = PublishTimeline::wire(pts);
+                            audio_frames_emitted += 1;
+                            if let Some(has_video) = layout.on_audio(pts_90khz) {
+                                apply_layout(&mut muxer, has_video, &flow_id);
+                            }
 
-                        // Only handle AAC
-                        if sound_format != 10 {
-                            continue;
-                        }
+                            let ts_packets = muxer.mux_audio(raw_aac, pts_90khz, audio_sample_rate_idx, audio_channels);
 
-                        match aac_packet_type {
-                            0 => {
-                                // AAC sequence header (AudioSpecificConfig)
-                                if data.len() >= 4 {
-                                    let asc = &data[2..];
-                                    // Parse AudioSpecificConfig (2 bytes min)
-                                    // Bits: [audioObjectType:5][frequencyIndex:4][channelConfiguration:4]...
-                                    let freq_idx = ((asc[0] & 0x07) << 1) | (asc[1] >> 7);
-                                    let ch_cfg = (asc[1] >> 3) & 0x0F;
-                                    audio_sample_rate_idx = freq_idx;
-                                    audio_channels = ch_cfg;
-                                    muxer.set_has_audio(true);
-                                    tracing::info!("RTMP: received AAC sequence header (freq_idx={freq_idx}, channels={ch_cfg})");
+                            if !ts_packets.is_empty() {
+                                let total_len: usize = ts_packets.iter().map(|c| c.len()).sum();
+                                let mut combined = bytes::BytesMut::with_capacity(total_len);
+                                for chunk in &ts_packets {
+                                    combined.extend_from_slice(chunk);
+                                }
+                                let recv_time = wall_clock_micros();
+                                let packet = RtpPacket {
+                                    data: combined.freeze(),
+                                    sequence_number: seq_num,
+                                    rtp_timestamp: pts_90khz as u32,
+                                    recv_time_us: recv_time,
+                                    is_raw_ts: true,
+                                    upstream_seq: None,
+                                    upstream_leg_id: None,
+                                    sender_timestamp_us: None,
+                                };
+                                seq_num = seq_num.wrapping_add(1);
+                                stats.input_packets.fetch_add(1, Ordering::Relaxed);
+                                stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
+                                if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
+                                    crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, packet);
+                                } else {
+                                    stats.input_filtered.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                            1 => {
-                                // Raw AAC frame
-                                let raw_aac = &data[2..];
-
-                                // Sample-counter-derived PTS — see
-                                // `audio_anchor_90k` doc above for the
-                                // rationale (Bug #11). The first frame
-                                // anchors to its RTMP-supplied wall time;
-                                // subsequent frames are spaced exactly one
-                                // AAC frame duration apart at 90 kHz.
-                                let sample_rate_hz = aac_sample_rate_hz(audio_sample_rate_idx);
-                                let (ms, opens) = timeline.frame(timestamp_ms, Instant::now());
-                                if opens {
-                                    muxer.mark_discontinuity();
-                                }
-                                let anchor = *audio_anchor_90k.get_or_insert_with(|| timeline.at(ms));
-                                let pts = anchor
-                                    + (audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64) as i64;
-                                timeline.issued(pts);
-                                let pts_90khz = PublishTimeline::wire(pts);
-                                audio_frames_emitted += 1;
-                                if let Some(has_video) = layout.on_audio(pts_90khz) {
-                                    apply_layout(&mut muxer, has_video, &flow_id);
-                                }
-
-                                let ts_packets = muxer.mux_audio(raw_aac, pts_90khz, audio_sample_rate_idx, audio_channels);
-
-                                if !ts_packets.is_empty() {
-                                    let total_len: usize = ts_packets.iter().map(|c| c.len()).sum();
-                                    let mut combined = bytes::BytesMut::with_capacity(total_len);
-                                    for chunk in &ts_packets {
-                                        combined.extend_from_slice(chunk);
-                                    }
-                                    let recv_time = wall_clock_micros();
-                                    let packet = RtpPacket {
-                                        data: combined.freeze(),
-                                        sequence_number: seq_num,
-                                        rtp_timestamp: pts_90khz as u32,
-                                        recv_time_us: recv_time,
-                                        is_raw_ts: true,
-                                        upstream_seq: None,
-                                        upstream_leg_id: None,
-                                        sender_timestamp_us: None,
-                                    };
-                                    seq_num = seq_num.wrapping_add(1);
-                                    stats.input_packets.fetch_add(1, Ordering::Relaxed);
-                                    stats.input_bytes.fetch_add(total_len as u64, Ordering::Relaxed);
-                                    if !stats.bandwidth_blocked.load(Ordering::Relaxed) {
-                                        crate::engine::input_transcode::publish_input_packet_smoothed(transcoder, post, &publisher, packet);
-                                    } else {
-                                        stats.input_filtered.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
+                        _ => {}
                     }
-                    RtmpMediaMessage::Metadata { declares_video } => {
-                        tracing::debug!(?declares_video, "RTMP: received metadata");
-                        if let Some(has_video) = layout.on_metadata(declares_video) {
-                            apply_layout(&mut muxer, has_video, &flow_id);
-                        }
+                }
+                RtmpMediaMessage::Metadata { declares_video } => {
+                    tracing::debug!(?declares_video, "RTMP: received metadata");
+                    if let Some(has_video) = layout.on_metadata(declares_video) {
+                        apply_layout(&mut muxer, has_video, &flow_id);
                     }
-                    RtmpMediaMessage::Disconnected => {
-                        tracing::info!("RTMP publisher disconnected, waiting for reconnection");
-                        event_sender.emit_flow(
-                            EventSeverity::Warning,
-                            category::RTMP,
-                            "RTMP publisher disconnected",
-                            &flow_id,
-                        );
-                    }
+                }
+                RtmpMediaMessage::Disconnected => {
+                    tracing::info!("RTMP publisher disconnected, waiting for reconnection");
+                    event_sender.emit_flow(
+                        EventSeverity::Warning,
+                        category::RTMP,
+                        "RTMP publisher disconnected",
+                        &flow_id,
+                    );
                 }
             }
         }
+    }
+}
+
+/// What an RTMP message is to the input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageKind {
+    /// A frame it muxes: H.264 or AAC.
+    Media,
+    /// What a publish says of its media: `onMetaData`, the AVC and the AAC
+    /// sequence header, by slot.
+    Config(u8),
+    /// Anything else: a codec it does not carry, an end of sequence.
+    Other,
+    /// The publish's end.
+    End,
+}
+
+impl MessageKind {
+    fn of(msg: &RtmpMediaMessage) -> Self {
+        match msg {
+            RtmpMediaMessage::Disconnected => Self::End,
+            RtmpMediaMessage::Metadata { .. } => Self::Config(0),
+            RtmpMediaMessage::Video { data, .. } if data.len() >= 5 && data[0] & 0x0F == 7 => match data[1] {
+                0 => Self::Config(1),
+                1 => Self::Media,
+                _ => Self::Other,
+            },
+            RtmpMediaMessage::Audio { data, .. } if data.len() >= 2 && data[0] >> 4 == 10 => match data[1] {
+                0 => Self::Config(2),
+                1 => Self::Media,
+                _ => Self::Other,
+            },
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The latest of each kind of thing a publish has said of its media
+/// ([`MessageKind::Config`]), in the order they came: what is read again when
+/// it goes on air after another.
+#[derive(Debug, Default)]
+struct PublishConfig {
+    messages: Vec<(u8, RtmpMediaMessage)>,
+}
+
+impl PublishConfig {
+    /// The most a kept message may weigh: a sequence header is a few hundred
+    /// bytes.
+    const MAX_BYTES: usize = 64 * 1024;
+
+    fn keep(&mut self, slot: u8, msg: &RtmpMediaMessage) {
+        if let RtmpMediaMessage::Video { data, .. } | RtmpMediaMessage::Audio { data, .. } = msg
+            && data.len() > Self::MAX_BYTES
+        {
+            return;
+        }
+        self.messages.retain(|(kept, _)| *kept != slot);
+        self.messages.push((slot, msg.clone()));
     }
 }
 
@@ -1054,6 +1160,11 @@ mod tests {
 
     /// [`muxed`], each part a part of the publish it names.
     async fn muxed_of(parts: Vec<(u64, u64, Vec<RtmpMediaMessage>)>) -> Vec<Vec<u8>> {
+        muxed_with_events(parts).await.0
+    }
+
+    /// [`muxed_of`], and the messages of the events raised.
+    async fn muxed_with_events(parts: Vec<(u64, u64, Vec<RtmpMediaMessage>)>) -> (Vec<Vec<u8>>, Vec<String>) {
         let (tx, rx) = mpsc::channel(8192);
         let sender = tokio::spawn(async move {
             for (after_ms, publish, msgs) in parts {
@@ -1073,7 +1184,7 @@ mod tests {
             cancel.clone(),
             stats.clone(),
         );
-        let (events, _events_rx) = crate::manager::events::event_channel();
+        let (events, mut raised) = crate::manager::events::event_channel();
         process_media(rx, publisher, stats, cancel, events, "flow".into(), &mut None, &mut None, None)
             .await;
         sender.await.unwrap();
@@ -1081,7 +1192,7 @@ mod tests {
         while let Ok(p) = brx.try_recv() {
             out.extend(p.data.chunks(188).map(<[u8]>::to_vec));
         }
-        out
+        (out, std::iter::from_fn(|| raised.try_recv().ok()).map(|e| e.message).collect())
     }
 
     /// The PTS of every PES on `pid`.
@@ -1260,7 +1371,9 @@ mod tests {
             (0, 2, (10..12).map(|k| avc_frame(k * 40, false, &[1])).collect()),
             (0, 2, end()),
         ];
-        let ts = muxed_of(parts).await;
+        let (ts, events) = muxed_with_events(parts).await;
+        let (connected, disconnected) = ("RTMP publisher connected", "RTMP publisher disconnected");
+        assert_eq!(events, [connected, connected, disconnected], "1, 2, and 2's end");
         let video = pts_on(&ts, 0x0100);
         assert_eq!(video.len(), 25 + 12, "nothing of 1 behind 2's start");
         assert_eq!(video[25..], (0..12).map(|k| video[25] + k * 3_600).collect::<Vec<_>>()[..], "one publish");
@@ -1275,6 +1388,144 @@ mod tests {
         assert_eq!(video.len(), 15);
         assert!(video.windows(2).all(|w| w[1] > w[0]), "{video:?}");
         assert_eq!(pcrs(&ts).iter().filter(|p| p.1).count(), 2);
+
+        // 1's connection, dropped, ends when 2 has: no second disconnect.
+        let (_, events) = muxed_with_events(vec![(0, 1, av(5)), (0, 2, av(5)), (0, 2, end()), (0, 1, end())]).await;
+        assert_eq!(events, [connected, connected, disconnected]);
+        // One that only got as far as its headers says so, as it ends.
+        let (_, events) = muxed_with_events(vec![(0, 1, vec![avc_config()]), (0, 1, end())]).await;
+        assert_eq!(events, [connected, disconnected]);
+    }
+
+    /// With none on air, what one publish has said does not stay for another
+    /// that goes on air first: an audio-only one is laid out as one though the
+    /// other has sent an AVC sequence header.
+    #[tokio::test]
+    async fn a_publish_on_air_first_is_laid_out_by_its_own_word() {
+        let audio_only = [vec![RtmpMediaMessage::Metadata { declares_video: Some(false) }, aac_config()], aac_frames(5, 0)];
+        let parts = vec![(0, 1, vec![avc_config()]), (0, 2, audio_only.concat())];
+        let ts = muxed_of(parts).await;
+        assert!(pcrs(&ts).len() >= 5);
+        assert!(ts.iter().all(|p| extract_pcr(p).is_none() || ts_pid(p) == 0x0101), "the PCR on the audio");
+    }
+
+    /// A publish's kept word is the latest of each kind, in the order they
+    /// came, and nothing a header could not be.
+    #[test]
+    fn a_publishs_kept_word_is_bounded() {
+        let mut config = PublishConfig::default();
+        let header = |byte: u8, len: usize| RtmpMediaMessage::Video {
+            data: std::iter::repeat_n(byte, len).collect::<Vec<u8>>().into(),
+            timestamp_ms: 0,
+        };
+        for byte in 0..100 {
+            config.keep(1, &header(byte, 40));
+            config.keep(0, &RtmpMediaMessage::Metadata { declares_video: Some(true) });
+        }
+        config.keep(1, &header(200, PublishConfig::MAX_BYTES + 1));
+        let slots: Vec<u8> = config.messages.iter().map(|m| m.0).collect();
+        assert_eq!(slots, [1, 0]);
+        let RtmpMediaMessage::Video { data, .. } = &config.messages[0].1 else { panic!("the header") };
+        assert_eq!(data[..], [99; 40]);
+    }
+
+    /// A newer publish goes on air with its first frame this input muxes:
+    /// one that sends none — `onMetaData` alone, sequence headers alone, HEVC
+    /// or another audio codec, and for however long — never takes the older
+    /// one off, nor does its end. On air with none other there, what it says
+    /// is heard.
+    #[tokio::test]
+    async fn a_publish_that_sends_no_frame_takes_nothing_off_air() {
+        let live = |from: u32| (from..from + 25).map(|k| avc_frame(k * 40, k % 25 == 0, &[if k % 25 == 0 { 5 } else { 1 }])).collect::<Vec<_>>();
+        let tag = |data: &[u8], video: bool| match video {
+            true => RtmpMediaMessage::Video { data: bytes::Bytes::copy_from_slice(data), timestamp_ms: 0 },
+            false => RtmpMediaMessage::Audio { data: bytes::Bytes::copy_from_slice(data), timestamp_ms: 0 },
+        };
+        let mut other_config = vec![0x17, 0x00, 0, 0, 0, 1, 0x64, 0x00, 0x28, 0xFF, 0xE1, 0x00, 0x04];
+        other_config.extend_from_slice(&[0x67, 0x64, 0x00, 0x28, 0x01, 0x00, 0x02, 0x68, 0xEE]);
+        let silent: Vec<(&str, Vec<RtmpMediaMessage>)> = vec![
+            ("metadata", vec![RtmpMediaMessage::Metadata { declares_video: Some(false) }; 3]),
+            ("sequence headers", vec![tag(&other_config, true), tag(&[0xAF, 0x00, 0x12, 0x08], false)]),
+            ("Enhanced RTMP HEVC", vec![tag(b"\x90hvc1\x01\x01", true), tag(b"\x91hvc1\x00\x00\x00\x26", true)]),
+            ("HEVC, the older way", vec![tag(&[0x1C, 1, 0, 0, 0, 0x26], true)]),
+            ("MP3", vec![tag(&[0x2F, 1, 2, 3], false)]),
+            ("an end of sequence", vec![tag(&[0x17, 2, 0, 0, 0], true)]),
+            ("nothing", vec![]),
+        ];
+        for (what, newer) in silent {
+            let mut first = vec![avc_config(), aac_config()];
+            first.extend(live(0));
+            let end = vec![RtmpMediaMessage::Disconnected];
+            let parts = vec![(0, 1, first), (0, 2, newer), (0, 1, live(25)), (0, 2, end), (0, 1, live(50))];
+            let ts = muxed_of(parts).await;
+            let video = pts_on(&ts, 0x0100);
+            assert_eq!(video, (0..75).map(|k| TIMELINE_START_90K + k * 3_600).collect::<Vec<_>>(), "{what}");
+            assert!(pcrs(&ts).iter().all(|p| !p.1), "{what}: no discontinuity");
+            let pmts: std::collections::BTreeSet<Vec<u8>> =
+                ts.iter().filter(|p| ts_pid(p) == 0x1000).map(|p| p[5..60].to_vec()).collect();
+            assert_eq!(pmts.len(), 1, "{what}: one PMT");
+        }
+    }
+
+    /// Each publish goes by its own sequence headers and `onMetaData`, whatever
+    /// another has sent since: one taken over from, on air again, as before;
+    /// and one that had sent its own while another was on air, as it takes over.
+    #[tokio::test]
+    async fn each_publish_goes_by_its_own_headers() {
+        let high = || {
+            let mut data = vec![0x17, 0x00, 0, 0, 0, 1, 0x64, 0x00, 0x28, 0xFF, 0xE1, 0x00, 0x04];
+            data.extend_from_slice(&[0x67, 0x64, 0x00, 0x28, 0x01, 0x00, 0x02, 0x68, 0xEE]);
+            RtmpMediaMessage::Video { data: data.into(), timestamp_ms: 0 }
+        };
+        // AAC-LC, 44.1 kHz.
+        let aac_441 = || RtmpMediaMessage::Audio { data: bytes::Bytes::from_static(&[0xAF, 0x00, 0x12, 0x10]), timestamp_ms: 0 };
+        let frames = |ms: u32| -> Vec<RtmpMediaMessage> {
+            [vec![avc_frame(ms, true, &[5])], aac_frames(2, ms)].concat()
+        };
+        let end = vec![RtmpMediaMessage::Disconnected];
+        let parts = vec![
+            (0, 1, vec![avc_config(), aac_config()]),
+            (0, 1, frames(0)),
+            (0, 2, vec![high(), aac_441()]),
+            (0, 1, frames(40)),
+            (0, 2, frames(0)),
+            (0, 2, frames(40)),
+            (0, 2, end),
+            (0, 1, frames(400)),
+        ];
+        let ts = muxed_of(parts).await;
+        // Each IDR's SPS profile, and each ADTS frame's sampling frequency
+        // index.
+        let mut profiles = Vec::new();
+        let mut rates = Vec::new();
+        for p in ts.iter().filter(|p| ts_pusi(p)) {
+            let off = crate::engine::ts_parse::ts_payload_offset(p);
+            match ts_pid(p) {
+                0x0100 => {
+                    let at = p.windows(5).position(|w| w[..4] == [0, 0, 1, 0x67] || w[..4] == [0, 1, 0x67, 0]);
+                    let sps = p[at.unwrap()..].windows(2).find(|w| w[0] == 0x67).unwrap();
+                    profiles.push(sps[1]);
+                }
+                0x0101 => rates.push((p[off + 9 + p[off + 8] as usize + 2] >> 2) & 0x0F),
+                _ => {}
+            }
+        }
+        assert_eq!(profiles, [0x42, 0x42, 0x64, 0x64, 0x42]);
+        assert_eq!(rates, [3, 3, 3, 3, 4, 4, 4, 4, 3, 3]);
+        let audio = pts_on(&ts, 0x0101);
+        assert_eq!((audio[1] - audio[0], audio[5] - audio[4], audio[9] - audio[8]), (1_920, 2_089, 1_920));
+    }
+
+    /// A picture that would be presented ahead of RTMP time 0 is presented
+    /// there.
+    #[tokio::test]
+    async fn nothing_is_presented_ahead_of_rtmp_time_0() {
+        let RtmpMediaMessage::Video { data, timestamp_ms } = avc_frame(0, true, &[5]) else { unreachable!() };
+        let mut data = data.to_vec();
+        data[2..5].copy_from_slice(&(0u32.wrapping_sub(80)).to_be_bytes()[1..]);
+        let first = RtmpMediaMessage::Video { data: data.into(), timestamp_ms };
+        let ts = muxed(vec![(0, vec![avc_config(), first, avc_frame(40, false, &[1])])]).await;
+        assert_eq!(pts_on(&ts, 0x0100), [TIMELINE_START_90K, TIMELINE_START_90K + 3_600]);
     }
 
     /// A publish that ends before it has sent anything moves nothing.

@@ -141,7 +141,8 @@ pub struct RtmpServerConfig {
     pub expected_stream_key: Option<String>,
 }
 
-/// Run the RTMP server, accepting one publisher at a time.
+/// Run the RTMP server. It accepts up to [`MAX_RTMP_CONNECTIONS`]; the input
+/// keeps the newest publish on air.
 ///
 /// Media messages from the publisher are sent to `media_tx`.
 /// The server runs until `cancel` is triggered.

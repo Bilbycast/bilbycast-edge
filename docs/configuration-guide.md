@@ -1347,11 +1347,13 @@ video: an audio-only publish named the absent video PID as PCR_PID and carried
 no PCR at all. A `pid_overrides` `pcr_pid` naming a PID other than the audio's
 is honoured as it is, which leaves an audio-only publish without a PCR.
 
-One publish is on air at a time, and the newest takes over: a publisher whose
-network dropped is back on air as it reconnects, though its old connection
-ends only at its idle timeout (300 s), and what an older publish still sends
-is dropped until the newer one ends. A publisher that reconnects, or the next
-one, runs on the same timeline: its first frame starts where the wall clock has
+One publish is on air at a time, and the newest takes over with its first
+H.264 or AAC frame: a publisher whose network dropped is back on air as it
+reconnects, though its old connection ends only at its idle timeout (300 s),
+and what an older publish still sends is dropped until the newer one ends. One
+that sends neither (headers alone, or another codec) takes nothing off air.
+Each publish goes by its own sequence headers and `onMetaData`. A publisher
+that reconnects, or the next one, runs on the same timeline: its first frame starts where the wall clock has
 got to since the input's first frame (and at least 100 ms past the last
 publish's latest timestamp), its tracks as far apart as its timestamps say,
 whatever they start at. The continuity counters and PSI versions run on, and
