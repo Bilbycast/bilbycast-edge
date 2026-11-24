@@ -2803,6 +2803,19 @@ mod tests {
     }
 
     #[test]
+    fn a_real_h264_sps_has_the_size_ffprobe_reads() {
+        use super::super::h264_sps::tests::{high_sps, real_sps};
+        let size_of =
+            |sps: &[u8]| find_and_parse_h264_sps(sps).map(|i| (u32::from(i.width), u32::from(i.height)));
+        for (what, sps, size) in real_sps() {
+            assert_eq!(size_of(&sps), Some(size), "{what}");
+        }
+        for (i, (sps, size)) in high_sps().iter().enumerate() {
+            assert_eq!(size_of(&sps.annex_b()), Some(*size), "{i}");
+        }
+    }
+
+    #[test]
     fn a_random_h264_sps_never_panics() {
         use super::super::h264_sps::tests::{RANDOM, random_sps};
         for sps in random_sps(RANDOM) {

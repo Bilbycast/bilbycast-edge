@@ -1613,33 +1613,14 @@ mod tests {
         }
     }
 
-    /// Real SPS, x264's and two captures', each with its size as ffprobe
-    /// reads it.
     #[test]
     fn a_real_sps_has_the_size_ffprobe_reads() {
-        for (what, sps, size) in [
-            ("Baseline 720p", "6742c01fdc05005bb011000003000100000300320f183380", (1280, 720)),
-            ("Main, interlaced SD", "674d401ef816849b011000000300100000030321f142b8", (720, 576)),
-            ("Main, interlaced 1440", "674d4028f80b4089fbc044000003000400000300c87c58be", (1440, 1080)),
-            ("High, PAFF capture", "67640029ac133140780447de03ea020203e000000300200000065280", (1920, 1080)),
-            (
-                "High, MBAFF capture with scaling lists",
-                concat!(
-                    "67640028ad843588742050b041074421ac47361882a210ffa69a4d5a31526c862c92c8a431cb104111251c",
-                    "28c716161d1e09050b05d06d087fd7af93f11fd7e6f8af0870d608a0a0b290078044fde036a02020280000",
-                    "0300080000030194a0",
-                ),
-                (1920, 1080),
-            ),
-            ("High 4:2:2 10-bit, interlaced", "677a1028b6cf01e0113f2e022000000300200000064280", (1920, 1080)),
-            ("High 4:2:2 10-bit 4K", "677a1033b6cb80780087d80880000003008000001902", (3840, 2160)),
-            ("High 10 8K", "676e103ca6cb803c0010ed80880000030008000003019020", (7680, 4320)),
-            ("High 4:2:2, 8192 wide", "677a103cbcb801000043b6022000000300200000064080", (8192, 4320)),
-            ("16384 wide, the widest taken", "6742c03cdc0040011b011000000300100000030320f0804380", (16384, 128)),
-            ("High 4:4:4, cropped by 14 each way", "67f4100d919705421e3e3f01100000030010000003032040", (322, 242)),
-        ] {
-            let sps = super::super::param_sets::tests::hx(sps);
+        use crate::engine::h264_sps::tests::{high_sps, real_sps};
+        for (what, sps, size) in real_sps() {
             assert_eq!(parse_sps_resolution(&sps), Some(size), "{what}");
+        }
+        for (i, (sps, size)) in high_sps().iter().enumerate() {
+            assert_eq!(parse_sps_resolution(&sps.nal()), Some(*size), "{i}");
         }
     }
 

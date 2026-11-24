@@ -65,7 +65,7 @@ pub fn skip_scaling_list(size: u32, mut se: impl FnMut() -> Option<i32>) -> Opti
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::engine::cmaf::param_sets::tests::{Bits, escaped};
+    use crate::engine::cmaf::param_sets::tests::{Bits, escaped, hx};
 
     /// An H.264 SPS, as far as its VUI flag.
     #[derive(Clone, Copy)]
@@ -76,6 +76,9 @@ pub(crate) mod tests {
         pub bit_depths: (u32, u32),
         /// The deltas of the first scaling list; the others are absent.
         pub scaling_list: Option<&'static [i32]>,
+        /// Every scaling list, all its deltas 0, where `scaling_list` is
+        /// `None`.
+        pub flat_lists: bool,
         pub width_in_mbs_minus1: u32,
         pub height_in_map_units_minus1: u32,
         pub frame_mbs_only: bool,
@@ -91,6 +94,7 @@ pub(crate) mod tests {
                 chroma: 1,
                 bit_depths: (0, 0),
                 scaling_list: None,
+                flat_lists: false,
                 width_in_mbs_minus1: 119,
                 height_in_map_units_minus1: 67,
                 frame_mbs_only: true,
@@ -111,17 +115,25 @@ pub(crate) mod tests {
                     b.put(0, 1); // separate_colour_plane_flag
                 }
                 b.ue(self.bit_depths.0).ue(self.bit_depths.1).put(0, 1);
-                b.put(u64::from(self.scaling_list.is_some()), 1);
+                b.put(u64::from(self.scaling_list.is_some() || self.flat_lists), 1);
+                let lists = if self.chroma == 3 { 12 } else { 8 };
                 if let Some(deltas) = self.scaling_list {
                     b.put(1, 1);
                     for &delta in deltas {
                         let delta = i64::from(delta);
                         b.ue(if delta > 0 { 2 * delta - 1 } else { -2 * delta } as u32);
                     }
-                    b.put(0, if self.chroma == 3 { 11 } else { 7 });
+                    b.put(0, lists - 1);
+                } else if self.flat_lists {
+                    for list in 0..lists {
+                        b.put(1, 1);
+                        for _ in 0..if list < 6 { 16 } else { 64 } {
+                            b.ue(0);
+                        }
+                    }
                 }
             }
-            b.ue(0).ue(0).ue(0); // frame_num of 4 bits, POC type 0 of 4
+            b.ue(2).ue(0).ue(0); // frame_num of 6 bits, POC type 0 of 4
             b.ue(1).put(0, 1); // one reference picture, no gaps
             b.ue(self.width_in_mbs_minus1).ue(self.height_in_map_units_minus1);
             b.put(u64::from(self.frame_mbs_only), 1);
@@ -201,6 +213,54 @@ pub(crate) mod tests {
             ([0, 0, u32::MAX - 1, 2], None),
         ]
         .map(|(crop, size)| (Sps { crop: Some(crop), ..Sps::default() }, size))
+    }
+
+    /// An SPS of each chroma format, frame and field coded, with every scaling
+    /// list spelt out and a crop of 3 units across and 7 down.
+    pub(crate) fn high_sps() -> [(Sps, (u32, u32)); 8] {
+        [
+            (0, true, (1917, 1081)),
+            (0, false, (1917, 1074)),
+            (1, true, (1914, 1074)),
+            (1, false, (1914, 1060)),
+            (2, true, (1914, 1081)),
+            (2, false, (1914, 1074)),
+            (3, true, (1917, 1081)),
+            (3, false, (1917, 1074)),
+        ]
+        .map(|(chroma, frame_mbs_only, size)| {
+            let height_in_map_units_minus1 = if frame_mbs_only { 67 } else { 33 };
+            let crop = Some([1, 2, 3, 4]);
+            let d = Sps::default();
+            (Sps { profile: 244, chroma, flat_lists: true, height_in_map_units_minus1, frame_mbs_only, crop, ..d }, size)
+        })
+    }
+
+    /// Real SPS NAL units, x264's and two captures', as `(what, SPS, size)`,
+    /// the size as ffprobe reads it.
+    pub(crate) fn real_sps() -> [(&'static str, Vec<u8>, (u32, u32)); 11] {
+        [
+            ("Baseline 720p", "6742c01fdc05005bb011000003000100000300320f183380", (1280, 720)),
+            ("Main, interlaced SD", "674d401ef816849b011000000300100000030321f142b8", (720, 576)),
+            ("Main, interlaced 1440", "674d4028f80b4089fbc044000003000400000300c87c58be", (1440, 1080)),
+            ("High, PAFF capture", "67640029ac133140780447de03ea020203e000000300200000065280", (1920, 1080)),
+            (
+                "High, MBAFF capture with scaling lists",
+                concat!(
+                    "67640028ad843588742050b041074421ac47361882a210ffa69a4d5a31526c862c92c8a431cb104111251c",
+                    "28c716161d1e09050b05d06d087fd7af93f11fd7e6f8af0870d608a0a0b290078044fde036a02020280000",
+                    "0300080000030194a0",
+                ),
+                (1920, 1080),
+            ),
+            ("High 4:2:2 10-bit, interlaced", "677a1028b6cf01e0113f2e022000000300200000064280", (1920, 1080)),
+            ("High 4:2:2 10-bit 4K", "677a1033b6cb80780087d80880000003008000001902", (3840, 2160)),
+            ("High 10 8K", "676e103ca6cb803c0010ed80880000030008000003019020", (7680, 4320)),
+            ("High 4:2:2, 8192 wide", "677a103cbcb801000043b6022000000300200000064080", (8192, 4320)),
+            ("16384 wide, the widest taken", "6742c03cdc0040011b011000000300100000030320f0804380", (16384, 128)),
+            ("High 4:4:4, cropped by 14 each way", "67f4100d919705421e3e3f01100000030010000003032040", (322, 242)),
+        ]
+        .map(|(what, sps, size)| (what, hx(sps), size))
     }
 
     /// `n` SPS NAL units of random bytes, the same ones each time. Most name a

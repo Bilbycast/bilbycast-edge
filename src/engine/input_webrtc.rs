@@ -4416,16 +4416,20 @@ mod tests {
     #[test]
     fn an_h264_order_is_not_read_off_an_sps_out_of_range() {
         use super::H264Order;
-        use crate::engine::h264_sps::tests::{RANDOM, Sps, edge_213, random_sps};
+        use crate::engine::h264_sps::tests::{RANDOM, Sps, edge_213, high_sps, random_sps};
         let [width, height, crop, scaling_list] = edge_213();
         for sps in [width, height, crop] {
-            assert_eq!(H264Order::of(&sps.nal()).map(|o| (o.frame_num_bits, o.in_order)), Some((4, true)));
+            assert_eq!(H264Order::of(&sps.nal()).map(|o| (o.frame_num_bits, o.in_order)), Some((6, true)));
         }
         assert!(H264Order::of(&scaling_list.nal()).is_none());
         let high = |deltas| Sps { profile: 100, scaling_list: Some(deltas), ..Sps::default() };
         assert!(H264Order::of(&high(&[-128, 127, -7]).nal()).is_some());
         assert!(H264Order::of(&high(&[-129, 121]).nal()).is_none());
         assert!(H264Order::of(&high(&[-129, -128, -8]).nal()).is_none());
+        for (i, (sps, _)) in high_sps().iter().enumerate() {
+            let order = H264Order::of(&sps.nal()).map(|o| (o.frame_num_bits, o.in_order));
+            assert_eq!(order, Some((6, false)), "{i}");
+        }
         let mut read = 0;
         for sps in random_sps(RANDOM) {
             if let Some(order) = H264Order::of(&sps) {
