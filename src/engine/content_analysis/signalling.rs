@@ -20,6 +20,7 @@
 use crate::stats::models::SignallingStats;
 
 use super::bitreader::{unescape_rbsp, BitReader};
+use crate::engine::h264_sps::picture_size;
 
 pub struct SignallingTracker {
     codec: Codec,
@@ -255,7 +256,7 @@ impl SignallingTracker {
         }
         let _ = br.read_bit(); // direct_8x8_inference_flag
         let frame_cropping_flag = br.read_bit().unwrap_or(0);
-        let (crop_left, crop_right, crop_top, crop_bottom) = if frame_cropping_flag == 1 {
+        let crop = if frame_cropping_flag == 1 {
             (
                 br.read_ue().unwrap_or(0),
                 br.read_ue().unwrap_or(0),
@@ -265,22 +266,23 @@ impl SignallingTracker {
         } else {
             (0, 0, 0, 0)
         };
+        // A size or crop out of range has no aspect ratio, as 0x0 has none.
+        let (width, height) = picture_size(
+            pic_width_in_mbs_minus1,
+            pic_height_in_map_units_minus1,
+            frame_mbs_only_flag == 1,
+            crop,
+            (2, 2),
+        )
+        .unwrap_or((0, 0));
         let vui_present = br.read_bit().unwrap_or(0);
         if vui_present != 1 {
             // Still compute AR from coded dimensions if we can.
-            let width = (pic_width_in_mbs_minus1 + 1) * 16 - (crop_left + crop_right) * 2;
-            let height = (2 - frame_mbs_only_flag as u32) * (pic_height_in_map_units_minus1 + 1) * 16
-                - (crop_top + crop_bottom) * 2;
             self.aspect_ratio = format_aspect_ratio(width, height, 1, 1);
             return;
         }
 
-        self.parse_vui(
-            &mut br,
-            (pic_width_in_mbs_minus1 + 1) * 16 - (crop_left + crop_right) * 2,
-            (2 - frame_mbs_only_flag as u32) * (pic_height_in_map_units_minus1 + 1) * 16
-                - (crop_top + crop_bottom) * 2,
-        );
+        self.parse_vui(&mut br, width, height);
     }
 
     fn parse_hevc_sps(&mut self, rbsp: &[u8]) {
@@ -696,5 +698,44 @@ fn matrix_name(m: u8) -> &'static str {
         13 => "chroma-cl",
         14 => "ictcp",
         _ => "unspecified",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::h264_sps::tests::{RANDOM, Sps, crops, edge_213, random_sps, sizes};
+
+    /// The aspect ratio read off `sps`, after one off 4:3 pictures.
+    fn aspect_ratio(sps: &Sps) -> Option<String> {
+        let mut tracker = SignallingTracker::new();
+        tracker.scan_avc(
+            &Sps { width_in_mbs_minus1: 43, height_in_map_units_minus1: 32, ..Sps::default() }.annex_b(),
+        );
+        assert_eq!(tracker.aspect_ratio.as_deref(), Some("4:3"));
+        tracker.scan_avc(&sps.annex_b());
+        tracker.aspect_ratio
+    }
+
+    /// edge#213: an SPS whose size or crop is out of range has no aspect
+    /// ratio. One with scaling lists is not read as far as its size, and
+    /// leaves the last there was.
+    #[test]
+    fn an_avc_sps_out_of_range_has_no_aspect_ratio() {
+        let [width, height, crop, scaling_list] = edge_213();
+        for sps in [width, height, crop] {
+            assert_eq!(aspect_ratio(&sps), None);
+        }
+        assert_eq!(aspect_ratio(&scaling_list).as_deref(), Some("4:3"));
+        for (sps, size) in sizes().into_iter().chain(crops()) {
+            assert_eq!(aspect_ratio(&sps), size.and_then(|(w, h)| format_aspect_ratio(w, h, 1, 1)));
+        }
+    }
+
+    #[test]
+    fn a_random_avc_sps_never_panics() {
+        for sps in random_sps(RANDOM) {
+            SignallingTracker::new().parse_avc_sps(&sps[1..]);
+        }
     }
 }
