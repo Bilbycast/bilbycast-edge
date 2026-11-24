@@ -3829,7 +3829,7 @@ Once running, an assembled flow exposes:
 - **Assembled Output section** on the flow card — one sub-table per program listing each slot's `out_pid`, `stream_type`, resolved `kind`, source label (or Hitless(A/B)), live bitrate, packets, CC errors, PCR discontinuity counters from `FlowStats.per_es[]`.
 - **Per-output PCR trust** — `p50 / p99` columns on the Outputs table, fed by `OutputStats.pcr_trust`.
 - **Flow-rollup PCR trust** — `FlowStats.pcr_trust_flow` (Samples, p50 / p95 / p99 / Max / Window p95) rendered at the bottom of the flow card.
-- **Events** — the `pid_bus_*` codes (see [Event reference](events-and-alarms.md#pid-bus--flow-assembly-flow)) ride as events at mixed severity — Critical for a bring-up or hot-swap refusal, Warning for runtime slot health and a stalled assembler, Info for `pid_bus_slot_recovered` — with structured `details` (`error_code`, `input_id`, `input_type`, `program_number`, ...) so the manager UI can highlight the offending form field on Create/Update modals without parsing the error string.
+- **Events** — most `pid_bus_*` codes ride as events; the [Event reference](events-and-alarms.md#pid-bus--flow-assembly-flow) names the few that are only on a `command_ack` or in the message of a `validation_error`. Their severity is mixed: Critical for a bring-up or hot-swap refusal, Warning for runtime slot health and a stalled assembler, Info for `pid_bus_slot_recovered`. They carry structured `details` (`error_code`, `input_id`, `input_type`, `program_number`, ...) so the manager UI can highlight the offending form field on Create/Update modals without parsing the error string.
 
 ---
 

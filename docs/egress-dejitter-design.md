@@ -106,6 +106,7 @@ its clock). *(Shipped: the residence-cap shed is **Lossless-only** — `dejitter
 | setpoint (centre) | 60 ms of content | US10313276 (120 ms @ 50%) |
 | residence cap | 250 ms — **superseded**; shipped is `max(4×setpoint, 1000)` ms capped at 5000 ms | ~2× setpoint, inside T-STD (≤0.7 s) + SRT RCVLATENCY headroom. 250 ms sat only 50 ms above the servo's own 200 ms lookahead, so it shed datagrams the pacer was legitimately holding |
 | rate authority | ±5 % | converges <1 s; receiver T-STD absorbs the induced PCR_OJ |
+
 Setpoint in datagrams computed live from `observed_rate_bps` (~34 dgms @6 Mbps). The deep
 8192-slot wire channel **stays** as the transient burst reservoir; the servo holds occupancy far
 below it. Codec backpressure (75 %) and SRT/RIST input buffers are unchanged + complementary.
