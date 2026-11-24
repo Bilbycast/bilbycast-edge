@@ -383,7 +383,7 @@ Validation rejects — at config load, not mid-show — `v210`, `bit_depth: 10`,
 ## Failure modes and events
 
 Three failure modes, deliberately handled differently. All events ride the
-`flow` category with a structured `error_code`:
+`sdi` category with a structured `error_code`:
 
 | Severity | error_code | Meaning / behaviour |
 |----------|------------|---------------------|

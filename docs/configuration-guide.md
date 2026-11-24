@@ -942,7 +942,7 @@ Coexists with the legacy `interface_addr` / `bind_addr` / `local_addr` fields. P
 **Capability advertisement:**
 
 - `interface-binding` — present from this release on. Signals the new field is honoured.
-- `interface-binding-strict` — present only when the startup `SO_BINDTODEVICE` probe succeeds. Edges without `CAP_NET_RAW` reject `strict: true` at bind time with a Critical `interface_binding_strict_denied` event. Manager UI hides the strict toggle until the capability appears.
+- `interface-binding-strict` — present only when the startup `SO_BINDTODEVICE` probe succeeds. Edges without `CAP_NET_RAW` refuse `strict: true` at bind time: on a UDP or RTP input that is a Critical `bind_failed` event whose `error` names the capability. Manager UI hides the strict toggle until the capability appears.
 
 **Per-leg + per-endpoint:**
 
@@ -986,8 +986,8 @@ sudo systemctl daemon-reload && sudo systemctl restart bilbycast-edge
 
 | `error_code` | Severity | Trigger |
 |---|---|---|
-| `interface_not_found` | Critical | `name` doesn't match any enumerated NIC at bind time. |
-| `interface_binding_strict_denied` | Critical | `setsockopt(SO_BINDTODEVICE)` returned `EPERM` (cap not granted). |
+| `interface_not_found` | Critical | A RIST input's `name` doesn't match any enumerated NIC at bind time. On a UDP or RTP input the same refusal is a `bind_failed`. |
+| `interface_binding_strict_denied` | — | **Never implemented** — nothing emits it (see [`events-and-alarms.md`](events-and-alarms.md#per-nic-interface-binding)). A strict pin the host refuses is a Critical `bind_failed` on a UDP or RTP input. |
 | `interface_binding_legacy_addr_ignored` | — | **Never implemented** — nothing emits it (see [`events-and-alarms.md`](events-and-alarms.md#per-nic-interface-binding)). Setting both `interface_binding` and a legacy address raises no event. |
 | `srt_strict_binding_unsupported` | Critical | `strict: true` on an SRT/RIST surface (Phase 1 limitation). |
 
@@ -1777,12 +1777,12 @@ of the local file kicks in transparently.
 |-------|------|----------|---------|------------|-------------|
 | `kind` | string | Yes | - | all | `"ts"`, `"mp4"`, or `"image"`. |
 | `name` | string | Yes | - | all | Filename within the media library. ASCII alphanumeric plus `._- ` only, 1–255 chars, no leading dot, no path separators. |
-
-> **`mp4` sources must be plain (unfragmented) H.264 + AAC.** Fragmented MP4 (fMP4 — `moof`/`traf` boxes, as produced by `ffmpeg -movflags frag_keyframe+empty_moov`, browser MediaRecorder / MSE, and DASH/HLS/CMAF packagers) is **rejected** with a Critical `media_player_source_unsupported` event, because the pure-Rust demuxer cannot address samples inside movie-fragment boxes and would otherwise emit an undecodable stream. Re-mux to a plain MP4 first — `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4` — or transcode to MPEG-TS and use a `"ts"` source (the lowest-CPU path). HEVC-in-MP4 is likewise out of scope; transcode to `.ts`.
 | `fps` | integer | No | `5` | `image` | Frames per second to render. Range 1–60. A still needs no more than a few fps — the picture never changes, so `fps` only sets how often an identical frame is re-encoded (and, with `gop_size = fps`, how often an IDR lands for fast receiver join). Raising it costs CPU and bitrate for no visible benefit. |
 | `bitrate_kbps` | integer | No | `250` | `image` | Encoded video bitrate. Range 50–50 000 (50 kbps – 50 Mbps). A static picture compresses to far less than this in practice; the value is an upper bound, not a target the encoder pads to. |
 | `duration_secs` | integer | No | `null` | `image` | How long the still stays on air before the playlist advances. Range 1–86 400 (1 s – 24 h). **Omit it (`null`) and the still plays forever** until an operator Next, a transition, or a flow stop — the intended behaviour for a fallback/emergency slate. Set it for a timed playlist item. |
 | `audio_silence` | boolean | No | `true` | `image` | Pair the rendered video with silent stereo AAC so downstream demuxers don't complain about a missing audio PID. |
+
+> **`mp4` sources must be plain (unfragmented) H.264 + AAC.** Fragmented MP4 (fMP4 — `moof`/`traf` boxes, as produced by `ffmpeg -movflags frag_keyframe+empty_moov`, browser MediaRecorder / MSE, and DASH/HLS/CMAF packagers) is **rejected** with a Critical `media_player_source_unsupported` event, because the pure-Rust demuxer cannot address samples inside movie-fragment boxes and would otherwise emit an undecodable stream. Re-mux to a plain MP4 first — `ffmpeg -i in.mp4 -c copy -movflags +faststart out.mp4` — or transcode to MPEG-TS and use a `"ts"` source (the lowest-CPU path). HEVC-in-MP4 is likewise out of scope; transcode to `.ts`.
 
 > **Still images are encoded, not looped bytes.** The `image` kind decodes
 > the file once to YUV420p and runs a real H.264 encoder at `fps`, so it
@@ -2374,7 +2374,7 @@ All three variants share the MXL domain reference:
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `type` | string | — | `"mxl_video"`, `"mxl_audio"` or `"mxl_anc"`. |
-| `domain_path` | string | — | **Required.** MXL domain directory, typically `/dev/shm/<name>`. Must live on tmpfs/ramfs — otherwise a `mxl_domain_not_tmpfs` Warning fires. |
+| `domain_path` | string | — | **Required.** MXL domain directory, typically `/dev/shm/<name>`. Put it on tmpfs/ramfs. Nothing checks the path, so no event says when it is not (`mxl_domain_not_tmpfs` was never implemented; at boot the edge only logs whether `/dev/shm` is tmpfs). |
 | `flow_name` | string | — | **Required.** libmxl flow name to consume. |
 | `clock_domain` | u8 | *(inherits flow)* | PTP clock domain `0..=127`. |
 
@@ -3378,7 +3378,8 @@ output.
     the config field: the resolver tests whether an ALSA playout position is
     currently driving the pacer, and disengages an already-engaged cadence the
     moment one comes up. So an output that has an `audio_device` configured
-    *can* engage when audio never opened (`display_audio_open_failed`) or the
+    *can* engage when audio never opened (`display_audio_device_invalid`, or
+    `display_audio_open_failed` from a device that refused its parameters) or the
     source carries none. Audio is master on that path and holding frames on
     the vblank raster would fight it; locking video to the panel is only sound
     once audio is resampled to the same clock, which this does not do.
@@ -3414,8 +3415,8 @@ output.
 **Build prerequisites.** `display` is Linux-only and gated on the
 `display` Cargo feature (off by default). Schema is unconditional —
 configs round-trip on every platform. On non-Linux / non-feature
-builds the spawner refuses with `display_device_invalid` so the
-manager UI can highlight the offending field. Install:
+builds the output is refused at start; `display_device_invalid` is in
+the error's text only, not a code on the ack. Install:
 
 ```sh
 sudo apt install libasound2-dev
@@ -3509,12 +3510,14 @@ restoring the desktop, console/VT noise) lives in
 under *Host prerequisites (NVIDIA GPUs + desktop systems)*.
 
 See [`docs/events-and-alarms.md`](events-and-alarms.md#display-output-events-display)
-for the full event catalogue, including `display_device_unavailable`,
-`display_mode_set_failed`, `display_master_busy`, `display_flip_timeout`,
-`display_audio_open_failed`, `display_frame_loss_sustained` /
-`display_frame_loss_recovered`, `display_subscriber_lagged`.
-(`display_decoder_overload` and `display_av_drift` appear in older
-revisions of this list but were never implemented — see the catalogue.)
+for the full event catalogue, including `display_mode_set_failed`,
+`display_master_busy`, `display_flip_timeout`,
+`display_audio_device_invalid`, `display_audio_open_failed`,
+`display_frame_loss_sustained` / `display_frame_loss_recovered`,
+`display_subscriber_lagged`.
+(`display_device_unavailable`, `display_decoder_overload` and
+`display_av_drift` appear in older revisions of this list but were never
+implemented — see the catalogue.)
 
 ### SDI Output (Blackmagic DeckLink playout)
 
@@ -3826,7 +3829,7 @@ Once running, an assembled flow exposes:
 - **Assembled Output section** on the flow card — one sub-table per program listing each slot's `out_pid`, `stream_type`, resolved `kind`, source label (or Hitless(A/B)), live bitrate, packets, CC errors, PCR discontinuity counters from `FlowStats.per_es[]`.
 - **Per-output PCR trust** — `p50 / p99` columns on the Outputs table, fed by `OutputStats.pcr_trust`.
 - **Flow-rollup PCR trust** — `FlowStats.pcr_trust_flow` (Samples, p50 / p95 / p99 / Max / Window p95) rendered at the bottom of the flow card.
-- **Events** — every `pid_bus_*` error code (see [Event reference](events-and-alarms.md)) rides as a Critical event with structured `details` (`error_code`, `input_id`, `input_type`, `program_number`, ...) so the manager UI can highlight the offending form field on Create/Update modals without parsing the error string.
+- **Events** — the `pid_bus_*` codes (see [Event reference](events-and-alarms.md#pid-bus--flow-assembly-flow)) ride as events at mixed severity — Critical for a bring-up or hot-swap refusal, Warning for runtime slot health and a stalled assembler, Info for `pid_bus_slot_recovered` — with structured `details` (`error_code`, `input_id`, `input_type`, `program_number`, ...) so the manager UI can highlight the offending form field on Create/Update modals without parsing the error string.
 
 ---
 
@@ -5312,14 +5315,15 @@ proxy rejects an out-of-range speed with HTTP 400 before forwarding.
 ### Events
 
 See [`events-and-alarms.md`](events-and-alarms.md#replay-server-events)
-for the full list of `replay_event` values and `command_ack.error_code`
-codes (`replay_recording_not_active`, `replay_no_playback_input`,
-`replay_clip_not_found`, `replay_writer_lagged`, `replay_disk_full`,
-`replay_recovery_alert`, `replay_invalid_field`, `replay_invalid_range`,
-`replay_invalid_tag`). `replay_recovery_alert` is the only
-restart-recovery code — the Warning `spawn_writer` raises when it has
-cleaned `.tmp/` orphans, found `recording.json` corrupt, or found a
-finalized segment on disk newer than the one `recording.json` records
+for the full list of `replay_event` values with their event codes
+(`replay_writer_lagged`, `replay_disk_full`, `replay_recovery_alert`, …)
+and of the `command_ack.error_code` codes (`replay_recording_not_active`,
+`replay_no_playback_input`, `replay_clip_not_found`,
+`replay_invalid_field`, `replay_invalid_range`, `replay_invalid_tag`, …).
+`replay_recovery_alert` is the only restart-recovery code — the Warning
+`spawn_writer` raises when it has cleaned `.tmp/` orphans, found
+`recording.json` corrupt, or found a finalized segment on disk newer than
+the one `recording.json` records
 (`details.tmp_orphans_removed` / `.meta_corrupt` / `.next_segment_id`);
 a short `index.bin` is aligned down to the last 24-byte boundary
 silently and raises nothing.
