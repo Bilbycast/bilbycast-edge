@@ -355,8 +355,12 @@ impl TsMuxer {
     ///
     /// Behaviour:
     /// - First call: passes the value through unchanged.
-    /// - Subsequent calls: if `pts_90khz <= last`, returns `last + 1`.
-    ///   Otherwise returns `pts_90khz` unchanged.
+    /// - Subsequent calls: if `pts_90khz` is at `last` or steps back from it
+    ///   ([`audio_pts_steps_back`]), returns `last + 1`. Otherwise returns
+    ///   `pts_90khz` unchanged, over the 33-bit wrap too: compared as it
+    ///   stands, every PTS after the wrap was behind the last one before it,
+    ///   so from 26.5 h on a WHIP, WHEP or RTSP input's audio stepped one tick
+    ///   a frame, until the input (RTSP: its connection) started again.
     ///
     /// We bump by exactly 1 tick (≈11.1 µs at 90 kHz) on a regression
     /// rather than a larger value because the regressions seen in
@@ -365,7 +369,7 @@ impl TsMuxer {
     /// without distorting the audio clock more than necessary.
     pub(crate) fn clamp_audio_pts(&mut self, pts_90khz: u64) -> u64 {
         let clamped = match self.last_audio_pts_90khz {
-            Some(last) if pts_90khz <= last => last + 1,
+            Some(last) if audio_pts_steps_back(last, pts_90khz) => last + 1,
             _ => pts_90khz,
         };
         self.last_audio_pts_90khz = Some(clamped);
@@ -1250,6 +1254,17 @@ fn build_pes_packet(
     buf.to_vec()
 }
 
+/// Whether an audio PTS is at the `last` one or behind it. Callers hand in 33
+/// bits (WebRTC, RTSP) or a count that runs on past them (RTMP), which on the
+/// wire is the same: a PTS below `last` that is ahead of it by less than half
+/// the 33-bit range has gone over the wrap, and one above it that is behind it
+/// by less than a second has come back over it. Any other is taken as it
+/// stands, so a step forward of any length is one.
+fn audio_pts_steps_back(last: u64, pts_90khz: u64) -> bool {
+    let behind = last.wrapping_sub(pts_90khz) & MASK_33;
+    if pts_90khz <= last { behind < 1 << 32 } else { behind < 90_000 }
+}
+
 /// Write a 33-bit PTS/DTS timestamp in the 5-byte PES format.
 fn write_timestamp(buf: &mut BytesMut, marker_bits: u8, ts: u64) {
     let ts = ts & 0x1_FFFF_FFFF; // 33 bits
@@ -1569,6 +1584,33 @@ mod tests {
         assert_eq!(clamped[2], 3870);
         // Equal value gets bumped by exactly 1 tick.
         assert_eq!(clamped[5], 7651);
+    }
+
+    /// The 33-bit wrap is no step back, whether the caller's PTS wraps
+    /// (WebRTC, RTSP) or runs on (RTMP): every PTS goes out as it is. A
+    /// regression by the wrap is clamped as anywhere, and so is one by an
+    /// hour, as it always was.
+    #[test]
+    fn clamp_audio_pts_runs_on_over_the_wrap() {
+        const FRAME: u64 = 1_800;
+        let clamped = |pts: &[u64]| {
+            let mut muxer = TsMuxer::new();
+            pts.iter().map(|p| muxer.clamp_audio_pts(*p) & MASK_33).collect::<Vec<_>>()
+        };
+        for start in [MASK_33 - 5 * FRAME, MASK_33 - 5 * FRAME + 1, MASK_33 - 5 * FRAME - 700] {
+            let wrapping: Vec<u64> = (0..40).map(|k| (start + k * FRAME) & MASK_33).collect();
+            assert_eq!(clamped(&wrapping), wrapping, "33 bits");
+            let running_on: Vec<u64> = (0..40).map(|k| start + k * FRAME).collect();
+            assert_eq!(clamped(&running_on), wrapping, "running on");
+        }
+        // A frame on the wrap's last tick again, and 10 ms back over it.
+        assert_eq!(clamped(&[MASK_33, MASK_33, FRAME]), [MASK_33, 0, FRAME]);
+        assert_eq!(clamped(&[MASK_33 - 100, 400, MASK_33 - 499, 2_200]), [MASK_33 - 100, 400, 401, 2_200]);
+        // An hour back, and a step forward of any length.
+        assert_eq!(clamped(&[400_000_000, 76_000_000, 76_001_800]), [400_000_000, 400_000_001, 400_000_002]);
+        for ahead in [324_000_000, (1 << 32) + 5, (1 << 33) - 90_000 - 1] {
+            assert_eq!(clamped(&[1_000, 1_000 + ahead]), [1_000, (1_000 + ahead) & MASK_33]);
+        }
     }
 
     /// Verify the same property end-to-end through `mux_audio` by

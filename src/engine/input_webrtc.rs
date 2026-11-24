@@ -4662,6 +4662,37 @@ mod tests {
         }
     }
 
+    /// The sound runs on over the 33-bit wrap with the pictures, on its own
+    /// and beside them, where it is the PCR's as well. It stopped there: a PTS
+    /// a tick past the last for every packet after the wrap, for the rest of
+    /// the input's life.
+    #[test]
+    fn the_sound_runs_on_over_the_33_bit_wrap() {
+        use crate::engine::rtmp::ts_mux::PCR_LEAD_90K as LEAD;
+        const WRAP: u64 = 1 << 33;
+        for video in [true, false] {
+            let mut w = av_whip_mux();
+            w.muxer.set_has_video(video);
+            let t0 = std::time::Instant::now();
+            // The input's first frame, and a session a second short of the
+            // wrap, 26.5 h on.
+            w.session(true, true);
+            let _ = fed(&mut w, t0, &opus(0, 1, 0xFC));
+            w.session(true, true);
+            let from_us = (WRAP - LEAD) * 100 / 9 - 1_000_000;
+            let mut frames = opus(from_us, 200, 0xFC);
+            if video {
+                frames.extend(pictures(&(0..100).collect::<Vec<_>>(), from_us, PERIOD_90K, |k| k * PERIOD_US));
+            }
+            let muxed = fed(&mut w, t0, &arriving(frames));
+            let from = LEAD + from_us * 9 / 100;
+            assert_eq!(pts_on(&muxed, 0x0101), (0..200).map(|k| (from + k * 1_800) % WRAP).collect::<Vec<_>>());
+            let pcrs = pcrs_in(&muxed);
+            assert!(pcrs[1..].iter().all(|p| !p.1), "the new session's DI alone");
+            assert!(pcr_steps(&pcrs).iter().all(|s| (1..=PERIOD_90K).contains(s)), "{:?}", pcr_steps(&pcrs));
+        }
+    }
+
     /// A WHIP publish is not looked at: one whose second picture is stamped
     /// 1.5 s past its first, sent 40 ms after it, is timed from its first as
     /// it always was — its PTS 1.5 s apart.

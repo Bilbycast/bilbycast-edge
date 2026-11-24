@@ -906,6 +906,38 @@ mod tests {
         assert!(creds.is_none());
     }
 
+    /// A camera connected for longer than 26.5 h: its sound runs on over the
+    /// 33-bit wrap with its pictures. Every frame after it was a tick past the
+    /// last, until the connection ended.
+    #[test]
+    fn the_sound_runs_on_over_the_33_bit_wrap() {
+        use crate::engine::ts_parse::{extract_pes_pts, ts_pid, ts_pusi};
+        const WRAP: u64 = 1 << 33;
+        let layout = SessionLayout { has_video: true, has_audio: true, is_h265: false };
+        let mut muxer = session_muxer(&config(serde_json::json!({})), layout, None);
+        let idr = [0u8, 0, 0, 1, 0x65, 0x88, 0x84, 0x00, 0x33];
+        let adts = [0xFFu8, 0xF1, 0x50, 0x80, 0x02, 0x1F, 0xFC, 0x21, 0x00];
+        // From a second short of it (a whole number of milliseconds in), AAC
+        // at 48 kHz and 25 fps.
+        let from = ((WRAP - PCR_LEAD_90K) as i64 - 90_000) / 90 * 90;
+        let (mut audio, mut video) = (Vec::new(), Vec::new());
+        let of = |packets: &[Bytes], pid: u16| {
+            let pes = packets.iter().filter(|p| ts_pid(p) == pid && ts_pusi(p));
+            pes.filter_map(|p| extract_pes_pts(p)).collect::<Vec<_>>()
+        };
+        for k in 0..100 {
+            let pts = rtsp_pts_90k(from + k * 3_600, 90_000);
+            let packets = muxer.mux_video(&idr, pts, pts, true);
+            video.extend(of(&packets, 0x0100));
+            let packets = muxer.mux_audio_pre_adts(&adts, rtsp_pts_90k(from * 48 / 90 + k * 1_024, 48_000));
+            audio.extend(of(&packets, 0x0101));
+        }
+        let start = PCR_LEAD_90K + from as u64;
+        let after = |pts: &[u64]| pts.iter().map(|p| (p + WRAP - start) % WRAP).collect::<Vec<_>>();
+        assert_eq!(after(&video), (0..100).map(|k| k * 3_600).collect::<Vec<_>>());
+        assert_eq!(after(&audio), (0..100).map(|k| k * 1_920).collect::<Vec<_>>());
+    }
+
     /// [`session_muxer`] continues every PID's continuity counter from the
     /// counters it is handed, audio included (the camera of
     /// `a_reconnect_continues_every_pids_continuity_counter` sends none).
