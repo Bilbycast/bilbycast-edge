@@ -248,7 +248,9 @@ impl TimecodeTracker {
                 "{:02}:{:02}:{:02}:{:02}",
                 hours_value, minutes_value, seconds_value, frames
             );
-            let fps_for_total = self.frame_rate.map(|f| f.round() as u64).unwrap_or(30);
+            // At least 1: a rate that rounds to 0 left every total at its
+            // frames, and the 24 h total below at less than its margin.
+            let fps_for_total = self.frame_rate.map(|f| (f.round() as u64).max(1)).unwrap_or(30);
             let total_frames = ((hours_value as u64) * 3600
                 + (minutes_value as u64) * 60
                 + (seconds_value as u64))
@@ -355,6 +357,28 @@ mod tests {
         t.decode_pic_timing(&pic_timing_payload(24));
         let snap = t.snapshot().expect("seen");
         assert_eq!(snap.last.as_deref(), Some("00:00:00:24"));
+    }
+
+    /// [`pic_timing_payload`] of 00:00:`seconds`:00.
+    fn pic_timing_at(seconds: u8) -> Vec<u8> {
+        vec![0x08, 0x04, 0x00, seconds << 2, 0x00, 0x00]
+    }
+
+    /// A rate that rounds to 0 took 10 off a 24 h total of 0.
+    #[test]
+    fn a_rate_under_half_a_frame_a_second_counts_seconds() {
+        for rate in [1e-9, 0.2, 0.499, 0.5, 1.0] {
+            let mut t = TimecodeTracker::new();
+            // Frame 6 of a rate not known yet, and then 0.
+            t.decode_pic_timing(&pic_timing_payload(6));
+            t.set_frame_rate(Some(rate));
+            t.decode_pic_timing(&pic_timing_at(0));
+            assert_eq!(t.snapshot().unwrap().non_monotonic_count, 1, "{rate}");
+            for (seconds, count) in [(3, 1), (6, 1), (12, 1), (7, 1), (1, 2)] {
+                t.decode_pic_timing(&pic_timing_at(seconds));
+                assert_eq!(t.snapshot().unwrap().non_monotonic_count, count, "{rate}: {seconds}");
+            }
+        }
     }
 
     #[test]
