@@ -462,9 +462,9 @@ and `redundancy_ssrc_mismatch` on a pair),
 
 | Severity | Message | Trigger | Details |
 |----------|---------|---------|---------|
-| info | RTMP publisher connected | Client connected and started publishing | |
-| warning | RTMP publisher disconnected | The publish on air ended (its connection closed, or sent nothing for 300 s), or, with none on air, one that had sent its headers. Not raised for a publish a newer one has taken over from, or a connection that never published | |
-| critical | RTMP server error: {error} | Server bind or accept failure | `{ error }` |
+| info | RTMP publisher connected | An H.264 sequence header with its SPS and PPS, from the publish on air or, with none on air, from the first one heard. Every header acted on raises one: a publisher that repeats its header raises it again, and a publish that takes over raises it for the header it has sent. An audio-only publish raises none | |
+| warning | RTMP publisher disconnected | The publish on air ended (it stopped, its connection closed, or it sent nothing for 300 s), or, with none on air, the first one heard did, whatever it had sent: a message the input does not carry counts. Not raised for a publish a newer one has taken over from, a publish that sent nothing, or a connection that never published | |
+| critical | RTMP server error: {error} | The listener could not bind `listen_addr`, for any reason but the address being in use, which raises `port_conflict` instead. A failed accept is only logged | `{ error }` |
 
 #### RTMP Output (push to Twitch / YouTube / any RTMP ingest)
 
