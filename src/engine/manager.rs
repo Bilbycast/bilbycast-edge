@@ -2299,6 +2299,354 @@ mod tests {
         }
     }
 
+    /// An assembly of `slots`, each the JSON of a slot's source, on one
+    /// program: out PIDs 512 up, the PCR on PID 256 of `pcr_input`.
+    fn assembly_of(pcr_input: &str, slots: &[serde_json::Value]) -> crate::config::models::FlowAssembly {
+        let streams: Vec<_> = slots
+            .iter()
+            .enumerate()
+            .map(|(i, source)| {
+                serde_json::json!({ "source": source, "out_pid": 512 + i, "stream_type": 27 })
+            })
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "kind": "spts",
+            "pcr_source": { "input_id": pcr_input, "pid": 256 },
+            "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": streams }]
+        }))
+        .expect("assembly fixture")
+    }
+
+    fn pid_source(input: &str, pid: u16) -> serde_json::Value {
+        serde_json::json!({ "type": "pid", "input_id": input, "source_pid": pid })
+    }
+
+    /// A Switch source with a leg on PID `pid` of each of `legs`, the first
+    /// its initial one.
+    fn switch_source(legs: &[&str], pid: u16) -> serde_json::Value {
+        serde_json::json!({
+            "type": "switch",
+            "initial_input_id": legs[0],
+            "legs": legs.iter().map(|leg| pid_source(leg, pid)).collect::<Vec<_>>()
+        })
+    }
+
+    /// Flow `f1` of `members` with `assembly`, over UDP inputs a, b and c on
+    /// `port` and the two after it, `active` on air.
+    fn assembled_flow(
+        port: u16,
+        members: &[&str],
+        active: &str,
+        assembly: &crate::config::models::FlowAssembly,
+    ) -> crate::config::models::ResolvedFlow {
+        let udp = |(i, id): (usize, &&str)| {
+            input(serde_json::json!({
+                "id": id, "name": id, "active": *id == active, "type": "udp",
+                "bind_addr": format!("127.0.0.1:{}", port + i as u16)
+            }))
+        };
+        let cfg = crate::config::models::AppConfig {
+            inputs: ["a", "b", "c"].iter().enumerate().map(udp).collect(),
+            flows: vec![serde_json::from_value(serde_json::json!({
+                "id": "f1", "name": "f1", "input_ids": members, "output_ids": [],
+                "assembly": assembly
+            }))
+            .expect("flow fixture")],
+            ..Default::default()
+        };
+        cfg.resolve_flow(&cfg.flows[0]).expect("resolve")
+    }
+
+    /// Wait until `f1` plays from exactly `inputs` of a, b and c.
+    async fn plays(runtime: &Arc<crate::engine::flow::FlowRuntime>, inputs: &[&str]) {
+        for _ in 0..300 {
+            if ["a", "b", "c"].iter().all(|id| runtime.stats.on_air.contains(id) == inputs.contains(id)) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {inputs:?} on air");
+    }
+
+    /// The PCR_PID of the next PMT on PID 4096 of `out`.
+    async fn pmt_pcr_pid(out: &mut broadcast::Receiver<RtpPacket>) -> u16 {
+        use crate::engine::ts_parse::{ts_pid, ts_pusi};
+        let pmt = async {
+            loop {
+                let bundle = out.recv().await.expect("the flow runs");
+                for p in bundle.data.chunks_exact(188) {
+                    if ts_pid(p) == 4096 && ts_pusi(p) {
+                        return u16::from_be_bytes([p[13], p[14]]) & 0x1FFF;
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), pmt).await.expect("a PMT")
+    }
+
+    /// The details of the `pid_bus_master_clock_mismatch` events raised, all
+    /// Critical, with their text.
+    fn mismatches(
+        events: &mut tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+    ) -> Vec<(serde_json::Value, String)> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|e| Some((e.details?, e.message, e.severity)))
+            .filter(|(d, ..)| d["error_code"] == "pid_bus_master_clock_mismatch")
+            .map(|(d, message, severity)| {
+                assert_eq!(severity, EventSeverity::Critical);
+                (d, message)
+            })
+            .collect()
+    }
+
+    /// Run `checks` on `fm`'s flows, and stop `f1` whether they pass or not: a
+    /// flow left running would hold the test runtime's shutdown forever.
+    async fn then_stop(fm: &Arc<FlowManager>, checks: impl Future<Output = ()> + Send + 'static) {
+        let outcome = tokio::spawn(checks).await;
+        let _ = fm.destroy_flow("f1").await;
+        if let Err(failed) = outcome {
+            std::panic::resume_unwind(failed.into_panic());
+        }
+    }
+
+    /// A program switched between two independent encoders starts, follows
+    /// a Take, and starts again on the input the Take left active. It did
+    /// neither: two UDP inputs are two clocks, and the PCR source is one leg
+    /// of its slot, which a restart on the other looked for in vain
+    /// (`pid_bus_pcr_source_unresolved`).
+    #[tokio::test]
+    async fn a_switch_between_two_encoders_starts_and_restarts() {
+        let (fm, mut events) = make_fm_with_events();
+        let legs = ["a", "b"];
+        let slots = [switch_source(&legs, 256), switch_source(&legs, 257)];
+        let assembly = assembly_of("a", &slots);
+        let runtime = fm
+            .create_flow(assembled_flow(42101, &legs, "a", &assembly))
+            .await
+            .expect("two encoders, switched as one");
+        let checks = {
+            let (fm, runtime) = (fm.clone(), runtime.clone());
+            async move {
+                plays(&runtime, &["a"]).await;
+                fm.switch_active_input("f1", "b", None).await.expect("a Take");
+                plays(&runtime, &["b"]).await;
+            }
+        };
+        then_stop(&fm, checks).await;
+
+        // The PCR stays on the slot whose leg it names, or goes to the first
+        // slot that reads its input when it names none.
+        let second = assembly_of("a", &[switch_source(&legs, 257), switch_source(&legs, 256)]);
+        let elsewhere = assembly_of("a", &[switch_source(&legs, 258), switch_source(&legs, 259)]);
+        let pinned = assembly_of("a", &[pid_source("other", 257), pid_source("a", 258)]);
+        for (assembly, plays_from, pcr_out_pid) in [
+            (assembly, "b", 512),
+            (second, "b", 513),
+            (elsewhere, "b", 512),
+            (pinned, "a", 513),
+        ] {
+            let runtime = fm
+                .create_flow(assembled_flow(42101, &legs, "b", &assembly))
+                .await
+                .expect("a start on the other leg");
+            let mut out = runtime.broadcast_tx.subscribe();
+            let checks = {
+                let runtime = runtime.clone();
+                async move {
+                    plays(&runtime, &[plays_from]).await;
+                    assert_eq!(pmt_pcr_pid(&mut out).await, pcr_out_pid);
+                }
+            };
+            then_stop(&fm, checks).await;
+        }
+        assert!(mismatches(&mut events).is_empty());
+    }
+
+    /// What still does not start: two encoders in one program, or a Switch
+    /// slot beside one that stays behind on a Take. The event names the two
+    /// inputs, and the Take.
+    #[tokio::test]
+    async fn a_program_of_two_clocks_does_not_start() {
+        let (fm, mut events) = make_fm_with_events();
+        let pinned = assembly_of("a", &[pid_source("a", 256), pid_source("b", 257)]);
+        let beside = assembly_of("a", &[switch_source(&["a", "b"], 256), pid_source("a", 257)]);
+        for (assembly, slot_input, reference_input, take) in
+            [(pinned, "b", "a", None), (beside, "a", "b", Some("b"))]
+        {
+            let err = match fm.create_flow(assembled_flow(42104, &["a", "b"], "a", &assembly)).await {
+                Ok(_) => {
+                    let _ = fm.destroy_flow("f1").await;
+                    panic!("two clocks in one program start");
+                }
+                Err(e) => e.to_string(),
+            };
+            let raised = mismatches(&mut events);
+            let [(details, message)] = raised.as_slice() else { panic!("{raised:?}") };
+            assert_eq!(err, *message, "the refusal is the event's text");
+            assert!(message.starts_with("flow 'f1': program 1 slot 0x0201"), "{message}");
+            assert_eq!(details["slot_out_pid"], 513);
+            assert_eq!(details["slot_input_id"], slot_input);
+            assert_eq!(details["slot_clock"], format!("source_pcr:input={slot_input}"));
+            assert_eq!(details["reference_out_pid"], 512);
+            assert_eq!(details["reference_input_id"], reference_input);
+            assert_eq!(details["reference_clock"], format!("source_pcr:input={reference_input}"));
+            assert_eq!(details["take_input_id"], serde_json::json!(take));
+        }
+    }
+
+    /// The same of a plan swapped in, on a running flow: a split program is
+    /// refused and the running plan plays on, and a switched one goes on air
+    /// where the Take left the program.
+    #[tokio::test]
+    async fn a_plan_swap_is_judged_like_a_start() {
+        let (fm, mut events) = make_fm_with_events();
+        let legs = ["a", "b"];
+        let pair = vec![switch_source(&legs, 256), switch_source(&legs, 257)];
+        let runtime = fm
+            .create_flow(assembled_flow(42107, &legs, "a", &assembly_of("a", &pair)))
+            .await
+            .expect("create_flow");
+        let checks = {
+            let (fm, runtime) = (fm.clone(), runtime.clone());
+            async move {
+                plays(&runtime, &["a"]).await;
+                fm.switch_active_input("f1", "b", None).await.expect("a Take");
+                plays(&runtime, &["b"]).await;
+
+                let mut beside = pair.clone();
+                beside.push(pid_source("a", 258));
+                let err = runtime
+                    .replace_assembly(assembly_of("a", &beside), None)
+                    .await
+                    .expect_err("a slot left on a");
+                let raised = mismatches(&mut events);
+                let [(details, message)] = raised.as_slice() else { panic!("{raised:?}") };
+                assert_eq!(err.to_string(), *message);
+                assert!(message.starts_with("flow 'f1': replace_assembly rejected — program 1"));
+                assert_eq!(details["slot_out_pid"], 514);
+                assert_eq!(details["take_input_id"], "b");
+                plays(&runtime, &["b"]).await;
+
+                let mut third = pair.clone();
+                third.push(switch_source(&legs, 258));
+                runtime.replace_assembly(assembly_of("a", &third), None).await.expect("a switched slot");
+                plays(&runtime, &["b"]).await;
+                fm.switch_active_input("f1", "a", None).await.expect("a Take back");
+                plays(&runtime, &["a"]).await;
+
+                // As at a start, the PCR source is a leg of its slot, on air
+                // or not, or the first slot's that reads its input.
+                let reversed = |pid: u16| switch_source(&["b", "a"], pid);
+                for (slots, pcr_out_pid) in [
+                    ([reversed(257), reversed(256)], 513),
+                    ([reversed(260), reversed(261)], 512),
+                ] {
+                    runtime
+                        .replace_assembly(assembly_of("b", &slots), None)
+                        .await
+                        .expect("a PCR source on a leg that is not on air");
+                    let mut out = runtime.broadcast_tx.subscribe();
+                    assert_eq!(pmt_pcr_pid(&mut out).await, pcr_out_pid);
+                }
+                assert!(mismatches(&mut events).is_empty());
+            }
+        };
+        then_stop(&fm, checks).await;
+    }
+
+    /// The assembler is told the flow's clocks, at start and on a swap: a
+    /// PES-aligned Take between two WebRTC inputs, on the host's one clock,
+    /// is spliced (degraded here for want of a PES to align to), and between
+    /// two UDP inputs it is a cut.
+    #[tokio::test]
+    async fn an_assembler_is_told_the_flows_clocks() {
+        let legs = ["a", "b"];
+        let aligned = |pid: u16| {
+            let mut source = switch_source(&legs, pid);
+            source["splice_mode"] = "pes_aligned".into();
+            source
+        };
+        let assembly = assembly_of("a", &[aligned(256), aligned(257)]);
+        for (webrtc, reason) in [(true, "no_aligned_pes_reference"), (false, "independent_clocks")] {
+            let (fm, mut events) = make_fm_with_events();
+            let mut resolved = assembled_flow(42110, &legs, "a", &assembly);
+            for def in resolved.inputs.iter_mut().filter(|_| webrtc) {
+                *def = input(serde_json::json!({
+                    "id": def.id, "name": def.id, "active": def.active, "type": "webrtc"
+                }));
+            }
+            let runtime = fm.create_flow(resolved).await.expect("create_flow");
+            let checks = {
+                let (fm, runtime, assembly) = (fm.clone(), runtime.clone(), assembly.clone());
+                async move {
+                    for swapped in [false, true] {
+                        if swapped {
+                            runtime.replace_assembly(assembly.clone(), None).await.expect("swap");
+                        }
+                        for take in ["b", "a"] {
+                            fm.switch_active_input("f1", take, None).await.expect("a Take");
+                            plays(&runtime, &[take]).await;
+                        }
+                        let reasons: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                            .filter_map(|e| e.details)
+                            .filter(|d| d["error_code"] == "pes_splice_degraded")
+                            .map(|d| d["reason"].clone())
+                            .collect();
+                        assert_eq!(reasons, vec![reason; 4], "swapped: {swapped}");
+                    }
+                }
+            };
+            then_stop(&fm, checks).await;
+        }
+    }
+
+    /// An input the assembly has a Switch leg on before its flow has the
+    /// input: no Take could reach it, and its clock was not judged. Joining,
+    /// it is, and one whose Take would split the program does not join.
+    #[tokio::test]
+    async fn an_input_whose_take_would_split_a_program_does_not_join() {
+        let c = |port: u16| {
+            input(serde_json::json!({
+                "id": "c", "name": "c", "type": "udp", "bind_addr": format!("127.0.0.1:{port}")
+            }))
+        };
+        let beside = assembly_of("a", &[switch_source(&["a", "c"], 256), pid_source("a", 257)]);
+        let as_one = assembly_of("a", &[switch_source(&["a", "c"], 256), switch_source(&["a", "c"], 257)]);
+        let fixed = assembly_of("a", &[pid_source("a", 256), pid_source("c", 257)]);
+        for (assembly, joins) in [(beside, false), (as_one, true), (fixed, true)] {
+            let (fm, mut events) = make_fm_with_events();
+            fm.create_flow(assembled_flow(42113, &["a"], "a", &assembly))
+                .await
+                .expect("another flow's input is not judged");
+            let checks = {
+                let fm = fm.clone();
+                async move {
+                    let added = fm.add_input("f1", c(42116)).await;
+                    let mut members = fm.running_input_ids("f1").await.expect("running");
+                    members.sort();
+                    let raised = mismatches(&mut events);
+                    if joins {
+                        added.expect("joins");
+                        assert_eq!(members, ["a", "c"]);
+                        assert!(raised.is_empty());
+                        return;
+                    }
+                    let err = added.err().expect("does not join");
+                    let refusal = err
+                        .downcast_ref::<crate::engine::flow::InputMembershipError>()
+                        .expect("a membership refusal");
+                    assert_eq!(refusal.code, "pid_bus_master_clock_mismatch");
+                    let [(details, message)] = raised.as_slice() else { panic!("{raised:?}") };
+                    assert_eq!(refusal.message, *message);
+                    assert!(message.starts_with("flow 'f1': input 'c' cannot join it — program 1"));
+                    assert_eq!(details["take_input_id"], "c");
+                    assert_eq!(members, ["a"]);
+                }
+            };
+            then_stop(&fm, checks).await;
+        }
+    }
+
     /// A plan swap its flow's assembler does not confirm still stands: the
     /// mergers run the new plan and the stalled assembler holds it, to put on
     /// air when it resumes, so it is the flow's plan and saved as such. Left
