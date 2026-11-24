@@ -87,9 +87,11 @@ impl VideoTrack {
 /// Minimal HEVC SPS resolution parser — returns (pic_width, pic_height)
 /// on success. Handles `sps_video_parameter_set_id`, sub-layer counting,
 /// full `profile_tier_level` (12 common + per-sub-layer), and the
-/// Exp-Golomb width/height fields.
+/// Exp-Golomb width/height fields. Until 2026-11 the per-sub-layer part was
+/// not skipped, and a source that has one was given another size, or the
+/// fallback's.
 fn parse_hevc_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
-    use super::codecs::BitReader;
+    use super::codecs::{BitReader, read_profile_tier_level};
     if sps.len() < 15 {
         return None;
     }
@@ -98,29 +100,7 @@ fn parse_hevc_sps_resolution(sps: &[u8]) -> Option<(u32, u32)> {
     let _sps_vps_id = r.read_bits(4)?;
     let sps_max_sub_layers_minus1 = r.read_bits(3)?;
     let _temporal_id_nesting = r.bit()?;
-    // profile_tier_level (common 12 bytes == 96 bits already read as raw
-    // bytes). BitReader has been consuming bits since the start; the
-    // common PTL follows on a byte boundary — skip 12 bytes (96 bits).
-    r.skip_bits(96)?;
-    // Sub-layer level info: 8 bits (2 each for profile/level present
-    // flags) per sub-layer, padding bits, then variable fields per set
-    // flag. Safely skip.
-    for _ in 0..sps_max_sub_layers_minus1 {
-        let profile_present = r.bit()?;
-        let level_present = r.bit()?;
-        let _ = (profile_present, level_present);
-    }
-    if sps_max_sub_layers_minus1 > 0 {
-        // Reserved padding for alignment.
-        for _ in sps_max_sub_layers_minus1..8 {
-            r.skip_bits(2)?;
-        }
-    }
-    for i in 0..sps_max_sub_layers_minus1 {
-        // If we had recorded the flags we'd skip conditionally here —
-        // a safer path is to bail and rely on the 1920×1080 fallback.
-        let _ = i;
-    }
+    read_profile_tier_level(&mut r, sps_max_sub_layers_minus1)?;
 
     let _sps_seq_parameter_set_id = r.ue()?;
     let chroma_format_idc = r.ue()?;
@@ -1661,6 +1641,30 @@ fn write_progressive_audio_trak(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The size of the track, and of its init, is the coded one whatever the
+    /// SPS says of its sub-layers.
+    #[test]
+    fn an_hevc_track_has_the_size_behind_the_sub_layers() {
+        use crate::engine::hevc_sps::tests::{VALID, real_sps, sub_layered, valid_sps};
+        let size_of = |sps: &[u8]| {
+            let track = VideoTrack::from_h265(vec![0x40, 0x01], sps.to_vec(), vec![0x44, 0x01]);
+            assert_eq!(parse_hevc_sps_resolution(sps), Some((track.width, track.height)));
+            (track.width, track.height)
+        };
+        for sps in sub_layered() {
+            assert_eq!(size_of(&sps.nal()), (720, 576), "{:?}", sps.sub_layers);
+        }
+        for (i, (sps, says)) in valid_sps(VALID).enumerate() {
+            assert_eq!(size_of(&sps), says.coded, "{i}");
+        }
+        let real = real_sps();
+        let (_, sps, size, _) = real.iter().find(|(what, ..)| what.starts_with("SLPPLP_A_VIDYO_2")).unwrap();
+        assert_eq!(size_of(sps), *size);
+        let init = build_init_segment(&VideoTrack::from_h265(vec![0x40, 0x01], sps.clone(), vec![0x44, 0x01]), None);
+        // width and height of the sample entry.
+        assert!(init.windows(4).any(|w| w == [0x01, 0xA0, 0x00, 0xF0]));
+    }
 
     /// A single-set track writes the init it always wrote, byte for byte —
     /// except the `hvcC` header edge#211 corrects.

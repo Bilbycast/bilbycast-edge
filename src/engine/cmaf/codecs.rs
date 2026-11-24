@@ -18,6 +18,7 @@ use super::box_writer::BoxWriter;
 use super::nalu::{H265_NAL_PPS, H265_NAL_SPS, H265_NAL_VPS};
 use super::param_sets::ParamSet;
 use crate::engine::h264_sps::{picture_size, skip_scaling_list};
+use crate::engine::hevc_sps::skip_sub_layers;
 
 // ────────────────────────────────────────────────────────────────────────
 //  H.264 avcC box
@@ -389,24 +390,7 @@ pub(super) fn read_profile_tier_level(
     // and shifting one by 32 overflows.
     let constraint = (u64::from(r.read_bits(16)?) << 32) | u64::from(r.read_bits(32)?);
     let level_idc = r.read_bits(8)? as u8;
-    let n = max_sub_layers_minus1.min(7) as usize;
-    let mut present = [(false, false); 7];
-    for p in present.iter_mut().take(n) {
-        *p = (r.bit()?, r.bit()?);
-    }
-    if n > 0 {
-        // reserved_zero_2bits for each sub-layer slot from n up to 8.
-        r.skip_bits(2 * (8 - n as u32))?;
-    }
-    for &(profile_present, level_present) in present.iter().take(n) {
-        if profile_present {
-            // sub_layer_profile_space .. the 44 constraint/reserved bits.
-            r.skip_bits(88)?;
-        }
-        if level_present {
-            r.skip_bits(8)?; // sub_layer_level_idc
-        }
-    }
+    skip_sub_layers(max_sub_layers_minus1, |n| r.read_bits(u32::from(n)))?;
     Some(GeneralPtl { profile_space, tier, profile_idc, compatibility, constraint, level_idc })
 }
 
@@ -1631,6 +1615,21 @@ mod tests {
             if let Some((w, h)) = parse_sps_resolution(&sps) {
                 assert!((1..=16384).contains(&w) && (1..=16384).contains(&h), "{w}x{h}");
             }
+        }
+    }
+
+    #[test]
+    fn a_random_hevc_sps_in_range_has_the_header_it_says() {
+        use crate::engine::hevc_sps::tests::{VALID, valid_sps};
+        for (i, (sps, says)) in valid_sps(VALID).enumerate() {
+            let header = sps_hvcc_fields(&sps).map(|h| {
+                let depths = (h.bit_depth_luma_minus8 + 8, h.bit_depth_chroma_minus8 + 8);
+                (h.ptl.profile_idc, h.ptl.level_idc, h.chroma_format_idc, depths)
+            });
+            // A bit depth of 16 is past what the record holds.
+            let held = says.bit_depths.0 < 16 && says.bit_depths.1 < 16;
+            let says = (says.profile, says.level, says.chroma as u8, says.bit_depths);
+            assert_eq!(header, held.then_some(says), "{i}");
         }
     }
 

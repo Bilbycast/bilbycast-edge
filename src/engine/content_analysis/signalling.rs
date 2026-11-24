@@ -287,16 +287,13 @@ impl SignallingTracker {
     }
 
     fn parse_hevc_sps(&mut self, rbsp: &[u8]) {
-        // HEVC SPS is complex — profile_tier_level alone is non-trivial.
-        // For Phase 1 of the real decode we parse only up to VUI when
-        // no profile-tier or scaling-list complications exist; otherwise
-        // bail. This still catches the vast majority of broadcast HEVC
-        // streams which use Main / Main10 with no custom scaling lists.
+        // Read as far as the VUI's colours, where no scaling lists are spelt
+        // out and the reference picture sets are in range; otherwise bail.
         let mut br = BitReader::new(rbsp);
         let _ = br.read_bits(4); // sps_video_parameter_set_id
         let max_sub_layers_minus1 = br.read_bits(3).unwrap_or(0);
         let _ = br.read_bit(); // sps_temporal_id_nesting_flag
-        if !skip_profile_tier_level(&mut br, max_sub_layers_minus1 as u8) {
+        if !skip_profile_tier_level(&mut br, max_sub_layers_minus1) {
             return;
         }
         let _ = br.read_ue(); // sps_seq_parameter_set_id
@@ -322,7 +319,7 @@ impl SignallingTracker {
             hevc_sps::picture_size(pic_width, pic_height, conf_win, (2, 2)).unwrap_or((0, 0));
         let _ = br.read_ue(); // bit_depth_luma_minus8
         let _ = br.read_ue(); // bit_depth_chroma_minus8
-        let _ = br.read_ue(); // log2_max_pic_order_cnt_lsb_minus4
+        let log2_max_pic_order_cnt_lsb_minus4 = br.read_ue().unwrap_or(0);
         let sps_sub_layer_ordering_info_present = br.read_bit().unwrap_or(0);
         let num = if sps_sub_layer_ordering_info_present == 1 {
             max_sub_layers_minus1 as i32 + 1
@@ -344,7 +341,7 @@ impl SignallingTracker {
         if scaling_list_enabled == 1 {
             let sps_scaling_list_present = br.read_bit().unwrap_or(0);
             if sps_scaling_list_present == 1 {
-                return; // custom scaling lists — too complex for Phase 1
+                return; // custom scaling lists are not read
             }
         }
         let _ = br.read_bit(); // amp_enabled_flag
@@ -357,14 +354,14 @@ impl SignallingTracker {
             let _ = br.read_ue();
             let _ = br.read_bit();
         }
-        let num_short_term_ref_pic_sets = br.read_ue().unwrap_or(0);
-        if num_short_term_ref_pic_sets > 0 {
-            // short_term_ref_pic_sets are complex; bail here.
+        let ref_pic_sets = hevc_sps::skip_ref_pic_sets(
+            &mut br,
+            log2_max_pic_order_cnt_lsb_minus4,
+            BitReader::read_bits,
+            BitReader::read_ue,
+        );
+        if ref_pic_sets.is_none() {
             return;
-        }
-        let long_term_ref = br.read_bit().unwrap_or(0);
-        if long_term_ref == 1 {
-            let _ = br.read_ue();
         }
         let _ = br.read_bit(); // sps_temporal_mvp_enabled_flag
         let _ = br.read_bit(); // strong_intra_smoothing_enabled_flag
@@ -541,7 +538,7 @@ fn find_next_start_code(bytes: &[u8], from: usize) -> usize {
     bytes.len()
 }
 
-fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u8) -> bool {
+fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u32) -> bool {
     // general_profile_space(2) + general_tier_flag(1) + general_profile_idc(5)
     if br.read_bits(8).is_none() {
         return false;
@@ -558,45 +555,7 @@ fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u8) -> boo
     if br.read_bits(8).is_none() {
         return false;
     }
-    let mut sub_layer_profile_present = [0u8; 8];
-    let mut sub_layer_level_present = [0u8; 8];
-    for i in 0..max_sub_layers_minus1 as usize {
-        sub_layer_profile_present[i] = br.read_bit().unwrap_or(0);
-        sub_layer_level_present[i] = br.read_bit().unwrap_or(0);
-    }
-    if max_sub_layers_minus1 > 0 {
-        for _ in max_sub_layers_minus1..8 {
-            let _ = br.read_bits(2); // reserved_zero_2bits
-        }
-    }
-    for i in 0..max_sub_layers_minus1 as usize {
-        if sub_layer_profile_present[i] == 1 {
-            // sub_layer_profile_space(2)+tier(1)+profile_idc(5)=8, compatibility 32, flags+reserved 48
-            //
-            // Note on the chunk shape: this reads 32+32+16+32 = 112 bits
-            // per present sub-layer profile rather than the spec's
-            // 8+32+48 = 88. An attempt was made to "fix" the read to 88
-            // bits per spec, but on the live broadcast 4K HEVC streams
-            // we test against, the spec-correct chunking causes pic_w /
-            // pic_h to read as 0 — suggesting either an encoder quirk
-            // or another bit-alignment bug elsewhere in the parser. The
-            // 480:271 quirk that kicked off the audit is already handled
-            // by the snap-to-canonical pass in `format_aspect_ratio`,
-            // and the failure mode of the spec-correct read (no SPS
-            // values at all) is strictly worse than the 480:271 one.
-            // Leaving the over-read in place pending a deeper SPS
-            // parser audit / replacement with a tested upstream parser.
-            if br.read_bits(32).is_none() || br.read_bits(32).is_none() ||
-               br.read_bits(16).is_none() || br.read_bits(32).is_none() {
-                return false;
-            }
-        }
-        if sub_layer_level_present[i] == 1
-            && br.read_bits(8).is_none() {
-                return false;
-            }
-    }
-    true
+    hevc_sps::skip_sub_layers(max_sub_layers_minus1, |n| br.read_bits(n)).is_some()
 }
 
 fn format_aspect_ratio(pic_w: u32, pic_h: u32, sar_w: u32, sar_h: u32) -> Option<String> {
@@ -738,8 +697,8 @@ mod tests {
     }
 
     /// edge#213: an HEVC SPS whose size or crop is out of range has no aspect
-    /// ratio. One with reference picture sets is not read as far as its VUI,
-    /// and leaves the last there was.
+    /// ratio. One whose reference picture sets are is not read as far as its
+    /// VUI, and leaves the last there was.
     #[test]
     fn an_hevc_sps_out_of_range_has_no_aspect_ratio() {
         use hevc_sps::tests::{Sps, crops, edge_213, sizes};
@@ -757,6 +716,76 @@ mod tests {
             }
         }
         assert_eq!(aspect_ratio(edge_213()).as_deref(), Some("4:3"));
+    }
+
+    /// What is shown of one HEVC SPS.
+    fn shown(sps: &[u8]) -> SignallingStats {
+        let mut tracker = SignallingTracker::new();
+        tracker.set_codec_from_stream_type(0x24);
+        tracker.scan_hevc(&[&[0, 0, 1], sps, &[0, 0, 1, 0x44, 0x01]].concat());
+        tracker.snapshot().unwrap()
+    }
+
+    #[test]
+    fn a_real_hevc_sps_shows_what_ffprobe_reads() {
+        let real = hevc_sps::tests::real_sps();
+        for (what, ratio, colours, range) in hevc_sps::tests::signalled() {
+            let (_, sps, ..) = real.iter().find(|(of, ..)| *of == what).unwrap();
+            let shown = shown(sps);
+            assert_eq!(shown.aspect_ratio.as_deref(), ratio, "{what}");
+            let [primaries, transfer, matrix] = colours.map_or([None; 3], |colours| colours.map(Some));
+            assert_eq!(shown.colour_primaries.as_deref(), primaries, "{what}");
+            assert_eq!(shown.transfer_characteristics.as_deref(), transfer, "{what}");
+            assert_eq!(shown.matrix_coefficients.as_deref(), matrix, "{what}");
+            assert_eq!(shown.video_range.as_deref(), range, "{what}");
+        }
+    }
+
+    #[test]
+    fn an_hevc_sps_is_read_past_its_sub_layers_and_reference_picture_sets() {
+        use hevc_sps::tests::{Sps, sub_layered};
+        for sps in sub_layered() {
+            // 720x576 is 5:4 of square samples.
+            assert_eq!(shown(&sps.nal()).aspect_ratio.as_deref(), Some("5:4"), "{:?}", sps.sub_layers);
+        }
+        let ratio = |ref_pic_sets, long_term_pics, log2_max_poc_lsb_minus4, vui| {
+            let sps = Sps { ref_pic_sets, long_term_pics, log2_max_poc_lsb_minus4, vui, ..Sps::default() };
+            shown(&sps.nal()).aspect_ratio
+        };
+        for (sets, pics) in [(2, None), (64, Some(0)), (0, Some(1)), (0, Some(32)), (3, Some(5))] {
+            for vui in [false, true] {
+                assert_eq!(ratio(sets, pics, 4, vui).as_deref(), Some("16:9"), "{sets} {pics:?} {vui}");
+            }
+        }
+        // Past their bounds, the SPS is not read.
+        for (sets, pics, lsb_minus4) in [(65, None, 4), (0, Some(33), 4), (0, Some(1), 13)] {
+            assert_eq!(ratio(sets, pics, lsb_minus4, true), None, "{sets} {pics:?} {lsb_minus4}");
+        }
+    }
+
+    #[test]
+    fn a_random_hevc_sps_in_range_shows_what_it_says() {
+        use hevc_sps::tests::{VALID, valid_sps};
+        for (i, (sps, says)) in valid_sps(VALID).enumerate() {
+            let shown = shown(&sps);
+            let shown = (
+                shown.aspect_ratio,
+                shown.colour_primaries,
+                shown.transfer_characteristics,
+                shown.matrix_coefficients,
+                shown.video_range,
+            );
+            if says.scaling_lists {
+                assert_eq!(shown, (None, None, None, None, None), "{i}");
+                continue;
+            }
+            let size = hevc_sps::picture_size(says.coded.0, says.coded.1, says.conf_win, (2, 2)).unwrap();
+            let ratio = format_aspect_ratio(size.0, size.1, says.sample_aspect.0, says.sample_aspect.1);
+            let name = |i: usize, name: fn(u8) -> &'static str| says.colours.map(|codes| name(codes[i]).into());
+            let range = says.full_range.map(|full| if full { "full" } else { "limited" }.into());
+            let says = (ratio, name(0, colour_primaries_name), name(1, transfer_name), name(2, matrix_name), range);
+            assert_eq!(shown, says, "{i}");
+        }
     }
 
     #[test]
