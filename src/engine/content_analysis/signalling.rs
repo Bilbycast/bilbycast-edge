@@ -21,6 +21,7 @@ use crate::stats::models::SignallingStats;
 
 use super::bitreader::{unescape_rbsp, BitReader};
 use crate::engine::h264_sps::picture_size;
+use crate::engine::hevc_sps;
 
 pub struct SignallingTracker {
     codec: Codec,
@@ -306,7 +307,7 @@ impl SignallingTracker {
         let pic_width = br.read_ue().unwrap_or(0);
         let pic_height = br.read_ue().unwrap_or(0);
         let conformance_window_flag = br.read_bit().unwrap_or(0);
-        let (crop_left, crop_right, crop_top, crop_bottom) = if conformance_window_flag == 1 {
+        let conf_win = if conformance_window_flag == 1 {
             (
                 br.read_ue().unwrap_or(0),
                 br.read_ue().unwrap_or(0),
@@ -316,6 +317,9 @@ impl SignallingTracker {
         } else {
             (0, 0, 0, 0)
         };
+        // A size or crop out of range has no aspect ratio, as 0x0 has none.
+        let (width, height) =
+            hevc_sps::picture_size(pic_width, pic_height, conf_win, (2, 2)).unwrap_or((0, 0));
         let _ = br.read_ue(); // bit_depth_luma_minus8
         let _ = br.read_ue(); // bit_depth_chroma_minus8
         let _ = br.read_ue(); // log2_max_pic_order_cnt_lsb_minus4
@@ -366,16 +370,10 @@ impl SignallingTracker {
         let _ = br.read_bit(); // strong_intra_smoothing_enabled_flag
         let vui_present = br.read_bit().unwrap_or(0);
         if vui_present != 1 {
-            self.aspect_ratio =
-                format_aspect_ratio(pic_width - (crop_left + crop_right) * 2,
-                                    pic_height - (crop_top + crop_bottom) * 2, 1, 1);
+            self.aspect_ratio = format_aspect_ratio(width, height, 1, 1);
             return;
         }
-        self.parse_vui(
-            &mut br,
-            pic_width - (crop_left + crop_right) * 2,
-            pic_height - (crop_top + crop_bottom) * 2,
-        );
+        self.parse_vui(&mut br, width, height);
     }
 
     fn parse_vui(&mut self, br: &mut BitReader, pic_width: u32, pic_height: u32) {
@@ -736,6 +734,43 @@ mod tests {
     fn a_random_avc_sps_never_panics() {
         for sps in random_sps(RANDOM) {
             SignallingTracker::new().parse_avc_sps(&sps[1..]);
+        }
+    }
+
+    /// edge#213: an HEVC SPS whose size or crop is out of range has no aspect
+    /// ratio. One with reference picture sets is not read as far as its VUI,
+    /// and leaves the last there was.
+    #[test]
+    fn an_hevc_sps_out_of_range_has_no_aspect_ratio() {
+        use hevc_sps::tests::{Sps, crops, edge_213, sizes};
+        let aspect_ratio = |sps: Sps| {
+            let mut tracker = SignallingTracker::new();
+            tracker.scan_hevc(&Sps { width: 704, height: 528, ..Sps::default() }.annex_b());
+            assert_eq!(tracker.aspect_ratio.as_deref(), Some("4:3"));
+            tracker.scan_hevc(&sps.annex_b());
+            tracker.aspect_ratio
+        };
+        for (sps, size) in sizes().into_iter().chain(crops()) {
+            for vui in [false, true] {
+                let ratio = size.and_then(|(w, h)| format_aspect_ratio(w, h, 1, 1));
+                assert_eq!(aspect_ratio(Sps { vui, ..sps }), ratio);
+            }
+        }
+        assert_eq!(aspect_ratio(edge_213()).as_deref(), Some("4:3"));
+    }
+
+    /// The widest and tallest picture taken, by the widest and tallest sample
+    /// aspect ratio there is.
+    #[test]
+    fn the_largest_aspect_ratio_there_is_fits() {
+        assert_eq!(format_aspect_ratio(16_384, 1, 65_535, 1).as_deref(), Some("1073725440:1"));
+        assert_eq!(format_aspect_ratio(1, 16_384, 1, 65_535).as_deref(), Some("1:1073725440"));
+    }
+
+    #[test]
+    fn a_random_hevc_sps_never_panics() {
+        for sps in hevc_sps::tests::random_sps(hevc_sps::tests::RANDOM) {
+            SignallingTracker::new().parse_hevc_sps(&unescape_rbsp(&sps[2..]));
         }
     }
 }

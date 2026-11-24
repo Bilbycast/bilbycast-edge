@@ -26,6 +26,7 @@ use crate::stats::collector::{
 };
 
 use super::h264_sps::{picture_size, skip_scaling_list};
+use super::hevc_sps;
 use super::packet::RtpPacket;
 use super::ts_parse::*;
 
@@ -1520,7 +1521,10 @@ fn find_and_parse_h265_sps(data: &[u8]) -> Option<SpsInfo> {
     None
 }
 
-/// Parse H.265 SPS NAL unit.
+/// Parse H.265 SPS NAL unit. `None`, and so no resolution, profile or frame
+/// rate off it, also for a size or crop out of range (`engine::hevc_sps`).
+/// What is out of range past those costs the frame rate alone, as what cannot
+/// be read there does.
 fn parse_h265_sps(data: &[u8]) -> Option<SpsInfo> {
     if data.len() < 4 {
         return None;
@@ -1615,28 +1619,37 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
         reader.read_bits(1)?; // separate_colour_plane_flag
     }
 
-    let pic_width_in_luma_samples = reader.read_exp_golomb()? as u16;
-    let pic_height_in_luma_samples = reader.read_exp_golomb()? as u16;
+    let pic_width_in_luma_samples = reader.read_exp_golomb()?;
+    let pic_height_in_luma_samples = reader.read_exp_golomb()?;
 
     let conformance_window_flag = reader.read_bits(1)?;
-    let (mut width, mut height) = (pic_width_in_luma_samples, pic_height_in_luma_samples);
-    if conformance_window_flag == 1 {
-        let left = reader.read_exp_golomb()?;
-        let right = reader.read_exp_golomb()?;
-        let top = reader.read_exp_golomb()?;
-        let bottom = reader.read_exp_golomb()?;
-        let sub_width_c: u32 = if chroma_format_idc == 1 || chroma_format_idc == 2 { 2 } else { 1 };
-        let sub_height_c: u32 = if chroma_format_idc == 1 { 2 } else { 1 };
-        width = (pic_width_in_luma_samples as u32 - sub_width_c * (left + right)) as u16;
-        height = (pic_height_in_luma_samples as u32 - sub_height_c * (top + bottom)) as u16;
-    }
+    let conf_win = if conformance_window_flag == 1 {
+        (
+            reader.read_exp_golomb()?,
+            reader.read_exp_golomb()?,
+            reader.read_exp_golomb()?,
+            reader.read_exp_golomb()?,
+        )
+    } else {
+        (0, 0, 0, 0)
+    };
+    let sub_width_c: u32 = if chroma_format_idc == 1 || chroma_format_idc == 2 { 2 } else { 1 };
+    let sub_height_c: u32 = if chroma_format_idc == 1 { 2 } else { 1 };
+    let (width, height) = hevc_sps::picture_size(
+        pic_width_in_luma_samples,
+        pic_height_in_luma_samples,
+        conf_win,
+        (sub_width_c, sub_height_c),
+    )?;
 
     // Parse remaining SPS fields to reach VUI (ITU-T H.265 §7.3.2.2.1)
     // Wrapped in a closure so any parse failure falls back to frame_rate: None
     let frame_rate = (|| -> Option<f64> {
         let bit_depth_luma_minus8 = reader.read_exp_golomb()?;
         let bit_depth_chroma_minus8 = reader.read_exp_golomb()?;
-        let log2_max_pic_order_cnt_lsb_minus4 = reader.read_exp_golomb()?;
+        // At most 12 (§7.4.3.2.1).
+        let log2_max_pic_order_cnt_lsb_minus4 =
+            reader.read_exp_golomb().filter(|minus4| *minus4 <= 12)?;
         tracing::debug!(
             "H.265 SPS VUI parse: bit_depth_luma_m8={}, bit_depth_chroma_m8={}, log2_max_poc_lsb_m4={}",
             bit_depth_luma_minus8, bit_depth_chroma_minus8, log2_max_pic_order_cnt_lsb_minus4
@@ -1684,10 +1697,13 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
             reader.read_bits(1)?; // pcm_loop_filter_disabled_flag
         }
 
-        // Short-term ref pic sets — must track num_delta_pocs per set for inter-prediction
-        let num_short_term_ref_pic_sets = reader.read_exp_golomb()?;
+        // Short-term ref pic sets — must track num_delta_pocs per set for inter-prediction.
+        // At most 64 (§7.4.3.2.1), and nothing is allocated by the count. Until 2026-11
+        // (edge#213) it was: 16 GiB for 2^32 − 2, and the process ended where it could not
+        // have it.
+        let num_short_term_ref_pic_sets = reader.read_exp_golomb().filter(|sets| *sets <= 64)?;
         tracing::debug!("H.265 SPS VUI parse: num_short_term_ref_pic_sets={}", num_short_term_ref_pic_sets);
-        let mut num_delta_pocs = Vec::with_capacity(num_short_term_ref_pic_sets as usize);
+        let mut num_delta_pocs = Vec::new();
         for i in 0..num_short_term_ref_pic_sets {
             let ndp = parse_h265_short_term_ref_pic_set(
                 &mut reader,
@@ -1702,7 +1718,8 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
         let long_term_ref_pics_present_flag = reader.read_bits(1)?;
         tracing::debug!("H.265 SPS VUI parse: long_term_ref_pics_present={}", long_term_ref_pics_present_flag);
         if long_term_ref_pics_present_flag == 1 {
-            let num_long_term_ref_pics_sps = reader.read_exp_golomb()?;
+            // At most 32 (§7.4.3.2.1).
+            let num_long_term_ref_pics_sps = reader.read_exp_golomb().filter(|pics| *pics <= 32)?;
             let log2_max_pic_order_cnt_lsb = log2_max_pic_order_cnt_lsb_minus4 + 4;
             for _ in 0..num_long_term_ref_pics_sps {
                 reader.read_bits(log2_max_pic_order_cnt_lsb as u8)?; // lt_ref_pic_poc_lsb_sps
@@ -1742,8 +1759,9 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
     );
 
     Some(SpsInfo {
-        width,
-        height,
+        // At most 16384.
+        width: width as u16,
+        height: height as u16,
         frame_rate,
         profile: profile.to_string(),
         level,
@@ -1844,7 +1862,7 @@ fn parse_h265_short_term_ref_pic_set(
 
     if inter_ref_pic_set_prediction_flag {
         let delta_idx_minus1 = reader.read_exp_golomb()?;
-        let ref_idx = idx.checked_sub(delta_idx_minus1 + 1)?;
+        let ref_idx = idx.checked_sub(delta_idx_minus1.checked_add(1)?)?;
         let ref_num_delta_pocs = *prev_num_delta_pocs.get(ref_idx as usize)?;
 
         reader.read_bits(1)?; // delta_rps_sign
@@ -1866,8 +1884,9 @@ fn parse_h265_short_term_ref_pic_set(
         }
         Some(num_delta_pocs)
     } else {
-        let num_negative_pics = reader.read_exp_golomb()?;
-        let num_positive_pics = reader.read_exp_golomb()?;
+        // A decoder holds at most 16 pictures (MaxDpbSize, §A.4.2).
+        let num_negative_pics = reader.read_exp_golomb().filter(|pics| *pics <= 16)?;
+        let num_positive_pics = reader.read_exp_golomb().filter(|pics| *pics <= 16)?;
         for _ in 0..num_negative_pics {
             reader.read_exp_golomb()?; // delta_poc_s0_minus1
             reader.read_bits(1)?; // used_by_curr_pic_s0_flag
@@ -2820,6 +2839,85 @@ mod tests {
         use super::super::h264_sps::tests::{RANDOM, random_sps};
         for sps in random_sps(RANDOM) {
             let _ = parse_h264_sps(&sps);
+        }
+    }
+
+    /// edge#213: an HEVC SPS whose size or crop is out of range is not read.
+    #[test]
+    fn an_h265_sps_out_of_range_is_not_read() {
+        use super::super::hevc_sps::tests::{crops, sizes};
+        for (sps, size) in sizes().into_iter().chain(crops()) {
+            let info = find_and_parse_h265_sps(&sps.annex_b());
+            assert_eq!(info.as_ref().map(|i| (u32::from(i.width), u32::from(i.height))), size);
+            assert_eq!(info.and_then(|i| i.frame_rate), size.map(|_| 25.0));
+        }
+    }
+
+    /// edge#213: what an SPS says between its size and its VUI is bounded
+    /// before anything is held, read or looped by it. Past a bound the size
+    /// is read and the frame rate is not.
+    #[test]
+    fn an_h265_sps_out_of_range_past_its_size_has_no_frame_rate() {
+        use super::super::hevc_sps::tests::{Sps, edge_213};
+        let rate = |sps: Sps| {
+            let info = find_and_parse_h265_sps(&sps.annex_b()).unwrap();
+            assert_eq!((info.width, info.height), (1920, 1080));
+            info.frame_rate
+        };
+        assert_eq!(rate(edge_213()), None);
+        let sets = |ref_pic_sets| Sps { ref_pic_sets, ..Sps::default() };
+        let negative = |pics| Sps { ref_pic_sets: 2, pics: (pics, 0), ..Sps::default() };
+        let positive = |pics| Sps { ref_pic_sets: 2, pics: (0, pics), ..Sps::default() };
+        let long_term = |pics| Sps { long_term_pics: Some(pics), ..Sps::default() };
+        let lsb = |minus4| Sps { log2_max_poc_lsb_minus4: minus4, ..long_term(2) };
+        let lsb_unused = |minus4| Sps { log2_max_poc_lsb_minus4: minus4, ..Sps::default() };
+        let fields: [(&dyn Fn(u32) -> Sps, u32); 6] =
+            [(&sets, 64), (&negative, 16), (&positive, 16), (&long_term, 32), (&lsb, 12), (&lsb_unused, 12)];
+        for (i, (sps, max)) in fields.into_iter().enumerate() {
+            for at in [0, 1, max] {
+                assert_eq!(rate(sps(at)), Some(25.0), "{i}: {at}");
+            }
+            // 252 and 4 cut to a byte are 0.
+            for past in [max + 1, 252, 256 + max, u32::MAX - 4, u32::MAX - 1] {
+                assert_eq!(rate(sps(past)), None, "{i}: {past}");
+            }
+        }
+        // Both at their bound.
+        assert_eq!(rate(Sps { ref_pic_sets: 64, pics: (16, 16), ..Sps::default() }), Some(25.0));
+    }
+
+    /// H.265 §7.3.7: a predicted set is counted off one before it.
+    #[test]
+    fn an_h265_ref_pic_set_is_predicted_from_one_before_it() {
+        use super::super::cmaf::param_sets::tests::Bits;
+        let count = |delta_idx_minus1| {
+            let mut set = Bits::new(&[]);
+            set.put(1, 1).ue(delta_idx_minus1).put(0, 1).ue(0).put(0xFF, 8);
+            parse_h265_short_term_ref_pic_set(&mut BitReader::new(&set.done()), 2, &[3, 5])
+        };
+        assert_eq!(count(0), Some(6));
+        assert_eq!(count(1), Some(4));
+        for before_the_first in [2, 3, u32::MAX - 1] {
+            assert_eq!(count(before_the_first), None);
+        }
+    }
+
+    #[test]
+    fn a_real_h265_sps_has_the_size_and_rate_ffprobe_reads() {
+        for (what, sps, size, rate) in super::super::hevc_sps::tests::real_sps() {
+            let info = find_and_parse_h265_sps(&[&[0, 0, 1], &sps[..]].concat()).unwrap();
+            assert_eq!((u32::from(info.width), u32::from(info.height)), size, "{what}");
+            assert_eq!(info.frame_rate, Some(rate), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_random_h265_sps_never_panics() {
+        use super::super::hevc_sps::tests::{RANDOM, random_sps};
+        for sps in random_sps(RANDOM) {
+            if let Some(info) = parse_h265_sps(&remove_emulation_prevention(&sps)) {
+                assert!((1..=16_384).contains(&info.width) && (1..=16_384).contains(&info.height));
+            }
         }
     }
 }

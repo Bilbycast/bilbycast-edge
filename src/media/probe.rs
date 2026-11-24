@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::content_analysis::bitreader::{BitReader, unescape_rbsp};
 use crate::engine::h264_sps::picture_size;
+use crate::engine::hevc_sps;
 use crate::engine::ts_parse::{
     TS_PACKET_SIZE, TS_SYNC_BYTE, extract_pcr, ts_has_adaptation, ts_pid, ts_pusi,
 };
@@ -578,6 +579,7 @@ fn parse_avc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
     picture_size(pic_w_mbs_m1, pic_h_units_m1, frame_mbs_only_flag == 1, crop, (2, 2))
 }
 
+/// `None` also for a size or crop out of range (`engine::hevc_sps`).
 fn parse_hevc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
     let mut br = BitReader::new(rbsp);
     br.read_bits(4)?; // sps_video_parameter_set_id
@@ -594,7 +596,7 @@ fn parse_hevc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
     let pic_width = br.read_ue()?;
     let pic_height = br.read_ue()?;
     let conformance_window_flag = br.read_bit()?;
-    let (cl, cr, ct, cb) = if conformance_window_flag == 1 {
+    let conf_win = if conformance_window_flag == 1 {
         (
             br.read_ue()?,
             br.read_ue()?,
@@ -604,12 +606,7 @@ fn parse_hevc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
     } else {
         (0, 0, 0, 0)
     };
-    let width = pic_width.saturating_sub((cl + cr) * 2);
-    let height = pic_height.saturating_sub((ct + cb) * 2);
-    if width == 0 || height == 0 {
-        return None;
-    }
-    Some((width, height))
+    hevc_sps::picture_size(pic_width, pic_height, conf_win, (2, 2))
 }
 
 /// Mirrors `engine::content_analysis::signalling::skip_profile_tier_level`
@@ -806,6 +803,30 @@ mod tests {
         use crate::engine::h264_sps::tests::{RANDOM, random_sps};
         for sps in random_sps(RANDOM) {
             let _ = parse_avc_sps_dims(&sps[1..]);
+        }
+    }
+
+    /// edge#213: an HEVC SPS whose size or crop is out of range has no size,
+    /// and the next one is looked at.
+    #[test]
+    fn an_hevc_sps_out_of_range_has_no_size() {
+        use crate::engine::hevc_sps::tests::{Sps, crops, edge_213, sizes};
+        for (sps, size) in sizes().into_iter().chain(crops()) {
+            assert_eq!(find_hevc_sps_dims(&sps.annex_b()), size);
+            let two = [sps.annex_b(), Sps { width: 704, ..Sps::default() }.annex_b()].concat();
+            assert_eq!(find_hevc_sps_dims(&two), size.or(Some((704, 1080))));
+        }
+        // Its reference picture sets are past its size, and not read.
+        assert_eq!(find_hevc_sps_dims(&edge_213().annex_b()), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn a_random_hevc_sps_never_panics() {
+        use crate::engine::hevc_sps::tests::{RANDOM, random_sps};
+        for sps in random_sps(RANDOM) {
+            if let Some((w, h)) = parse_hevc_sps_dims(&unescape_rbsp(&sps[2..])) {
+                assert!((1..=16_384).contains(&w) && (1..=16_384).contains(&h), "{w}x{h}");
+            }
         }
     }
 }

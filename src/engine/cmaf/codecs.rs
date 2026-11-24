@@ -1633,4 +1633,17 @@ mod tests {
             }
         }
     }
+
+    /// Every HEVC parameter set parser of CMAF: the `hvcC` header's two, the
+    /// ids' and the size's.
+    #[test]
+    fn a_random_hevc_parameter_set_never_panics() {
+        use super::super::fmp4::VideoTrack;
+        use crate::engine::hevc_sps::tests::{RANDOM, random_sps};
+        for sps in random_sps(RANDOM) {
+            let _ = (sps_hvcc_fields(&sps), vps_ptl(&sps));
+            let track = VideoTrack::from_h265(sps.clone(), sps.clone(), sps);
+            assert!((1..=16384).contains(&track.width) && (1..=16384).contains(&track.height));
+        }
+    }
 }
