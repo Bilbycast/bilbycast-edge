@@ -19,8 +19,8 @@
 //!   one bad output never masks another's recovery.
 //!
 //! - **A/V mux interleave** (`stats::av_interleave`): windowed p95
-//!   above 1200 ms sustained → Warning `av_interleave_deep` — not a
-//!   lip-sync fault, but consumer players whose caching is shallower
+//!   above 1200 ms sustained → Warning `av_interleave_deep` — no measure
+//!   of lip sync, but consumer players whose caching is shallower
 //!   than the interleave (VLC defaults ~1 s) starve their audio queue
 //!   and drop out. Recovery below 900 ms → Info
 //!   `av_interleave_recovered`. Hysteresis prevents flapping on
@@ -629,10 +629,13 @@ pub fn spawn_av_quality_watch(
                     if il_over >= GRACE_POLLS && !il_alerted {
                         il_alerted = true;
                         let msg = format!(
-                            "A/V mux interleave p95 {} ms on flow '{}' — not a \
-                             lip-sync fault, but receivers buffering less than \
-                             this (consumer players default ~1 s) will starve \
-                             their audio queue",
+                            "A/V mux interleave p95 {} ms on flow '{}': the audio and \
+                             video next to each other in the stream are that far apart \
+                             in PTS. Receivers buffering less than this (consumer \
+                             players default ~1 s) will starve their audio queue. This \
+                             does not measure lip sync: a deep mux plays in sync, and a \
+                             source whose own tracks are mis-timed against each other \
+                             reads the same",
                             p95, flow_id,
                         );
                         tracing::warn!("{msg}");

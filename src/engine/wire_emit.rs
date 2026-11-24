@@ -1998,6 +1998,7 @@ fn run_emitter(
     let mut batch_log_next_ns: u64 = monotonic_now_ns().saturating_add(5_000_000_000);
     // Diagnostic: per-5s throughput + PCR event counters
     let mut diag_dgms: u64 = 0;
+    let mut diag_bytes: u64 = 0;
     let mut diag_pcr_events: u64 = 0;
     let mut diag_sleep_ns: u64 = 0;
     let mut diag_last_ns: u64 = monotonic_now_ns();
@@ -2316,6 +2317,7 @@ fn run_emitter(
             // the sendmmsg optimisation is firing on bursty TS outputs,
             // with the cumulative rebase / ceil / floor counters.
             diag_dgms = diag_dgms.saturating_add(batch.len() as u64);
+            diag_bytes = diag_bytes.saturating_add(batch.iter().map(|e| e.dg.bytes.len() as u64).sum());
             batch_count = batch_count.saturating_add(1);
             batch_dgms_total = batch_dgms_total.saturating_add(batch.len() as u64);
             let now = monotonic_now_ns();
@@ -2323,7 +2325,7 @@ fn run_emitter(
                 let avg = batch_dgms_total as f64 / batch_count as f64;
                 let dt_s = (now.saturating_sub(diag_last_ns)) as f64 / 1e9;
                 let dgms_per_s = diag_dgms as f64 / dt_s.max(0.001);
-                let mbps = dgms_per_s * 1316.0 * 8.0 / 1e6;
+                let mbps = diag_bytes as f64 * 8.0 / dt_s.max(0.001) / 1e6;
                 let sleep_pct = diag_sleep_ns as f64 / (now.saturating_sub(diag_last_ns)) as f64 * 100.0;
                 let depth = rx.depth.load(std::sync::atomic::Ordering::Relaxed);
                 // `rebase` / `ceil` / `floor` are cumulative. Only the first
@@ -2338,6 +2340,7 @@ fn run_emitter(
                 batch_count = 0;
                 batch_dgms_total = 0;
                 diag_dgms = 0;
+                diag_bytes = 0;
                 diag_pcr_events = 0;
                 diag_sleep_ns = 0;
                 diag_last_ns = now;
