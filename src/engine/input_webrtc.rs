@@ -1172,10 +1172,11 @@ const PRIMED_FIRST_SHOWN_WITHIN: usize = 5;
 /// a decoder is shown it until the first live picture.
 ///
 /// It shows on the second picture: that picture's `frame_num` says that
-/// reference pictures between the two were not sent ([`H264Order`]), which a
-/// live stream's second picture never says unless one was lost on the way, and
-/// it runs ahead of the IDR ([`PRIMED_LEAD_90K`]), which it would not for a
-/// picture lost. Its timing alone would not do. A live stream's picture runs
+/// reference pictures between the two were not sent ([`H264Order`]), which one
+/// behind a live picture says only where one was lost on the way or left out
+/// by the server (a temporal layer), and it runs ahead of the IDR
+/// ([`PRIMED_LEAD_90K`]), which such a one does only where the first came late
+/// or in a burst. Its timing alone would not do. A live stream's picture runs
 /// ahead too where it is a P-frame sent ahead of the B-frames shown before it,
 /// or where a server sends what it queued for a connecting viewer in one go,
 /// and one of a source with no steady frame period (a screen share) by any
@@ -1305,7 +1306,7 @@ impl PrimedIdr {
 /// What an H.264 stream's SPS says of the order its pictures come in, and how
 /// to read a picture's `frame_num` (ITU-T H.264 §7.3.2.1.1, §7.3.3, §7.4.3):
 /// it counts the reference pictures from the last IDR, whose is 0, so that
-/// the picture sent right behind an IDR has 1 — or 0, the IDR's second field.
+/// the picture coded right behind an IDR has 1 — or 0, the IDR's second field.
 #[cfg(any(feature = "webrtc", test))]
 #[derive(Debug)]
 struct H264Order {
@@ -1528,9 +1529,9 @@ impl WhipMux {
     /// still to come. Not past the PCR the first of them will carry: that is
     /// no earlier than the one shown first of those that have come puts it.
     /// Nothing while the IDR itself is held, for the channel count. Padded
-    /// with null packets to whole datagrams: the UDP, RTP and RIST outputs
-    /// re-chunk to seven packets, and would hold the PCR until the pictures it
-    /// is sent for went out.
+    /// with null packets, whatever an output's last datagram lacks and a whole
+    /// number of them: the UDP, RTP and RIST outputs re-chunk to seven packets,
+    /// and would hold the PCR until the pictures it is sent for went out.
     fn run_pcr_on(&mut self, now: std::time::Instant) -> Vec<MuxedFrame> {
         let Some(primed) = self.primed.as_ref().filter(|p| self.held.is_empty() && p.held.last().is_some_and(|f| f.video))
         else {
@@ -1548,8 +1549,8 @@ impl WhipMux {
             return Vec::new();
         }
         let null = crate::engine::flow::null_ts_packet().data;
-        let whole = packets.len().next_multiple_of(crate::engine::packet::TS_PACKETS_PER_ITEM);
-        packets.resize_with(whole, || null.slice(..188));
+        const ITEM: usize = crate::engine::packet::TS_PACKETS_PER_ITEM;
+        packets.resize_with((packets.len() + ITEM - 1).next_multiple_of(ITEM), || null.slice(..188));
         vec![(packets, ts)]
     }
 
@@ -1590,7 +1591,7 @@ impl WhipMux {
             // The pull's first picture: a keyframe the one after it may show
             // cached, or a picture nothing is to be told by.
             None => {
-                if video && holds_idr(data) {
+                if video && holds_idr(data) && !holds_two_sps(data) {
                     primed.first = Some((rtp, arrival));
                 } else if video {
                     self.primed = None;
@@ -1829,6 +1830,16 @@ fn nal_units(data: &[u8]) -> Vec<Vec<u8>> {
 #[cfg(any(feature = "webrtc", test))]
 fn holds_idr(data: &[u8]) -> bool {
     nal_units(data).iter().any(|n| n.first().is_some_and(|b| b & 0x1F == 5))
+}
+
+/// Whether the access unit `data` holds two SPS that differ: which of them a
+/// slice is of, only the PPS it names says ([`H264Order`] is of one).
+#[cfg(any(feature = "webrtc", test))]
+fn holds_two_sps(data: &[u8]) -> bool {
+    let nals = nal_units(data);
+    let mut sps = nals.iter().filter(|n| n.first().is_some_and(|b| b & 0x1F == 7));
+    let first = sps.next();
+    sps.any(|other| Some(other) != first)
 }
 
 #[cfg(any(feature = "webrtc", test))]
@@ -4480,6 +4491,33 @@ mod tests {
         let video = [140u64, 60, 100, 260].map(|at| LEAD + at * 90);
         assert_eq!(pts_on(&out, 0x0100), video);
         assert_eq!(pcrs_in(&out)[0], (140 * 90, false), "the first of them past it");
+
+        // Fillers too, all in datagrams that are full whatever an output's
+        // last one held: the first of them 60 ms behind the IDR's PCR.
+        let mut w = pull(SPS_REORDERED);
+        let out = put(&mut w, 60, 1_200, 9);
+        let (pids, pcrs): (Vec<u16>, usize) =
+            (out[0].0.iter().map(|p| crate::engine::ts_parse::ts_pid(p)).collect(), pcrs_in(&out).len());
+        assert_eq!((pids.len(), pcrs), (14, 2));
+        assert!(pids[..2] == [0x0100; 2] && pids[2..] == [0x1FFF; 12]);
+
+        // Two SPS in the IDR's access unit: which one a slice is of, only its
+        // PPS says. Not looked at.
+        let mut w = av_whip_mux();
+        w.session(true, true);
+        w.expect_primed_idr();
+        let sps = |s: &str| [&[0, 0, 0, 1], &hex(s)[..]].concat();
+        let rest = [0, 0, 0, 1, 0x68, 0xCE, 0, 0, 0, 1, 0x65, 0x88];
+        let idr = [sps(SPS_IN_ORDER), sps(SPS_REORDERED), rest.to_vec()].concat();
+        assert_eq!(w.frame(true, &idr, 1_000, 90_000, t0).len(), 1);
+        assert_eq!(stamped(put(&mut w, 20, 1_200, 14)), [LEAD + 1_200 * 90]);
+        // The same one twice is one.
+        let mut w = av_whip_mux();
+        w.session(true, true);
+        w.expect_primed_idr();
+        let idr = [sps(SPS_IN_ORDER), sps(SPS_IN_ORDER), rest.to_vec()].concat();
+        assert_eq!(w.frame(true, &idr, 1_000, 90_000, t0).len(), 1);
+        assert_eq!(stamped(put(&mut w, 20, 1_200, 14)), [LEAD + 1_800]);
 
         // The PCR is not run on past the reference's, though a B-frame comes
         // late: 40 ms past the one shown first, which came 40 ms in.

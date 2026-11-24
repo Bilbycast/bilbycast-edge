@@ -1700,8 +1700,8 @@ by its age for the whole pull,
 
 - where `frame_num` has come round to the IDR's again: two in sixteen of
   x264's, one pull in eight of a source without B-frames;
-- where the picture behind it is another IDR, or its SPS or slices do not
-  parse;
+- where the picture behind it is another IDR, where its SPS or slices do not
+  parse, or where it carries two SPS that differ;
 - where it is 100 ms old or less: one pull in twenty, of a source with a 2 s
   GOP;
 - where the SPS allows reordering and too few pictures come within 400 ms of

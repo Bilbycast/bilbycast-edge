@@ -360,7 +360,8 @@ impl TsMuxer {
     ///   `pts_90khz` unchanged, over the 33-bit wrap too: compared as it
     ///   stands, every PTS after the wrap was behind the last one before it,
     ///   so from 26.5 h on a WHIP, WHEP or RTSP input's audio stepped one tick
-    ///   a frame, until the input (RTSP: its connection) started again.
+    ///   a frame, until the input (RTSP: its connection) started again, and a
+    ///   media player's MP4 or image's until its next file.
     ///
     /// We bump by exactly 1 tick (≈11.1 µs at 90 kHz) on a regression
     /// rather than a larger value because the regressions seen in
@@ -1259,8 +1260,8 @@ fn build_pes_packet(
 }
 
 /// Whether an audio PTS is at the `last` one or behind it. Callers hand in 33
-/// bits (WebRTC, RTSP) or a count that runs on past them (RTMP), which on the
-/// wire is the same: a PTS below `last` that is ahead of it by less than half
+/// bits (WebRTC, RTSP, the media player) or a count that runs on past them
+/// (RTMP), which on the wire is the same: a PTS below `last` that is ahead of it by less than half
 /// the 33-bit range has gone over the wrap, and one above it that is behind it
 /// by less than a second has come back over it. Any other is taken as it
 /// stands, so a step forward of any length is one.
