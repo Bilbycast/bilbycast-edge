@@ -1347,6 +1347,23 @@ video: an audio-only publish named the absent video PID as PCR_PID and carried
 no PCR at all. A `pid_overrides` `pcr_pid` naming a PID other than the audio's
 is honoured as it is, which leaves an audio-only publish without a PCR.
 
+One publish is on air at a time, and the newest takes over with its first
+H.264 or AAC frame: a publisher whose network dropped is back on air as it
+reconnects, though its old connection ends only at its idle timeout (300 s),
+and what an older publish still sends is dropped until the newer one ends. One
+that sends neither (headers alone, or another codec) takes nothing off air.
+Each publish goes by its own sequence headers and `onMetaData`. A publisher
+that reconnects, or the next one, runs on the same timeline: its first frame starts where the wall clock has
+got to since the input's first frame (and at least 100 ms past the last
+publish's latest timestamp), its tracks as far apart as its timestamps say,
+whatever they start at. The continuity counters and PSI versions run on, and
+the first PCR past the step carries `discontinuity_indicator`. Up to 0.117.0
+each publish started the timeline over: the audio's timestamps stood still
+until the new publish had run as long as the last, and with
+`passthrough_clock: true` the picture and the PCR stepped back, unmarked (the
+default clock rewriter bridged that step). Two publishers at once were muxed
+into each other.
+
 ```json
 {
   "type": "rtmp",
@@ -1363,7 +1380,7 @@ is honoured as it is, which leaves an audio-only publish without a PCR.
 | `external_address` | string | No | `null` | Public `host:port` this listener is reachable on from outside (a firewall port-forward). **Hint to the manager UI only** — the edge binds `listen_addr` and ignores this semantically; the manager's topology matcher uses it so cross-NAT links draw correctly. |
 | `app` | string | No | `"live"` | RTMP application name — the publisher's URL path component (`rtmp://host:port/<app>/<stream_key>`). Must be non-empty and at most 64 characters. |
 | `stream_key` | string | No | `null` | Stream key the publisher must present. `null` accepts any key. At most 256 characters. |
-| `max_publishers` | integer | No | `1` | Parsed and persisted, but **inert today** — nothing in the edge reads this field, not even validation. Concurrent RTMP connections are bounded instead by a fixed internal cap of 8 (`MAX_RTMP_CONNECTIONS`); excess connections are dropped at accept with a warning. |
+| `max_publishers` | integer | No | `1` | Parsed and persisted, but **inert today** — nothing in the edge reads this field, not even validation. Concurrent RTMP connections are bounded instead by a fixed internal cap of 8 (`MAX_RTMP_CONNECTIONS`); excess connections are dropped at accept with a warning. One publish is on air at a time, the newest (above). |
 | `program_number` | integer | No | `null` | MPTS → SPTS ingress filter. Accepted and validated (`> 0`) but there is nothing for it to filter: RTMP ingest is remuxed locally by `TsMuxer`, which always emits SPTS **program 1**. See [MPTS → SPTS filtering](#mpts--spts-filtering). |
 | `pid_map` | object | No | `null` | Mechanical ingress PID remap table applied to the synthesised TS. Keys + values in `0x0010..=0x1FFE`; source PIDs not listed pass through. Same shape as the output-side [`pid_map`](#ts-output-pid-remapping-pid_map). |
 | `pid_overrides` | object | No | `null` | Role-keyed PID pinning, applied by `TsMuxer` as it builds the TS. Because RTMP is a synthetic-TS source, the map may hold at most one entry, and it must be keyed `"1"`. See [Per-program PID pinning](#per-program-pid-pinning-pid_overrides). |

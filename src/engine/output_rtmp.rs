@@ -5496,7 +5496,7 @@ pub(super) mod flv_wire_tests {
     use super::flv_timestamp_tests::silent_fallback_state;
     use super::*;
     use crate::engine::cmaf::param_sets::tests::{h264_pps, h770, hevc_pps, hx};
-    use crate::engine::rtmp::server::{RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
+    use crate::engine::rtmp::server::{PublishMessage, RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
     use crate::engine::rtmp::ts_mux::TsMuxer;
     use bytes::Bytes;
     use std::sync::atomic::AtomicBool;
@@ -5514,7 +5514,7 @@ pub(super) mod flv_wire_tests {
 
     /// A client published to a loopback RTMP server, the channel the server
     /// hands each tag it reads back on, and the token that stops the server.
-    async fn loopback() -> (RtmpClient, tokio::sync::mpsc::Receiver<RtmpMediaMessage>, CancellationToken) {
+    async fn loopback() -> (RtmpClient, tokio::sync::mpsc::Receiver<PublishMessage>, CancellationToken) {
         let cancel = CancellationToken::new();
         let (media_tx, media_rx) = tokio::sync::mpsc::channel(4_096);
         // A free port, found by binding one and letting it go; another
@@ -5555,21 +5555,21 @@ pub(super) mod flv_wire_tests {
 
     /// What the server read, in order, up to the unpublish: call it once the
     /// client has closed.
-    async fn tags_read(mut media_rx: tokio::sync::mpsc::Receiver<RtmpMediaMessage>) -> Vec<WireTag> {
+    async fn tags_read(mut media_rx: tokio::sync::mpsc::Receiver<PublishMessage>) -> Vec<WireTag> {
         let mut tags = Vec::new();
         loop {
             let msg = tokio::time::timeout(Duration::from_secs(20), media_rx.recv())
                 .await
                 .expect("the server hands back every tag, then the unpublish");
             match msg {
-                Some(RtmpMediaMessage::Video { data, timestamp_ms }) => {
+                Some((_, RtmpMediaMessage::Video { data, timestamp_ms })) => {
                     tags.push(WireTag { video: true, ts: timestamp_ms, data })
                 }
-                Some(RtmpMediaMessage::Audio { data, timestamp_ms }) => {
+                Some((_, RtmpMediaMessage::Audio { data, timestamp_ms })) => {
                     tags.push(WireTag { video: false, ts: timestamp_ms, data })
                 }
-                Some(RtmpMediaMessage::Metadata { .. }) => {}
-                Some(RtmpMediaMessage::Disconnected) | None => break,
+                Some((_, RtmpMediaMessage::Metadata { .. })) => {}
+                Some((_, RtmpMediaMessage::Disconnected)) | None => break,
             }
         }
         tags
