@@ -2817,5 +2817,9 @@ mod tests {
             let _ = parse_avc_sps_params(&sps[1..]);
             let _ = parse_hevc_sps_params(&sps[1..]);
         }
+        use crate::engine::hevc_sps;
+        for sps in hevc_sps::tests::random_sps(hevc_sps::tests::RANDOM) {
+            let _ = parse_hevc_sps_params(&unescape_rbsp(&sps[2..]));
+        }
     }
 }

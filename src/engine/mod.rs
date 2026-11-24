@@ -52,6 +52,9 @@ pub mod flow;
 /// The checked arithmetic the H.264 SPS parsers share: picture size and
 /// scaling lists. See [`h264_sps`].
 pub mod h264_sps;
+/// The checked arithmetic the HEVC SPS parsers share: picture size. See
+/// [`hevc_sps`].
+pub mod hevc_sps;
 /// Hardware probe + CPU class + software-encode capacity estimate. Powers
 /// the `resource_budget` block on the manager `HealthPayload`. One-shot
 /// probe at startup, no async / no I/O. See [`hardware_probe`].

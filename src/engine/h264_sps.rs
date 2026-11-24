@@ -31,15 +31,17 @@ pub fn picture_size(
 ) -> Option<(u32, u32)> {
     // A map unit is a macroblock, or a pair of them where fields are coded.
     let map_unit = if frame_mbs_only { 16 } else { 32 };
+    let width = pic_width_in_mbs_minus1.checked_add(1)?.checked_mul(16)?;
+    let height = pic_height_in_map_units_minus1.checked_add(1)?.checked_mul(map_unit)?;
     Some((
-        cropped(pic_width_in_mbs_minus1, 16, (crop.0, crop.1), crop_unit.0)?,
-        cropped(pic_height_in_map_units_minus1, map_unit, (crop.2, crop.3), crop_unit.1)?,
+        cropped(width, (crop.0, crop.1), crop_unit.0)?,
+        cropped(height, (crop.2, crop.3), crop_unit.1)?,
     ))
 }
 
-/// One dimension: `units_minus1 + 1` units of `unit` samples, less the crop.
-fn cropped(units_minus1: u32, unit: u32, crop: (u32, u32), crop_unit: u32) -> Option<u32> {
-    let coded = units_minus1.checked_add(1)?.checked_mul(unit)?;
+/// One dimension, here and in `engine::hevc_sps`: `coded` samples, less the
+/// crop.
+pub(super) fn cropped(coded: u32, crop: (u32, u32), crop_unit: u32) -> Option<u32> {
     if coded > MAX_DIMENSION {
         return None;
     }
