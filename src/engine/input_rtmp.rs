@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -215,6 +216,8 @@ async fn process_media(
     // muxer regardless of how it computes DTS.
     let mut audio_anchor_pts_90khz: Option<u64> = None;
     let mut audio_frames_emitted: u64 = 0;
+    // Where each publish's RTMP timestamps lie on the input's one timeline.
+    let mut timeline = PublishTimeline::default();
     // Whether this publish carries video — what the PMT lists and which PID
     // carries the PCR. See `PublishLayout`.
     let mut layout = PublishLayout::default();
@@ -274,8 +277,11 @@ async fn process_media(
                                 let dts_ms = timestamp_ms as i64;
                                 let pts_ms = dts_ms + composition_time as i64;
 
-                                let dts_90khz = TIMELINE_START_90K + (dts_ms.max(0) * 90) as u64;
-                                let pts_90khz = TIMELINE_START_90K + (pts_ms.max(0) * 90) as u64;
+                                if timeline.open(dts_ms, Instant::now()) {
+                                    muxer.mark_discontinuity();
+                                }
+                                let dts_90khz = timeline.at(dts_ms);
+                                let pts_90khz = timeline.at(pts_ms);
 
                                 // Convert length-prefixed NALUs to Annex B,
                                 // with the sequence header's SPS / PPS ahead
@@ -361,10 +367,14 @@ async fn process_media(
                                 // subsequent frames are spaced exactly one
                                 // AAC frame duration apart at 90 kHz.
                                 let sample_rate_hz = aac_sample_rate_hz(audio_sample_rate_idx);
+                                if timeline.open(timestamp_ms as i64, Instant::now()) {
+                                    muxer.mark_discontinuity();
+                                }
                                 let anchor = *audio_anchor_pts_90khz
-                                    .get_or_insert_with(|| TIMELINE_START_90K + (timestamp_ms as u64) * 90);
+                                    .get_or_insert_with(|| timeline.at(timestamp_ms as i64));
                                 let pts_90khz = anchor
                                     + audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64;
+                                timeline.issued(pts_90khz);
                                 audio_frames_emitted += 1;
                                 if let Some(has_video) = layout.on_audio(pts_90khz) {
                                     apply_layout(&mut muxer, has_video, &flow_id);
@@ -417,9 +427,11 @@ async fn process_media(
                             &flow_id,
                         );
                         // Reset audio anchor so the next publisher restarts
-                        // the sample counter from its own RTMP wall time.
+                        // the sample counter from its own RTMP wall time, on
+                        // the timeline past this one's end.
                         audio_anchor_pts_90khz = None;
                         audio_frames_emitted = 0;
+                        timeline.ended();
                         // The next publisher states its own layout. The
                         // muxer keeps this one's until it does.
                         layout = PublishLayout::default();
@@ -440,6 +452,79 @@ async fn process_media(
 /// that far behind the first timestamp — is 0 rather than just below the
 /// 33-bit wrap.
 const TIMELINE_START_90K: u64 = super::rtmp::ts_mux::PCR_LEAD_90K;
+
+/// The least a publish starts past the last one's latest PTS (90 kHz, the
+/// muxer's PCR lead): a track whose first timestamp is up to that much below
+/// the first the publish sends still starts past it.
+const PUBLISH_GAP_90K: u64 = super::rtmp::ts_mux::PCR_LEAD_90K;
+
+/// The one timeline an RTMP input's publishes run on.
+///
+/// The first publish's timestamps are carried as they are
+/// ([`TIMELINE_START_90K`]). Each later one — the same publisher reconnecting,
+/// or another — starts where the wall clock has got to since the input's
+/// first frame, and never short of [`PUBLISH_GAP_90K`] past the last one's
+/// latest PTS; from there it runs on its own timestamps, its tracks as far
+/// apart as they say. The muxer runs on (continuity counters, PSI versions),
+/// and the step carries `discontinuity_indicator` on the first PCR past it,
+/// as a WHIP input's sessions do ([`TsMuxer::mark_discontinuity`]).
+///
+/// Every publish used to be carried as it is, so a republish started the
+/// timeline over: the PCR and the video stepped back by the length of the
+/// last publish, with no `discontinuity_indicator`, and the audio, whose PTS
+/// the muxer holds past the last one (`TsMuxer::clamp_audio_pts`), stood
+/// still until the new publish had run as long as the last, tick by tick.
+#[derive(Debug, Default)]
+struct PublishTimeline {
+    /// The input's first frame: where it lies (90 kHz) and when it came.
+    origin: Option<(u64, Instant)>,
+    /// What a publish's timestamps are moved by (90 kHz).
+    offset: i64,
+    /// The latest PTS issued (90 kHz).
+    latest: u64,
+    /// A publish has ended: the next frame opens another.
+    over: bool,
+}
+
+impl PublishTimeline {
+    /// The publish now over, the next frame opens another.
+    fn ended(&mut self) {
+        self.over = self.origin.is_some();
+    }
+
+    /// A frame of RTMP time `ms` has come at `now`. Whether it opens a publish
+    /// that is not the input's first, which starts here.
+    fn open(&mut self, ms: i64, now: Instant) -> bool {
+        let Some((start, at)) = self.origin else {
+            self.origin = Some((self.at(ms), now));
+            return false;
+        };
+        if !std::mem::take(&mut self.over) {
+            return false;
+        }
+        let wall = start + now.saturating_duration_since(at).as_micros() as u64 * 9 / 100;
+        self.offset = wall.max(self.latest + PUBLISH_GAP_90K) as i64 - Self::unmoved(ms) as i64;
+        true
+    }
+
+    /// RTMP time `ms` on the timeline (90 kHz).
+    fn at(&mut self, ms: i64) -> u64 {
+        let at = (Self::unmoved(ms) as i64 + self.offset).max(0) as u64;
+        self.issued(at);
+        at
+    }
+
+    /// An audio frame was stamped `pts_90khz`, counted from its publish's
+    /// first.
+    fn issued(&mut self, pts_90khz: u64) {
+        self.latest = self.latest.max(pts_90khz);
+    }
+
+    /// RTMP time `ms` (90 kHz) of a publish carried as it is.
+    fn unmoved(ms: i64) -> u64 {
+        TIMELINE_START_90K + ms.max(0) as u64 * 90
+    }
+}
 
 /// Audio media time an RTMP publish may carry without a single H.264 tag
 /// before it is taken as audio-only (1 s). Publishers send the AVC sequence
@@ -922,6 +1007,143 @@ mod tests {
         let out = publish(msgs).await;
         assert_eq!(out.pmts, vec![(0, 0x0100, vec![0x0100, 0x0101])]);
         assert_eq!(out.pcr_pids, vec![0x0100]);
+    }
+
+    /// The TS packets `process_media` published for `parts`, each sent the
+    /// milliseconds it names after the one before.
+    async fn muxed(parts: Vec<(u64, Vec<RtmpMediaMessage>)>) -> Vec<Vec<u8>> {
+        let (tx, rx) = mpsc::channel(8192);
+        let sender = tokio::spawn(async move {
+            for (after_ms, msgs) in parts {
+                tokio::time::sleep(std::time::Duration::from_millis(after_ms)).await;
+                for m in msgs {
+                    tx.send(m).await.unwrap();
+                }
+            }
+        });
+        let (btx, mut brx) = broadcast::channel(8192);
+        let stats = Arc::new(FlowStatsAccumulator::new("f".into(), "flow".into(), "rtmp".into()));
+        let cancel = CancellationToken::new();
+        let publisher = crate::engine::ingress_publisher::IngressPublisher::new(
+            Default::default(),
+            btx,
+            "in",
+            cancel.clone(),
+            stats.clone(),
+        );
+        let (events, _events_rx) = crate::manager::events::event_channel();
+        process_media(rx, publisher, stats, cancel, events, "flow".into(), &mut None, &mut None, None)
+            .await;
+        sender.await.unwrap();
+        let mut out = Vec::new();
+        while let Ok(p) = brx.try_recv() {
+            out.extend(p.data.chunks(188).map(<[u8]>::to_vec));
+        }
+        out
+    }
+
+    /// The PTS of every PES on `pid`.
+    fn pts_on(ts: &[Vec<u8>], pid: u16) -> Vec<u64> {
+        let pes = ts.iter().filter(|p| ts_pid(p) == pid && ts_pusi(p));
+        pes.filter_map(|p| crate::engine::ts_parse::extract_pes_pts(p)).collect()
+    }
+
+    /// Every PCR (90 kHz), each with its `discontinuity_indicator`.
+    fn pcrs(ts: &[Vec<u8>]) -> Vec<(u64, bool)> {
+        let pcr = |p: &Vec<u8>| Some((extract_pcr(p)? / 300, crate::engine::ts_parse::ts_discontinuity_indicator(p)));
+        ts.iter().filter_map(pcr).collect()
+    }
+
+    /// A publish of `n` pictures at 25 fps and as much AAC, from RTMP time
+    /// `from_ms` on, and its end.
+    fn av_publish(n: u32, from_ms: u32) -> Vec<RtmpMediaMessage> {
+        let mut msgs = vec![RtmpMediaMessage::Metadata { declares_video: Some(true) }, avc_config(), aac_config()];
+        for k in 0..n {
+            msgs.push(avc_frame(from_ms + k * 40, k % 25 == 0, &[if k % 25 == 0 { 5 } else { 1 }]));
+            msgs.extend(aac_frames(2, from_ms + k * 40));
+        }
+        msgs.push(RtmpMediaMessage::Disconnected);
+        msgs
+    }
+
+    /// A publisher that reconnects runs on past where it left off: both tracks
+    /// step forward, by the same, as far apart as its timestamps say, whatever
+    /// they start at, and the PCR with them, one `discontinuity_indicator` at
+    /// the step. The continuity counters run on. The video and the PCR stepped
+    /// back by the last publish's length, unmarked, and the audio stood still,
+    /// a tick a frame, until the new one had run as long.
+    #[tokio::test]
+    async fn a_republish_runs_on_from_the_last_publish() {
+        const LEAD: u64 = TIMELINE_START_90K;
+        const AAC: u64 = 1_920;
+        for (first_from, second_from) in [(0u32, 0u32), (0, 3_600_000), (5_000, 0), (0, 2_000), (7_000, 7_000)] {
+            let ts = muxed(vec![(0, av_publish(75, first_from)), (0, av_publish(50, second_from))]).await;
+            let (video, audio) = (pts_on(&ts, 0x0100), pts_on(&ts, 0x0101));
+            assert_eq!((video.len(), audio.len()), (125, 250));
+            // The first publish as it is, from its own timestamps.
+            let from = LEAD + u64::from(first_from) * 90;
+            assert_eq!(video[..75], (0..75).map(|k| from + k * 3_600).collect::<Vec<_>>()[..]);
+            assert_eq!(audio[..150], (0..150).map(|k| from + k * AAC).collect::<Vec<_>>()[..]);
+            // The second past all of it, each track on its own pace from there,
+            // the two starting together.
+            let latest = (*audio[..150].last().unwrap()).max(video[74]);
+            assert!(video[75] >= latest + PUBLISH_GAP_90K, "{} / {latest}", video[75]);
+            assert!(video[75] < latest + PUBLISH_GAP_90K + 4 * 90_000, "{} / {latest}", video[75]);
+            assert_eq!(video[75..], (0..50).map(|k| video[75] + k * 3_600).collect::<Vec<_>>()[..]);
+            assert_eq!(audio[150..], (0..100).map(|k| video[75] + k * AAC).collect::<Vec<_>>()[..]);
+
+            let pcrs = pcrs(&ts);
+            let step = pcrs.windows(2).position(|w| w[1].0 - w[0].0 > 3_600).expect("the step");
+            assert!(pcrs.windows(2).all(|w| w[1].0 > w[0].0), "the PCR back: {pcrs:?}");
+            let marked: Vec<usize> = (0..pcrs.len()).filter(|k| pcrs[*k].1).collect();
+            assert_eq!(marked, [step + 1], "one discontinuity, at the step");
+            for pid in [0x0000u16, 0x0100, 0x0101, 0x1000] {
+                let ccs: Vec<u8> = ts
+                    .iter()
+                    .filter(|p| ts_pid(p) == pid && crate::engine::ts_parse::ts_has_payload(p))
+                    .map(|p| crate::engine::ts_parse::ts_cc(p))
+                    .collect();
+                assert!(ccs.windows(2).all(|w| w[1] == (w[0] + 1) & 0x0F), "PID {pid:#06x}: {ccs:?}");
+            }
+        }
+    }
+
+    /// The gap a publisher was away for is on the timeline, and a second
+    /// republish runs on from the first. A third whose audio starts a little
+    /// ahead of its first picture, or is all it sends, does too.
+    #[tokio::test]
+    async fn a_republish_starts_where_the_wall_clock_is() {
+        let mut late_video = vec![avc_config(), aac_config()];
+        late_video.extend(aac_frames(3, 0));
+        late_video.push(avc_frame(60, true, &[5]));
+        late_video.extend([avc_frame(20, true, &[5]), RtmpMediaMessage::Disconnected]);
+        let mut audio_only = vec![RtmpMediaMessage::Metadata { declares_video: Some(false) }, aac_config()];
+        audio_only.extend(aac_frames(20, 0));
+        let parts = vec![(0, av_publish(5, 0)), (900, av_publish(5, 0)), (0, late_video), (0, audio_only)];
+        let ts = muxed(parts).await;
+        let (video, audio) = (pts_on(&ts, 0x0100), pts_on(&ts, 0x0101));
+        let away = (video[5] - video[0]) as i64 - 81_000;
+        assert!((0..40_000).contains(&away), "0.9 s away, on the timeline from the first frame: {away}");
+        assert!(audio.windows(2).all(|w| w[1] - w[0] >= 1_900), "a frame's worth at least: {audio:?}");
+        assert!(video[11] < video[10], "a picture stamped before its publish's first keeps its place");
+        assert!(video[11] > *video[..10].iter().max().unwrap(), "past the last publish");
+        let pcrs = pcrs(&ts);
+        assert_eq!(pcrs.iter().filter(|p| p.1).count(), 3, "one for each republish: {pcrs:?}");
+    }
+
+    /// A publish that ends before it has sent anything moves nothing.
+    #[tokio::test]
+    async fn an_empty_publish_moves_nothing() {
+        let empty = vec![RtmpMediaMessage::Metadata { declares_video: None }, RtmpMediaMessage::Disconnected];
+        let mut msgs = [empty.clone(), vec![RtmpMediaMessage::Disconnected], av_publish(5, 250)].concat();
+        msgs.pop();
+        let ts = muxed(vec![(0, msgs)]).await;
+        let from = TIMELINE_START_90K + 250 * 90;
+        assert_eq!(pts_on(&ts, 0x0100), (0..5).map(|k| from + k * 3_600).collect::<Vec<_>>());
+        assert!(pcrs(&ts).iter().all(|p| !p.1));
+        // Between two publishes as well: one discontinuity, not two.
+        let ts = muxed(vec![(0, [av_publish(5, 0), empty, av_publish(5, 0)].concat())]).await;
+        assert_eq!(pcrs(&ts).iter().filter(|p| p.1).count(), 1);
     }
 
     /// Metadata cannot overrule the tags: once video has been sent, an

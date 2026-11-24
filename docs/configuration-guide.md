@@ -1347,6 +1347,15 @@ video: an audio-only publish named the absent video PID as PCR_PID and carried
 no PCR at all. A `pid_overrides` `pcr_pid` naming a PID other than the audio's
 is honoured as it is, which leaves an audio-only publish without a PCR.
 
+A publisher that reconnects, or the next one, runs on the same timeline: its
+first frame starts where the wall clock has got to since the input's first
+frame (and at least 100 ms past the last publish's latest timestamp), its
+tracks as far apart as its timestamps say, whatever they start at. The
+continuity counters and PSI versions run on, and the first PCR past the step
+carries `discontinuity_indicator`. Up to 0.117.0 each publish started the
+timeline over: the picture and the PCR stepped back, unmarked, and the audio's
+timestamps stood still until the new publish had run as long as the last.
+
 ```json
 {
   "type": "rtmp",
