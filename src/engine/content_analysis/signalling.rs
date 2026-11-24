@@ -759,6 +759,16 @@ mod tests {
         assert_eq!(aspect_ratio(edge_213()).as_deref(), Some("4:3"));
     }
 
+    #[test]
+    fn an_hevc_crop_is_in_units_of_2x2() {
+        for (what, sps, (w, h)) in hevc_sps::tests::cropped_by_2x2() {
+            let mut tracker = SignallingTracker::new();
+            tracker.scan_hevc(&[&[0, 0, 1], &sps[..], &[0, 0, 1, 0x44, 0x01]].concat());
+            let ratio = format_aspect_ratio(w, h, 1, 1);
+            assert!(ratio.is_some() && tracker.aspect_ratio == ratio, "{what}: {:?}", tracker.aspect_ratio);
+        }
+    }
+
     /// The widest and tallest picture taken, by the widest and tallest sample
     /// aspect ratio there is.
     #[test]

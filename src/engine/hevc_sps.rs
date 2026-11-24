@@ -170,7 +170,7 @@ pub(crate) mod tests {
 
     /// Real SPS NAL units, encoders' and captures', as `(what, SPS, size,
     /// frames a second)`, the size and rate as ffprobe reads them.
-    pub(crate) fn real_sps() -> [(&'static str, Vec<u8>, (u32, u32), f64); 14] {
+    pub(crate) fn real_sps() -> [(&'static str, Vec<u8>, (u32, u32), f64); 15] {
         [
             (
                 "x265 1080p",
@@ -239,7 +239,16 @@ pub(crate) mod tests {
                 25.0,
             ),
             (
-                "VAAPI 720p, three reference picture sets",
+                "x265 720p50, 11 reference picture sets",
+                concat!(
+                    "420101016000000300900000030000030078a00280802d165959529301845aae6f5d444aa4a8b2555444aaaa",
+                    "2495535ae4fd492a949116a4ef0168080000030008000003019040",
+                ),
+                (1280, 720),
+                50.0,
+            ),
+            (
+                "VAAPI 720p",
                 concat!(
                     "420101016000000300b0000003000003005da00280802d1624d6491b6ac05a0200000300020000030033af84",
                     "0208",
@@ -279,6 +288,18 @@ pub(crate) mod tests {
             ),
         ]
         .map(|(what, sps, size, rate)| (what, hx(sps), size, rate))
+    }
+
+    /// The SPS of [`real_sps`] that are not 4:2:0, pictures of 322x242, as
+    /// `(what, SPS, size)`: the size as the probe and signalling read it. They
+    /// count a crop in units of 2x2 luma samples whatever the chroma format.
+    pub(crate) fn cropped_by_2x2() -> [(&'static str, Vec<u8>, (u32, u32)); 3] {
+        [("x265 4:0:0", (308, 228)), ("x265 4:2:2 10-bit", (322, 228)), ("x265 4:4:4", (308, 228))].map(
+            |(of, size)| {
+                let (what, sps, ..) = real_sps().into_iter().find(|(what, ..)| *what == of).unwrap();
+                (what, sps, size)
+            },
+        )
     }
 
     /// xorshift64, the same numbers each time.

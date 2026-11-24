@@ -821,6 +821,13 @@ mod tests {
     }
 
     #[test]
+    fn an_hevc_crop_is_in_units_of_2x2() {
+        for (what, sps, size) in hevc_sps::tests::cropped_by_2x2() {
+            assert_eq!(find_hevc_sps_dims(&[&[0, 0, 1], &sps[..]].concat()), Some(size), "{what}");
+        }
+    }
+
+    #[test]
     fn a_random_hevc_sps_never_panics() {
         use crate::engine::hevc_sps::tests::{RANDOM, random_sps};
         for sps in random_sps(RANDOM) {
