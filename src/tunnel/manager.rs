@@ -988,6 +988,8 @@ async fn run_relay_tunnel(
         if let Some(h) = probe_handle {
             h.abort();
         }
+        // Nothing forwards on the connection any more: let go of its bind.
+        conn_cancel.cancel();
 
         if cancel.is_cancelled() {
             return Ok(());
@@ -1431,5 +1433,224 @@ mod kernel_drop_watchdog_tests {
         let ev = rx.try_recv().expect("a new episode after a clean minute");
         assert_eq!(ev.details.unwrap()["dropped_window"], 3);
         cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod relay_notice_tests {
+    //! What a relay says of a tunnel that is up, and what becomes of the tunnel
+    //! and of what it carries.
+    use super::*;
+    use crate::manager::events::{Event, event_channel};
+    use crate::tunnel::protocol::{self, RelayMessage};
+    use crate::tunnel::relay_client::stand_in::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, UdpSocket};
+    use tokio::sync::mpsc;
+
+    struct Edge {
+        id: Uuid,
+        relay: StandIn,
+        manager: TunnelManager,
+        events: mpsc::Receiver<Event>,
+    }
+
+    impl Edge {
+        async fn start(protocol: &str, direction: &str, local_addr: SocketAddr) -> Self {
+            let relay = StandIn::start();
+            let id = Uuid::new_v4();
+            let (event_tx, events) = event_channel();
+            let manager = TunnelManager::new(event_tx);
+            let config = serde_json::json!({
+                "id": id, "name": "t", "protocol": protocol, "mode": "relay", "direction": direction,
+                "local_addr": local_addr, "relay_addrs": [relay.addr],
+            });
+            manager.create_tunnel(serde_json::from_value(config).unwrap()).await.unwrap();
+            let mut edge = Self { id, relay, manager, events };
+            edge.raises(&["Tunnel 't' started"]).await;
+            edge
+        }
+
+        /// Bind, and the peer with it.
+        async fn up(&mut self) -> Session {
+            let (mut session, _bind) = self.relay.binding().await;
+            session.answer(ready(self.id)).await;
+            self.becomes("ready").await;
+            self.raises(&["Tunnel connected to relay"]).await;
+            session
+        }
+
+        async fn becomes(&self, state: &str) {
+            let is = || self.manager.tunnel_status(&self.id.to_string()).map(|s| s.state);
+            soon(state, async {
+                while is().as_deref() != Some(state) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+        }
+
+        /// The next events raised, by their messages.
+        async fn raises(&mut self, messages: &[&str]) {
+            for message in messages {
+                let event = soon(message, self.events.recv()).await.unwrap();
+                assert_eq!(event.message, *message);
+            }
+        }
+    }
+
+    async fn passes(session: &Session, id: Uuid, app: &UdpSocket, from_edge: &mut Option<SocketAddr>) {
+        let payload = Uuid::new_v4().to_string();
+        let datagram = protocol::encode_udp_datagram(&id, payload.as_bytes());
+        session.conn.send_datagram(datagram.into()).unwrap();
+        let mut buf = [0; 64];
+        let (n, edge) = soon("a datagram", app.recv_from(&mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], payload.as_bytes());
+        assert_eq!(*from_edge.get_or_insert(edge), edge, "another forwarder");
+        app.send_to(b"back", edge).await.unwrap();
+        let back = soon("its answer", session.conn.read_datagram()).await.unwrap();
+        assert_eq!(protocol::decode_udp_datagram(&back).unwrap(), (id, &b"back"[..]));
+    }
+
+    /// The peer goes and is back, and our side is removed and bound again: one
+    /// connection and one forwarder throughout, on one socket.
+    #[tokio::test]
+    async fn a_udp_tunnel_goes_on_through_what_the_relay_says() {
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut edge = Edge::start("udp", "ingress", app.local_addr().unwrap()).await;
+        let mut session = edge.up().await;
+        let id = edge.id;
+        let mut from = None;
+        passes(&session, id, &app, &mut from).await;
+
+        session.notify(down(id, "peer unbound")).await;
+        edge.becomes("waiting").await;
+        passes(&session, id, &app, &mut from).await;
+        session.notify(ready(id)).await;
+        edge.becomes("ready").await;
+        passes(&session, id, &app, &mut from).await;
+        edge.raises(&["Tunnel peer disconnected: peer unbound", "Tunnel ready again"]).await;
+
+        session.notify(down(id, "tunnel closed by manager")).await;
+        edge.becomes("down").await;
+        passes(&session, id, &app, &mut from).await;
+        session.next().await;
+        session.answer(ready(id)).await;
+        edge.becomes("ready").await;
+        passes(&session, id, &app, &mut from).await;
+        edge.raises(&["Tunnel removed on relay: tunnel closed by manager", "Tunnel ready again"]).await;
+        assert!(!edge.relay.is_dialled(Duration::from_millis(300)).await);
+    }
+
+    /// A TCP connection through the tunnel is not cut by it either.
+    #[tokio::test]
+    async fn a_tcp_connection_goes_on_through_what_the_relay_says() {
+        let app = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut edge = Edge::start("tcp", "ingress", app.local_addr().unwrap()).await;
+        let mut session = edge.up().await;
+        let id = edge.id;
+        let (mut send, mut recv) = session.conn.open_bi().await.unwrap();
+        let header = protocol::StreamHeader { tunnel_id: id, stream_type: protocol::StreamType::Tcp };
+        protocol::write_stream_header(&mut send, &header).await.unwrap();
+        let (mut tcp, _) = soon("a connection", app.accept()).await.unwrap();
+        for n in 0..3u8 {
+            send.write_all(&[n]).await.unwrap();
+            assert_eq!(soon("its data", tcp.read_u8()).await.unwrap(), n);
+            tcp.write_all(&[n + 100]).await.unwrap();
+            let mut back = [0];
+            soon("its answer", recv.read_exact(&mut back)).await.unwrap();
+            assert_eq!(back, [n + 100]);
+            match n {
+                0 => {
+                    session.notify(down(id, "peer disconnected")).await;
+                    edge.becomes("waiting").await;
+                }
+                _ => {
+                    session.notify(down(id, "tunnel deleted via relay REST API")).await;
+                    edge.becomes("down").await;
+                    session.next().await;
+                    session.answer(ready(id)).await;
+                    edge.becomes("ready").await;
+                }
+            }
+        }
+    }
+
+    /// Bound again and refused: the edge connects anew, is refused there too,
+    /// and goes on trying, more and more seldom, until it is not.
+    #[tokio::test]
+    async fn a_tunnel_that_was_revoked_is_tried_again_and_again() {
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut edge = Edge::start("udp", "ingress", app.local_addr().unwrap()).await;
+        let mut session = edge.up().await;
+        let id = edge.id;
+        passes(&session, id, &app, &mut None).await;
+        session.notify(down(id, "tunnel deleted via relay REST API")).await;
+        session.next().await;
+        session.answer(down(id, "bind authentication failed")).await;
+        edge.raises(&["Tunnel removed on relay: tunnel deleted via relay REST API"]).await;
+        edge.raises(&["Tunnel disconnected from relay: quic datagram recv: closed"]).await;
+        let mut since = tokio::time::Instant::now();
+        for wait in [1, 1, 2] {
+            let (mut session, _bind) = edge.relay.binding().await;
+            assert!(since.elapsed() >= Duration::from_millis(wait * 1000 - 100), "{:?}", since.elapsed());
+            edge.becomes("connecting").await;
+            session.answer(down(id, "bind authentication failed")).await;
+            edge.raises(&["Tunnel bind rejected by relay: bind authentication failed"]).await;
+            since = tokio::time::Instant::now();
+        }
+        let session = edge.up().await;
+        passes(&session, id, &app, &mut None).await;
+    }
+
+    /// The relay's control stream ends: the edge connects anew.
+    #[tokio::test]
+    async fn a_tunnel_whose_control_stream_ends_connects_anew() {
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut edge = Edge::start("udp", "ingress", app.local_addr().unwrap()).await;
+        let mut session = edge.up().await;
+        session.send.finish().unwrap();
+        edge.raises(&["Tunnel disconnected from relay: quic datagram recv: closed"]).await;
+        let session = edge.up().await;
+        passes(&session, edge.id, &app, &mut None).await;
+    }
+
+    /// Deleted while it waits to bind its side again: it does not, and leaves.
+    #[tokio::test]
+    async fn a_tunnel_that_is_deleted_is_not_bound_again() {
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut edge = Edge::start("udp", "ingress", app.local_addr().unwrap()).await;
+        let mut session = edge.up().await;
+        session.notify(down(edge.id, "tunnel closed by manager")).await;
+        edge.becomes("down").await;
+        edge.manager.destroy_tunnel(&edge.id.to_string()).await.unwrap();
+        session.closed().await;
+        while let Ok(msg) = protocol::read_message(&mut session.recv).await {
+            assert!(matches!(msg, protocol::EdgeMessage::Ping), "{msg:?}");
+        }
+        assert!(!edge.relay.is_dialled(Duration::from_millis(1500)).await);
+        edge.raises(&["Tunnel removed on relay: tunnel closed by manager", "Tunnel 't' stopped"]).await;
+    }
+
+    /// A tunnel that cannot listen locally leaves the relay: it does not keep
+    /// its side bound there, which would be neither forwarded to nor free.
+    #[tokio::test]
+    async fn a_tunnel_that_cannot_listen_lets_go_of_its_bind() {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        for (protocol, taken) in
+            [("udp", udp.local_addr().unwrap()), ("tcp", tcp.local_addr().unwrap())]
+        {
+            let edge = Edge::start(protocol, "egress", taken).await;
+            let (mut session, _bind) = edge.relay.binding().await;
+            session.answer(RelayMessage::TunnelReady { tunnel_id: edge.id }).await;
+            session.closed().await;
+            soon("its end", async {
+                while edge.manager.tunnel_status(&edge.id.to_string()).is_some() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+        }
     }
 }

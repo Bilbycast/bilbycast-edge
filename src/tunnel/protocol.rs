@@ -75,7 +75,10 @@ pub enum RelayMessage {
     #[serde(rename = "tunnel_waiting")]
     TunnelWaiting { tunnel_id: Uuid },
 
-    /// Tunnel went down (peer disconnected or unbound).
+    /// On the control stream: the bind this answers was refused. On a stream
+    /// of its own: the other side is gone ([`PEER_DISCONNECTED`],
+    /// [`PEER_UNBOUND`]), or with any other reason the side of the edge this is
+    /// sent to was removed, and takes a bind to hold again.
     #[serde(rename = "tunnel_down")]
     TunnelDown { tunnel_id: Uuid, reason: String },
 
@@ -92,6 +95,13 @@ pub enum RelayMessage {
         software_version: String,
     },
 }
+
+/// The reasons of a [`RelayMessage::TunnelDown`] that is about the other side of
+/// the tunnel. The edge it is sent to still holds its own. Edges tell the two
+/// apart by these, so they stay as every release has them.
+pub const PEER_DISCONNECTED: &str = "peer disconnected";
+/// See [`PEER_DISCONNECTED`].
+pub const PEER_UNBOUND: &str = "peer unbound";
 
 // ── Direct mode messages ──
 
