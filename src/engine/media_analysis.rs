@@ -1477,11 +1477,25 @@ fn parse_h264_vui_timing(reader: &mut BitReader) -> Option<f64> {
     if reader.read_bits(1)? == 1 {
         let num_units_in_tick = reader.read_bits(32)?;
         let time_scale = reader.read_bits(32)?;
-        if num_units_in_tick > 0 {
-            return Some(time_scale as f64 / (2.0 * num_units_in_tick as f64));
-        }
+        // A tick is a field's time.
+        return vui_frame_rate(num_units_in_tick, time_scale, 2.0);
     }
     None
+}
+
+/// From here on the rate a VUI states is taken for a clock's, not the
+/// pictures': 1000 is what FFmpeg's libx264 writes for a millisecond time
+/// base, 90000 for MPEG's. The levels of H.265 allow 300 pictures a second
+/// (fR, §A.4.2), and a high-speed source has more than three times that.
+const VUI_CLOCK_RATE: f64 = 1000.0;
+
+/// The frame rate a VUI's timing states. `None`, so that it is measured from
+/// the timestamps instead, for one that is not above 0 and under
+/// [`VUI_CLOCK_RATE`]. Until 2026-11 a `time_scale` of 0 was a rate of 0 fps,
+/// and any other was taken whatever it came to.
+fn vui_frame_rate(num_units_in_tick: u32, time_scale: u32, ticks_per_frame: f64) -> Option<f64> {
+    let rate = f64::from(time_scale) / (ticks_per_frame * f64::from(num_units_in_tick));
+    (rate > 0.0 && rate < VUI_CLOCK_RATE).then_some(rate)
 }
 
 // ── H.265 SPS Parser ────────────────────────────────────────────────────
@@ -1585,33 +1599,7 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
     reader.read_bits(16)?;
     let general_level_idc = reader.read_bits(8)? as u8;
 
-    // Skip sub-layer info (ITU-T H.265 §7.3.3)
-    if sps_max_sub_layers_minus1 > 0 {
-        let mut sub_layer_profile_present = [false; 8];
-        let mut sub_layer_level_present = [false; 8];
-        for i in 0..sps_max_sub_layers_minus1 as usize {
-            sub_layer_profile_present[i] = reader.read_bits(1)? == 1;
-            sub_layer_level_present[i] = reader.read_bits(1)? == 1;
-        }
-        if sps_max_sub_layers_minus1 < 8 {
-            for _ in sps_max_sub_layers_minus1..8 {
-                reader.read_bits(2)?; // reserved_zero_2bits
-            }
-        }
-        for i in 0..sps_max_sub_layers_minus1 as usize {
-            if sub_layer_profile_present[i] {
-                // sub_layer_profile_space(2) + sub_layer_tier_flag(1) + sub_layer_profile_idc(5)
-                reader.read_bits(8)?;
-                reader.read_bits(32)?; // sub_layer_profile_compatibility_flag[32]
-                // sub_layer_constraint flags (48 bits)
-                reader.read_bits(32)?;
-                reader.read_bits(16)?;
-            }
-            if sub_layer_level_present[i] {
-                reader.read_bits(8)?; // sub_layer_level_idc
-            }
-        }
-    }
+    hevc_sps::skip_sub_layers(u32::from(sps_max_sub_layers_minus1), |n| reader.read_bits(n))?;
 
     let _sps_seq_parameter_set_id = reader.read_exp_golomb()?;
     let chroma_format_idc = reader.read_exp_golomb()?;
@@ -1647,9 +1635,7 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
     let frame_rate = (|| -> Option<f64> {
         let bit_depth_luma_minus8 = reader.read_exp_golomb()?;
         let bit_depth_chroma_minus8 = reader.read_exp_golomb()?;
-        // At most 12 (§7.4.3.2.1).
-        let log2_max_pic_order_cnt_lsb_minus4 =
-            reader.read_exp_golomb().filter(|minus4| *minus4 <= 12)?;
+        let log2_max_pic_order_cnt_lsb_minus4 = reader.read_exp_golomb()?;
         tracing::debug!(
             "H.265 SPS VUI parse: bit_depth_luma_m8={}, bit_depth_chroma_m8={}, log2_max_poc_lsb_m4={}",
             bit_depth_luma_minus8, bit_depth_chroma_minus8, log2_max_pic_order_cnt_lsb_minus4
@@ -1697,35 +1683,13 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
             reader.read_bits(1)?; // pcm_loop_filter_disabled_flag
         }
 
-        // Short-term ref pic sets — must track num_delta_pocs per set for inter-prediction.
-        // At most 64 (§7.4.3.2.1), and nothing is allocated by the count. Until 2026-11
-        // (edge#213) it was: 16 GiB for 2^32 − 2, and the process ended where it could not
-        // have it.
-        let num_short_term_ref_pic_sets = reader.read_exp_golomb().filter(|sets| *sets <= 64)?;
-        tracing::debug!("H.265 SPS VUI parse: num_short_term_ref_pic_sets={}", num_short_term_ref_pic_sets);
-        let mut num_delta_pocs = Vec::new();
-        for i in 0..num_short_term_ref_pic_sets {
-            let ndp = parse_h265_short_term_ref_pic_set(
-                &mut reader,
-                i,
-                &num_delta_pocs,
-            )?;
-            num_delta_pocs.push(ndp);
-        }
-        tracing::debug!("H.265 SPS VUI parse: parsed all ref pic sets, num_delta_pocs={:?}", num_delta_pocs);
-
-        // Long-term ref pics
-        let long_term_ref_pics_present_flag = reader.read_bits(1)?;
-        tracing::debug!("H.265 SPS VUI parse: long_term_ref_pics_present={}", long_term_ref_pics_present_flag);
-        if long_term_ref_pics_present_flag == 1 {
-            // At most 32 (§7.4.3.2.1).
-            let num_long_term_ref_pics_sps = reader.read_exp_golomb().filter(|pics| *pics <= 32)?;
-            let log2_max_pic_order_cnt_lsb = log2_max_pic_order_cnt_lsb_minus4 + 4;
-            for _ in 0..num_long_term_ref_pics_sps {
-                reader.read_bits(log2_max_pic_order_cnt_lsb as u8)?; // lt_ref_pic_poc_lsb_sps
-                reader.read_bits(1)?; // used_by_curr_pic_lt_sps_flag
-            }
-        }
+        hevc_sps::skip_ref_pic_sets(
+            &mut reader,
+            log2_max_pic_order_cnt_lsb_minus4,
+            BitReader::read_bits,
+            BitReader::read_exp_golomb,
+        )?;
+        tracing::debug!("H.265 SPS VUI parse: passed reference picture sets");
 
         let temporal_mvp = reader.read_bits(1)?; // sps_temporal_mvp_enabled_flag
         let strong_intra = reader.read_bits(1)?; // strong_intra_smoothing_enabled_flag
@@ -1818,9 +1782,7 @@ fn parse_h265_vui_timing(reader: &mut BitReader) -> Option<f64> {
         let num_units_in_tick = reader.read_bits(32)?;
         let time_scale = reader.read_bits(32)?;
         tracing::debug!("H.265 VUI: num_units_in_tick={}, time_scale={}", num_units_in_tick, time_scale);
-        if num_units_in_tick > 0 {
-            return Some(time_scale as f64 / num_units_in_tick as f64);
-        }
+        return vui_frame_rate(num_units_in_tick, time_scale, 1.0);
     }
     None
 }
@@ -1845,58 +1807,6 @@ fn skip_h265_scaling_list_data(reader: &mut BitReader) -> Option<()> {
         }
     }
     Some(())
-}
-
-/// Parse one H.265 short-term ref pic set (ITU-T H.265 §7.3.7).
-/// Returns NumDeltaPocs for this set (needed by subsequent inter-predicted sets).
-fn parse_h265_short_term_ref_pic_set(
-    reader: &mut BitReader,
-    idx: u32,
-    prev_num_delta_pocs: &[u32],
-) -> Option<u32> {
-    let inter_ref_pic_set_prediction_flag = if idx > 0 {
-        reader.read_bits(1)? == 1
-    } else {
-        false
-    };
-
-    if inter_ref_pic_set_prediction_flag {
-        let delta_idx_minus1 = reader.read_exp_golomb()?;
-        let ref_idx = idx.checked_sub(delta_idx_minus1.checked_add(1)?)?;
-        let ref_num_delta_pocs = *prev_num_delta_pocs.get(ref_idx as usize)?;
-
-        reader.read_bits(1)?; // delta_rps_sign
-        reader.read_exp_golomb()?; // abs_delta_rps_minus1
-
-        // For each delta poc in the reference set + 1, read used_by_curr_pic_flag
-        // and conditionally use_delta_flag
-        let mut num_delta_pocs = 0u32;
-        for _ in 0..=ref_num_delta_pocs {
-            let used_by_curr_pic_flag = reader.read_bits(1)?;
-            if used_by_curr_pic_flag == 0 {
-                let use_delta_flag = reader.read_bits(1)?;
-                if use_delta_flag == 1 {
-                    num_delta_pocs += 1;
-                }
-            } else {
-                num_delta_pocs += 1;
-            }
-        }
-        Some(num_delta_pocs)
-    } else {
-        // A decoder holds at most 16 pictures (MaxDpbSize, §A.4.2).
-        let num_negative_pics = reader.read_exp_golomb().filter(|pics| *pics <= 16)?;
-        let num_positive_pics = reader.read_exp_golomb().filter(|pics| *pics <= 16)?;
-        for _ in 0..num_negative_pics {
-            reader.read_exp_golomb()?; // delta_poc_s0_minus1
-            reader.read_bits(1)?; // used_by_curr_pic_s0_flag
-        }
-        for _ in 0..num_positive_pics {
-            reader.read_exp_golomb()?; // delta_poc_s1_minus1
-            reader.read_bits(1)?; // used_by_curr_pic_s1_flag
-        }
-        Some(num_negative_pics + num_positive_pics)
-    }
 }
 
 // ── MPEG-1 / MPEG-2 Sequence Header Parser ──────────────────────────────
@@ -2438,16 +2348,26 @@ mod tests {
     /// stream whose bitstream states none (no SPS at all) stamped `steps`
     /// ticks apart.
     fn reported_rates(steps: impl IntoIterator<Item = u64>) -> Vec<Option<f64>> {
+        reported_rates_of(false, &AVC_SLICE, steps)
+    }
+
+    const AVC_SLICE: [u8; 8] = [0, 0, 0, 1, 0x41, 0x9A, 0x00, 0x10];
+
+    /// The same of a stream, H.264 or H.265, every frame of which is `es`.
+    fn reported_rates_of(h265: bool, es: &[u8], steps: impl IntoIterator<Item = u64>) -> Vec<Option<f64>> {
+        use crate::engine::rtmp::ts_mux::{PCR_LEAD_90K, STREAM_TYPE_H265, TsMuxer};
         let acc =
             MediaAnalysisAccumulator::new("webrtc".into(), "raw_ts".into(), false, None, false, None);
         let mut state = acc.state.lock().unwrap();
-        let mut muxer = crate::engine::rtmp::ts_mux::TsMuxer::new();
-        let slice = [0u8, 0, 0, 1, 0x41, 0x9A, 0x00, 0x10];
-        let mut pts = crate::engine::rtmp::ts_mux::PCR_LEAD_90K;
+        let mut muxer = TsMuxer::new();
+        if h265 {
+            muxer.set_video_stream_type(STREAM_TYPE_H265);
+        }
+        let mut pts = PCR_LEAD_90K;
         let mut reported = Vec::new();
         for (i, step) in std::iter::once(0).chain(steps).enumerate() {
             pts += step;
-            for chunk in muxer.mux_video(&slice, pts, pts, i == 0) {
+            for chunk in muxer.mux_video(es, pts, pts, i == 0) {
                 for pkt in chunk.chunks(188) {
                     process_ts_packet(pkt, &mut state);
                 }
@@ -2886,28 +2806,98 @@ mod tests {
         assert_eq!(rate(Sps { ref_pic_sets: 64, pics: (16, 16), ..Sps::default() }), Some(25.0));
     }
 
-    /// H.265 §7.3.7: a predicted set is counted off one before it.
-    #[test]
-    fn an_h265_ref_pic_set_is_predicted_from_one_before_it() {
-        use super::super::cmaf::param_sets::tests::Bits;
-        let count = |delta_idx_minus1| {
-            let mut set = Bits::new(&[]);
-            set.put(1, 1).ue(delta_idx_minus1).put(0, 1).ue(0).put(0xFF, 8);
-            parse_h265_short_term_ref_pic_set(&mut BitReader::new(&set.done()), 2, &[3, 5])
-        };
-        assert_eq!(count(0), Some(6));
-        assert_eq!(count(1), Some(4));
-        for before_the_first in [2, 3, u32::MAX - 1] {
-            assert_eq!(count(before_the_first), None);
-        }
-    }
-
     #[test]
     fn a_real_h265_sps_has_the_size_and_rate_ffprobe_reads() {
         for (what, sps, size, rate) in super::super::hevc_sps::tests::real_sps() {
             let info = find_and_parse_h265_sps(&[&[0, 0, 1], &sps[..]].concat()).unwrap();
             assert_eq!((u32::from(info.width), u32::from(info.height)), size, "{what}");
-            assert_eq!(info.frame_rate, Some(rate), "{what}");
+            assert_eq!(info.frame_rate, rate, "{what}");
+        }
+    }
+
+    #[test]
+    fn an_h265_sps_is_read_past_its_sub_layers() {
+        for sps in super::super::hevc_sps::tests::sub_layered() {
+            let info = find_and_parse_h265_sps(&sps.annex_b()).unwrap();
+            assert_eq!((info.width, info.height), (720, 576), "{:?}", sps.sub_layers);
+            assert_eq!(info.frame_rate, Some(25.0), "{:?}", sps.sub_layers);
+        }
+    }
+
+    #[test]
+    fn a_random_h265_sps_in_range_is_read_as_it_was_written() {
+        use super::super::hevc_sps::tests::{VALID, valid_sps};
+        for (i, (sps, says)) in valid_sps(VALID).enumerate() {
+            let info = find_and_parse_h265_sps(&[&[0, 0, 1], &sps[..]].concat()).unwrap();
+            let unit = [(1, 1), (2, 2), (2, 1), (1, 1)][says.chroma as usize];
+            let size = hevc_sps::picture_size(says.coded.0, says.coded.1, says.conf_win, unit).unwrap();
+            assert_eq!((u32::from(info.width), u32::from(info.height)), size, "{i}");
+            let rate = says.timing.map(|(units, scale)| f64::from(scale) / f64::from(units));
+            assert_eq!(info.frame_rate, rate.filter(|rate| (f64::MIN_POSITIVE..1000.0).contains(rate)), "{i}");
+            let level = u32::from(says.level);
+            assert_eq!(info.level, format!("{}.{}", level / 30, level % 30 / 3), "{i}");
+        }
+    }
+
+    /// A VUI whose timing gives no rate, or a clock's, states none.
+    #[test]
+    fn a_vui_rate_is_above_0_and_under_a_clocks() {
+        use super::super::h264_sps::tests::Sps as Avc;
+        use super::super::hevc_sps::tests::Sps as Hevc;
+        for (timing, rate) in [
+            ((1, 25), Some(25.0)),
+            ((1001, 60_000), Some(60_000.0 / 1001.0)),
+            ((1, 300), Some(300.0)),
+            ((1, 999), Some(999.0)),
+            ((4_294_968, u32::MAX), Some(f64::from(u32::MAX) / 4_294_968.0)),
+            ((4_294_967, u32::MAX), None),
+            ((1, 1000), None),
+            ((1001, 1_001_000), None),
+            ((1, 1001), None),
+            ((1, 90_000), None),
+            ((1, u32::MAX), None),
+            ((u32::MAX, 1), Some(1.0 / f64::from(u32::MAX))),
+            ((1, 0), None),
+            ((u32::MAX, 0), None),
+            ((0, 25), None),
+            ((0, 0), None),
+        ] {
+            let info = find_and_parse_h265_sps(&Hevc { timing, ..Hevc::default() }.annex_b()).unwrap();
+            assert_eq!((info.width, info.frame_rate), (1920, rate), "H.265 {timing:?}");
+            // H.264's tick is a field's.
+            let info = find_and_parse_h264_sps(&Avc { timing: Some(timing), ..Avc::default() }.annex_b());
+            let info = info.unwrap();
+            let rate = (timing.0 > 0 && timing.1 > 0)
+                .then(|| f64::from(timing.1) / (2.0 * f64::from(timing.0)))
+                .filter(|rate| *rate < 1000.0);
+            assert_eq!((info.width, info.frame_rate), (1920, rate), "H.264 {timing:?}");
+        }
+        let avc = |timing| {
+            find_and_parse_h264_sps(&Avc { timing: Some(timing), ..Avc::default() }.annex_b()).unwrap().frame_rate
+        };
+        assert_eq!(avc((1, 50)), Some(25.0));
+        assert_eq!(avc((1, 1999)), Some(999.5));
+        assert_eq!(avc((1, 2000)), None);
+        assert_eq!(avc((1001, 60_000)), Some(30_000.0 / 1001.0));
+    }
+
+    /// A stream whose VUI states no rate is measured from its timestamps; one
+    /// whose VUI does is not.
+    #[test]
+    fn a_stream_whose_vui_gives_no_rate_is_measured() {
+        use super::super::h264_sps::tests::Sps as Avc;
+        use super::super::hevc_sps::tests::Sps as Hevc;
+        let steps = || std::iter::repeat_n(1_800, 200);
+        let avc = |timing| [&Avc { timing: Some(timing), ..Avc::default() }.annex_b()[..], &AVC_SLICE].concat();
+        let hevc = |timing| {
+            [&Hevc { timing, ..Hevc::default() }.annex_b()[..], &[0, 0, 0, 1, 0x02, 0x01, 0xD0, 0x21]].concat()
+        };
+        let last = |h265, es: &[u8]| *reported_rates_of(h265, es, steps()).last().unwrap();
+        assert_eq!(last(false, &avc((1, 60))), Some(30.0));
+        assert_eq!(last(true, &hevc((1, 30))), Some(30.0));
+        for timing in [(1, 0), (0, 0), (1, 90_000), (1, 180_000)] {
+            assert_eq!(last(false, &avc(timing)), Some(50.0), "H.264 {timing:?}");
+            assert_eq!(last(true, &hevc(timing)), Some(50.0), "H.265 {timing:?}");
         }
     }
 

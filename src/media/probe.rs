@@ -585,7 +585,7 @@ fn parse_hevc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
     br.read_bits(4)?; // sps_video_parameter_set_id
     let max_sub_layers_minus1 = br.read_bits(3)?;
     br.read_bit()?; // sps_temporal_id_nesting_flag
-    if !skip_profile_tier_level(&mut br, max_sub_layers_minus1 as u8) {
+    if !skip_profile_tier_level(&mut br, max_sub_layers_minus1) {
         return None;
     }
     br.read_ue()?; // sps_seq_parameter_set_id
@@ -609,12 +609,8 @@ fn parse_hevc_sps_dims(rbsp: &[u8]) -> Option<(u32, u32)> {
     hevc_sps::picture_size(pic_width, pic_height, conf_win, (2, 2))
 }
 
-/// Mirrors `engine::content_analysis::signalling::skip_profile_tier_level`
-/// — see that function's commentary for why the per-sub-layer chunk is
-/// 112 bits (32+32+16+32) rather than the spec-correct 88. The over-read
-/// matches what real broadcast HEVC encoders emit and is necessary for
-/// `pic_width` / `pic_height` to land at the right bit boundary.
-fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u8) -> bool {
+/// Mirrors `engine::content_analysis::signalling::skip_profile_tier_level`.
+fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u32) -> bool {
     if br.read_bits(8).is_none() {
         return false;
     }
@@ -627,31 +623,7 @@ fn skip_profile_tier_level(br: &mut BitReader, max_sub_layers_minus1: u8) -> boo
     if br.read_bits(8).is_none() {
         return false;
     }
-    let mut sub_layer_profile_present = [0u8; 8];
-    let mut sub_layer_level_present = [0u8; 8];
-    for i in 0..max_sub_layers_minus1 as usize {
-        sub_layer_profile_present[i] = br.read_bit().unwrap_or(0);
-        sub_layer_level_present[i] = br.read_bit().unwrap_or(0);
-    }
-    if max_sub_layers_minus1 > 0 {
-        for _ in max_sub_layers_minus1..8 {
-            let _ = br.read_bits(2);
-        }
-    }
-    for i in 0..max_sub_layers_minus1 as usize {
-        if sub_layer_profile_present[i] == 1
-            && (br.read_bits(32).is_none()
-                || br.read_bits(32).is_none()
-                || br.read_bits(16).is_none()
-                || br.read_bits(32).is_none())
-            {
-                return false;
-            }
-        if sub_layer_level_present[i] == 1 && br.read_bits(8).is_none() {
-            return false;
-        }
-    }
-    true
+    hevc_sps::skip_sub_layers(max_sub_layers_minus1, |n| br.read_bits(n)).is_some()
 }
 
 #[cfg(test)]
@@ -818,6 +790,22 @@ mod tests {
         }
         // Its reference picture sets are past its size, and not read.
         assert_eq!(find_hevc_sps_dims(&edge_213().annex_b()), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn an_hevc_sps_is_read_past_its_sub_layers() {
+        for sps in hevc_sps::tests::sub_layered() {
+            assert_eq!(find_hevc_sps_dims(&sps.annex_b()), Some((720, 576)), "{:?}", sps.sub_layers);
+        }
+        for (what, sps, size, _) in hevc_sps::tests::real_sps() {
+            if !hevc_sps::tests::cropped_by_2x2().iter().any(|(of, ..)| *of == what) {
+                assert_eq!(find_hevc_sps_dims(&[&[0, 0, 1], &sps[..]].concat()), Some(size), "{what}");
+            }
+        }
+        for (i, (sps, says)) in hevc_sps::tests::valid_sps(hevc_sps::tests::VALID).enumerate() {
+            let size = hevc_sps::picture_size(says.coded.0, says.coded.1, says.conf_win, (2, 2));
+            assert_eq!(find_hevc_sps_dims(&[&[0, 0, 1], &sps[..]].concat()), size, "{i}");
+        }
     }
 
     #[test]

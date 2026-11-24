@@ -69,7 +69,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::engine::cmaf::param_sets::tests::{Bits, escaped, hx};
 
-    /// An H.264 SPS, as far as its VUI flag.
+    /// An H.264 SPS, as far as its VUI's timing.
     #[derive(Clone, Copy)]
     pub(crate) struct Sps {
         pub profile: u8,
@@ -86,9 +86,11 @@ pub(crate) mod tests {
         pub frame_mbs_only: bool,
         /// Left, right, top, bottom.
         pub crop: Option<[u32; 4]>,
+        /// `(num_units_in_tick, time_scale)` of a VUI; `None` for no VUI.
+        pub timing: Option<(u32, u32)>,
     }
 
-    /// Baseline, 1920x1088, not cropped.
+    /// Baseline, 1920x1088, not cropped, no VUI.
     impl Default for Sps {
         fn default() -> Self {
             Self {
@@ -101,6 +103,7 @@ pub(crate) mod tests {
                 height_in_map_units_minus1: 67,
                 frame_mbs_only: true,
                 crop: None,
+                timing: None,
             }
         }
     }
@@ -147,7 +150,10 @@ pub(crate) mod tests {
             for offset in self.crop.into_iter().flatten() {
                 b.ue(offset);
             }
-            b.put(0, 1); // vui_parameters_present_flag
+            b.put(u64::from(self.timing.is_some()), 1); // vui_parameters_present_flag
+            if let Some((num_units_in_tick, time_scale)) = self.timing {
+                b.put(0, 4).put(1, 1).put(u64::from(num_units_in_tick), 32).put(u64::from(time_scale), 32);
+            }
             b.done()
         }
 

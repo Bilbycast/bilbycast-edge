@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::content_analysis::bitreader::{unescape_rbsp, BitReader};
 use crate::engine::h264_sps::picture_size;
+use crate::engine::hevc_sps;
 use crate::engine::ts_parse::{extract_pes_pts, pes_payload_offset, ts_pusi};
 
 /// Default splice budget for audio in milliseconds. ≥8 audio frames at
@@ -948,17 +949,17 @@ fn bit_depth(minus8: u32, max: u8) -> Option<u8> {
 }
 
 /// Parse an HEVC SPS RBSP into [`VideoCodecParams`]. Same shape /
-/// fail-safe semantics as [`parse_avc_sps_params`]. The
-/// `profile_tier_level` walk mirrors the production parser in
-/// `engine::content_analysis::signalling::skip_profile_tier_level` —
-/// 112 bits per sub_layer profile rather than the spec's 88, because
-/// the spec-correct chunking reads `pic_width` / `pic_height` as 0 on
-/// some live 4K HEVC encoders (encoder quirk; see comment on
-/// `skip_profile_tier_level`).
+/// fail-safe semantics as [`parse_avc_sps_params`].
+///
+/// The sub-layers' own profiles and levels are skipped, not compared. Until
+/// 2026-11 24 bits too many were skipped for each profile, so on an SPS that
+/// has one the fields behind it were read from the wrong bits: two legs with
+/// the same parameters could differ, and two with others compare equal or not
+/// at all.
 pub fn parse_hevc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
     let mut br = BitReader::new(rbsp);
     br.read_bits(4)?; // sps_video_parameter_set_id
-    let max_sub_layers_minus1 = br.read_bits(3)? as u8;
+    let max_sub_layers_minus1 = br.read_bits(3)?;
     br.read_bit()?; // sps_temporal_id_nesting_flag
 
     // profile_tier_level — inline rather than reusing
@@ -973,29 +974,7 @@ pub fn parse_hevc_sps_params(rbsp: &[u8]) -> Option<VideoCodecParams> {
     br.read_bits(16)?;
     br.read_bits(32)?;
     let general_level_idc = br.read_bits(8)? as u8;
-    let mut sub_layer_profile_present = [0u8; 8];
-    let mut sub_layer_level_present = [0u8; 8];
-    for i in 0..max_sub_layers_minus1 as usize {
-        sub_layer_profile_present[i] = br.read_bit()?;
-        sub_layer_level_present[i] = br.read_bit()?;
-    }
-    if max_sub_layers_minus1 > 0 {
-        for _ in max_sub_layers_minus1..8 {
-            br.read_bits(2)?; // reserved_zero_2bits
-        }
-    }
-    for i in 0..max_sub_layers_minus1 as usize {
-        if sub_layer_profile_present[i] == 1 {
-            // 112 bits — matches signalling.rs production-tested chunking.
-            br.read_bits(32)?;
-            br.read_bits(32)?;
-            br.read_bits(16)?;
-            br.read_bits(32)?;
-        }
-        if sub_layer_level_present[i] == 1 {
-            br.read_bits(8)?;
-        }
-    }
+    hevc_sps::skip_sub_layers(max_sub_layers_minus1, |n| br.read_bits(n))?;
 
     br.read_ue()?; // sps_seq_parameter_set_id
     let chroma_format_idc = br.read_ue()? as u8;
@@ -2432,7 +2411,18 @@ mod tests {
         payload.extend_from_slice(sps_rbsp);
         // IDR slice: start code + NAL header (type 5, nal_ref_idc=3)
         payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x65]);
+        pkt_with_video_es(pts, &payload)
+    }
 
+    /// The HEVC sibling: AUD, the SPS NAL unit `sps`, the start of an
+    /// IDR_W_RADL slice.
+    fn pkt_with_hevc_idr_pes(pts: u64, sps: &[u8]) -> [u8; 188] {
+        let payload = [&[0, 0, 0, 1, 0x46, 0x01, 0x50, 0, 0, 0, 1], sps, &[0, 0, 0, 1, 0x26, 0x01]].concat();
+        assert!(payload.len() <= 170, "fits the packet");
+        pkt_with_video_es(pts, &payload)
+    }
+
+    fn pkt_with_video_es(pts: u64, payload: &[u8]) -> [u8; 188] {
         let mut p = [0u8; 188];
         p[0] = 0x47;
         p[1] = 0x40; // PUSI=1
@@ -2807,6 +2797,70 @@ mod tests {
         for bit_depths in [(7, 0), (0, 7)] {
             assert_eq!(avc(bit_depths), None, "{bit_depths:?}");
             assert!(hevc(bit_depths).is_some(), "{bit_depths:?}");
+        }
+    }
+
+    #[test]
+    fn an_hevc_sps_has_the_params_behind_its_sub_layers() {
+        use crate::engine::hevc_sps::tests::{Sps, VALID, real_sps, sub_layered, valid_sps};
+        let params = |nal: &[u8]| parse_hevc_sps_params(&unescape_rbsp(&nal[2..]));
+        let plain = params(&Sps { width: 720, height: 576, ..Sps::default() }.nal()).unwrap();
+        assert_eq!(
+            (plain.profile_idc, plain.level_idc, plain.chroma_format_idc, plain.width, plain.height),
+            (1, 120, 1, 720, 576)
+        );
+        for sps in sub_layered() {
+            assert_eq!(params(&sps.nal()), Some(plain), "{:?}", sps.sub_layers);
+        }
+        for (i, (nal, says)) in valid_sps(VALID).enumerate() {
+            let says = VideoCodecParams {
+                codec: VideoCodec::Hevc,
+                profile_idc: says.profile,
+                level_idc: says.level,
+                chroma_format_idc: says.chroma as u8,
+                bit_depth_luma: says.bit_depths.0,
+                bit_depth_chroma: says.bit_depths.1,
+                width: says.coded.0,
+                height: says.coded.1,
+            };
+            assert_eq!(params(&nal), Some(says), "{i}");
+        }
+        let real = real_sps();
+        let (_, nal, size, _) = real.iter().find(|(what, ..)| what.starts_with("SLPPLP_A_VIDYO_2")).unwrap();
+        let read = params(nal).unwrap();
+        assert_eq!(((read.width, read.height), read.bit_depth_luma), (*size, 8));
+    }
+
+    /// A leg whose SPS gives the profiles of its sub-layers is compared by
+    /// what the SPS says of the stream, with one that gives none too.
+    #[test]
+    fn hevc_legs_with_sub_layer_profiles_are_compared_by_their_params() {
+        use crate::engine::hevc_sps::tests::Sps;
+        const LAYERS: &[(bool, bool)] = &[(true, true), (true, true)];
+        let splice = |a: Sps, b: Sps| {
+            let a = extract_video_params_from_pes(&pkt_with_hevc_idr_pes(90_000, &a.nal()), 0x24);
+            assert!(a.is_some());
+            let mut s = VideoSpliceState::default();
+            assert!(s.arm("to-leg".into(), 0x24, 90_000, Instant::now(), Duration::from_secs(2), a));
+            s.observe_b_packet(&pkt_with_hevc_idr_pes(93_600, &b.nal())).unwrap()
+        };
+        let plain = Sps::default;
+        let layered = || Sps { sub_layers: LAYERS, ..plain() };
+        let committed = SpliceOutcome::Committed { first_b_pts: 93_600 };
+        assert_eq!(splice(layered(), layered()), committed);
+        assert_eq!(splice(layered(), plain()), committed);
+        assert_eq!(splice(plain(), layered()), committed);
+        // The same size, and a frame rate and reference pictures of its own.
+        let other = Sps { timing: (1, 50), ref_pic_sets: 2, log2_max_poc_lsb_minus4: 12, ..layered() };
+        assert_eq!(splice(layered(), other), committed);
+        for small in [Sps { width: 1280, height: 720, ..plain() }, Sps { width: 1280, height: 720, ..layered() }] {
+            for (a, b) in [(layered(), small), (small, layered())] {
+                let outcome = splice(a, b);
+                let SpliceOutcome::VideoCodecParamMismatch { a_params, b_params, .. } = outcome else {
+                    panic!("{outcome:?}");
+                };
+                assert_eq!((a_params.width, b_params.width), (a.width, b.width));
+            }
         }
     }
 
