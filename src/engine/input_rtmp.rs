@@ -291,23 +291,23 @@ async fn process_media(
             layout = PublishLayout::default();
             configured = None;
         }
-        match kind {
-            // Its first frame on air: what it said of its media, if
-            // that was kept back while another was.
-            MessageKind::Media if configured != Some(publish) => {
-                if configured.take().is_some() {
-                    layout = PublishLayout::default();
-                }
-                queue.extend(configs.get(&publish).into_iter().flat_map(|c| c.messages.iter().cloned().map(|m| m.1)));
-                configured = Some(publish);
-            }
-            // With none on air the first to say anything is heard at
-            // once, as it will most likely be the one.
+        let first_heard = match kind {
+            MessageKind::End => false,
+            MessageKind::Media => configured != Some(publish),
+            // With none on air the first to say anything is heard at once, as
+            // it will most likely be the one.
             MessageKind::Config(_) | MessageKind::Other => match on_air.or(configured) {
                 Some(heard) if heard != publish => continue,
-                _ => configured = Some(publish),
+                heard => heard.is_none(),
             },
-            _ => {}
+        };
+        if first_heard {
+            if configured.replace(publish).is_some() {
+                layout = PublishLayout::default();
+            }
+            // What it said of its media while another was heard.
+            let kept = configs.get(&publish).into_iter().flat_map(|c| &c.messages);
+            queue.extend(kept.filter(|(slot, _)| kind != MessageKind::Config(*slot)).map(|(_, kept)| kept.clone()));
         }
         queue.push_back(msg);
         while let Some(msg) = queue.pop_front() {
@@ -1395,6 +1395,58 @@ mod tests {
         // One that only got as far as its headers says so, as it ends.
         let (_, events) = muxed_with_events(vec![(0, 1, vec![avc_config()]), (0, 1, end())]).await;
         assert_eq!(events, [connected, disconnected]);
+    }
+
+    /// A reconnecting publisher's headers are all heard, wherever among them
+    /// the old connection's end lands.
+    #[tokio::test]
+    async fn headers_around_the_last_publishs_end_are_all_heard() {
+        let high = {
+            let mut data = vec![0x17, 0x00, 0, 0, 0, 1, 0x64, 0x00, 0x28, 0xFF, 0xE1, 0x00, 0x04];
+            data.extend_from_slice(&[0x67, 0x64, 0x00, 0x28, 0x01, 0x00, 0x02, 0x68, 0xEE]);
+            RtmpMediaMessage::Video { data: data.into(), timestamp_ms: 0 }
+        };
+        let aac_441 = RtmpMediaMessage::Audio { data: bytes::Bytes::from_static(&[0xAF, 0x00, 0x12, 0x10]), timestamp_ms: 0 };
+        let av = [RtmpMediaMessage::Metadata { declares_video: Some(true) }, high, aac_441];
+        let order = |of: [usize; 3]| of.map(|k| av[k].clone()).to_vec();
+        for headers in [order([0, 1, 2]), order([0, 2, 1]), order([1, 2, 0]), order([2, 0, 1])] {
+            for cut in 0..=headers.len() {
+                let mut a = vec![avc_config(), aac_config(), avc_frame(0, true, &[5])];
+                a.extend(aac_frames(2, 0));
+                let b = [avc_frame(0, true, &[5]), avc_frame(40, true, &[5])];
+                let parts = vec![
+                    (0, 1, a),
+                    (0, 2, headers[..cut].to_vec()),
+                    (0, 1, vec![RtmpMediaMessage::Disconnected]),
+                    (0, 2, headers[cut..].to_vec()),
+                    (0, 2, [b.to_vec(), aac_frames(2, 0)].concat()),
+                ];
+                let (ts, events) = muxed_with_events(parts).await;
+                let sps = |p: &&Vec<u8>| p.windows(2).find(|w| w[0] == 0x67).map(|w| w[1]);
+                let idrs = ts.iter().filter(|p| ts_pid(p) == 0x0100 && ts_pusi(p));
+                assert_eq!(idrs.filter_map(|p| sps(&p)).collect::<Vec<_>>(), [0x42, 0x64, 0x64], "cut {cut}");
+                let adts = ts.iter().filter(|p| ts_pid(p) == 0x0101 && ts_pusi(p)).map(|p| {
+                    let off = crate::engine::ts_parse::ts_payload_offset(p);
+                    (p[off + 9 + p[off + 8] as usize + 2] >> 2) & 0x0F
+                });
+                assert_eq!(adts.collect::<Vec<_>>(), [3, 3, 4, 4], "cut {cut}");
+                let connected = events.iter().filter(|e| *e == "RTMP publisher connected").count();
+                assert_eq!((connected, events.len()), (2, 3), "cut {cut}: {events:?}");
+            }
+        }
+        // An audio-only one is laid out as one from its first frame.
+        let headers = [RtmpMediaMessage::Metadata { declares_video: Some(false) }, aac_config()];
+        for cut in 0..=2 {
+            let parts = vec![
+                (0, 1, vec![avc_config(), avc_frame(0, true, &[5])]),
+                (0, 2, headers[..cut].to_vec()),
+                (0, 1, vec![RtmpMediaMessage::Disconnected]),
+                (0, 2, headers[cut..].to_vec()),
+                (0, 2, aac_frames(20, 0)),
+            ];
+            let ts = muxed_of(parts).await;
+            assert_eq!(ts.iter().filter(|p| ts_pid(p) == 0x0101 && ts_pusi(p) && extract_pcr(p).is_some()).count(), 20, "cut {cut}");
+        }
     }
 
     /// With none on air, what one publish has said does not stay for another
