@@ -779,11 +779,14 @@ impl KmsDisplay {
     /// Open the KMS card backing `connector_name`, drm-master the device,
     /// pick the requested mode (or the connector's preferred mode when
     /// `(width, height, refresh_hz)` is `None`), allocate two XRGB8888
-    /// dumb buffers, and program the initial mode-set. Returns an error
-    /// (lifted by the caller onto `command_ack.error_code`) when:
-    /// - the connector is not enumerated (`display_device_invalid`),
-    /// - the requested mode is not supported (`display_resolution_unsupported`),
-    /// - the modeset fails (`display_mode_set_failed`).
+    /// dumb buffers, and program the initial mode-set. The caller retries
+    /// an error and reports it in events (`display_output_waiting`, then a
+    /// Critical); it opens after the ack, so no `command_ack` carries it.
+    /// The error's text starts with the code the caller reads off it when:
+    /// - the connector is not found or not connected (`display_device_invalid`),
+    /// - the connector has no modes (`display_resolution_unsupported`),
+    /// - another DRM master holds it (`display_master_busy`),
+    /// - the modeset fails any other way (`display_mode_set_failed`).
     pub fn open(
         connector_name: &str,
         width: Option<u32>,

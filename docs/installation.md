@@ -1101,7 +1101,7 @@ sessions exist. Video keeps rendering (DRM is a separate path) while
 every ALSA open fails, and alsa-lib reports the misleading
 `ALSA lib confmisc.c: (snd_config_get_card) Cannot get card index for N`
 — that is EACCES on `/dev/snd/controlCN`, not a missing sound card.
-The edge raises Critical `display_audio_open_failed` events and, after
+The edge raises Critical `display_audio_device_invalid` events and, after
 10 consecutive failures, `display_audio_disabled_persistent_failure`
 (see the event catalogue).
 
@@ -1191,9 +1191,10 @@ transcoding prerequisites in *Running on an NVIDIA host* above.)
 
 The schema is unconditional on every host (configs round-trip
 cleanly), but the runtime spawner is `cfg(all(feature = "display",
-target_os = "linux"))`. macOS dev builds reject `display` outputs at
-`start_output()` with `display_device_invalid`, so the manager UI
-surfaces the offending field clearly.
+target_os = "linux"))`. A build without the feature, or not for Linux
+(a macOS dev build), refuses a `display` output at `start_output()` and
+names `display_device_invalid` in the error's text only; no
+`command_ack` carries it as its `error_code`.
 
 `display-vaapi` / `display-nvdec` are placeholders for v2 hardware
 decode and currently fail at compile time (so the manager UI can
