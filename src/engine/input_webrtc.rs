@@ -1527,7 +1527,10 @@ impl WhipMux {
     /// pictures of a pull whose first picture was cached, the one shown first
     /// still to come. Not past the PCR the first of them will carry: that is
     /// no earlier than the one shown first of those that have come puts it.
-    /// Nothing while the IDR itself is held, for the channel count.
+    /// Nothing while the IDR itself is held, for the channel count. Padded
+    /// with null packets to whole datagrams: the UDP, RTP and RIST outputs
+    /// re-chunk to seven packets, and would hold the PCR until the pictures it
+    /// is sent for went out.
     fn run_pcr_on(&mut self, now: std::time::Instant) -> Vec<MuxedFrame> {
         let Some(primed) = self.primed.as_ref().filter(|p| self.held.is_empty() && p.held.last().is_some_and(|f| f.video))
         else {
@@ -1540,8 +1543,14 @@ impl WhipMux {
         let behind = u64::try_from(opens.shown - live.shown).unwrap_or(0);
         let shown_first_at = live.frame.arrival;
         let ts = self.clock.start_90k(now).min(self.clock.start_90k(shown_first_at) + behind) & 0x1_FFFF_FFFF;
-        let packets = self.muxer.run_pcr_on(ts);
-        if packets.is_empty() { Vec::new() } else { vec![(packets, ts)] }
+        let mut packets = self.muxer.run_pcr_on(ts);
+        if packets.is_empty() {
+            return Vec::new();
+        }
+        let null = crate::engine::flow::null_ts_packet().data;
+        let whole = packets.len().next_multiple_of(crate::engine::packet::TS_PACKETS_PER_ITEM);
+        packets.resize_with(whole, || null.slice(..188));
+        vec![(packets, ts)]
     }
 
     /// The held video muxed, in order, and the channel count closed for the
@@ -4460,6 +4469,9 @@ mod tests {
             assert_eq!(pts_on(&out, 0x0100), [0u64; 0], "held");
             assert!(pmt_codes(&out).is_empty());
             pcrs.extend(pcrs_in(&out));
+            // A datagram of its own, which an output sends at once.
+            let pids: Vec<u16> = out[0].0.iter().map(|p| crate::engine::ts_parse::ts_pid(p)).collect();
+            assert_eq!(pids, [0x0100, 0x1FFF, 0x1FFF, 0x1FFF, 0x1FFF, 0x1FFF, 0x1FFF]);
             assert!(opus_at(&mut w, t0, at + 5, 0xFC).is_empty(), "and the sound, no PCR with it");
         }
         assert_eq!(pcrs, [20, 60, 100].map(|at| (at * 90, false)));
