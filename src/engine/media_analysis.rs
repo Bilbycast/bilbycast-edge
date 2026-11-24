@@ -891,8 +891,17 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                 }
             }
             0x24 => {
-                // H.265/HEVC — look for SPS NAL unit (type 33)
-                if let Some(sps_info) = find_and_parse_h265_sps(es_data) {
+                // H.265/HEVC — look for SPS NAL unit (type 33). Each is read (none sets
+                // `sps_detected`), so that a change of rate is followed: until 2026-11
+                // an SPS with predicted reference picture sets stated none here, and
+                // the measurement followed it.
+                if let Some((sps_info, whole)) = find_and_parse_h265_sps(es_data)
+                    && let Some(v) = state
+                        .programs
+                        .iter_mut()
+                        .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
+                    && sps_info.changes(v, whole)
+                {
                     tracing::info!(
                         "Media analysis: H.265 PID 0x{:04X}: {}x{}{}, profile={}, level={}",
                         pid,
@@ -905,21 +914,19 @@ fn try_parse_video_pes(pkt: &[u8], pid: u16, state: &mut MediaAnalysisState) {
                         sps_info.profile,
                         sps_info.level,
                     );
-                    if let Some(v) = state
-                        .programs
-                        .iter_mut()
-                        .find_map(|p| p.video_streams.iter_mut().find(|v| v.pid == pid))
-                    {
-                        v.width = Some(sps_info.width);
-                        v.height = Some(sps_info.height);
-                        if let Some(fps) = sps_info.frame_rate {
-                            v.frame_rate = Some(fps);
-                            v.rate_from_bitstream = true;
-                        }
-                        v.profile = Some(sps_info.profile);
-                        v.level = Some(sps_info.level);
-                        v.sps_detected = true;
+                    v.width = Some(sps_info.width);
+                    v.height = Some(sps_info.height);
+                    if let Some(fps) = sps_info.frame_rate {
+                        v.frame_rate = Some(fps);
+                        v.rate_from_bitstream = true;
+                    } else if v.rate_from_bitstream {
+                        // The SPS before it stated a rate: measured from here on.
+                        v.frame_rate = None;
+                        v.rate_from_bitstream = false;
+                        v.ts_rate = Default::default();
                     }
+                    v.profile = Some(sps_info.profile);
+                    v.level = Some(sps_info.level);
                 }
             }
             _ => {}
@@ -1274,6 +1281,19 @@ struct SpsInfo {
     level: String,
 }
 
+impl SpsInfo {
+    /// Whether this SPS says other of `v` than the last one did. One that is
+    /// not `whole` may go on in the next packet, and says nothing of the rate
+    /// where it has none.
+    fn changes(&self, v: &VideoStreamState, whole: bool) -> bool {
+        let stated = v.frame_rate.filter(|_| v.rate_from_bitstream);
+        (Some(self.width), Some(self.height)) != (v.width, v.height)
+            || Some(&self.profile) != v.profile.as_ref()
+            || Some(&self.level) != v.level.as_ref()
+            || (self.frame_rate != stated && (whole || self.frame_rate.is_some()))
+    }
+}
+
 /// Find a H.264 SPS NAL unit in elementary stream data and parse it.
 fn find_and_parse_h264_sps(data: &[u8]) -> Option<SpsInfo> {
     // Look for NAL start codes (0x00 0x00 0x01 or 0x00 0x00 0x00 0x01)
@@ -1486,7 +1506,7 @@ fn parse_h264_vui_timing(reader: &mut BitReader) -> Option<f64> {
 /// From here on the rate a VUI states is taken for a clock's, not the
 /// pictures': 1000 is what FFmpeg's libx264 writes for a millisecond time
 /// base, 90000 for MPEG's. The levels of H.265 allow 300 pictures a second
-/// (fR, §A.4.2), and a high-speed source has more than three times that.
+/// (fR, §A.4.2), and a high-speed source may state over three times that.
 const VUI_CLOCK_RATE: f64 = 1000.0;
 
 /// The frame rate a VUI's timing states. `None`, so that it is measured from
@@ -1500,8 +1520,9 @@ fn vui_frame_rate(num_units_in_tick: u32, time_scale: u32, ticks_per_frame: f64)
 
 // ── H.265 SPS Parser ────────────────────────────────────────────────────
 
-/// Find a H.265 SPS NAL unit in elementary stream data and parse it.
-fn find_and_parse_h265_sps(data: &[u8]) -> Option<SpsInfo> {
+/// Find a H.265 SPS NAL unit in elementary stream data and parse it. With it,
+/// whether all of it is there, as another NAL unit behind it shows.
+fn find_and_parse_h265_sps(data: &[u8]) -> Option<(SpsInfo, bool)> {
     let mut i = 0;
     while i + 4 < data.len() {
         let nal_start = if data[i] == 0x00 && data[i + 1] == 0x00 && data[i + 2] == 0x01 {
@@ -1524,7 +1545,7 @@ fn find_and_parse_h265_sps(data: &[u8]) -> Option<SpsInfo> {
                     // SPS
                     let end = find_nal_end(data, start);
                     let sps_bytes = remove_emulation_prevention(&data[start..end]);
-                    return parse_h265_sps(&sps_bytes);
+                    return Some((parse_h265_sps(&sps_bytes)?, end < data.len()));
                 }
             }
             i = start;
@@ -1636,7 +1657,7 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
         let bit_depth_luma_minus8 = reader.read_exp_golomb()?;
         let bit_depth_chroma_minus8 = reader.read_exp_golomb()?;
         let log2_max_pic_order_cnt_lsb_minus4 = reader.read_exp_golomb()?;
-        tracing::debug!(
+        tracing::trace!(
             "H.265 SPS VUI parse: bit_depth_luma_m8={}, bit_depth_chroma_m8={}, log2_max_poc_lsb_m4={}",
             bit_depth_luma_minus8, bit_depth_chroma_minus8, log2_max_pic_order_cnt_lsb_minus4
         );
@@ -1652,7 +1673,7 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
             reader.read_exp_golomb()?; // max_num_reorder_pics
             reader.read_exp_golomb()?; // max_latency_increase_plus1
         }
-        tracing::debug!("H.265 SPS VUI parse: passed sub-layer ordering");
+        tracing::trace!("H.265 SPS VUI parse: passed sub-layer ordering");
 
         let _log2_min_luma_coding_block_size_minus3 = reader.read_exp_golomb()?;
         let _log2_diff_max_min_luma_coding_block_size = reader.read_exp_golomb()?;
@@ -1662,7 +1683,7 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
         let _max_transform_hierarchy_depth_intra = reader.read_exp_golomb()?;
 
         let scaling_list_enabled_flag = reader.read_bits(1)?;
-        tracing::debug!("H.265 SPS VUI parse: scaling_list_enabled={}", scaling_list_enabled_flag);
+        tracing::trace!("H.265 SPS VUI parse: scaling_list_enabled={}", scaling_list_enabled_flag);
         if scaling_list_enabled_flag == 1 {
             let sps_scaling_list_data_present_flag = reader.read_bits(1)?;
             if sps_scaling_list_data_present_flag == 1 {
@@ -1674,7 +1695,7 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
         let sao_enabled = reader.read_bits(1)?; // sample_adaptive_offset_enabled_flag
 
         let pcm_enabled_flag = reader.read_bits(1)?;
-        tracing::debug!("H.265 SPS VUI parse: amp={}, sao={}, pcm={}", amp_enabled, sao_enabled, pcm_enabled_flag);
+        tracing::trace!("H.265 SPS VUI parse: amp={}, sao={}, pcm={}", amp_enabled, sao_enabled, pcm_enabled_flag);
         if pcm_enabled_flag == 1 {
             reader.read_bits(4)?; // pcm_sample_bit_depth_luma_minus1
             reader.read_bits(4)?; // pcm_sample_bit_depth_chroma_minus1
@@ -1689,19 +1710,19 @@ fn parse_h265_sps_clean(mut reader: BitReader, sps_max_sub_layers_minus1: u8) ->
             BitReader::read_bits,
             BitReader::read_exp_golomb,
         )?;
-        tracing::debug!("H.265 SPS VUI parse: passed reference picture sets");
+        tracing::trace!("H.265 SPS VUI parse: passed reference picture sets");
 
         let temporal_mvp = reader.read_bits(1)?; // sps_temporal_mvp_enabled_flag
         let strong_intra = reader.read_bits(1)?; // strong_intra_smoothing_enabled_flag
 
         let vui_parameters_present_flag = reader.read_bits(1)?;
-        tracing::debug!(
+        tracing::trace!(
             "H.265 SPS VUI parse: temporal_mvp={}, strong_intra={}, vui_present={}",
             temporal_mvp, strong_intra, vui_parameters_present_flag
         );
         if vui_parameters_present_flag == 1 {
             let result = parse_h265_vui_timing(&mut reader);
-            tracing::debug!("H.265 SPS VUI parse: vui_timing result={:?}", result);
+            tracing::trace!("H.265 SPS VUI parse: vui_timing result={:?}", result);
             return result;
         }
         None
@@ -1777,11 +1798,11 @@ fn parse_h265_vui_timing(reader: &mut BitReader) -> Option<f64> {
     }
     // vui_timing_info_present_flag
     let timing_info_present = reader.read_bits(1)?;
-    tracing::debug!("H.265 VUI: timing_info_present={}", timing_info_present);
+    tracing::trace!("H.265 VUI: timing_info_present={}", timing_info_present);
     if timing_info_present == 1 {
         let num_units_in_tick = reader.read_bits(32)?;
         let time_scale = reader.read_bits(32)?;
-        tracing::debug!("H.265 VUI: num_units_in_tick={}, time_scale={}", num_units_in_tick, time_scale);
+        tracing::trace!("H.265 VUI: num_units_in_tick={}, time_scale={}", num_units_in_tick, time_scale);
         return vui_frame_rate(num_units_in_tick, time_scale, 1.0);
     }
     None
@@ -2352,9 +2373,20 @@ mod tests {
     }
 
     const AVC_SLICE: [u8; 8] = [0, 0, 0, 1, 0x41, 0x9A, 0x00, 0x10];
+    const HEVC_SLICE: [u8; 8] = [0, 0, 0, 1, 0x02, 0x01, 0xD0, 0x21];
 
     /// The same of a stream, H.264 or H.265, every frame of which is `es`.
     fn reported_rates_of(h265: bool, es: &[u8], steps: impl IntoIterator<Item = u64>) -> Vec<Option<f64>> {
+        let frames = std::iter::once(0).chain(steps).map(|step| (es, step));
+        reported_video(h265, frames).into_iter().map(|(_, rate)| rate).collect()
+    }
+
+    /// The width and frame rate an analyser reports, frame by frame, for a
+    /// stream of `(access unit, ticks since the one before it)`.
+    fn reported_video<'a>(
+        h265: bool,
+        frames: impl IntoIterator<Item = (&'a [u8], u64)>,
+    ) -> Vec<(Option<u16>, Option<f64>)> {
         use crate::engine::rtmp::ts_mux::{PCR_LEAD_90K, STREAM_TYPE_H265, TsMuxer};
         let acc =
             MediaAnalysisAccumulator::new("webrtc".into(), "raw_ts".into(), false, None, false, None);
@@ -2365,14 +2397,15 @@ mod tests {
         }
         let mut pts = PCR_LEAD_90K;
         let mut reported = Vec::new();
-        for (i, step) in std::iter::once(0).chain(steps).enumerate() {
+        for (i, (es, step)) in frames.into_iter().enumerate() {
             pts += step;
             for chunk in muxer.mux_video(es, pts, pts, i == 0) {
                 for pkt in chunk.chunks(188) {
                     process_ts_packet(pkt, &mut state);
                 }
             }
-            reported.push(state.programs[0].video_streams[0].frame_rate);
+            let v = &state.programs[0].video_streams[0];
+            reported.push((v.width, v.frame_rate));
         }
         reported
     }
@@ -2762,12 +2795,16 @@ mod tests {
         }
     }
 
+    fn h265_info(data: &[u8]) -> Option<SpsInfo> {
+        find_and_parse_h265_sps(data).map(|(info, _whole)| info)
+    }
+
     /// edge#213: an HEVC SPS whose size or crop is out of range is not read.
     #[test]
     fn an_h265_sps_out_of_range_is_not_read() {
         use super::super::hevc_sps::tests::{crops, sizes};
         for (sps, size) in sizes().into_iter().chain(crops()) {
-            let info = find_and_parse_h265_sps(&sps.annex_b());
+            let info = h265_info(&sps.annex_b());
             assert_eq!(info.as_ref().map(|i| (u32::from(i.width), u32::from(i.height))), size);
             assert_eq!(info.and_then(|i| i.frame_rate), size.map(|_| 25.0));
         }
@@ -2780,7 +2817,7 @@ mod tests {
     fn an_h265_sps_out_of_range_past_its_size_has_no_frame_rate() {
         use super::super::hevc_sps::tests::{Sps, edge_213};
         let rate = |sps: Sps| {
-            let info = find_and_parse_h265_sps(&sps.annex_b()).unwrap();
+            let info = h265_info(&sps.annex_b()).unwrap();
             assert_eq!((info.width, info.height), (1920, 1080));
             info.frame_rate
         };
@@ -2809,7 +2846,7 @@ mod tests {
     #[test]
     fn a_real_h265_sps_has_the_size_and_rate_ffprobe_reads() {
         for (what, sps, size, rate) in super::super::hevc_sps::tests::real_sps() {
-            let info = find_and_parse_h265_sps(&[&[0, 0, 1], &sps[..]].concat()).unwrap();
+            let info = h265_info(&[&[0, 0, 1], &sps[..]].concat()).unwrap();
             assert_eq!((u32::from(info.width), u32::from(info.height)), size, "{what}");
             assert_eq!(info.frame_rate, rate, "{what}");
         }
@@ -2818,7 +2855,7 @@ mod tests {
     #[test]
     fn an_h265_sps_is_read_past_its_sub_layers() {
         for sps in super::super::hevc_sps::tests::sub_layered() {
-            let info = find_and_parse_h265_sps(&sps.annex_b()).unwrap();
+            let info = h265_info(&sps.annex_b()).unwrap();
             assert_eq!((info.width, info.height), (720, 576), "{:?}", sps.sub_layers);
             assert_eq!(info.frame_rate, Some(25.0), "{:?}", sps.sub_layers);
         }
@@ -2828,7 +2865,7 @@ mod tests {
     fn a_random_h265_sps_in_range_is_read_as_it_was_written() {
         use super::super::hevc_sps::tests::{VALID, valid_sps};
         for (i, (sps, says)) in valid_sps(VALID).enumerate() {
-            let info = find_and_parse_h265_sps(&[&[0, 0, 1], &sps[..]].concat()).unwrap();
+            let info = h265_info(&[&[0, 0, 1], &sps[..]].concat()).unwrap();
             let unit = [(1, 1), (2, 2), (2, 1), (1, 1)][says.chroma as usize];
             let size = hevc_sps::picture_size(says.coded.0, says.coded.1, says.conf_win, unit).unwrap();
             assert_eq!((u32::from(info.width), u32::from(info.height)), size, "{i}");
@@ -2862,7 +2899,7 @@ mod tests {
             ((0, 25), None),
             ((0, 0), None),
         ] {
-            let info = find_and_parse_h265_sps(&Hevc { timing, ..Hevc::default() }.annex_b()).unwrap();
+            let info = h265_info(&Hevc { timing, ..Hevc::default() }.annex_b()).unwrap();
             assert_eq!((info.width, info.frame_rate), (1920, rate), "H.265 {timing:?}");
             // H.264's tick is a field's.
             let info = find_and_parse_h264_sps(&Avc { timing: Some(timing), ..Avc::default() }.annex_b());
@@ -2889,15 +2926,145 @@ mod tests {
         use super::super::hevc_sps::tests::Sps as Hevc;
         let steps = || std::iter::repeat_n(1_800, 200);
         let avc = |timing| [&Avc { timing: Some(timing), ..Avc::default() }.annex_b()[..], &AVC_SLICE].concat();
-        let hevc = |timing| {
-            [&Hevc { timing, ..Hevc::default() }.annex_b()[..], &[0, 0, 0, 1, 0x02, 0x01, 0xD0, 0x21]].concat()
-        };
+        let hevc = |timing| [&Hevc { timing, ..Hevc::default() }.annex_b()[..], &HEVC_SLICE].concat();
         let last = |h265, es: &[u8]| *reported_rates_of(h265, es, steps()).last().unwrap();
         assert_eq!(last(false, &avc((1, 60))), Some(30.0));
         assert_eq!(last(true, &hevc((1, 30))), Some(30.0));
         for timing in [(1, 0), (0, 0), (1, 90_000), (1, 180_000)] {
             assert_eq!(last(false, &avc(timing)), Some(50.0), "H.264 {timing:?}");
             assert_eq!(last(true, &hevc(timing)), Some(50.0), "H.265 {timing:?}");
+        }
+    }
+
+    /// A source that starts again, its PMT the same, is shown by its new SPS:
+    /// Quick Sync 720p50, then 1080p59.94, then back.
+    #[test]
+    fn an_h265_sps_that_changes_is_followed() {
+        let real = super::super::hevc_sps::tests::real_sps();
+        let frames = |what: &str, frames, step| {
+            let (_, sps, ..) = real.iter().find(|(name, ..)| name.starts_with(what)).unwrap();
+            let pps = [0, 0, 0, 1, 0x44, 0x01, 0xC0, 0x73];
+            let idr = [&[0, 0, 0, 1], &sps[..], &pps, &HEVC_SLICE].concat();
+            std::iter::once((idr, step))
+                .chain(std::iter::repeat_n((HEVC_SLICE.to_vec(), step), 49))
+                .cycle()
+                .take(frames)
+        };
+        let stream: Vec<_> = frames("Quick Sync 720p50", 200, 1_800)
+            .chain(frames("Quick Sync 1080p59.94", 250, 1_501))
+            .chain(frames("Quick Sync 720p50", 200, 1_800))
+            .collect();
+        let reported = reported_video(true, stream.iter().map(|(es, step)| (&es[..], *step)));
+        for (i, shown) in reported.into_iter().enumerate() {
+            let ntsc = (200..450).contains(&i);
+            let sps = if ntsc { (Some(1920), Some(60_000.0 / 1001.0)) } else { (Some(1280), Some(50.0)) };
+            assert_eq!(shown, sps, "frame {i}");
+        }
+    }
+
+    /// One that states no rate behind one that does is measured, and afresh:
+    /// not with what was measured before that one. One that states a rate
+    /// again is taken at once.
+    #[test]
+    fn an_h265_sps_that_states_no_rate_any_more_is_measured() {
+        use super::super::hevc_sps::tests::Sps;
+        let stating = |timing| [&Sps { timing, ..Sps::default() }.annex_b()[..], &HEVC_SLICE].concat();
+        let (none, stated) = (stating((1, 0)), stating((1, 25)));
+        let no_vui = [&Sps { vui: false, ..Sps::default() }.annex_b()[..], &HEVC_SLICE].concat();
+        for silent in [&none, &no_vui] {
+            let stream = std::iter::repeat_n((&silent[..], 3_000), 400)
+                .chain(std::iter::repeat_n((&stated[..], 3_000), 5))
+                .chain(std::iter::repeat_n((&silent[..], 3_003), 100))
+                .chain(std::iter::repeat_n((&stated[..], 3_003), 5));
+            let rates: Vec<_> = reported_video(true, stream).into_iter().map(|(_, rate)| rate).collect();
+            assert_eq!(rates[399], Some(30.0));
+            assert_eq!(rates[400..405], [Some(25.0); 5]);
+            // 2 s of it are 60 steps of 3003 ticks.
+            assert_eq!(rates[405..465], [None; 60]);
+            assert_eq!(rates[465..505], [Some(30_000.0 / 1001.0); 40]);
+            assert_eq!(rates[505..], [Some(25.0); 5]);
+        }
+        // Measured on where neither states one.
+        let smaller = [&Sps { width: 1280, vui: false, ..Sps::default() }.annex_b()[..], &HEVC_SLICE].concat();
+        let stream = std::iter::repeat_n((&no_vui[..], 3_000), 100).chain(std::iter::repeat_n((&smaller[..], 3_000), 5));
+        let shown = reported_video(true, stream);
+        assert_eq!(shown[99], (Some(1920), Some(30.0)));
+        assert_eq!(shown[100..], [(Some(1280), Some(30.0)); 5]);
+    }
+
+    /// An SPS that its packet cuts before its timing leaves the rate as it
+    /// was, if it is the one the rate is from as far as it goes.
+    #[test]
+    fn an_h265_sps_cut_before_its_timing_says_nothing_of_the_rate() {
+        use super::super::hevc_sps::tests::Sps;
+        // What of an access unit its first packet has room for, behind a PCR
+        // and a PTS.
+        const ROOM: usize = 162;
+        let whole = [&Sps::default().annex_b()[..], &HEVC_SLICE].concat();
+        let shown = |sps: &Sps, there: usize| {
+            let sei = [&[0, 0, 0, 1, 0x4E, 0x01][..], &vec![0xFF; ROOM - 10 - there], &[0, 0, 0, 1]].concat();
+            let cut = [&sei[..], &sps.nal(), &HEVC_SLICE, &[0xFF; 200]].concat();
+            let stream = [(&whole[..], 3_600), (&cut[..], 3_600)];
+            *reported_video(true, stream).last().unwrap()
+        };
+        let another = Sps { width: 1280, height: 720, timing: (1, 50), ..Sps::default() };
+        let mut seen = Vec::new();
+        for there in 1..=another.nal().len() {
+            assert_eq!(shown(&Sps::default(), there), (Some(1920), Some(25.0)), "{there}");
+            let shown = shown(&another, there);
+            if seen.last() != Some(&shown) {
+                seen.push(shown);
+            }
+        }
+        // Not read as far as its size, as far as that, and as its timing.
+        assert_eq!(seen, [(Some(1920), Some(25.0)), (Some(1280), None), (Some(1280), Some(50.0))]);
+        // One that states none, with 0 to 4 bytes of the start code behind it:
+        // three show where it ends.
+        let silent = Sps { vui: false, ..Sps::default() };
+        let rates = [0, 1, 2, 3, 4].map(|behind| shown(&silent, silent.nal().len() + behind).1);
+        assert_eq!(rates, [Some(25.0), Some(25.0), Some(25.0), None, None]);
+    }
+
+    /// Nothing is taken off an SPS that says what the last one did, however
+    /// the rate shown came about.
+    #[test]
+    fn an_sps_changes_what_it_says_other_than_the_last() {
+        let sps = |width, height, frame_rate, profile: &str, level: &str| SpsInfo {
+            width,
+            height,
+            frame_rate,
+            profile: profile.into(),
+            level: level.into(),
+        };
+        let stream = |frame_rate, rate_from_bitstream| VideoStreamState {
+            pid: 0x100,
+            codec: String::new(),
+            stream_type: 0x24,
+            width: Some(1920),
+            height: Some(1080),
+            frame_rate,
+            profile: Some("Main".into()),
+            level: Some("4.0".into()),
+            sps_detected: false,
+            rate_from_bitstream,
+            ts_rate: Default::default(),
+        };
+        let says = |frame_rate| sps(1920, 1080, frame_rate, "Main", "4.0");
+        let (stated, measured) = (stream(Some(25.0), true), stream(Some(25.0), false));
+        for whole in [false, true] {
+            assert!(!says(Some(25.0)).changes(&stated, whole));
+            assert!(says(Some(50.0)).changes(&stated, whole));
+            assert_eq!(says(None).changes(&stated, whole), whole);
+            assert!(!says(None).changes(&measured, whole));
+            assert!(says(Some(25.0)).changes(&measured, whole));
+            for other in [
+                sps(1280, 1080, Some(25.0), "Main", "4.0"),
+                sps(1920, 720, Some(25.0), "Main", "4.0"),
+                sps(1920, 1080, Some(25.0), "Main 10", "4.0"),
+                sps(1920, 1080, Some(25.0), "Main", "4.1"),
+            ] {
+                assert!(other.changes(&stated, whole));
+            }
         }
     }
 

@@ -2493,6 +2493,9 @@ pub struct VideoStreamState {
     pub frame_rate: Option<f64>,
     pub profile: Option<String>,
     pub level: Option<String>,
+    /// The SPS (MPEG-2: the sequence header) is looked for no more: one has
+    /// been read, or the codec has none. Never set for HEVC, each SPS of
+    /// which is read.
     pub sps_detected: bool,
     /// `frame_rate` is the one the bitstream states (VUI timing, an MPEG-2
     /// sequence header) rather than [`Self::ts_rate`]'s measurement.
