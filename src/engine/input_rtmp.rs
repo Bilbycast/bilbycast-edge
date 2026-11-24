@@ -3,8 +3,8 @@
 
 //! RTMP input — accepts incoming publish connections and remuxes to MPEG-TS.
 //!
-//! This module runs an RTMP server that accepts one publisher at a time (OBS,
-//! ffmpeg, Wirecast, etc.). The received H.264 video and AAC audio are remuxed
+//! This module runs an RTMP server and keeps one publish on air at a time, the
+//! newest (OBS, ffmpeg, Wirecast, etc.). The received H.264 video and AAC audio are remuxed
 //! into MPEG-TS packets and pushed into the broadcast channel as `RtpPacket`
 //! structs, identical to how SRT and RTP inputs work.
 //!
@@ -40,7 +40,7 @@ use crate::stats::collector::FlowStatsAccumulator;
 use super::input_post_process::{InputPostProcess, InputPostProcessConfig};
 use super::input_transcode::InputTranscoder;
 use super::packet::RtpPacket;
-use super::rtmp::server::{RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
+use super::rtmp::server::{PublishMessage, RtmpMediaMessage, RtmpServerConfig, run_rtmp_server};
 use super::rtmp::ts_mux::TsMuxer;
 
 /// Spawn the RTMP input task.
@@ -61,7 +61,7 @@ pub fn spawn_rtmp_input(
     tokio::spawn(async move {
         tracing::info!("RTMP input starting on {} (app='{}')", config.listen_addr, config.app);
 
-        let (media_tx, media_rx) = mpsc::channel::<RtmpMediaMessage>(1024);
+        let (media_tx, media_rx) = mpsc::channel::<PublishMessage>(1024);
         let is_publishing = Arc::new(AtomicBool::new(false));
 
         let server_config = RtmpServerConfig {
@@ -176,7 +176,7 @@ pub fn spawn_rtmp_input(
 
 /// Process media messages from the RTMP server, mux into TS, and push to broadcast.
 async fn process_media(
-    mut media_rx: mpsc::Receiver<RtmpMediaMessage>,
+    mut media_rx: mpsc::Receiver<PublishMessage>,
     publisher: crate::engine::ingress_publisher::IngressPublisher,
     stats: Arc<FlowStatsAccumulator>,
     cancel: CancellationToken,
@@ -214,13 +214,15 @@ async fn process_media(
     // strictly monotonic, evenly-spaced sequence whose deltas exactly
     // match the AAC nominal frame duration, satisfying every downstream
     // muxer regardless of how it computes DTS.
-    let mut audio_anchor_pts_90khz: Option<u64> = None;
+    let mut audio_anchor_90k: Option<i64> = None;
     let mut audio_frames_emitted: u64 = 0;
     // Where each publish's RTMP timestamps lie on the input's one timeline.
     let mut timeline = PublishTimeline::default();
     // Whether this publish carries video — what the PMT lists and which PID
     // carries the PCR. See `PublishLayout`.
     let mut layout = PublishLayout::default();
+    // The publish on air: the newest whose media has come, until it ends.
+    let mut on_air: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -229,8 +231,39 @@ async fn process_media(
                 return;
             }
             msg = media_rx.recv() => {
+                let Some((publish, msg)) = msg else {
+                    // Channel closed
+                    tracing::info!("RTMP input channel closed");
+                    return;
+                };
+                // One publish is on air at a time. A newer one takes over
+                // from it, since a publisher whose network dropped ends only
+                // at its idle timeout, long after it has reconnected; what
+                // an older one still sends, and its end, go nowhere.
+                let disconnected = matches!(msg, RtmpMediaMessage::Disconnected);
+                let ends = match on_air {
+                    Some(current) if publish != current => {
+                        if disconnected || publish < current {
+                            continue;
+                        }
+                        tracing::info!("RTMP: a newer publish takes over from the one on air");
+                        true
+                    }
+                    _ => disconnected,
+                };
+                if ends {
+                    // The next publish restarts the audio's sample counter
+                    // from its own RTMP time, on the timeline past this one's
+                    // end, and states its own layout. The muxer keeps this
+                    // one's until it does.
+                    audio_anchor_90k = None;
+                    audio_frames_emitted = 0;
+                    timeline.ended();
+                    layout = PublishLayout::default();
+                }
+                on_air = (!disconnected).then_some(publish);
                 match msg {
-                    Some(RtmpMediaMessage::Video { data, timestamp_ms }) => {
+                    RtmpMediaMessage::Video { data, timestamp_ms } => {
                         if data.len() < 5 {
                             continue;
                         }
@@ -274,14 +307,16 @@ async fn process_media(
                                     composition_time
                                 };
 
-                                let dts_ms = timestamp_ms as i64;
-                                let pts_ms = dts_ms + composition_time as i64;
-
-                                if timeline.open(dts_ms, Instant::now()) {
+                                let (dts_ms, opens) = timeline.frame(timestamp_ms, Instant::now());
+                                if opens {
                                     muxer.mark_discontinuity();
                                 }
-                                let dts_90khz = timeline.at(dts_ms);
-                                let pts_90khz = timeline.at(pts_ms);
+                                // No presentation ahead of RTMP time 0.
+                                let raw_ms = i64::from(timestamp_ms);
+                                let pts_ms = dts_ms + (raw_ms + composition_time as i64).max(0) - raw_ms;
+
+                                let dts_90khz = PublishTimeline::wire(timeline.at(dts_ms));
+                                let pts_90khz = PublishTimeline::wire(timeline.at(pts_ms));
 
                                 // Convert length-prefixed NALUs to Annex B,
                                 // with the sequence header's SPS / PPS ahead
@@ -328,7 +363,7 @@ async fn process_media(
                             _ => {}
                         }
                     }
-                    Some(RtmpMediaMessage::Audio { data, timestamp_ms }) => {
+                    RtmpMediaMessage::Audio { data, timestamp_ms } => {
                         if data.len() < 2 {
                             continue;
                         }
@@ -361,20 +396,21 @@ async fn process_media(
                                 let raw_aac = &data[2..];
 
                                 // Sample-counter-derived PTS — see
-                                // `audio_anchor_pts_90khz` doc above for the
+                                // `audio_anchor_90k` doc above for the
                                 // rationale (Bug #11). The first frame
                                 // anchors to its RTMP-supplied wall time;
                                 // subsequent frames are spaced exactly one
                                 // AAC frame duration apart at 90 kHz.
                                 let sample_rate_hz = aac_sample_rate_hz(audio_sample_rate_idx);
-                                if timeline.open(timestamp_ms as i64, Instant::now()) {
+                                let (ms, opens) = timeline.frame(timestamp_ms, Instant::now());
+                                if opens {
                                     muxer.mark_discontinuity();
                                 }
-                                let anchor = *audio_anchor_pts_90khz
-                                    .get_or_insert_with(|| timeline.at(timestamp_ms as i64));
-                                let pts_90khz = anchor
-                                    + audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64;
-                                timeline.issued(pts_90khz);
+                                let anchor = *audio_anchor_90k.get_or_insert_with(|| timeline.at(ms));
+                                let pts = anchor
+                                    + (audio_frames_emitted * 1024 * 90_000 / sample_rate_hz as u64) as i64;
+                                timeline.issued(pts);
+                                let pts_90khz = PublishTimeline::wire(pts);
                                 audio_frames_emitted += 1;
                                 if let Some(has_video) = layout.on_audio(pts_90khz) {
                                     apply_layout(&mut muxer, has_video, &flow_id);
@@ -412,13 +448,13 @@ async fn process_media(
                             _ => {}
                         }
                     }
-                    Some(RtmpMediaMessage::Metadata { declares_video }) => {
+                    RtmpMediaMessage::Metadata { declares_video } => {
                         tracing::debug!(?declares_video, "RTMP: received metadata");
                         if let Some(has_video) = layout.on_metadata(declares_video) {
                             apply_layout(&mut muxer, has_video, &flow_id);
                         }
                     }
-                    Some(RtmpMediaMessage::Disconnected) => {
+                    RtmpMediaMessage::Disconnected => {
                         tracing::info!("RTMP publisher disconnected, waiting for reconnection");
                         event_sender.emit_flow(
                             EventSeverity::Warning,
@@ -426,20 +462,6 @@ async fn process_media(
                             "RTMP publisher disconnected",
                             &flow_id,
                         );
-                        // Reset audio anchor so the next publisher restarts
-                        // the sample counter from its own RTMP wall time, on
-                        // the timeline past this one's end.
-                        audio_anchor_pts_90khz = None;
-                        audio_frames_emitted = 0;
-                        timeline.ended();
-                        // The next publisher states its own layout. The
-                        // muxer keeps this one's until it does.
-                        layout = PublishLayout::default();
-                    }
-                    None => {
-                        // Channel closed
-                        tracing::info!("RTMP input channel closed");
-                        return;
                     }
                 }
             }
@@ -456,7 +478,7 @@ const TIMELINE_START_90K: u64 = super::rtmp::ts_mux::PCR_LEAD_90K;
 /// The least a publish starts past the last one's latest PTS (90 kHz, the
 /// muxer's PCR lead): a track whose first timestamp is up to that much below
 /// the first the publish sends still starts past it.
-const PUBLISH_GAP_90K: u64 = super::rtmp::ts_mux::PCR_LEAD_90K;
+const PUBLISH_GAP_90K: i64 = super::rtmp::ts_mux::PCR_LEAD_90K as i64;
 
 /// The one timeline an RTMP input's publishes run on.
 ///
@@ -471,58 +493,73 @@ const PUBLISH_GAP_90K: u64 = super::rtmp::ts_mux::PCR_LEAD_90K;
 ///
 /// Every publish used to be carried as it is, so a republish started the
 /// timeline over: the PCR and the video stepped back by the length of the
-/// last publish, with no `discontinuity_indicator`, and the audio, whose PTS
-/// the muxer holds past the last one (`TsMuxer::clamp_audio_pts`), stood
-/// still until the new publish had run as long as the last, tick by tick.
+/// last publish, with no `discontinuity_indicator` (the muxer-mode rewriter
+/// bridged that), and the audio, whose PTS the muxer holds past the last one
+/// (`TsMuxer::clamp_audio_pts`), stood still until the new publish had run as
+/// long as the last, tick by tick.
+///
+/// Positions are 90 kHz from the timeline's zero and run on past 33 bits; the
+/// 32-bit milliseconds are unwrapped from frame to frame, and may step back.
 #[derive(Debug, Default)]
 struct PublishTimeline {
-    /// The input's first frame: where it lies (90 kHz) and when it came.
-    origin: Option<(u64, Instant)>,
-    /// What a publish's timestamps are moved by (90 kHz).
+    /// The input's first frame: where it lies and when it came.
+    origin: Option<(i64, Instant)>,
+    /// The last frame, of any publish: its RTMP time as it came, and unwrapped.
+    last: Option<(u32, i64)>,
+    /// What the publish's timestamps are moved by.
     offset: i64,
-    /// The latest PTS issued (90 kHz).
-    latest: u64,
+    /// The latest PTS issued.
+    latest: i64,
     /// A publish has ended: the next frame opens another.
     over: bool,
 }
 
 impl PublishTimeline {
-    /// The publish now over, the next frame opens another.
+    /// The publish is over, the next frame opens another.
     fn ended(&mut self) {
         self.over = self.origin.is_some();
     }
 
-    /// A frame of RTMP time `ms` has come at `now`. Whether it opens a publish
-    /// that is not the input's first, which starts here.
-    fn open(&mut self, ms: i64, now: Instant) -> bool {
-        let Some((start, at)) = self.origin else {
-            self.origin = Some((self.at(ms), now));
-            return false;
+    /// A frame of RTMP time `raw` (ms) has come at `now`: its time unwrapped,
+    /// and whether it opens a publish that is not the input's first, which
+    /// starts here.
+    fn frame(&mut self, raw: u32, now: Instant) -> (i64, bool) {
+        let opens = std::mem::take(&mut self.over);
+        let ms = match self.last {
+            Some((last, ms)) => ms + i64::from(raw.wrapping_sub(last) as i32),
+            None => i64::from(raw),
         };
-        if !std::mem::take(&mut self.over) {
-            return false;
+        self.last = Some((raw, ms));
+        let (start, at) = *self.origin.get_or_insert((Self::unmoved(ms), now));
+        if opens {
+            let wall = start + now.saturating_duration_since(at).as_micros() as i64 * 9 / 100;
+            self.offset = wall.max(self.latest + PUBLISH_GAP_90K) - Self::unmoved(ms);
         }
-        let wall = start + now.saturating_duration_since(at).as_micros() as u64 * 9 / 100;
-        self.offset = wall.max(self.latest + PUBLISH_GAP_90K) as i64 - Self::unmoved(ms) as i64;
-        true
+        (ms, opens)
     }
 
-    /// RTMP time `ms` on the timeline (90 kHz).
-    fn at(&mut self, ms: i64) -> u64 {
-        let at = (Self::unmoved(ms) as i64 + self.offset).max(0) as u64;
+    /// The publish's unwrapped RTMP time `ms` on the timeline, issued.
+    fn at(&mut self, ms: i64) -> i64 {
+        let at = Self::unmoved(ms) + self.offset;
         self.issued(at);
         at
     }
 
-    /// An audio frame was stamped `pts_90khz`, counted from its publish's
-    /// first.
-    fn issued(&mut self, pts_90khz: u64) {
-        self.latest = self.latest.max(pts_90khz);
+    /// A frame was stamped `at`.
+    fn issued(&mut self, at: i64) {
+        self.latest = self.latest.max(at);
     }
 
-    /// RTMP time `ms` (90 kHz) of a publish carried as it is.
-    fn unmoved(ms: i64) -> u64 {
-        TIMELINE_START_90K + ms.max(0) as u64 * 90
+    /// RTMP time `ms` of a publish carried as it is.
+    fn unmoved(ms: i64) -> i64 {
+        TIMELINE_START_90K as i64 + ms * 90
+    }
+
+    /// The timestamp for the muxer, which takes its low 33 bits: below zero,
+    /// what the 32-bit milliseconds' own wrap makes of it (2^32 ms are a
+    /// whole number of 33-bit ranges).
+    fn wire(at: i64) -> u64 {
+        if at < 0 { at.rem_euclid((1 << 32) * 90) as u64 } else { at as u64 }
     }
 }
 
@@ -796,7 +833,7 @@ mod tests {
     async fn publish(msgs: Vec<RtmpMediaMessage>) -> Published {
         let (tx, rx) = mpsc::channel(8192);
         for m in msgs {
-            tx.send(m).await.unwrap();
+            tx.send((1, m)).await.unwrap();
         }
         drop(tx);
         let (btx, mut brx) = broadcast::channel(8192);
@@ -851,7 +888,7 @@ mod tests {
             .map(|i| {
                 let mut data = vec![0xAF, 0x01];
                 data.extend(std::iter::repeat_n(0x21, 300));
-                RtmpMediaMessage::Audio { data: data.into(), timestamp_ms: first_ms + i * 21 }
+                RtmpMediaMessage::Audio { data: data.into(), timestamp_ms: first_ms.wrapping_add(i * 21) }
             })
             .collect()
     }
@@ -877,7 +914,7 @@ mod tests {
     async fn published_video_units(msgs: Vec<RtmpMediaMessage>) -> Vec<Vec<u8>> {
         let (tx, rx) = mpsc::channel(8192);
         for m in msgs {
-            tx.send(m).await.unwrap();
+            tx.send((1, m)).await.unwrap();
         }
         drop(tx);
         let (btx, mut brx) = broadcast::channel(8192);
@@ -1010,14 +1047,19 @@ mod tests {
     }
 
     /// The TS packets `process_media` published for `parts`, each sent the
-    /// milliseconds it names after the one before.
+    /// milliseconds it names after the one before, as a publish of its own.
     async fn muxed(parts: Vec<(u64, Vec<RtmpMediaMessage>)>) -> Vec<Vec<u8>> {
+        muxed_of(parts.into_iter().enumerate().map(|(k, (after, msgs))| (after, k as u64, msgs)).collect()).await
+    }
+
+    /// [`muxed`], each part a part of the publish it names.
+    async fn muxed_of(parts: Vec<(u64, u64, Vec<RtmpMediaMessage>)>) -> Vec<Vec<u8>> {
         let (tx, rx) = mpsc::channel(8192);
         let sender = tokio::spawn(async move {
-            for (after_ms, msgs) in parts {
+            for (after_ms, publish, msgs) in parts {
                 tokio::time::sleep(std::time::Duration::from_millis(after_ms)).await;
                 for m in msgs {
-                    tx.send(m).await.unwrap();
+                    tx.send((publish, m)).await.unwrap();
                 }
             }
         });
@@ -1059,8 +1101,9 @@ mod tests {
     fn av_publish(n: u32, from_ms: u32) -> Vec<RtmpMediaMessage> {
         let mut msgs = vec![RtmpMediaMessage::Metadata { declares_video: Some(true) }, avc_config(), aac_config()];
         for k in 0..n {
-            msgs.push(avc_frame(from_ms + k * 40, k % 25 == 0, &[if k % 25 == 0 { 5 } else { 1 }]));
-            msgs.extend(aac_frames(2, from_ms + k * 40));
+            let at = from_ms.wrapping_add(k * 40);
+            msgs.push(avc_frame(at, k % 25 == 0, &[if k % 25 == 0 { 5 } else { 1 }]));
+            msgs.extend(aac_frames(2, at));
         }
         msgs.push(RtmpMediaMessage::Disconnected);
         msgs
@@ -1076,7 +1119,10 @@ mod tests {
     async fn a_republish_runs_on_from_the_last_publish() {
         const LEAD: u64 = TIMELINE_START_90K;
         const AAC: u64 = 1_920;
-        for (first_from, second_from) in [(0u32, 0u32), (0, 3_600_000), (5_000, 0), (0, 2_000), (7_000, 7_000)] {
+        let gap = PUBLISH_GAP_90K as u64;
+        for (first_from, second_from) in
+            [(0u32, 0u32), (0, 3_600_000), (5_000, 0), (0, 2_000), (7_000, 7_000), (0, u32::MAX - 700)]
+        {
             let ts = muxed(vec![(0, av_publish(75, first_from)), (0, av_publish(50, second_from))]).await;
             let (video, audio) = (pts_on(&ts, 0x0100), pts_on(&ts, 0x0101));
             assert_eq!((video.len(), audio.len()), (125, 250));
@@ -1087,8 +1133,8 @@ mod tests {
             // The second past all of it, each track on its own pace from there,
             // the two starting together.
             let latest = (*audio[..150].last().unwrap()).max(video[74]);
-            assert!(video[75] >= latest + PUBLISH_GAP_90K, "{} / {latest}", video[75]);
-            assert!(video[75] < latest + PUBLISH_GAP_90K + 4 * 90_000, "{} / {latest}", video[75]);
+            assert!(video[75] >= latest + gap, "{} / {latest}", video[75]);
+            assert!(video[75] < latest + gap + 4 * 90_000, "{} / {latest}", video[75]);
             assert_eq!(video[75..], (0..50).map(|k| video[75] + k * 3_600).collect::<Vec<_>>()[..]);
             assert_eq!(audio[150..], (0..100).map(|k| video[75] + k * AAC).collect::<Vec<_>>()[..]);
 
@@ -1123,12 +1169,112 @@ mod tests {
         let ts = muxed(parts).await;
         let (video, audio) = (pts_on(&ts, 0x0100), pts_on(&ts, 0x0101));
         let away = (video[5] - video[0]) as i64 - 81_000;
-        assert!((0..40_000).contains(&away), "0.9 s away, on the timeline from the first frame: {away}");
+        assert!((0..450_000).contains(&away), "0.9 s away, on the timeline from the first frame: {away}");
         assert!(audio.windows(2).all(|w| w[1] - w[0] >= 1_900), "a frame's worth at least: {audio:?}");
         assert!(video[11] < video[10], "a picture stamped before its publish's first keeps its place");
         assert!(video[11] > *video[..10].iter().max().unwrap(), "past the last publish");
         let pcrs = pcrs(&ts);
         assert_eq!(pcrs.iter().filter(|p| p.1).count(), 3, "one for each republish: {pcrs:?}");
+    }
+
+    /// A picture-only publish with B-frames is continued past its latest
+    /// presentation, not its last picture's; and a republish whose timestamps
+    /// go round the 32-bit milliseconds, open below 0 or step back behind its
+    /// own start runs on on them, none of it pinned.
+    #[tokio::test]
+    async fn a_republish_is_placed_by_the_frames_it_sends() {
+        let picture = |ms: u32, composition_ms: u32| {
+            let RtmpMediaMessage::Video { data, timestamp_ms } = avc_frame(ms, ms.is_multiple_of(1_000), &[1]) else {
+                unreachable!()
+            };
+            let mut data = data.to_vec();
+            data[2..5].copy_from_slice(&composition_ms.to_be_bytes()[1..]);
+            RtmpMediaMessage::Video { data: data.into(), timestamp_ms }
+        };
+        // P, B, B in decode order: the first shown 120 ms past its decoding.
+        let b_frames = |n: u32| -> Vec<RtmpMediaMessage> {
+            let pictures = (0..n).map(|k| picture(k * 40, if k % 3 == 0 { 120 } else { 0 }));
+            std::iter::once(avc_config()).chain(pictures).chain([RtmpMediaMessage::Disconnected]).collect()
+        };
+        let ts = muxed(vec![(0, b_frames(31)), (0, b_frames(31))]).await;
+        let video = pts_on(&ts, 0x0100);
+        let latest = *video[..31].iter().max().unwrap();
+        assert_eq!(latest, TIMELINE_START_90K + (1_200 + 120) * 90);
+        // Its first picture is shown 120 ms past the place it opens at.
+        assert_eq!(video[31], latest + PUBLISH_GAP_90K as u64 + 120 * 90);
+        assert!(video[31..].iter().all(|pts| *pts > latest));
+
+        let at = |ms: &[u32]| -> Vec<RtmpMediaMessage> {
+            let pictures = ms.iter().map(|ms| avc_frame(*ms, true, &[5]));
+            std::iter::once(avc_config()).chain(pictures).chain([RtmpMediaMessage::Disconnected]).collect()
+        };
+        for (ms, steps) in [
+            (vec![u32::MAX - 59, u32::MAX - 19, 20, 60], vec![0i64, 40, 80, 120]),
+            (vec![u32::MAX - 20, 0, 40], vec![0, 21, 61]),
+            (vec![0, u32::MAX - 20, 40], vec![0, -21, 40]),
+            (vec![3_600_000, 3_600_040, 0, 40], vec![0, 40, -3_600_000, -3_599_960]),
+        ] {
+            let ts = muxed(vec![(0, at(&[0, 40])), (0, at(&ms)), (0, at(&[0, 40]))]).await;
+            let video = pts_on(&ts, 0x0100);
+            let start = video[2] as i64;
+            assert!(start >= video[1] as i64 + PUBLISH_GAP_90K, "{ms:?}: {video:?}");
+            let expected: Vec<u64> = steps.iter().map(|s| (start + s * 90).rem_euclid(1 << 33) as u64).collect();
+            assert_eq!(video[2..2 + ms.len()], expected[..], "{ms:?}");
+            // And the next is past the latest of it, not its last.
+            let latest = start + steps.iter().max().unwrap() * 90;
+            let next = video[2 + ms.len()] as i64;
+            assert!((latest + PUBLISH_GAP_90K..latest + PUBLISH_GAP_90K + 450_000).contains(&next), "{ms:?}: {next}");
+        }
+
+        // The first publish as it is: round the wrap as its milliseconds are.
+        let first: Vec<u32> = vec![u32::MAX - 59, u32::MAX - 19, 20, 60];
+        let ts = muxed(vec![(0, at(&first))]).await;
+        let as_is: Vec<u64> = first.iter().map(|ms| (TIMELINE_START_90K + u64::from(*ms) * 90) & 0x1_FFFF_FFFF).collect();
+        assert_eq!(pts_on(&ts, 0x0100), as_is);
+    }
+
+    /// A publisher whose network dropped reconnects long before its old
+    /// connection ends: the newer publish takes over at its first message, on
+    /// past the old one, and the old one's end, or what it still sends, moves
+    /// nothing. Nor does the end of a newer one that sent nothing. When the
+    /// newer ends, an older one still live is on air again.
+    #[tokio::test]
+    async fn the_newest_publish_is_on_air() {
+        let mut dropped = av_publish(25, 0);
+        dropped.pop();
+        let av = |n: u32| {
+            let mut msgs = av_publish(n, 0);
+            msgs.pop();
+            msgs
+        };
+        let end = || vec![RtmpMediaMessage::Disconnected];
+        // 1 drops; 2 takes over; 1 still sends, and ends; 2 goes on; 3 ends
+        // having sent nothing.
+        let parts = vec![
+            (0, 1, dropped.clone()),
+            (0, 2, av(5)),
+            (0, 1, av(3)),
+            (0, 1, end()),
+            (0, 2, (5..10).map(|k| avc_frame(k * 40, false, &[1])).collect()),
+            (0, 3, end()),
+            (0, 2, (10..12).map(|k| avc_frame(k * 40, false, &[1])).collect()),
+            (0, 2, end()),
+        ];
+        let ts = muxed_of(parts).await;
+        let video = pts_on(&ts, 0x0100);
+        assert_eq!(video.len(), 25 + 12, "nothing of 1 behind 2's start");
+        assert_eq!(video[25..], (0..12).map(|k| video[25] + k * 3_600).collect::<Vec<_>>()[..], "one publish");
+        assert!(video[25] > *pts_on(&ts, 0x0101)[..50].last().unwrap());
+        assert_eq!(pcrs(&ts).iter().filter(|p| p.1).count(), 1);
+        assert!(pcrs(&ts).windows(2).all(|w| w[1].0 > w[0].0));
+
+        // 1 live, 2 takes over and leaves: 1 again, on past it.
+        let more = |from: u32| (from..from + 5).map(|k| avc_frame(k * 40, true, &[5])).collect::<Vec<_>>();
+        let ts = muxed_of(vec![(0, 1, av(5)), (0, 2, av(5)), (0, 1, more(5)), (0, 2, end()), (0, 1, more(50))]).await;
+        let video = pts_on(&ts, 0x0100);
+        assert_eq!(video.len(), 15);
+        assert!(video.windows(2).all(|w| w[1] > w[0]), "{video:?}");
+        assert_eq!(pcrs(&ts).iter().filter(|p| p.1).count(), 2);
     }
 
     /// A publish that ends before it has sent anything moves nothing.

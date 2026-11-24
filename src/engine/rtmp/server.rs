@@ -14,7 +14,7 @@
 //! - ffmpeg (`-f flv rtmp://host:port/app/key`)
 //! - Wirecast, vMix, etc.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -84,6 +84,14 @@ pub enum RtmpMediaMessage {
     Disconnected,
 }
 
+/// A message of a publish, under the publish's number: they rise in the order
+/// publishes are accepted, so a publisher that has reconnected is told from
+/// its old connection, which may be gone without having said so.
+pub type PublishMessage = (u64, RtmpMediaMessage);
+
+/// The number of the next publish accepted, by any input of the node.
+static NEXT_PUBLISH: AtomicU64 = AtomicU64::new(0);
+
 /// `onMetaData` properties that describe a video stream. ffmpeg's FLV muxer
 /// writes them only for one; OBS, Wirecast, vMix and hardware encoders do
 /// the same.
@@ -139,7 +147,7 @@ pub struct RtmpServerConfig {
 /// The server runs until `cancel` is triggered.
 pub async fn run_rtmp_server(
     config: RtmpServerConfig,
-    media_tx: mpsc::Sender<RtmpMediaMessage>,
+    media_tx: mpsc::Sender<PublishMessage>,
     is_publishing: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -210,7 +218,7 @@ async fn handle_rtmp_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
     addr: std::net::SocketAddr,
     expected_app: &str,
     expected_stream_key: Option<&str>,
-    media_tx: mpsc::Sender<RtmpMediaMessage>,
+    media_tx: mpsc::Sender<PublishMessage>,
     is_publishing: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) -> Result<()> {
@@ -405,13 +413,16 @@ async fn handle_rtmp_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
                         // force, and media was never subject to it.
 
                         // Enter media receive loop
-                        receive_media_loop(&mut stream, &mut reader, &media_tx, &cancel).await?;
-                        let _ = media_tx.send(RtmpMediaMessage::Disconnected).await;
+                        let publish = NEXT_PUBLISH.fetch_add(1, Ordering::Relaxed);
+                        receive_media_loop(&mut stream, &mut reader, &media_tx, publish, &cancel).await?;
+                        let _ = media_tx.send((publish, RtmpMediaMessage::Disconnected)).await;
                         return Ok(());
                     }
                     "FCUnpublish" | "deleteStream" => {
+                        // Nothing was published: not the end of the publish
+                        // on air, which is another connection's (any peer,
+                        // without a stream key, could end it here).
                         tracing::info!("RTMP client sent {cmd}");
-                        let _ = media_tx.send(RtmpMediaMessage::Disconnected).await;
                         return Ok(());
                     }
                     other => {
@@ -431,7 +442,8 @@ async fn handle_rtmp_client<S: AsyncRead + AsyncWrite + Unpin + Send>(
 async fn receive_media_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
     stream: &mut S,
     reader: &mut ChunkReader,
-    media_tx: &mpsc::Sender<RtmpMediaMessage>,
+    media_tx: &mpsc::Sender<PublishMessage>,
+    publish: u64,
     cancel: &CancellationToken,
 ) -> Result<()> {
     tracing::info!("RTMP: receiving media data");
@@ -458,16 +470,16 @@ async fn receive_media_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
 
         match msg.msg_type {
             msg_type::VIDEO => {
-                let _ = media_tx.send(RtmpMediaMessage::Video {
+                let _ = media_tx.send((publish, RtmpMediaMessage::Video {
                     data: Bytes::from(msg.payload),
                     timestamp_ms: msg.timestamp,
-                }).await;
+                })).await;
             }
             msg_type::AUDIO => {
-                let _ = media_tx.send(RtmpMediaMessage::Audio {
+                let _ = media_tx.send((publish, RtmpMediaMessage::Audio {
                     data: Bytes::from(msg.payload),
                     timestamp_ms: msg.timestamp,
-                }).await;
+                })).await;
             }
             msg_type::DATA_AMF0 => {
                 // Bounded like every AMF0 message this server decodes: the
@@ -476,7 +488,7 @@ async fn receive_media_loop<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 let declares_video = amf0::decode_all(&msg.payload)
                     .ok()
                     .and_then(|values| metadata_declares_video(&values));
-                let _ = media_tx.send(RtmpMediaMessage::Metadata { declares_video }).await;
+                let _ = media_tx.send((publish, RtmpMediaMessage::Metadata { declares_video })).await;
             }
             msg_type::SET_CHUNK_SIZE => {
                 if msg.payload.len() >= 4 {
@@ -569,7 +581,7 @@ mod tests {
         server: DuplexStream,
     ) -> (
         tokio::task::JoinHandle<Result<()>>,
-        mpsc::Receiver<RtmpMediaMessage>,
+        mpsc::Receiver<PublishMessage>,
     ) {
         let (tx, rx) = mpsc::channel(8);
         let addr: std::net::SocketAddr = "127.0.0.1:1935".parse().unwrap();
@@ -802,11 +814,65 @@ mod tests {
             .unwrap();
 
         match rx.recv().await.expect("a 300 KiB keyframe must be delivered") {
-            RtmpMediaMessage::Video { data, .. } => assert_eq!(data.len(), payload.len()),
+            (_, RtmpMediaMessage::Video { data, .. }) => assert_eq!(data.len(), payload.len()),
             other => panic!("expected Video, got {other:?}"),
         }
         drop(client);
         let _ = handle.await;
+    }
+
+    /// A command that ends a stream from a connection that has published
+    /// nothing — a client closing after `createStream`, or a peer that never
+    /// presented a key — tells the input nothing: the publish on air is
+    /// another's. It used to end it.
+    #[tokio::test]
+    async fn closing_before_publishing_ends_no_publish() {
+        for cmd in ["FCUnpublish", "deleteStream"] {
+            let (mut client, server) = tokio::io::duplex(64 * 1024);
+            let (handle, mut rx) = spawn_server(server);
+            client_handshake(&mut client).await;
+            let payload = amf0::encode_values(&[
+                Amf0Value::String(cmd.into()),
+                Amf0Value::Number(4.0),
+                Amf0Value::Null,
+                Amf0Value::Number(1.0),
+            ]);
+            client
+                .write_all(&test_chunk_message(3, msg_type::COMMAND_AMF0, &payload, 128))
+                .await
+                .unwrap();
+            let ended = tokio::time::timeout(Duration::from_secs(5), handle).await;
+            assert!(ended.unwrap().unwrap().is_ok(), "the connection ends");
+            assert!(rx.recv().await.is_none(), "{cmd}: nothing sent");
+        }
+    }
+
+    /// Each accepted publish has a number of its own, above those before it:
+    /// on every message it sends, its end included.
+    #[tokio::test]
+    async fn a_later_publish_has_a_higher_number() {
+        let mut numbers = Vec::new();
+        for _ in 0..3 {
+            let (mut client, server) = tokio::io::duplex(1024 * 1024);
+            let (handle, mut rx) = spawn_server(server);
+            client_handshake(&mut client).await;
+            let _ = publish_with_key(&mut client, "s3cret-stream-key").await;
+            client
+                .write_all(&test_chunk_message(4, msg_type::VIDEO, &[0x17, 1, 0, 0, 0, 0], 128))
+                .await
+                .unwrap();
+            let Some((publish, RtmpMediaMessage::Video { .. })) = rx.recv().await else {
+                panic!("the picture");
+            };
+            drop(client);
+            let Some((end, RtmpMediaMessage::Disconnected)) = rx.recv().await else {
+                panic!("the end");
+            };
+            assert_eq!(end, publish);
+            numbers.push(publish);
+            let _ = handle.await;
+        }
+        assert!(numbers.windows(2).all(|w| w[1] > w[0]), "{numbers:?}");
     }
 
     #[tokio::test]
@@ -840,7 +906,7 @@ mod tests {
             .await
             .expect("the command cap must still be in force after publish");
         assert!(
-            matches!(got, Some(RtmpMediaMessage::Disconnected)),
+            matches!(got, Some((_, RtmpMediaMessage::Disconnected))),
             "expected the connection to end on the oversized command, got {got:?}"
         );
         drop(client);
