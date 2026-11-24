@@ -83,11 +83,13 @@ is its own free-running oscillator unless the card is genlocked to house
 reference, so two SDI inputs on the *same card* are not on the same clock: they
 drift against each other, slowly and silently. That is exactly the failure
 `ClockIdentity` exists to catch — it is the identity the PID-bus assembler
-checks so every slot in one output program comes from genuinely coherent
-inputs. Two un-genlocked SDI ports must therefore report **different**
-identities and be **refused** for assembly into one program
-(`pid_bus_master_clock_mismatch`), because "video from SDI 1 + audio from
-SDI 2" is a lip-sync error that grows without bound and shows up on no counter.
+checks so that whatever plays together in one output program comes from
+genuinely coherent inputs. Two un-genlocked SDI ports must therefore report
+**different** identities, and a program that would play them together is
+**refused** (`pid_bus_master_clock_mismatch`), because "video from SDI 1 + audio
+from SDI 2" is a lip-sync error that grows without bound and shows up on no
+counter. A program whose Switch slots all have a leg on both ports plays one of
+them at a time, and is not.
 Note the asymmetry: sharing the Wallclock *kind* is fine — it is a per-flow
 pacing policy — while sharing a Wallclock *identity* would assert a coherence
 the hardware does not provide. `reference_locked` per port (below) is what
