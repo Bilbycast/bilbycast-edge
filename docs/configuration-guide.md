@@ -1607,7 +1607,9 @@ handshake that failed, or a session that ended, was retried at once.
 
 The pull's H.264 and Opus are remuxed into an SPTS (program 1) the way a
 WHIP publish's are ([above](#webrtcwhip-input)): both tracks on one
-timeline, each anchored at its first frame's arrival, the SPS and PPS ahead
+timeline, each anchored at its first frame's arrival — the video, where the
+server starts it with a keyframe it had cached, at its first live picture's
+([below](#a-pull-primed-with-a-cached-keyframe)) — the SPS and PPS ahead
 of every IDR, and the Opus in the Opus-in-TS carriage ffmpeg reads. The
 layout starts from the tracks the server's answer accepted: video and Opus,
 video alone (`video_only`, which offers no audio, or a server that refuses
@@ -1657,6 +1659,62 @@ is mono or stereo (300 ms at most), so the first PMT already names the
 channel count and the IDR goes out behind it; see
 [supported-protocols.md](supported-protocols.md) ("Audio") for why the first
 PMT's count is the one ffmpeg and GStreamer keep.
+
+#### A pull primed with a cached keyframe
+
+The IDR bilbycast-relay primes a viewer with is the last its source sent, up
+to a GOP older than the live pictures that follow it, and stamped so. The
+input keeps it, where it arrived, at the start of the pull, and times the
+video from the live pictures: the one of them shown first goes out as it
+arrived, as the first picture of any other server's stream does, and the
+rest by their RTP times from it. Nothing else is moved: not the sound, and no
+picture against another, so B-frames keep the order and the distances they
+came with. The PCR runs on from the IDR's by the time the live pictures took
+to arrive, usually less than a frame period; after a pause of more than a
+second, which no filler PCR bridges, the step carries
+`discontinuity_indicator`. Up to 0.117.0 the video was timed from the IDR
+itself: every live picture went out later than it came by the IDR's age, and
+that far past its sound for the whole pull, and the PCR stepped by as much at
+the first of them, past a second with no `discontinuity_indicator`.
+
+It is done once, as the second picture of the pull shows that the IDR was
+cached: its `frame_num` is past 1, which says that reference pictures between
+the two were not sent, and it runs more than 100 ms ahead of the IDR on the
+RTP clock for the time that passed. Where the SPS allows no reordering
+(Baseline, or picture order count type 2, which x264 writes without
+B-frames) it is settled on that picture, with nothing held. Otherwise the
+pull's frames are held from that picture on, until the pictures of its
+mini-GOP show which of them is shown first: 40 ms without B-frames, up to
+120 ms with two, at 25 fps, and 400 ms and 2 MiB at most. The PCR runs on
+meanwhile, in PCR-only packets.
+
+Every other pull, and every WHIP publish, is timed as it always was, each
+frame going out as it comes: its first picture is no IDR, or the second one's
+`frame_num` is 1 or 0, as it is right behind a live first picture (however its
+server sends it: late, in bursts, at no steady rate), or cannot be read. The
+exception is a live start with the picture right behind the first lost, or left
+out by its server: if the next one runs 100 ms ahead of the first, frames are
+held as above, and the first is taken for cached should every picture come that
+far ahead of it. A cached IDR is left as it was, its pictures past their sound
+by its age for the whole pull,
+
+- where `frame_num` has come round to the IDR's again: two in sixteen of
+  x264's, one pull in eight of a source without B-frames;
+- where the picture behind it is another IDR, where its SPS or slices do not
+  parse, or where it carries two SPS that differ;
+- where it is 100 ms old or less: one pull in twenty, of a source with a 2 s
+  GOP;
+- where the SPS allows reordering and too few pictures come within 400 ms of
+  the second to show which is shown first: a source of few frames a second, or
+  a hiccup.
+
+Audio and picture are otherwise as far apart as the first live picture and the
+first Opus packet arrived, as on any pull. A source that sends its sound in
+bursts (ffmpeg's MPEG-TS muxer packs up to 0.35 s of a quiet AAC track into one
+PES) starts them apart by up to a burst. And bilbycast-relay passes a picture
+on as the next one's first packet comes, so a pull of it starts with the
+picture behind its sound by one frame period, 33 ms of a browser at 30 fps and
+as long as the first gap between two frames of a screen share.
 
 ### Media Player Input
 

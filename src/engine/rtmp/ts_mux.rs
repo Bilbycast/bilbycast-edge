@@ -355,8 +355,13 @@ impl TsMuxer {
     ///
     /// Behaviour:
     /// - First call: passes the value through unchanged.
-    /// - Subsequent calls: if `pts_90khz <= last`, returns `last + 1`.
-    ///   Otherwise returns `pts_90khz` unchanged.
+    /// - Subsequent calls: if `pts_90khz` is at `last` or steps back from it
+    ///   ([`audio_pts_steps_back`]), returns `last + 1`. Otherwise returns
+    ///   `pts_90khz` unchanged, over the 33-bit wrap too: compared as it
+    ///   stands, every PTS after the wrap was behind the last one before it,
+    ///   so from 26.5 h on a WHIP, WHEP or RTSP input's audio stepped one tick
+    ///   a frame, until the input (RTSP: its connection) started again, and a
+    ///   media player's MP4 or image's until its next file.
     ///
     /// We bump by exactly 1 tick (≈11.1 µs at 90 kHz) on a regression
     /// rather than a larger value because the regressions seen in
@@ -365,7 +370,7 @@ impl TsMuxer {
     /// without distorting the audio clock more than necessary.
     pub(crate) fn clamp_audio_pts(&mut self, pts_90khz: u64) -> u64 {
         let clamped = match self.last_audio_pts_90khz {
-            Some(last) if pts_90khz <= last => last + 1,
+            Some(last) if audio_pts_steps_back(last, pts_90khz) => last + 1,
             _ => pts_90khz,
         };
         self.last_audio_pts_90khz = Some(clamped);
@@ -467,6 +472,42 @@ impl TsMuxer {
     /// ran through). Nothing before the muxer's first PCR.
     pub fn mark_discontinuity(&mut self) {
         self.pcr_discontinuity_pending = self.last_pcr_90khz.is_some();
+    }
+
+    /// [`Self::mark_discontinuity`] if the PCR of an access unit stamped
+    /// `ts_90khz`, muxed next, would step past the last one by more than the
+    /// filler PCRs bridge ([`PCR_FILL_MAX_GAP_90K`]), or back: a WHEP pull's
+    /// first live picture, a pause behind the cached one it was primed with.
+    pub fn mark_unbridged_step(&mut self, ts_90khz: u64) {
+        if let Some(last) = self.last_pcr_90khz
+            && ts_90khz.wrapping_sub(PCR_LEAD_90K).wrapping_sub(last) & MASK_33 > PCR_FILL_MAX_GAP_90K
+        {
+            self.mark_discontinuity();
+        }
+    }
+
+    /// The PCR run on to where an access unit stamped `ts_90khz` would put it,
+    /// without one: a PCR-only packet on the video PID, behind the fillers of
+    /// a step past 40 ms and, when one is due ([`Self::change_has_video`]), the
+    /// PSI that names that PID as PCR_PID. For a caller that holds its video
+    /// back and knows the timeline meanwhile. Empty when the video does not
+    /// carry the PCR, before the first PCR or where the next starts a new
+    /// timeline, for a step back, and for one no filler bridges.
+    pub fn run_pcr_on(&mut self, ts_90khz: u64) -> Vec<Bytes> {
+        let mut packets = Vec::new();
+        let Some(last) = self.last_pcr_90khz.filter(|_| self.has_video && !self.pcr_discontinuity_pending) else {
+            return packets;
+        };
+        let step = ts_90khz.wrapping_sub(PCR_LEAD_90K).wrapping_sub(last) & MASK_33;
+        if (1..=PCR_FILL_MAX_GAP_90K).contains(&step) {
+            if self.psi_due {
+                packets = self.maybe_emit_pat_pmt(false);
+            }
+            let pid = self.video_pid;
+            let pcr = self.programme_pcr(ts_90khz, pid, VIDEO_PCR_FILL_AFTER_90K, &mut packets);
+            packets.push(self.pcr_filler(pid, pcr));
+        }
+        packets
     }
 
     /// Advertise a raw SCTE-35 section stream (`stream_type 0x86`) in the PMT.
@@ -1218,6 +1259,17 @@ fn build_pes_packet(
     buf.to_vec()
 }
 
+/// Whether an audio PTS is at the `last` one or behind it. Callers hand in 33
+/// bits (WebRTC, RTSP, the media player) or a count that runs on past them
+/// (RTMP), which on the wire is the same: a PTS below `last` that is ahead of it by less than half
+/// the 33-bit range has gone over the wrap, and one above it that is behind it
+/// by less than a second has come back over it. Any other is taken as it
+/// stands, so a step forward of any length is one.
+fn audio_pts_steps_back(last: u64, pts_90khz: u64) -> bool {
+    let behind = last.wrapping_sub(pts_90khz) & MASK_33;
+    if pts_90khz <= last { behind < 1 << 32 } else { behind < 90_000 }
+}
+
 /// Write a 33-bit PTS/DTS timestamp in the 5-byte PES format.
 fn write_timestamp(buf: &mut BytesMut, marker_bits: u8, ts: u64) {
     let ts = ts & 0x1_FFFF_FFFF; // 33 bits
@@ -1440,6 +1492,70 @@ mod tests {
         assert!(pcrs[2].0 >= unmarked);
     }
 
+    /// `run_pcr_on` carries the PCR on to where an access unit would put it,
+    /// with no access unit: one PCR-only packet, its CC the last payload
+    /// packet's, behind the fillers of a step past 40 ms, and the next access
+    /// unit's PCR steps on from there. Nothing where the PCR is there already
+    /// or past it, where no filler bridges the step, before the first PCR,
+    /// ahead of a marked discontinuity, and where the audio carries the PCR.
+    #[test]
+    fn the_pcr_runs_on_without_an_access_unit() {
+        use crate::engine::ts_parse::extract_pcr;
+        const AU: &[u8] = &[0, 0, 0, 1, 0x41, 0x9a];
+        let pcrs = |ts: &[Bytes]| ts.iter().filter_map(|p| extract_pcr(p)).map(|pcr| pcr / 300).collect::<Vec<_>>();
+        let mut muxer = TsMuxer::new();
+        let at = |ms: u64| PCR_LEAD_90K + ms * 90;
+        assert!(muxer.run_pcr_on(at(40)).is_empty(), "before the first PCR");
+        let ts = muxer.mux_video(AU, at(0), at(0), false);
+        let cc = ts.last().unwrap()[3] & 0x0F;
+        let on = muxer.run_pcr_on(at(40));
+        assert_eq!(pcrs(&on), [40 * 90]);
+        assert!(on.iter().all(|p| ts_pid(p) == VIDEO_PID && p[3] == 0x20 | cc), "adaptation field only");
+        assert_eq!(pcrs(&muxer.run_pcr_on(at(110))), [75 * 90, 110 * 90]);
+        assert!(muxer.run_pcr_on(at(110)).is_empty(), "there already");
+        assert!(muxer.run_pcr_on(at(100)).is_empty(), "past it");
+        assert!(muxer.run_pcr_on(at(1_111)).is_empty(), "past what fillers bridge");
+        assert_eq!(pcrs(&muxer.mux_video(AU, at(130), at(130), false)), [130 * 90]);
+        muxer.change_has_video(false);
+        assert!(muxer.run_pcr_on(at(150)).is_empty(), "the audio carries it");
+        // The video listed again: the PSI that says the PCR is its, ahead of
+        // the first PCR there, once.
+        muxer.change_has_video(true);
+        assert!(muxer.run_pcr_on(at(130)).is_empty(), "there already: the PSI is still due");
+        let on = muxer.run_pcr_on(at(150));
+        let pids: Vec<u16> = on.iter().map(|p| ts_pid(p)).collect();
+        assert_eq!(pids, [0, PMT_PID, VIDEO_PID]);
+        assert_eq!(pcrs(&on), [150 * 90]);
+        let on = muxer.run_pcr_on(at(190));
+        assert_eq!(on.iter().map(|p| ts_pid(p)).collect::<Vec<_>>(), [VIDEO_PID]);
+        muxer.mark_discontinuity();
+        assert!(muxer.run_pcr_on(at(200)).is_empty(), "a new timeline next");
+    }
+
+    /// `mark_unbridged_step` marks the step to an access unit only where no
+    /// filler PCR bridges it: one past a second, or back. A step of a second
+    /// or less goes unmarked, with its fillers, across the 33-bit wrap too.
+    #[test]
+    fn only_a_step_no_filler_bridges_is_marked() {
+        use crate::engine::ts_parse::{extract_pcr, ts_discontinuity_indicator};
+        for start in [PCR_LEAD_90K, MASK_33 - 30_000] {
+            for (step, marked) in [(3_600u64, false), (90_000, false), (90_001, true), (9_000_000, true), (MASK_33, true)] {
+                let mut muxer = TsMuxer::new();
+                muxer.continue_timeline();
+                muxer.mark_unbridged_step(start);
+                let _ = muxer.mux_video(&[0, 0, 0, 1, 0x65, 0x88], start, start, true);
+                let next = (start + step) & MASK_33;
+                muxer.mark_unbridged_step(next);
+                let ts = muxer.mux_video(&[0, 0, 0, 1, 0x41, 0x9a], next, next, false);
+                let pcrs: Vec<bool> =
+                    ts.iter().filter(|p| extract_pcr(p).is_some()).map(|p| ts_discontinuity_indicator(p)).collect();
+                let fillers = if step == 90_000 { 28 } else { 0 };
+                assert_eq!(pcrs.len(), fillers + 1, "start {start}, step {step}");
+                assert_eq!(pcrs.contains(&true), marked, "start {start}, step {step}");
+            }
+        }
+    }
+
     /// Bug #11 (2026-04-09): RTMP-ingest → RTP transmux emitted
     /// non-monotonic audio DTS because the source publisher fed
     /// millisecond-rounded timestamps that occasionally regressed by
@@ -1482,6 +1598,33 @@ mod tests {
         assert_eq!(clamped[2], 3870);
         // Equal value gets bumped by exactly 1 tick.
         assert_eq!(clamped[5], 7651);
+    }
+
+    /// The 33-bit wrap is no step back, whether the caller's PTS wraps
+    /// (WebRTC, RTSP) or runs on (RTMP): every PTS goes out as it is. A
+    /// regression by the wrap is clamped as anywhere, and so is one by an
+    /// hour, as it always was.
+    #[test]
+    fn clamp_audio_pts_runs_on_over_the_wrap() {
+        const FRAME: u64 = 1_800;
+        let clamped = |pts: &[u64]| {
+            let mut muxer = TsMuxer::new();
+            pts.iter().map(|p| muxer.clamp_audio_pts(*p) & MASK_33).collect::<Vec<_>>()
+        };
+        for start in [MASK_33 - 5 * FRAME, MASK_33 - 5 * FRAME + 1, MASK_33 - 5 * FRAME - 700] {
+            let wrapping: Vec<u64> = (0..40).map(|k| (start + k * FRAME) & MASK_33).collect();
+            assert_eq!(clamped(&wrapping), wrapping, "33 bits");
+            let running_on: Vec<u64> = (0..40).map(|k| start + k * FRAME).collect();
+            assert_eq!(clamped(&running_on), wrapping, "running on");
+        }
+        // A frame on the wrap's last tick again, and 10 ms back over it.
+        assert_eq!(clamped(&[MASK_33, MASK_33, FRAME]), [MASK_33, 0, FRAME]);
+        assert_eq!(clamped(&[MASK_33 - 100, 400, MASK_33 - 499, 2_200]), [MASK_33 - 100, 400, 401, 2_200]);
+        // An hour back, and a step forward of any length.
+        assert_eq!(clamped(&[400_000_000, 76_000_000, 76_001_800]), [400_000_000, 400_000_001, 400_000_002]);
+        for ahead in [324_000_000, (1 << 32) + 5, (1 << 33) - 90_000 - 1] {
+            assert_eq!(clamped(&[1_000, 1_000 + ahead]), [1_000, (1_000 + ahead) & MASK_33]);
+        }
     }
 
     /// Verify the same property end-to-end through `mux_audio` by
