@@ -487,10 +487,11 @@ impl TsMuxer {
 
     /// The PCR run on to where an access unit stamped `ts_90khz` would put it,
     /// without one: a PCR-only packet on the video PID, behind the fillers of
-    /// a step past 40 ms. For a caller that holds its video back and knows
-    /// the timeline meanwhile. Empty when the video does not carry the PCR,
-    /// before the first PCR or where the next starts a new timeline, for a
-    /// step back, and for one no filler bridges.
+    /// a step past 40 ms and, when one is due ([`Self::change_has_video`]), the
+    /// PSI that names that PID as PCR_PID. For a caller that holds its video
+    /// back and knows the timeline meanwhile. Empty when the video does not
+    /// carry the PCR, before the first PCR or where the next starts a new
+    /// timeline, for a step back, and for one no filler bridges.
     pub fn run_pcr_on(&mut self, ts_90khz: u64) -> Vec<Bytes> {
         let mut packets = Vec::new();
         let Some(last) = self.last_pcr_90khz.filter(|_| self.has_video && !self.pcr_discontinuity_pending) else {
@@ -498,6 +499,9 @@ impl TsMuxer {
         };
         let step = ts_90khz.wrapping_sub(PCR_LEAD_90K).wrapping_sub(last) & MASK_33;
         if (1..=PCR_FILL_MAX_GAP_90K).contains(&step) {
+            if self.psi_due {
+                packets = self.maybe_emit_pat_pmt(false);
+            }
             let pid = self.video_pid;
             let pcr = self.programme_pcr(ts_90khz, pid, VIDEO_PCR_FILL_AFTER_90K, &mut packets);
             packets.push(self.pcr_filler(pid, pcr));
@@ -1513,9 +1517,18 @@ mod tests {
         assert_eq!(pcrs(&muxer.mux_video(AU, at(130), at(130), false)), [130 * 90]);
         muxer.change_has_video(false);
         assert!(muxer.run_pcr_on(at(150)).is_empty(), "the audio carries it");
+        // The video listed again: the PSI that says the PCR is its, ahead of
+        // the first PCR there, once.
         muxer.change_has_video(true);
+        assert!(muxer.run_pcr_on(at(130)).is_empty(), "there already: the PSI is still due");
+        let on = muxer.run_pcr_on(at(150));
+        let pids: Vec<u16> = on.iter().map(|p| ts_pid(p)).collect();
+        assert_eq!(pids, [0, PMT_PID, VIDEO_PID]);
+        assert_eq!(pcrs(&on), [150 * 90]);
+        let on = muxer.run_pcr_on(at(190));
+        assert_eq!(on.iter().map(|p| ts_pid(p)).collect::<Vec<_>>(), [VIDEO_PID]);
         muxer.mark_discontinuity();
-        assert!(muxer.run_pcr_on(at(150)).is_empty(), "a new timeline next");
+        assert!(muxer.run_pcr_on(at(200)).is_empty(), "a new timeline next");
     }
 
     /// `mark_unbridged_step` marks the step to an access unit only where no
