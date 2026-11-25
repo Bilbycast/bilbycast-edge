@@ -555,6 +555,9 @@ impl InputMembershipError {
             ),
         }
     }
+    pub fn clock_mismatch(message: String) -> Self {
+        Self { code: "pid_bus_master_clock_mismatch", message }
+    }
     pub fn resource_critical(flow_id: &str, input_id: &str) -> Self {
         Self {
             code: "input_resource_critical",
@@ -986,17 +989,10 @@ impl FlowRuntime {
         // TS-producing input's per-input broadcast channel, so PAT/PMT
         // arriving even a few hundred ms after input spawn lands before
         // the resolver's 3 s deadline.
-        // Build the per-input clock-identity map used by the cross-
-        // clock compatibility check inside `finalize_spts_assembler`.
-        // Populated unconditionally for assembled flows; the check
-        // itself is a no-op today (membership rule prevents cross-
-        // clock combinations) but the map is cheap (one entry per
-        // input — typical < 10) and Phase 2.1 will need it ready.
-        let input_clocks: HashMap<String, crate::engine::master_clock::ClockIdentity> = config
-            .inputs
-            .iter()
-            .map(|i| (i.id.clone(), crate::engine::master_clock::clock_identity_for_input(i)))
-            .collect();
+        // The clock of each of the flow's own inputs, for the check in
+        // `finalize_spts_assembler` and for the assembler's Takes. A slot
+        // on another flow's input is not judged: its clock is not here.
+        let input_clocks = input_clocks(&config.inputs);
         // PES Switch Phase 2.1c Stage 3: enable cross-flow ES routing.
         // The assembly plan may reference inputs that are NOT in
         // `flow.input_ids` — owned by sibling flows on the node.
@@ -1999,15 +1995,12 @@ impl FlowRuntime {
         // Pro broadcast-relevant: any operator using `kind: "essence"`
         // (the auto-PID UI affordance) hits this on every plan change.
         for prog in build.plan.programs.iter_mut() {
-            if prog.slots.iter().any(|s| s.source == prog.pcr_source) {
+            if prog.slots.iter().any(|s| s.reads(&prog.pcr_source)) {
                 continue;
             }
             let pcr_input = prog.pcr_source.0.clone();
-            if let Some(remap) = prog
-                .slots
-                .iter()
-                .find(|s| s.source.0 == pcr_input)
-                .map(|s| s.source.clone())
+            if let Some(remap) =
+                prog.slots.iter().find_map(|s| s.source_on(&pcr_input)).cloned()
             {
                 tracing::info!(
                     "Flow '{}': replace_assembly program {} pcr_source auto-remapped \
@@ -2036,54 +2029,23 @@ impl FlowRuntime {
             }
         }
 
-        // Cross-clock compatibility check on the new plan. Mirrors the
-        // step 2.5 in `finalize_spts_assembler` so a hot-swap into an
-        // incompatible plan is rejected with the same error code +
-        // structured details as an initial start. See that call site
-        // for the full rationale.
+        // The clock check of `finalize_spts_assembler` on the new plan: what
+        // it refuses at start it refuses here, with the same event.
         //
         // Reads `live_inputs` (control-plane lock) rather than the
         // start-time `self.config.inputs` snapshot so a flow that has
         // hot-added inputs after start sees the current input set when
         // an assembly plan is hot-swapped.
-        let input_clocks: HashMap<String, crate::engine::master_clock::ClockIdentity> = {
-            let inputs = self.live_inputs.read().await;
-            inputs
-                .iter()
-                .map(|i| (i.id.clone(), crate::engine::master_clock::clock_identity_for_input(i)))
-                .collect()
-        };
+        let input_clocks = input_clocks(&self.live_inputs.read().await);
         if let Err(mismatch) = crate::engine::ts_assembler::check_assembly_clock_compatibility(
             &build.plan,
             &input_clocks,
         ) {
-            let msg = format!(
-                "flow '{}': replace_assembly rejected — program {} slot 0x{:04X} input '{}' has master clock {} but the program already references input '{}' on clock {}",
-                flow_id,
-                mismatch.program_number,
-                mismatch.slot_out_pid,
-                mismatch.slot_input_id,
-                mismatch.slot_clock,
-                mismatch.reference_input_id,
-                mismatch.reference_clock,
-            );
-            self.event_sender.emit_flow_with_details(
-                EventSeverity::Critical,
-                category::FLOW,
-                msg.clone(),
-                flow_id,
-                serde_json::json!({
-                    "error_code": "pid_bus_master_clock_mismatch",
-                    "program_number": mismatch.program_number,
-                    "slot_out_pid": mismatch.slot_out_pid,
-                    "slot_input_id": mismatch.slot_input_id,
-                    "slot_clock": mismatch.slot_clock,
-                    "reference_input_id": mismatch.reference_input_id,
-                    "reference_clock": mismatch.reference_clock,
-                }),
-            );
+            let msg = format!("flow '{flow_id}': replace_assembly rejected — {mismatch}");
+            emit_clock_mismatch(&self.event_sender, flow_id, &msg, &mismatch);
             bail!(msg);
         }
+        build.plan.clocks = input_clocks;
 
         // Room for the plan in the assembler's queue before anything changes.
         let permit =
@@ -3234,6 +3196,9 @@ impl FlowRuntime {
     ///   any running hitless slot's leg list. The merger is not
     ///   designed to grow legs mid-flight; operator must restart the
     ///   flow to land this change.
+    /// - `pid_bus_master_clock_mismatch`: the running assembly has a Switch
+    ///   leg on the input, and a Take to it would mix two clocks in one
+    ///   program.
     ///
     /// Bind failures (SRT-listener / RIST / RTSP / WHIP-server on a busy
     /// port) surface asynchronously through the event channel. The
@@ -3271,6 +3236,26 @@ impl FlowRuntime {
             return Err(anyhow::Error::new(
                 InputMembershipError::hitless_leg_change(&input_id),
             ));
+        }
+
+        // An assembly may name an input its flow does not have yet. Once it
+        // has it, a Take can put it on air beside a slot on another clock.
+        let assembly = self.current_assembly.lock().await.clone();
+        if let Some(assembly) = assembly.as_ref() {
+            let mut clocks = input_clocks(&self.live_inputs.read().await);
+            clocks.insert(
+                input_id.clone(),
+                crate::engine::master_clock::clock_identity_for_input(&input_def),
+            );
+            if let Err(mismatch) = crate::engine::ts_assembler::check_added_input_clock(
+                assembly, &clocks, &input_id,
+            ) {
+                let flow_id = &self.config.config.id;
+                let msg =
+                    format!("flow '{flow_id}': input '{input_id}' cannot join it — {mismatch}");
+                emit_clock_mismatch(&self.event_sender, flow_id, &msg, &mismatch);
+                return Err(anyhow::Error::new(InputMembershipError::clock_mismatch(msg)));
+            }
         }
 
         // Build the spawn context. Mirrors the context built at flow
@@ -3322,6 +3307,14 @@ impl FlowRuntime {
                     .iter()
                     .any(|d| matches!(d.config, InputConfig::Bonded(_)));
             live.push(input_def);
+            // A running plan with a Switch leg on the input judges a Take to
+            // it by its clock. With no room in the queue those Takes are cuts
+            // until the next plan swap.
+            if let Some(handle) = self.pid_bus_assembler_handle.as_ref() {
+                let _ = handle.plan_tx.try_send(
+                    crate::engine::ts_assembler::PlanCommand::InputClocks(input_clocks(&live)),
+                );
+            }
         }
         {
             let mut handles = self.input_handles.write().await;
@@ -5215,6 +5208,32 @@ fn essence_error_to_event(flow_id: &str, err: &EssenceResolveError) -> (&'static
     }
 }
 
+/// The clock of each of `inputs`, as the PID-bus clock check compares them.
+fn input_clocks(
+    inputs: &[InputDefinition],
+) -> HashMap<String, crate::engine::master_clock::ClockIdentity> {
+    inputs
+        .iter()
+        .map(|i| (i.id.clone(), crate::engine::master_clock::clock_identity_for_input(i)))
+        .collect()
+}
+
+/// Raise `pid_bus_master_clock_mismatch` for a plan, or an input, refused.
+fn emit_clock_mismatch(
+    event_sender: &EventSender,
+    flow_id: &str,
+    message: &str,
+    mismatch: &crate::engine::ts_assembler::MasterClockMismatch,
+) {
+    event_sender.emit_flow_with_details(
+        EventSeverity::Critical,
+        category::FLOW,
+        message,
+        flow_id,
+        mismatch.details(),
+    );
+}
+
 /// Finish bringing up the PID-bus SPTS runtime for a flow.
 ///
 /// Extracted from `FlowRuntime::start` so the startup pipeline can call
@@ -5309,17 +5328,16 @@ async fn finalize_spts_assembler(
         }
     }
 
-    // 2. Post-resolution PCR source fixup.
+    // 2. Post-resolution PCR source fixup. The PCR source is one leg of a
+    //    Switch slot, whichever of them the slot starts on: a restart after
+    //    a Take starts it on another.
     for prog in build.plan.programs.iter_mut() {
-        if prog.slots.iter().any(|s| s.source == prog.pcr_source) {
+        if prog.slots.iter().any(|s| s.reads(&prog.pcr_source)) {
             continue;
         }
         let pcr_input = prog.pcr_source.0.clone();
-        if let Some(remap) = prog
-            .slots
-            .iter()
-            .find(|s| s.source.0 == pcr_input)
-            .map(|s| s.source.clone())
+        if let Some(remap) =
+            prog.slots.iter().find_map(|s| s.source_on(&pcr_input)).cloned()
         {
             tracing::info!(
                 "Flow '{}': program {} pcr_source auto-remapped from 0x{:04X} to 0x{:04X} (essence-resolved slot on input '{}')",
@@ -5350,52 +5368,19 @@ async fn finalize_spts_assembler(
         }
     }
 
-    // 2.5. Cross-clock compatibility check.
-    //
-    // Phase 2 of the PES Switch redesign drops the manager-side
-    // membership check that today forces every assembly slot to
-    // reference an input already in the flow. Once that's lifted,
-    // operators can wire video and audio from different inputs.
-    // This guard rejects any program whose slots come from
-    // master-clock-incompatible inputs (two SourcePcr inputs from
-    // separate encoders, cross-PTP-domain ST 2110 inputs, etc.) so
-    // we never silently emit a stream that will drift apart.
-    //
-    // Today (membership check still in place + assignment-uniqueness
-    // still enforced) the call is a no-op because every slot's input
-    // lives in the same flow and therefore reports the same identity.
-    // Phase 2.1 makes it load-bearing.
+    // 2.5. Clock check: refuse a program two of whose slots can play from
+    //      inputs on different clocks at the same time. The legs of one
+    //      Switch slot are alternatives, so a program may switch between
+    //      clocks as long as all of it follows every Take.
     if let Err(mismatch) = crate::engine::ts_assembler::check_assembly_clock_compatibility(
         &build.plan,
         input_clocks,
     ) {
-        let msg = format!(
-            "flow '{}': program {} slot 0x{:04X} input '{}' has master clock {} but the program already references input '{}' on clock {} — combining incompatible clocks would silently drift",
-            flow_id,
-            mismatch.program_number,
-            mismatch.slot_out_pid,
-            mismatch.slot_input_id,
-            mismatch.slot_clock,
-            mismatch.reference_input_id,
-            mismatch.reference_clock,
-        );
-        event_sender.emit_flow_with_details(
-            EventSeverity::Critical,
-            category::FLOW,
-            msg.clone(),
-            flow_id,
-            serde_json::json!({
-                "error_code": "pid_bus_master_clock_mismatch",
-                "program_number": mismatch.program_number,
-                "slot_out_pid": mismatch.slot_out_pid,
-                "slot_input_id": mismatch.slot_input_id,
-                "slot_clock": mismatch.slot_clock,
-                "reference_input_id": mismatch.reference_input_id,
-                "reference_clock": mismatch.reference_clock,
-            }),
-        );
+        let msg = format!("flow '{flow_id}': {mismatch}");
+        emit_clock_mismatch(event_sender, flow_id, &msg, &mismatch);
         bail!(msg);
     }
+    build.plan.clocks = input_clocks.clone();
 
     // 3. Pre-bus Hitless mergers.
     if !build.pending_hitless.is_empty() {
@@ -6027,7 +6012,7 @@ fn build_assembly_plan(
     }
 
     Ok(SptsBuildResult {
-        plan: AssemblyPlan { programs },
+        plan: AssemblyPlan { programs, clocks: HashMap::new() },
         pending_essence,
         pending_hitless,
     })
@@ -8454,7 +8439,7 @@ mod assembly_plan_tests {
         };
         let mut mergers = HitlessMergers::default();
         let outputs = mergers.outputs();
-        let mut plan = AssemblyPlan { programs: Vec::new() };
+        let mut plan = AssemblyPlan { programs: Vec::new(), clocks: HashMap::new() };
         mergers.apply(&[slot], &mut plan, &bus, &flow).await;
         let retired = mergers.apply(&[], &mut plan, &bus, &flow).await;
 

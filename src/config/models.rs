@@ -1371,7 +1371,8 @@ pub enum SlotSource {
         /// AAC-ADTS parameter check) and video (H.264 `0x1B` / HEVC
         /// `0x24`, IDR-aligned with an SPS codec-param check). Slots
         /// whose `stream_type` is neither a supported audio nor video
-        /// codec (e.g. MPEG-2 video `0x02`) fall through to `PmtBump`
+        /// codec (e.g. MPEG-2 video `0x02`), and a Take between inputs
+        /// not known to run on one clock, fall through to `PmtBump`
         /// and the assembler emits `pes_splice_degraded`.
         #[serde(default, skip_serializing_if = "SpliceMode::is_default")]
         splice_mode: SpliceMode,

@@ -9,7 +9,9 @@
 //! On budget exhaustion the path falls back to today's `PmtBump` behaviour
 //! and emits `pes_splice_timeout`. Both paths emit `pes_splice_completed`
 //! on success so operators can correlate switch events to receiver-side
-//! behaviour.
+//! behaviour. The two legs' PTS are compared, so the assembler arms a splice
+//! only between inputs on one clock; between others the Take is a `PmtBump`
+//! cut (`pes_splice_degraded`).
 //!
 //! Both audio and video splice have landed. Audio aligns on the next
 //! PES boundary at/after the splice PTS (optionally guarded by an

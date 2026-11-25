@@ -2097,7 +2097,7 @@ mod tests {
         let scope = hitless_scope("f1");
         let mut mergers = HitlessMergers::default();
         let outputs = mergers.outputs();
-        let mut plan = AssemblyPlan { programs: Vec::new() };
+        let mut plan = AssemblyPlan { programs: Vec::new(), clocks: Default::default() };
         mergers.apply(&[pending(&scope, "slot_0_0")], &mut plan, &bus, &flow).await;
 
         // The flow stops: its cancel, then its channels.
@@ -2132,7 +2132,7 @@ mod tests {
     #[tokio::test]
     async fn a_restarted_flow_keeps_its_channel_when_its_old_run_releases_its_own() {
         let bus = Arc::new(NodeEsBus::new());
-        let mut plan = AssemblyPlan { programs: Vec::new() };
+        let mut plan = AssemblyPlan { programs: Vec::new(), clocks: Default::default() };
         // The old run, and a swap that drops the slot: its channel retired,
         // to be released once the run's assembler answers.
         let old_flow = CancellationToken::new();

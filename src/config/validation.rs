@@ -11003,8 +11003,8 @@ mod tests {
         // cross-flow assembly references are now legal so an operator
         // can route ES from one flow's input into another flow's
         // assembly via the Node Bus Matrix. The cross-clock guard
-        // (`check_assembly_clock_compatibility`) at resolve time is the
-        // real correctness gate; runtime closes surface as the
+        // (`check_assembly_clock_compatibility`) at resolve time judges
+        // a flow's own inputs only; runtime closes surface as the
         // `pid_bus_slot_source_closed` Warning when the foreign input's
         // owning flow stops. Foreign refs to inputs that never resolve
         // degrade gracefully (the slot just stays silent) — they are no

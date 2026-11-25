@@ -1313,10 +1313,10 @@ impl std::fmt::Debug for MasterClockHandle {
 /// iff they share a PTP domain.
 ///
 /// This enum is the identity the PID-bus assembler uses to validate
-/// that every slot in a single output program comes from inputs that
-/// are *actually* coherent — preventing the silent A/V-drift class
-/// of bugs that arises when an operator wires "video from encoder A"
-/// + "audio from encoder B" through Phase 2's cross-flow ES routing.
+/// that the inputs a single output program plays at once are
+/// *actually* coherent — preventing the silent A/V-drift class of
+/// bugs that arises when an operator wires "video from encoder A"
+/// + "audio from encoder B".
 ///
 /// Equality semantics:
 /// - `Ptp { domain: N }` == `Ptp { domain: N }` (same grandmaster).
@@ -1354,10 +1354,11 @@ impl ClockIdentity {
 
 /// Derive the [`ClockIdentity`] for a node's input from its definition.
 ///
-/// Used by the PID-bus assembly compatibility check: every slot in
-/// one output program must report the same identity from this
-/// function, otherwise the resolve-time check rejects the plan with
-/// `pid_bus_master_clock_mismatch`.
+/// Used by the PID-bus assembly compatibility check: two slots of one
+/// output program may only play at the same time from inputs that report
+/// the same identity from this function, otherwise the resolve-time check
+/// rejects the plan with `pid_bus_master_clock_mismatch`. The assembler
+/// also cuts rather than splices on a Take between two identities.
 ///
 /// The mapping mirrors [`select_master_kind_for_input`] but additionally
 /// pins each clock to its concrete coherence-defining property:

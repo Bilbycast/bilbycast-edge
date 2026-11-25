@@ -35,7 +35,7 @@
 //!   swapped in after each flush) — bundles ship at ~(video packet rate
 //!   / 7), not per-TS-packet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -84,6 +84,11 @@ const SLOT_STALL_START_GRACE: Duration = Duration::from_secs(10);
 
 /// Cadence of the per-slot stall scan + `AssemblyHealth` publication.
 const STALL_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long a Take may hold a program for its new leg's first PCR before
+/// `pid_bus_take_no_pcr` says so. Twenty times the 100 ms ISO/IEC 13818-1
+/// allows between PCRs.
+const PCR_HOLD_ALARM: Duration = Duration::from_secs(2);
 
 /// Shared cell the assembler publishes its per-slot health snapshot
 /// into. Written by the assembler at the 1 Hz stall scan, read by
@@ -206,6 +211,27 @@ fn slot_health_identity(
             return (iid.clone(), *pid);
         }
     slot.source.clone()
+}
+
+/// What carries a program's PCR: its slot's `out_pid`, and the input and PID
+/// that slot plays.
+struct PcrLeg {
+    out_pid: u16,
+    source: (String, u16),
+}
+
+/// The [`PcrLeg`] of each program, by program number.
+fn pcr_legs(
+    plan: &AssemblyPlan,
+    pcr_out_pid_by_program: &[u16],
+    active_leg_input: &HashMap<(usize, u16), String>,
+) -> HashMap<u16, PcrLeg> {
+    let leg = |(pidx, (prog, out_pid)): (usize, (&ProgramPlan, &u16))| {
+        let slot = prog.slots.iter().find(|s| s.out_pid == *out_pid)?;
+        let source = slot_health_identity(slot, (pidx, *out_pid), active_leg_input);
+        Some((prog.program_number, PcrLeg { out_pid: *out_pid, source }))
+    };
+    plan.programs.iter().zip(pcr_out_pid_by_program).enumerate().filter_map(leg).collect()
 }
 
 /// What the assembled output plays from: each Pid / Essence slot's source,
@@ -339,6 +365,19 @@ pub struct AssemblyPlan {
     /// one entry per program; PMT synthesis emits one packet per
     /// program on the same 100 ms cadence.
     pub programs: Vec<ProgramPlan>,
+    /// The clock of each of the flow's inputs, as
+    /// [`check_assembly_clock_compatibility`] was given it and
+    /// [`PlanCommand::InputClocks`] brings up to date. An input of another
+    /// flow is absent.
+    pub clocks: HashMap<String, ClockIdentity>,
+}
+
+impl AssemblyPlan {
+    /// Whether two inputs are known to run on one clock, so that the
+    /// timestamps of one can be compared with the other's.
+    fn share_clock(&self, a: &str, b: &str) -> bool {
+        self.clocks.get(a).is_some_and(|clock| self.clocks.get(b) == Some(clock))
+    }
 }
 
 /// One program within the assembled TS.
@@ -357,10 +396,9 @@ pub struct ProgramPlan {
 /// One elementary-stream slot within a program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssemblySlot {
-    /// Concrete `(input_id, source_pid)` on the bus. For Switch slots
-    /// this carries the **currently-active** leg — it mutates over time
-    /// when the operator drives `ActivateInput`. For Pid / Essence /
-    /// Hitless slots the value is fixed across the slot's lifetime.
+    /// Concrete `(input_id, source_pid)` on the bus. For Switch slots this
+    /// is the leg the slot starts on; a Take moves only the assembler's
+    /// `active_leg_input`.
     pub source: (String, u16),
     pub out_pid: u16,
     pub stream_type: u8,
@@ -395,6 +433,22 @@ pub struct AssemblySlot {
     /// `PesAligned` mode. `None` falls back to the default
     /// (200 ms for audio). Ignored when `splice_mode = PmtBump`.
     pub splice_budget_ms: Option<u32>,
+}
+
+impl AssemblySlot {
+    /// Whether the slot reads `source`: its own, or one of its Switch legs.
+    pub fn reads(&self, source: &(String, u16)) -> bool {
+        &self.source == source
+            || self.switch_legs.as_ref().is_some_and(|legs| legs.contains(source))
+    }
+
+    /// What the slot reads from `input_id`, if it does.
+    pub fn source_on(&self, input_id: &str) -> Option<&(String, u16)> {
+        match &self.switch_legs {
+            Some(legs) => legs.iter().find(|leg| leg.0 == input_id),
+            None => Some(&self.source).filter(|source| source.0 == input_id),
+        }
+    }
 }
 
 /// The two inputs behind a [`SlotSource::Hitless`] slot's merger, and which
@@ -436,6 +490,10 @@ pub enum PlanCommand {
     /// fan-ins for added/changed slots, cancels fan-ins for removed
     /// slots, bumps per-program PMT versions where composition changed,
     /// and bumps PAT version when the set of programs itself changed.
+    ///
+    /// A splice pending in a slot that keeps both its legs goes on, and any
+    /// other ends ([`legs_after_swap`]). A program held for a PCR since a
+    /// Take waits on while its PCR comes from the input the Take named.
     ReplacePlan {
         plan: AssemblyPlan,
         /// Per-swap splice request carried through from the manager's
@@ -480,8 +538,14 @@ pub enum PlanCommand {
     ///   `pts ≥ threshold`; video: the same plus an IDR access unit)
     ///   — commit — or the splice budget expires (fall back to
     ///   PmtBump, emits `pes_splice_timeout`). Slots whose codec
-    ///   supports neither fall through to the PmtBump path and emit
-    ///   `pes_splice_degraded`.
+    ///   supports neither, and legs not known to run on one clock,
+    ///   whose PTS cannot be compared, fall through to the PmtBump
+    ///   path and emit `pes_splice_degraded`.
+    ///
+    /// A splice still pending from an earlier Take is dropped for this
+    /// one. Where the slot that carries a program's PCR moves to another
+    /// clock, the program's packets are held until the first PCR from the
+    /// new leg: a PES ahead of it would go out on the old leg's clock.
     ///
     /// Slots whose leg list does not include `new_input_id` are left
     /// untouched — per design, `ActivateInput` is silent for slots
@@ -499,141 +563,305 @@ pub enum PlanCommand {
         /// handler.
         splice_mode_override: Option<crate::config::models::SpliceMode>,
     },
+    /// The flow's clocks, [`AssemblyPlan::clocks`], after an input joined it:
+    /// the running plan may have a Switch leg on that input.
+    InputClocks(HashMap<String, ClockIdentity>),
     /// Tests: hold the assembler, as a host too starved to run it would,
     /// until `release` is sent or dropped.
     #[cfg(test)]
     Stall { release: tokio::sync::oneshot::Receiver<()> },
 }
 
-/// Structured description of an assembly plan whose slots in one
-/// program reference inputs with incompatible master clocks.
-///
-/// Built by [`check_assembly_clock_compatibility`]; consumed by
-/// `flow.rs`'s `finalize_spts_assembler` to populate the structured
-/// `details` block on the `pid_bus_master_clock_mismatch` event so
-/// the manager UI can highlight the offending slot.
+/// Two slots of one program that can play from inputs on different clocks at
+/// the same time, as [`check_assembly_clock_compatibility`] and
+/// [`check_added_input_clock`] report it. Its [`Display`](std::fmt::Display)
+/// and [`details`](Self::details) go into the `pid_bus_master_clock_mismatch`
+/// event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MasterClockMismatch {
     /// MPEG-TS program number containing the conflict (matches `ProgramPlan.program_number`).
     pub program_number: u16,
-    /// `out_pid` of the slot that breaks the program's clock identity.
+    /// `out_pid` of the slot that breaks the program's clock: the later of
+    /// the two in the program.
     pub slot_out_pid: u16,
-    /// `input_id` referenced by the offending slot.
+    /// The input that slot would play.
     pub slot_input_id: String,
-    /// Human-readable label of the offending slot's clock
+    /// Human-readable label of that input's clock
     /// (e.g. `"source_pcr:input=in-srt-a"`, `"ptp:domain=127"`).
     pub slot_clock: String,
-    /// `input_id` of the slot whose clock the program adopted (the
-    /// first slot walked in the program, used as the reference).
+    /// `out_pid` of the other slot.
+    pub reference_out_pid: u16,
+    /// The input the other slot would play beside it.
     pub reference_input_id: String,
-    /// Human-readable label of the reference slot's clock.
+    /// Human-readable label of that input's clock.
     pub reference_clock: String,
+    /// The input whose Take puts the pair on air. `None` when the flow
+    /// starts on it.
+    pub take_input_id: Option<String>,
 }
 
-/// Reject assembly plans that combine elementary streams from
-/// inputs whose master clocks are not coherent.
+impl std::fmt::Display for MasterClockMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "program {} slot 0x{:04X} input '{}' has master clock {} but slot 0x{:04X} \
+             plays input '{}' on clock {} beside it ",
+            self.program_number,
+            self.slot_out_pid,
+            self.slot_input_id,
+            self.slot_clock,
+            self.reference_out_pid,
+            self.reference_input_id,
+            self.reference_clock,
+        )?;
+        match &self.take_input_id {
+            Some(input) => write!(f, "after a Take to '{input}'")?,
+            None => write!(f, "from the start")?,
+        }
+        write!(f, " — combining incompatible clocks would silently drift")
+    }
+}
+
+impl MasterClockMismatch {
+    /// The `details` of the `pid_bus_master_clock_mismatch` event.
+    pub fn details(&self) -> serde_json::Value {
+        serde_json::json!({
+            "error_code": "pid_bus_master_clock_mismatch",
+            "program_number": self.program_number,
+            "slot_out_pid": self.slot_out_pid,
+            "slot_input_id": self.slot_input_id,
+            "slot_clock": self.slot_clock,
+            "reference_out_pid": self.reference_out_pid,
+            "reference_input_id": self.reference_input_id,
+            "reference_clock": self.reference_clock,
+            "take_input_id": self.take_input_id,
+        })
+    }
+}
+
+/// What the clock rule reads of one slot.
+struct SlotInputs<'a> {
+    out_pid: u16,
+    /// The input it starts on. A Hitless slot's is its merger, whose clock is
+    /// not known.
+    start: &'a str,
+    /// The inputs of a Switch slot's legs, the one input of any other slot.
+    inputs: Vec<&'a str>,
+    /// The input a refusal names for it: a Hitless slot's primary, the input
+    /// any other slot starts on.
+    name: &'a str,
+}
+
+impl SlotInputs<'_> {
+    /// Whether a Take can move the slot off the input it starts on.
+    fn moves(&self) -> bool {
+        self.inputs.iter().any(|input| *input != self.start)
+    }
+}
+
+/// The pairs of inputs slots `a` and `b` of one program can play at the same
+/// time, as `(input of a, input of b, input whose Take brings them on air)`,
+/// first the pair they start on, with no Take.
 ///
-/// **Why this exists.** When Phase 2 of the PES Switch redesign drops
-/// the manager-side membership check (`assembly.input_ids ⊆
-/// flow.input_ids`), assembly slots can pull from any input on the
-/// node. Without this guard, an operator could route video from one
-/// SRT encoder and audio from a *different* SRT encoder onto the
-/// same output program. The two encoders run independent 27 MHz
-/// oscillators — their PCRs drift apart at hundreds of ppm and the
-/// downstream receiver loses lipsync within minutes. Mute beats
-/// wrong-sync (per `feedback_no_pcr_restamp.md` + the master-clock
-/// invariants in the PES Switch plan).
+/// On a running plan only `PlanCommand::SwitchActiveInput { x }` moves a
+/// slot: it puts every Switch slot with a leg on `x` on that leg and leaves
+/// the others. So, beside the start pair:
 ///
-/// **What we check.** Each [`ProgramPlan`] in the resolved plan:
-/// - The first slot's source `input_id` defines the program's
-///   reference clock identity (looked up in `input_clocks`).
-/// - Every subsequent slot's source — and **every leg** of a switch
-///   slot's `switch_legs` — must report the same `ClockIdentity` from
-///   the map. Mismatch → `Err(MasterClockMismatch { … })` describing
-///   the first conflict found.
-/// - Slots whose `input_id` is absent from `input_clocks` are
-///   skipped (defensive). The caller should populate the map
-///   eagerly from `ResolvedFlow::inputs`; missing entries indicate
-///   a bug upstream in the resolve pipeline, not an operator error.
+/// - Both slots have a leg on `x`: a Take to `x` puts both on it. With a leg
+///   each on `y` as well, nothing puts one on `x` and the other on `y`.
+/// - Only one has a leg on `x`: a Take to `x` puts it there and leaves the
+///   other where it is, which can be any of its legs, as a Take to that leg
+///   may have come first.
 ///
-/// Cross-program clock differences are **allowed** — MPEG-TS
-/// receivers re-acquire per program anyway, so an MPTS may carry
-/// programs from different sources side-by-side.
-///
-/// This function is pure / does not allocate beyond the error path.
-/// Today (with the membership check still in place) the check is a
-/// no-op because every slot's input is in the flow's `input_ids`
-/// and the single-flow runtime has a single master clock by
-/// construction. Phase 2.1 makes it load-bearing.
-pub fn check_assembly_clock_compatibility(
-    plan: &AssemblyPlan,
-    input_clocks: &HashMap<String, ClockIdentity>,
-) -> Result<(), MasterClockMismatch> {
-    for program in &plan.programs {
-        // Collect (input_id, out_pid) for every source the program
-        // references — the primary slot source plus every switch leg.
-        // The walk preserves config order so the first slot's clock
-        // becomes the program reference. This matches operator intent
-        // because the first slot is conventionally the video PID, and
-        // a video clock mismatch is the most user-visible failure
-        // mode (audio drifts before video does, but video locks
-        // first).
-        let mut reference: Option<(String, ClockIdentity)> = None;
-        for slot in &program.slots {
-            // Direct source.
-            check_one_source(
-                program.program_number,
-                slot.out_pid,
-                &slot.source.0,
-                input_clocks,
-                &mut reference,
-            )?;
-            // Every switch leg.
-            if let Some(legs) = &slot.switch_legs {
-                for leg in legs {
-                    check_one_source(
-                        program.program_number,
-                        slot.out_pid,
-                        &leg.0,
-                        input_clocks,
-                        &mut reference,
-                    )?;
-                }
+/// A splice ends on the leg its Take named whether it commits, times out,
+/// degrades or is refused; it runs only between inputs on one clock, so the
+/// wait for it mixes none; and the next Take of its slot, or a plan swap that
+/// takes one of its legs, ends one still pending. A plan swap keeps the legs
+/// its Switch slots are on, which the plan before it was judged for, and puts
+/// a slot it adds beside them, or where a splice is taking them. A leg whose
+/// input is gone plays nothing.
+fn pairs_on_air<'a>(
+    a: &SlotInputs<'a>,
+    b: &SlotInputs<'a>,
+) -> Vec<(&'a str, &'a str, Option<&'a str>)> {
+    let mut pairs = vec![(a.start, b.start, None)];
+    for &x in &a.inputs {
+        for &y in &b.inputs {
+            let a_goes_alone = !b.inputs.contains(&x);
+            let b_goes_alone = b.moves() && !a.inputs.contains(&y);
+            if b_goes_alone && (a.start == x || !a_goes_alone) {
+                pairs.push((x, y, Some(y)));
+            } else if a_goes_alone {
+                pairs.push((x, y, Some(x)));
+            }
+        }
+    }
+    pairs
+}
+
+/// An input of `moving` that cannot play beside `still`, whose clock is not
+/// known, with the Take that brings it on air: `None` unless Takes that leave
+/// `still` where it starts, to inputs it has no leg on, put `moving` on two
+/// clocks, of which `still` can be on one at most. With `added`, one of those
+/// Takes must be to it.
+fn apart_from_unknown<'a>(
+    still: &SlotInputs<'a>,
+    moving: &SlotInputs<'a>,
+    clocks: &HashMap<String, ClockIdentity>,
+    added: Option<&str>,
+) -> Option<(&'a str, Option<&'a str>)> {
+    if clocks.contains_key(still.start) {
+        return None;
+    }
+    let beside: Vec<(&str, &ClockIdentity)> = moving
+        .inputs
+        .iter()
+        .filter(|x| !still.inputs.contains(*x))
+        .filter_map(|x| Some((*x, clocks.get(*x)?)))
+        .collect();
+    let (_, first) = beside.first()?;
+    if beside.iter().all(|(_, clock)| clock == first)
+        || added.is_some_and(|added| !beside.iter().any(|(x, _)| *x == added))
+    {
+        return None;
+    }
+    let of_still =
+        clocks.get(still.name).or_else(|| clocks.get(moving.start)).unwrap_or(first);
+    let (x, _) = beside.iter().find(|(_, clock)| *clock != of_still)?;
+    Some((x, (*x != moving.start).then_some(*x)))
+}
+
+/// The first two of `slots` that can play from inputs on different clocks at
+/// the same time, in slot order. An input with no clock in `clocks`, which is
+/// another flow's, and a Hitless slot are on a clock that is not known: all
+/// that is certain of it is that it is one ([`apart_from_unknown`]). With
+/// `added`, only what a Take to one of `added`'s Switch legs takes part in.
+fn first_clock_mismatch(
+    program_number: u16,
+    slots: &[SlotInputs<'_>],
+    clocks: &HashMap<String, ClockIdentity>,
+    added: Option<&str>,
+) -> Result<(), Box<MasterClockMismatch>> {
+    let label = |input: &str| clocks.get(input).map_or_else(|| "unknown".into(), |c| c.label());
+    for (later, b) in slots.iter().enumerate() {
+        for a in &slots[..later] {
+            let known = pairs_on_air(a, b).into_iter().find(|(x, y, take)| {
+                let counts = added.is_none_or(|added| {
+                    take.is_some()
+                        && ((*x == added && a.moves()) || (*y == added && b.moves()))
+                });
+                let (x, y) = (clocks.get(*x), clocks.get(*y));
+                counts && x.is_some() && y.is_some() && x != y
+            });
+            let mixed = known
+                .or_else(|| {
+                    let (y, take) = apart_from_unknown(a, b, clocks, added)?;
+                    Some((a.name, y, take))
+                })
+                .or_else(|| {
+                    let (x, take) = apart_from_unknown(b, a, clocks, added)?;
+                    Some((x, b.name, take))
+                });
+            if let Some((x, y, take)) = mixed {
+                return Err(Box::new(MasterClockMismatch {
+                    program_number,
+                    slot_out_pid: b.out_pid,
+                    slot_input_id: y.to_string(),
+                    slot_clock: label(y),
+                    reference_out_pid: a.out_pid,
+                    reference_input_id: x.to_string(),
+                    reference_clock: label(x),
+                    take_input_id: take.map(str::to_string),
+                }));
             }
         }
     }
     Ok(())
 }
 
-fn check_one_source(
-    program_number: u16,
-    slot_out_pid: u16,
-    input_id: &str,
+/// Refuse a plan in which two slots of one program can play from inputs on
+/// different master clocks at the same time.
+///
+/// Two encoders run independent 27 MHz oscillators, so video from one with
+/// audio from the other drifts out of lip-sync without bound and shows on no
+/// counter. Mute beats wrong-sync.
+///
+/// The legs of a Switch slot are alternatives: they never play together, so
+/// what is judged is every pair [`pairs_on_air`] names, not every leg. Two
+/// Switch slots with the same legs that start on one input follow each Take
+/// together, and their program plays one clock at a time whatever the legs'
+/// clocks are. A slot fixed to one of those legs, or with a leg the other
+/// does not have, stays behind on a Take and mixes two clocks.
+///
+/// Programs are independent: a receiver acquires a clock for each.
+///
+/// `input_clocks` holds the flow's own inputs. An input of another flow and
+/// a Hitless slot's merged source are not in it, and are judged only beside a
+/// slot that changes clock while they stay.
+pub fn check_assembly_clock_compatibility(
+    plan: &AssemblyPlan,
     input_clocks: &HashMap<String, ClockIdentity>,
-    reference: &mut Option<(String, ClockIdentity)>,
-) -> Result<(), MasterClockMismatch> {
-    let Some(clock) = input_clocks.get(input_id) else {
-        // Defensive: missing entries indicate the caller didn't
-        // populate the map for this input. Treat as "unknown but
-        // not provably incompatible" and skip — the upstream essence
-        // resolver will have already failed on a truly unknown input.
-        return Ok(());
-    };
-    match reference.as_ref() {
-        None => {
-            *reference = Some((input_id.to_string(), clock.clone()));
-            Ok(())
-        }
-        Some((_ref_input, ref_clock)) if ref_clock == clock => Ok(()),
-        Some((ref_input, ref_clock)) => Err(MasterClockMismatch {
-            program_number,
-            slot_out_pid,
-            slot_input_id: input_id.to_string(),
-            slot_clock: clock.label(),
-            reference_input_id: ref_input.clone(),
-            reference_clock: ref_clock.label(),
-        }),
+) -> Result<(), Box<MasterClockMismatch>> {
+    for program in &plan.programs {
+        let slots: Vec<SlotInputs> = program
+            .slots
+            .iter()
+            .map(|slot| SlotInputs {
+                out_pid: slot.out_pid,
+                start: &slot.source.0,
+                inputs: match &slot.switch_legs {
+                    Some(legs) => legs.iter().map(|leg| leg.0.as_str()).collect(),
+                    None => vec![slot.source.0.as_str()],
+                },
+                name: slot.hitless_legs.as_ref().map_or(&slot.source.0, |legs| &legs.primary),
+            })
+            .collect();
+        first_clock_mismatch(program.program_number, &slots, input_clocks, None)?;
     }
+    Ok(())
+}
+
+/// [`check_assembly_clock_compatibility`] for an input about to join a
+/// running flow whose assembly already names it: until then it was not one
+/// of the flow's own, so it was not judged and no Take could reach it. Only
+/// what a Take to one of its Switch legs brings on air counts; a slot fixed
+/// to it plays it already.
+pub fn check_added_input_clock(
+    assembly: &crate::config::models::FlowAssembly,
+    input_clocks: &HashMap<String, ClockIdentity>,
+    added: &str,
+) -> Result<(), Box<MasterClockMismatch>> {
+    use crate::config::models::SlotSource;
+    for program in &assembly.programs {
+        let slots: Vec<SlotInputs> = program
+            .streams
+            .iter()
+            .map(|stream| {
+                let (start, inputs, name) = match &stream.source {
+                    SlotSource::Pid { input_id, .. } | SlotSource::Essence { input_id, .. } => {
+                        (input_id.as_str(), vec![input_id.as_str()], input_id.as_str())
+                    }
+                    SlotSource::Switch { legs, initial_input_id, .. } => (
+                        initial_input_id.as_str(),
+                        legs.iter().map(|leg| leg.input_id()).collect(),
+                        initial_input_id.as_str(),
+                    ),
+                    // No input is named "".
+                    SlotSource::Hitless { primary, .. } => (
+                        "",
+                        vec![""],
+                        match primary.as_ref() {
+                            SlotSource::Pid { input_id, .. } => input_id.as_str(),
+                            _ => "",
+                        },
+                    ),
+                };
+                SlotInputs { out_pid: stream.out_pid, start, inputs, name }
+            })
+            .collect();
+        first_clock_mismatch(program.program_number, &slots, input_clocks, Some(added))?;
+    }
+    Ok(())
 }
 
 /// Handle returned to the flow runtime after spawning the assembler.
@@ -854,6 +1082,11 @@ async fn run_assembler(
     let mut pending_di_for_out_pid: std::collections::HashMap<u16, bool> =
         std::collections::HashMap::new();
 
+    // Programs a Take moved to another clock, by program number, until their
+    // first PCR from the new leg: when the Take was, and whether its silence
+    // has been reported.
+    let mut awaiting_pcr: HashMap<u16, (Instant, bool)> = HashMap::new();
+
     // Per-switch-slot active-leg pointer, keyed by `(program_idx, out_pid)`.
     // Populated on `install_plan` and `apply_plan_replacement` from each
     // switch slot's initial `source.0`; mutated by `SwitchActiveInput`.
@@ -948,7 +1181,33 @@ async fn run_assembler(
                         if !new_catalogs.is_empty() {
                             catalogs = new_catalogs;
                         }
-                        apply_plan_replacement(&mut plan, new_plan, PlanSwapState { bus: &bus, fanin_tx: &fanin_tx, cancel: &cancel, flat: &mut flat, slot_cancels: &mut slot_cancels, slot_tasks: &mut slot_tasks, pcr_out_pid_by_program: &mut pcr_out_pid_by_program, pat_version: &mut pat_version, pmt_versions: &mut pmt_versions, active_leg_input: &mut active_leg_input, event_sender: &event_sender, flow_id: &flow_id });
+                        // The leg each pending splice takes its slot to.
+                        let audio = splice_state.iter().map(|(k, s)| (k, s.pending_to_input_id()));
+                        let video =
+                            video_splice_state.iter().map(|(k, s)| (k, s.pending_to_input_id()));
+                        let splicing_to: HashMap<(usize, u16), String> = audio
+                            .chain(video)
+                            .filter_map(|(key, to)| Some((*key, to?.to_string())))
+                            .collect();
+                        let pcr_from =
+                            pcr_legs(&plan, &pcr_out_pid_by_program, &active_leg_input);
+                        let spliced = apply_plan_replacement(&mut plan, new_plan, PlanSwapState { bus: &bus, fanin_tx: &fanin_tx, cancel: &cancel, flat: &mut flat, slot_cancels: &mut slot_cancels, slot_tasks: &mut slot_tasks, pcr_out_pid_by_program: &mut pcr_out_pid_by_program, pat_version: &mut pat_version, pmt_versions: &mut pmt_versions, active_leg_input: &mut active_leg_input, splicing_to: &splicing_to, event_sender: &event_sender, flow_id: &flow_id });
+                        // A splice the new plan has no leg or no slot for ends
+                        // here: left to run it would move a slot to a leg that
+                        // is not there.
+                        splice_state.retain(|key, _| spliced.contains(key));
+                        video_splice_state.retain(|key, _| spliced.contains(key));
+                        // A held program waits on for its PCR if that still
+                        // comes from the input the Take named. A swap to
+                        // another input is a cut of its own, and holds nothing.
+                        let pcr_now =
+                            pcr_legs(&plan, &pcr_out_pid_by_program, &active_leg_input);
+                        awaiting_pcr.retain(|program, _| {
+                            match (pcr_from.get(program), pcr_now.get(program)) {
+                                (Some(from), Some(now)) => from.source.0 == now.source.0,
+                                _ => false,
+                            }
+                        });
                         publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
                         // Drop vitals for removed slots; fresh grace
                         // anchor for hot-swapped-in ones.
@@ -1054,15 +1313,24 @@ async fn run_assembler(
                                     continue;
                                 }
                                 let key = (pidx, slot.out_pid);
+                                // This Take replaces one whose splice is
+                                // still pending, a Take back included.
+                                splice_state.remove(&key);
+                                video_splice_state.remove(&key);
                                 let prev = active_leg_input.get(&key).cloned();
                                 if prev.as_deref() == Some(new_input_id.as_str()) {
                                     continue; // already active
                                 }
+                                let same_clock = prev
+                                    .as_deref()
+                                    .is_some_and(|prev| plan.share_clock(prev, &new_input_id));
 
                                 // Decide splice path. PesAligned needs:
                                 //  (1) effective splice_mode == PesAligned,
                                 //  (2) slot is a known audio OR video codec,
-                                //  (3) we've seen at least one PUSI=1 PTS
+                                //  (3) both legs on one clock: B's PTS is
+                                //      compared with A's,
+                                //  (4) we've seen at least one PUSI=1 PTS
                                 //      on the active leg (otherwise we
                                 //      have no threshold to align B to).
                                 //
@@ -1075,8 +1343,10 @@ async fn run_assembler(
                                 let pes_aligned =
                                     matches!(effective_mode, SpliceMode::PesAligned);
                                 let want_audio = pes_aligned
+                                    && same_clock
                                     && is_supported_audio_stream_type(slot.stream_type);
                                 let want_video = pes_aligned
+                                    && same_clock
                                     && is_supported_video_stream_type(slot.stream_type);
                                 if want_audio {
                                     if let Some(&last_pts) = last_a_pts.get(&key) {
@@ -1163,16 +1433,19 @@ async fn run_assembler(
                                 // slot config) but we reached the PmtBump
                                 // fall-through — emit a degrade Warning so
                                 // the operator isn't left thinking the cut
-                                // was glitchless. Reasons: the slot's codec
-                                // is not a supported PES-splice type, or no
-                                // active-leg PTS reference has been observed
+                                // was glitchless. Reasons: the two legs are
+                                // not known to run on one clock, the slot's
+                                // codec is not a supported PES-splice type, or
+                                // no active-leg PTS reference has been observed
                                 // yet (first switch on a freshly-armed flow).
                                 // Budget-exhaustion degrades emit
                                 // `pes_splice_timeout` separately on the
                                 // flush tick.
                                 if pes_aligned
                                     && let Some(es_) = &event_sender {
-                                        let reason = if want_audio || want_video {
+                                        let reason = if !same_clock {
+                                            "independent_clocks"
+                                        } else if want_audio || want_video {
                                             "no_aligned_pes_reference"
                                         } else {
                                             "unsupported_codec"
@@ -1208,6 +1481,21 @@ async fn run_assembler(
                                 }
                                 pending_di_for_out_pid.insert(slot.out_pid, true);
                                 any_flipped = true;
+                                if !same_clock {
+                                    // The next splice has nothing to measure
+                                    // until the new leg's first PES: the old
+                                    // leg's PTS and codec parameters are no
+                                    // reference for it.
+                                    last_a_pts.remove(&key);
+                                    last_a_aac_params.remove(&key);
+                                    last_a_video_params.remove(&key);
+                                    // The other slots of the program move with
+                                    // the one that carries its PCR.
+                                    if pcr_out_pid_by_program.get(pidx) == Some(&slot.out_pid) {
+                                        awaiting_pcr
+                                            .insert(prog.program_number, (Instant::now(), false));
+                                    }
+                                }
                             }
                         }
                         if any_flipped {
@@ -1235,6 +1523,7 @@ async fn run_assembler(
                             );
                         }
                     }
+                    PlanCommand::InputClocks(clocks) => plan.clocks = clocks,
                     #[cfg(test)]
                     PlanCommand::Stall { release } => {
                         let _ = release.await;
@@ -1754,21 +2043,31 @@ async fn run_assembler(
                 // From here on: forward the packet (was active leg with
                 // splice forwarding A, or B's first committed PES).
                 //
-                // Slot liveness: count the forwarded packet. The first
-                // ES packet after a latched stall fires the recovery
-                // event and re-arms stall detection for the slot.
-                let vitals_program_number = plan
+                let slot_program_number = plan
                     .programs
                     .get(slot.program_idx)
                     .map(|p| p.program_number)
                     .unwrap_or(0);
-                if let Some(v) = slot_vitals.get_mut(&(vitals_program_number, slot.out_pid)) {
+                // A Take moved the program to another clock: nothing of it
+                // goes out until a PCR of the new leg does.
+                if awaiting_pcr.contains_key(&slot_program_number) {
+                    if pcr_out_pid_by_program.get(slot.program_idx) != Some(&slot.out_pid)
+                        || extract_pcr(&es.payload).is_none()
+                    {
+                        continue;
+                    }
+                    awaiting_pcr.remove(&slot_program_number);
+                }
+                // Slot liveness: count the forwarded packet. The first
+                // ES packet after a latched stall fires the recovery
+                // event and re-arms stall detection for the slot.
+                if let Some(v) = slot_vitals.get_mut(&(slot_program_number, slot.out_pid)) {
                     v.packets = v.packets.wrapping_add(1);
                     if v.stalled {
                         v.stalled = false;
                         v.last_data = Some(Instant::now());
                         if let Some(es_) = &event_sender {
-                            let program_number = vitals_program_number;
+                            let program_number = slot_program_number;
                             es_.emit_flow_with_details(
                                 crate::manager::events::EventSeverity::Info,
                                 crate::manager::events::category::FLOW,
@@ -1989,6 +2288,40 @@ async fn run_assembler(
                 // incident lacked — a dead source behind an assembled
                 // flow used to emit PSI-only with zero events.
                 let now = Instant::now();
+                for (program_number, (since, reported)) in awaiting_pcr.iter_mut() {
+                    if *reported || now.duration_since(*since) < PCR_HOLD_ALARM {
+                        continue;
+                    }
+                    *reported = true;
+                    let Some(PcrLeg { out_pid, source: (input_id, source_pid) }) =
+                        pcr_legs(&plan, &pcr_out_pid_by_program, &active_leg_input)
+                            .remove(program_number)
+                    else {
+                        continue;
+                    };
+                    if let Some(es_) = &event_sender {
+                        es_.emit_flow_with_details(
+                            crate::manager::events::EventSeverity::Warning,
+                            crate::manager::events::category::FLOW,
+                            format!(
+                                "Flow '{flow_id}': program {program_number} is off air since \
+                                 the Take to '{input_id}' — no PCR on its source_pid \
+                                 0x{source_pid:04X}, which carries the program's clock on \
+                                 out_pid 0x{out_pid:04X}. It goes out again with the first \
+                                 PCR there, with a Take to an input that sends one, or with a \
+                                 plan swap that takes the program's PCR to another input",
+                            ),
+                            &flow_id,
+                            serde_json::json!({
+                                "error_code": "pid_bus_take_no_pcr",
+                                "program_number": program_number,
+                                "out_pid": out_pid,
+                                "input_id": input_id,
+                                "source_pid": source_pid,
+                            }),
+                        );
+                    }
+                }
                 let (health, newly_stalled) = scan_slot_stalls(
                     &plan,
                     &active_leg_input,
@@ -2116,16 +2449,54 @@ fn install_plan(
         .map(|prog| {
             prog.slots
                 .iter()
-                .find(|s| {
-                    s.source == prog.pcr_source
-                        || s.switch_legs
-                            .as_ref()
-                            .is_some_and(|legs| legs.iter().any(|p| p == &prog.pcr_source))
-                })
+                .find(|s| s.reads(&prog.pcr_source))
                 .map(|s| s.out_pid)
                 .unwrap_or(prog.pmt_pid)
         })
         .collect();
+}
+
+/// The leg each Switch slot of `plan` is on once a swap has put it in place
+/// of the plan `on` and `splicing_to` are of (the leg each slot is on, and the
+/// one its pending splice takes it to), and the slots whose splice goes on.
+///
+/// A slot that has the leg it is on keeps it, and its splice if it has the leg
+/// that goes to as well. One that has only the latter is put on it. One with
+/// neither starts where a slot of its program that kept a leg is, or is being
+/// spliced to, if it has that leg: a Take moved that slot, and the plan's
+/// `source.0` (the initial leg) could be another clock. Without one it starts
+/// there.
+fn legs_after_swap(
+    plan: &AssemblyPlan,
+    on: &HashMap<(usize, u16), String>,
+    splicing_to: &HashMap<(usize, u16), String>,
+) -> (HashMap<(usize, u16), String>, HashSet<(usize, u16)>) {
+    let mut legs = HashMap::new();
+    let mut spliced = HashSet::new();
+    for (pidx, prog) in plan.programs.iter().enumerate() {
+        let switches = || prog.slots.iter().filter(|s| s.switch_legs.is_some());
+        let mut kept: Vec<&String> = Vec::new();
+        for s in switches() {
+            let key = (pidx, s.out_pid);
+            let has = |leg: &&String| s.source_on(leg).is_some();
+            let on = on.get(&key).filter(has);
+            let to = splicing_to.get(&key).filter(has);
+            if let Some(leg) = on.or(to) {
+                legs.insert(key, leg.clone());
+            }
+            if on.is_some() && to.is_some() {
+                spliced.insert(key);
+            }
+            kept.extend(to.or(on));
+        }
+        for s in switches() {
+            legs.entry((pidx, s.out_pid)).or_insert_with(|| {
+                let joined = kept.iter().find(|leg| s.source_on(leg).is_some());
+                joined.map_or(&s.source.0, |leg| *leg).clone()
+            });
+        }
+    }
+    (legs, spliced)
 }
 
 /// Apply a `ReplacePlan` delta.
@@ -2158,15 +2529,18 @@ struct PlanSwapState<'a> {
     pat_version: &'a mut u8,
     pmt_versions: &'a mut Vec<u8>,
     active_leg_input: &'a mut std::collections::HashMap<(usize, u16), String>,
+    /// The leg each pending splice takes its slot to.
+    splicing_to: &'a HashMap<(usize, u16), String>,
     event_sender: &'a Option<crate::manager::events::EventSender>,
     flow_id: &'a str,
 }
 
+/// Returns the Switch slots whose pending splice goes on ([`legs_after_swap`]).
 fn apply_plan_replacement(
     plan: &mut AssemblyPlan,
     new_plan: AssemblyPlan,
     params: PlanSwapState<'_>,
-) {
+) -> HashSet<(usize, u16)> {
     // Destructured back into the original bindings so the body is unchanged.
     let PlanSwapState {
         bus,
@@ -2179,6 +2553,7 @@ fn apply_plan_replacement(
         pat_version,
         pmt_versions,
         active_leg_input,
+        splicing_to,
         event_sender,
         flow_id,
     } = params;
@@ -2243,11 +2618,9 @@ fn apply_plan_replacement(
     // main loop's `flat.get(idx)` naturally tolerates. This avoids the
     // whole re-indexing headache.
 
-    // Refresh active-leg pointers on swap. Drop entries for switch
-    // slots that no longer exist; preserve entries for slots that
-    // survive (the operator's prior switch sticks across hot-swap).
-    let mut new_active_leg_input: std::collections::HashMap<(usize, u16), String> =
-        std::collections::HashMap::new();
+    // The operator's prior switch sticks across a hot-swap.
+    let (legs, spliced) = legs_after_swap(&new_plan, active_leg_input, splicing_to);
+    *active_leg_input = legs;
 
     for new_prog in new_plan.programs.iter().enumerate() {
         let (pidx, prog) = new_prog;
@@ -2312,22 +2685,8 @@ fn apply_plan_replacement(
                     }
                 }
             }
-            if is_switch {
-                // Carry the operator's prior choice if the new slot
-                // still has it as a leg; otherwise fall back to the
-                // new plan's `source.0` (= initial_input_id).
-                let key = (pidx, s.out_pid);
-                let prior = active_leg_input
-                    .get(&key)
-                    .filter(|prev| leg_pairs.iter().any(|(iid, _)| iid == prev.as_str()))
-                    .cloned()
-                    .unwrap_or_else(|| s.source.0.clone());
-                new_active_leg_input.insert(key, prior);
-            }
         }
     }
-
-    *active_leg_input = new_active_leg_input;
 
     // Cancel any fan-in that wasn't reused. Leave its entry in `flat`
     // as a tombstone — the main loop's `flat.get(idx)` still returns
@@ -2349,12 +2708,7 @@ fn apply_plan_replacement(
         .map(|prog| {
             prog.slots
                 .iter()
-                .find(|s| {
-                    s.source == prog.pcr_source
-                        || s.switch_legs
-                            .as_ref()
-                            .is_some_and(|legs| legs.iter().any(|p| p == &prog.pcr_source))
-                })
+                .find(|s| s.reads(&prog.pcr_source))
                 .map(|s| s.out_pid)
                 .unwrap_or(prog.pmt_pid)
         })
@@ -2365,6 +2719,7 @@ fn apply_plan_replacement(
 
     // Silence unused-var warnings from the earlier parallel-map stubs.
     let _ = (&mut new_flat, &mut carry_tasks, &mut carry_cancels);
+    spliced
 }
 
 /// Identity carried into [`slot_fanin`] so it can emit a structured
@@ -3206,6 +3561,7 @@ mod tests {
                     slot("in-b", 0x200, 0x201, 0x0F), // AAC-LC audio
                 ],
             }],
+            clocks: HashMap::new(),
         }
     }
 
@@ -3363,6 +3719,7 @@ mod tests {
                     slots: vec![slot("in-b", 0x200, 0x300, 0x1B)],
                 },
             ],
+            clocks: HashMap::new(),
         }
     }
 
@@ -3684,6 +4041,7 @@ mod tests {
                 pcr_source: ("hitless:cam1".to_string(), 0x100),
                 slots: vec![slot("hitless:cam1", 0x100, 0x200, 0x1B)],
             }],
+            clocks: HashMap::new(),
         };
         let handle = spawn_spts_assembler(plan, bus.clone(), tx, cancel.clone(), None, String::new(), None, None, None, Default::default()).join;
         // The startup PSI: the fan-in has subscribed, before any packet.
@@ -3822,6 +4180,7 @@ mod tests {
                     slot("in-b", 0x200, 0x201, 0x0F),
                 ],
             }],
+            clocks: HashMap::new(),
         };
         handle
             .plan_tx
@@ -4258,33 +4617,529 @@ mod tests {
             .expect("two programs from different sources is allowed");
     }
 
+    fn source_pcr(id: &str) -> ClockIdentity {
+        ClockIdentity::SourcePcr { input_id: id.into() }
+    }
+
+    /// A slot with a leg on each of `legs` (the PID tells the slot's own apart),
+    /// starting on the first.
+    fn switch_slot(legs: &[&str], src_pid: u16, out_pid: u16, stream_type: u8) -> AssemblySlot {
+        let mut s = slot(legs[0], src_pid, out_pid, stream_type);
+        s.switch_legs = Some(legs.iter().map(|leg| (leg.to_string(), src_pid)).collect());
+        s
+    }
+
+    /// One program of `slots`, its PCR on the first, every input on a clock
+    /// of its own.
+    fn one_program(slots: Vec<AssemblySlot>) -> AssemblyPlan {
+        let mut clocks = HashMap::new();
+        for id in ["a", "b", "c"] {
+            clocks.insert(id.to_string(), source_pcr(id));
+        }
+        AssemblyPlan {
+            programs: vec![ProgramPlan {
+                program_number: 1,
+                pmt_pid: 0x1000,
+                pcr_source: slots[0].source.clone(),
+                slots,
+            }],
+            clocks,
+        }
+    }
+
+    /// Two encoders switched as a whole: the legs of each slot are
+    /// alternatives, and both slots follow every Take.
     #[test]
-    fn clock_compat_walks_switch_legs() {
-        // A Switch slot whose legs span multiple inputs must have
-        // every leg on the same clock as the program's reference.
-        let mut plan = make_plan();
-        // Replace slot 1 with a switch slot whose backup leg lives on
-        // a different SourcePcr — that's a sneaky failure mode the
-        // resolver could miss because the active leg looks fine.
-        plan.programs[0].slots[1] = AssemblySlot {
-            source: ("in-a".to_string(), 0x200),
-            out_pid: 0x201,
-            stream_type: 0x0F,
-            switch_legs: Some(vec![
-                ("in-a".to_string(), 0x200),
-                ("in-c".to_string(), 0x200),
-            ]),
-            hitless_legs: None,
-            splice_mode: Default::default(),
-            splice_budget_ms: None,
-        };
-        let map = clocks(&[
-            ("in-a", ClockIdentity::SourcePcr { input_id: "in-a".into() }),
-            ("in-c", ClockIdentity::SourcePcr { input_id: "in-c".into() }),
+    fn clock_compat_accepts_a_program_that_switches_as_one() {
+        let plan = one_program(vec![
+            switch_slot(&["a", "b"], 0x100, 0x200, 0x1B),
+            switch_slot(&["a", "b"], 0x101, 0x201, 0x0F),
         ]);
-        let err = check_assembly_clock_compatibility(&plan, &map)
-            .expect_err("switch leg on a different clock must fail");
-        assert_eq!(err.slot_input_id, "in-c");
+        check_assembly_clock_compatibility(&plan, &plan.clocks).expect("never on two clocks");
+    }
+
+    /// What a Switch slot can be left beside: a slot pinned to one of its
+    /// legs, a Switch slot without one of its legs, and one that starts on
+    /// another leg. The refusal names the two inputs and what brings them
+    /// on air together.
+    #[test]
+    fn clock_compat_refuses_a_program_a_take_would_split() {
+        let pinned = one_program(vec![
+            switch_slot(&["a", "b"], 0x100, 0x200, 0x1B),
+            slot("a", 0x101, 0x201, 0x0F),
+        ]);
+        let err = check_assembly_clock_compatibility(&pinned, &pinned.clocks)
+            .expect_err("a Take to b leaves the audio on a");
+        assert_eq!(
+            *err,
+            MasterClockMismatch {
+                program_number: 1,
+                slot_out_pid: 0x201,
+                slot_input_id: "a".into(),
+                slot_clock: "source_pcr:input=a".into(),
+                reference_out_pid: 0x200,
+                reference_input_id: "b".into(),
+                reference_clock: "source_pcr:input=b".into(),
+                take_input_id: Some("b".into()),
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "program 1 slot 0x0201 input 'a' has master clock source_pcr:input=a but slot \
+             0x0200 plays input 'b' on clock source_pcr:input=b beside it after a Take to 'b' \
+             — combining incompatible clocks would silently drift"
+        );
+        assert_eq!(
+            err.details(),
+            serde_json::json!({
+                "error_code": "pid_bus_master_clock_mismatch",
+                "program_number": 1,
+                "slot_out_pid": 0x201,
+                "slot_input_id": "a",
+                "slot_clock": "source_pcr:input=a",
+                "reference_out_pid": 0x200,
+                "reference_input_id": "b",
+                "reference_clock": "source_pcr:input=b",
+                "take_input_id": "b",
+            })
+        );
+
+        let third = one_program(vec![
+            switch_slot(&["a", "b"], 0x100, 0x200, 0x1B),
+            switch_slot(&["a", "b", "c"], 0x101, 0x201, 0x0F),
+        ]);
+        let err = check_assembly_clock_compatibility(&third, &third.clocks)
+            .expect_err("a Take to c leaves the video behind");
+        assert_eq!(err.take_input_id.as_deref(), Some("c"));
+        assert_eq!((err.reference_input_id.as_str(), err.slot_input_id.as_str()), ("a", "c"));
+
+        let start = one_program(vec![
+            switch_slot(&["a", "b"], 0x100, 0x200, 0x1B),
+            switch_slot(&["b", "a"], 0x101, 0x201, 0x0F),
+        ]);
+        let err = check_assembly_clock_compatibility(&start, &start.clocks)
+            .expect_err("it starts on a and b");
+        assert_eq!(err.take_input_id, None);
+        assert!(err.to_string().contains("beside it from the start"), "{err}");
+    }
+
+    /// What [`clock_rule_matches_every_small_plan`] runs a plan on: the inputs
+    /// of each slot and the one it starts on.
+    type Legs = (Vec<usize>, usize);
+
+    /// The plan of `slots`.
+    fn plan_of(slots: &[Legs]) -> AssemblyPlan {
+        let slots = slots.iter().enumerate().map(|(i, (legs, start))| {
+            let mut s = slot(IDS[*start], 0x100, 0x200 + i as u16, 0x1B);
+            if legs.len() > 1 {
+                s.switch_legs = Some(legs.iter().map(|l| (IDS[*l].to_string(), 0x100)).collect());
+            }
+            s
+        });
+        one_program(slots.collect())
+    }
+
+    /// Every state a plan can be in, by playing Takes to `takeable` from the
+    /// start: what each slot is on.
+    fn states(slots: &[Legs], takeable: &[usize]) -> std::collections::HashSet<Vec<usize>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut todo = vec![slots.iter().map(|(_, start)| *start).collect::<Vec<_>>()];
+        while let Some(state) = todo.pop() {
+            if !seen.insert(state.clone()) {
+                continue;
+            }
+            for &take in takeable {
+                todo.push(after_take(slots, &state, take));
+            }
+        }
+        seen
+    }
+
+    fn after_take(slots: &[Legs], state: &[usize], take: usize) -> Vec<usize> {
+        let on = |((legs, _), now): (&Legs, &usize)| if legs.contains(&take) { take } else { *now };
+        slots.iter().zip(state).map(on).collect()
+    }
+
+    const IDS: [&str; 3] = ["x", "y", "z"];
+
+    /// Every leg set of three inputs with every start, a slot each.
+    fn every_slot() -> Vec<Legs> {
+        (1..8usize)
+            .flat_map(|set| {
+                let legs: Vec<usize> = (0..3).filter(|i| set & (1 << i) != 0).collect();
+                legs.clone().into_iter().map(move |start| (legs.clone(), start))
+            })
+            .collect()
+    }
+
+    /// Every plan of up to three slots.
+    fn every_plan() -> Vec<Vec<Legs>> {
+        let slots = every_slot();
+        let mut all = Vec::new();
+        let mut plans: Vec<Vec<Legs>> = vec![Vec::new()];
+        for _ in 0..3 {
+            plans = plans
+                .iter()
+                .flat_map(|plan| {
+                    slots.iter().map(move |s| plan.iter().cloned().chain([s.clone()]).collect())
+                })
+                .collect();
+            all.extend(plans.iter().cloned());
+        }
+        all
+    }
+
+    /// Whether `state` plays the pair `err` names.
+    fn plays(state: &[usize], err: &MasterClockMismatch) -> bool {
+        let on = |out_pid: u16| IDS[state[(out_pid - 0x200) as usize]];
+        on(err.slot_out_pid) == err.slot_input_id
+            && on(err.reference_out_pid) == err.reference_input_id
+    }
+
+    /// The check against a run of every plan of up to three slots on three
+    /// inputs, each on one of two clocks or on none known (another flow's
+    /// input, which no Take reaches): refused exactly when some run of Takes
+    /// puts two slots on inputs of different clocks, or one on two clocks
+    /// beside another that stays on an input of unknown clock, with a pair
+    /// such a run does put on air, brought there by the Take it names.
+    #[test]
+    fn clock_rule_matches_every_small_plan() {
+        let plans = every_plan();
+        let (mut refused, mut accepted) = (0, 0);
+        for clocks in 0..27usize {
+            let clock = |input: usize| match clocks / 3usize.pow(input as u32) % 3 {
+                0 => None,
+                domain => Some(domain as u8),
+            };
+            let map: HashMap<String, ClockIdentity> = (0..3)
+                .filter_map(|i| clock(i).map(|d| (IDS[i].to_string(), ClockIdentity::Ptp { domain: d })))
+                .collect();
+            let takeable: Vec<usize> = (0..3).filter(|i| clock(*i).is_some()).collect();
+            for legs in &plans {
+                let plan = plan_of(legs);
+                let states = states(legs, &takeable);
+                let known_mix = states.iter().any(|state| {
+                    let mut known = state.iter().filter_map(|i| clock(*i));
+                    let first = known.next();
+                    known.any(|c| Some(c) != first)
+                });
+                // A slot on an input whose clock is not known, with another
+                // slot on one clock in one state and on another in the next.
+                let mut beside = std::collections::HashMap::new();
+                let unknown_mix = states.iter().any(|state| {
+                    (0..state.len()).any(|j| {
+                        clock(state[j]).is_none()
+                            && (0..state.len()).filter_map(|i| Some((i, clock(state[i])?))).any(
+                                |(i, c)| *beside.entry((j, state[j], i)).or_insert(c) != c,
+                            )
+                    })
+                });
+                let mixes = known_mix || unknown_mix;
+                match check_assembly_clock_compatibility(&plan, &map) {
+                    Ok(()) => {
+                        assert!(!mixes, "accepted {legs:?} on clocks {clocks}");
+                        accepted += 1;
+                    }
+                    Err(err) => {
+                        assert!(mixes, "refused {legs:?} on clocks {clocks}: {err}");
+                        assert!(err.slot_clock != err.reference_clock);
+                        let by_unknown =
+                            err.slot_clock == "unknown" || err.reference_clock == "unknown";
+                        assert!(if by_unknown { unknown_mix } else { known_mix }, "{legs:?}: {err}");
+                        let start: Vec<usize> = legs.iter().map(|(_, start)| *start).collect();
+                        match &err.take_input_id {
+                            None => assert!(plays(&start, &err), "{legs:?}: {err}"),
+                            Some(id) => {
+                                let take = IDS.iter().position(|i| i == id).unwrap();
+                                assert!(
+                                    states.iter().any(|from| {
+                                        !plays(from, &err)
+                                            && plays(&after_take(legs, from, take), &err)
+                                    }),
+                                    "{legs:?}: {err}"
+                                );
+                            }
+                        }
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        // 12 slots, so 12 + 144 + 1728 plans, on 27 clock settings.
+        assert_eq!(refused + accepted, 27 * 1884);
+        assert!(refused > 1000 && accepted > 1000, "{refused} refused, {accepted} accepted");
+    }
+
+    /// What a slot is on, and what a splice pending takes it to.
+    type OnTo = (usize, Option<usize>);
+
+    /// Every state Takes put `slots` in from `from`: one on another input of
+    /// the same clock is a cut, or a splice that lands before the next or not.
+    fn spliced_states(
+        slots: &[Legs],
+        from: Vec<OnTo>,
+        clock: &[usize; 3],
+    ) -> HashSet<Vec<OnTo>> {
+        let mut seen = HashSet::new();
+        let mut todo = vec![from];
+        while let Some(state) = todo.pop() {
+            if !seen.insert(state.clone()) {
+                continue;
+            }
+            for i in 0..state.len() {
+                if let Some(to) = state[i].1 {
+                    let mut landed = state.clone();
+                    landed[i] = (to, None);
+                    todo.push(landed);
+                }
+            }
+            for take in 0..3 {
+                for splice in [false, true] {
+                    let taken = |((legs, _), (on, to)): (&Legs, &OnTo)| {
+                        if !legs.contains(&take) {
+                            (*on, *to)
+                        } else if splice && *on != take && clock[*on] == clock[take] {
+                            (*on, Some(take))
+                        } else {
+                            (take, None)
+                        }
+                    };
+                    todo.push(slots.iter().zip(&state).map(taken).collect());
+                }
+            }
+        }
+        seen
+    }
+
+    /// [`legs_after_swap`], from every state a plan of three slots the check
+    /// accepts can be in, any of them new to the swap, to every other such
+    /// plan: no Take after the swap and no splice it left pending puts two of
+    /// them on different clocks.
+    #[test]
+    fn a_plan_swap_mixes_no_clocks() {
+        let mut swaps = 0;
+        for clock in [[0, 1, 2], [0, 0, 1]] {
+            let map: HashMap<String, ClockIdentity> = (0..3)
+                .map(|i| (IDS[i].to_string(), ClockIdentity::Ptp { domain: clock[i] as u8 }))
+                .collect();
+            let accepted: Vec<Vec<Legs>> = every_plan()
+                .into_iter()
+                .filter(|legs| legs.len() == 3)
+                .filter(|legs| check_assembly_clock_compatibility(&plan_of(legs), &map).is_ok())
+                .collect();
+            let start = |legs: &[Legs]| legs.iter().map(|(_, start)| (*start, None)).collect();
+            let before: HashSet<Vec<OnTo>> = accepted
+                .iter()
+                .flat_map(|legs| spliced_states(legs, start(legs), &clock))
+                .collect();
+            let key = |i: usize| (0, 0x200 + i as u16);
+            for legs in &accepted {
+                let plan = plan_of(legs);
+                let mut checked = HashSet::new();
+                for (state, kept) in before.iter().flat_map(|s| (0..8).map(move |kept| (s, kept))) {
+                    let kept = |i: &usize| kept & (1 << i) != 0;
+                    let on = (0..3)
+                        .filter(kept)
+                        .map(|i| (key(i), IDS[state[i].0].to_string()))
+                        .collect();
+                    let splicing_to = (0..3)
+                        .filter(kept)
+                        .filter_map(|i| Some((key(i), IDS[state[i].1?].to_string())))
+                        .collect();
+                    let (now, spliced) = legs_after_swap(&plan, &on, &splicing_to);
+                    let after: Vec<OnTo> = (0..3)
+                        .map(|i| {
+                            let Some(leg) = now.get(&key(i)) else { return (legs[i].1, None) };
+                            let leg = IDS.iter().position(|id| id == leg).unwrap();
+                            (leg, state[i].1.filter(|_| spliced.contains(&key(i))))
+                        })
+                        .collect();
+                    swaps += 1;
+                    if !checked.insert(after.clone()) {
+                        continue;
+                    }
+                    for then in spliced_states(legs, after.clone(), &clock) {
+                        assert!(
+                            then.iter().all(|(on, _)| clock[*on] == clock[then[0].0]),
+                            "{state:?} to {legs:?} on clocks {clock:?}: {after:?}, {then:?}"
+                        );
+                        assert!(
+                            then.iter().zip(legs).all(|((on, to), (legs, _))| {
+                                legs.contains(on) && to.is_none_or(|to| legs.contains(&to))
+                            }),
+                            "{state:?} to {legs:?}: {after:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(swaps > 10_000, "{swaps}");
+    }
+
+    /// [`check_added_input_clock`] against the same plans, `z` the input
+    /// joining the flow: refused exactly when a Take to `z`, or another that
+    /// leaves a slot on `z`, brings it on air beside a slot on another clock.
+    #[test]
+    fn added_input_rule_matches_every_small_plan() {
+        let mut refused = 0;
+        for clocks in 0..4u8 {
+            // x and y on one clock or two, z on the first or on its own.
+            let domains = [1, 1 + (clocks & 1), if clocks & 2 == 0 { 1 } else { 3 }];
+            let map: HashMap<String, ClockIdentity> = (0..3)
+                .map(|i| (IDS[i].to_string(), ClockIdentity::Ptp { domain: domains[i] }))
+                .collect();
+            for legs in &every_plan() {
+                let streams: Vec<serde_json::Value> = legs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (legs, start))| {
+                        let leg = |l: usize| {
+                            serde_json::json!({ "type": "pid", "input_id": IDS[l], "source_pid": 256 })
+                        };
+                        let source = if legs.len() > 1 {
+                            serde_json::json!({
+                                "type": "switch", "initial_input_id": IDS[*start],
+                                "legs": legs.iter().map(|l| leg(*l)).collect::<Vec<_>>()
+                            })
+                        } else {
+                            leg(legs[0])
+                        };
+                        serde_json::json!({
+                            "source": source, "out_pid": 0x200 + i, "stream_type": 27
+                        })
+                    })
+                    .collect();
+                let assembly: crate::config::models::FlowAssembly =
+                    serde_json::from_value(serde_json::json!({
+                        "kind": "spts",
+                        "programs": [{
+                            "program_number": 1, "pmt_pid": 4096, "streams": streams
+                        }]
+                    }))
+                    .expect("assembly");
+                // The pairs of slots a Take moves one of onto its place in,
+                // with a slot that can move on `z`, and the Takes.
+                let mut brought = std::collections::HashMap::<_, Vec<&str>>::new();
+                for from in states(legs, &[0, 1, 2]) {
+                    for take in 0..3 {
+                        let to = after_take(legs, &from, take);
+                        for j in 0..legs.len() {
+                            for i in 0..j {
+                                let z_moves = |s: usize| to[s] == 2 && legs[s].0.len() > 1;
+                                if (from[i], from[j]) != (to[i], to[j]) && (z_moves(i) || z_moves(j))
+                                    && domains[to[i]] != domains[to[j]]
+                                {
+                                    brought.entry((i, to[i], j, to[j])).or_default().push(IDS[take]);
+                                }
+                            }
+                        }
+                    }
+                }
+                match check_added_input_clock(&assembly, &map, "z") {
+                    Ok(()) => assert!(brought.is_empty(), "{legs:?} {domains:?}: {brought:?}"),
+                    Err(err) => {
+                        let at = |out_pid: u16| (out_pid - 0x200) as usize;
+                        let id = |id: &str| IDS.iter().position(|i| *i == id).unwrap();
+                        let pair = (
+                            at(err.reference_out_pid),
+                            id(&err.reference_input_id),
+                            at(err.slot_out_pid),
+                            id(&err.slot_input_id),
+                        );
+                        let takes = brought.get(&pair).map_or(&[][..], Vec::as_slice);
+                        let take = err.take_input_id.as_deref().expect("a Take");
+                        assert!(takes.contains(&take), "{legs:?} {domains:?}: {err}");
+                        refused += 1;
+                    }
+                }
+            }
+        }
+        assert!(refused > 1000, "{refused} refused");
+    }
+
+    /// A Hitless slot fails over by itself, so its legs are not judged, but no
+    /// Take moves it: beside it a Switch slot cannot change clock, and one on
+    /// one clock can switch. The refusal names its primary, and whichever leg
+    /// of the Switch slot is not on that one's clock.
+    #[test]
+    fn clock_compat_refuses_a_take_beside_a_hitless_slot() {
+        let hitless = |primary: &str| {
+            let mut s = slot("hitless:f1:0:slot_0_1", 0, 0x201, 0x0F);
+            s.hitless_legs = Some(HitlessLegs {
+                primary: primary.to_string(),
+                backup: "c".to_string(),
+                forwarding_primary: Default::default(),
+                seq_fallback: Default::default(),
+            });
+            s
+        };
+        for (primary, switch_input, clock, take) in [
+            ("a", "b", "source_pcr:input=a", Some("b")),
+            ("b", "a", "source_pcr:input=b", None),
+            ("elsewhere", "b", "unknown", Some("b")),
+        ] {
+            let mut switch = switch_slot(&["a", "b"], 0x100, 0x200, 0x1B);
+            switch.switch_legs.as_mut().unwrap().reverse();
+            let mut plan = one_program(vec![switch, hitless(primary)]);
+            let err = check_assembly_clock_compatibility(&plan, &plan.clocks)
+                .expect_err("a Take leaves the Hitless slot");
+            assert_eq!((err.slot_out_pid, err.reference_out_pid), (0x201, 0x200));
+            assert_eq!((err.slot_input_id.as_str(), err.slot_clock.as_str()), (primary, clock));
+            assert_eq!(err.reference_input_id, switch_input);
+            assert_eq!(err.take_input_id.as_deref(), take);
+
+            plan.programs[0].slots.reverse();
+            let err = check_assembly_clock_compatibility(&plan, &plan.clocks)
+                .expect_err("in either order");
+            assert_eq!((err.slot_out_pid, err.slot_input_id.as_str()), (0x200, switch_input));
+            assert_eq!((err.reference_out_pid, err.reference_input_id.as_str()), (0x201, primary));
+            assert_eq!(err.reference_clock, clock);
+
+            plan.clocks.insert("b".into(), source_pcr("a"));
+            check_assembly_clock_compatibility(&plan, &plan.clocks).expect("one clock");
+        }
+        let fixed = one_program(vec![slot("a", 0x100, 0x200, 0x1B), hitless("b")]);
+        check_assembly_clock_compatibility(&fixed, &fixed.clocks).expect("not judged on its legs");
+    }
+
+    /// Nor does an input join whose Take would leave a Hitless slot, or a slot
+    /// on another flow's input, on a clock the program played before.
+    #[test]
+    fn added_input_rule_keeps_a_hitless_slot_company() {
+        let assembly = |still: serde_json::Value| -> crate::config::models::FlowAssembly {
+            serde_json::from_value(serde_json::json!({
+                "kind": "spts",
+                "programs": [{
+                    "program_number": 1, "pmt_pid": 4096,
+                    "streams": [
+                        { "source": still, "out_pid": 512, "stream_type": 27 },
+                        { "source": { "type": "switch", "initial_input_id": "b", "legs": [
+                            { "type": "essence", "input_id": "b", "kind": "audio" },
+                            { "type": "essence", "input_id": "c", "kind": "audio" } ] },
+                          "out_pid": 513, "stream_type": 15 }
+                    ]
+                }]
+            }))
+            .expect("assembly")
+        };
+        let pid = |id: &str| serde_json::json!({ "type": "pid", "input_id": id, "source_pid": 256 });
+        let hitless = assembly(serde_json::json!({
+            "type": "hitless", "primary": pid("b"), "backup": pid("b")
+        }));
+        let foreign = assembly(pid("elsewhere"));
+        let map = clocks(&[("b", source_pcr("b")), ("c", source_pcr("c")), ("d", source_pcr("d"))]);
+        for (assembly, name, clock) in
+            [(&hitless, "b", "source_pcr:input=b"), (&foreign, "elsewhere", "unknown")]
+        {
+            let err = check_added_input_clock(assembly, &map, "c").expect_err("a Take to c");
+            assert_eq!((err.slot_out_pid, err.slot_input_id.as_str()), (513, "c"));
+            assert_eq!((err.reference_out_pid, err.reference_input_id.as_str()), (512, name));
+            assert_eq!(err.reference_clock, clock);
+            assert_eq!(err.take_input_id.as_deref(), Some("c"));
+            check_added_input_clock(assembly, &map, "d").expect("an input it does not name");
+            let same = clocks(&[("b", source_pcr("b")), ("c", source_pcr("b"))]);
+            check_added_input_clock(assembly, &same, "c").expect("one clock");
+        }
     }
 
     #[test]
@@ -4543,6 +5398,7 @@ mod tests {
                 pcr_source: ("in-e".to_string(), 0x600),
                 slots: vec![slot("in-e", 0x600, 0x601, 0x1B)],
             }],
+            clocks: HashMap::new(),
         };
         plan2.programs.extend(plan.programs.clone());
         sync_slot_vitals(&plan2, &mut vitals, t0 + Duration::from_secs(30));
@@ -4591,8 +5447,9 @@ mod tests {
         );
     }
 
-    /// A Switch slot whose legs are `srt-main` (active) and `srt-backup`,
-    /// next to a Hitless slot whose merger reads `srt-pri` and `srt-bak`.
+    /// A Switch slot whose legs are `srt-main` (active) and `srt-backup`, on
+    /// one clock, next to a Hitless slot whose merger reads `srt-pri` and
+    /// `srt-bak`.
     fn switch_and_hitless_plan(
         splice_mode: crate::config::models::SpliceMode,
         splice_budget_ms: Option<u32>,
@@ -4619,6 +5476,10 @@ mod tests {
                 pcr_source: ("srt-main".to_string(), 0x101),
                 slots: vec![switch, hitless],
             }],
+            clocks: clocks(&[
+                ("srt-main", ClockIdentity::Wallclock),
+                ("srt-backup", ClockIdentity::Wallclock),
+            ]),
         }
     }
 
@@ -4991,5 +5852,710 @@ mod tests {
 
         cancel.cancel();
         handle.join.await.unwrap();
+    }
+
+    /// A running assembler, its inputs and what it sends.
+    struct Rig {
+        bus: Arc<NodeEsBus>,
+        on_air: Arc<OnAirInputs>,
+        out: broadcast::Receiver<RtpPacket>,
+        events: tokio::sync::mpsc::Receiver<crate::manager::events::Event>,
+        handle: AssemblerHandle,
+        _stop: tokio_util::sync::DropGuard,
+    }
+
+    impl Rig {
+        async fn start(plan: AssemblyPlan) -> Self {
+            let on_air = Arc::new(OnAirInputs::default());
+            let bus = Arc::new(NodeEsBus::new());
+            let (tx, out) = broadcast::channel::<RtpPacket>(1024);
+            let cancel = CancellationToken::new();
+            let (events_tx, events) = crate::manager::events::event_channel();
+            let first = plan.programs[0].slots[0].source.0.clone();
+            let handle = spawn_spts_assembler(
+                plan,
+                bus.clone(),
+                tx,
+                cancel.clone(),
+                Some(events_tx),
+                "f1".to_string(),
+                None,
+                None,
+                Some(on_air.clone()),
+                Default::default(),
+            );
+            until("the assembler's first publication", || on_air.contains(&first)).await;
+            Rig { bus, on_air, out, events, handle, _stop: cancel.drop_guard() }
+        }
+
+        fn send(&self, input: &str, packet: EsPacket) {
+            self.bus.sender_for(input, packet.source_pid, packet.stream_type).send(packet).unwrap();
+        }
+
+        async fn take(&self, input: &str, mode: Option<crate::config::models::SpliceMode>) {
+            let take = PlanCommand::SwitchActiveInput {
+                new_input_id: input.to_string(),
+                splice_mode_override: mode,
+            };
+            self.handle.plan_tx.send(take).await.unwrap();
+        }
+
+        async fn replace(&self, plan: AssemblyPlan) {
+            let (applied, done) = tokio::sync::oneshot::channel();
+            let replace = PlanCommand::ReplacePlan {
+                plan,
+                splice_mode_override: None,
+                catalogs: Default::default(),
+                applied: Some(applied),
+            };
+            self.handle.plan_tx.send(replace).await.unwrap();
+            done.await.unwrap();
+        }
+
+        /// Whether the program plays from exactly `inputs` of `a`, `b`, `c`.
+        fn plays(&self, inputs: &[&str]) -> bool {
+            ["a", "b", "c"].iter().all(|id| self.on_air.contains(id) == inputs.contains(id))
+        }
+
+        /// The ES packets that go out, in order: `expected` of them, however
+        /// long a busy host takes, and what follows within 100 ms.
+        async fn sent(&mut self, expected: usize) -> Vec<(u16, Vec<u8>)> {
+            let mut es = Vec::new();
+            for wait in [Duration::from_secs(5), Duration::from_millis(100)] {
+                let end = tokio::time::Instant::now() + wait;
+                while (wait.as_secs() == 0 || es.len() < expected)
+                    && let Ok(Ok(bundle)) = tokio::time::timeout_at(end, self.out.recv()).await
+                {
+                    for p in bundle.data.chunks_exact(TS_PACKET_SIZE) {
+                        if (0x200..0x400).contains(&ts_pid(p)) {
+                            es.push((ts_pid(p), p.to_vec()));
+                        }
+                    }
+                }
+            }
+            es
+        }
+
+        /// The PIDs of [`Self::sent`], sorted: slots are read by tasks of
+        /// their own.
+        async fn sent_pids(&mut self, expected: usize) -> Vec<u16> {
+            let mut pids: Vec<u16> =
+                self.sent(expected).await.into_iter().map(|(pid, _)| pid).collect();
+            pids.sort_unstable();
+            pids
+        }
+
+        fn raised(&mut self, code: &str) -> Vec<serde_json::Value> {
+            std::iter::from_fn(|| self.events.try_recv().ok())
+                .filter_map(|e| e.details)
+                .filter(|d| d["error_code"] == code)
+                .collect()
+        }
+    }
+
+    /// A packet of `input`'s ES on `src_pid`, opening a PES stamped `pts`.
+    fn es_pes(src_pid: u16, stream_type: u8, pts: u64) -> EsPacket {
+        EsPacket { stream_type, ..audio_pes(src_pid, pts) }
+    }
+
+    /// An adaptation-field-only packet with a PCR.
+    fn es_pcr(src_pid: u16, stream_type: u8) -> EsPacket {
+        EsPacket {
+            stream_type,
+            payload: ts_af_only(src_pid),
+            is_pusi: false,
+            has_pcr: true,
+            pcr: Some(0),
+            ..audio_pes(src_pid, 0)
+        }
+    }
+
+    /// Video and audio of one program, each with a leg on `a` and on `b`.
+    fn switched_program() -> AssemblyPlan {
+        one_program(vec![
+            switch_slot(&["a", "b"], 0x100, 0x200, 0x1B),
+            switch_slot(&["a", "b"], 0x101, 0x201, 0x0F),
+        ])
+    }
+
+    /// The same, both legs on one clock.
+    fn one_clock(mut plan: AssemblyPlan) -> AssemblyPlan {
+        plan.clocks.insert("b".into(), source_pcr("a"));
+        plan
+    }
+
+    fn pes_aligned(mut plan: AssemblyPlan, budget_ms: u32) -> AssemblyPlan {
+        for slot in plan.programs.iter_mut().flat_map(|p| &mut p.slots) {
+            slot.splice_mode = crate::config::models::SpliceMode::PesAligned;
+            slot.splice_budget_ms = Some(budget_ms);
+        }
+        plan
+    }
+
+    /// A PES of each slot's leg on `input`: whether they reach the output, and
+    /// what a splice from it is aligned to.
+    async fn feed(rig: &mut Rig, input: &str, pts: u64, expected: usize) -> Vec<u16> {
+        rig.send(input, es_pes(0x100, 0x1B, pts));
+        rig.send(input, es_pes(0x101, 0x0F, pts));
+        rig.sent_pids(expected).await
+    }
+
+    /// The PMT's PCR_PID is the slot that reads the PCR source: the slot pinned
+    /// to it, or the Switch slot with a leg on it, whichever it starts on, at
+    /// start and after a swap.
+    #[tokio::test]
+    async fn the_pcr_pid_is_the_slot_that_reads_the_pcr_source() {
+        let pcr_pid = async |rig: &mut Rig| {
+            let end = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let bundle =
+                    tokio::time::timeout_at(end, rig.out.recv()).await.expect("a PMT").unwrap();
+                for p in bundle.data.chunks_exact(TS_PACKET_SIZE) {
+                    if ts_pid(p) == 0x1000 {
+                        return u16::from_be_bytes([p[13], p[14]]) & 0x1FFF;
+                    }
+                }
+            }
+        };
+        let mut pinned =
+            one_program(vec![slot("a", 0x101, 0x201, 0x0F), slot("a", 0x100, 0x200, 0x1B)]);
+        pinned.programs[0].pcr_source = ("a".to_string(), 0x100);
+        let mut switched = one_program(vec![
+            switch_slot(&["a", "b"], 0x101, 0x201, 0x0F),
+            switch_slot(&["a", "b"], 0x100, 0x200, 0x1B),
+        ]);
+        switched.programs[0].pcr_source = ("b".to_string(), 0x100);
+        for (plan, next) in [(&pinned, &switched), (&switched, &pinned)] {
+            let mut rig = Rig::start(plan.clone()).await;
+            assert_eq!(pcr_pid(&mut rig).await, 0x200);
+            rig.replace(next.clone()).await;
+            while rig.out.try_recv().is_ok() {}
+            assert_eq!(pcr_pid(&mut rig).await, 0x200, "after the swap");
+        }
+    }
+
+    /// A Take to another clock: nothing of the program goes out until a PCR
+    /// of the new leg has, on the slot that carries the program's PCR. A
+    /// PES ahead of it went out on the old leg's clock, hours off for two
+    /// encoders. The other program does not notice, and neither does a
+    /// Take between inputs on one clock.
+    #[tokio::test]
+    async fn a_take_to_another_clock_waits_for_its_pcr() {
+        let mut rig = Rig::start(two_programs()).await;
+        assert_eq!(feed(&mut rig, "a", 90_000, 2).await, [0x200, 0x201]);
+
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b", "c"])).await;
+        // PES without PCR, and a PCR on the slot that does not carry it.
+        assert_eq!(feed(&mut rig, "b", 90_000, 0).await, [0u16; 0], "held for b's PCR");
+        rig.send("b", es_pcr(0x101, 0x0F));
+        rig.send("c", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(1).await, [0x300], "only the other program");
+
+        rig.send("b", es_pcr(0x100, 0x1B));
+        let sent = rig.sent(1).await;
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, 0x200);
+        assert!(extract_pcr(&sent[0].1).is_some() && sent[0].1[5] & 0x80 != 0, "PCR with DI");
+        assert_eq!(feed(&mut rig, "b", 93_600, 2).await, [0x200, 0x201], "and it plays on");
+
+        // Back to a and to b again before a sent a PCR: b's releases it.
+        rig.take("a", None).await;
+        until("the cut back", || rig.plays(&["a", "c"])).await;
+        assert_eq!(feed(&mut rig, "a", 93_600, 0).await, [0u16; 0], "held for a's PCR");
+        rig.take("b", None).await;
+        until("the second cut", || rig.plays(&["b", "c"])).await;
+        assert_eq!(feed(&mut rig, "b", 97_200, 0).await, [0u16; 0]);
+        rig.send("b", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+
+        let mut rig = Rig::start(one_clock(switched_program())).await;
+        feed(&mut rig, "a", 90_000, 2).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        assert_eq!(feed(&mut rig, "b", 90_000, 2).await, [0x200, 0x201], "one clock, nothing to wait for");
+    }
+
+    /// A Take that leaves the slot carrying the program's PCR alone, which
+    /// only happens beside an input whose clock is not known, holds nothing:
+    /// no PCR of the new leg is to come.
+    #[tokio::test]
+    async fn a_take_that_leaves_the_pcr_alone_holds_nothing() {
+        let mut plan = one_program(vec![
+            slot("a", 0x100, 0x200, 0x1B),
+            switch_slot(&["c", "b"], 0x101, 0x201, 0x0F),
+        ]);
+        plan.clocks.clear();
+        let mut rig = Rig::start(plan).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["a", "b"])).await;
+        rig.send("a", es_pes(0x100, 0x1B, 90_000));
+        rig.send("b", es_pes(0x101, 0x0F, 90_000));
+        assert_eq!(rig.sent_pids(2).await, [0x200, 0x201]);
+    }
+
+    /// A program held past the alarm says which leg sends no PCR, once, and
+    /// plays again with the first one.
+    #[tokio::test]
+    async fn a_take_to_a_leg_without_pcr_is_reported() {
+        let mut rig = Rig::start(switched_program()).await;
+        let code = "pid_bus_take_no_pcr";
+        rig.take("b", None).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert!(rig.raised(code).is_empty(), "not in the first 2 s");
+        let mut details = Vec::new();
+        for _ in 0..100 {
+            details = rig.raised(code);
+            if !details.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            details,
+            [serde_json::json!({
+                "error_code": code,
+                "program_number": 1,
+                "out_pid": 0x200,
+                "input_id": "b",
+                "source_pid": 0x100,
+            })]
+        );
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(rig.raised(code).is_empty(), "once");
+        rig.send("b", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        tokio::time::sleep(Duration::from_millis(3_000)).await;
+        assert!(rig.raised(code).is_empty(), "and it plays");
+    }
+
+    /// `pes_aligned` compares the two legs' timestamps, which means nothing
+    /// between two clocks: the audio went over at once or after its budget,
+    /// the video a GOP or 2 s later, and the audio in between carried
+    /// timestamps off by the difference of the clocks. Such a Take is a cut,
+    /// of every slot at once, and says so, whichever asked for the splice.
+    #[tokio::test]
+    async fn a_splice_between_two_clocks_is_a_cut() {
+        use crate::config::models::SpliceMode;
+        let mut unknown = pes_aligned(switched_program(), 60_000);
+        unknown.clocks.clear();
+        for (plan, mode, forced) in [
+            (pes_aligned(switched_program(), 60_000), None, false),
+            (switched_program(), Some(SpliceMode::PesAligned), true),
+            (unknown, None, false),
+        ] {
+            let mut rig = Rig::start(plan).await;
+            assert_eq!(feed(&mut rig, "a", 90_000, 2).await, [0x200, 0x201]);
+            rig.take("b", mode).await;
+            until("the cut", || rig.plays(&["b"])).await;
+            let degraded: Vec<serde_json::Value> = rig.raised("pes_splice_degraded");
+            let said: Vec<_> = degraded
+                .iter()
+                .map(|d| (d["out_pid"].clone(), d["reason"].clone(), d["forced"].clone()))
+                .collect();
+            let reason = serde_json::json!("independent_clocks");
+            assert_eq!(
+                said,
+                [
+                    (0x200.into(), reason.clone(), forced.into()),
+                    (0x201.into(), reason.clone(), forced.into()),
+                ]
+            );
+        }
+        // On one clock the reasons are the ones they were, and a slot that can
+        // be spliced waits for its alignment.
+        let mut plan = pes_aligned(one_clock(switched_program()), 60_000);
+        plan.programs[0].slots[0].stream_type = 0x02;
+        let mut rig = Rig::start(plan).await;
+        rig.take("b", None).await;
+        until("the cut of both", || rig.plays(&["b"])).await;
+        let reasons: Vec<_> =
+            rig.raised("pes_splice_degraded").iter().map(|d| d["reason"].clone()).collect();
+        assert_eq!(reasons, ["unsupported_codec", "no_aligned_pes_reference"]);
+
+        let mut rig = Rig::start(pes_aligned(one_clock(switched_program()), 60_000)).await;
+        feed(&mut rig, "a", 90_000, 2).await;
+        rig.take("b", None).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rig.plays(&["a"]), "armed, not yet cut");
+        assert!(rig.raised("pes_splice_degraded").is_empty());
+    }
+
+    /// The last Take decides: one that takes a slot elsewhere, or back to the
+    /// leg it is still on, ends a splice that has not landed. Left pending it
+    /// went on to move the slot at its commit or timeout, alone.
+    #[tokio::test]
+    async fn a_take_ends_a_pending_splice() {
+        // a and b on one clock, c on another, so a Take to c is a cut.
+        let legs = ["a", "b", "c"];
+        for back_to in ["a", "c"] {
+            let plan = one_program(vec![
+                switch_slot(&legs, 0x100, 0x200, 0x1B),
+                switch_slot(&legs, 0x101, 0x201, 0x0F),
+            ]);
+            let mut rig = Rig::start(pes_aligned(one_clock(plan), 1_500)).await;
+            assert_eq!(feed(&mut rig, "a", 90_000, 2).await, [0x200, 0x201]);
+            rig.take("b", None).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(rig.plays(&["a"]), "both slots wait for b");
+            rig.take(back_to, None).await;
+            until("the second Take", || rig.plays(&[back_to])).await;
+            tokio::time::sleep(Duration::from_millis(1_800)).await;
+            assert!(rig.plays(&[back_to]), "past the splice's budget, still on {back_to}");
+            assert!(rig.raised("pes_splice_timeout").is_empty());
+            rig.send(back_to, es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [0x200]);
+            assert_eq!(feed(&mut rig, back_to, 97_200, 2).await, [0x200, 0x201], "{back_to} plays");
+        }
+    }
+
+    /// [`switched_program`] beside a program 2 pinned to `c`.
+    fn two_programs() -> AssemblyPlan {
+        let mut plan = switched_program();
+        plan.programs.push(ProgramPlan {
+            program_number: 2,
+            pmt_pid: 0x1001,
+            pcr_source: ("c".to_string(), 0x100),
+            slots: vec![slot("c", 0x100, 0x300, 0x1B)],
+        });
+        plan
+    }
+
+    /// A plan swap leaves a splice it takes no leg of to land as it would
+    /// have: the audio on its aligned PES, the video here at its budget. Cut
+    /// short it went over in mid-GOP, whatever the swap was for. A slot the
+    /// swap adds is on the leg the Take named from the start.
+    #[tokio::test]
+    async fn a_plan_swap_leaves_a_splice_pending() {
+        let plan = pes_aligned(one_clock(two_programs()), 3_000);
+        let mut rig = Rig::start(plan.clone()).await;
+        feed(&mut rig, "a", 90_000, 2).await;
+        rig.take("b", None).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut changed = plan;
+        changed.programs[0].slots.push(switch_slot(&["a", "b"], 0x102, 0x202, 0x0F));
+        changed.programs[1].slots.push(slot("c", 0x101, 0x301, 0x0F));
+        rig.replace(changed).await;
+        assert!(rig.plays(&["a", "b", "c"]), "two slots on a, the new one on b");
+        rig.send("b", es_pes(0x102, 0x0F, 90_000));
+        assert_eq!(rig.sent_pids(1).await, [0x202]);
+
+        // Both legs' packets still go through the splice: a's next PES ends
+        // what a sends, b's is the first of b.
+        assert_eq!(feed(&mut rig, "a", 93_600, 0).await, [0u16; 0]);
+        assert_eq!(feed(&mut rig, "b", 97_200, 1).await, [0x201]);
+        let completed: Vec<_> = rig
+            .raised("pes_splice_completed")
+            .iter()
+            .map(|d| (d["out_pid"].clone(), d["first_b_pts"].clone()))
+            .collect();
+        assert_eq!(completed, [(0x201.into(), 97_200.into())]);
+        assert!(rig.plays(&["a", "b", "c"]), "the video waits for an IDR");
+        tokio::time::sleep(Duration::from_millis(1_800)).await;
+        until("the video's budget", || rig.plays(&["b", "c"])).await;
+        let timeouts: Vec<_> =
+            rig.raised("pes_splice_timeout").iter().map(|d| d["out_pid"].clone()).collect();
+        assert_eq!(timeouts, [serde_json::json!(0x200)]);
+    }
+
+    /// A plan swap that takes a leg of a pending splice, or its slot, ends it:
+    /// the slot keeps the leg it is on, or goes to the one the Take named if
+    /// only that is left. Left pending it moved the slot later, to a leg the
+    /// new plan may not have, and a program it was for being gone ended the
+    /// assembler.
+    #[tokio::test]
+    async fn a_plan_swap_ends_a_splice_it_takes_a_leg_of() {
+        let switched = |legs: &[&str]| {
+            one_clock(one_program(vec![
+                switch_slot(legs, 0x100, 0x200, 0x1B),
+                switch_slot(legs, 0x101, 0x201, 0x0F),
+            ]))
+        };
+        let pinned = |id: &str| {
+            one_program(vec![slot(id, 0x100, 0x200, 0x1B), slot(id, 0x101, 0x201, 0x0F)])
+        };
+        for (next, on) in [
+            (switched(&["c", "a"]), "a"),
+            (switched(&["c", "b"]), "b"),
+            (switched(&["c"]), "c"),
+            (pinned("a"), "a"),
+        ] {
+            let mut rig = Rig::start(pes_aligned(one_clock(switched_program()), 1_500)).await;
+            feed(&mut rig, "a", 90_000, 2).await;
+            rig.take("b", None).await;
+            assert_eq!(feed(&mut rig, "a", 93_600, 0).await, [0u16; 0], "waiting for b");
+            assert!(rig.plays(&["a"]));
+            let legs = next.programs[0].slots[0].switch_legs.clone();
+            rig.replace(next).await;
+            assert!(rig.plays(&[on]), "{legs:?}");
+            assert_eq!(feed(&mut rig, on, 97_200, 2).await, [0x200, 0x201], "{legs:?}");
+            tokio::time::sleep(Duration::from_millis(1_800)).await;
+            assert!(rig.raised("pes_splice_timeout").is_empty(), "nothing left to time out");
+            assert!(rig.plays(&[on]), "{legs:?}");
+        }
+
+        let one = pes_aligned(one_clock(switched_program()), 1_500);
+        let mut plan = one.clone();
+        plan.programs.push(ProgramPlan {
+            program_number: 2,
+            pmt_pid: 0x1001,
+            pcr_source: ("a".to_string(), 0x100),
+            slots: vec![switch_slot(&["a", "b"], 0x100, 0x300, 0x1B)],
+        });
+        let mut rig = Rig::start(pes_aligned(plan, 1_500)).await;
+        rig.send("a", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(2).await, [0x200, 0x300]);
+        rig.take("b", None).await;
+        rig.replace(one).await;
+        until("program 1's budget", || rig.plays(&["b"])).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let timeouts: Vec<_> =
+            rig.raised("pes_splice_timeout").iter().map(|d| d["out_pid"].clone()).collect();
+        assert_eq!(timeouts, [serde_json::json!(0x200)], "and not program 2's");
+        assert!(!rig.handle.join.is_finished(), "the assembler runs");
+        rig.send("b", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+    }
+
+    /// A slot that loses the leg it is on lands its splice rather than join
+    /// another slot, and one with nothing to keep joins the first it can.
+    #[test]
+    fn a_slot_lands_its_splice_before_it_joins() {
+        let plan = one_program(vec![
+            switch_slot(&["c"], 0x100, 0x200, 0x1B),
+            switch_slot(&["c", "b"], 0x101, 0x201, 0x0F),
+            switch_slot(&["a", "b", "c"], 0x102, 0x202, 0x0F),
+        ]);
+        let on = [((0, 0x200), "c".to_string()), ((0, 0x201), "a".to_string())].into();
+        let splicing_to = [((0, 0x201), "b".to_string())].into();
+        let (legs, spliced) = legs_after_swap(&plan, &on, &splicing_to);
+        assert_eq!(legs[&(0, 0x201)], "b");
+        assert_eq!(legs[&(0, 0x202)], "c");
+        assert!(spliced.is_empty());
+    }
+
+    /// The hold of a Take stays with its program over a plan swap for as long
+    /// as its PCR comes from the input the Take named. Kept by the program's
+    /// place in the plan it held the one a swap put there, for which no Take
+    /// was, and kept over a swap to another input it left the program off air.
+    #[tokio::test]
+    async fn a_hold_stays_with_its_program() {
+        let code = "pid_bus_take_no_pcr";
+        let held = async || {
+            let rig = Rig::start(two_programs()).await;
+            rig.take("b", None).await;
+            until("the cut", || rig.plays(&["b", "c"])).await;
+            rig
+        };
+
+        // Program 1 gone, program 2 is the first.
+        let mut rig = held().await;
+        let mut second = two_programs();
+        second.programs.remove(0);
+        rig.replace(second).await;
+        rig.send("c", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(1).await, [0x300]);
+        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        assert!(rig.raised(code).is_empty(), "no Take moved it");
+        rig.replace(two_programs()).await;
+        assert_eq!(feed(&mut rig, "a", 93_600, 2).await, [0x200, 0x201], "nor the new program 1");
+
+        // Both there, the other way round: program 1 is still held, program 2
+        // still not.
+        let mut rig = held().await;
+        let mut plan = two_programs();
+        plan.programs[0].slots = vec![
+            switch_slot(&["b", "a"], 0x100, 0x200, 0x1B),
+            switch_slot(&["b", "a"], 0x101, 0x201, 0x0F),
+        ];
+        plan.programs.reverse();
+        rig.replace(plan).await;
+        rig.send("c", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(feed(&mut rig, "b", 90_000, 1).await, [0x300]);
+        rig.send("b", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        assert_eq!(feed(&mut rig, "b", 93_600, 2).await, [0x200, 0x201]);
+
+        // Slots added to both: held, and said so.
+        let mut rig = held().await;
+        let mut plan = two_programs();
+        plan.programs[1].slots.push(slot("c", 0x101, 0x301, 0x0F));
+        plan.programs[0].slots.push(switch_slot(&["a", "b"], 0x102, 0x202, 0x0F));
+        rig.replace(plan.clone()).await;
+        assert_eq!(feed(&mut rig, "b", 90_000, 0).await, [0u16; 0], "held for b's PCR");
+        let mut said = Vec::new();
+        for _ in 0..100 {
+            said = rig.raised(code);
+            if !said.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let said: Vec<_> = said
+            .iter()
+            .map(|d| (d["program_number"].clone(), d["out_pid"].clone(), d["input_id"].clone()))
+            .collect();
+        assert_eq!(said, [(1.into(), 0x200.into(), "b".into())]);
+
+        // Its PCR on another slot, from b still: b's PCR there lets it out.
+        plan.programs[0].pcr_source = ("a".to_string(), 0x101);
+        rig.replace(plan).await;
+        rig.send("b", es_pcr(0x100, 0x1B));
+        assert_eq!(feed(&mut rig, "b", 93_600, 0).await, [0u16; 0], "not the slot that carries it");
+        rig.send("b", es_pcr(0x101, 0x0F));
+        assert_eq!(rig.sent_pids(1).await, [0x201]);
+        assert_eq!(feed(&mut rig, "b", 97_200, 2).await, [0x200, 0x201], "and it plays on");
+
+        // Fixed to b it waits for b, fixed to another input it plays that.
+        for (id, out) in [("b", vec![]), ("c", vec![0x200u16, 0x201])] {
+            let mut rig = held().await;
+            let mut pinned = two_programs();
+            pinned.programs[0].slots =
+                vec![slot(id, 0x100, 0x200, 0x1B), slot(id, 0x101, 0x201, 0x0F)];
+            pinned.programs[0].pcr_source = (id.to_string(), 0x100);
+            pinned.programs.truncate(1);
+            rig.replace(pinned).await;
+            assert_eq!(feed(&mut rig, id, 90_000, out.len()).await, out, "{id}");
+        }
+
+        // Two programs held by one Take: each waits for a PCR of its own.
+        let mut plan = two_programs();
+        plan.programs[1].slots = vec![switch_slot(&["a", "b"], 0x110, 0x300, 0x1B)];
+        plan.programs[1].pcr_source = ("a".to_string(), 0x110);
+        let mut rig = Rig::start(plan).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        rig.send("b", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        rig.send("b", es_pes(0x110, 0x1B, 90_000));
+        assert_eq!(feed(&mut rig, "b", 90_000, 2).await, [0x200, 0x201], "program 2 still held");
+        rig.send("b", es_pcr(0x110, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x300]);
+    }
+
+    /// [`es_pes`] whose ES is `es`, zeros after it.
+    fn es_pes_of(src_pid: u16, stream_type: u8, pts: u64, es: &[u8]) -> EsPacket {
+        let mut packet = es_pes(src_pid, stream_type, pts);
+        let mut pkt = packet.payload.to_vec();
+        pkt[18..].fill(0);
+        pkt[18..18 + es.len()].copy_from_slice(es);
+        packet.payload = Bytes::from(pkt);
+        packet
+    }
+
+    /// After a cut to another clock nothing of the leg before it is compared
+    /// with a splice's: not its PTS, for which the slots waited out their
+    /// budget with the program off air, nor its codec parameters, for which a
+    /// splice was refused.
+    #[tokio::test]
+    async fn a_splice_is_not_measured_against_a_leg_on_another_clock() {
+        // b and c on one clock, a on its own.
+        let legs = ["a", "b", "c"];
+        let mut plan = one_program(vec![
+            switch_slot(&legs, 0x100, 0x200, 0x1B),
+            switch_slot(&legs, 0x101, 0x201, 0x0F),
+        ]);
+        plan.clocks.insert("c".into(), source_pcr("b"));
+        let plan = pes_aligned(plan, 60_000);
+        let reasons = |rig: &mut Rig| -> Vec<serde_json::Value> {
+            rig.raised("pes_splice_degraded").iter().map(|d| d["reason"].clone()).collect()
+        };
+
+        // b sends nothing: there is no PES to align c to.
+        let mut rig = Rig::start(plan.clone()).await;
+        feed(&mut rig, "a", 90_000, 2).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        assert_eq!(reasons(&mut rig), ["independent_clocks"; 2]);
+        rig.take("c", None).await;
+        until("the second cut", || rig.plays(&["c"])).await;
+        assert_eq!(reasons(&mut rig), ["no_aligned_pes_reference"; 2]);
+        rig.send("c", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200], "held until a PCR, b's or c's");
+
+        // b sends PES and neither an SPS nor an ADTS header.
+        let adts = |rate_idx: u8| [0xFF, 0xF1, 0x40 | rate_idx << 2, 0x80];
+        let idr = |level: u8| {
+            [0, 0, 0, 1, 0x67, 66, 0, level, 0xF4, 0x0A, 0x0F, 0x80, 0, 0, 0, 1, 0x65]
+        };
+        let mut rig = Rig::start(plan).await;
+        rig.send("a", es_pes_of(0x100, 0x1B, 90_000, &idr(30)));
+        rig.send("a", es_pes_of(0x101, 0x0F, 90_000, &adts(3)));
+        assert_eq!(rig.sent_pids(2).await, [0x200, 0x201]);
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        rig.send("b", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        rig.send("b", es_pes_of(0x100, 0x1B, 93_600, &[]));
+        rig.send("b", es_pes_of(0x101, 0x0F, 93_600, &[]));
+        assert_eq!(rig.sent_pids(2).await, [0x200, 0x201]);
+        rig.take("c", None).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rig.plays(&["b"]), "both slots wait for c");
+        rig.send("c", es_pes_of(0x100, 0x1B, 97_200, &idr(40)));
+        rig.send("c", es_pes_of(0x101, 0x0F, 97_200, &adts(4)));
+        assert_eq!(rig.sent_pids(2).await, [0x200, 0x201]);
+        until("the splice", || rig.plays(&["c"])).await;
+        let events: Vec<_> = std::iter::from_fn(|| rig.events.try_recv().ok())
+            .filter_map(|e| Some(e.details?["error_code"].clone()))
+            .filter(|code| code != "pes_splice_degraded")
+            .collect();
+        assert_eq!(events, ["pes_splice_completed"; 2], "nothing to refuse it for");
+
+        // A cut on one clock leaves the reference: its PTS still compare.
+        let mut rig = Rig::start(pes_aligned(one_clock(switched_program()), 60_000)).await;
+        feed(&mut rig, "a", 90_000, 2).await;
+        rig.take("b", Some(crate::config::models::SpliceMode::PmtBump)).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        rig.take("a", None).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rig.plays(&["b"]), "both slots wait for a");
+        assert!(rig.raised("pes_splice_degraded").is_empty());
+    }
+
+    /// A plan swap that adds a slot to a program a Take moved starts it
+    /// where the program is, not on its initial leg, another clock. A slot
+    /// without that leg starts on its own, and so does another program's.
+    #[tokio::test]
+    async fn a_slot_a_swap_adds_joins_its_program() {
+        let rig = Rig::start(switched_program()).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+
+        // It takes the place the kept slots are on, wherever it stands.
+        let mut plan = switched_program();
+        plan.programs[0].slots.insert(0, switch_slot(&["a", "b"], 0x102, 0x202, 0x0F));
+        rig.replace(plan.clone()).await;
+        assert!(rig.plays(&["b"]), "all three on b");
+
+        // A leg dropped from a slot that was on it, with a sibling still on.
+        let mut dropped = switched_program();
+        dropped.programs[0].slots[1] = switch_slot(&["a", "c"], 0x101, 0x201, 0x0F);
+        rig.replace(dropped).await;
+        assert!(rig.plays(&["b", "a"]), "without b, its own initial leg");
+
+        rig.replace(plan).await;
+        assert!(rig.plays(&["b", "a"]), "a kept leg is kept");
+        rig.take("b", None).await;
+        until("all on b", || rig.plays(&["b"])).await;
+
+        let mut two = switched_program();
+        two.programs.push(ProgramPlan {
+            program_number: 2,
+            pmt_pid: 0x1001,
+            pcr_source: ("c".to_string(), 0x100),
+            slots: vec![switch_slot(&["c", "b"], 0x100, 0x300, 0x1B)],
+        });
+        rig.replace(two).await;
+        assert!(rig.plays(&["b", "c"]), "another program starts on its own leg");
+
+        // A slot the swap pins keeps no leg for another to join.
+        let mut pinned = one_clock(one_program(vec![
+            slot("b", 0x100, 0x200, 0x1B),
+            switch_slot(&["a", "b"], 0x101, 0x203, 0x0F),
+        ]));
+        pinned.programs[0].pcr_source = ("b".to_string(), 0x100);
+        rig.replace(pinned).await;
+        assert!(rig.plays(&["a", "b"]), "the added slot starts on its own leg");
     }
 }
