@@ -951,7 +951,7 @@ pub async fn run_native_relay_leg_inproc(
             "native-UDP relay bond leg connecting"
         );
 
-        let link = PlainUdpLink::new(sock.clone());
+        let mut link = PlainUdpLink::new(sock.clone());
         let last_ack = link.last_ack_ms.clone();
         // Seed liveness to "now" — PlainUdpLink::new leaves last_ack at 0, which
         // the watchdog would read as silent-forever and rotate instantly.

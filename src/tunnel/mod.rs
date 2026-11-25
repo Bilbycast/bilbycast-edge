@@ -28,12 +28,15 @@
 //! ```
 
 pub mod auth;
+pub mod carrier;
 pub mod config;
 pub mod crypto;
 pub mod manager;
 pub mod protocol;
 pub mod quic;
 pub mod relay_client;
+#[cfg(test)]
+mod relay_client_sim;
 pub mod tcp_forwarder;
 pub mod udp_forwarder;
 pub mod udp_relay_client;

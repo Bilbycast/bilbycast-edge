@@ -7,7 +7,6 @@
 //! immediately binds tunnels by UUID. All tunnel data is encrypted end-to-end
 //! between edge nodes; the relay only sees ciphertext.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -27,10 +26,17 @@ use super::protocol::{
 use super::quic;
 use crate::manager::events::{EventSender, EventSeverity, category};
 
-/// How long we tolerate a `Waiting` state (peer not yet bound) before stepping
-/// to the next relay. This is the convergence mechanism when each edge has
-/// landed on a different relay.
+/// How long a tunnel waits for its peer before it looks for it elsewhere. One
+/// with two relays binds the other as well ([`other_relay`]), which is how two
+/// edges meet that have lost different paths. One with a single relay lets go of
+/// it and starts over.
 const WAITING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long both sides have to be on the other relay before a tunnel moves
+/// there. Both edges may be trying each other's relay at that moment, and would
+/// go past each other, and again, if each went to where the other has just been.
+/// A tunnel that waits on its backup goes to its primary at once.
+const SETTLE: Duration = Duration::from_secs(1);
 
 /// How long we wait for the QUIC handshake to a relay to complete before
 /// stepping to the next relay. Bounded so a dead primary cannot stall failover
@@ -39,7 +45,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Marker substring used to distinguish a waiting-timeout failure from a real
 /// connect/bind error. The failover loop checks for this to avoid logging a
-/// hard error when we're simply trying to converge on the same relay as the peer.
+/// hard error when the peer of a tunnel with one relay is simply not there.
 const WAITING_TIMEOUT_MSG: &str = "waiting-timeout-stepping-forward";
 
 /// How often we ping the relay on the control stream of a tunnel that is up.
@@ -69,11 +75,33 @@ const MAX_REASON: usize = 200;
 const REPORT_BURST: u32 = 4;
 const REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How often the failback probe task attempts to measure the primary relay.
-pub const FAILBACK_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+/// How long a tunnel that is up on its backup stays there before it tries the
+/// primary, how long after a try that came to nothing it tries again, and how
+/// often it asks while it waits there whether the primary is still near enough.
+const FAILBACK_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Timeout for a single RTT probe against a relay address.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a relay may take to have read that we leave it.
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The waits above that a test has no time for.
+#[derive(Debug, Clone)]
+pub struct Timing {
+    pub connect: Duration,
+    pub waiting: Duration,
+    pub settle: Duration,
+    pub failback: Duration,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            connect: CONNECT_TIMEOUT,
+            waiting: WAITING_TIMEOUT,
+            settle: SETTLE,
+            failback: FAILBACK_INTERVAL,
+        }
+    }
+}
 
 /// State of the relay tunnel connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +144,9 @@ pub struct RelayTunnelParams {
     /// Optional bind secret for relay tunnel authentication.
     pub tunnel_bind_secret: Option<String>,
     /// Maximum RTT increase (ms) tolerated when failing back from backup to
-    /// primary. Consumed by the failback probe task.
+    /// primary ([`other_relay`]).
     pub failback_rtt_gate_ms: u32,
+    pub timing: Timing,
 }
 
 /// The relay's reason for refusing our bind.
@@ -175,7 +204,7 @@ impl News {
 }
 
 /// A connection to a relay, with our side of one tunnel bound on it.
-struct RelayLink {
+pub struct RelayLink {
     conn: Connection,
     control: quinn::SendStream,
     tunnel_id: Uuid,
@@ -191,6 +220,38 @@ struct RelayLink {
 }
 
 impl RelayLink {
+    /// Connect to a relay.
+    ///
+    /// `relay_addr` is a `host:port` string. It is resolved inside the
+    /// [`CONNECT_TIMEOUT`] window, so a slow resolver cannot hold the caller and
+    /// a DNS change is picked up on every attempt without a config reload. The
+    /// first returned `SocketAddr` is used — multi-record round-robin is not
+    /// implemented at this layer (operators wanting that can list multiple
+    /// addresses in `relay_addrs`).
+    async fn dial(params: &RelayTunnelParams, relay_addr: &str) -> Result<Self> {
+        let connect = async {
+            let endpoint = quic::make_client_endpoint(ALPN_RELAY)?;
+            let resolved = lookup_host(relay_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("resolve relay '{relay_addr}': {e}"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("relay '{relay_addr}' resolved to no addresses"))?;
+            let conn = quic::connect(&endpoint, resolved, "relay").await?;
+            Ok::<_, anyhow::Error>((resolved, conn))
+        };
+        let within = params.timing.connect;
+        let (resolved, conn) = timeout(within, connect)
+            .await
+            .map_err(|_| anyhow::anyhow!("connect to relay {relay_addr} timed out after {within:?}"))??;
+        tracing::info!(
+            tunnel_id = %params.tunnel_id,
+            relay = %relay_addr,
+            resolved = %resolved,
+            "Connected to relay"
+        );
+        Self::open(conn, params).await
+    }
+
     /// Open the control stream, and introduce ourselves on it.
     async fn open(conn: Connection, params: &RelayTunnelParams) -> Result<Self> {
         let (mut control, control_recv) = conn.open_bi().await?;
@@ -231,6 +292,28 @@ impl RelayLink {
     async fn bind(&mut self) -> Result<()> {
         self.unanswered = true;
         protocol::write_message(&mut self.control, &self.bind).await
+    }
+
+    /// The connection, for what the tunnel carries.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Let go of our side, so that the relay does not list it any more, and of
+    /// the connection. The streams that are open on it keep it until they end.
+    pub async fn leave(mut self, after: Duration) {
+        tokio::time::sleep(after).await;
+        let left = async {
+            let unbind = EdgeMessage::TunnelUnbind { tunnel_id: self.tunnel_id };
+            protocol::write_message(&mut self.control, &unbind).await?;
+            // A connection that is closed delivers nothing more.
+            self.control.finish()?;
+            self.control.stopped().await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        if !matches!(timeout(LEAVE_TIMEOUT, left).await, Ok(Ok(()))) {
+            tracing::debug!(tunnel_id = %self.tunnel_id, "The relay was not told that we leave it");
+        }
     }
 
     /// The next news of the tunnel, or why there will be none. It loses nothing
@@ -311,16 +394,15 @@ impl RelayLink {
         None
     }
 
-    /// See to the bind of a tunnel that is up until `cancel` fires: report what
-    /// becomes of the tunnel, and bind our side again if it is removed. If that
-    /// is refused, or the relay is heard no more, the connection is closed,
-    /// which ends the forwarder on it; the caller then connects anew.
-    async fn hold(
-        mut self,
-        relay_addr: String,
-        state_tx: watch::Sender<RelayTunnelState>,
-        cancel: CancellationToken,
-        event_sender: EventSender,
+    /// See to the bind of a tunnel that is up: report what becomes of the
+    /// tunnel, and bind our side again if it is removed. If that is refused, or
+    /// the relay is heard no more, the connection is closed, which ends the
+    /// forwarder on it, and this returns; the caller then connects anew.
+    pub async fn hold(
+        &mut self,
+        relay_addr: &str,
+        state_tx: &watch::Sender<RelayTunnelState>,
+        event_sender: &EventSender,
     ) {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         let mut reports = Reports::new(Instant::now());
@@ -384,7 +466,6 @@ impl RelayLink {
                         break format!("ping not sent: {e}");
                     }
                 }
-                _ = cancel.cancelled() => return,
             }
             if let Some(report) = reports.due(Instant::now()) {
                 let (severity, message, details) = match report {
@@ -539,76 +620,314 @@ fn bind_message(params: &RelayTunnelParams) -> EdgeMessage {
     EdgeMessage::TunnelBind { tunnel_id: params.tunnel_id, direction, protocol, bind_token }
 }
 
-/// Establish a QUIC connection to the specified relay address and bind the
-/// tunnel.
+/// Which relay is tried next while the tunnel is bound on none, and when.
+pub(super) struct Walk {
+    relays: usize,
+    began: usize,
+    pub(super) at: usize,
+    backoff: Duration,
+}
+
+impl Walk {
+    pub(super) fn new(relays: usize, began: usize) -> Self {
+        Self { relays, began, at: began, backoff: Duration::from_secs(1) }
+    }
+
+    /// The relay it is at came to nothing: go to the next. Back where it began
+    /// it has tried them all, and waits before it goes on, for this long.
+    pub(super) fn step(&mut self) -> Option<Duration> {
+        self.at = (self.at + 1) % self.relays;
+        if self.at != self.began {
+            return None;
+        }
+        let wait = self.backoff;
+        self.backoff = (wait * 2).min(Duration::from_secs(60));
+        Some(wait)
+    }
+}
+
+/// When a tunnel that is on one of its two relays tries the other.
+pub(super) struct OtherRelay {
+    on_backup: bool,
+    timing: Timing,
+    /// The tunnel's state on the relay it is on, and since when.
+    state: RelayTunnelState,
+    since: Instant,
+    /// When it came there, or when the last try of the other came to nothing.
+    idle: Instant,
+    /// How long that puts off the next try, if it waits for its peer.
+    pause: Duration,
+    delay: RebindDelay,
+}
+
+impl OtherRelay {
+    pub(super) fn new(on_backup: bool, timing: &Timing, now: Instant) -> Self {
+        Self {
+            on_backup,
+            timing: timing.clone(),
+            state: RelayTunnelState::Connecting,
+            since: now,
+            idle: now,
+            pause: Duration::ZERO,
+            delay: RebindDelay(REBIND_MIN),
+        }
+    }
+
+    pub(super) fn set(&mut self, state: RelayTunnelState, now: Instant) {
+        if state != self.state {
+            (self.state, self.since) = (state, now);
+        }
+        if state == RelayTunnelState::Ready {
+            self.pause = Duration::ZERO;
+            self.delay = RebindDelay(REBIND_MIN);
+        }
+    }
+
+    /// When the other relay is tried next, if it is.
+    pub(super) fn due(&self) -> Option<Instant> {
+        match self.state {
+            RelayTunnelState::Waiting => {
+                Some((self.since + self.timing.waiting).max(self.idle + self.pause))
+            }
+            RelayTunnelState::Ready if self.on_backup => Some(self.idle + self.timing.failback),
+            _ => None,
+        }
+    }
+
+    /// Whether our side is to be bound on the other relay. A tunnel that is up
+    /// on its primary has nothing to look for, and one that is up on its backup
+    /// does not go back to a primary that is too far. But it may be up only for
+    /// as long as the peer tries the backup, and stays on the primary if it finds
+    /// us there.
+    pub(super) fn wanted(&self, now: Instant, is_near: impl FnOnce() -> bool) -> bool {
+        if self.state != RelayTunnelState::Ready {
+            return true;
+        }
+        self.on_backup && (now < self.since + self.timing.settle || is_near())
+    }
+
+    /// See [`SETTLE`].
+    pub(super) fn settle(&self) -> Duration {
+        match self.on_backup && self.state != RelayTunnelState::Ready {
+            true => Duration::ZERO,
+            false => self.timing.settle,
+        }
+    }
+
+    /// The try came to nothing.
+    pub(super) fn failed(&mut self, now: Instant) {
+        self.idle = now;
+        self.pause = self.delay.next(Duration::ZERO);
+    }
+}
+
+/// The relays that have refused our bind since we began. That is an alarm once,
+/// and a refusal may go on for as long as nobody sees to it.
+struct Refusals(Vec<bool>);
+
+impl Refusals {
+    fn none(params: &RelayTunnelParams) -> Self {
+        Self(vec![false; params.relay_addrs.len()])
+    }
+
+    fn report(&mut self, params: &RelayTunnelParams, idx: usize, e: &BindRejected, events: &EventSender) {
+        let relay_addr = &params.relay_addrs[idx];
+        tracing::warn!(
+            tunnel_id = %params.tunnel_id,
+            relay = %relay_addr,
+            "Tunnel bind rejected by relay: {e}"
+        );
+        if !std::mem::replace(&mut self.0[idx], true) {
+            events.emit_flow_with_details(
+                EventSeverity::Critical,
+                category::TUNNEL,
+                format!("Tunnel bind rejected by relay: {e}"),
+                &params.tunnel_id.to_string(),
+                serde_json::json!({ "relay_addr": relay_addr }),
+            );
+        }
+    }
+}
+
+/// A second connection, that the tunnel may move to. It is let go of if it does
+/// not.
+struct Second(Option<RelayLink>);
+
+impl Drop for Second {
+    fn drop(&mut self) {
+        if let Some(link) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(link.leave(Duration::ZERO));
+        }
+    }
+}
+
+/// The other relay of a tunnel that is on relay `idx`, once the tunnel is to
+/// move there. With one relay there is none.
 ///
-/// `relay_addr` is the address currently being attempted — chosen by the
-/// caller from `params.relay_addrs`. If the peer has bound a different relay
-/// and we get stuck in `Waiting` for more than [`WAITING_TIMEOUT`], this
-/// function bails with an error containing [`WAITING_TIMEOUT_MSG`] so the
-/// failover loop can step to the next relay without treating it as a hard
-/// failure.
-///
-/// Returns the QUIC connection ready for data forwarding once state becomes
-/// `Ready`. From then on a task of its own sees to the bind ([`RelayLink::hold`]),
-/// until the connection or `cancel` ends it.
-///
-/// `relay_addr` is a `host:port` string. It is resolved via
-/// `tokio::net::lookup_host` inside the [`CONNECT_TIMEOUT`] window so DNS
-/// changes are picked up on every retry without a config reload. The
-/// first returned `SocketAddr` is used — multi-record round-robin is not
-/// implemented at this layer (operators wanting that can list multiple
-/// addresses in `relay_addrs`).
-pub async fn connect_and_bind(
+/// Our side is bound there too, on a connection of its own, and the tunnel moves
+/// when the relay says that both sides are there. What it is on stays as it is
+/// until then: nothing is interrupted, and nothing moves while the peer cannot
+/// come too. That goes on for as long as the tunnel waits for its peer, which
+/// may have lost its path to the relay the tunnel is on, and, if the primary is
+/// near enough, while the tunnel is up on its backup. The peer needs to know
+/// nothing of it: an older one binds where it happens to look.
+pub async fn other_relay(
     params: &RelayTunnelParams,
-    relay_addr: &str,
+    idx: usize,
+    active: &Connection,
+    state: watch::Receiver<RelayTunnelState>,
+    events: &EventSender,
+) -> (usize, RelayLink) {
+    other_relay_refusing(params, idx, active, state, &mut Refusals::none(params), events).await
+}
+
+async fn other_relay_refusing(
+    params: &RelayTunnelParams,
+    idx: usize,
+    active: &Connection,
+    mut state: watch::Receiver<RelayTunnelState>,
+    refusals: &mut Refusals,
+    events: &EventSender,
+) -> (usize, RelayLink) {
+    let to = (idx + 1) % params.relay_addrs.len();
+    if to == idx {
+        return std::future::pending().await;
+    }
+    let mut rule = OtherRelay::new(idx != 0, &params.timing, Instant::now());
+    loop {
+        rule.set(*state.borrow_and_update(), Instant::now());
+        let due = async {
+            match rule.due() {
+                Some(at) => sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = due => {}
+            changed = state.changed() => match changed {
+                Ok(()) => continue,
+                Err(_) => return std::future::pending().await,
+            },
+        }
+        match try_other(params, to, active, &mut state, &mut rule).await {
+            Ok(link) => return (to, link),
+            Err(e) => {
+                tracing::debug!(
+                    tunnel_id = %params.tunnel_id,
+                    relay = %params.relay_addrs[to],
+                    "Not moving to the other relay: {e}"
+                );
+                if let Some(e) = e.downcast_ref() {
+                    refusals.report(params, to, e, events);
+                }
+                rule.failed(Instant::now());
+            }
+        }
+    }
+}
+
+/// Bind our side on relay `to` and wait there until the tunnel is to move to it.
+async fn try_other(
+    params: &RelayTunnelParams,
+    to: usize,
+    active: &Connection,
+    state: &mut watch::Receiver<RelayTunnelState>,
+    rule: &mut OtherRelay,
+) -> Result<RelayLink> {
+    let link = RelayLink::dial(params, &params.relay_addrs[to]).await?;
+    let conn = link.conn.clone();
+    let is_near = || {
+        let gate = Duration::from_millis(params.failback_rtt_gate_ms.into());
+        let (rtt, active_rtt) = (conn.rtt(), active.rtt());
+        let near = rtt <= active_rtt.saturating_add(gate);
+        if !near {
+            tracing::info!(
+                tunnel_id = %params.tunnel_id,
+                "Not failing back: primary_rtt={rtt:?}, active_rtt={active_rtt:?}, gate={gate:?}"
+            );
+        }
+        near
+    };
+    rule.set(*state.borrow_and_update(), Instant::now());
+    if !rule.wanted(Instant::now(), is_near) {
+        anyhow::bail!("it is not wanted, or too far");
+    }
+    let mut second = Second(Some(link));
+    let link = second.0.as_mut().expect("just put there");
+    link.bind().await?;
+    let every = params.timing.failback;
+    let mut check = tokio::time::interval_at(Instant::now() + every, every);
+    let mut both_since: Option<Instant> = None;
+    loop {
+        let settled = async {
+            match both_since {
+                Some(since) => sleep_until(since + rule.settle()).await,
+                None => std::future::pending().await,
+            }
+        };
+        // It has settled only if there is nothing else to say.
+        tokio::select! {
+            biased;
+            changed = state.changed() => {
+                changed?;
+                rule.set(*state.borrow_and_update(), Instant::now());
+                check.reset_after(params.timing.settle);
+            }
+            news = link.news() => {
+                let why = match news {
+                    Ok(News::Ready) => {
+                        both_since.get_or_insert(Instant::now());
+                        continue;
+                    }
+                    Ok(News::Waiting | News::PeerGone(_)) => {
+                        both_since = None;
+                        continue;
+                    }
+                    Ok(News::Removed(reason)) => anyhow::anyhow!("tunnel removed on relay: {reason}"),
+                    Ok(News::Refused(reason)) => BindRejected(reason).into(),
+                    Err(e) => e,
+                };
+                // There is no bind to let go of.
+                second.0 = None;
+                return Err(why);
+            }
+            _ = check.tick() => {}
+            _ = settled => break,
+        }
+        if !rule.wanted(Instant::now(), is_near) {
+            anyhow::bail!("it is not wanted any more, or too far");
+        }
+    }
+    Ok(second.0.take().expect("still there"))
+}
+
+/// Bind the tunnel on relay `idx` and wait until both sides are there, on this
+/// relay or on the other.
+///
+/// A tunnel with two relays stays bound on those it has reached for as long as
+/// it waits. With one, it bails after [`WAITING_TIMEOUT`] with an error
+/// containing [`WAITING_TIMEOUT_MSG`], so that the caller starts over without
+/// treating it as a hard failure.
+async fn meet(
+    params: &RelayTunnelParams,
+    idx: usize,
     state_tx: &watch::Sender<RelayTunnelState>,
-    cancel: CancellationToken,
-    event_sender: EventSender,
-) -> Result<Connection> {
-    // Connect to relay
+    refusals: &mut Refusals,
+    events: &EventSender,
+) -> Result<(usize, RelayLink)> {
+    let relay_addr: &str = &params.relay_addrs[idx];
     state_tx.send_replace(RelayTunnelState::Connecting);
-    let endpoint = quic::make_client_endpoint(ALPN_RELAY)?;
-
-    // Resolve host:port → SocketAddr (DNS lookup if hostname; instant if
-    // already a literal). Bounded by CONNECT_TIMEOUT alongside the QUIC
-    // handshake so a slow / unresponsive resolver doesn't park the
-    // failover loop.
-    let connect_work = async {
-        let mut iter = lookup_host(relay_addr).await.map_err(|e| {
-            anyhow::anyhow!("resolve relay '{relay_addr}': {e}")
-        })?;
-        let resolved = iter
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("relay '{relay_addr}' resolved to no addresses"))?;
-        let conn = quic::connect(&endpoint, resolved, "relay").await?;
-        Ok::<(SocketAddr, Connection), anyhow::Error>((resolved, conn))
-    };
-
-    let (resolved_addr, conn) = tokio::select! {
-        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_work) => result
-            .map_err(|_| anyhow::anyhow!("connect to relay {relay_addr} timed out after {CONNECT_TIMEOUT:?}"))??,
-        _ = cancel.cancelled() => anyhow::bail!("cancelled during connect"),
-    };
-
-    tracing::info!(
-        tunnel_id = %params.tunnel_id,
-        relay = %relay_addr,
-        resolved = %resolved_addr,
-        "Connected to relay"
-    );
-
-    let mut link = RelayLink::open(conn.clone(), params).await?;
+    let mut link = RelayLink::dial(params, relay_addr).await?;
     link.bind().await?;
 
     // Wait for tunnel to become ready. The relay says so in answer to our bind
     // if we are the second edge to bind, and in a notice if the peer binds
     // after us.
-    //
-    // While in the `Waiting` state (peer not yet bound), we start a deadline
-    // timer. If we remain in `Waiting` for longer than `WAITING_TIMEOUT`, we
-    // bail so the caller can step to the next relay — this is how two edges
-    // that independently landed on different relays converge.
+    let conn = link.conn.clone();
+    let other = other_relay_refusing(params, idx, &conn, state_tx.subscribe(), refusals, events);
+    tokio::pin!(other);
     let mut deadline: Option<Instant> = None;
     loop {
         let waited_out = async {
@@ -617,12 +936,16 @@ pub async fn connect_and_bind(
                 None => std::future::pending().await,
             }
         };
+        // The relay it is on before the other.
         tokio::select! {
+            biased;
             news = link.news() => match news? {
-                News::Ready => break,
+                News::Ready => return Ok((idx, link)),
                 News::Waiting => {
                     state_tx.send_replace(RelayTunnelState::Waiting);
-                    deadline.get_or_insert(Instant::now() + WAITING_TIMEOUT);
+                    if params.relay_addrs.len() == 1 {
+                        deadline.get_or_insert(Instant::now() + params.timing.waiting);
+                    }
                     tracing::info!(
                         tunnel_id = %params.tunnel_id,
                         "Waiting for peer to bind"
@@ -633,6 +956,10 @@ pub async fn connect_and_bind(
                 News::Removed(reason) => anyhow::bail!("tunnel removed on relay: {reason}"),
                 News::Refused(reason) => return Err(BindRejected(reason).into()),
             },
+            found = &mut other => {
+                tokio::spawn(link.leave(Duration::ZERO));
+                return Ok(found);
+            }
             _ = waited_out => {
                 // Peer hasn't bound on this relay within the window. Unbind
                 // politely so the relay drops its pending state, then bail.
@@ -643,45 +970,61 @@ pub async fn connect_and_bind(
                 tracing::info!(
                     tunnel_id = %params.tunnel_id,
                     relay = %relay_addr,
-                    "Peer hasn't bound on this relay within {WAITING_TIMEOUT:?}, stepping to next relay"
+                    "Peer hasn't bound on this relay within {:?}, starting over",
+                    params.timing.waiting
                 );
                 anyhow::bail!("{WAITING_TIMEOUT_MSG}: peer not bound on {relay_addr}");
             }
-            _ = cancel.cancelled() => anyhow::bail!("cancelled waiting for tunnel ready"),
         }
     }
+}
 
-    state_tx.send_replace(RelayTunnelState::Ready);
-    tracing::info!(
-        tunnel_id = %params.tunnel_id,
-        direction = %params.direction,
-        "Tunnel ready"
-    );
-    event_sender.emit_flow_with_details(
+/// Report that the tunnel is up on relay `to`, and was on relay `from` before.
+pub fn report_up(params: &RelayTunnelParams, from: usize, to: usize, events: &EventSender) {
+    let tunnel_id = params.tunnel_id.to_string();
+    let (from_addr, to_addr) = (&params.relay_addrs[from], &params.relay_addrs[to]);
+    events.emit_flow_with_details(
         EventSeverity::Info,
         category::TUNNEL,
         "Tunnel connected to relay",
-        &params.tunnel_id.to_string(),
-        serde_json::json!({ "relay_addr": relay_addr.to_string() }),
+        &tunnel_id,
+        serde_json::json!({ "relay_addr": to_addr }),
     );
-
-    tokio::spawn(link.hold(relay_addr.to_string(), state_tx.clone(), cancel, event_sender));
-
-    Ok(conn)
+    if from == to {
+        return;
+    }
+    let which = if to == 0 { "primary" } else { "backup" };
+    tracing::warn!(
+        tunnel_id = %tunnel_id,
+        "Tunnel failed over from {from_addr} to {to_addr} (idx {from} → {to})"
+    );
+    events.emit_flow_with_details(
+        EventSeverity::Warning,
+        category::TUNNEL,
+        format!("Tunnel failed over to {which} relay {to_addr}"),
+        &tunnel_id,
+        serde_json::json!({
+            "from_relay_addr": from_addr,
+            "to_relay_addr": to_addr,
+            "from_idx": from,
+            "to_idx": to,
+        }),
+    );
 }
 
-/// Connect to a relay with ordered failover + exponential backoff.
+/// Connect to a relay with ordered failover + exponential backoff, and bind the
+/// tunnel there, until both sides are ([`meet`]).
 ///
 /// Walks `params.relay_addrs` starting from `*active_idx`, stepping forward on
 /// each failure. After trying every relay in the list once (a full cycle), it
 /// sleeps with exponential backoff before retrying.
 ///
-/// `active_idx` is shared mutable state owned by the caller so that reconnect
-/// cycles are sticky: when the forwarder drops and we reconnect, we resume on
-/// the same relay we were using (and only step forward on sustained failure).
+/// `active_idx` is owned by the caller so that reconnect cycles are sticky: when
+/// the forwarder drops and we reconnect, we resume on the same relay we were
+/// using (and only step forward on sustained failure).
 ///
 /// `active_idx_tx` publishes the currently-active relay index to observers
-/// (stats snapshot, failback probe).
+/// (stats snapshot).
 pub async fn connect_with_retry(
     params: &RelayTunnelParams,
     active_idx: &mut usize,
@@ -689,81 +1032,47 @@ pub async fn connect_with_retry(
     state_tx: &watch::Sender<RelayTunnelState>,
     cancel: CancellationToken,
     event_sender: EventSender,
-) -> Result<Connection> {
+) -> Result<RelayLink> {
     if params.relay_addrs.is_empty() {
         anyhow::bail!("relay_addrs is empty — at least one relay is required");
     }
 
     let n = params.relay_addrs.len();
-    if *active_idx >= n {
-        *active_idx = 0;
-    }
-    let initial_idx = *active_idx;
-
-    let mut backoff = Duration::from_secs(1);
-    let max_backoff = Duration::from_secs(60);
-    // The relays that have refused our bind since we began. That is an alarm
-    // once, and a refusal may go on for as long as nobody sees to it.
-    let mut refused_by = vec![false; n];
+    let mut walk = Walk::new(n, if *active_idx < n { *active_idx } else { 0 });
+    let mut refusals = Refusals::none(params);
 
     loop {
-        let relay_addr: &str = &params.relay_addrs[*active_idx];
-        match connect_and_bind(params, relay_addr, state_tx, cancel.clone(), event_sender.clone())
-            .await
-        {
-            Ok(conn) => {
-                active_idx_tx.send_replace(*active_idx);
-                if *active_idx != initial_idx {
-                    let from: &str = &params.relay_addrs[initial_idx];
-                    tracing::warn!(
-                        tunnel_id = %params.tunnel_id,
-                        "Tunnel failed over from {from} to {relay_addr} (idx {initial_idx} → {})",
-                        *active_idx
-                    );
-                    event_sender.emit_flow_with_details(
-                        EventSeverity::Warning,
-                        category::TUNNEL,
-                        format!("Tunnel failed over to backup relay {relay_addr}"),
-                        &params.tunnel_id.to_string(),
-                        serde_json::json!({
-                            "from_relay_addr": from,
-                            "to_relay_addr": relay_addr,
-                            "from_idx": initial_idx,
-                            "to_idx": *active_idx,
-                        }),
-                    );
-                }
-                return Ok(conn);
+        let relay_addr: &str = &params.relay_addrs[walk.at];
+        let met = tokio::select! {
+            met = meet(params, walk.at, state_tx, &mut refusals, &event_sender) => met,
+            _ = cancel.cancelled() => anyhow::bail!("cancelled during connect"),
+        };
+        match met {
+            Ok((idx, link)) => {
+                *active_idx = idx;
+                active_idx_tx.send_replace(idx);
+                state_tx.send_replace(RelayTunnelState::Ready);
+                tracing::info!(
+                    tunnel_id = %params.tunnel_id,
+                    direction = %params.direction,
+                    "Tunnel ready"
+                );
+                report_up(params, walk.began, idx, &event_sender);
+                return Ok(link);
             }
             Err(e) => {
-                if cancel.is_cancelled() {
-                    return Err(e);
-                }
                 let err_msg = e.to_string();
                 let is_waiting_timeout = err_msg.contains(WAITING_TIMEOUT_MSG);
 
                 if is_waiting_timeout {
-                    // Expected convergence step, not a hard failure.
+                    // Expected, not a hard failure.
                     tracing::info!(
                         tunnel_id = %params.tunnel_id,
                         relay = %relay_addr,
-                        "Stepping to next relay (waiting timeout)"
+                        "Peer not there (waiting timeout)"
                     );
-                } else if e.is::<BindRejected>() {
-                    tracing::warn!(
-                        tunnel_id = %params.tunnel_id,
-                        relay = %relay_addr,
-                        "Tunnel bind rejected by relay: {e}"
-                    );
-                    if !std::mem::replace(&mut refused_by[*active_idx], true) {
-                        event_sender.emit_flow_with_details(
-                            EventSeverity::Critical,
-                            category::TUNNEL,
-                            format!("Tunnel bind rejected by relay: {e}"),
-                            &params.tunnel_id.to_string(),
-                            serde_json::json!({ "relay_addr": relay_addr.to_string() }),
-                        );
-                    }
+                } else if let Some(e) = e.downcast_ref() {
+                    refusals.report(params, walk.at, e, &event_sender);
                 } else {
                     event_sender.emit_flow_with_details(
                         EventSeverity::Warning,
@@ -780,13 +1089,11 @@ pub async fn connect_with_retry(
                 }
 
                 // Step to the next relay in the list. If that brings us back
-                // to `initial_idx` we've tried every relay once this cycle —
+                // to where we began we've tried every relay once this cycle —
                 // sleep with exponential backoff before the next round.
-                let next = (*active_idx + 1) % n;
-                *active_idx = next;
-                active_idx_tx.send_replace(*active_idx);
-
-                if next == initial_idx {
+                let pause = walk.step();
+                active_idx_tx.send_replace(walk.at);
+                if let Some(backoff) = pause {
                     tracing::info!(
                         tunnel_id = %params.tunnel_id,
                         "All {n} relays failed this cycle, sleeping {backoff:?} before retry"
@@ -795,63 +1102,22 @@ pub async fn connect_with_retry(
                         _ = tokio::time::sleep(backoff) => {}
                         _ = cancel.cancelled() => anyhow::bail!("cancelled during retry backoff"),
                     }
-                    backoff = (backoff * 2).min(max_backoff);
                 }
             }
         }
     }
 }
 
-/// Measure the smoothed QUIC RTT to `relay_addr` by opening a short-lived
-/// probe connection and performing the Hello / HelloAck handshake.
-///
-/// `relay_addr` is a `host:port` string (IP literal or DNS name). Resolution
-/// happens on every probe so an IP change behind a hostname is observed
-/// without restarting the failback task.
-///
-/// Used by the failback probe to decide whether the primary relay is healthy
-/// enough (RTT-wise) to resume traffic on. The connection is dropped at the
-/// end of the call.
-pub async fn measure_relay_rtt(
-    relay_addr: &str,
-    cancel: CancellationToken,
-) -> Result<Duration> {
-    let target = relay_addr.to_string();
-    let work = async move {
-        let endpoint = quic::make_client_endpoint(ALPN_RELAY)?;
-        let resolved = lookup_host(target.as_str())
-            .await
-            .map_err(|e| anyhow::anyhow!("resolve relay '{target}': {e}"))?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("relay '{target}' resolved to no addresses"))?;
-        let conn = tokio::select! {
-            result = quic::connect(&endpoint, resolved, "relay") => result?,
-            _ = cancel.cancelled() => anyhow::bail!("cancelled during probe connect"),
-        };
-        let (mut send, mut recv) = conn.open_bi().await?;
-        protocol::write_message(
-            &mut send,
-            &EdgeMessage::Hello {
-                protocol_version: TUNNEL_PROTOCOL_VERSION,
-                software_version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-        )
-        .await?;
-        // Wait for HelloAck so we know the relay is responsive at the
-        // application layer (not just the QUIC handshake).
-        let _ = protocol::read_message_resilient::<RelayMessage>(&mut recv).await?;
-        Ok::<Duration, anyhow::Error>(conn.rtt())
-    };
-
-    match tokio::time::timeout(PROBE_TIMEOUT, work).await {
-        Ok(result) => result,
-        Err(_) => anyhow::bail!("probe to {relay_addr} timed out after {PROBE_TIMEOUT:?}"),
-    }
-}
-
 #[cfg(test)]
 pub(super) mod stand_in {
     //! A relay that says what the test tells it to, over the real protocol.
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use tokio::net::UdpSocket;
+
     use super::*;
     use crate::tunnel::protocol::{read_message, write_message};
 
@@ -882,10 +1148,15 @@ pub(super) mod stand_in {
             Self { endpoint, addr }
         }
 
-        /// The next connection to come, with its control stream.
-        pub(crate) async fn session(&self) -> Session {
+        /// The next connection to come.
+        pub(crate) async fn accept(&self) -> Connection {
             let incoming = soon("a connection", self.endpoint.accept()).await.unwrap();
-            let conn = soon("its handshake", incoming.into_future()).await.unwrap();
+            soon("its handshake", incoming.into_future()).await.unwrap()
+        }
+
+        /// The same, with its control stream.
+        pub(crate) async fn session(&self) -> Session {
+            let conn = self.accept().await;
             let (send, recv) = soon("its control stream", conn.accept_bi()).await.unwrap();
             Session { conn, send, recv }
         }
@@ -895,6 +1166,11 @@ pub(super) mod stand_in {
             let mut session = self.session().await;
             let bind = session.next().await;
             (session, bind)
+        }
+
+        /// The next connection to come, which the relay ends before any bind.
+        pub(crate) async fn turns_away(&self) {
+            self.session().await.conn.close(0u32.into(), b"");
         }
 
         /// Whether a connection comes within `time`.
@@ -940,6 +1216,82 @@ pub(super) mod stand_in {
         pub(crate) async fn closed(&self) {
             soon("the edge's leaving", self.conn.closed()).await;
         }
+
+        /// The edge lets go of its side, and then of the connection.
+        pub(crate) async fn is_left(&mut self) {
+            assert!(matches!(self.next().await, EdgeMessage::TunnelUnbind { .. }));
+            self.closed().await;
+        }
+    }
+
+    /// A way to a relay, that takes a while.
+    pub(crate) struct Far {
+        /// In milliseconds, each way, or [`CUT`].
+        pub(crate) delay: Arc<AtomicU64>,
+        _way: JoinSet<()>,
+    }
+
+    /// The delay of a way on which nothing comes through.
+    pub(crate) const CUT: u64 = u64::MAX;
+
+    impl Far {
+        /// From now on the relay's address is that of the way to it.
+        pub(crate) async fn to(relay: &mut StandIn, delay: u64) -> Self {
+            let here = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let addr = here.local_addr().unwrap().to_string();
+            let relay = std::mem::replace(&mut relay.addr, addr);
+            let delay = Arc::new(AtomicU64::new(delay));
+            let wait = delay.clone();
+            let mut way = JoinSet::new();
+            way.spawn(async move {
+                let mut back = JoinSet::new();
+                let mut edges: HashMap<SocketAddr, Arc<UdpSocket>> = HashMap::new();
+                loop {
+                    let (data, edge) = next_datagram(&here).await;
+                    if let Some(there) = edges.get(&edge) {
+                        later(&wait, there.clone(), data, None);
+                        continue;
+                    }
+                    let there = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                    there.connect(&relay).await.unwrap();
+                    edges.insert(edge, there.clone());
+                    later(&wait, there.clone(), data, None);
+                    let (here, wait) = (here.clone(), wait.clone());
+                    back.spawn(async move {
+                        loop {
+                            let (data, _) = next_datagram(&there).await;
+                            later(&wait, here.clone(), data, Some(edge));
+                        }
+                    });
+                }
+            });
+            Self { delay, _way: way }
+        }
+    }
+
+    async fn next_datagram(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut buf = vec![0; 2048];
+        loop {
+            // An error is of a datagram that was sent.
+            if let Ok((n, from)) = socket.recv_from(&mut buf).await {
+                buf.truncate(n);
+                return (buf, from);
+            }
+        }
+    }
+
+    fn later(wait: &AtomicU64, by: Arc<UdpSocket>, data: Vec<u8>, to: Option<SocketAddr>) {
+        let wait = match wait.load(Ordering::Relaxed) {
+            CUT => return,
+            wait => Duration::from_millis(wait),
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            let _ = match to {
+                Some(to) => by.send_to(&data, to).await,
+                None => by.send(&data).await,
+            };
+        });
     }
 
     pub(crate) fn ready(tunnel_id: Uuid) -> RelayMessage {
@@ -989,6 +1341,7 @@ mod tests {
                 edge_id: Some("edge-1".into()),
                 tunnel_bind_secret: Some("ab".repeat(32)),
                 failback_rtt_gate_ms: 50,
+                timing: Default::default(),
             });
             let id = params.tunnel_id;
             let (state_tx, state) = watch::channel(Connecting);
@@ -997,7 +1350,18 @@ mod tests {
             let token = cancel.clone();
             let connect = tokio::spawn(async move {
                 let (active_tx, _active) = watch::channel(0);
-                connect_with_retry(&params, &mut 0, &active_tx, &state_tx, token, event_tx).await
+                let (cancel, events) = (token.clone(), event_tx.clone());
+                let mut link =
+                    connect_with_retry(&params, &mut 0, &active_tx, &state_tx, cancel, events).await?;
+                let conn = link.conn().clone();
+                tokio::spawn(async move {
+                    let relay_addr = &params.relay_addrs[0];
+                    tokio::select! {
+                        _ = link.hold(relay_addr, &state_tx, &event_tx) => {}
+                        _ = token.cancelled() => {}
+                    }
+                });
+                Ok(conn)
             });
             Self { id, relay, state, events, cancel, connect: Some(connect) }
         }
@@ -1131,6 +1495,7 @@ mod tests {
                 edge_id: None,
                 tunnel_bind_secret: token.is_some().then(|| secret.clone()),
                 failback_rtt_gate_ms: 50,
+                timing: Default::default(),
             });
             let mut on_the_wire = serde_json::json!({
                 "type": "tunnel_bind", "tunnel_id": id, "direction": want.0, "protocol": want.1,
@@ -1539,6 +1904,130 @@ mod tests {
         let mut t = Tunnel::start();
         let (mut session, _conn) = t.up().await;
         assert!(matches!(session.raw().await, EdgeMessage::Ping));
+    }
+
+    /// Each relay in turn, and a longer and longer wait once they have all been
+    /// tried.
+    #[test]
+    fn the_relays_are_tried_in_turn() {
+        for began in [0, 1] {
+            let mut walk = Walk::new(2, began);
+            assert_eq!(walk.at, began);
+            for wait in [1, 2, 4, 8, 16, 32, 60, 60] {
+                assert_eq!(walk.step(), None);
+                assert_eq!(walk.at, 1 - began);
+                assert_eq!(walk.step(), Some(Duration::from_secs(wait)));
+                assert_eq!(walk.at, began);
+            }
+        }
+        let mut walk = Walk::new(1, 0);
+        for wait in [1, 2, 4, 8, 16, 32, 60, 60] {
+            assert_eq!(walk.step(), Some(Duration::from_secs(wait)));
+            assert_eq!(walk.at, 0);
+        }
+    }
+
+    /// When a tunnel tries its other relay, in seconds.
+    struct Tries {
+        rule: OtherRelay,
+        start: Instant,
+    }
+
+    impl Tries {
+        fn of(on_backup: bool) -> Self {
+            let start = Instant::now();
+            Self { rule: OtherRelay::new(on_backup, &Timing::default(), start), start }
+        }
+
+        fn at(&self, secs: u64) -> Instant {
+            self.start + Duration::from_secs(secs)
+        }
+
+        fn is(&mut self, state: RelayTunnelState, at: u64) -> Option<u64> {
+            self.rule.set(state, self.at(at));
+            self.due()
+        }
+
+        /// A try that comes to nothing.
+        fn fails(&mut self, at: u64) -> Option<u64> {
+            self.rule.failed(self.at(at));
+            self.due()
+        }
+
+        fn due(&self) -> Option<u64> {
+            self.rule.due().map(|at| (at - self.start).as_secs())
+        }
+    }
+
+    #[test]
+    fn a_tunnel_on_its_primary_looks_for_a_peer_that_is_gone() {
+        let mut tries = Tries::of(false);
+        assert_eq!(tries.is(Connecting, 0), None);
+        assert_eq!(tries.is(Ready, 1), None);
+        assert_eq!(tries.is(Waiting, 100), Some(110));
+        assert_eq!(tries.is(Waiting, 105), Some(110), "since it was first told");
+        assert_eq!(tries.is(Ready, 109), None);
+        assert_eq!(tries.is(Waiting, 110), Some(120));
+        // Its side is removed, and bound again.
+        assert_eq!(tries.is(Down, 115), None);
+        assert_eq!(tries.is(Waiting, 119), Some(129));
+        // Later and later, for as long as the peer is gone.
+        let mut at = 129;
+        for wait in [1, 2, 4, 8, 16, 32, 60, 60] {
+            assert_eq!(tries.fails(at), Some(at + wait));
+            at += wait;
+        }
+        // Soon again after the tunnel has been up.
+        assert_eq!(tries.is(Ready, at), None);
+        assert_eq!(tries.is(Waiting, at + 1), Some(at + 11));
+        assert_eq!(tries.fails(at + 11), Some(at + 12));
+        assert_eq!(tries.fails(at + 12), Some(at + 14));
+    }
+
+    #[test]
+    fn a_tunnel_on_its_backup_looks_for_its_primary() {
+        let mut tries = Tries::of(true);
+        assert_eq!(tries.is(Connecting, 0), None);
+        assert_eq!(tries.is(Ready, 5), Some(60));
+        assert_eq!(tries.fails(61), Some(121));
+        assert_eq!(tries.fails(122), Some(182));
+        // Sooner if its peer is gone, whenever it last tried.
+        assert_eq!(tries.is(Waiting, 125), Some(135));
+        assert_eq!(tries.is(Down, 130), None);
+        assert_eq!(tries.is(Ready, 131), Some(182));
+    }
+
+    #[test]
+    fn what_a_tunnel_is_to_have_on_its_other_relay() {
+        for (on_backup, state, near, wanted, settles) in [
+            (false, Connecting, true, true, true),
+            (false, Waiting, false, true, true),
+            (false, Down, true, true, true),
+            (false, Ready, true, false, true),
+            (true, Connecting, false, true, false),
+            (true, Waiting, false, true, false),
+            (true, Down, false, true, false),
+            (true, Ready, true, true, true),
+            (true, Ready, false, false, true),
+        ] {
+            let mut tries = Tries::of(on_backup);
+            tries.is(Connecting, 0);
+            tries.is(state, 5);
+            let what = format!("{on_backup} {state} {near}");
+            // Not on the spot, on its backup.
+            let in_a_moment = tries.at(6) - Duration::from_millis(1);
+            assert_eq!(tries.rule.wanted(in_a_moment, || near), wanted || on_backup, "{what}");
+            tries.is(state, 6);
+            assert_eq!(tries.rule.wanted(tries.at(6), || near), wanted, "{what}");
+            assert_eq!(tries.rule.settle(), if settles { SETTLE } else { Duration::ZERO }, "{what}");
+        }
+    }
+
+    /// What the tests have no time for.
+    #[test]
+    fn how_long_a_tunnel_waits() {
+        let Timing { connect, waiting, settle, failback } = Timing::default();
+        assert_eq!([connect, waiting, settle, failback].map(|t| t.as_secs()), [6, 10, 1, 60]);
     }
 
     fn gone(reason: &str) -> Option<Trouble> {
