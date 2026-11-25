@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use bytes::Bytes;
-use quinn::Connection;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::carrier::Carrier;
 use super::crypto::TunnelCipher;
 use super::protocol::{self, try_decode_udp_control, UdpRelayControl};
 
@@ -72,21 +72,22 @@ pub trait DatagramLink: Send + Sync {
     /// Receive the next inbound framed media datagram. Control datagrams (the
     /// nil-UUID-prefixed [`UdpRelayControl`]) are consumed internally and never
     /// surface here.
-    fn recv_datagram(&self) -> impl Future<Output = Result<Bytes>> + Send;
+    fn recv_datagram(&mut self) -> impl Future<Output = Result<Bytes>> + Send;
 }
 
-/// QUIC carrier — the legacy tunnel data plane. Thin wrapper over a
-/// [`quinn::Connection`] so it satisfies [`DatagramLink`].
-pub struct QuicLink(pub Connection);
+/// QUIC carrier — the legacy tunnel data plane. Thin wrapper over the tunnel's
+/// [`Carrier`] so it satisfies [`DatagramLink`].
+pub struct QuicLink(pub Carrier);
 
 impl DatagramLink for QuicLink {
     fn send_datagram(&self, data: Bytes) -> Result<()> {
         self.0
+            .conn()
             .send_datagram(data)
             .map_err(|e| anyhow::anyhow!("quic datagram send: {e}"))
     }
 
-    async fn recv_datagram(&self) -> Result<Bytes> {
+    async fn recv_datagram(&mut self) -> Result<Bytes> {
         self.0
             .read_datagram()
             .await
@@ -144,7 +145,7 @@ impl DatagramLink for PlainUdpLink {
         }
     }
 
-    async fn recv_datagram(&self) -> Result<Bytes> {
+    async fn recv_datagram(&mut self) -> Result<Bytes> {
         {
             let mut buf = vec![0u8; 2048];
             loop {
@@ -318,7 +319,7 @@ pub(crate) fn spawn_kernel_drop_sampler(
 pub async fn run_egress<L: DatagramLink>(
     tunnel_id: Uuid,
     local_addr: SocketAddr,
-    link: L,
+    mut link: L,
     stats: Arc<UdpForwarderStats>,
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
@@ -432,7 +433,7 @@ pub async fn run_egress<L: DatagramLink>(
 pub async fn run_ingress<L: DatagramLink>(
     tunnel_id: Uuid,
     forward_addr: SocketAddr,
-    link: L,
+    mut link: L,
     stats: Arc<UdpForwarderStats>,
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
@@ -521,7 +522,7 @@ pub async fn run_ingress<L: DatagramLink>(
 #[cfg(test)]
 mod tunnel_prefix_tests {
     use super::*;
-    use tokio::sync::{mpsc, Mutex};
+    use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
     const PATIENCE: Duration = Duration::from_secs(2);
@@ -534,13 +535,13 @@ mod tunnel_prefix_tests {
     /// error instead would end the forwarder before a negative assertion could
     /// be made.
     struct MockLink {
-        rx: Mutex<mpsc::UnboundedReceiver<Bytes>>,
+        rx: mpsc::UnboundedReceiver<Bytes>,
     }
 
     impl MockLink {
         fn new() -> (Self, mpsc::UnboundedSender<Bytes>) {
             let (tx, rx) = mpsc::unbounded_channel();
-            (Self { rx: Mutex::new(rx) }, tx)
+            (Self { rx }, tx)
         }
     }
 
@@ -549,9 +550,8 @@ mod tunnel_prefix_tests {
             Ok(())
         }
 
-        async fn recv_datagram(&self) -> Result<Bytes> {
-            let mut rx = self.rx.lock().await;
-            match rx.recv().await {
+        async fn recv_datagram(&mut self) -> Result<Bytes> {
+            match self.rx.recv().await {
                 Some(b) => Ok(b),
                 // Sender dropped: park rather than error, see the type doc.
                 None => std::future::pending().await,

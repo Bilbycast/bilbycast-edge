@@ -21,6 +21,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::carrier::Carrier;
 use super::crypto::TunnelCipher;
 use super::protocol::{self, StreamHeader, StreamType};
 
@@ -41,7 +42,7 @@ pub struct TcpForwarderStats {
 pub async fn run_egress(
     tunnel_id: Uuid,
     local_addr: SocketAddr,
-    conn: Connection,
+    mut carrier: Carrier,
     stats: Arc<TcpForwarderStats>,
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
@@ -69,7 +70,7 @@ pub async fn run_egress(
                     "New TCP connection, opening QUIC stream"
                 );
 
-                let conn = conn.clone();
+                let conn = carrier.conn().clone();
                 let stats = stats.clone();
                 let cancel = cancel.clone();
                 let cipher = cipher.clone();
@@ -82,7 +83,7 @@ pub async fn run_egress(
                 });
             }
 
-            reason = conn.closed() => {
+            reason = carrier.closed() => {
                 tracing::warn!(
                     tunnel_id = %tunnel_id,
                     reason = %reason,
@@ -176,7 +177,7 @@ async fn handle_egress_tcp(
 pub async fn run_ingress(
     tunnel_id: Uuid,
     forward_addr: SocketAddr,
-    conn: Connection,
+    mut carrier: Carrier,
     stats: Arc<TcpForwarderStats>,
     cancel: CancellationToken,
     cipher: Option<Arc<TunnelCipher>>,
@@ -190,7 +191,7 @@ pub async fn run_ingress(
 
     loop {
         tokio::select! {
-            result = conn.accept_bi() => {
+            result = carrier.accept_bi() => {
                 let (quic_send, mut quic_recv) = result?;
                 stats.connections_total.fetch_add(1, Ordering::Relaxed);
                 stats.connections_active.fetch_add(1, Ordering::Relaxed);

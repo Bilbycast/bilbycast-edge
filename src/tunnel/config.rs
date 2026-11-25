@@ -59,8 +59,9 @@ pub struct TunnelConfig {
     /// Maximum acceptable RTT increase (in milliseconds) when failing back from
     /// the backup relay to the primary. If the primary's measured RTT exceeds
     /// the active backup's RTT by more than this value, failback is refused and
-    /// retried later. Only meaningful when a backup relay is configured.
-    /// Default: 50ms.
+    /// retried later. A tunnel that waits for its peer goes to such a primary only
+    /// if the peer is there and does not come to the backup. Only meaningful when a
+    /// backup relay is configured. Default: 50ms.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rtt_failback_increase_ms: Option<u32>,
 
