@@ -2104,12 +2104,12 @@ impl FlowRuntime {
             applied: Some(applied),
         });
         // Once the assembler runs the new plan — or has gone — nothing reads
-        // the bus channels of the Hitless slots the plan dropped: their
-        // mergers are stopped and the assembler's fan-ins for them
-        // cancelled. Release them now rather than keep their rings for the
-        // life of the node, and their per-ES stats with them, so a slot
-        // added back later gets a fresh analyzer on its fresh channel. A
-        // stalled assembler leaves the swap unconfirmed, with them kept.
+        // the bus channels of the Hitless slots the plan dropped: the
+        // assembler's fan-ins for them are cancelled. Stop their mergers and
+        // release them now rather than keep their rings for the life of the
+        // node, and their per-ES stats with them, so a slot added back later
+        // gets a fresh analyzer on its fresh channel. A stalled assembler
+        // leaves the swap unconfirmed, with them kept.
         let on_air = await_plan_on_air(
             on_air,
             retired,
@@ -2132,7 +2132,7 @@ impl FlowRuntime {
             Ok(retired) => {
                 for output in retired {
                     self.stats.per_es_stats.remove(output.key());
-                    output.release(&bus);
+                    output.release(&bus).await;
                 }
                 Ok(SwapOutcome::OnAir)
             }

@@ -209,6 +209,15 @@ fn slot_health_identity(
     slot.source.clone()
 }
 
+/// The input a slot plays: a Hitless one's is the leg its merger forwards,
+/// where [`slot_health_identity`] has its merger's bus key.
+fn slot_on_air(slot: &AssemblySlot, active_leg_input: &HashMap<u16, String>) -> String {
+    match &slot.hitless_legs {
+        Some(legs) => legs.on_air().to_string(),
+        None => slot_health_identity(slot, active_leg_input).0,
+    }
+}
+
 /// What carries a program's PCR: its slot's `out_pid`, and the input and PID
 /// that slot plays.
 struct PcrLeg {
@@ -1416,17 +1425,18 @@ async fn run_assembler(
                         && (was_prog.program_number == prog.program_number
                             || was_prog.slots == prog.slots);
                     // A slot of the program that stays on its clock goes on,
-                    // unless it was held. A Hitless slot does with the legs it
-                    // had: its source, its merger's key, does not name them.
+                    // unless it was held. A Hitless slot is on the leg its
+                    // merger forwards, and a new merger starts on its primary.
                     let stays = |out_pid: &u16| {
                         let it = |s: &&AssemblySlot| s.out_pid == *out_pid;
                         let found = (was_prog.slots.iter().find(it), prog.slots.iter().find(it));
                         let (Some(was), Some(is)) = found else {
                             return false;
                         };
-                        let played = slot_health_identity(was, &legs_from).0;
-                        let plays = slot_health_identity(is, &active_leg_input).0;
-                        (played == plays && was.hitless_legs == is.hitless_legs)
+                        let played = slot_on_air(was, &legs_from);
+                        let plays = slot_on_air(is, &active_leg_input);
+                        played == plays
+                            || (was.hitless_legs.is_some() && was.hitless_legs == is.hitless_legs)
                             || plan.share_clock(&played, &plays)
                     };
                     let hold = match held.remove(&was_prog.program_number) {
@@ -6952,16 +6962,20 @@ mod tests {
             plan.programs[0].slots[1] = audio;
             plan
         };
-        // The audio slot on merger `key`, whose legs are the others.
-        let merged = |key: &str, primary: &str, backup: &str| AssemblySlot {
-            hitless_legs: Some(HitlessLegs {
-                primary: primary.to_string(),
-                backup: backup.to_string(),
-                forwarding_primary: Default::default(),
-                seq_fallback: Default::default(),
-            }),
-            ..slot(key, 0x101, 0x201, 0x0F)
+        // The audio slot on merger `key`, whose legs are the others, the
+        // primary on air, or the backup.
+        let on_leg = |key: &str, primary: &str, backup: &str, on_primary: bool| {
+            let forwarding_primary = ForwardingPrimary::default();
+            forwarding_primary.set(on_primary);
+            let (primary, backup) = (primary.to_string(), backup.to_string());
+            let seq_fallback = Default::default();
+            AssemblySlot {
+                hitless_legs: Some(HitlessLegs { primary, backup, forwarding_primary, seq_fallback }),
+                ..slot(key, 0x101, 0x201, 0x0F)
+            }
         };
+        let merged = |key: &str, primary: &str, backup: &str| on_leg(key, primary, backup, true);
+        let failed_over = |primary: &str, backup: &str| on_leg("m", primary, backup, false);
         let renumbered = AssemblySlot { out_pid: 0x202, ..merged("m", "a", "c") };
         // Another program's slot on 0x202, before the swap gives it to this one.
         let mut theirs = beside(breakaway("x", "a"));
@@ -6983,15 +6997,25 @@ mod tests {
             // A Switch slot on the leg it was on, and one that loses it.
             (video("x", legs(&["a", "b"])), video("y", legs(&["a", "b"])), ("a", 0x101), true),
             (video("x", legs(&["a", "b"])), video("y", legs(&["b"])), ("b", 0x101), false),
-            // A Hitless slot with the legs it had, however they are merged;
-            // with another primary, or backup, behind the key it read; on
-            // another merger's, or none; and on another `out_pid`.
-            (video("x", merged("m", "a", "c")), video("y", merged("m", "a", "c")), ("m", 0x101), true),
-            (video("x", merged("m", "a", "c")), video("y", merged("m", "b", "c")), ("m", 0x101), false),
-            (video("x", merged("m", "a", "c")), video("y", merged("m", "a", "b")), ("m", 0x101), false),
-            (video("x", merged("m", "a", "c")), video("y", merged("n", "a", "c")), ("n", 0x101), false),
-            (video("x", merged("m", "a", "c")), breakaway("y", "a"), ("a", 0x101), false),
-            (breakaway("x", "a"), video("y", merged("m", "a", "c")), ("m", 0x101), false),
+            // A Hitless slot with the legs it had, whichever is on air, however
+            // they are merged.
+            (video("x", merged("m", "a", "b")), video("y", merged("m", "a", "b")), ("m", 0x101), true),
+            (video("x", merged("m", "a", "b")), video("y", merged("n", "a", "b")), ("n", 0x101), true),
+            (video("x", failed_over("a", "b")), video("y", merged("n", "a", "b")), ("n", 0x101), true),
+            // With another backup; with another primary, on its clock or not;
+            // and where it was on the backup, which it loses, or is left with.
+            (video("x", merged("m", "a", "b")), video("y", merged("n", "a", "y")), ("n", 0x101), true),
+            (video("x", merged("m", "a", "b")), video("y", merged("n", "c", "b")), ("n", 0x101), true),
+            (video("x", merged("m", "a", "c")), video("y", merged("n", "b", "c")), ("n", 0x101), false),
+            (video("x", merged("m", "x", "a")), video("y", merged("n", "y", "a")), ("n", 0x101), false),
+            (video("x", failed_over("a", "z")), video("y", merged("n", "a", "b")), ("n", 0x101), false),
+            (video("x", failed_over("b", "a")), video("y", merged("n", "c", "z")), ("n", 0x101), true),
+            // Merged no more, or only now; and on another `out_pid`.
+            (video("x", merged("m", "a", "b")), breakaway("y", "a"), ("a", 0x101), true),
+            (video("x", merged("m", "a", "b")), breakaway("y", "b"), ("b", 0x101), false),
+            (video("x", failed_over("a", "z")), breakaway("y", "z"), ("z", 0x101), true),
+            (breakaway("x", "a"), video("y", merged("m", "a", "b")), ("m", 0x101), true),
+            (breakaway("x", "b"), video("y", merged("m", "a", "b")), ("m", 0x101), false),
             (video("x", merged("m", "a", "c")), video("y", renumbered), ("m", 0x101), false),
         ] {
             let what = format!("{id} 0x{pid:X} of {after:?}");
@@ -7388,9 +7412,23 @@ mod tests {
         assert!(rig.raised(code).is_empty());
         // The PCR to another slot of the program, with none on its PID either.
         more.programs[0].pcr_source.1 = 0x101;
-        rig.replace(more).await;
+        rig.replace(more.clone()).await;
         assert_eq!(rig.raised(code), said("b", 0x201, 0x101));
         assert_eq!(feed(&mut rig, "b", 97_200, 2).await, [0x200, 0x201]);
+        // And back, under another number, which the event has.
+        more.programs[0].pcr_source.1 = 0x100;
+        more.programs[0].program_number = 7;
+        rig.replace(more.clone()).await;
+        let mut renumbered = said("b", 0x200, 0x100);
+        renumbered[0]["program_number"] = 7.into();
+        assert_eq!(rig.raised(code), renumbered);
+        // Nor is it said for another number, or `out_pid`, of the same slot.
+        more.programs[0].program_number = 1;
+        rig.replace(more.clone()).await;
+        more.programs[0].slots[0].out_pid = 0x210;
+        rig.replace(more).await;
+        assert!(rig.raised(code).is_empty());
+        assert_eq!(feed(&mut rig, "b", 97_200, 2).await, [0x201, 0x210]);
         // To one with a PCR it waits for it, and within it for none.
         rig.replace(pinned_beside("a")).await;
         assert_eq!(feed(&mut rig, "a", 90_000, 0).await, [0u16; 0]);

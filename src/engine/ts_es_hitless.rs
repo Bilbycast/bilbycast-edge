@@ -70,7 +70,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use super::ts_assembler::{AssemblyPlan, PendingHitlessSlot};
 use super::ts_es_bus::{NodeEsBus, UpstreamSeq};
@@ -499,20 +499,27 @@ struct OutputChannels {
     closed: bool,
 }
 
-/// A Hitless slot's bus channel whose merger a plan swap stopped for good:
-/// the new plan has no slot on its key. Released once the assembler runs the
-/// new plan ([`RetiredOutput::release`]).
+/// A Hitless slot's bus channel, and its merger, that a plan swap retires: the
+/// new plan has no slot on its key. The merger publishes until this is
+/// dropped, so the plan before plays it up to the swap; stopped ahead of the
+/// swap, it left a slot on its way to another primary with nothing to play
+/// until the new plan was on air. Released once the assembler runs the new
+/// plan ([`RetiredOutput::release`]).
 pub struct RetiredOutput {
     key: (String, u16),
     sender: broadcast::Sender<EsPacketAlias>,
+    merger: DropGuard,
+    task: JoinHandle<()>,
 }
 
 impl RetiredOutput {
-    /// Take the channel off the bus. Nothing reads it any more: its merger
-    /// is gone and the assembler, on the new plan, has cancelled its
-    /// fan-in. The per-ES analyzer still subscribed sees it close and ends,
-    /// and the ring goes with the last receiver.
-    pub fn release(self, bus: &NodeEsBus) {
+    /// Stop the merger and take the channel off the bus. Nothing reads it any
+    /// more: the assembler, on the new plan, has cancelled its fan-in. The
+    /// per-ES analyzer still subscribed sees it close and ends, and the ring
+    /// goes with the last receiver.
+    pub async fn release(self, bus: &NodeEsBus) {
+        drop(self.merger);
+        let _ = self.task.await;
         bus.remove_if_same(&self.key, &self.sender);
     }
 
@@ -562,9 +569,9 @@ impl HitlessOutputs {
     /// Hold `retired` again, for the flow's stop to release: a swap whose
     /// assembler has not put its plan on air — whose fan-ins read these
     /// channels until it does — keeps the channels it retired rather than
-    /// release them under a reader.
+    /// release them under a reader. Their mergers stop.
     pub fn keep(&self, retired: Vec<RetiredOutput>, bus: &NodeEsBus) {
-        for RetiredOutput { key, sender } in retired {
+        for RetiredOutput { key, sender, .. } in retired {
             self.register(key, sender, bus);
         }
     }
@@ -592,18 +599,19 @@ impl HitlessMergers {
     /// `out_pid` alone changed, keeps its merger, uninterrupted, and `plan`
     /// takes that merger's [`ForwardingPrimary`] and [`SeqFallback`] in place
     /// of the fresh ones it was built with, so the on-air set goes on
-    /// following the merger's failovers and the flow's health its fallback. A
-    /// merger whose slot is gone or changed is cancelled and awaited, so it is
-    /// no longer publishing onto the slot's bus key when its replacement
-    /// starts there, or, on another primary, on a key of its own. Every slot
-    /// without a merger then gets one, under
-    /// `parent` — until the flow is found to have stopped meanwhile ([`HitlessOutputs::register`]), whose stop
-    /// has released every channel but the one just taken: that one is
-    /// released, and the rest of the slots get none.
+    /// following the merger's failovers and the flow's health its fallback.
     ///
-    /// Returns the bus channels of the mergers it stopped whose key the plan
-    /// has no slot on: the caller releases them once the assembler runs the
-    /// plan.
+    /// A slot changed on the primary it had gets a new merger on the key it
+    /// had, once its old one is cancelled and awaited, so the two never
+    /// publish there together. Every other slot without one gets a new merger
+    /// on a new key: those on another primary, whose old merger runs on until
+    /// the plan is on air. All are under `parent` — until the flow is found to
+    /// have stopped meanwhile ([`HitlessOutputs::register`]), whose stop has
+    /// released every channel but the one just taken: that one is released,
+    /// and the rest of the slots get none.
+    ///
+    /// Returns the bus channels, with their mergers, the plan has no slot on:
+    /// the caller releases them once the assembler runs the plan.
     pub async fn apply(
         &mut self,
         slots: &[PendingHitlessSlot],
@@ -634,10 +642,10 @@ impl HitlessMergers {
         }
         let mut retired = Vec::new();
         for gone in running {
-            gone.cancel.cancel();
-            let _ = gone.task.await;
-            if let Some(sender) = self.outputs.take(&gone.key) {
-                retired.push(RetiredOutput { key: gone.key, sender });
+            let RunningMerger { key, cancel, task, .. } = gone;
+            let merger = cancel.drop_guard();
+            if let Some(sender) = self.outputs.take(&key) {
+                retired.push(RetiredOutput { key, sender, merger, task });
             }
         }
         for (slot, taken) in slots.iter().zip(taken) {
@@ -2200,7 +2208,7 @@ mod tests {
         // The old run's assembler answers, and its swap releases the channel
         // it retired.
         for output in retired {
-            output.release(&bus);
+            output.release(&bus).await;
         }
         // A fan-in subscribing now still reads the new run's merger.
         let (key, pid) = hitless_bus_key(&new, "slot_257_0");
@@ -2264,7 +2272,7 @@ mod tests {
                 .collect();
             let gone = retired.len();
             for output in retired {
-                output.release(&bus);
+                output.release(&bus).await;
             }
             (read, gone)
         };
@@ -2344,8 +2352,9 @@ mod tests {
 
     /// A merger on another primary starts before the plan it is for is on air,
     /// and the plan before plays nothing of it: it publishes onto a key of its
-    /// own. One on the same primary, whatever else of it changes, goes on on
-    /// its slot's.
+    /// own, and the one it replaces goes on on the key that plan reads, until
+    /// its channel is released. One on the same primary, whatever else of it
+    /// changes, goes on on its slot's key.
     #[tokio::test]
     async fn a_new_primary_is_not_played_by_the_plan_before() {
         let bus = Arc::new(NodeEsBus::new());
@@ -2354,20 +2363,30 @@ mod tests {
         let mut mergers = HitlessMergers::default();
         let mut plan = AssemblyPlan { programs: Vec::new(), clocks: Default::default() };
         mergers.apply(&[pending("f1:0", 257)], &mut plan, &bus, &flow).await;
-        let mut played = bus.subscribe(&hitless_bus_key("f1:0", "slot_257_0").0, 0);
+        let on_key = |uid: &str| bus.subscribe(&hitless_bus_key("f1:0", uid).0, 0);
+        let sends = |input: &str| bus.sender_for(input, 0x300, 0x1B).send(es(0x300, 7)).is_ok();
+        let plays = async |rx: &mut broadcast::Receiver<EsPacketAlias>| {
+            matches!(tokio::time::timeout(Duration::from_millis(300), rx.recv()).await, Ok(Ok(_)))
+        };
+        let mut before = on_key("slot_257_0");
 
         let leg = |input: &str| (input.to_string(), 0x300);
-        for (primary, backup, plays_on) in [("in-a", "in-c", true), ("in-c", "in-b", false)] {
-            let slot = PendingHitlessSlot {
-                primary: leg(primary),
-                backup: leg(backup),
-                ..pending("f1:0", 257)
-            };
-            let retired = mergers.apply(&[slot], &mut plan, &bus, &flow).await;
-            assert_eq!(retired.len(), usize::from(!plays_on), "{primary}");
-            bus.sender_for(primary, 0x300, 0x1B).send(es(0x300, 7)).expect("read");
-            let got = tokio::time::timeout(Duration::from_millis(300), played.recv()).await;
-            assert_eq!(matches!(got, Ok(Ok(_))), plays_on, "{primary}: {got:?}");
+        let of = |primary: &str, backup: &str| PendingHitlessSlot {
+            primary: leg(primary),
+            backup: leg(backup),
+            ..pending("f1:0", 257)
+        };
+        assert!(mergers.apply(&[of("in-a", "in-c")], &mut plan, &bus, &flow).await.is_empty());
+        assert!(sends("in-a") && plays(&mut before).await, "on the key it had");
+        let retired = mergers.apply(&[of("in-d", "in-c")], &mut plan, &bus, &flow).await;
+        assert_eq!(retired.len(), 1);
+        let mut after = on_key("slot_257_1");
+        assert!(sends("in-a") && plays(&mut before).await, "the plan before is on air yet");
+        assert!(sends("in-d") && plays(&mut after).await, "and the new one is ready");
+        assert!(!plays(&mut before).await, "which the plan before does not play");
+        for output in retired {
+            output.release(&bus).await;
         }
+        assert!(!sends("in-a"), "its merger is gone");
     }
 }
