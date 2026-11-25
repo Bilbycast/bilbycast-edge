@@ -58,9 +58,10 @@
 //!   the bus edge — same as every other bus publisher.
 //! - Cancellation propagates from the parent flow token via
 //!   `CancellationToken::child_token`.
-//! - One merger per Hitless slot: [`HitlessMergers`] keeps a slot's merger
-//!   across a plan swap that leaves the slot alone and stops it before
-//!   anything else publishes onto the slot's bus key.
+//! - One merger per bus key: [`HitlessMergers`] keeps a slot's merger across
+//!   a plan swap that leaves the slot alone and stops it before anything else
+//!   publishes onto its key. A slot taken to another primary has two, each on
+//!   a key of its own, until the swap is on air.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -451,10 +452,10 @@ impl PartialEq for LegLag {
 
 impl Eq for LegLag {}
 
-/// The mergers running behind one assembled flow's Hitless slots. A slot's
-/// merger is the only publisher onto the slot's bus key, so the flow keeps
-/// exactly one per slot: [`Self::apply`] brings the set in line with each plan
-/// before it goes on air.
+/// The mergers running behind one assembled flow's Hitless slots, one per
+/// slot of the plan, each the only publisher onto its bus key:
+/// [`Self::apply`] brings the set in line with each plan before it goes on
+/// air, and hands back those the plan before is still on.
 #[derive(Default)]
 pub struct HitlessMergers {
     running: Vec<RunningMerger>,

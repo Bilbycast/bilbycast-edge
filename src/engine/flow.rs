@@ -2104,12 +2104,13 @@ impl FlowRuntime {
             applied: Some(applied),
         });
         // Once the assembler runs the new plan — or has gone — nothing reads
-        // the bus channels of the Hitless slots the plan dropped: the
-        // assembler's fan-ins for them are cancelled. Stop their mergers and
-        // release them now rather than keep their rings for the life of the
-        // node, and their per-ES stats with them, so a slot added back later
-        // gets a fresh analyzer on its fresh channel. A stalled assembler
-        // leaves the swap unconfirmed, with them kept.
+        // the bus channels of the Hitless slots the plan dropped or took to
+        // another primary: the assembler's fan-ins for them are cancelled.
+        // Stop their mergers and release them now rather than keep their rings
+        // for the life of the node, and their per-ES stats with them, so a
+        // slot added back later gets a fresh analyzer on its fresh channel. A
+        // stalled assembler leaves the swap unconfirmed, with the channels
+        // kept and their mergers stopped.
         let on_air = await_plan_on_air(
             on_air,
             retired,
@@ -5096,15 +5097,16 @@ async fn reserve_plan_slot<'a>(
 
 /// Wait at most `timeout` (production: [`ASSEMBLER_ACK_TIMEOUT`]) for the
 /// assembler's word that the plan it was handed is on air, its fan-ins on
-/// the dropped slots cancelled — or for the assembler to go, dropping the
-/// word with it — and hand back `retired`, the dropped Hitless slots'
-/// channels, for the caller to release. A stalled assembler still holds the
-/// plan, and its fan-ins read those channels until it gets to it: they are
-/// kept in `outputs`, for the flow's stop to release, and the swap stands
-/// unconfirmed: a Warning `pid_bus_assembler_unresponsive` (`awaiting:
-/// "applied"`) and an [`AssemblySwapError`] of that code for the caller to
-/// report. Unbounded, the wait held the REST call or WS command, and the
-/// flow's merger lock, for as long as the assembler stalled.
+/// the slots dropped, or taken to another primary, cancelled — or for the
+/// assembler to go, dropping the word with it — and hand back `retired`,
+/// those Hitless slots' channels, for the caller to release. A stalled
+/// assembler still holds the plan, and its fan-ins read those channels until
+/// it gets to it: they are kept in `outputs`, for the flow's stop to release,
+/// their mergers stop, and the swap stands unconfirmed: a Warning
+/// `pid_bus_assembler_unresponsive` (`awaiting: "applied"`) and an
+/// [`AssemblySwapError`] of that code for the caller to report. Unbounded,
+/// the wait held the REST call or WS command, and the flow's merger lock,
+/// for as long as the assembler stalled.
 async fn await_plan_on_air(
     on_air: tokio::sync::oneshot::Receiver<()>,
     retired: Vec<crate::engine::ts_es_hitless::RetiredOutput>,

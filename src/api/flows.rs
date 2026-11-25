@@ -388,6 +388,11 @@ pub async fn stop_flow(
 /// validation, same error codes. Used by the testbed probe so it can
 /// drive the runtime switch without standing up a manager.
 ///
+/// The swap runs to its end on a task of its own, as that command does: a
+/// handler is dropped when its client closes the connection, and a swap
+/// dropped part-way went on air unsaved, and left the Hitless channels it
+/// retired on the node's bus with nothing to take them off.
+///
 /// # Errors
 ///
 /// - [`ApiError::NotFound`] (404) when the flow isn't running.
@@ -407,6 +412,17 @@ pub async fn update_flow_assembly(
     State(state): State<AppState>,
     Path(flow_id): Path<String>,
     Json(new_assembly): Json<crate::config::models::FlowAssembly>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    tokio::spawn(swap_flow_assembly(state, flow_id, new_assembly))
+        .await
+        .unwrap_or_else(|e| Err(ApiError::Internal(format!("the assembly swap failed: {e}"))))
+}
+
+/// [`update_flow_assembly`]'s swap, from the running flow to `config.json`.
+async fn swap_flow_assembly(
+    state: AppState,
+    flow_id: String,
+    new_assembly: crate::config::models::FlowAssembly,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let runtime = state
         .flow_manager
@@ -1210,6 +1226,110 @@ pub(crate) mod passive_output_tests {
         let saved: serde_json::Value = serde_json::from_str(&saved).expect("saved is JSON");
         assert_eq!(saved["outputs"][0]["active"], false);
         let _ = state.flow_manager.destroy_flow("f1").await;
+    }
+}
+
+#[cfg(test)]
+mod assembly_swap_tests {
+    //! `PUT /api/v1/flows/{id}/assembly` on a running flow.
+    use super::*;
+
+    use std::time::Duration;
+
+    use super::whole_config_tests::state;
+    use crate::config::models::FlowAssembly;
+    use crate::engine::ts_assembler::PlanCommand;
+
+    /// A swap whose client closes the connection before the answer runs to
+    /// its end: the plan is saved, and the Hitless channels it retired are off
+    /// the node's bus. The swap was dropped with the handler: on air unsaved,
+    /// its retired channels on the bus for the life of the node.
+    #[tokio::test]
+    async fn a_swap_whose_client_goes_away_is_finished() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (state, _events) = state(dir.path());
+        let assembly = |main: &str, backup: &str| -> FlowAssembly {
+            let pid = |input_id: &str, pid: u16| {
+                serde_json::json!({ "type": "pid", "input_id": input_id, "source_pid": pid })
+            };
+            let hitless = |of: u16| {
+                serde_json::json!({ "type": "hitless", "mode": "primary_preference",
+                                    "primary": pid(main, of), "backup": pid(backup, of) })
+            };
+            serde_json::from_value(serde_json::json!({
+                "kind": "spts",
+                "pcr_source": { "input_id": main, "pid": 256 },
+                "programs": [{ "program_number": 1, "pmt_pid": 4096, "streams": [
+                    { "source": pid(main, 256), "out_pid": 512, "stream_type": 27 },
+                    { "source": hitless(257), "out_pid": 513, "stream_type": 15 },
+                    { "source": hitless(258), "out_pid": 514, "stream_type": 15 }
+                ] }]
+            }))
+            .expect("assembly fixture")
+        };
+        let resolved = {
+            let mut config = state.config.write().await;
+            config.inputs = serde_json::from_value(serde_json::json!([
+                { "id": "a", "name": "a", "type": "udp", "bind_addr": "127.0.0.1:29904" },
+                { "id": "b", "name": "b", "type": "udp", "bind_addr": "127.0.0.1:29905" }
+            ]))
+            .expect("inputs fixture");
+            config.flows = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "f1", "name": "f1", "input_ids": ["a", "b"], "output_ids": [],
+                    "assembly": assembly("a", "b")
+                }))
+                .expect("flow fixture"),
+            ];
+            config.resolve_flow(&config.flows[0]).expect("resolve")
+        };
+        let runtime = state.flow_manager.create_flow(resolved).await.expect("create_flow");
+        // A failed assertion must not leave the flow running: its input
+        // thread would hold the test runtime's shutdown forever.
+        let checks = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let retired = [runtime.hitless_bus_key(513), runtime.hitless_bus_key(514)];
+                let bus = state.flow_manager.node_es_bus();
+                let on_bus = || retired.iter().filter(|key| bus.keys().contains(key)).count();
+                assert_eq!(on_bus(), 2, "the slots' channels are on the bus");
+
+                // The assembler holds the swap up until after the client goes.
+                let (release, stalled) = tokio::sync::oneshot::channel();
+                let assembler = runtime.pid_bus_assembler_handle.as_ref().expect("an assembler");
+                assembler.plan_tx.send(PlanCommand::Stall { release: stalled }).await.expect("the assembler runs");
+                let put = update_flow_assembly(
+                    RequireAdmin,
+                    State(state.clone()),
+                    Path("f1".to_string()),
+                    Json(assembly("b", "a")),
+                );
+                let answered = tokio::time::timeout(Duration::from_millis(200), put).await;
+                assert!(answered.is_err(), "the client has gone before the answer");
+                drop(release);
+
+                let finished = async {
+                    loop {
+                        let saved = state.config.read().await.flows[0].assembly.clone();
+                        if saved == Some(assembly("b", "a")) && state.config_path.exists() && on_bus() == 0 {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                };
+                tokio::time::timeout(Duration::from_secs(10), finished)
+                    .await
+                    .expect("the plan is saved, and the retired channels off the bus");
+            }
+        });
+        let outcome = checks.await;
+        let _ = state.flow_manager.destroy_flow("f1").await;
+        if let Err(failed) = outcome {
+            std::panic::resume_unwind(failed.into_panic());
+        }
+        let left: Vec<_> =
+            state.flow_manager.node_es_bus().keys().into_iter().filter(|(id, _)| id.starts_with("hitless:")).collect();
+        assert!(left.is_empty(), "the stop leaves no Hitless channel: {left:?}");
     }
 }
 
