@@ -7171,6 +7171,8 @@ mod tests {
             let expected: Vec<u16> =
                 (0..2).filter(|i| !withheld[*i]).map(|i| 0x200 + i as u16).collect();
             let sent = rig.sent_pids(expected.len()).await;
+            // A hold that ends while this waits lets out more, never less.
+            assert!(sent.len() >= expected.len(), "seed {seed}: {sent:X?} of {expected:X?}: {log:#?}");
             if held.is_none() || since.elapsed() < Duration::from_millis(1_900) {
                 assert_eq!(sent, expected, "seed {seed}: {log:#?}");
             }
