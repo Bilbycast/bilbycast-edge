@@ -249,10 +249,11 @@ impl NodeEsBus {
     /// input whose id merely starts with `hitless:` is an input key like any)
     /// is the exception: only its merger creates it, before anything reads
     /// it, so one that is absent has been released — its flow stopped, or a
-    /// plan swap dropped the slot — and its subscriber gets a channel that is
-    /// already closed. Created again here, it would be held by nothing that
-    /// releases it: an analyzer or fan-in started as the flow stopped kept an
-    /// 8 192-slot ring for the life of the node.
+    /// plan swap dropped the slot or took its primary to another input — and
+    /// its subscriber gets a channel that is already closed. Created again
+    /// here, it would be held by nothing that releases it: an analyzer or
+    /// fan-in started as the flow stopped kept an 8 192-slot ring for the life
+    /// of the node.
     pub fn subscribe(&self, input_id: &str, source_pid: u16) -> broadcast::Receiver<EsPacket> {
         if crate::engine::ts_es_hitless::is_hitless_bus_key(input_id, source_pid) {
             return match self.channels.get(&(input_id.to_string(), source_pid)) {
@@ -269,11 +270,12 @@ impl NodeEsBus {
     /// of key removed: its channel is the flow run's own — the key names the
     /// run ([`crate::engine::ts_es_hitless::hitless_scope`]), so no other
     /// run can hold it — and once its merger is gone for good — the flow
-    /// stopped, or a plan swap dropped the slot — it would otherwise keep
-    /// its 8 192-slot ring, and the payloads pinned in it, for the life of
-    /// the node. Checked by identity, so a slot re-added meanwhile, whose
-    /// new merger made a new channel, keeps it. Input keys are never
-    /// removed; see the sender cache in [`TsEsDemuxer`].
+    /// stopped, or a plan swap dropped the slot or took its primary to
+    /// another input — it would otherwise keep its 8 192-slot ring, and the
+    /// payloads pinned in it, for the life of the node. Checked by identity,
+    /// so a slot re-added meanwhile, whose new merger made a new channel,
+    /// keeps it. Input keys are never removed; see the sender cache in
+    /// [`TsEsDemuxer`].
     pub fn remove_if_same(&self, key: &(String, u16), sender: &broadcast::Sender<EsPacket>) -> bool {
         self.channels
             .remove_if(key, |_, existing| existing.same_channel(sender))
