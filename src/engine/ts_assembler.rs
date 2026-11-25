@@ -2308,7 +2308,8 @@ async fn run_assembler(
                                  the Take to '{input_id}' — no PCR on its source_pid \
                                  0x{source_pid:04X}, which carries the program's clock on \
                                  out_pid 0x{out_pid:04X}. It goes out again with the first \
-                                 PCR there, or with a Take to an input that sends one",
+                                 PCR there, with a Take to an input that sends one, or with a \
+                                 plan swap that takes the program's PCR to another input",
                             ),
                             &flow_id,
                             serde_json::json!({
@@ -6416,6 +6417,20 @@ mod tests {
             rig.replace(pinned).await;
             assert_eq!(feed(&mut rig, id, 90_000, out.len()).await, out, "{id}");
         }
+
+        // Two programs held by one Take: each waits for a PCR of its own.
+        let mut plan = two_programs();
+        plan.programs[1].slots = vec![switch_slot(&["a", "b"], 0x110, 0x300, 0x1B)];
+        plan.programs[1].pcr_source = ("a".to_string(), 0x110);
+        let mut rig = Rig::start(plan).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        rig.send("b", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        rig.send("b", es_pes(0x110, 0x1B, 90_000));
+        assert_eq!(feed(&mut rig, "b", 90_000, 2).await, [0x200, 0x201], "program 2 still held");
+        rig.send("b", es_pcr(0x110, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x300]);
     }
 
     /// [`es_pes`] whose ES is `es`, zeros after it.
