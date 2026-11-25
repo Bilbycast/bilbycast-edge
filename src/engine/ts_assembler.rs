@@ -499,9 +499,10 @@ pub enum PlanCommand {
     /// or its number ([`programs_before`]).
     ///
     /// A splice pending in a slot that keeps both its legs goes on, and any
-    /// other ends ([`legs_after_swap`]). A program whose PCR the swap moves
-    /// to an input not known to share the clock of the one before is held
-    /// for the first PCR from there, but not for good ([`PcrHold::Swap`]).
+    /// other ends ([`legs_after_swap`]). Where the swap moves a program's PCR
+    /// to an input not known to share the clock of the one before, what it
+    /// moves with it is held for the first PCR from there, but not for good
+    /// ([`PcrHold::Swap`]).
     ReplacePlan {
         plan: AssemblyPlan,
         /// Per-swap splice request carried through from the manager's
@@ -1012,10 +1013,27 @@ enum PcrHold {
     /// A Take, `since` then: it lasts until the PCR. `reported` once the Take
     /// has been said to wait for it in vain.
     Take { since: Instant, reported: bool },
-    /// A plan swap. An input that sends its PCR on a PID the program does not
-    /// carry, which no swap refuses, would leave it off air for good: the hold
-    /// ends [`PCR_HOLD_ALARM`] after the first packet it withheld.
-    Swap { withheld: Option<Instant> },
+    /// A plan swap. The slots of `goes_on`, by `out_pid`, stay on the clock
+    /// they were on, as far from the last PCR as they were: they go out as
+    /// they did. An input that sends its PCR on a PID the program does not
+    /// carry, which no swap refuses, would leave the others off air for good:
+    /// the hold ends [`PCR_HOLD_ALARM`] after the first packet it withheld.
+    Swap { goes_on: HashSet<u16>, withheld: Option<Instant> },
+}
+
+impl PcrHold {
+    /// Whether a packet of the slot on `out_pid` that does not end the hold
+    /// is withheld.
+    fn withholds(&mut self, out_pid: u16) -> bool {
+        match self {
+            PcrHold::Swap { goes_on, .. } if goes_on.contains(&out_pid) => return false,
+            PcrHold::Swap { withheld, .. } => {
+                withheld.get_or_insert_with(Instant::now);
+            }
+            PcrHold::Take { .. } => {}
+        }
+        true
+    }
 }
 
 /// A Switch slot as a plan swap finds it: the place of its program in the
@@ -1357,16 +1375,36 @@ async fn run_assembler(
                 // a clock and it was not held already. One the swap adds was
                 // on no clock.
                 if let (Some(was_prog), Some(from), Some(now)) = (was_prog, from, &pcr_now[pidx]) {
-                    let hold = held.remove(&was_prog.program_number);
                     let (from, now) = (&from.source.0, &now.source.0);
                     // A hold goes on as it is in the program it is of, which
                     // has its number or its slots.
-                    let same = was_prog.program_number == prog.program_number
-                        || was_prog.slots == prog.slots;
-                    let hold = match hold {
-                        Some(hold) if from == now && same => Some(hold),
+                    let same = from == now
+                        && (was_prog.program_number == prog.program_number
+                            || was_prog.slots == prog.slots);
+                    // A slot of the program that stays on its clock goes on,
+                    // unless it was held.
+                    let stays = |out_pid: &u16| {
+                        let plays = |prog: &ProgramPlan, legs| {
+                            let slot = prog.slots.iter().find(|s| s.out_pid == *out_pid)?;
+                            Some(slot_health_identity(slot, legs).0)
+                        };
+                        let (was, is) = (plays(was_prog, &legs_from), plays(prog, &active_leg_input));
+                        was.zip(is).is_some_and(|(was, is)| was == is || plan.share_clock(&was, &is))
+                    };
+                    let hold = match held.remove(&was_prog.program_number) {
                         None if from == now || plan.share_clock(from, now) => None,
-                        _ => Some(PcrHold::Swap { withheld: None }),
+                        hold @ Some(PcrHold::Take { .. }) if same => hold,
+                        hold => {
+                            let (mut goes_on, withheld) = match hold {
+                                None => (was_prog.slots.iter().map(|s| s.out_pid).collect(), None),
+                                Some(PcrHold::Take { .. }) => (HashSet::new(), None),
+                                Some(PcrHold::Swap { goes_on, withheld }) => {
+                                    (goes_on, withheld.filter(|_| same))
+                                }
+                            };
+                            goes_on.retain(stays);
+                            Some(PcrHold::Swap { goes_on, withheld })
+                        }
                     };
                     if let Some(hold) = hold {
                         awaiting_pcr.insert(prog.program_number, hold);
@@ -1814,8 +1852,8 @@ async fn run_assembler(
                     // Two disjoint splice state maps — audio + video.
                     // A slot's `stream_type` chooses at most one; both
                     // cannot be pending simultaneously for the same
-                    // `(program_idx, out_pid)`. The boolean OR below
-                    // drives the "are we mid-splice?" gate; the two
+                    // `out_pid`. The boolean OR below drives the
+                    // "are we mid-splice?" gate; the two
                     // observe_a / observe_b call sites dispatch on
                     // which state machine is actually pending.
                     let audio_splice_pending = splice_state
@@ -2281,18 +2319,16 @@ async fn run_assembler(
                 // From here on: forward the packet (was active leg with
                 // splice forwarding A, or B's first committed PES).
                 //
-                // The program was moved to another clock: nothing of it goes
+                // The program was moved to another clock: nothing on it goes
                 // out until a PCR of the new leg does.
                 if let Some(hold) = awaiting_pcr.get_mut(&slot_program_number) {
-                    if pcr_out_pid_by_program.get(slot.program_idx) != Some(&slot.out_pid)
-                        || extract_pcr(&es.payload).is_none()
+                    if pcr_out_pid_by_program.get(slot.program_idx) == Some(&slot.out_pid)
+                        && extract_pcr(&es.payload).is_some()
                     {
-                        if let PcrHold::Swap { withheld: withheld @ None } = hold {
-                            *withheld = Some(Instant::now());
-                        }
+                        awaiting_pcr.remove(&slot_program_number);
+                    } else if hold.withholds(slot.out_pid) {
                         continue;
                     }
-                    awaiting_pcr.remove(&slot_program_number);
                 }
                 // Slot liveness: count the forwarded packet. The first
                 // ES packet after a latched stall fires the recovery
@@ -2443,7 +2479,7 @@ async fn run_assembler(
                 // it may, no PCR among them, ends: the program goes out
                 // without one.
                 awaiting_pcr.retain(|program_number, hold| {
-                    let PcrHold::Swap { withheld: Some(since) } = hold else {
+                    let PcrHold::Swap { withheld: Some(since), .. } = hold else {
                         return true;
                     };
                     if now.duration_since(*since) < PCR_HOLD_ALARM {
@@ -2460,7 +2496,7 @@ async fn run_assembler(
                                 "Flow '{flow_id}': program {program_number} goes out without a \
                                  PCR since the plan swap to '{input_id}' — none on its source_pid \
                                  0x{source_pid:04X}, which carries the program's clock on out_pid \
-                                 0x{out_pid:04X}, in the 2 s the program was held for it",
+                                 0x{out_pid:04X}, in the 2 s it was held for one",
                             ),
                             &flow_id,
                             serde_json::json!({
@@ -5967,11 +6003,12 @@ mod tests {
 
     impl Rig {
         async fn start(plan: AssemblyPlan) -> Self {
-            Self::start_with(plan, Default::default()).await
+            Self::start_with(plan, None, Default::default()).await
         }
 
         async fn start_with(
             plan: AssemblyPlan,
+            pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
             catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
         ) -> Self {
             let on_air = Arc::new(OnAirInputs::default());
@@ -5987,7 +6024,7 @@ mod tests {
                 cancel.clone(),
                 Some(events_tx),
                 "f1".to_string(),
-                None,
+                pacer,
                 None,
                 Some(on_air.clone()),
                 catalogs,
@@ -6111,12 +6148,20 @@ mod tests {
 
     /// An adaptation-field-only packet with a PCR.
     fn es_pcr(src_pid: u16, stream_type: u8) -> EsPacket {
+        es_pcr_at(src_pid, stream_type, 0)
+    }
+
+    /// [`es_pcr`] `base` ticks of 90 kHz on.
+    fn es_pcr_at(src_pid: u16, stream_type: u8, base: u32) -> EsPacket {
+        let mut pkt = ts_af_only(src_pid).to_vec();
+        pkt[6..10].copy_from_slice(&(base >> 1).to_be_bytes());
+        pkt[10] |= ((base & 1) << 7) as u8;
         EsPacket {
             stream_type,
-            payload: ts_af_only(src_pid),
+            payload: Bytes::from(pkt),
             is_pusi: false,
             has_pcr: true,
-            pcr: Some(0),
+            pcr: Some(base as u64 * 300),
             ..audio_pes(src_pid, 0)
         }
     }
@@ -6772,11 +6817,11 @@ mod tests {
         plan
     }
 
-    /// A swap that takes a program's PCR to an input on another clock, or on
-    /// one not known to be the same: nothing of the program goes out until a
-    /// PCR of that input has, on the slot that carries the program's. PES ahead
-    /// of it went out on the clock before, hours off for two encoders. The
-    /// other program does not notice.
+    /// A swap that takes a program to an input on another clock, or on one not
+    /// known to be the same: nothing of the program goes out until a PCR of
+    /// that input has, on the slot that carries the program's. PES ahead of it
+    /// went out on the clock before, hours off for two encoders. The other
+    /// program does not notice.
     #[tokio::test]
     async fn a_swap_to_another_clock_waits_for_its_pcr() {
         let switched = |legs: &[&str]| {
@@ -6785,11 +6830,6 @@ mod tests {
                 switch_slot(legs, 0x101, 0x201, 0x0F),
             ]))
         };
-        // The PCR moves from one slot to another, each on an input of its own.
-        let mut two = pinned_beside("x");
-        two.programs[0].slots.push(slot("y", 0x102, 0x202, 0x0F));
-        let mut other = two.clone();
-        other.programs[0].pcr_source = ("y".to_string(), 0x102);
         for (before, from, after, to) in [
             (pinned_beside("a"), "a", pinned_beside("b"), "b"),
             // Another flow's inputs: their clocks are not known.
@@ -6816,18 +6856,263 @@ mod tests {
             assert!(extract_pcr(&sent[0].1).is_some() && sent[0].1[5] & 0x80 != 0, "{what}: with DI");
             assert_eq!(feed(&mut rig, to, 93_600, 2).await, [0x200, 0x201], "{what}: it plays on");
         }
-        let mut rig = Rig::start(two).await;
-        rig.replace(other).await;
-        rig.send("x", es_pcr(0x100, 0x1B));
-        assert_eq!(feed(&mut rig, "x", 90_000, 0).await, [0u16; 0], "held for y's, not x's");
-        rig.send("y", es_pcr(0x102, 0x0F));
-        let sent = rig.sent(1).await;
-        assert_eq!((sent.len(), sent[0].0), (1, 0x202));
-        assert!(sent[0].1[5] & 0x80 != 0, "the PCR is on another slot now: DI");
-        assert_eq!(feed(&mut rig, "x", 93_600, 2).await, [0x200, 0x201]);
-        rig.send("x", es_pcr(0x100, 0x1B));
-        let sent = rig.sent(1).await;
-        assert_eq!(sent[0].1[5] & 0x80, 0, "x's is what it was");
+        // The PCR moves to another slot, with it or without: the slot that was
+        // there plays on, on the clock it was on.
+        let mut two = pinned_beside("x");
+        two.programs[0].slots.push(slot("y", 0x102, 0x202, 0x0F));
+        let mut other = two.clone();
+        other.programs[0].pcr_source = ("y".to_string(), 0x102);
+        for (before, held) in [(pinned_beside("x"), true), (two, false)] {
+            let mut rig = Rig::start(before).await;
+            rig.replace(other.clone()).await;
+            rig.send("x", es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [0x200]);
+            rig.send("y", es_pes(0x102, 0x0F, 90_000));
+            let new: &[u16] = if held { &[] } else { &[0x202] };
+            assert_eq!(rig.sent_pids(new.len()).await, new, "for y's, not x's");
+            assert_eq!(feed(&mut rig, "x", 90_000, 2).await, [0x200, 0x201]);
+            rig.send("y", es_pcr(0x102, 0x0F));
+            let sent = rig.sent(1).await;
+            assert_eq!((sent.len(), sent[0].0), (1, 0x202));
+            assert!(sent[0].1[5] & 0x80 != 0, "the PCR is on another slot now: DI");
+            rig.send("y", es_pes(0x102, 0x0F, 93_600));
+            assert_eq!(feed(&mut rig, "x", 93_600, 3).await, [0x200, 0x201, 0x202]);
+            rig.send("x", es_pcr(0x100, 0x1B));
+            let sent = rig.sent(1).await;
+            assert_eq!(sent[0].1[5] & 0x80, 0, "x's is what it was");
+        }
+    }
+
+    /// Video of `video` with the PCR, and audio of `audio`, of one program.
+    fn breakaway(video: &str, audio: &str) -> AssemblyPlan {
+        let mut plan =
+            one_program(vec![slot(video, 0x100, 0x200, 0x1B), slot(audio, 0x101, 0x201, 0x0F)]);
+        plan.clocks.insert("c".into(), source_pcr("a"));
+        plan
+    }
+
+    /// What a swap leaves on the clock it was on, beside a PCR it takes to
+    /// another, plays on: no further from the last PCR than it was, it has
+    /// nothing to wait for. What the swap moves or adds waits.
+    #[tokio::test]
+    async fn a_swap_withholds_only_what_it_takes_to_another_clock() {
+        let on_pid = |mut plan: AssemblyPlan, pid: u16| {
+            plan.programs[0].slots[1].source.1 = pid;
+            plan
+        };
+        let with = |mut plan: AssemblyPlan, slots: Vec<AssemblySlot>| {
+            plan.programs[0].slots.extend(slots);
+            plan
+        };
+        let legs = |legs: &[&str]| switch_slot(legs, 0x101, 0x201, 0x0F);
+        let video = |id: &str, audio: AssemblySlot| {
+            let mut plan = breakaway(id, "a");
+            plan.programs[0].slots[1] = audio;
+            plan
+        };
+        // Another program's slot on 0x202, before the swap gives it to this one.
+        let mut theirs = beside(breakaway("x", "a"));
+        theirs.programs[1].slots.push(slot("a", 0x102, 0x202, 0x0F));
+        let added = slot("a", 0x102, 0x202, 0x0F);
+        for (before, after, (id, pid), plays_on) in [
+            (breakaway("x", "a"), breakaway("y", "a"), ("a", 0x101), true),
+            (breakaway("x", "y"), breakaway("y", "y"), ("y", 0x101), true),
+            (breakaway("x", "x"), breakaway("y", "x"), ("x", 0x101), true),
+            // Another PID of its input, another input on its clock, another's.
+            (breakaway("x", "a"), on_pid(breakaway("y", "a"), 0x109), ("a", 0x109), true),
+            (breakaway("x", "a"), breakaway("y", "c"), ("c", 0x101), true),
+            (breakaway("x", "a"), breakaway("y", "b"), ("b", 0x101), false),
+            (breakaway("x", "a"), breakaway("y", "z"), ("z", 0x101), false),
+            (breakaway("x", "a"), breakaway("y", "y"), ("y", 0x101), false),
+            // One the swap adds, or takes from another program.
+            (breakaway("x", "a"), with(breakaway("y", "a"), vec![added.clone()]), ("a", 0x102), false),
+            (theirs, beside(with(breakaway("y", "a"), vec![added])), ("a", 0x102), false),
+            // A Switch slot on the leg it was on, and one that loses it.
+            (video("x", legs(&["a", "b"])), video("y", legs(&["a", "b"])), ("a", 0x101), true),
+            (video("x", legs(&["a", "b"])), video("y", legs(&["b"])), ("b", 0x101), false),
+        ] {
+            let what = format!("{id} 0x{pid:X} of {after:?}");
+            let out = pid + 0x100;
+            let out = if out == 0x209 { 0x201 } else { out };
+            let mut rig = Rig::start(before).await;
+            rig.replace(after).await;
+            rig.send(id, es_pes(pid, 0x0F, 90_000));
+            let expected: &[u16] = if plays_on { &[out] } else { &[] };
+            assert_eq!(rig.sent_pids(expected.len()).await, expected, "{what}");
+            rig.send("y", es_pes(0x100, 0x1B, 90_000));
+            assert_eq!(rig.sent_pids(0).await, [0u16; 0], "the video is y's: {what}");
+            rig.send("y", es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [0x200], "{what}");
+            rig.send(id, es_pes(pid, 0x0F, 93_600));
+            rig.send("y", es_pes(0x100, 0x1B, 93_600));
+            assert_eq!(rig.sent_pids(2).await, [0x200, out], "{what}");
+        }
+
+        // The clock a slot is on is that of the leg a Take put it on, or of the
+        // one the swap has it join.
+        for (audio, plays_on) in [(legs(&["a", "b"]), true), (slot("a", 0x101, 0x201, 0x0F), false)] {
+            let other = switch_slot(&["a", "b"], 0x102, 0x202, 0x0F);
+            let mut rig = Rig::start(with(video("x", audio), vec![other.clone()])).await;
+            rig.take("b", None).await;
+            until("the cut", || rig.on_air.contains("b")).await;
+            rig.replace(with(video("y", legs(&["a", "b"])), vec![other])).await;
+            rig.send("b", es_pes(0x101, 0x0F, 90_000));
+            let expected: &[u16] = if plays_on { &[0x201] } else { &[] };
+            assert_eq!(rig.sent_pids(expected.len()).await, expected);
+            rig.send("b", es_pes(0x102, 0x0F, 90_000));
+            assert_eq!(rig.sent_pids(1).await, [0x202]);
+        }
+
+        // One that goes while the program waits is new to it when it comes back.
+        let mut rig = Rig::start(breakaway("x", "a")).await;
+        let mut alone = breakaway("y", "a");
+        alone.programs[0].slots.truncate(1);
+        rig.replace(alone).await;
+        rig.replace(breakaway("y", "a")).await;
+        rig.send("a", es_pes(0x101, 0x0F, 90_000));
+        assert_eq!(rig.sent_pids(0).await, [0u16; 0]);
+        rig.send("y", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+
+        // What was held for a Take's PCR was not on the clock before.
+        let mut rig = Rig::start(switched_program()).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        let mut moved = switched_program();
+        moved.programs[0].slots[0] = slot("y", 0x100, 0x200, 0x1B);
+        moved.programs[0].pcr_source = ("y".to_string(), 0x100);
+        rig.replace(moved).await;
+        rig.send("b", es_pes(0x101, 0x0F, 90_000));
+        assert_eq!(rig.sent_pids(0).await, [0u16; 0], "held since the Take");
+        rig.send("y", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+    }
+
+    /// What plays on starts no 2 s: with the new input silent the program is
+    /// never said to go out without a PCR. They run from the first packet
+    /// withheld, over a swap that leaves the PCR where it waits for it, and
+    /// anew after one that takes it elsewhere.
+    #[tokio::test]
+    async fn what_plays_on_is_no_part_of_a_swaps_2_s() {
+        let code = "pid_bus_swap_no_pcr";
+        let mut rig = Rig::start(breakaway("x", "a")).await;
+        rig.replace(breakaway("y", "a")).await;
+        for _ in 0..6 {
+            rig.send("a", es_pes(0x101, 0x0F, 90_000));
+            assert_eq!(rig.sent_pids(1).await, [0x201]);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        assert!(rig.raised(code).is_empty(), "nothing was withheld");
+        rig.send("y", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(0).await, [0u16; 0], "still for y's PCR");
+        // 1.2 s on, a swap that only renumbers the program: they run on.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let mut renumbered = breakaway("y", "a");
+        renumbered.programs[0].program_number = 7;
+        rig.replace(renumbered).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        rig.send("y", es_pes(0x100, 0x1B, 93_600));
+        assert_eq!(rig.sent_pids(1).await, [0x200], "2.3 s after the first withheld");
+        assert_eq!(rig.raised(code).len(), 1);
+
+        // To x, and 1.2 s on to y again: they start over.
+        rig.replace(breakaway("x", "a")).await;
+        rig.send("x", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(0).await, [0u16; 0]);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        rig.replace(breakaway("y", "a")).await;
+        rig.send("y", es_pes(0x100, 0x1B, 97_200));
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        rig.send("y", es_pes(0x100, 0x1B, 100_800));
+        rig.send("a", es_pes(0x101, 0x0F, 90_000));
+        assert_eq!(rig.sent_pids(1).await, [0x201], "y for 0.9 s, x for 1.3 s");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        rig.send("y", es_pes(0x100, 0x1B, 104_400));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        assert_eq!(rig.raised(code).len(), 1);
+    }
+
+    /// Swaps at random of a program's two slots between inputs on one known
+    /// clock (a, c), on another (b) and on unknown ones (x, y), its PCR on
+    /// either, with a model beside: what goes out before a PCR.
+    #[tokio::test]
+    async fn a_swap_withholds_what_the_model_says() {
+        let mut runs = tokio::task::JoinSet::new();
+        for seed in 1..=16u64 {
+            runs.spawn(hold_at_random(seed));
+        }
+        let mut seen = [0usize; 3];
+        while let Some(run) = runs.join_next().await {
+            let run = run.expect("the model and the assembler agree");
+            seen.iter_mut().zip(run).for_each(|(all, of)| *all += of);
+        }
+        let [neither, one, both] = seen;
+        assert!(neither > 50 && one > 50 && both > 50, "slots withheld: {seen:?}");
+    }
+
+    /// One run of [`a_swap_withholds_what_the_model_says`]: after how many swaps
+    /// none, one and both of the slots were withheld.
+    async fn hold_at_random(seed: u64) -> [usize; 3] {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut below = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as usize % n
+        };
+        let planned = |on: [&str; 2], pcr: usize| {
+            let mut plan = breakaway(on[0], on[1]);
+            plan.programs[0].pcr_source = (on[pcr].to_string(), 0x100 + pcr as u16);
+            plan
+        };
+        let one_clock = |p: &str, q: &str| p == q || (["a", "c"].contains(&p) && ["a", "c"].contains(&q));
+        let mut rig = Rig::start(planned(["a", "a"], 0)).await;
+        let (mut on, mut pcr) = (["a", "a"], 0);
+        // Which slots wait for a PCR, and since when at the earliest.
+        let mut held: Option<[bool; 2]> = None;
+        let mut since = Instant::now();
+        let mut seen = [0; 3];
+        let mut log: Vec<String> = Vec::new();
+        for _ in 0..40 {
+            // The PCR now and then, and before 2 s of a hold are over.
+            if below(3) == 0 || (held.is_some() && since.elapsed() > Duration::from_secs(1)) {
+                rig.send(on[pcr], es_pcr(0x100 + pcr as u16, 0x1B));
+                assert_eq!(rig.sent_pids(1).await, [0x200 + pcr as u16], "seed {seed}: {log:#?}");
+                log.push(format!("PCR of {}", on[pcr]));
+                held = None;
+            }
+            let (was, was_pcr) = (on, pcr);
+            let mut inputs = || ["a", "b", "c", "x", "y"][below(5)];
+            on = [inputs(), inputs()];
+            if below(2) == 0 {
+                // One slot of the two.
+                let i = below(2);
+                on[i] = was[i];
+            }
+            pcr = below(2);
+            log.push(format!("{was:?} with slot {was_pcr}'s PCR to {on:?} with slot {pcr}'s"));
+            rig.replace(planned(on, pcr)).await;
+            let (from, now) = (was[was_pcr], on[pcr]);
+            if held.is_none() && one_clock(from, now) {
+                held = None;
+            } else {
+                let before = held.unwrap_or([false; 2]);
+                since = if held.is_none() { Instant::now() } else { since };
+                held = Some([0, 1].map(|i| before[i] || !one_clock(was[i], on[i])));
+            }
+            let withheld = held.unwrap_or([false; 2]);
+            seen[withheld.iter().filter(|w| **w).count()] += 1;
+            for i in [0, 1] {
+                rig.send(on[i], es_pes(0x100 + i as u16, 0x0F, 90_000));
+            }
+            let expected: Vec<u16> =
+                (0..2).filter(|i| !withheld[*i]).map(|i| 0x200 + i as u16).collect();
+            let sent = rig.sent_pids(expected.len()).await;
+            if held.is_none() || since.elapsed() < Duration::from_millis(1_900) {
+                assert_eq!(sent, expected, "seed {seed}: {log:#?}");
+            }
+        }
+        seen
     }
 
     /// A swap that takes a program's PCR to no other clock waits for nothing:
@@ -7327,6 +7612,47 @@ mod tests {
         assert_eq!(marked(&mut rig, "b", 0x100).await, (0x200, false));
     }
 
+    /// The output clock's rewriter follows one program's clock: from the swap
+    /// that first gives the output a second one, the first goes on with its
+    /// source's, and its next PCR says so. So does no PCR after it, nor one
+    /// after a swap back and one more.
+    #[tokio::test]
+    async fn the_first_swap_to_several_programs_marks_the_pcr_it_stops_regenerating() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::MasterClockHandle;
+        let one = || one_program(vec![slot("a", 0x100, 0x200, 0x1B), slot("a", 0x101, 0x201, 0x0F)]);
+        let pacer = Arc::new(AvSyncPacer::new(MasterClockHandle::wallclock()));
+        let mut rig = Rig::start_with(one(), Some(pacer), Default::default()).await;
+        // The PCR `base` of a's next one, and its discontinuity.
+        async fn next(rig: &mut Rig, base: u32) -> (Option<u64>, bool) {
+            rig.send("a", es_pcr_at(0x100, 0x1B, base));
+            let sent: Vec<_> =
+                rig.sent(1).await.into_iter().filter(|(pid, _)| *pid == 0x200).collect();
+            assert_eq!(sent.len(), 1);
+            (extract_pcr(&sent[0].1), sent[0].1[5] & 0x80 != 0)
+        }
+        let source = |base: u32| Some(base as u64 * 300);
+        // The first packet of each PID is marked as such.
+        next(&mut rig, 900_000).await;
+        rig.send("a", es_pcr_at(0x101, 0x0F, 900_000));
+        assert_eq!(rig.sent_pids(1).await, [0x201]);
+        let (pcr, marked) = next(&mut rig, 903_600).await;
+        assert!(pcr != source(903_600) && !marked, "the output clock's: {pcr:?}");
+        // The order of the programs is no matter.
+        let mut two = beside(one());
+        two.programs.reverse();
+        rig.replace(two.clone()).await;
+        rig.send("a", es_pcr_at(0x101, 0x0F, 905_000));
+        let sent = rig.sent(1).await;
+        assert_eq!((sent[0].0, sent[0].1[5] & 0x80), (0x201, 0), "not the program's PCR");
+        assert_eq!(next(&mut rig, 907_200).await, (source(907_200), true), "the source's");
+        assert_eq!(next(&mut rig, 910_800).await, (source(910_800), false));
+        for plan in [one(), two] {
+            rig.replace(plan).await;
+            assert_eq!(next(&mut rig, 914_400).await, (source(914_400), false));
+        }
+    }
+
     /// A changed PMT's version is the one after the last its number and its
     /// PID had, whichever program had it, and a program that comes back does
     /// not start over.
@@ -7468,7 +7794,7 @@ mod tests {
         };
         let mismatches = |rig: &mut Rig| rig.raised("pid_bus_stream_type_mismatch").len();
 
-        let mut rig = Rig::start_with(plan(), full()).await;
+        let mut rig = Rig::start_with(plan(), None, full()).await;
         assert_eq!(pmt(&mut rig).await, (1, said(0x1B)), "corrected");
         assert_eq!(mismatches(&mut rig), 1);
         let mut more = plan();
@@ -7744,6 +8070,9 @@ mod tests {
                         on_air = before.clone();
                         edited.clear();
                     }
+                    let slots_edited = |p: &OnAirProgram| {
+                        before.iter().any(|b| b.kind == p.kind && b.extra != p.extra)
+                    };
                     for i in 0..on_air.len() {
                         let p = &mut on_air[i];
                         if edited.contains(&p.number) {
@@ -7763,7 +8092,10 @@ mod tests {
                                 p.number = next_number;
                                 edited.push(p.number);
                             }
-                            3 if i > 0 => {
+                            // Not with one whose slots the swap edits: with
+                            // another number as well, a hold of it would end
+                            // after 2 s, and the model knows no time.
+                            3 if i > 0 && !slots_edited(&on_air[0]) => {
                                 let other = std::mem::replace(&mut on_air[0].number, 0);
                                 on_air[0].number = std::mem::replace(&mut on_air[i].number, other);
                                 edited.extend([on_air[0].number, on_air[i].number]);
