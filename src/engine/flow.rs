@@ -1782,10 +1782,11 @@ impl FlowRuntime {
         }
     }
 
-    /// The bus key of this run's Hitless slot `uid`.
+    /// The bus key of this run's first Hitless slot on `out_pid`.
     #[cfg(test)]
-    pub fn hitless_bus_key(&self, uid: &str) -> (String, u16) {
-        crate::engine::ts_es_hitless::hitless_bus_key(&self.hitless_scope, uid)
+    pub fn hitless_bus_key(&self, out_pid: u16) -> (String, u16) {
+        use crate::engine::ts_es_hitless::{hitless_bus_key, hitless_uid};
+        hitless_bus_key(&self.hitless_scope, &hitless_uid(out_pid, 0))
     }
 
     /// Start a plan swap: take the Hitless mergers' lock, which every swap
@@ -1984,7 +1985,7 @@ impl FlowRuntime {
         // in `build_assembly_plan_with_essence_resolution` (see flow.rs
         // ~line 2915). Without this, `pcr_source` stays at the
         // operator-declared output PID; once the assembler's
-        // `apply_plan_replacement` looks up `pcr_source` against the
+        // `pcr_out_pids` looks up `pcr_source` against the
         // post-resolution slots (which carry source-side PIDs after
         // essence resolution), the find fails and the PMT's `PCR_PID`
         // field falls back to `pmt_pid` itself. Receivers parse the PMT,
@@ -2103,12 +2104,13 @@ impl FlowRuntime {
             applied: Some(applied),
         });
         // Once the assembler runs the new plan — or has gone — nothing reads
-        // the bus channels of the Hitless slots the plan dropped: their
-        // mergers are stopped and the assembler's fan-ins for them
-        // cancelled. Release them now rather than keep their rings for the
-        // life of the node, and their per-ES stats with them, so a slot
-        // added back later gets a fresh analyzer on its fresh channel. A
-        // stalled assembler leaves the swap unconfirmed, with them kept.
+        // the bus channels of the Hitless slots the plan dropped or took to
+        // another primary: the assembler's fan-ins for them are cancelled.
+        // Stop their mergers and release them now rather than keep their rings
+        // for the life of the node, and their per-ES stats with them, so a
+        // slot added back later gets a fresh analyzer on its fresh channel. A
+        // stalled assembler leaves the swap unconfirmed, with the channels
+        // kept and their mergers stopped.
         let on_air = await_plan_on_air(
             on_air,
             retired,
@@ -2131,7 +2133,7 @@ impl FlowRuntime {
             Ok(retired) => {
                 for output in retired {
                     self.stats.per_es_stats.remove(output.key());
-                    output.release(&bus);
+                    output.release(&bus).await;
                 }
                 Ok(SwapOutcome::OnAir)
             }
@@ -5095,15 +5097,16 @@ async fn reserve_plan_slot<'a>(
 
 /// Wait at most `timeout` (production: [`ASSEMBLER_ACK_TIMEOUT`]) for the
 /// assembler's word that the plan it was handed is on air, its fan-ins on
-/// the dropped slots cancelled — or for the assembler to go, dropping the
-/// word with it — and hand back `retired`, the dropped Hitless slots'
-/// channels, for the caller to release. A stalled assembler still holds the
-/// plan, and its fan-ins read those channels until it gets to it: they are
-/// kept in `outputs`, for the flow's stop to release, and the swap stands
-/// unconfirmed: a Warning `pid_bus_assembler_unresponsive` (`awaiting:
-/// "applied"`) and an [`AssemblySwapError`] of that code for the caller to
-/// report. Unbounded, the wait held the REST call or WS command, and the
-/// flow's merger lock, for as long as the assembler stalled.
+/// the slots dropped, or taken to another primary, cancelled — or for the
+/// assembler to go, dropping the word with it — and hand back `retired`,
+/// those Hitless slots' channels, for the caller to release. A stalled
+/// assembler still holds the plan, and its fan-ins read those channels until
+/// it gets to it: they are kept in `outputs`, for the flow's stop to release,
+/// their mergers stop, and the swap stands unconfirmed: a Warning
+/// `pid_bus_assembler_unresponsive` (`awaiting: "applied"`) and an
+/// [`AssemblySwapError`] of that code for the caller to report. Unbounded,
+/// the wait held the REST call or WS command, and the flow's merger lock,
+/// for as long as the assembler stalled.
 async fn await_plan_on_air(
     on_air: tokio::sync::oneshot::Receiver<()>,
     retired: Vec<crate::engine::ts_es_hitless::RetiredOutput>,
@@ -5615,8 +5618,8 @@ fn patch_essence_pid(slot: &mut AssemblySlot, leg_idx: Option<usize>, pid: u16) 
             {
                 leg.1 = pid;
                 // If this is the active leg, refresh `source.1` too
-                // — the assembler's install_plan / apply_plan_replacement
-                // reads `source` to seed `active_leg_input` and the
+                // — the assembler's install_plan and its plan swap
+                // read `source` to seed `active_leg_input` and the
                 // PCR-resolution lookup uses it as well.
                 if leg.0 == slot.source.0 {
                     slot.source.1 = pid;
@@ -5744,7 +5747,7 @@ fn build_assembly_plan(
         // `source_pid = 0` and an entry in `pending_essence` so the
         // runtime can patch the slot in place after the resolver
         // returns. `Hitless` slots expand into a synthetic bus key
-        // (`hitless:{flow_id}:slot_{P}_{S}`) and a `PendingHitlessSlot` entry
+        // (`hitless:{flow_id}:{generation}:slot_{out_pid}_{n}`) and a `PendingHitlessSlot` entry
         // that the runtime turns into a merger task before the
         // assembler starts.
         let mut slots: Vec<AssemblySlot> = Vec::with_capacity(program.streams.len());
@@ -5829,8 +5832,6 @@ fn build_assembly_plan(
                     reorder_window,
                     path_differential_ms,
                 } => {
-                    let slot_idx = slots.len();
-                    let uid = format!("slot_{}_{}", program_idx, slot_idx);
                     // Resolve primary + backup. For first-light both
                     // legs must be `SlotSource::Pid` — Essence-inside-
                     // Hitless and nested Hitless both fail loudly so
@@ -5901,11 +5902,10 @@ fn build_assembly_plan(
                         forwarding_primary: Default::default(),
                         seq_fallback: Default::default(),
                     };
-                    // Scoped to the flow's run: the bus is node-wide.
-                    let bus_key = crate::engine::ts_es_hitless::hitless_bus_key(hitless_scope, &uid);
                     pending_hitless.push(crate::engine::ts_assembler::PendingHitlessSlot {
-                        uid,
-                        bus_key: bus_key.clone(),
+                        out_pid: stream.out_pid,
+                        // Scoped to the flow's run: the bus is node-wide.
+                        scope: hitless_scope.to_string(),
                         primary: primary_pair,
                         backup: backup_pair,
                         stall_ms: stall_ms.unwrap_or(
@@ -5921,8 +5921,11 @@ fn build_assembly_plan(
                     });
                     // The assembler reads from the synthetic merger
                     // output. The pre-bus merger task is responsible
-                    // for keeping that key supplied.
-                    let (iid, pid) = bus_key;
+                    // for keeping that key supplied: the one the slot has,
+                    // after a plan swap, is the one it had before
+                    // (`HitlessMergers::apply`).
+                    let uid = crate::engine::ts_es_hitless::hitless_uid(stream.out_pid, 0);
+                    let (iid, pid) = crate::engine::ts_es_hitless::hitless_bus_key(hitless_scope, &uid);
                     (iid, pid, None, Some(legs), Default::default(), None)
                 }
             };
@@ -7663,8 +7666,9 @@ impl AssemblySwap<'_> {
     /// 4. Brings the Hitless mergers in line with the new plan
     ///    ([`crate::engine::ts_es_hitless::HitlessMergers::apply`]): a slot
     ///    the swap leaves alone keeps its merger and the flag that says
-    ///    which leg it forwards; a slot it changes or drops has its merger
-    ///    stopped; every slot left without one gets a new one. Each slot's
+    ///    which leg it forwards; every other slot gets a new one. The merger
+    ///    of a slot changed on the primary it had is stopped first, that of a
+    ///    slot dropped or on another primary once the plan is on air. Each
     ///    bus key has one publisher, so no packet reaches the assembler
     ///    twice.
     /// 5. Sends [`crate::engine::ts_assembler::PlanCommand::ReplacePlan`]
@@ -7734,11 +7738,11 @@ impl AssemblySwap<'_> {
         Ok(())
     }
 
-    /// How far apart the merger behind Hitless slot `uid` was told its legs
-    /// are.
+    /// How far apart the merger behind the Hitless slot on `out_pid` was told
+    /// its legs are.
     #[cfg(test)]
-    pub fn leg_lag(&self, uid: &str) -> Option<std::time::Duration> {
-        self.mergers.leg_lag(uid)
+    pub fn leg_lag(&self, out_pid: u16) -> Option<std::time::Duration> {
+        self.mergers.leg_lag(out_pid)
     }
 }
 #[cfg(test)]
@@ -8294,8 +8298,8 @@ mod assembly_plan_tests {
         let build = build_assembly_plan(assembly, &resolved, &resolved.leg_holds, "f1:0", &events)
             .expect("plan");
         let slot = &build.plan.programs[0].slots[0];
-        assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("f1:0", "slot_0_0"));
-        assert_eq!(build.pending_hitless[0].bus_key, slot.source, "the merger feeds the slot");
+        assert_eq!(slot.source, crate::engine::ts_es_hitless::hitless_bus_key("f1:0", "slot_257_0"));
+        assert_eq!(build.pending_hitless[0].out_pid, slot.out_pid, "the merger feeds the slot");
         let legs = slot.hitless_legs.as_ref().expect("the slot names its legs");
         assert_eq!((legs.primary.as_str(), legs.backup.as_str()), ("in-a", "in-b"));
         assert_eq!(legs.on_air(), "in-a");
@@ -8423,10 +8427,10 @@ mod assembly_plan_tests {
         let bus = Arc::new(NodeEsBus::new());
         let flow = CancellationToken::new();
         let _stop = flow.clone().drop_guard();
-        let key = hitless_bus_key("f1:0", "slot_0_0");
+        let key = hitless_bus_key("f1:0", "slot_257_0");
         let slot = crate::engine::ts_assembler::PendingHitlessSlot {
-            uid: "slot_0_0".to_string(),
-            bus_key: key.clone(),
+            out_pid: 257,
+            scope: "f1:0".to_string(),
             primary: ("in-a".to_string(), 256),
             backup: ("in-b".to_string(), 256),
             stall_ms: crate::engine::ts_es_hitless::DEFAULT_STALL_MS,

@@ -174,6 +174,7 @@ tooltip.
 | `webrtc` | `webrtc` (default on) | WHIP / WHEP supported |
 | `tls` | `tls` (default on) | HTTPS + RTMPS |
 | `replay` | `replay` (default on) | Recording + clip playback |
+| `pid_bus_switch_clocks` | always (after 0.117.0) | The legs of a flow-assembly Switch slot may be on different clocks, as long as the whole program follows every Take. An older edge refuses such a plan (`pid_bus_master_clock_mismatch`) |
 
 The `resource_budget.hw_encoder_chroma` block on the same payload
 carries the per-(codec, chroma, bit-depth) matrix with one boolean per

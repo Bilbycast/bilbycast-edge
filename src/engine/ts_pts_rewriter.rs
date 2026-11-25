@@ -445,6 +445,11 @@ pub struct TsPtsRewriter {
     /// would produce a one-time anchor reset glitch.
     mpts_passthrough_latch: bool,
 
+    /// The PCR PIDs whose PCRs were regenerated until the latch, each until
+    /// its first source PCR after it, which carries DI=1: the two are on
+    /// different clocks. Empty when the first PAT latched.
+    latch_di: HashSet<u16>,
+
     /// Edge-added A/V skew reporter (`stats::av_skew`). The rewriter's
     /// shared `ClockAnchor` preserves the source A/V relationship by
     /// construction, so its only skew contribution is the deliberate
@@ -531,6 +536,7 @@ impl TsPtsRewriter {
             last_psi_emit_master_27mhz: None,
             scte35_pids: HashSet::new(),
             mpts_passthrough_latch: false,
+            latch_di: HashSet::new(),
             av_skew: None,
             av_skew_last: None,
             pes_gate: HashMap::new(),
@@ -642,6 +648,16 @@ impl TsPtsRewriter {
                 if pid == PAT_PID && ts_pusi(pkt) {
                     self.observe_pat(pkt);
                 }
+                // Regenerated until the latch, the source's from here on.
+                let mut marked = [0u8; TS_PACKET_SIZE];
+                let pkt = if self.latch_di.contains(&pid) && extract_pcr(pkt).is_some() {
+                    self.latch_di.remove(&pid);
+                    marked.copy_from_slice(pkt);
+                    set_discontinuity_indicator(&mut marked);
+                    &marked[..]
+                } else {
+                    pkt
+                };
                 // A PES the gate was dropping when the PAT latched keeps
                 // going until the PID's next PES starts, and the PIDs it
                 // dropped packets on keep their CC renumbered: verbatim
@@ -1508,6 +1524,9 @@ impl TsPtsRewriter {
         // PMT-PIDs (which can be stale after PMT removal).
         if !self.mpts_passthrough_latch && programs.len() > 1 {
             self.mpts_passthrough_latch = true;
+            if self.anchor.established {
+                self.latch_di = self.pcr_pids.clone();
+            }
             tracing::info!(
                 program_count = programs.len(),
                 "ts_pts_rewriter: MPTS detected — latching into verbatim passthrough \
@@ -3935,6 +3954,48 @@ mod tests {
             !r.mpts_passthrough_latch,
             "single-program PAT must leave the rewriter in muxer mode"
         );
+    }
+
+    /// A stream that becomes several programs after its PCR was regenerated:
+    /// the first source PCR on that PCR PID is on another clock and carries
+    /// DI=1, with the packets around it and every other PID's as they come.
+    /// With no PCR regenerated there is none to mark.
+    #[test]
+    fn the_latch_marks_the_pcr_it_stops_regenerating() {
+        use crate::engine::ts_parse::ts_discontinuity_indicator;
+        let pcr_at = |pid: u16, s: u64| build_pcr_packet(pid, s * 27_000_000);
+        for regenerated in [true, false] {
+            let mut r = TsPtsRewriter::new(make_wallclock_pacer()).without_start_marks();
+            let mut out = Vec::new();
+            r.process(&build_psi(0x200, 0x201), &mut out);
+            // A PES ahead of any PCR is dropped: the PID is renumbered from here.
+            r.process(&build_pes_packet_pts_only(0x200, 90_000), &mut out);
+            if regenerated {
+                out.clear();
+                r.process(&pcr_at(0x200, 1_000), &mut out);
+                assert_ne!(extract_pcr(&out), Some(1_000 * 27_000_000), "regenerated");
+            }
+            let stream = [
+                build_mpts_pat(2),
+                build_pes_packet_pts_only(0x200, 90_000),
+                pcr_at(0x201, 1_001),
+                pcr_at(0x300, 5),
+                pcr_at(0x200, 1_001),
+                pcr_at(0x200, 1_002),
+            ];
+            out.clear();
+            r.process(&stream.concat(), &mut out);
+            assert!(r.mpts_passthrough_latch);
+            assert_eq!(out.len(), stream.len() * TS_PACKET_SIZE);
+            for (i, (got, sent)) in out.chunks(TS_PACKET_SIZE).zip(&stream).enumerate().skip(1) {
+                let marked = regenerated && i == 4;
+                assert_eq!(ts_discontinuity_indicator(got), marked, "packet {i}");
+                let mut expected = sent.to_vec();
+                expected[3] = expected[3] & 0xF0 | got[3] & 0x0F;
+                expected[5] |= if marked { 0x80 } else { 0 };
+                assert_eq!(got, expected, "packet {i}: {regenerated}");
+            }
+        }
     }
 
     /// One-way latch: once SPTS-rewriter mode is left behind, a later

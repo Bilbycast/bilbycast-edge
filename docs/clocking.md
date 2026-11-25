@@ -1050,8 +1050,10 @@ pass with the master-clock work in.
   rewriter into verbatim packet-for-packet passthrough permanently
   (`mpts_passthrough_latch`) — the rewriter carries one `ClockAnchor`,
   which is SPTS-only — so an MPTS ingress silently gets neither PCR nor
-  PES regeneration. Down-select with `program_number` to get muxer mode
-  back. It is not an alignment route either: `epoch_lock` is
+  PES regeneration. Where PCRs had been regenerated until then (a source, or
+  an assembled output, that gets a second program), the first source PCR on
+  each of its PCR PIDs has DI=1. Down-select with `program_number` to get
+  muxer mode back. It is not an alignment route either: `epoch_lock` is
   single-program by scope.
 
 ## Local PTP grandmaster for testing

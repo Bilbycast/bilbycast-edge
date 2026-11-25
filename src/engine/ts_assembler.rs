@@ -25,7 +25,7 @@
 //!
 //! Performance contract (data-path rules):
 //! - Each slot subscribes to a `broadcast::Receiver<EsPacket>` and funnels
-//!   into a single `mpsc::Sender<(slot_idx, EsPacket)>`. Slow consumers
+//!   into a single `mpsc::Sender<FromFanin>`. Slow consumers
 //!   see `broadcast::error::RecvError::Lagged(_)` and drop; nothing
 //!   blocks the demuxer.
 //! - Per-packet work: two header-byte edits + one CC increment. No PES
@@ -35,7 +35,7 @@
 //!   swapped in after each flush) — bundles ship at ~(video packet rate
 //!   / 7), not per-TS-packet.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -85,10 +85,15 @@ const SLOT_STALL_START_GRACE: Duration = Duration::from_secs(10);
 /// Cadence of the per-slot stall scan + `AssemblyHealth` publication.
 const STALL_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long a Take may hold a program for its new leg's first PCR before
-/// `pid_bus_take_no_pcr` says so. Twenty times the 100 ms ISO/IEC 13818-1
-/// allows between PCRs.
+/// How long a program may be held for its new leg's first PCR before an event
+/// says so: after a Take `pid_bus_take_no_pcr`, after a plan swap
+/// `pid_bus_swap_no_pcr`, which also ends the hold. Twenty times the 100 ms
+/// ISO/IEC 13818-1 allows between PCRs.
 const PCR_HOLD_ALARM: Duration = Duration::from_secs(2);
+
+/// Packets the fan-ins may have queued for the assembler. Small: if it lags,
+/// the bus rings lag and drop at their edge, not behind this queue.
+const FANIN_DEPTH: usize = 256;
 
 /// Shared cell the assembler publishes its per-slot health snapshot
 /// into. Written by the assembler at the 1 Hz stall scan, read by
@@ -98,11 +103,10 @@ const PCR_HOLD_ALARM: Duration = Duration::from_secs(2);
 pub type AssemblyHealthCell =
     std::sync::RwLock<Option<crate::stats::models::AssemblyHealth>>;
 
-/// Per-slot liveness state, keyed `(program_number, out_pid)` — NOT the
-/// positional `(program_idx, out_pid)` used by `active_leg_input`,
-/// because a `ReplacePlan` that inserts or reorders programs must not
-/// reset surviving slots' stall history (program_number is validated
-/// unique per mux; out_pid is mux-global-unique). Owned exclusively by
+/// Per-slot liveness state, keyed by `out_pid` like the rest of what the
+/// assembler keeps of a slot: it is unique in the mux
+/// (`config::validation::validate_flow_assembly`), and a `ReplacePlan` that
+/// moves or renumbers the slot's program leaves it. Owned exclusively by
 /// the assembler task — the forward path bumps `packets`, the 1 Hz scan
 /// derives `last_data` from the counter delta — so no atomics or locks
 /// are needed (single-task ownership keeps the packet path lock-free,
@@ -181,18 +185,11 @@ fn stall_seconds(now: Instant, assembler_start: Instant, v: &SlotVitals) -> Opti
 /// slot doesn't silently reset on an unrelated plan edit.
 fn sync_slot_vitals(
     plan: &AssemblyPlan,
-    vitals: &mut HashMap<(u16, u16), SlotVitals>,
+    vitals: &mut HashMap<u16, SlotVitals>,
     now: Instant,
 ) {
-    let keys: std::collections::HashSet<(u16, u16)> = plan
-        .programs
-        .iter()
-        .flat_map(|prog| {
-            prog.slots
-                .iter()
-                .map(move |s| (prog.program_number, s.out_pid))
-        })
-        .collect();
+    let keys: HashSet<u16> =
+        plan.programs.iter().flat_map(|prog| &prog.slots).map(|s| s.out_pid).collect();
     vitals.retain(|k, _| keys.contains(k));
     for k in keys {
         vitals.entry(k).or_insert_with(|| SlotVitals::new(now));
@@ -203,14 +200,22 @@ fn sync_slot_vitals(
 /// report: the active leg for Switch slots, the fixed source otherwise.
 fn slot_health_identity(
     slot: &AssemblySlot,
-    key: (usize, u16),
-    active_leg_input: &HashMap<(usize, u16), String>,
+    active_leg_input: &HashMap<u16, String>,
 ) -> (String, u16) {
-    if let (Some(legs), Some(active)) = (&slot.switch_legs, active_leg_input.get(&key))
+    if let (Some(legs), Some(active)) = (&slot.switch_legs, active_leg_input.get(&slot.out_pid))
         && let Some((iid, pid)) = legs.iter().find(|(iid, _)| iid == active) {
             return (iid.clone(), *pid);
         }
     slot.source.clone()
+}
+
+/// The input a slot plays: a Hitless one's is the leg its merger forwards,
+/// where [`slot_health_identity`] has its merger's bus key.
+fn slot_on_air(slot: &AssemblySlot, active_leg_input: &HashMap<u16, String>) -> String {
+    match &slot.hitless_legs {
+        Some(legs) => legs.on_air().to_string(),
+        None => slot_health_identity(slot, active_leg_input).0,
+    }
 }
 
 /// What carries a program's PCR: its slot's `out_pid`, and the input and PID
@@ -220,18 +225,61 @@ struct PcrLeg {
     source: (String, u16),
 }
 
-/// The [`PcrLeg`] of each program, by program number.
+/// The [`PcrLeg`] of each program of `plan`, in its order.
 fn pcr_legs(
     plan: &AssemblyPlan,
     pcr_out_pid_by_program: &[u16],
-    active_leg_input: &HashMap<(usize, u16), String>,
-) -> HashMap<u16, PcrLeg> {
-    let leg = |(pidx, (prog, out_pid)): (usize, (&ProgramPlan, &u16))| {
+    active_leg_input: &HashMap<u16, String>,
+) -> Vec<Option<PcrLeg>> {
+    let leg = |(prog, out_pid): (&ProgramPlan, &u16)| {
         let slot = prog.slots.iter().find(|s| s.out_pid == *out_pid)?;
-        let source = slot_health_identity(slot, (pidx, *out_pid), active_leg_input);
-        Some((prog.program_number, PcrLeg { out_pid: *out_pid, source }))
+        let source = slot_health_identity(slot, active_leg_input);
+        Some(PcrLeg { out_pid: *out_pid, source })
     };
-    plan.programs.iter().zip(pcr_out_pid_by_program).enumerate().filter_map(leg).collect()
+    plan.programs.iter().zip(pcr_out_pid_by_program).map(leg).collect()
+}
+
+/// The [`PcrLeg`] of the program numbered `program_number`.
+fn pcr_leg_of(
+    program_number: u16,
+    plan: &AssemblyPlan,
+    pcr_out_pid_by_program: &[u16],
+    active_leg_input: &HashMap<u16, String>,
+) -> Option<PcrLeg> {
+    let pidx = plan.programs.iter().position(|p| p.program_number == program_number)?;
+    pcr_legs(plan, pcr_out_pid_by_program, active_leg_input).swap_remove(pidx)
+}
+
+/// Say that a program goes out without a PCR since a plan swap: `leg` has none,
+/// for `why`.
+fn emit_swap_no_pcr(
+    event_sender: &Option<crate::manager::events::EventSender>,
+    flow_id: &str,
+    program_number: u16,
+    leg: &PcrLeg,
+    why: &str,
+) {
+    let Some(events) = event_sender else {
+        return;
+    };
+    let PcrLeg { out_pid, source: (input_id, source_pid) } = leg;
+    events.emit_flow_with_details(
+        crate::manager::events::EventSeverity::Warning,
+        crate::manager::events::category::FLOW,
+        format!(
+            "Flow '{flow_id}': program {program_number} goes out without a PCR since the plan \
+             swap to '{input_id}' — its source_pid 0x{source_pid:04X}, which carries the \
+             program's clock on out_pid 0x{out_pid:04X}, {why}",
+        ),
+        flow_id,
+        serde_json::json!({
+            "error_code": "pid_bus_swap_no_pcr",
+            "program_number": program_number,
+            "out_pid": out_pid,
+            "input_id": input_id,
+            "source_pid": source_pid,
+        }),
+    );
 }
 
 /// What the assembled output plays from: each Pid / Essence slot's source,
@@ -240,18 +288,14 @@ fn pcr_legs(
 /// bus key.
 pub(crate) fn on_air_inputs(
     plan: &AssemblyPlan,
-    active_leg_input: &HashMap<(usize, u16), String>,
+    active_leg_input: &HashMap<u16, String>,
 ) -> AssembledOnAir {
     let mut on_air = AssembledOnAir::default();
-    for (pidx, prog) in plan.programs.iter().enumerate() {
-        for slot in &prog.slots {
-            match &slot.hitless_legs {
-                Some(legs) => on_air.hitless.push(legs.clone()),
-                None => {
-                    on_air.inputs.insert(
-                        slot_health_identity(slot, (pidx, slot.out_pid), active_leg_input).0,
-                    );
-                }
+    for slot in plan.programs.iter().flat_map(|prog| &prog.slots) {
+        match &slot.hitless_legs {
+            Some(legs) => on_air.hitless.push(legs.clone()),
+            None => {
+                on_air.inputs.insert(slot_health_identity(slot, active_leg_input).0);
             }
         }
     }
@@ -268,7 +312,7 @@ pub(crate) fn on_air_inputs(
 fn publish_on_air(
     on_air: Option<&OnAirInputs>,
     plan: &AssemblyPlan,
-    active_leg_input: &HashMap<(usize, u16), String>,
+    active_leg_input: &HashMap<u16, String>,
 ) {
     if let Some(on_air) = on_air {
         on_air.set_assembled(on_air_inputs(plan, active_leg_input));
@@ -283,8 +327,8 @@ fn publish_on_air(
 /// alarms once, re-arming only after recovery).
 fn scan_slot_stalls(
     plan: &AssemblyPlan,
-    active_leg_input: &HashMap<(usize, u16), String>,
-    vitals: &mut HashMap<(u16, u16), SlotVitals>,
+    active_leg_input: &HashMap<u16, String>,
+    vitals: &mut HashMap<u16, SlotVitals>,
     now: Instant,
     assembler_start: Instant,
 ) -> (
@@ -294,7 +338,7 @@ fn scan_slot_stalls(
     use crate::stats::models::{AssemblyHealth, StalledSlotStats, UnsequencedHitlessSlot};
     let mut health = AssemblyHealth::default();
     let mut newly_stalled: Vec<StalledSlotStats> = Vec::new();
-    for (pidx, prog) in plan.programs.iter().enumerate() {
+    for prog in &plan.programs {
         for slot in &prog.slots {
             health.total_slots += 1;
             // Ahead of the liveness checks, which skip a slot that is
@@ -309,7 +353,7 @@ fn scan_slot_stalls(
                     input_id: if leg == "primary" { &legs.primary } else { &legs.backup }.clone(),
                 });
             }
-            let Some(v) = vitals.get_mut(&(prog.program_number, slot.out_pid)) else {
+            let Some(v) = vitals.get_mut(&slot.out_pid) else {
                 continue; // unsynced entry — next sync_slot_vitals heals it
             };
             if v.packets != v.scanned_packets {
@@ -320,7 +364,6 @@ fn scan_slot_stalls(
             if !stall_scan_eligible(slot.stream_type) {
                 continue; // sparse essence (SCTE-35/subs/teletext/data) — never judged
             }
-            let key = (pidx, slot.out_pid);
             let (was_stalled, since) =
                 match (v.stalled, stall_seconds(now, assembler_start, v)) {
                     // Already latched: keep reporting with a fresh age.
@@ -335,7 +378,7 @@ fn scan_slot_stalls(
                     }
                     (false, None) => continue,
                 };
-            let (input_id, source_pid) = slot_health_identity(slot, key, active_leg_input);
+            let (input_id, source_pid) = slot_health_identity(slot, active_leg_input);
             let entry = StalledSlotStats {
                 program_number: prog.program_number,
                 out_pid: slot.out_pid,
@@ -486,14 +529,21 @@ impl HitlessLegs {
 /// the same mechanism the WS protocol already uses.
 #[derive(Debug)]
 pub enum PlanCommand {
-    /// Swap the running plan. The assembler diffs old vs new, re-spawns
-    /// fan-ins for added/changed slots, cancels fan-ins for removed
-    /// slots, bumps per-program PMT versions where composition changed,
-    /// and bumps PAT version when the set of programs itself changed.
+    /// Swap the running plan. The assembler diffs old vs new, spawns
+    /// fan-ins for sources it has none on, cancels those the new plan does
+    /// not read, bumps per-program PMT versions where composition changed,
+    /// and bumps PAT version when the set of programs itself changed. What
+    /// a cancelled fan-in had queued goes out first, on the plan before.
+    ///
+    /// What the swap does not edit it leaves as it is, wherever the new plan
+    /// puts it: a slot is known by its `out_pid`, and a program by its slots
+    /// or its number ([`programs_before`]).
     ///
     /// A splice pending in a slot that keeps both its legs goes on, and any
-    /// other ends ([`legs_after_swap`]). A program held for a PCR since a
-    /// Take waits on while its PCR comes from the input the Take named.
+    /// other ends ([`legs_after_swap`]). Where the swap moves a program's PCR
+    /// to an input not known to share the clock of the one before, what it
+    /// moves with it is held for the first PCR from there, if one is to come,
+    /// but not for good ([`PcrHold::Swap`]).
     ReplacePlan {
         plan: AssemblyPlan,
         /// Per-swap splice request carried through from the manager's
@@ -545,7 +595,8 @@ pub enum PlanCommand {
     /// A splice still pending from an earlier Take is dropped for this
     /// one. Where the slot that carries a program's PCR moves to another
     /// clock, the program's packets are held until the first PCR from the
-    /// new leg: a PES ahead of it would go out on the old leg's clock.
+    /// new leg ([`PcrHold::Take`]): a PES ahead of it would go out on the old
+    /// leg's clock.
     ///
     /// Slots whose leg list does not include `new_input_id` are left
     /// untouched — per design, `ActivateInput` is silent for slots
@@ -954,8 +1005,8 @@ pub fn spawn_spts_assembler(
 /// **bus subscription** — for `Pid` / `Essence` / `Hitless` slots that's
 /// one FlatSlot per AssemblySlot, but for Switch slots it's one
 /// FlatSlot per leg (all sharing the same `out_pid` and `program_idx`).
-/// `program_idx` is retained for per-PID switching so fan-in traffic
-/// routes to the right program's PMT without re-searching.
+/// `program_idx` is the program's place in the running plan; a plan swap
+/// sets it anew on every fan-in it keeps.
 #[derive(Debug, Clone)]
 struct FlatSlot {
     program_idx: usize,
@@ -964,7 +1015,7 @@ struct FlatSlot {
     /// `true` iff this FlatSlot is one leg of a [`AssemblySlot::switch_legs`]
     /// group. The main loop drops fan-in packets whose `source.0`
     /// (this leg's input_id) doesn't match
-    /// `active_leg_input.get(&(program_idx, out_pid))`. Non-switch slots
+    /// `active_leg_input.get(&out_pid)`. Non-switch slots
     /// have this `false` and forward unconditionally.
     is_switch_leg: bool,
     /// MPEG-TS `stream_type` of the parent [`AssemblySlot`]. Carried on
@@ -972,6 +1023,123 @@ struct FlatSlot {
     /// sentinel can short-circuit the AAC ADTS-only path without a
     /// PSI lookup on every fan-in packet.
     stream_type: u8,
+}
+
+/// The bus subscriptions of `plan`, in its order.
+fn flatten(plan: &AssemblyPlan) -> Vec<FlatSlot> {
+    let mut flat = Vec::new();
+    for (program_idx, prog) in plan.programs.iter().enumerate() {
+        for slot in &prog.slots {
+            let sources = slot.switch_legs.as_deref().unwrap_or(std::slice::from_ref(&slot.source));
+            flat.extend(sources.iter().map(|source| FlatSlot {
+                program_idx,
+                source: source.clone(),
+                out_pid: slot.out_pid,
+                is_switch_leg: slot.switch_legs.is_some(),
+                stream_type: slot.stream_type,
+            }));
+        }
+    }
+    flat
+}
+
+/// What a fan-in hands the assembler: its index in the assembler's `flat`
+/// with a packet, or with `None` when its bus channel has closed.
+type FromFanin = (usize, Option<EsPacket>);
+
+/// Why a program waits for a PCR: what moved the slot that carries its PCR to
+/// a leg not known to be on the clock of the one before. Ahead of the new
+/// leg's first PCR its PES would go out on the old one's clock.
+enum PcrHold {
+    /// A Take, `since` then: it lasts until the PCR. `reported` once the Take
+    /// has been said to wait for it in vain.
+    Take { since: Instant, reported: bool },
+    /// A plan swap. The slots of `goes_on`, by `out_pid`, stay on the clock
+    /// they were on, as far from the last PCR as they were: they go out as
+    /// they did.
+    /// An input that sends its PCR on a PID the program does not carry, which
+    /// no swap refuses, would leave the others off air for good: the hold ends
+    /// [`PCR_HOLD_ALARM`] after the first packet it withheld, and there is none
+    /// where the input's PMT says so ([`no_pcr_expected`]).
+    Swap { goes_on: HashSet<u16>, withheld: Option<Instant> },
+}
+
+impl PcrHold {
+    /// Whether a packet of the slot on `out_pid` that does not end the hold
+    /// is withheld.
+    fn withholds(&mut self, out_pid: u16) -> bool {
+        match self {
+            PcrHold::Swap { goes_on, .. } if goes_on.contains(&out_pid) => return false,
+            PcrHold::Swap { withheld, .. } => {
+                withheld.get_or_insert_with(Instant::now);
+            }
+            PcrHold::Take { .. } => {}
+        }
+        true
+    }
+}
+
+/// A Switch slot as a plan swap finds it: the place of its program in the
+/// plan before, the leg it is on, and the one a pending splice takes it to.
+struct Switched {
+    program: usize,
+    on: String,
+    to: Option<String>,
+}
+
+/// The version each program's PMT was last sent with, by program number and
+/// by PMT PID, either of which a receiver may keep it by. A program that goes
+/// keeps its own for when it comes back.
+#[derive(Default)]
+struct PmtVersions {
+    by_program: HashMap<u16, u8>,
+    by_pid: HashMap<u16, u8>,
+}
+
+impl PmtVersions {
+    fn of(&self, prog: &ProgramPlan) -> u8 {
+        self.by_program.get(&prog.program_number).copied().unwrap_or(0)
+    }
+
+    /// `prog`'s PMT is another table from here on: the version after the last
+    /// of its number and the last on its PID, mod 32.
+    fn bump(&mut self, prog: &ProgramPlan) {
+        let of_number = self.by_program.get(&prog.program_number).copied();
+        let on_pid = self.by_pid.get(&prog.pmt_pid).copied();
+        let last = match (of_number, on_pid) {
+            (Some(n), Some(p)) if p.wrapping_sub(n) & 0x1F < 16 => Some(p),
+            (n, p) => n.or(p),
+        };
+        let next = last.map_or(0, |v| v.wrapping_add(1) & 0x1F);
+        self.by_program.insert(prog.program_number, next);
+        self.by_pid.insert(prog.pmt_pid, next);
+    }
+}
+
+/// A plan swap taken off the command queue, to apply once what the fan-ins it
+/// cancels had queued has gone out.
+struct PlanSwap {
+    plan: AssemblyPlan,
+    splice_mode_override: Option<crate::config::models::SpliceMode>,
+    catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+    applied: Option<tokio::sync::oneshot::Sender<()>>,
+    /// The program of the running plan each of the new one's is.
+    before: Vec<Option<usize>>,
+    /// The new plan's subscriptions, each with the fan-in that goes on in it.
+    fanins: Vec<(FlatSlot, Option<usize>)>,
+    /// What the other fan-ins had queued: it goes out on the new plan.
+    queued: VecDeque<FromFanin>,
+}
+
+/// The next packet of `queued`, or of the fan-ins once there is none.
+async fn next_packet(
+    queued: &mut VecDeque<FromFanin>,
+    fanins: &mut mpsc::Receiver<FromFanin>,
+) -> Option<FromFanin> {
+    match queued.pop_front() {
+        Some(packet) => Some(packet),
+        None => fanins.recv().await,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1005,53 +1173,54 @@ async fn run_assembler(
         is_supported_video_stream_type,
     };
     use std::time::Duration;
-    // PES Switch Phase 4 — per-switch-slot splice state, keyed by
-    // `(program_idx, out_pid)` to match the `active_leg_input` map.
+    // What the assembler keeps of a slot is keyed by its `out_pid`: unique in
+    // the mux whatever its programs are called and in whatever order the plan
+    // has them, so a plan swap that leaves a slot alone leaves its state.
+    //
+    // PES Switch Phase 4 — per-switch-slot splice state.
     // Default `Idle`; flipped to `Pending` on `SwitchActiveInput` with
     // splice_mode = PesAligned, reset to `Idle` on commit or timeout.
-    let mut splice_state: std::collections::HashMap<(usize, u16), AudioSpliceState> =
-        std::collections::HashMap::new();
-    // Last PUSI=1 PTS observed on each (program_idx, out_pid) — needed
-    // to arm the splice machine at SwitchActiveInput time. Updated on
-    // every active-leg PUSI=1 packet; cheap (one HashMap insert per AU,
-    // hot path stays clean).
-    let mut last_a_pts: std::collections::HashMap<(usize, u16), u64> =
-        std::collections::HashMap::new();
+    let mut splice_state: HashMap<u16, AudioSpliceState> = HashMap::new();
+    // Last PUSI=1 PTS observed on each switch slot — needed to arm the
+    // splice machine at SwitchActiveInput time. Updated on every
+    // active-leg PUSI=1 packet; cheap (one HashMap insert per AU, hot
+    // path stays clean).
+    let mut last_a_pts: HashMap<u16, u64> = HashMap::new();
     // Most recent AAC AudioSpecificConfig observed on the active leg of
-    // each (program_idx, out_pid) — feeds the codec-param sentinel at
-    // arm time. Only populated for AAC ADTS (stream_type 0x0F) slots;
-    // every other audio codec leaves this `None`.
-    let mut last_a_aac_params: std::collections::HashMap<(usize, u16), AacAudioParams> =
-        std::collections::HashMap::new();
+    // each switch slot — feeds the codec-param sentinel at arm time. Only
+    // populated for AAC ADTS (stream_type 0x0F) slots; every other audio
+    // codec leaves this `None`.
+    let mut last_a_aac_params: HashMap<u16, AacAudioParams> = HashMap::new();
     // PES Switch Phase 4 (edge 0.66.0) — per-switch-slot video splice
-    // state, keyed by `(program_idx, out_pid)`. Disjoint from
-    // `splice_state` by construction: each slot's `stream_type` is
-    // either an audio codec (audio state map) or a supported video
-    // codec (this map), never both.
-    let mut video_splice_state: std::collections::HashMap<(usize, u16), VideoSpliceState> =
-        std::collections::HashMap::new();
+    // state. Disjoint from `splice_state` by construction: each slot's
+    // `stream_type` is either an audio codec (audio state map) or a
+    // supported video codec (this map), never both.
+    let mut video_splice_state: HashMap<u16, VideoSpliceState> = HashMap::new();
     // PES Switch Phase 4 Session B — most recent SPS-derived parameter
-    // snapshot observed on the active leg of each `(program_idx,
-    // out_pid)` for video slots. Refreshed on every active-leg PUSI=1
-    // IDR PES that carries a parseable SPS. Feeds the codec-param
-    // sentinel at splice arm time so the state machine can compare
-    // A's snapshot against B's first IDR.
-    let mut last_a_video_params: std::collections::HashMap<(usize, u16), VideoCodecParams> =
-        std::collections::HashMap::new();
+    // snapshot observed on the active leg of each video switch slot.
+    // Refreshed on every active-leg PUSI=1 IDR PES that carries a
+    // parseable SPS. Feeds the codec-param sentinel at splice arm time so
+    // the state machine can compare A's snapshot against B's first IDR.
+    let mut last_a_video_params: HashMap<u16, VideoCodecParams> = HashMap::new();
     // Fan-in: one task per flat slot drains the bus broadcast receiver
     // and forwards into a single mpsc. Channel capacity is deliberately
     // small — if the assembler lags, broadcasts `Lagged` earlier and
     // dropping happens at the bus edge, not in mpsc backpressure. This
     // keeps the no-cascade-backpressure invariant.
-    let (fanin_tx, mut fanin_rx) = mpsc::channel::<(usize, EsPacket)>(256);
+    let (fanin_tx, mut fanin_rx) = mpsc::channel::<FromFanin>(FANIN_DEPTH);
 
     // Flat slot view rebuilt on every plan change. Slot indices in this
     // vec are the keys under which fan-in tasks send their packets; they
     // must stay stable for already-spawned fan-ins, so on a plan swap
-    // we append new slots to the end rather than recompact.
-    let mut flat: Vec<FlatSlot> = Vec::new();
+    // we append new slots to the end rather than recompact. A fan-in that
+    // is gone leaves `None`, and a packet it still sends is dropped.
+    let mut flat: Vec<Option<FlatSlot>> = Vec::new();
     let mut slot_cancels: Vec<CancellationToken> = Vec::new();
     let mut slot_tasks: Vec<JoinHandle<()>> = Vec::new();
+
+    // A plan swap to apply, and the packets it took off the queue.
+    let mut swap: Option<PlanSwap> = None;
+    let mut queued: VecDeque<FromFanin> = VecDeque::new();
 
     // Per-program PCR resolution — the out_pid of whichever slot on
     // that program matches `pcr_source`. Recomputed on every plan swap.
@@ -1059,19 +1228,22 @@ async fn run_assembler(
 
     // PSI state.
     //
-    // `pat_version` bumps when the *set of programs* changes (add/remove).
-    // Per-program `pmt_versions[i]` bumps when `programs[i].slots` or
-    // `pcr_source` changes. Both wrap mod 32 (5-bit PMT spec field) and
+    // `pat_version` bumps when the list of programs changes, a program's
+    // in `pmt_versions` when its slots, its `pcr_source`, its number or
+    // its PMT PID changes. Both wrap mod 32 (5-bit PMT spec field) and
     // advance monotonically across switches, including A→B→A, to avoid
     // phantom-version collisions the `TsContinuityFixer` already wrestled
     // with (see project_ffplay_stuck_state memory).
     let mut pat_version: u8 = 0;
-    let mut pmt_versions: Vec<u8> = vec![0; plan.programs.len()];
+    let mut pmt_versions = PmtVersions::default();
+    for prog in &plan.programs {
+        pmt_versions.bump(prog);
+    }
 
-    // Per-out_pid one-shot DI arming. After every `ReplacePlan` the
-    // map is populated for every out_pid in the new plan; after every
-    // `SwitchActiveInput` only the affected switch slots' out_pids are
-    // armed. The flag is consumed when the next PCR-bearing TS packet
+    // Per-out_pid one-shot DI arming. A `ReplacePlan` arms the slots it
+    // has play another source and the one a program's PCR moves to, a
+    // `SwitchActiveInput` the switch slots it flips.
+    // The flag is consumed when the next PCR-bearing TS packet
     // flows through the ES rewrite path on that out_pid; the assembler
     // sets `discontinuity_indicator` (AF flags 0x80) so receivers (VLC,
     // ffplay, broadcast-grade hardware) re-anchor STC instead of treating
@@ -1082,47 +1254,43 @@ async fn run_assembler(
     let mut pending_di_for_out_pid: std::collections::HashMap<u16, bool> =
         std::collections::HashMap::new();
 
-    // Programs a Take moved to another clock, by program number, until their
-    // first PCR from the new leg: when the Take was, and whether its silence
-    // has been reported.
-    let mut awaiting_pcr: HashMap<u16, (Instant, bool)> = HashMap::new();
+    // Programs moved to another clock, by program number, until their first
+    // PCR from the new leg. A plan swap gives a program it renumbers its hold
+    // under the new number.
+    let mut awaiting_pcr: HashMap<u16, PcrHold> = HashMap::new();
 
-    // Per-switch-slot active-leg pointer, keyed by `(program_idx, out_pid)`.
-    // Populated on `install_plan` and `apply_plan_replacement` from each
-    // switch slot's initial `source.0`; mutated by `SwitchActiveInput`.
-    // Fan-in packets from non-active legs are dropped at the main-loop
-    // edge (cheap string compare, no rewrite).
-    let mut active_leg_input: std::collections::HashMap<(usize, u16), String> =
-        std::collections::HashMap::new();
+    // Per-switch-slot active-leg pointer. Set from each switch slot's
+    // initial `source.0` by `install_plan`, by `legs_after_swap` on a plan
+    // swap and by `SwitchActiveInput`. Fan-in packets from non-active legs
+    // are dropped at the main-loop edge (cheap string compare, no rewrite).
+    let mut active_leg_input: HashMap<u16, String> = HashMap::new();
 
-    // Copy-through ES descriptors per `(program_number, out_pid)`,
-    // resolved from each slot's current source against the per-input
+    // Copy-through ES descriptors per slot, resolved from each slot's
+    // current source against the per-input
     // PSI catalogues. Refreshed on plan install/replace and on every
     // PSI tick (cheap — Arc load + small decode per slot at 10 Hz) so
     // a catalogue that arrives after flow start, or a switch-leg flip,
     // converges within one PSI cadence. A descriptor change bumps the
     // owning program's PMT version like any other composition change.
-    let mut es_info_by_slot: std::collections::HashMap<(u16, u16), Vec<u8>> =
-        std::collections::HashMap::new();
+    let mut es_info_by_slot: HashMap<u16, Vec<u8>> = HashMap::new();
 
-    // Declared-vs-source stream_type mismatch debounce, keyed
-    // `(program_number, out_pid)` → `(observed stream_type, ticks seen)`.
-    // See `reconcile_slot_stream_types`.
-    let mut st_mismatch_stability: std::collections::HashMap<(u16, u16), (u8, u8)> =
-        std::collections::HashMap::new();
+    // Declared-vs-source stream_type mismatch debounce per slot:
+    // `(observed stream_type, ticks seen)`. See `reconcile_slot_stream_types`.
+    let mut st_mismatch_stability: HashMap<u16, (u8, u8)> = HashMap::new();
+    // What the config declares for a slot whose `stream_type` that corrected.
+    let mut declared_stream_types: HashMap<u16, u8> = HashMap::new();
 
-    // Egress bundle buffer + per-out-PID CC counter + PAT/PMT CC.
+    // Egress bundle buffer + per-PID CC counters (ES and PMT PIDs, one of
+    // which a plan swap can turn into the other) + PAT CC.
     let mut buf = BytesMut::with_capacity(BUNDLE_BYTES);
-    let mut cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
+    let mut cc: HashMap<u16, u8> = HashMap::new();
     let mut pat_cc: u8 = 0;
-    let mut pmt_cc: std::collections::HashMap<u16, u8> = std::collections::HashMap::new();
     let mut bundle_seq: u16 = 0;
 
-    // Per-slot liveness, keyed `(program_idx, out_pid)`. Forward path
-    // bumps the counter; the 1 Hz stall scan latches stalls and
-    // publishes `AssemblyHealth` into `health_cell`.
+    // Per-slot liveness. Forward path bumps the counter; the 1 Hz stall
+    // scan latches stalls and publishes `AssemblyHealth` into `health_cell`.
     let assembler_start = Instant::now();
-    let mut slot_vitals: HashMap<(u16, u16), SlotVitals> = HashMap::new();
+    let mut slot_vitals: HashMap<u16, SlotVitals> = HashMap::new();
 
     // Prime fan-ins + PCR + snapshot for the initial plan.
     install_plan(
@@ -1135,12 +1303,10 @@ async fn run_assembler(
         &mut slot_tasks,
         &mut pcr_out_pid_by_program,
         &mut active_leg_input,
-        &event_sender,
-        &flow_id,
     );
     publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
     sync_slot_vitals(&plan, &mut slot_vitals, assembler_start);
-    let _ = refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, false);
+    let _ = refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, |_| false);
 
     let mut psi_tick = interval(PSI_INTERVAL);
     psi_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -1158,7 +1324,7 @@ async fn run_assembler(
         pat_version,
         &pmt_versions,
         &mut pat_cc,
-        &mut pmt_cc,
+        &mut cc,
         &broadcast_tx,
         &mut bundle_seq,
         &es_info_by_slot,
@@ -1166,120 +1332,255 @@ async fn run_assembler(
     );
 
     loop {
+        if queued.is_empty() && let Some(next) = swap.take() {
+            let PlanSwap {
+                plan: new_plan,
+                splice_mode_override,
+                catalogs: new_catalogs,
+                applied,
+                before,
+                fanins,
+                queued: rest,
+            } = next;
+            queued = rest;
+            // Adopt the new plan's catalogue handles so retargeted slots
+            // resolve descriptors from their (possibly brand-new) sources.
+            if !new_catalogs.is_empty() {
+                catalogs = new_catalogs;
+            }
+            let pcr_from = pcr_legs(&plan, &pcr_out_pid_by_program, &active_leg_input);
+            let old = std::mem::replace(&mut plan, new_plan);
+
+            // The leg each Switch slot is on now. A splice the plan has no leg
+            // or no slot for ends here: left to run it would move a slot to a
+            // leg that is not there.
+            let splicing_to = |out_pid: &u16| {
+                let audio = splice_state.get(out_pid).and_then(|s| s.pending_to_input_id());
+                let video = || video_splice_state.get(out_pid)?.pending_to_input_id();
+                audio.or_else(video).map(str::to_string)
+            };
+            let mut switched = HashMap::new();
+            for (program, prog) in old.programs.iter().enumerate() {
+                for slot in &prog.slots {
+                    if let Some(on) = active_leg_input.get(&slot.out_pid).cloned() {
+                        let to = splicing_to(&slot.out_pid);
+                        switched.insert(slot.out_pid, Switched { program, on, to });
+                    }
+                }
+            }
+            let (legs, spliced) = legs_after_swap(&plan, &before, &switched);
+            let legs_from = std::mem::replace(&mut active_leg_input, legs);
+            splice_state.retain(|out_pid, _| spliced.contains(out_pid));
+            video_splice_state.retain(|out_pid, _| spliced.contains(out_pid));
+            // Nor is the next splice measured against a leg on another clock.
+            let measures = |out_pid: &u16| match (legs_from.get(out_pid), active_leg_input.get(out_pid)) {
+                (Some(from), Some(now)) => from == now || plan.share_clock(from, now),
+                _ => false,
+            };
+            last_a_pts.retain(|out_pid, _| measures(out_pid));
+            last_a_aac_params.retain(|out_pid, _| measures(out_pid));
+            last_a_video_params.retain(|out_pid, _| measures(out_pid));
+
+            // The fan-ins: those that go on, where the plan has them now.
+            flat.fill(None);
+            for (slot, fanin) in fanins {
+                match fanin {
+                    Some(i) => flat[i] = Some(slot),
+                    None => spawn_fanin(slot, &bus, &fanin_tx, &cancel, &mut flat, &mut slot_cancels, &mut slot_tasks),
+                }
+            }
+
+            // PSI versions. The PAT lists the programs in the plan's order.
+            let listed = |plan: &AssemblyPlan| -> Vec<(u16, u16)> {
+                plan.programs.iter().map(|p| (p.program_number, p.pmt_pid)).collect()
+            };
+            if listed(&old) != listed(&plan) {
+                pat_version = pat_version.wrapping_add(1) & 0x1F;
+            }
+            let mut bumped: HashSet<u16> = HashSet::new();
+            for (prog, before) in plan.programs.iter().zip(&before) {
+                if before.map(|b| &old.programs[b]) != Some(prog) {
+                    pmt_versions.bump(prog);
+                    bumped.insert(prog.program_number);
+                }
+            }
+
+            pcr_out_pid_by_program = pcr_out_pids(&plan);
+            let pcr_now = pcr_legs(&plan, &pcr_out_pid_by_program, &active_leg_input);
+            let was: HashMap<u16, &AssemblySlot> =
+                old.programs.iter().flat_map(|p| &p.slots).map(|s| (s.out_pid, s)).collect();
+            let mut held = std::mem::take(&mut awaiting_pcr);
+            for (pidx, prog) in plan.programs.iter().enumerate() {
+                let was_prog = before[pidx].map(|b| &old.programs[b]);
+                let from = before[pidx].and_then(|b| pcr_from[b].as_ref());
+                // Where its PCR comes from another input now, the program is
+                // held for the first one, unless the two are known to share
+                // a clock and it was not held already, or none is to come.
+                // One the swap adds was on no clock.
+                if let (Some(was_prog), Some(was_leg), Some(leg)) = (was_prog, from, &pcr_now[pidx]) {
+                    let (from, now) = (&was_leg.source.0, &leg.source.0);
+                    // A hold goes on as it is in the program it is of, which
+                    // has its number or its slots.
+                    let same = from == now
+                        && (was_prog.program_number == prog.program_number
+                            || was_prog.slots == prog.slots);
+                    // A slot of the program that stays on its clock goes on,
+                    // unless it was held. A Hitless slot is on the leg its
+                    // merger forwards, and a new merger starts on its primary.
+                    let stays = |out_pid: &u16| {
+                        let it = |s: &&AssemblySlot| s.out_pid == *out_pid;
+                        let found = (was_prog.slots.iter().find(it), prog.slots.iter().find(it));
+                        let (Some(was), Some(is)) = found else {
+                            return false;
+                        };
+                        let played = slot_on_air(was, &legs_from);
+                        let plays = slot_on_air(is, &active_leg_input);
+                        played == plays
+                            || (was.hitless_legs.is_some() && was.hitless_legs == is.hitless_legs)
+                            || plan.share_clock(&played, &plays)
+                    };
+                    let hold = match held.remove(&was_prog.program_number) {
+                        hold @ Some(PcrHold::Take { .. }) if same => hold,
+                        hold if no_pcr_expected(&catalogs, &leg.source) => {
+                            if hold.is_some() || was_leg.source != leg.source {
+                                let why = "has none by the input's PMT";
+                                emit_swap_no_pcr(&event_sender, &flow_id, prog.program_number, leg, why);
+                            }
+                            None
+                        }
+                        None if from == now || plan.share_clock(from, now) => None,
+                        hold => {
+                            let (mut goes_on, withheld) = match hold {
+                                None => (was_prog.slots.iter().map(|s| s.out_pid).collect(), None),
+                                Some(PcrHold::Take { .. }) => (HashSet::new(), None),
+                                Some(PcrHold::Swap { goes_on, withheld }) => {
+                                    (goes_on, withheld.filter(|_| same))
+                                }
+                            };
+                            goes_on.retain(stays);
+                            Some(PcrHold::Swap { goes_on, withheld })
+                        }
+                    };
+                    if let Some(hold) = hold {
+                        awaiting_pcr.insert(prog.program_number, hold);
+                    }
+                }
+                // The next PCR of a slot that plays another source, and of one
+                // that takes the program's PCR over, carries
+                // `discontinuity_indicator = 1`. Without it receivers
+                // see the PCR epoch jump as a clock fault and freeze on their
+                // last decoded frame even though the PMT version bumped.
+                let pcr_moved = from.map(|from| from.out_pid) != Some(pcr_out_pid_by_program[pidx]);
+                for slot in &prog.slots {
+                    let plays = slot_health_identity(slot, &active_leg_input);
+                    let played = was.get(&slot.out_pid).map(|s| slot_health_identity(s, &legs_from));
+                    if played != Some(plays)
+                        || (pcr_moved && slot.out_pid == pcr_out_pid_by_program[pidx])
+                    {
+                        pending_di_for_out_pid.insert(slot.out_pid, true);
+                    }
+                }
+            }
+            publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
+            // Drop vitals for removed slots; fresh grace anchor for
+            // hot-swapped-in ones.
+            sync_slot_vitals(&plan, &mut slot_vitals, Instant::now());
+            // Re-resolve copy-through descriptors against the (possibly
+            // retargeted) slot sources before the immediate PSI push, so the
+            // swap-time PMT already identifies the new sources' codecs.
+            let same_source =
+                |slot: &AssemblySlot| was.get(&slot.out_pid).is_some_and(|s| s.source == slot.source);
+            for pn in refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, same_source) {
+                if !bumped.contains(&pn)
+                    && let Some(prog) = plan.programs.iter().find(|p| p.program_number == pn)
+                {
+                    pmt_versions.bump(prog);
+                }
+            }
+            // A bus_route Swap is a plan replacement — old fan-in cancelled,
+            // new fan-in spawned, PMT bump + DI. `PesAligned` cannot be
+            // honoured here (the PES splice machine only drives Switch-slot
+            // legs); say so instead of silently dropping the operator's
+            // request.
+            if matches!(splice_mode_override, Some(crate::config::models::SpliceMode::PesAligned))
+                && let Some(es_) = &event_sender
+            {
+                es_.emit_flow_with_details(
+                    crate::manager::events::EventSeverity::Warning,
+                    crate::manager::events::category::FLOW,
+                    format!(
+                        "Flow '{flow_id}': splice override 'pes_aligned' ignored — \
+                         this switch re-pinned slot sources (bus_route swap), which \
+                         is inherently a PMT-bump cut. PES-aligned splicing needs a \
+                         Switch slot with both inputs as legs."
+                    ),
+                    &flow_id,
+                    serde_json::json!({
+                        "error_code": "splice_override_ignored",
+                        "requested_mode": "pes_aligned",
+                        "reason": "bus_route_slot_retarget",
+                    }),
+                );
+            }
+            // Emit fresh PSI immediately on switch so downstream receivers
+            // see the new PMT before the first rewritten ES packet lands on a
+            // new out_pid — without this, ffprobe can see TS bytes on an
+            // unknown PID for ~100 ms.
+            push_psi(
+                &mut buf,
+                &plan,
+                &pcr_out_pid_by_program,
+                pat_version,
+                &pmt_versions,
+                &mut pat_cc,
+                &mut cc,
+                &broadcast_tx,
+                &mut bundle_seq,
+                &es_info_by_slot,
+                pts_rewriter.as_mut(),
+            );
+            if let Some(applied) = applied {
+                let _ = applied.send(());
+            }
+        }
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 flush(&mut buf, &broadcast_tx, &mut bundle_seq, pts_rewriter.as_mut());
                 break;
             }
-            Some(cmd) = plan_rx.recv() => {
+            Some(cmd) = plan_rx.recv(), if swap.is_none() => {
                 match cmd {
-                    PlanCommand::ReplacePlan { plan: new_plan, splice_mode_override, catalogs: new_catalogs, applied } => {
-                        // Adopt the new plan's catalogue handles so
-                        // retargeted slots resolve descriptors from
-                        // their (possibly brand-new) sources.
-                        if !new_catalogs.is_empty() {
-                            catalogs = new_catalogs;
+                    PlanCommand::ReplacePlan { plan: mut new_plan, splice_mode_override, catalogs, applied } => {
+                        keep_corrections(&plan, &mut new_plan, &mut declared_stream_types);
+                        let before = programs_before(&plan, &new_plan);
+                        let fanins = reuse_fanins(&flat, &new_plan, &before);
+                        let kept: HashSet<usize> = fanins.iter().filter_map(|(_, fanin)| *fanin).collect();
+                        for (_, fanin) in slot_cancels.iter().enumerate().filter(|(i, _)| !kept.contains(i)) {
+                            fanin.cancel();
                         }
-                        // The leg each pending splice takes its slot to.
-                        let audio = splice_state.iter().map(|(k, s)| (k, s.pending_to_input_id()));
-                        let video =
-                            video_splice_state.iter().map(|(k, s)| (k, s.pending_to_input_id()));
-                        let splicing_to: HashMap<(usize, u16), String> = audio
-                            .chain(video)
-                            .filter_map(|(key, to)| Some((*key, to?.to_string())))
-                            .collect();
-                        let pcr_from =
-                            pcr_legs(&plan, &pcr_out_pid_by_program, &active_leg_input);
-                        let spliced = apply_plan_replacement(&mut plan, new_plan, PlanSwapState { bus: &bus, fanin_tx: &fanin_tx, cancel: &cancel, flat: &mut flat, slot_cancels: &mut slot_cancels, slot_tasks: &mut slot_tasks, pcr_out_pid_by_program: &mut pcr_out_pid_by_program, pat_version: &mut pat_version, pmt_versions: &mut pmt_versions, active_leg_input: &mut active_leg_input, splicing_to: &splicing_to, event_sender: &event_sender, flow_id: &flow_id });
-                        // A splice the new plan has no leg or no slot for ends
-                        // here: left to run it would move a slot to a leg that
-                        // is not there.
-                        splice_state.retain(|key, _| spliced.contains(key));
-                        video_splice_state.retain(|key, _| spliced.contains(key));
-                        // A held program waits on for its PCR if that still
-                        // comes from the input the Take named. A swap to
-                        // another input is a cut of its own, and holds nothing.
-                        let pcr_now =
-                            pcr_legs(&plan, &pcr_out_pid_by_program, &active_leg_input);
-                        awaiting_pcr.retain(|program, _| {
-                            match (pcr_from.get(program), pcr_now.get(program)) {
-                                (Some(from), Some(now)) => from.source.0 == now.source.0,
-                                _ => false,
-                            }
-                        });
-                        publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
-                        // Drop vitals for removed slots; fresh grace
-                        // anchor for hot-swapped-in ones.
-                        sync_slot_vitals(&plan, &mut slot_vitals, Instant::now());
-                        // Re-resolve copy-through descriptors against the
-                        // (possibly retargeted) slot sources before the
-                        // immediate PSI push, so the swap-time PMT already
-                        // identifies the new sources' codecs. Version
-                        // bumps for changed slots happened inside
-                        // `apply_plan_replacement` (slots differ).
-                        let _ = refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, false);
-                        // A bus_route Swap is a plan replacement — old
-                        // fan-in cancelled, new fan-in spawned, PMT bump +
-                        // DI. `PesAligned` cannot be honoured here (the
-                        // PES splice machine only drives Switch-slot
-                        // legs); say so instead of silently dropping the
-                        // operator's request.
-                        if matches!(
+                        // What a cancelled fan-in has queued, with the one
+                        // packet it waits to queue if there was no room, goes
+                        // out on the plan it was for, before the swap. Sent on
+                        // after it, it was the old source's on the slot's PID.
+                        let full = fanin_rx.len() == FANIN_DEPTH;
+                        take_queued(&mut fanin_rx, &mut queued);
+                        if full {
+                            tokio::task::yield_now().await;
+                            take_queued(&mut fanin_rx, &mut queued);
+                        }
+                        let (rest, first) =
+                            queued.into_iter().partition(|(i, _)| kept.contains(i));
+                        queued = first;
+                        swap = Some(PlanSwap {
+                            plan: new_plan,
                             splice_mode_override,
-                            Some(crate::config::models::SpliceMode::PesAligned)
-                        )
-                            && let Some(es_) = &event_sender {
-                                es_.emit_flow_with_details(
-                                    crate::manager::events::EventSeverity::Warning,
-                                    crate::manager::events::category::FLOW,
-                                    format!(
-                                        "Flow '{flow_id}': splice override 'pes_aligned' ignored — \
-                                         this switch re-pinned slot sources (bus_route swap), which \
-                                         is inherently a PMT-bump cut. PES-aligned splicing needs a \
-                                         Switch slot with both inputs as legs."
-                                    ),
-                                    &flow_id,
-                                    serde_json::json!({
-                                        "error_code": "splice_override_ignored",
-                                        "requested_mode": "pes_aligned",
-                                        "reason": "bus_route_slot_retarget",
-                                    }),
-                                );
-                            }
-                        // Arm DI on every out_pid — the next PCR-bearing
-                        // TS packet on each will carry
-                        // `discontinuity_indicator = 1`. Without this,
-                        // receivers see the source-change PCR epoch jump
-                        // as a clock fault and freeze on their last
-                        // decoded frame even though PMT version bumped.
-                        pending_di_for_out_pid.clear();
-                        for prog in &plan.programs {
-                            for slot in &prog.slots {
-                                pending_di_for_out_pid.insert(slot.out_pid, true);
-                            }
-                        }
-                        // Emit fresh PSI immediately on switch so
-                        // downstream receivers see the new PMT before
-                        // the first rewritten ES packet lands on a new
-                        // out_pid — without this, ffprobe can see TS
-                        // bytes on an unknown PID for ~100 ms.
-                        push_psi(
-                            &mut buf,
-                            &plan,
-                            &pcr_out_pid_by_program,
-                            pat_version,
-                            &pmt_versions,
-                            &mut pat_cc,
-                            &mut pmt_cc,
-                            &broadcast_tx,
-                            &mut bundle_seq,
-                            &es_info_by_slot,
-                            pts_rewriter.as_mut(),
-                        );
-                        if let Some(applied) = applied {
-                            let _ = applied.send(());
-                        }
+                            catalogs,
+                            applied,
+                            before,
+                            fanins,
+                            queued: rest,
+                        });
                     }
                     PlanCommand::SwitchActiveInput {
                         new_input_id,
@@ -1312,7 +1613,7 @@ async fn run_assembler(
                                 if !legs.iter().any(|(iid, _)| iid == &new_input_id) {
                                     continue;
                                 }
-                                let key = (pidx, slot.out_pid);
+                                let key = slot.out_pid;
                                 // This Take replaces one whose splice is
                                 // still pending, a Take back included.
                                 splice_state.remove(&key);
@@ -1476,9 +1777,7 @@ async fn run_assembler(
 
                                 // PmtBump path (today's behaviour).
                                 active_leg_input.insert(key, new_input_id.clone());
-                                if let Some(v) = pmt_versions.get_mut(pidx) {
-                                    *v = v.wrapping_add(1) & 0x1F;
-                                }
+                                pmt_versions.bump(prog);
                                 pending_di_for_out_pid.insert(slot.out_pid, true);
                                 any_flipped = true;
                                 if !same_clock {
@@ -1492,8 +1791,9 @@ async fn run_assembler(
                                     // The other slots of the program move with
                                     // the one that carries its PCR.
                                     if pcr_out_pid_by_program.get(pidx) == Some(&slot.out_pid) {
-                                        awaiting_pcr
-                                            .insert(prog.program_number, (Instant::now(), false));
+                                        let hold =
+                                            PcrHold::Take { since: Instant::now(), reported: false };
+                                        awaiting_pcr.insert(prog.program_number, hold);
                                     }
                                 }
                             }
@@ -1515,7 +1815,7 @@ async fn run_assembler(
                                 pat_version,
                                 &pmt_versions,
                                 &mut pat_cc,
-                                &mut pmt_cc,
+                                &mut cc,
                                 &broadcast_tx,
                                 &mut bundle_seq,
                                 &es_info_by_slot,
@@ -1530,10 +1830,49 @@ async fn run_assembler(
                     }
                 }
             }
-            Some((slot_idx, es)) = fanin_rx.recv() => {
-                let slot = match flat.get(slot_idx) {
-                    Some(s) => s,
-                    None => continue,
+            Some((slot_idx, es)) = next_packet(&mut queued, &mut fanin_rx) => {
+                // `None` too for a fan-in a plan swap cancelled while it had
+                // a packet to queue.
+                let Some(slot) = flat.get(slot_idx).and_then(Option::as_ref) else {
+                    continue;
+                };
+                let slot_program_number = plan
+                    .programs
+                    .get(slot.program_idx)
+                    .map(|p| p.program_number)
+                    .unwrap_or(0);
+                let Some(es) = es else {
+                    // Upstream publisher dropped — the input task that
+                    // owns this `(input_id, source_pid)` channel exited.
+                    // Most commonly the owning flow was stopped while
+                    // sibling flows still reference its inputs via
+                    // assembly slots (the "input-host flow" pattern). The
+                    // operator needs to see why output went silent.
+                    if let Some(es_) = &event_sender {
+                        es_.emit_flow_with_details(
+                            crate::manager::events::EventSeverity::Warning,
+                            crate::manager::events::category::FLOW,
+                            format!(
+                                "Flow '{flow_id}': assembly slot source disappeared — \
+                                 input '{}' source_pid 0x{:04X} (program {} out_pid 0x{:04X}). \
+                                 Most likely the owning flow stopped; restart it to recover.",
+                                slot.source.0,
+                                slot.source.1,
+                                slot_program_number,
+                                slot.out_pid,
+                            ),
+                            &flow_id,
+                            serde_json::json!({
+                                "error_code": "pid_bus_slot_source_closed",
+                                "program_number": slot_program_number,
+                                "out_pid": slot.out_pid,
+                                "source_input_id": slot.source.0,
+                                "source_pid": slot.source.1,
+                            }),
+                        );
+                    }
+                    flat[slot_idx] = None;
+                    continue;
                 };
                 if es.payload.len() != TS_PACKET_SIZE {
                     continue;
@@ -1559,7 +1898,7 @@ async fn run_assembler(
                 //  - other-leg packets (neither active nor splice-to)
                 //    drop as today.
                 if slot.is_switch_leg {
-                    let key = (slot.program_idx, slot.out_pid);
+                    let key = slot.out_pid;
                     let is_active = active_leg_input
                         .get(&key)
                         .map(|active| active == &slot.source.0)
@@ -1568,8 +1907,8 @@ async fn run_assembler(
                     // Two disjoint splice state maps — audio + video.
                     // A slot's `stream_type` chooses at most one; both
                     // cannot be pending simultaneously for the same
-                    // `(program_idx, out_pid)`. The boolean OR below
-                    // drives the "are we mid-splice?" gate; the two
+                    // `out_pid`. The boolean OR below drives the
+                    // "are we mid-splice?" gate; the two
                     // observe_a / observe_b call sites dispatch on
                     // which state machine is actually pending.
                     let audio_splice_pending = splice_state
@@ -1689,9 +2028,7 @@ async fn run_assembler(
                                 active_leg_input
                                     .insert(key, slot.source.0.clone());
                                 publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
-                                if let Some(v) = pmt_versions.get_mut(key.0) {
-                                    *v = v.wrapping_add(1) & 0x1F;
-                                }
+                                pmt_versions.bump(&plan.programs[slot.program_idx]);
                                 pending_di_for_out_pid.insert(slot.out_pid, true);
                                 push_psi(
                                     &mut buf,
@@ -1700,7 +2037,7 @@ async fn run_assembler(
                                     pat_version,
                                     &pmt_versions,
                                     &mut pat_cc,
-                                    &mut pmt_cc,
+                                    &mut cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
                                     &es_info_by_slot,
@@ -1713,16 +2050,16 @@ async fn run_assembler(
                                         format!(
                                             "Flow '{flow_id}': PES-aligned video splice committed on \
                                              program {} out_pid 0x{:04X} → '{}' (IDR @ first_b_pts={first_b_pts})",
-                                            plan.programs[key.0].program_number,
-                                            key.1,
+                                            slot_program_number,
+                                            slot.out_pid,
                                             slot.source.0,
                                         ),
                                         &flow_id,
                                         serde_json::json!({
                                             "error_code": "pes_splice_completed",
                                             "kind": "video",
-                                            "program_number": plan.programs[key.0].program_number,
-                                            "out_pid": key.1,
+                                            "program_number": slot_program_number,
+                                            "out_pid": slot.out_pid,
                                             "to_input_id": slot.source.0,
                                             "first_b_pts": first_b_pts,
                                         }),
@@ -1753,9 +2090,7 @@ async fn run_assembler(
                                 // SPS-field diff for operator triage.
                                 active_leg_input.insert(key, to_input_id.clone());
                                 publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
-                                if let Some(v) = pmt_versions.get_mut(key.0) {
-                                    *v = v.wrapping_add(1) & 0x1F;
-                                }
+                                pmt_versions.bump(&plan.programs[slot.program_idx]);
                                 pending_di_for_out_pid.insert(slot.out_pid, true);
                                 push_psi(
                                     &mut buf,
@@ -1764,7 +2099,7 @@ async fn run_assembler(
                                     pat_version,
                                     &pmt_versions,
                                     &mut pat_cc,
-                                    &mut pmt_cc,
+                                    &mut cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
                                     &es_info_by_slot,
@@ -1779,8 +2114,8 @@ async fn run_assembler(
                                              program {} out_pid 0x{:04X} → '{to_input_id}': SPS \
                                              params changed (profile {}→{}, level {}→{}, \
                                              {}×{}→{}×{}, bit-depth {}→{}); falling back to PMT-bump",
-                                            plan.programs[key.0].program_number,
-                                            key.1,
+                                            slot_program_number,
+                                            slot.out_pid,
                                             a_params.profile_idc,
                                             b_params.profile_idc,
                                             a_params.level_idc,
@@ -1796,8 +2131,8 @@ async fn run_assembler(
                                         serde_json::json!({
                                             "error_code": "pes_splice_codec_param_mismatch",
                                             "kind": "video",
-                                            "program_number": plan.programs[key.0].program_number,
-                                            "out_pid": key.1,
+                                            "program_number": slot_program_number,
+                                            "out_pid": slot.out_pid,
                                             "to_input_id": to_input_id,
                                             "a_video_params": {
                                                 "profile_idc": a_params.profile_idc,
@@ -1876,9 +2211,7 @@ async fn run_assembler(
                                 active_leg_input
                                     .insert(key, slot.source.0.clone());
                                 publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
-                                if let Some(v) = pmt_versions.get_mut(key.0) {
-                                    *v = v.wrapping_add(1) & 0x1F;
-                                }
+                                pmt_versions.bump(&plan.programs[slot.program_idx]);
                                 pending_di_for_out_pid.insert(slot.out_pid, true);
                                 push_psi(
                                     &mut buf,
@@ -1887,7 +2220,7 @@ async fn run_assembler(
                                     pat_version,
                                     &pmt_versions,
                                     &mut pat_cc,
-                                    &mut pmt_cc,
+                                    &mut cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
                                     &es_info_by_slot,
@@ -1900,15 +2233,15 @@ async fn run_assembler(
                                         format!(
                                             "Flow '{flow_id}': PES-aligned splice committed on program \
                                              {} out_pid 0x{:04X} → '{}' (first_b_pts={first_b_pts})",
-                                            plan.programs[key.0].program_number,
-                                            key.1,
+                                            slot_program_number,
+                                            slot.out_pid,
                                             slot.source.0,
                                         ),
                                         &flow_id,
                                         serde_json::json!({
                                             "error_code": "pes_splice_completed",
-                                            "program_number": plan.programs[key.0].program_number,
-                                            "out_pid": key.1,
+                                            "program_number": slot_program_number,
+                                            "out_pid": slot.out_pid,
                                             "to_input_id": slot.source.0,
                                             "first_b_pts": first_b_pts,
                                         }),
@@ -1944,9 +2277,7 @@ async fn run_assembler(
                                 // for operator visibility.
                                 active_leg_input.insert(key, to_input_id.clone());
                                 publish_on_air(on_air.as_deref(), &plan, &active_leg_input);
-                                if let Some(v) = pmt_versions.get_mut(key.0) {
-                                    *v = v.wrapping_add(1) & 0x1F;
-                                }
+                                pmt_versions.bump(&plan.programs[slot.program_idx]);
                                 pending_di_for_out_pid.insert(slot.out_pid, true);
                                 push_psi(
                                     &mut buf,
@@ -1955,7 +2286,7 @@ async fn run_assembler(
                                     pat_version,
                                     &pmt_versions,
                                     &mut pat_cc,
-                                    &mut pmt_cc,
+                                    &mut cc,
                                     &broadcast_tx,
                                     &mut bundle_seq,
                                     &es_info_by_slot,
@@ -1970,8 +2301,8 @@ async fn run_assembler(
                                              {} out_pid 0x{:04X} → '{to_input_id}': AAC params \
                                              changed (profile {}→{}, sample_rate idx {}→{}, ch {}→{}); \
                                              falling back to PMT-bump",
-                                            plan.programs[key.0].program_number,
-                                            key.1,
+                                            slot_program_number,
+                                            slot.out_pid,
                                             a_params.profile,
                                             b_params.profile,
                                             a_params.sample_rate_idx,
@@ -1982,8 +2313,8 @@ async fn run_assembler(
                                         &flow_id,
                                         serde_json::json!({
                                             "error_code": "pes_splice_codec_param_mismatch",
-                                            "program_number": plan.programs[key.0].program_number,
-                                            "out_pid": key.1,
+                                            "program_number": slot_program_number,
+                                            "out_pid": slot.out_pid,
                                             "to_input_id": to_input_id,
                                             "a_aac_params": {
                                                 "profile": a_params.profile,
@@ -2043,25 +2374,21 @@ async fn run_assembler(
                 // From here on: forward the packet (was active leg with
                 // splice forwarding A, or B's first committed PES).
                 //
-                let slot_program_number = plan
-                    .programs
-                    .get(slot.program_idx)
-                    .map(|p| p.program_number)
-                    .unwrap_or(0);
-                // A Take moved the program to another clock: nothing of it
-                // goes out until a PCR of the new leg does.
-                if awaiting_pcr.contains_key(&slot_program_number) {
-                    if pcr_out_pid_by_program.get(slot.program_idx) != Some(&slot.out_pid)
-                        || extract_pcr(&es.payload).is_none()
+                // The program was moved to another clock: nothing on it goes
+                // out until a PCR of the new leg does.
+                if let Some(hold) = awaiting_pcr.get_mut(&slot_program_number) {
+                    if pcr_out_pid_by_program.get(slot.program_idx) == Some(&slot.out_pid)
+                        && extract_pcr(&es.payload).is_some()
                     {
+                        awaiting_pcr.remove(&slot_program_number);
+                    } else if hold.withholds(slot.out_pid) {
                         continue;
                     }
-                    awaiting_pcr.remove(&slot_program_number);
                 }
                 // Slot liveness: count the forwarded packet. The first
                 // ES packet after a latched stall fires the recovery
                 // event and re-arms stall detection for the slot.
-                if let Some(v) = slot_vitals.get_mut(&(slot_program_number, slot.out_pid)) {
+                if let Some(v) = slot_vitals.get_mut(&slot.out_pid) {
                     v.packets = v.packets.wrapping_add(1);
                     if v.stalled {
                         v.stalled = false;
@@ -2125,19 +2452,14 @@ async fn run_assembler(
                 for (pidx, out_pid, declared, observed, source) in
                     reconcile_slot_stream_types(&mut plan, &catalogs, &mut st_mismatch_stability)
                 {
-                    for f in flat.iter_mut() {
-                        if f.program_idx == pidx && f.out_pid == out_pid {
+                    for f in flat.iter_mut().flatten() {
+                        if f.out_pid == out_pid {
                             f.stream_type = observed;
                         }
                     }
-                    if let Some(v) = pmt_versions.get_mut(pidx) {
-                        *v = v.wrapping_add(1) & 0x1F;
-                    }
-                    let program_number = plan
-                        .programs
-                        .get(pidx)
-                        .map(|p| p.program_number)
-                        .unwrap_or_default();
+                    declared_stream_types.entry(out_pid).or_insert(declared);
+                    pmt_versions.bump(&plan.programs[pidx]);
+                    let program_number = plan.programs[pidx].program_number;
                     tracing::warn!(
                         flow_id = %flow_id,
                         program_number,
@@ -2176,16 +2498,14 @@ async fn run_assembler(
                 // Converge copy-through descriptors against catalogues
                 // that updated since the last tick (late PSI discovery
                 // on a cold-started input, source PMT change, deferred
-                // PES-splice leg commits). `keep_nonempty_on_miss` so a
+                // PES-splice leg commits). Kept on a miss so a
                 // briefly-empty catalogue (input restart) doesn't flap
                 // the PMT version. A real change bumps the owning
                 // program's PMT version before this tick's PSI goes out.
-                for pn in refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, true) {
-                    if let Some(pidx) =
-                        plan.programs.iter().position(|p| p.program_number == pn)
-                        && let Some(v) = pmt_versions.get_mut(pidx) {
-                            *v = v.wrapping_add(1) & 0x1F;
-                        }
+                for pn in refresh_slot_es_info(&plan, &catalogs, &mut es_info_by_slot, |_| true) {
+                    if let Some(prog) = plan.programs.iter().find(|p| p.program_number == pn) {
+                        pmt_versions.bump(prog);
+                    }
                 }
                 push_psi(
                     &mut buf,
@@ -2194,7 +2514,7 @@ async fn run_assembler(
                     pat_version,
                     &pmt_versions,
                     &mut pat_cc,
-                    &mut pmt_cc,
+                    &mut cc,
                     &broadcast_tx,
                     &mut bundle_seq,
                     &es_info_by_slot,
@@ -2210,12 +2530,30 @@ async fn run_assembler(
                 // budget. Collected-and-applied in two passes so we
                 // don't mutate the splice_state map while iterating.
                 let now = std::time::Instant::now();
+                // A plan swap's hold that has withheld packets for as long as
+                // it may, no PCR among them, ends: the program goes out
+                // without one.
+                awaiting_pcr.retain(|program_number, hold| {
+                    let PcrHold::Swap { withheld: Some(since), .. } = hold else {
+                        return true;
+                    };
+                    if now.duration_since(*since) < PCR_HOLD_ALARM {
+                        return true;
+                    }
+                    let leg =
+                        pcr_leg_of(*program_number, &plan, &pcr_out_pid_by_program, &active_leg_input);
+                    if let Some(leg) = leg {
+                        let why = "sent none in the 2 s it was waited for";
+                        emit_swap_no_pcr(&event_sender, &flow_id, *program_number, &leg, why);
+                    }
+                    false
+                });
                 // (key, to_input_id, kind) tuples. `kind` is folded
                 // into the emitted event so the manager UI can tell
                 // audio splice timeouts apart from video splice
                 // timeouts (different operator action — video timeouts
                 // usually mean the encoder's GoP exceeds the budget).
-                let mut timeouts: Vec<((usize, u16), String, &'static str)> = Vec::new();
+                let mut timeouts: Vec<(u16, String, &'static str)> = Vec::new();
                 for (key, state) in splice_state.iter_mut() {
                     if let Some(SpliceOutcome::Timeout { to_input_id }) =
                         state.check_timeout(now)
@@ -2232,12 +2570,14 @@ async fn run_assembler(
                 }
                 if !timeouts.is_empty() {
                     let mut any_flipped = false;
-                    for (key, to_input_id, kind) in &timeouts {
-                        let (pidx, out_pid) = *key;
-                        active_leg_input.insert(*key, to_input_id.clone());
-                        if let Some(v) = pmt_versions.get_mut(pidx) {
-                            *v = v.wrapping_add(1) & 0x1F;
-                        }
+                    for (out_pid, to_input_id, kind) in &timeouts {
+                        let out_pid = *out_pid;
+                        let carries = |p: &&ProgramPlan| p.slots.iter().any(|s| s.out_pid == out_pid);
+                        let Some(prog) = plan.programs.iter().find(carries) else {
+                            continue;
+                        };
+                        active_leg_input.insert(out_pid, to_input_id.clone());
+                        pmt_versions.bump(prog);
                         pending_di_for_out_pid.insert(out_pid, true);
                         any_flipped = true;
                         if let Some(es_) = &event_sender {
@@ -2247,14 +2587,14 @@ async fn run_assembler(
                                 format!(
                                     "Flow '{flow_id}': PES-aligned {kind} splice timed out on program \
                                      {} out_pid 0x{:04X} → '{to_input_id}'; falling back to PMT-bump",
-                                    plan.programs[pidx].program_number,
+                                    prog.program_number,
                                     out_pid,
                                 ),
                                 &flow_id,
                                 serde_json::json!({
                                     "error_code": "pes_splice_timeout",
                                     "kind": kind,
-                                    "program_number": plan.programs[pidx].program_number,
+                                    "program_number": prog.program_number,
                                     "out_pid": out_pid,
                                     "to_input_id": to_input_id,
                                 }),
@@ -2270,7 +2610,7 @@ async fn run_assembler(
                             pat_version,
                             &pmt_versions,
                             &mut pat_cc,
-                            &mut pmt_cc,
+                            &mut cc,
                             &broadcast_tx,
                             &mut bundle_seq,
                             &es_info_by_slot,
@@ -2288,18 +2628,18 @@ async fn run_assembler(
                 // incident lacked — a dead source behind an assembled
                 // flow used to emit PSI-only with zero events.
                 let now = Instant::now();
-                for (program_number, (since, reported)) in awaiting_pcr.iter_mut() {
+                for (program_number, hold) in awaiting_pcr.iter_mut() {
+                    let PcrHold::Take { since, reported } = hold else {
+                        continue;
+                    };
                     if *reported || now.duration_since(*since) < PCR_HOLD_ALARM {
                         continue;
                     }
                     *reported = true;
-                    let Some(PcrLeg { out_pid, source: (input_id, source_pid) }) =
-                        pcr_legs(&plan, &pcr_out_pid_by_program, &active_leg_input)
-                            .remove(program_number)
-                    else {
-                        continue;
-                    };
-                    if let Some(es_) = &event_sender {
+                    if let Some(es_) = &event_sender
+                        && let Some(PcrLeg { out_pid, source: (input_id, source_pid) }) =
+                            pcr_leg_of(*program_number, &plan, &pcr_out_pid_by_program, &active_leg_input)
+                    {
                         es_.emit_flow_with_details(
                             crate::manager::events::EventSeverity::Warning,
                             crate::manager::events::category::FLOW,
@@ -2374,77 +2714,44 @@ async fn run_assembler(
     }
 }
 
-/// (Re-)flatten the program×slot matrix into `flat`, spawn fan-ins for
-/// any slot that isn't already represented by a live task, and recompute
-/// `pcr_out_pid_by_program`. Call once at startup; subsequent plan
-/// changes go through [`apply_plan_replacement`] which handles diff +
-/// fan-in reuse.
+/// Flatten the plan into `flat`, spawn its fan-ins and compute
+/// `pcr_out_pid_by_program`. Called once at startup; a plan swap changes
+/// them for what it edits.
 #[allow(clippy::too_many_arguments)]
 fn install_plan(
     plan: &AssemblyPlan,
     bus: &Arc<NodeEsBus>,
-    fanin_tx: &mpsc::Sender<(usize, EsPacket)>,
+    fanin_tx: &mpsc::Sender<FromFanin>,
     cancel: &CancellationToken,
-    flat: &mut Vec<FlatSlot>,
+    flat: &mut Vec<Option<FlatSlot>>,
     slot_cancels: &mut Vec<CancellationToken>,
     slot_tasks: &mut Vec<JoinHandle<()>>,
     pcr_out_pid_by_program: &mut Vec<u16>,
-    active_leg_input: &mut std::collections::HashMap<(usize, u16), String>,
-    event_sender: &Option<crate::manager::events::EventSender>,
-    flow_id: &str,
+    active_leg_input: &mut HashMap<u16, String>,
 ) {
-    for (pidx, prog) in plan.programs.iter().enumerate() {
-        for s in prog.slots.iter() {
-            // Spawn one fan-in per bus subscription. Pid / Essence /
-            // Hitless slots produce one. Switch slots produce one per
-            // leg, all sharing `(pidx, out_pid)` so the main loop can
-            // gate on a single (program_idx, out_pid) → active_input
-            // lookup and drop non-active-leg packets at the edge.
-            let leg_pairs: Vec<(String, u16)> = match &s.switch_legs {
-                Some(legs) => legs.clone(),
-                None => vec![s.source.clone()],
-            };
-            let is_switch = s.switch_legs.is_some();
-            for src in leg_pairs {
-                let slot = FlatSlot {
-                    program_idx: pidx,
-                    source: src.clone(),
-                    out_pid: s.out_pid,
-                    is_switch_leg: is_switch,
-                    stream_type: s.stream_type,
-                };
-                let idx = flat.len();
-                flat.push(slot.clone());
-                let slot_cancel = cancel.child_token();
-                let rx = bus.subscribe(&slot.source.0, slot.source.1);
-                let tx = fanin_tx.clone();
-                slot_cancels.push(slot_cancel.clone());
-                let identity = SlotIdentity {
-                    program_number: prog.program_number,
-                    out_pid: slot.out_pid,
-                    source_input_id: slot.source.0.clone(),
-                    source_pid: slot.source.1,
-                };
-                slot_tasks.push(tokio::spawn(slot_fanin(
-                    idx,
-                    rx,
-                    tx,
-                    slot_cancel,
-                    identity,
-                    event_sender.clone(),
-                    flow_id.to_string(),
-                )));
-            }
-            if is_switch {
-                // Initial active leg = AssemblySlot.source — populated
-                // by build_assembly_plan from the config's
-                // initial_input_id (or flow.active_input_id on restart).
-                active_leg_input.insert((pidx, s.out_pid), s.source.0.clone());
-            }
+    // Spawn one fan-in per bus subscription. Pid / Essence / Hitless slots
+    // produce one. Switch slots produce one per leg, all sharing the slot's
+    // `out_pid` so the main loop can gate on a single out_pid → active_input
+    // lookup and drop non-active-leg packets at the edge.
+    for slot in flatten(plan) {
+        spawn_fanin(slot, bus, fanin_tx, cancel, flat, slot_cancels, slot_tasks);
+    }
+    for s in plan.programs.iter().flat_map(|prog| &prog.slots) {
+        if s.switch_legs.is_some() {
+            // Initial active leg = AssemblySlot.source — populated
+            // by build_assembly_plan from the config's
+            // initial_input_id (or flow.active_input_id on restart).
+            active_leg_input.insert(s.out_pid, s.source.0.clone());
         }
     }
-    *pcr_out_pid_by_program = plan
-        .programs
+    *pcr_out_pid_by_program = pcr_out_pids(plan);
+}
+
+/// The `out_pid` that carries each program's PCR: that of the slot that reads
+/// its `pcr_source`. Any leg of a Switch slot counts: its active leg flips at
+/// runtime and the PCR still rides the slot's fixed `out_pid`.
+fn pcr_out_pids(plan: &AssemblyPlan) -> Vec<u16> {
+    plan.programs
         .iter()
         .map(|prog| {
             prog.slots
@@ -2453,12 +2760,110 @@ fn install_plan(
                 .map(|s| s.out_pid)
                 .unwrap_or(prog.pmt_pid)
         })
-        .collect();
+        .collect()
+}
+
+/// Subscribe `slot` to its source, at the end of `flat`.
+fn spawn_fanin(
+    slot: FlatSlot,
+    bus: &Arc<NodeEsBus>,
+    fanin_tx: &mpsc::Sender<FromFanin>,
+    cancel: &CancellationToken,
+    flat: &mut Vec<Option<FlatSlot>>,
+    slot_cancels: &mut Vec<CancellationToken>,
+    slot_tasks: &mut Vec<JoinHandle<()>>,
+) {
+    let slot_cancel = cancel.child_token();
+    let rx = bus.subscribe(&slot.source.0, slot.source.1);
+    slot_tasks.push(tokio::spawn(slot_fanin(flat.len(), rx, fanin_tx.clone(), slot_cancel.clone())));
+    slot_cancels.push(slot_cancel);
+    flat.push(Some(slot));
+}
+
+/// The program of `old` each program of `new` is, in `new`'s order: the one
+/// with the same slots, under whatever number, else the one with its number,
+/// else one that shares an `out_pid` with it, else, in a transport stream of
+/// one program, the only one there was. `None` for one the swap adds.
+///
+/// The numbers of a transport stream are unique, and so are its PIDs
+/// (`config::validation::validate_flow_assembly`), but only within one plan:
+/// a swap may give a number or an `out_pid` of one program to another.
+fn programs_before(old: &AssemblyPlan, new: &AssemblyPlan) -> Vec<Option<usize>> {
+    let shares_a_pid = |old: &ProgramPlan, new: &ProgramPlan| {
+        new.slots.iter().any(|n| old.slots.iter().any(|o| o.out_pid == n.out_pid))
+    };
+    let only_one = old.programs.len() == 1 && new.programs.len() == 1;
+    let rules: [&dyn Fn(&ProgramPlan, &ProgramPlan) -> bool; 4] = [
+        &|old, new| old.slots == new.slots,
+        &|old, new| old.program_number == new.program_number,
+        &shares_a_pid,
+        &|_, _| only_one,
+    ];
+    let mut before: Vec<Option<usize>> = vec![None; new.programs.len()];
+    for same in rules {
+        for (n, prog) in new.programs.iter().enumerate() {
+            if before[n].is_none() {
+                before[n] = (0..old.programs.len())
+                    .find(|o| !before.contains(&Some(*o)) && same(&old.programs[*o], prog));
+            }
+        }
+    }
+    before
+}
+
+/// The subscriptions of `new`, each with the fan-in of `flat` that goes on in
+/// it: one that reads its source. Its own comes first, and one of its program
+/// before any other: each is at its own place in the source.
+fn reuse_fanins(
+    flat: &[Option<FlatSlot>],
+    new: &AssemblyPlan,
+    before: &[Option<usize>],
+) -> Vec<(FlatSlot, Option<usize>)> {
+    let mut fanins: Vec<(FlatSlot, Option<usize>)> =
+        flatten(new).into_iter().map(|slot| (slot, None)).collect();
+    let mut free: Vec<(usize, &FlatSlot)> =
+        flat.iter().enumerate().filter_map(|(i, f)| Some((i, f.as_ref()?))).collect();
+    let own = |f: &FlatSlot, slot: &FlatSlot| f.out_pid == slot.out_pid;
+    let of_its_program =
+        |f: &FlatSlot, slot: &FlatSlot| before[slot.program_idx] == Some(f.program_idx);
+    let rules: [&dyn Fn(&FlatSlot, &FlatSlot) -> bool; 3] = [&own, &of_its_program, &|_, _| true];
+    for suits in rules {
+        for (slot, fanin) in fanins.iter_mut().filter(|(_, fanin)| fanin.is_none()) {
+            let found = free.iter().position(|(_, f)| f.source == slot.source && suits(f, slot));
+            *fanin = found.map(|at| free.remove(at).0);
+        }
+    }
+    fanins
+}
+
+/// Move what the fan-ins have queued to the end of `queued`.
+fn take_queued(fanins: &mut mpsc::Receiver<FromFanin>, queued: &mut VecDeque<FromFanin>) {
+    for _ in 0..fanins.len() {
+        queued.extend(fanins.try_recv());
+    }
+}
+
+/// A slot of `new` that declares, for the source it had, the `stream_type` the
+/// assembler has corrected ([`reconcile_slot_stream_types`]) keeps the
+/// correction: judged anew, its program's PMT went back to the declared one
+/// for two ticks.
+fn keep_corrections(old: &AssemblyPlan, new: &mut AssemblyPlan, declared: &mut HashMap<u16, u8>) {
+    let corrected = std::mem::take(declared);
+    for slot in new.programs.iter_mut().flat_map(|p| &mut p.slots) {
+        let before = old.programs.iter().flat_map(|p| &p.slots).find(|s| s.out_pid == slot.out_pid);
+        if let Some(before) = before
+            && before.source == slot.source
+            && corrected.get(&slot.out_pid) == Some(&slot.stream_type)
+        {
+            declared.insert(slot.out_pid, slot.stream_type);
+            slot.stream_type = before.stream_type;
+        }
+    }
 }
 
 /// The leg each Switch slot of `plan` is on once a swap has put it in place
-/// of the plan `on` and `splicing_to` are of (the leg each slot is on, and the
-/// one its pending splice takes it to), and the slots whose splice goes on.
+/// of the plan `switched` is of, and the slots whose splice goes on. `before`
+/// is what the programs of `plan` were ([`programs_before`]).
 ///
 /// A slot that has the leg it is on keeps it, and its splice if it has the leg
 /// that goes to as well. One that has only the latter is put on it. One with
@@ -2466,31 +2871,39 @@ fn install_plan(
 /// spliced to, if it has that leg: a Take moved that slot, and the plan's
 /// `source.0` (the initial leg) could be another clock. Without one it starts
 /// there.
+///
+/// What the slots of one program are on is one clock; the slots of two can be
+/// on two. So the slots that keep a leg are its own before the swap, or where
+/// it has none of them, as one the swap adds, those of one other program. The
+/// rest are new to it.
 fn legs_after_swap(
     plan: &AssemblyPlan,
-    on: &HashMap<(usize, u16), String>,
-    splicing_to: &HashMap<(usize, u16), String>,
-) -> (HashMap<(usize, u16), String>, HashSet<(usize, u16)>) {
+    before: &[Option<usize>],
+    switched: &HashMap<u16, Switched>,
+) -> (HashMap<u16, String>, HashSet<u16>) {
     let mut legs = HashMap::new();
     let mut spliced = HashSet::new();
-    for (pidx, prog) in plan.programs.iter().enumerate() {
+    for (prog, before) in plan.programs.iter().zip(before) {
         let switches = || prog.slots.iter().filter(|s| s.switch_legs.is_some());
+        let mut homes = switches().filter_map(|s| switched.get(&s.out_pid)).map(|was| was.program);
+        let first = homes.clone().next();
+        let home = homes.find(|home| Some(*home) == *before).or(first);
         let mut kept: Vec<&String> = Vec::new();
         for s in switches() {
-            let key = (pidx, s.out_pid);
+            let was = switched.get(&s.out_pid).filter(|was| Some(was.program) == home);
             let has = |leg: &&String| s.source_on(leg).is_some();
-            let on = on.get(&key).filter(has);
-            let to = splicing_to.get(&key).filter(has);
+            let on = was.map(|was| &was.on).filter(has);
+            let to = was.and_then(|was| was.to.as_ref()).filter(has);
             if let Some(leg) = on.or(to) {
-                legs.insert(key, leg.clone());
+                legs.insert(s.out_pid, leg.clone());
             }
             if on.is_some() && to.is_some() {
-                spliced.insert(key);
+                spliced.insert(s.out_pid);
             }
             kept.extend(to.or(on));
         }
         for s in switches() {
-            legs.entry((pidx, s.out_pid)).or_insert_with(|| {
+            legs.entry(s.out_pid).or_insert_with(|| {
                 let joined = kept.iter().find(|leg| s.source_on(leg).is_some());
                 joined.map_or(&s.source.0, |leg| *leg).clone()
             });
@@ -2499,249 +2912,11 @@ fn legs_after_swap(
     (legs, spliced)
 }
 
-/// Apply a `ReplacePlan` delta.
-///
-/// Strategy: walk the new plan and for each `(program_idx, new_slot_idx)`
-/// find a fan-in in the current `flat` that (a) hasn't already been
-/// re-used in this call and (b) subscribes to the same `(input_id,
-/// source_pid)`. If found, update its `out_pid`/`program_idx` in place
-/// — no re-subscribe needed. If not found, spawn a fresh fan-in. Any
-/// old fan-in not re-used is cancelled.
-///
-/// Version bumps:
-/// - PMT version for a program bumps iff its `slots` vec or `pcr_source`
-///   differs from before.
-/// - PAT version bumps iff the set of `(program_number, pmt_pid)` pairs
-///   differs from before.
-///
-/// Monotonic mod 32 — same discipline as `TsContinuityFixer` so A→B→A
-/// never lands on a receiver-locked phantom version.
-/// The assembler's live, mutable slot bookkeeping, handed to a plan swap as
-/// one unit because every field has to move in lock-step with the others.
-struct PlanSwapState<'a> {
-    bus: &'a Arc<NodeEsBus>,
-    fanin_tx: &'a mpsc::Sender<(usize, EsPacket)>,
-    cancel: &'a CancellationToken,
-    flat: &'a mut Vec<FlatSlot>,
-    slot_cancels: &'a mut Vec<CancellationToken>,
-    slot_tasks: &'a mut Vec<JoinHandle<()>>,
-    pcr_out_pid_by_program: &'a mut Vec<u16>,
-    pat_version: &'a mut u8,
-    pmt_versions: &'a mut Vec<u8>,
-    active_leg_input: &'a mut std::collections::HashMap<(usize, u16), String>,
-    /// The leg each pending splice takes its slot to.
-    splicing_to: &'a HashMap<(usize, u16), String>,
-    event_sender: &'a Option<crate::manager::events::EventSender>,
-    flow_id: &'a str,
-}
-
-/// Returns the Switch slots whose pending splice goes on ([`legs_after_swap`]).
-fn apply_plan_replacement(
-    plan: &mut AssemblyPlan,
-    new_plan: AssemblyPlan,
-    params: PlanSwapState<'_>,
-) -> HashSet<(usize, u16)> {
-    // Destructured back into the original bindings so the body is unchanged.
-    let PlanSwapState {
-        bus,
-        fanin_tx,
-        cancel,
-        flat,
-        slot_cancels,
-        slot_tasks,
-        pcr_out_pid_by_program,
-        pat_version,
-        pmt_versions,
-        active_leg_input,
-        splicing_to,
-        event_sender,
-        flow_id,
-    } = params;
-
-    // Program set: (program_number, pmt_pid) pairs, order-preserving.
-    let old_pat: Vec<(u16, u16)> = plan
-        .programs
-        .iter()
-        .map(|p| (p.program_number, p.pmt_pid))
-        .collect();
-    let new_pat: Vec<(u16, u16)> = new_plan
-        .programs
-        .iter()
-        .map(|p| (p.program_number, p.pmt_pid))
-        .collect();
-    if new_pat != old_pat {
-        *pat_version = pat_version.wrapping_add(1) & 0x1F;
-    }
-
-    // Per-program PMT version: composition = (slots, pcr_source).
-    let mut new_pmt_versions: Vec<u8> = Vec::with_capacity(new_plan.programs.len());
-    for (pidx, new_prog) in new_plan.programs.iter().enumerate() {
-        // Find the matching old program by `program_number` so adding a
-        // program doesn't spuriously bump siblings.
-        let old_prog = plan
-            .programs
-            .iter()
-            .find(|p| p.program_number == new_prog.program_number);
-        let changed = match old_prog {
-            Some(op) => op.slots != new_prog.slots || op.pcr_source != new_prog.pcr_source,
-            None => true, // new program → version starts fresh but advances first tick
-        };
-        let prev_v = pmt_versions.get(pidx).copied().unwrap_or(0);
-        let v = if changed {
-            prev_v.wrapping_add(1) & 0x1F
-        } else {
-            prev_v
-        };
-        new_pmt_versions.push(v);
-    }
-
-    // Fan-in reuse: we match by `(source, out_pid)` in the current flat
-    // list; anything not matched gets cancelled. For unmatched new slots
-    // we append fresh fan-ins (slot indices grow monotonically — old
-    // fan-ins that were cancelled never send again, so stale `slot_idx`
-    // in fanin_rx is defensively filtered by the main loop's
-    // `flat.get(idx)`).
-    let mut reused: Vec<bool> = vec![false; flat.len()];
-    let mut new_flat: Vec<FlatSlot> = Vec::new();
-    let mut carry_tasks: Vec<JoinHandle<()>> = Vec::new();
-    let mut carry_cancels: Vec<CancellationToken> = Vec::new();
-
-    // Also carry a parallel "flat_idx in the new ordering → original
-    // flat_idx" map so the send key stays stable. Because we append-only
-    // on reuse, we re-map: each reused fan-in keeps its *original* index
-    // (fanin sends use that), and we insert a synthetic entry at that
-    // index into `flat_new_by_orig` then rebuild `flat` at the end.
-    //
-    // Simpler: keep the `flat` vec append-only across the assembler's
-    // lifetime — reused slots stay at their original index, new slots
-    // are pushed at the end, and cancelled slots leave a hole that the
-    // main loop's `flat.get(idx)` naturally tolerates. This avoids the
-    // whole re-indexing headache.
-
-    // The operator's prior switch sticks across a hot-swap.
-    let (legs, spliced) = legs_after_swap(&new_plan, active_leg_input, splicing_to);
-    *active_leg_input = legs;
-
-    for new_prog in new_plan.programs.iter().enumerate() {
-        let (pidx, prog) = new_prog;
-        for s in prog.slots.iter() {
-            let leg_pairs: Vec<(String, u16)> = match &s.switch_legs {
-                Some(legs) => legs.clone(),
-                None => vec![s.source.clone()],
-            };
-            let is_switch = s.switch_legs.is_some();
-            for src in &leg_pairs {
-                // Look for a reusable fan-in in the current flat list
-                // for this exact (source, ...) tuple. Skip cancelled
-                // tombstones — see original comment.
-                let match_idx = flat.iter().enumerate().find_map(|(i, f)| {
-                    if !reused[i]
-                        && f.source == *src
-                        && slot_cancels.get(i).is_none_or(|c| !c.is_cancelled())
-                    {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                });
-                match match_idx {
-                    Some(i) => {
-                        reused[i] = true;
-                        flat[i].out_pid = s.out_pid;
-                        flat[i].program_idx = pidx;
-                        flat[i].is_switch_leg = is_switch;
-                        flat[i].stream_type = s.stream_type;
-                    }
-                    None => {
-                        let slot = FlatSlot {
-                            program_idx: pidx,
-                            source: src.clone(),
-                            out_pid: s.out_pid,
-                            is_switch_leg: is_switch,
-                            stream_type: s.stream_type,
-                        };
-                        let idx = flat.len();
-                        flat.push(slot.clone());
-                        reused.push(true);
-                        let slot_cancel = cancel.child_token();
-                        let rx = bus.subscribe(&slot.source.0, slot.source.1);
-                        let tx = fanin_tx.clone();
-                        slot_cancels.push(slot_cancel.clone());
-                        let identity = SlotIdentity {
-                            program_number: prog.program_number,
-                            out_pid: slot.out_pid,
-                            source_input_id: slot.source.0.clone(),
-                            source_pid: slot.source.1,
-                        };
-                        slot_tasks.push(tokio::spawn(slot_fanin(
-                            idx,
-                            rx,
-                            tx,
-                            slot_cancel,
-                            identity,
-                            event_sender.clone(),
-                            flow_id.to_string(),
-                        )));
-                    }
-                }
-            }
-        }
-    }
-
-    // Cancel any fan-in that wasn't reused. Leave its entry in `flat`
-    // as a tombstone — the main loop's `flat.get(idx)` still returns
-    // the old metadata, but since the fan-in is cancelled no further
-    // packets arrive under that index.
-    for (i, was_reused) in reused.iter().enumerate().take(slot_cancels.len()) {
-        if !was_reused {
-            slot_cancels[i].cancel();
-        }
-    }
-
-    // Recompute PCR resolution for each program. Match either the
-    // active-leg `source` (Pid/Essence/Hitless or current Switch) or
-    // any leg in `switch_legs` — switch slots' active leg flips at
-    // runtime but the PCR still rides the slot's fixed out_pid.
-    *pcr_out_pid_by_program = new_plan
-        .programs
-        .iter()
-        .map(|prog| {
-            prog.slots
-                .iter()
-                .find(|s| s.reads(&prog.pcr_source))
-                .map(|s| s.out_pid)
-                .unwrap_or(prog.pmt_pid)
-        })
-        .collect();
-
-    *plan = new_plan;
-    *pmt_versions = new_pmt_versions;
-
-    // Silence unused-var warnings from the earlier parallel-map stubs.
-    let _ = (&mut new_flat, &mut carry_tasks, &mut carry_cancels);
-    spliced
-}
-
-/// Identity carried into [`slot_fanin`] so it can emit a structured
-/// `pid_bus_slot_source_closed` event when the upstream ES bus channel
-/// closes while the parent assembler is still running. Cheap to clone
-/// (one String + four scalars).
-#[derive(Debug, Clone)]
-struct SlotIdentity {
-    program_number: u16,
-    out_pid: u16,
-    source_input_id: String,
-    source_pid: u16,
-}
-
 async fn slot_fanin(
     slot_idx: usize,
     mut rx: broadcast::Receiver<EsPacket>,
-    tx: mpsc::Sender<(usize, EsPacket)>,
+    tx: mpsc::Sender<FromFanin>,
     cancel: CancellationToken,
-    identity: SlotIdentity,
-    event_sender: Option<crate::manager::events::EventSender>,
-    flow_id: String,
 ) {
     loop {
         tokio::select! {
@@ -2751,7 +2926,7 @@ async fn slot_fanin(
                 Ok(es) => {
                     // `send` returns Err only when receiver is closed; that
                     // only happens during shutdown, so exit cleanly.
-                    if tx.send((slot_idx, es)).await.is_err() {
+                    if tx.send((slot_idx, Some(es))).await.is_err() {
                         break;
                     }
                 }
@@ -2762,40 +2937,13 @@ async fn slot_fanin(
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
-                    // Upstream publisher dropped — the input task that
-                    // owns this `(input_id, source_pid)` channel exited.
-                    // Most commonly the owning flow was stopped while
-                    // sibling flows still reference its inputs via
-                    // assembly slots (the "input-host flow" pattern). The
-                    // bus channel re-arms automatically on owner restart,
-                    // but the operator needs to see why output went
-                    // silent. The `cancel.cancelled()` arm above wins
-                    // when the assembler is being torn down (parent flow
-                    // stop / hot-swap / edge shutdown), so this emit only
-                    // fires on truly unexpected closes.
-                    if let Some(es) = &event_sender {
-                        es.emit_flow_with_details(
-                            crate::manager::events::EventSeverity::Warning,
-                            crate::manager::events::category::FLOW,
-                            format!(
-                                "Flow '{flow_id}': assembly slot source disappeared — \
-                                 input '{}' source_pid 0x{:04X} (program {} out_pid 0x{:04X}). \
-                                 Most likely the owning flow stopped; restart it to recover.",
-                                identity.source_input_id,
-                                identity.source_pid,
-                                identity.program_number,
-                                identity.out_pid,
-                            ),
-                            &flow_id,
-                            serde_json::json!({
-                                "error_code": "pid_bus_slot_source_closed",
-                                "program_number": identity.program_number,
-                                "out_pid": identity.out_pid,
-                                "source_input_id": identity.source_input_id,
-                                "source_pid": identity.source_pid,
-                            }),
-                        );
-                    }
+                    // The assembler says whose source closed: a plan swap
+                    // may have moved the slot since. The
+                    // `cancel.cancelled()` arm above wins when the assembler
+                    // is being torn down (parent flow stop / hot-swap / edge
+                    // shutdown), so this only fires on truly unexpected
+                    // closes.
+                    let _ = tx.send((slot_idx, None)).await;
                     break;
                 }
             }
@@ -2861,7 +3009,7 @@ fn rewrite_es_packet(src: &[u8], out_pid: u16, cc_table: &mut std::collections::
 /// never overflows past a bundle boundary.
 ///
 /// `pat_version` and `pmt_versions` are bumped on plan change by
-/// [`apply_plan_replacement`]; `push_psi` only stamps them onto the
+/// [`run_assembler`]; `push_psi` only stamps them onto the
 /// section bytes.
 #[allow(clippy::too_many_arguments)]
 fn push_psi(
@@ -2869,12 +3017,12 @@ fn push_psi(
     plan: &AssemblyPlan,
     pcr_out_pid_by_program: &[u16],
     pat_version: u8,
-    pmt_versions: &[u8],
+    pmt_versions: &PmtVersions,
     pat_cc: &mut u8,
-    pmt_cc: &mut std::collections::HashMap<u16, u8>,
+    cc: &mut HashMap<u16, u8>,
     broadcast_tx: &broadcast::Sender<RtpPacket>,
     bundle_seq: &mut u16,
-    es_info: &std::collections::HashMap<(u16, u16), Vec<u8>>,
+    es_info: &HashMap<u16, Vec<u8>>,
     rewriter: Option<&mut crate::engine::ts_pts_rewriter::TsPtsRewriter>,
 ) {
     // PAT: one entry per program. PAT lives on PID 0x0000 with its own
@@ -2893,14 +3041,14 @@ fn push_psi(
     let mut rewriter = rewriter;
     append_ts(buf, &pat, broadcast_tx, bundle_seq, rewriter.as_deref_mut());
 
-    // One PMT per program on its own `pmt_pid` with its own CC counter.
+    // One PMT per program on its own `pmt_pid`, with that PID's CC counter.
     for (pidx, prog) in plan.programs.iter().enumerate() {
-        let cc_entry = pmt_cc.entry(prog.pmt_pid).or_insert(0);
+        let cc_entry = cc.entry(prog.pmt_pid).or_insert(0);
         let pcr_out_pid = pcr_out_pid_by_program
             .get(pidx)
             .copied()
             .unwrap_or(prog.pmt_pid);
-        let pmt_version = pmt_versions.get(pidx).copied().unwrap_or(0);
+        let pmt_version = pmt_versions.of(prog);
         let pmt = build_pmt(
             prog.program_number,
             prog.pmt_pid,
@@ -3046,7 +3194,7 @@ fn build_pmt(
     slots: &[AssemblySlot],
     version: u8,
     cc: u8,
-    es_info: &std::collections::HashMap<(u16, u16), Vec<u8>>,
+    es_info: &HashMap<u16, Vec<u8>>,
 ) -> [u8; TS_PACKET_SIZE] {
     let mut pkt = [0xFFu8; TS_PACKET_SIZE];
     pkt[0] = TS_SYNC_BYTE;
@@ -3063,7 +3211,7 @@ fn build_pmt(
     let base_len = 9 + 5 * slots.len() + 4;
     for slot in slots {
         let d = es_info
-            .get(&(program_number, slot.out_pid))
+            .get(&slot.out_pid)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
         if !d.is_empty() && d.len() <= 0x3FF && base_len + es_total + d.len() <= PMT_MAX_SECTION_LENGTH {
@@ -3144,28 +3292,26 @@ fn filter_es_descriptors(raw: &[u8]) -> Vec<u8> {
 }
 
 /// Re-resolve every slot's copy-through ES descriptors from the
-/// per-input PSI catalogues. Keyed `(program_number, out_pid)` to match
-/// `build_pmt`'s lookup. Returns the `program_number`s whose descriptor
+/// per-input PSI catalogues. Returns the `program_number`s whose descriptor
 /// set changed so the caller can bump those PMT versions (skipped on
-/// install / plan replacement where versions are already handled).
+/// install, whose PMTs are the first).
 ///
-/// `keep_nonempty_on_miss`: when the slot's source has no catalogue
-/// entry *right now* (input restarting, catalogue not yet observed),
-/// keep the previously-resolved bytes instead of flapping to empty —
-/// used by the periodic tick. Plan-change callers pass `false` so a
-/// retargeted slot never inherits the old source's descriptors.
+/// `keep_on_miss`: whether a slot whose source has no catalogue
+/// entry *right now* (input restarting, catalogue not yet observed)
+/// keeps the previously-resolved bytes instead of flapping to empty —
+/// every one on the periodic tick, and on a plan swap those whose source it
+/// leaves, so a retargeted slot never inherits the old source's descriptors.
 fn refresh_slot_es_info(
     plan: &AssemblyPlan,
     catalogs: &HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
-    es_info: &mut std::collections::HashMap<(u16, u16), Vec<u8>>,
-    keep_nonempty_on_miss: bool,
+    es_info: &mut HashMap<u16, Vec<u8>>,
+    keep_on_miss: impl Fn(&AssemblySlot) -> bool,
 ) -> Vec<u16> {
     let mut changed: Vec<u16> = Vec::new();
-    let mut next: std::collections::HashMap<(u16, u16), Vec<u8>> =
-        std::collections::HashMap::with_capacity(es_info.len());
+    let mut next: HashMap<u16, Vec<u8>> = HashMap::with_capacity(es_info.len());
     for prog in &plan.programs {
         for slot in &prog.slots {
-            let key = (prog.program_number, slot.out_pid);
+            let key = slot.out_pid;
             // `Some(bytes)` = source ES found in its catalogue (bytes may
             // legitimately be empty); `None` = no catalogue / ES missing.
             let resolved: Option<Vec<u8>> = catalogs
@@ -3184,7 +3330,7 @@ fn refresh_slot_es_info(
                 .map(|raw| filter_es_descriptors(&raw));
             let bytes = match resolved {
                 Some(b) => b,
-                None if keep_nonempty_on_miss => {
+                None if keep_on_miss(slot) => {
                     es_info.get(&key).cloned().unwrap_or_default()
                 }
                 None => Vec::new(),
@@ -3226,6 +3372,20 @@ fn observed_source_stream_type(
     })
 }
 
+/// Whether no PCR is to come on `source`: a program of its input has the PID,
+/// and none has its PCR there (one whose PMT names no PCR PID has it nowhere).
+/// `false` where the input has no catalogue yet or the PID is in none of its
+/// PMTs.
+fn no_pcr_expected(
+    catalogs: &HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+    source: &(String, u16),
+) -> bool {
+    catalogs.get(&source.0).and_then(|store| store.load()).is_some_and(|cat| {
+        cat.programs.iter().any(|p| p.streams.iter().any(|s| s.pid == source.1))
+            && cat.programs.iter().all(|p| p.pcr_pid != Some(source.1))
+    })
+}
+
 /// Reconcile every video slot's declared `stream_type` against the live
 /// source PMT (PSI-tick cadence). An assembly declaring 0x24 (HEVC) over
 /// an H.264 ES feeds H.264 NALs to downstream HEVC decoders — video
@@ -3244,7 +3404,7 @@ fn observed_source_stream_type(
 fn reconcile_slot_stream_types(
     plan: &mut AssemblyPlan,
     catalogs: &HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
-    stability: &mut std::collections::HashMap<(u16, u16), (u8, u8)>,
+    stability: &mut HashMap<u16, (u8, u8)>,
 ) -> Vec<(usize, u16, u8, u8, (String, u16))> {
     let mut corrections = Vec::new();
     for (pidx, prog) in plan.programs.iter_mut().enumerate() {
@@ -3261,7 +3421,7 @@ fn reconcile_slot_stream_types(
             if slot.switch_legs.is_some() {
                 continue;
             }
-            let key = (prog.program_number, slot.out_pid);
+            let key = slot.out_pid;
             let observed = match observed_source_stream_type(catalogs, &slot.source) {
                 Some(o) => o,
                 None => {
@@ -3356,15 +3516,15 @@ pub struct PendingEssenceSlot {
 /// after essence resolution and spawns one
 /// [`crate::engine::ts_es_hitless::spawn_hitless_es_merger_full`] per entry
 /// before bringing the assembler up.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PendingHitlessSlot {
-    /// Stable identifier within the flow — `"slot_{program_idx}_{slot_idx}"`
-    /// is the convention so two Hitless slots on the same flow never collide.
-    pub uid: String,
-    /// The synthetic bus key the merger publishes onto and the slot reads:
-    /// [`crate::engine::ts_es_hitless::hitless_bus_key`] of the flow's run
-    /// and `uid`, so no other flow's slot, nor another run's, shares it.
-    pub bus_key: (String, u16),
+    /// The slot's `out_pid`, which tells it from the plan's other slots
+    /// wherever the plan has it.
+    pub out_pid: u16,
+    /// The flow run's scope of the bus key its merger publishes onto and the
+    /// slot reads ([`crate::engine::ts_es_hitless::hitless_bus_key`]), so no
+    /// other flow's slot, nor another run's, shares it.
+    pub scope: String,
     /// Concrete `(input_id, source_pid)` for the primary leg.
     pub primary: (String, u16),
     /// Concrete `(input_id, source_pid)` for the backup leg.
@@ -3401,6 +3561,18 @@ pub struct PendingHitlessSlot {
     pub forwarding_primary: ForwardingPrimary,
     /// The slot's [`HitlessLegs::seq_fallback`], for the merger to set.
     pub seq_fallback: SeqFallback,
+}
+
+impl PendingHitlessSlot {
+    /// Whether the merger of `other` is the one this slot wants: the same legs,
+    /// merged the same way.
+    pub fn merges_as(&self, other: &Self) -> bool {
+        let settings = |slot: &Self| {
+            (slot.stall_ms, slot.seq_aware, slot.reorder_window, slot.path_differential_ms)
+        };
+        (&self.primary, &self.backup) == (&other.primary, &other.backup)
+            && settings(self) == settings(other)
+    }
 }
 
 /// Output of `build_spts_plan` (defined on the runtime side): the
@@ -3645,7 +3817,7 @@ mod tests {
             slot("a", 0x101, 0x101, 0x06), // DVB private PES (e.g. AC-3)
         ];
         let mut es_info = std::collections::HashMap::new();
-        es_info.insert((1u16, 0x101u16), vec![0x6A, 0x01, 0x00]); // AC-3 descriptor
+        es_info.insert(0x101u16, vec![0x6A, 0x01, 0x00]); // AC-3 descriptor
         let pkt = build_pmt(1, 0x1000, 0x100, &slots, 0, 0, &es_info);
         // Entries start at byte 17. Entry 0: video, empty loop.
         assert_eq!(pkt[17], 0x1B);
@@ -3679,7 +3851,7 @@ mod tests {
     fn build_pmt_drops_descriptor_loops_that_overflow_one_packet() {
         let slots = vec![slot("a", 0x100, 0x100, 0x06)];
         let mut es_info = std::collections::HashMap::new();
-        es_info.insert((1u16, 0x100u16), vec![0x0A; 200]); // can't fit in 180
+        es_info.insert(0x100u16, vec![0x0A; 200]); // can't fit in 180
         let pkt = build_pmt(1, 0x1000, 0x100, &slots, 0, 0, &es_info);
         let section_length = (((pkt[6] & 0x0F) as usize) << 8) | pkt[7] as usize;
         assert_eq!(section_length, 9 + 5 + 4, "oversized loop must be dropped");
@@ -4180,7 +4352,8 @@ mod tests {
                     slot("in-b", 0x200, 0x201, 0x0F),
                 ],
             }],
-            clocks: HashMap::new(),
+            // One clock, so the program is not held for in-c's PCR.
+            clocks: clocks(&[("in-a", ClockIdentity::Wallclock), ("in-c", ClockIdentity::Wallclock)]),
         };
         handle
             .plan_tx
@@ -4914,7 +5087,9 @@ mod tests {
     /// [`legs_after_swap`], from every state a plan of three slots the check
     /// accepts can be in, any of them new to the swap, to every other such
     /// plan: no Take after the swap and no splice it left pending puts two of
-    /// them on different clocks.
+    /// them on different clocks. Its slots may come from two programs of the
+    /// plan before, in states of their own, whether the program is one of them
+    /// or new.
     #[test]
     fn a_plan_swap_mixes_no_clocks() {
         let mut swaps = 0;
@@ -4932,26 +5107,40 @@ mod tests {
                 .iter()
                 .flat_map(|legs| spliced_states(legs, start(legs), &clock))
                 .collect();
-            let key = |i: usize| (0, 0x200 + i as u16);
+            // What the slots of each set (a bit each) can be on at once.
+            let places: Vec<HashSet<Vec<Option<OnTo>>>> = (0..8)
+                .map(|set| {
+                    let of = |state: &Vec<OnTo>| {
+                        (0..3).map(|i| (set & (1 << i) != 0).then_some(state[i])).collect()
+                    };
+                    before.iter().map(of).collect()
+                })
+                .collect();
+            let key = |i: usize| 0x200 + i as u16;
             for legs in &accepted {
                 let plan = plan_of(legs);
                 let mut checked = HashSet::new();
-                for (state, kept) in before.iter().flat_map(|s| (0..8).map(move |kept| (s, kept))) {
-                    let kept = |i: &usize| kept & (1 << i) != 0;
-                    let on = (0..3)
-                        .filter(kept)
-                        .map(|i| (key(i), IDS[state[i].0].to_string()))
+                // The slots kept of program 0 of the plan before, and of 1.
+                let sets = (0..8).flat_map(|a| (0..8).map(move |b| (a, b))).filter(|(a, b)| a & b == 0);
+                let pairs = sets.flat_map(|(a, b)| {
+                    places[a].iter().flat_map(|x| places[b].iter().map(move |y| (x, y))).collect::<Vec<_>>()
+                });
+                for ((x, y), program) in pairs.flat_map(|p| [Some(0), None].map(|program| (p, program))) {
+                    let switched: HashMap<u16, Switched> = (0..3)
+                        .filter_map(|i| {
+                            let program = usize::from(x[i].is_none());
+                            let (on, to) = x[i].or(y[i])?;
+                            let (on, to) = (IDS[on].to_string(), to.map(|to| IDS[to].to_string()));
+                            Some((key(i), Switched { program, on, to }))
+                        })
                         .collect();
-                    let splicing_to = (0..3)
-                        .filter(kept)
-                        .filter_map(|i| Some((key(i), IDS[state[i].1?].to_string())))
-                        .collect();
-                    let (now, spliced) = legs_after_swap(&plan, &on, &splicing_to);
+                    let (now, spliced) = legs_after_swap(&plan, &[program], &switched);
                     let after: Vec<OnTo> = (0..3)
                         .map(|i| {
                             let Some(leg) = now.get(&key(i)) else { return (legs[i].1, None) };
                             let leg = IDS.iter().position(|id| id == leg).unwrap();
-                            (leg, state[i].1.filter(|_| spliced.contains(&key(i))))
+                            let to = x[i].or(y[i]).and_then(|(_, to)| to);
+                            (leg, to.filter(|_| spliced.contains(&key(i))))
                         })
                         .collect();
                     swaps += 1;
@@ -4961,13 +5150,13 @@ mod tests {
                     for then in spliced_states(legs, after.clone(), &clock) {
                         assert!(
                             then.iter().all(|(on, _)| clock[*on] == clock[then[0].0]),
-                            "{state:?} to {legs:?} on clocks {clock:?}: {after:?}, {then:?}"
+                            "{x:?} and {y:?} to {legs:?} on clocks {clock:?}: {after:?}, {then:?}"
                         );
                         assert!(
                             then.iter().zip(legs).all(|((on, to), (legs, _))| {
                                 legs.contains(on) && to.is_none_or(|to| legs.contains(&to))
                             }),
-                            "{state:?} to {legs:?}: {after:?}"
+                            "{x:?} and {y:?} to {legs:?}: {after:?}"
                         );
                     }
                 }
@@ -5273,7 +5462,7 @@ mod tests {
         // as the fanin arm performs it: counter bump + latch clear +
         // last_data refresh.
         {
-            let v = vitals.get_mut(&(1, 0x200)).unwrap();
+            let v = vitals.get_mut(&0x200).unwrap();
             v.packets += 1;
             v.stalled = false;
             v.last_data = Some(start + Duration::from_secs(12));
@@ -5309,7 +5498,7 @@ mod tests {
             ("in-c".to_string(), 0x300),
         ]);
         let mut active = HashMap::new();
-        active.insert((0usize, 0x200u16), "in-c".to_string());
+        active.insert(0x200u16, "in-c".to_string());
         let mut vitals = HashMap::new();
         let start = Instant::now();
         sync_slot_vitals(&plan, &mut vitals, start);
@@ -5334,9 +5523,9 @@ mod tests {
         assert_eq!(vitals.len(), 2);
         // State survives a no-op re-sync (an unrelated ReplacePlan must
         // not reset an already-latched stall).
-        vitals.get_mut(&(1, 0x200)).unwrap().stalled = true;
+        vitals.get_mut(&0x200).unwrap().stalled = true;
         sync_slot_vitals(&plan, &mut vitals, t0 + Duration::from_secs(30));
-        assert!(vitals.get(&(1, 0x200)).unwrap().stalled);
+        assert!(vitals.get(&0x200).unwrap().stalled);
         // Swap the audio slot: old key dropped, new key registered with
         // a fresh grace anchor at the swap time.
         let mut plan2 = make_plan();
@@ -5344,8 +5533,8 @@ mod tests {
         let t_swap = t0 + Duration::from_secs(60);
         sync_slot_vitals(&plan2, &mut vitals, t_swap);
         assert_eq!(vitals.len(), 2);
-        assert!(!vitals.contains_key(&(1, 0x201)));
-        let fresh = vitals.get(&(1, 0x401)).unwrap();
+        assert!(!vitals.contains_key(&0x201));
+        let fresh = vitals.get(&0x401).unwrap();
         assert_eq!(fresh.registered_at, t_swap);
         assert!(!fresh.stalled);
     }
@@ -5383,14 +5572,13 @@ mod tests {
 
     #[test]
     fn stall_state_survives_program_reorder() {
-        // ReplacePlan that prepends a program must not reset surviving
-        // slots' stall history (vitals are keyed by program_number, not
-        // positional index).
+        // ReplacePlan that prepends a program, or renumbers one, must not
+        // reset surviving slots' stall history (vitals are keyed by out_pid).
         let plan = make_plan();
         let mut vitals = HashMap::new();
         let t0 = Instant::now();
         sync_slot_vitals(&plan, &mut vitals, t0);
-        vitals.get_mut(&(1, 0x200)).unwrap().stalled = true;
+        vitals.get_mut(&0x200).unwrap().stalled = true;
         let mut plan2 = AssemblyPlan {
             programs: vec![ProgramPlan {
                 program_number: 2,
@@ -5401,12 +5589,13 @@ mod tests {
             clocks: HashMap::new(),
         };
         plan2.programs.extend(plan.programs.clone());
+        plan2.programs[1].program_number = 7;
         sync_slot_vitals(&plan2, &mut vitals, t0 + Duration::from_secs(30));
         assert!(
-            vitals.get(&(1, 0x200)).unwrap().stalled,
+            vitals.get(&0x200).unwrap().stalled,
             "latched stall survives the reorder"
         );
-        assert!(vitals.contains_key(&(2, 0x601)), "new program registered");
+        assert!(vitals.contains_key(&0x601), "new program registered");
     }
 
     #[tokio::test]
@@ -5531,7 +5720,7 @@ mod tests {
     #[test]
     fn on_air_is_each_switch_slots_active_leg_and_the_hitless_leg_forwarded() {
         let plan = switch_and_hitless_plan(Default::default(), None);
-        let published = |legs: &HashMap<(usize, u16), String>| {
+        let published = |legs: &HashMap<u16, String>| {
             let on_air = OnAirInputs::default();
             on_air.set_assembled(on_air_inputs(&plan, legs));
             on_air
@@ -5551,7 +5740,7 @@ mod tests {
         hitless_legs(&plan).forwarding_primary.set(false);
         assert_eq!(playing(&on_air), ["srt-main", "srt-bak"]);
         hitless_legs(&plan).forwarding_primary.set(true);
-        let taken = HashMap::from([((0, 0x201), "srt-backup".to_string())]);
+        let taken = HashMap::from([(0x201, "srt-backup".to_string())]);
         assert_eq!(playing(&published(&taken)), ["srt-backup", "srt-pri"]);
     }
 
@@ -5866,6 +6055,14 @@ mod tests {
 
     impl Rig {
         async fn start(plan: AssemblyPlan) -> Self {
+            Self::start_with(plan, None, Default::default()).await
+        }
+
+        async fn start_with(
+            plan: AssemblyPlan,
+            pacer: Option<Arc<crate::engine::av_sync_mux::AvSyncPacer>>,
+            catalogs: HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+        ) -> Self {
             let on_air = Arc::new(OnAirInputs::default());
             let bus = Arc::new(NodeEsBus::new());
             let (tx, out) = broadcast::channel::<RtpPacket>(1024);
@@ -5879,10 +6076,10 @@ mod tests {
                 cancel.clone(),
                 Some(events_tx),
                 "f1".to_string(),
-                None,
+                pacer,
                 None,
                 Some(on_air.clone()),
-                Default::default(),
+                catalogs,
             );
             until("the assembler's first publication", || on_air.contains(&first)).await;
             Rig { bus, on_air, out, events, handle, _stop: cancel.drop_guard() }
@@ -5901,6 +6098,11 @@ mod tests {
         }
 
         async fn replace(&self, plan: AssemblyPlan) {
+            self.replaced(plan).await.await.unwrap();
+        }
+
+        /// Ask for the swap: what it answers says when it is on air.
+        async fn replaced(&self, plan: AssemblyPlan) -> tokio::sync::oneshot::Receiver<()> {
             let (applied, done) = tokio::sync::oneshot::channel();
             let replace = PlanCommand::ReplacePlan {
                 plan,
@@ -5909,7 +6111,45 @@ mod tests {
                 applied: Some(applied),
             };
             self.handle.plan_tx.send(replace).await.unwrap();
-            done.await.unwrap();
+            done
+        }
+
+        /// Hold the assembler, its fan-ins running, until this is dropped.
+        async fn stall(&self) -> tokio::sync::oneshot::Sender<()> {
+            let (release, stalled) = tokio::sync::oneshot::channel();
+            self.handle.plan_tx.send(PlanCommand::Stall { release: stalled }).await.unwrap();
+            release
+        }
+
+        /// Everything that goes out in `wait`, in order.
+        async fn wire(&mut self, wait: Duration) -> Vec<(u16, Vec<u8>)> {
+            let end = tokio::time::Instant::now() + wait;
+            let mut out = Vec::new();
+            while let Ok(Ok(bundle)) = tokio::time::timeout_at(end, self.out.recv()).await {
+                out.extend(bundle.data.chunks_exact(TS_PACKET_SIZE).map(|p| (ts_pid(p), p.to_vec())));
+            }
+            out
+        }
+
+        /// How many packets of `input`'s `pid` its fan-ins have yet to take.
+        fn untaken(&self, input: &str, pid: u16) -> usize {
+            self.bus.sender_for(input, pid, 0).len()
+        }
+
+        /// The version of the next PMT on each of `pmt_pids`.
+        async fn versions(&mut self, pmt_pids: &[u16]) -> Vec<u8> {
+            while self.out.try_recv().is_ok() {}
+            let mut found: HashMap<u16, u8> = HashMap::new();
+            let end = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !pmt_pids.iter().all(|pid| found.contains_key(pid)) {
+                let bundle = tokio::time::timeout_at(end, self.out.recv()).await.expect("the PMTs");
+                for p in bundle.unwrap().data.chunks_exact(TS_PACKET_SIZE) {
+                    if pmt_pids.contains(&ts_pid(p)) {
+                        found.insert(ts_pid(p), pmt_version(p));
+                    }
+                }
+            }
+            pmt_pids.iter().map(|pid| found[pid]).collect()
         }
 
         /// Whether the program plays from exactly `inputs` of `a`, `b`, `c`.
@@ -5960,12 +6200,20 @@ mod tests {
 
     /// An adaptation-field-only packet with a PCR.
     fn es_pcr(src_pid: u16, stream_type: u8) -> EsPacket {
+        es_pcr_at(src_pid, stream_type, 0)
+    }
+
+    /// [`es_pcr`] `base` ticks of 90 kHz on.
+    fn es_pcr_at(src_pid: u16, stream_type: u8, base: u32) -> EsPacket {
+        let mut pkt = ts_af_only(src_pid).to_vec();
+        pkt[6..10].copy_from_slice(&(base >> 1).to_be_bytes());
+        pkt[10] |= ((base & 1) << 7) as u8;
         EsPacket {
             stream_type,
-            payload: ts_af_only(src_pid),
+            payload: Bytes::from(pkt),
             is_pusi: false,
             has_pcr: true,
-            pcr: Some(0),
+            pcr: Some(base as u64 * 300),
             ..audio_pes(src_pid, 0)
         }
     }
@@ -6251,8 +6499,10 @@ mod tests {
             .collect();
         assert_eq!(completed, [(0x201.into(), 97_200.into())]);
         assert!(rig.plays(&["a", "b", "c"]), "the video waits for an IDR");
+        let before = rig.versions(&[0x1000]).await[0];
         tokio::time::sleep(Duration::from_millis(1_800)).await;
         until("the video's budget", || rig.plays(&["b", "c"])).await;
+        assert_eq!(rig.versions(&[0x1000]).await, [(before + 1) & 0x1F]);
         let timeouts: Vec<_> =
             rig.raised("pes_splice_timeout").iter().map(|d| d["out_pid"].clone()).collect();
         assert_eq!(timeouts, [serde_json::json!(0x200)]);
@@ -6288,6 +6538,10 @@ mod tests {
             let legs = next.programs[0].slots[0].switch_legs.clone();
             rig.replace(next).await;
             assert!(rig.plays(&[on]), "{legs:?}");
+            if on == "c" {
+                rig.send(on, es_pcr(0x100, 0x1B));
+                assert_eq!(rig.sent_pids(1).await, [0x200], "c is on a clock of its own");
+            }
             assert_eq!(feed(&mut rig, on, 97_200, 2).await, [0x200, 0x201], "{legs:?}");
             tokio::time::sleep(Duration::from_millis(1_800)).await;
             assert!(rig.raised("pes_splice_timeout").is_empty(), "nothing left to time out");
@@ -6326,18 +6580,54 @@ mod tests {
             switch_slot(&["c", "b"], 0x101, 0x201, 0x0F),
             switch_slot(&["a", "b", "c"], 0x102, 0x202, 0x0F),
         ]);
-        let on = [((0, 0x200), "c".to_string()), ((0, 0x201), "a".to_string())].into();
-        let splicing_to = [((0, 0x201), "b".to_string())].into();
-        let (legs, spliced) = legs_after_swap(&plan, &on, &splicing_to);
-        assert_eq!(legs[&(0, 0x201)], "b");
-        assert_eq!(legs[&(0, 0x202)], "c");
+        let on = |on: &str, to: Option<&str>| Switched {
+            program: 0,
+            on: on.to_string(),
+            to: to.map(str::to_string),
+        };
+        let switched = [(0x200, on("c", None)), (0x201, on("a", Some("b")))].into();
+        let (legs, spliced) = legs_after_swap(&plan, &[Some(0)], &switched);
+        assert_eq!(legs[&0x201], "b");
+        assert_eq!(legs[&0x202], "c");
         assert!(spliced.is_empty());
+    }
+
+    /// The slots of two programs can be on two clocks. Where a swap puts them in
+    /// one program, that program's own keep the leg they are on and the others
+    /// join them; in a program it adds, the first one's do.
+    #[test]
+    fn a_slot_of_another_program_is_new_to_a_program() {
+        let plan = one_program(vec![
+            switch_slot(&["a", "b"], 0x101, 0x201, 0x0F),
+            switch_slot(&["a", "b"], 0x100, 0x200, 0x1B),
+            switch_slot(&["a", "b"], 0x102, 0x202, 0x0F),
+        ]);
+        let on = |program: usize, on: &str, to: Option<&str>| Switched {
+            program,
+            on: on.to_string(),
+            to: to.map(str::to_string),
+        };
+        let legs = |before: Option<usize>, switched: HashMap<u16, Switched>| {
+            let (legs, spliced) = legs_after_swap(&plan, &[before], &switched);
+            ([0x201, 0x200, 0x202].map(|pid| legs[&pid].clone()), spliced)
+        };
+        let switched = || HashMap::from([(0x201, on(1, "b", Some("a"))), (0x200, on(0, "a", None))]);
+        let (now, spliced) = legs(Some(0), switched());
+        assert_eq!(now, ["a", "a", "a"], "where program 0's is");
+        assert!(spliced.is_empty(), "nor is another program's splice one of its own");
+        let (now, spliced) = legs(Some(1), switched());
+        assert_eq!(now, ["b", "a", "a"], "where program 1's is, or is being spliced to");
+        assert!(spliced.contains(&0x201));
+        for before in [None, Some(2)] {
+            let (now, _) = legs(before, HashMap::from([(0x200, on(0, "b", None))]));
+            assert_eq!(now, ["b", "b", "b"], "{before:?}: there is no other");
+        }
     }
 
     /// The hold of a Take stays with its program over a plan swap for as long
     /// as its PCR comes from the input the Take named. Kept by the program's
     /// place in the plan it held the one a swap put there, for which no Take
-    /// was, and kept over a swap to another input it left the program off air.
+    /// was.
     #[tokio::test]
     async fn a_hold_stays_with_its_program() {
         let code = "pid_bus_take_no_pcr";
@@ -6406,8 +6696,8 @@ mod tests {
         assert_eq!(rig.sent_pids(1).await, [0x201]);
         assert_eq!(feed(&mut rig, "b", 97_200, 2).await, [0x200, 0x201], "and it plays on");
 
-        // Fixed to b it waits for b, fixed to another input it plays that.
-        for (id, out) in [("b", vec![]), ("c", vec![0x200u16, 0x201])] {
+        // Fixed to b it waits for b, fixed to another input for that one.
+        for id in ["b", "c"] {
             let mut rig = held().await;
             let mut pinned = two_programs();
             pinned.programs[0].slots =
@@ -6415,7 +6705,9 @@ mod tests {
             pinned.programs[0].pcr_source = (id.to_string(), 0x100);
             pinned.programs.truncate(1);
             rig.replace(pinned).await;
-            assert_eq!(feed(&mut rig, id, 90_000, out.len()).await, out, "{id}");
+            assert_eq!(feed(&mut rig, id, 90_000, 0).await, [0u16; 0], "{id}");
+            rig.send(id, es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [0x200], "{id}");
         }
 
         // Two programs held by one Take: each waits for a PCR of its own.
@@ -6557,5 +6849,1564 @@ mod tests {
         pinned.programs[0].pcr_source = ("b".to_string(), 0x100);
         rig.replace(pinned).await;
         assert!(rig.plays(&["a", "b"]), "the added slot starts on its own leg");
+    }
+
+    // ── What a plan swap holds, and what it leaves alone ───────────────
+
+    /// `id`'s video and audio on program 1, beside a program 2 pinned to `c`.
+    fn pinned_beside(id: &str) -> AssemblyPlan {
+        beside(one_program(vec![slot(id, 0x100, 0x200, 0x1B), slot(id, 0x101, 0x201, 0x0F)]))
+    }
+
+    /// `plan` with a program 2 pinned to `c` after it.
+    fn beside(mut plan: AssemblyPlan) -> AssemblyPlan {
+        plan.programs.push(ProgramPlan {
+            program_number: 2,
+            pmt_pid: 0x1001,
+            pcr_source: ("c".to_string(), 0x110),
+            slots: vec![slot("c", 0x110, 0x300, 0x1B)],
+        });
+        plan
+    }
+
+    /// A swap that takes a program to an input on another clock, or on one not
+    /// known to be the same: nothing of the program goes out until a PCR of
+    /// that input has, on the slot that carries the program's. PES ahead of it
+    /// went out on the clock before, hours off for two encoders. The other
+    /// program does not notice.
+    #[tokio::test]
+    async fn a_swap_to_another_clock_waits_for_its_pcr() {
+        let switched = |legs: &[&str]| {
+            beside(one_program(vec![
+                switch_slot(legs, 0x100, 0x200, 0x1B),
+                switch_slot(legs, 0x101, 0x201, 0x0F),
+            ]))
+        };
+        for (before, from, after, to) in [
+            (pinned_beside("a"), "a", pinned_beside("b"), "b"),
+            // Another flow's inputs: their clocks are not known.
+            (pinned_beside("a"), "a", pinned_beside("x"), "x"),
+            (pinned_beside("x"), "x", pinned_beside("a"), "a"),
+            (pinned_beside("x"), "x", pinned_beside("y"), "y"),
+            (switched(&["a", "c"]), "a", switched(&["b", "c"]), "b"),
+            (switched(&["a", "b"]), "a", pinned_beside("b"), "b"),
+            (pinned_beside("a"), "a", switched(&["b", "a"]), "b"),
+        ] {
+            let what = format!("{from} to {to}");
+            let mut rig = Rig::start(before).await;
+            assert_eq!(feed(&mut rig, from, 90_000, 2).await, [0x200, 0x201], "{what}");
+            rig.replace(after).await;
+            // PES without PCR, and a PCR on the slot that does not carry it.
+            assert_eq!(feed(&mut rig, to, 90_000, 0).await, [0u16; 0], "{what}: held");
+            rig.send(to, es_pcr(0x101, 0x0F));
+            rig.send("c", es_pes(0x110, 0x1B, 90_000));
+            assert_eq!(rig.sent_pids(1).await, [0x300], "{what}: only the other program");
+            rig.send(to, es_pcr(0x100, 0x1B));
+            let sent = rig.sent(1).await;
+            assert_eq!(sent.len(), 1, "{what}");
+            assert_eq!(sent[0].0, 0x200, "{what}");
+            assert!(extract_pcr(&sent[0].1).is_some() && sent[0].1[5] & 0x80 != 0, "{what}: with DI");
+            assert_eq!(feed(&mut rig, to, 93_600, 2).await, [0x200, 0x201], "{what}: it plays on");
+        }
+        // The PCR moves to another slot, with it or without: the slot that was
+        // there plays on, on the clock it was on.
+        let mut two = pinned_beside("x");
+        two.programs[0].slots.push(slot("y", 0x102, 0x202, 0x0F));
+        let mut other = two.clone();
+        other.programs[0].pcr_source = ("y".to_string(), 0x102);
+        for (before, held) in [(pinned_beside("x"), true), (two, false)] {
+            let mut rig = Rig::start(before).await;
+            rig.replace(other.clone()).await;
+            rig.send("x", es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [0x200]);
+            rig.send("y", es_pes(0x102, 0x0F, 90_000));
+            let new: &[u16] = if held { &[] } else { &[0x202] };
+            assert_eq!(rig.sent_pids(new.len()).await, new, "for y's, not x's");
+            assert_eq!(feed(&mut rig, "x", 90_000, 2).await, [0x200, 0x201]);
+            rig.send("y", es_pcr(0x102, 0x0F));
+            let sent = rig.sent(1).await;
+            assert_eq!((sent.len(), sent[0].0), (1, 0x202));
+            assert!(sent[0].1[5] & 0x80 != 0, "the PCR is on another slot now: DI");
+            rig.send("y", es_pes(0x102, 0x0F, 93_600));
+            assert_eq!(feed(&mut rig, "x", 93_600, 3).await, [0x200, 0x201, 0x202]);
+            rig.send("x", es_pcr(0x100, 0x1B));
+            let sent = rig.sent(1).await;
+            assert_eq!(sent[0].1[5] & 0x80, 0, "x's is what it was");
+        }
+    }
+
+    /// Video of `video` with the PCR, and audio of `audio`, of one program.
+    fn breakaway(video: &str, audio: &str) -> AssemblyPlan {
+        let mut plan =
+            one_program(vec![slot(video, 0x100, 0x200, 0x1B), slot(audio, 0x101, 0x201, 0x0F)]);
+        plan.clocks.insert("c".into(), source_pcr("a"));
+        plan
+    }
+
+    /// What a swap leaves on the clock it was on, beside a PCR it takes to
+    /// another, plays on: no further from the last PCR than it was, it has
+    /// nothing to wait for. What the swap moves or adds waits.
+    #[tokio::test]
+    async fn a_swap_withholds_only_what_it_takes_to_another_clock() {
+        let on_pid = |mut plan: AssemblyPlan, pid: u16| {
+            plan.programs[0].slots[1].source.1 = pid;
+            plan
+        };
+        let with = |mut plan: AssemblyPlan, slots: Vec<AssemblySlot>| {
+            plan.programs[0].slots.extend(slots);
+            plan
+        };
+        let legs = |legs: &[&str]| switch_slot(legs, 0x101, 0x201, 0x0F);
+        let video = |id: &str, audio: AssemblySlot| {
+            let mut plan = breakaway(id, "a");
+            plan.programs[0].slots[1] = audio;
+            plan
+        };
+        // The audio slot on merger `key`, whose legs are the others, the
+        // primary on air, or the backup.
+        let on_leg = |key: &str, primary: &str, backup: &str, on_primary: bool| {
+            let forwarding_primary = ForwardingPrimary::default();
+            forwarding_primary.set(on_primary);
+            let (primary, backup) = (primary.to_string(), backup.to_string());
+            let seq_fallback = Default::default();
+            AssemblySlot {
+                hitless_legs: Some(HitlessLegs { primary, backup, forwarding_primary, seq_fallback }),
+                ..slot(key, 0x101, 0x201, 0x0F)
+            }
+        };
+        let merged = |key: &str, primary: &str, backup: &str| on_leg(key, primary, backup, true);
+        let failed_over = |primary: &str, backup: &str| on_leg("m", primary, backup, false);
+        let renumbered = AssemblySlot { out_pid: 0x202, ..merged("m", "a", "c") };
+        // Another program's slot on 0x202, before the swap gives it to this one.
+        let mut theirs = beside(breakaway("x", "a"));
+        theirs.programs[1].slots.push(slot("a", 0x102, 0x202, 0x0F));
+        let added = slot("a", 0x102, 0x202, 0x0F);
+        for (before, after, (id, pid), plays_on) in [
+            (breakaway("x", "a"), breakaway("y", "a"), ("a", 0x101), true),
+            (breakaway("x", "y"), breakaway("y", "y"), ("y", 0x101), true),
+            (breakaway("x", "x"), breakaway("y", "x"), ("x", 0x101), true),
+            // Another PID of its input, another input on its clock, another's.
+            (breakaway("x", "a"), on_pid(breakaway("y", "a"), 0x109), ("a", 0x109), true),
+            (breakaway("x", "a"), breakaway("y", "c"), ("c", 0x101), true),
+            (breakaway("x", "a"), breakaway("y", "b"), ("b", 0x101), false),
+            (breakaway("x", "a"), breakaway("y", "z"), ("z", 0x101), false),
+            (breakaway("x", "a"), breakaway("y", "y"), ("y", 0x101), false),
+            // One the swap adds, or takes from another program.
+            (breakaway("x", "a"), with(breakaway("y", "a"), vec![added.clone()]), ("a", 0x102), false),
+            (theirs, beside(with(breakaway("y", "a"), vec![added])), ("a", 0x102), false),
+            // A Switch slot on the leg it was on, and one that loses it.
+            (video("x", legs(&["a", "b"])), video("y", legs(&["a", "b"])), ("a", 0x101), true),
+            (video("x", legs(&["a", "b"])), video("y", legs(&["b"])), ("b", 0x101), false),
+            // A Hitless slot with the legs it had, whichever is on air, however
+            // they are merged.
+            (video("x", merged("m", "a", "b")), video("y", merged("m", "a", "b")), ("m", 0x101), true),
+            (video("x", merged("m", "a", "b")), video("y", merged("n", "a", "b")), ("n", 0x101), true),
+            (video("x", failed_over("a", "b")), video("y", merged("n", "a", "b")), ("n", 0x101), true),
+            // With another backup; with another primary, on its clock or not;
+            // and where it was on the backup, which it loses, or is left with.
+            (video("x", merged("m", "a", "b")), video("y", merged("n", "a", "y")), ("n", 0x101), true),
+            (video("x", merged("m", "a", "b")), video("y", merged("n", "c", "b")), ("n", 0x101), true),
+            (video("x", merged("m", "a", "c")), video("y", merged("n", "b", "c")), ("n", 0x101), false),
+            (video("x", merged("m", "x", "a")), video("y", merged("n", "y", "a")), ("n", 0x101), false),
+            (video("x", failed_over("a", "z")), video("y", merged("n", "a", "b")), ("n", 0x101), false),
+            (video("x", failed_over("b", "a")), video("y", merged("n", "c", "z")), ("n", 0x101), true),
+            // Merged no more, or only now; and on another `out_pid`.
+            (video("x", merged("m", "a", "b")), breakaway("y", "a"), ("a", 0x101), true),
+            (video("x", merged("m", "a", "b")), breakaway("y", "b"), ("b", 0x101), false),
+            (video("x", failed_over("a", "z")), breakaway("y", "z"), ("z", 0x101), true),
+            (breakaway("x", "a"), video("y", merged("m", "a", "b")), ("m", 0x101), true),
+            (breakaway("x", "b"), video("y", merged("m", "a", "b")), ("m", 0x101), false),
+            (video("x", merged("m", "a", "c")), video("y", renumbered), ("m", 0x101), false),
+        ] {
+            let what = format!("{id} 0x{pid:X} of {after:?}");
+            let reads = |s: &&AssemblySlot| s.reads(&(id.to_string(), pid));
+            let out = after.programs[0].slots.iter().find(reads).expect("a slot").out_pid;
+            let mut rig = Rig::start(before).await;
+            rig.replace(after).await;
+            rig.send(id, es_pes(pid, 0x0F, 90_000));
+            let expected: &[u16] = if plays_on { &[out] } else { &[] };
+            assert_eq!(rig.sent_pids(expected.len()).await, expected, "{what}");
+            rig.send("y", es_pes(0x100, 0x1B, 90_000));
+            assert_eq!(rig.sent_pids(0).await, [0u16; 0], "the video is y's: {what}");
+            rig.send("y", es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [0x200], "{what}");
+            rig.send(id, es_pes(pid, 0x0F, 93_600));
+            rig.send("y", es_pes(0x100, 0x1B, 93_600));
+            assert_eq!(rig.sent_pids(2).await, [0x200, out], "{what}");
+        }
+
+        // The clock a slot is on is that of the leg a Take put it on, or of the
+        // one the swap has it join.
+        for (audio, plays_on) in [(legs(&["a", "b"]), true), (slot("a", 0x101, 0x201, 0x0F), false)] {
+            let other = switch_slot(&["a", "b"], 0x102, 0x202, 0x0F);
+            let mut rig = Rig::start(with(video("x", audio), vec![other.clone()])).await;
+            rig.take("b", None).await;
+            until("the cut", || rig.on_air.contains("b")).await;
+            rig.replace(with(video("y", legs(&["a", "b"])), vec![other])).await;
+            rig.send("b", es_pes(0x101, 0x0F, 90_000));
+            let expected: &[u16] = if plays_on { &[0x201] } else { &[] };
+            assert_eq!(rig.sent_pids(expected.len()).await, expected);
+            rig.send("b", es_pes(0x102, 0x0F, 90_000));
+            assert_eq!(rig.sent_pids(1).await, [0x202]);
+        }
+
+        // One that goes while the program waits is new to it when it comes back.
+        let mut rig = Rig::start(breakaway("x", "a")).await;
+        let mut alone = breakaway("y", "a");
+        alone.programs[0].slots.truncate(1);
+        rig.replace(alone).await;
+        rig.replace(breakaway("y", "a")).await;
+        rig.send("a", es_pes(0x101, 0x0F, 90_000));
+        assert_eq!(rig.sent_pids(0).await, [0u16; 0]);
+        rig.send("y", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+
+        // What was held for a Take's PCR was not on the clock before.
+        let mut rig = Rig::start(switched_program()).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        let mut moved = switched_program();
+        moved.programs[0].slots[0] = slot("y", 0x100, 0x200, 0x1B);
+        moved.programs[0].pcr_source = ("y".to_string(), 0x100);
+        rig.replace(moved).await;
+        rig.send("b", es_pes(0x101, 0x0F, 90_000));
+        assert_eq!(rig.sent_pids(0).await, [0u16; 0], "held since the Take");
+        rig.send("y", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+    }
+
+    /// What plays on starts no 2 s: with the new input silent the program is
+    /// never said to go out without a PCR. They run from the first packet
+    /// withheld, over a swap that leaves the PCR where it waits for it, and
+    /// anew after one that takes it elsewhere.
+    #[tokio::test]
+    async fn what_plays_on_is_no_part_of_a_swaps_2_s() {
+        let code = "pid_bus_swap_no_pcr";
+        let mut rig = Rig::start(breakaway("x", "a")).await;
+        rig.replace(breakaway("y", "a")).await;
+        for _ in 0..6 {
+            rig.send("a", es_pes(0x101, 0x0F, 90_000));
+            assert_eq!(rig.sent_pids(1).await, [0x201]);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        assert!(rig.raised(code).is_empty(), "nothing was withheld");
+        rig.send("y", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(0).await, [0u16; 0], "still for y's PCR");
+        // 1.2 s on, a swap that only renumbers the program: they run on.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let mut renumbered = breakaway("y", "a");
+        renumbered.programs[0].program_number = 7;
+        rig.replace(renumbered).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        rig.send("y", es_pes(0x100, 0x1B, 93_600));
+        assert_eq!(rig.sent_pids(1).await, [0x200], "2.3 s after the first withheld");
+        assert_eq!(rig.raised(code).len(), 1);
+
+        // To x, and 1.2 s on to y again: they start over.
+        rig.replace(breakaway("x", "a")).await;
+        rig.send("x", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(0).await, [0u16; 0]);
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        rig.replace(breakaway("y", "a")).await;
+        rig.send("y", es_pes(0x100, 0x1B, 97_200));
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        rig.send("y", es_pes(0x100, 0x1B, 100_800));
+        rig.send("a", es_pes(0x101, 0x0F, 90_000));
+        assert_eq!(rig.sent_pids(1).await, [0x201], "y for 0.9 s, x for 1.3 s");
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        rig.send("y", es_pes(0x100, 0x1B, 104_400));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        assert_eq!(rig.raised(code).len(), 1);
+    }
+
+    /// Swaps at random of a program's two slots between inputs on one known
+    /// clock (a, c), on another (b) and on unknown ones (x, y), its PCR on
+    /// either, with a model beside: what goes out before a PCR.
+    #[tokio::test]
+    async fn a_swap_withholds_what_the_model_says() {
+        let mut runs = tokio::task::JoinSet::new();
+        for seed in 1..=16u64 {
+            runs.spawn(hold_at_random(seed));
+        }
+        let mut seen = [0usize; 3];
+        while let Some(run) = runs.join_next().await {
+            let run = run.expect("the model and the assembler agree");
+            seen.iter_mut().zip(run).for_each(|(all, of)| *all += of);
+        }
+        let [neither, one, both] = seen;
+        assert!(neither > 50 && one > 50 && both > 50, "slots withheld: {seen:?}");
+    }
+
+    /// One run of [`a_swap_withholds_what_the_model_says`]: after how many swaps
+    /// none, one and both of the slots were withheld.
+    async fn hold_at_random(seed: u64) -> [usize; 3] {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut below = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as usize % n
+        };
+        let planned = |on: [&str; 2], pcr: usize| {
+            let mut plan = breakaway(on[0], on[1]);
+            plan.programs[0].pcr_source = (on[pcr].to_string(), 0x100 + pcr as u16);
+            plan
+        };
+        let one_clock = |p: &str, q: &str| p == q || (["a", "c"].contains(&p) && ["a", "c"].contains(&q));
+        let mut rig = Rig::start(planned(["a", "a"], 0)).await;
+        let (mut on, mut pcr) = (["a", "a"], 0);
+        // Which slots wait for a PCR, and since when at the earliest.
+        let mut held: Option<[bool; 2]> = None;
+        let mut since = Instant::now();
+        let mut seen = [0; 3];
+        let mut log: Vec<String> = Vec::new();
+        for _ in 0..40 {
+            // The PCR now and then, and before 2 s of a hold are over.
+            if below(3) == 0 || (held.is_some() && since.elapsed() > Duration::from_secs(1)) {
+                rig.send(on[pcr], es_pcr(0x100 + pcr as u16, 0x1B));
+                assert_eq!(rig.sent_pids(1).await, [0x200 + pcr as u16], "seed {seed}: {log:#?}");
+                log.push(format!("PCR of {}", on[pcr]));
+                held = None;
+            }
+            let (was, was_pcr) = (on, pcr);
+            let mut inputs = || ["a", "b", "c", "x", "y"][below(5)];
+            on = [inputs(), inputs()];
+            if below(2) == 0 {
+                // One slot of the two.
+                let i = below(2);
+                on[i] = was[i];
+            }
+            pcr = below(2);
+            log.push(format!("{was:?} with slot {was_pcr}'s PCR to {on:?} with slot {pcr}'s"));
+            rig.replace(planned(on, pcr)).await;
+            let (from, now) = (was[was_pcr], on[pcr]);
+            if held.is_none() && one_clock(from, now) {
+                held = None;
+            } else {
+                let before = held.unwrap_or([false; 2]);
+                since = if held.is_none() { Instant::now() } else { since };
+                held = Some([0, 1].map(|i| before[i] || !one_clock(was[i], on[i])));
+            }
+            let withheld = held.unwrap_or([false; 2]);
+            seen[withheld.iter().filter(|w| **w).count()] += 1;
+            for i in [0, 1] {
+                rig.send(on[i], es_pes(0x100 + i as u16, 0x0F, 90_000));
+            }
+            let expected: Vec<u16> =
+                (0..2).filter(|i| !withheld[*i]).map(|i| 0x200 + i as u16).collect();
+            let sent = rig.sent_pids(expected.len()).await;
+            // A hold that ends while this waits lets out more, never less.
+            assert!(sent.len() >= expected.len(), "seed {seed}: {sent:X?} of {expected:X?}: {log:#?}");
+            if held.is_none() || since.elapsed() < Duration::from_millis(1_900) {
+                assert_eq!(sent, expected, "seed {seed}: {log:#?}");
+            }
+        }
+        seen
+    }
+
+    /// A swap that takes a program's PCR to no other clock waits for nothing:
+    /// to an input on the same one, to another PID of its input, whose clock
+    /// need not be known, and one that moves only slots beside it.
+    #[tokio::test]
+    async fn a_swap_on_one_clock_holds_nothing() {
+        let on = |id: &str, pid: u16| {
+            one_program(vec![slot(id, pid, 0x200, 0x1B), slot(id, pid + 1, 0x201, 0x0F)])
+        };
+        let mut audio = on("a", 0x100);
+        audio.programs[0].slots[1] = slot("x", 0x101, 0x201, 0x0F);
+        let mut moved = audio.clone();
+        moved.programs[0].slots[1] = slot("y", 0x101, 0x201, 0x0F);
+        let mut pcr_on_audio = on("x", 0x100);
+        pcr_on_audio.programs[0].pcr_source = ("x".to_string(), 0x101);
+        for (before, after, [video, sound]) in [
+            (one_clock(on("a", 0x100)), one_clock(on("b", 0x100)), [("b", 0x100), ("b", 0x101)]),
+            (on("a", 0x100), on("a", 0x110), [("a", 0x110), ("a", 0x111)]),
+            (on("x", 0x100), on("x", 0x110), [("x", 0x110), ("x", 0x111)]),
+            (audio, moved, [("a", 0x100), ("y", 0x101)]),
+            (on("x", 0x100), pcr_on_audio, [("x", 0x100), ("x", 0x101)]),
+        ] {
+            let mut rig = Rig::start(before).await;
+            rig.replace(after).await;
+            rig.send(video.0, es_pes(video.1, 0x1B, 90_000));
+            rig.send(sound.0, es_pes(sound.1, 0x0F, 90_000));
+            assert_eq!(rig.sent_pids(2).await, [0x200, 0x201], "{video:?} {sound:?}");
+        }
+    }
+
+    /// A program of a plan of one is that one's whatever else a swap changes of
+    /// it; one a swap adds was on no clock.
+    #[tokio::test]
+    async fn a_swap_holds_the_program_that_was_there() {
+        let on = |id: &str, number: u16, out_pid: u16| {
+            let mut plan = one_program(vec![slot(id, 0x100, out_pid, 0x1B)]);
+            plan.programs[0].program_number = number;
+            plan.programs[0].pmt_pid = 0x1000 + number;
+            plan
+        };
+        for (number, out_pid) in [(1, 0x300), (7, 0x200), (7, 0x300)] {
+            let mut rig = Rig::start(on("a", 1, 0x200)).await;
+            rig.replace(on("b", number, out_pid)).await;
+            rig.send("b", es_pes(0x100, 0x1B, 90_000));
+            assert_eq!(rig.sent_pids(0).await, [0u16; 0], "{number} on 0x{out_pid:X}");
+            rig.send("b", es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [out_pid]);
+        }
+        let mut rig = Rig::start(on("a", 1, 0x200)).await;
+        let mut two = on("a", 1, 0x200);
+        two.programs.extend(on("b", 2, 0x300).programs);
+        rig.replace(two.clone()).await;
+        rig.send("b", es_pes(0x100, 0x1B, 90_000));
+        rig.send("a", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(2).await, [0x200, 0x300]);
+        // Nor is a program held for one that goes.
+        two.programs.remove(0);
+        rig.replace(two).await;
+        rig.send("b", es_pes(0x100, 0x1B, 93_600));
+        assert_eq!(rig.sent_pids(1).await, [0x300]);
+    }
+
+    /// An input that sends its PCR on a PID the program does not carry is no
+    /// reason to leave it off air: the hold of a swap ends 2 s after the first
+    /// packet it withheld, and says so, once. Until a packet comes there is
+    /// nothing to end.
+    #[tokio::test]
+    async fn a_swap_to_an_input_without_pcr_holds_for_2_s() {
+        let code = "pid_bus_swap_no_pcr";
+        let mut rig = Rig::start(pinned_beside("a")).await;
+        rig.replace(pinned_beside("b")).await;
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(rig.raised(code).is_empty(), "b sends nothing");
+        let first = Instant::now();
+        let held_for = loop {
+            rig.send("b", es_pes(0x101, 0x0F, 90_000));
+            if !rig.sent_pids(0).await.is_empty() {
+                break first.elapsed();
+            }
+            assert!(first.elapsed() < Duration::from_secs(5), "b is on air");
+        };
+        assert!(held_for >= PCR_HOLD_ALARM, "{held_for:?}");
+        assert_eq!(
+            rig.raised(code),
+            [serde_json::json!({
+                "error_code": code,
+                "program_number": 1,
+                "out_pid": 0x200,
+                "input_id": "b",
+                "source_pid": 0x100,
+            })]
+        );
+        assert_eq!(feed(&mut rig, "b", 93_600, 2).await, [0x200, 0x201]);
+        // It is the program's clock from now on: a swap that leaves it alone
+        // holds nothing, and the next one to another does.
+        let mut more = pinned_beside("b");
+        more.programs[0].slots.push(slot("b", 0x102, 0x202, 0x0F));
+        rig.replace(more).await;
+        assert_eq!(feed(&mut rig, "b", 97_200, 2).await, [0x200, 0x201]);
+        rig.replace(pinned_beside("a")).await;
+        assert_eq!(feed(&mut rig, "a", 90_000, 0).await, [0u16; 0]);
+        rig.send("a", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(rig.raised(code).is_empty(), "nor once it has its PCR");
+        assert!(rig.raised("pid_bus_take_no_pcr").is_empty(), "no Take was");
+    }
+
+    /// The catalogue of an input with `programs`, each its PCR PID and the PIDs
+    /// of its streams.
+    fn pcr_catalogue(
+        programs: &[(Option<u16>, &[u16])],
+    ) -> Arc<crate::engine::ts_psi_catalog::PsiCatalogStore> {
+        use crate::engine::ts_psi_catalog::*;
+        let store = PsiCatalogStore::new();
+        seed_programs(&store, programs);
+        Arc::new(store)
+    }
+
+    fn seed_programs(
+        store: &crate::engine::ts_psi_catalog::PsiCatalogStore,
+        programs: &[(Option<u16>, &[u16])],
+    ) {
+        use crate::engine::ts_psi_catalog::*;
+        let stream = |pid: &u16| CatalogStream {
+            pid: *pid,
+            stream_type: 0x1B,
+            codec: "test".to_string(),
+            kind: CatalogStreamKind::Video,
+            descriptors_hex: String::new(),
+        };
+        let program = |(i, (pcr_pid, pids)): (usize, &(Option<u16>, &[u16]))| CatalogProgram {
+            program_number: i as u16 + 1,
+            pmt_pid: 0x1000 + i as u16,
+            pcr_pid: *pcr_pid,
+            streams: pids.iter().map(stream).collect(),
+        };
+        let programs = programs.iter().enumerate().map(program).collect();
+        PsiCatalogStore::seed_for_test(store, PsiCatalog { programs, last_updated_us: 1 });
+    }
+
+    /// No PCR is to come on a PID a program has, if none has its PCR there. A
+    /// PMT that names no PCR PID (0x1FFF, in the catalogue `None`) has it
+    /// nowhere; one that has not come yet says nothing.
+    #[test]
+    fn no_pcr_is_expected_where_the_pmts_have_it_elsewhere() {
+        for (programs, none) in [
+            (&[(Some(0x1FE), &[0x100, 0x101][..])][..], true),
+            (&[(Some(0x101), &[0x100, 0x101])], true),
+            (&[(None, &[0x100, 0x101])], true),
+            (&[(Some(0x1FFF), &[0x100])], true),
+            (&[(Some(0x1FE), &[0x100]), (Some(0x1FD), &[0x100])], true),
+            (&[(Some(0x1FE), &[0x100]), (None, &[])], true),
+            // There, for one of the programs that have the PID or of the others.
+            (&[(Some(0x100), &[0x100, 0x101])], false),
+            (&[(Some(0x1FE), &[0x100]), (Some(0x100), &[0x100])], false),
+            (&[(Some(0x1FE), &[0x100]), (Some(0x100), &[0x200])], false),
+            // Not known.
+            (&[(Some(0x1FE), &[0x101])], false),
+            (&[(None, &[])], false),
+            (&[], false),
+        ] {
+            let catalogs = HashMap::from([("b".to_string(), pcr_catalogue(programs))]);
+            assert_eq!(no_pcr_expected(&catalogs, &("b".to_string(), 0x100)), none, "{programs:X?}");
+            assert!(!no_pcr_expected(&catalogs, &("a".to_string(), 0x100)), "no catalogue");
+        }
+        let unread = HashMap::from([("b".to_string(), Arc::default())]);
+        assert!(!no_pcr_expected(&unread, &("b".to_string(), 0x100)));
+    }
+
+    /// A swap to an input whose PMT has its PCR on another PID does not wait
+    /// for one: no packet of the program is lost, and the event comes at once,
+    /// once, and for a swap within the input too. It ends another swap's hold
+    /// for the same leg, whose PMT has come since, but not a Take's.
+    #[tokio::test]
+    async fn a_swap_waits_for_no_pcr_that_is_not_to_come() {
+        let code = "pid_bus_swap_no_pcr";
+        let es: &[u16] = &[0x100, 0x101];
+        let late = Arc::new(crate::engine::ts_psi_catalog::PsiCatalogStore::new());
+        let catalogs = || {
+            HashMap::from([
+                ("a".to_string(), pcr_catalogue(&[(Some(0x100), es)])),
+                ("b".to_string(), pcr_catalogue(&[(Some(0x1FE), es)])),
+                ("late".to_string(), late.clone()),
+            ])
+        };
+        let said = |input: &str, out_pid: u16, source_pid: u16| {
+            vec![serde_json::json!({
+                "error_code": code,
+                "program_number": 1,
+                "out_pid": out_pid,
+                "input_id": input,
+                "source_pid": source_pid,
+            })]
+        };
+        let mut rig = Rig::start_with(pinned_beside("a"), None, catalogs()).await;
+        rig.replace(pinned_beside("b")).await;
+        assert_eq!(rig.raised(code), said("b", 0x200, 0x100), "at once");
+        for pts in 0..20 {
+            assert_eq!(feed(&mut rig, "b", 90_000 + pts, 2).await, [0x200, 0x201], "{pts}");
+        }
+        // It is not said again: 2 s on, and after a swap that leaves the PCR.
+        let mut more = pinned_beside("b");
+        more.programs[0].slots.push(slot("b", 0x102, 0x202, 0x0F));
+        rig.replace(more.clone()).await;
+        assert_eq!(feed(&mut rig, "b", 93_600, 2).await, [0x200, 0x201]);
+        assert!(rig.raised(code).is_empty());
+        // The PCR to another slot of the program, with none on its PID either.
+        more.programs[0].pcr_source.1 = 0x101;
+        rig.replace(more.clone()).await;
+        assert_eq!(rig.raised(code), said("b", 0x201, 0x101));
+        assert_eq!(feed(&mut rig, "b", 97_200, 2).await, [0x200, 0x201]);
+        // And back, under another number, which the event has.
+        more.programs[0].pcr_source.1 = 0x100;
+        more.programs[0].program_number = 7;
+        rig.replace(more.clone()).await;
+        let mut renumbered = said("b", 0x200, 0x100);
+        renumbered[0]["program_number"] = 7.into();
+        assert_eq!(rig.raised(code), renumbered);
+        // Nor is it said for another number, or `out_pid`, of the same slot.
+        more.programs[0].program_number = 1;
+        rig.replace(more.clone()).await;
+        more.programs[0].slots[0].out_pid = 0x210;
+        rig.replace(more).await;
+        assert!(rig.raised(code).is_empty());
+        assert_eq!(feed(&mut rig, "b", 97_200, 2).await, [0x201, 0x210]);
+        // To one with a PCR it waits for it, and within it for none.
+        rig.replace(pinned_beside("a")).await;
+        assert_eq!(feed(&mut rig, "a", 90_000, 0).await, [0u16; 0]);
+        rig.send("a", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        assert!(rig.raised(code).is_empty());
+        let mut on_audio = pinned_beside("a");
+        on_audio.programs[0].pcr_source.1 = 0x101;
+        rig.replace(on_audio).await;
+        assert_eq!(rig.raised(code), said("a", 0x201, 0x101));
+        assert_eq!(feed(&mut rig, "a", 93_600, 2).await, [0x200, 0x201]);
+
+        // One whose PMT comes during the hold: the next swap ends it.
+        rig.replace(pinned_beside("late")).await;
+        assert_eq!(feed(&mut rig, "late", 90_000, 0).await, [0u16; 0], "not known yet");
+        seed_programs(&late, &[(Some(0x1FE), es)]);
+        assert!(rig.raised(code).is_empty());
+        let mut more = pinned_beside("late");
+        more.programs[0].slots.push(slot("late", 0x102, 0x202, 0x0F));
+        rig.replace(more).await;
+        assert_eq!(rig.raised(code), said("late", 0x200, 0x100));
+        assert_eq!(feed(&mut rig, "late", 93_600, 2).await, [0x200, 0x201]);
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(rig.raised(code).is_empty(), "for the hold that ended");
+
+        // A Take's is over with the PCR, or with a swap to another leg.
+        let mut rig = Rig::start_with(beside(switched_program()), None, catalogs()).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b", "c"])).await;
+        let mut more = beside(switched_program());
+        more.programs[0].slots.push(switch_slot(&["a", "b"], 0x102, 0x202, 0x0F));
+        rig.replace(more).await;
+        assert_eq!(feed(&mut rig, "b", 90_000, 0).await, [0u16; 0], "as long as the Take's lasts");
+        assert!(rig.raised(code).is_empty());
+        rig.replace(pinned_beside("late")).await;
+        assert_eq!(rig.raised(code), said("late", 0x200, 0x100));
+        assert_eq!(feed(&mut rig, "late", 90_000, 2).await, [0x200, 0x201]);
+    }
+
+    /// A swap that leaves a program waiting where a Take put it leaves it to
+    /// wait as long as the Take would, under another number too; one that moves
+    /// it again, on the clock it waited for as well, is what it waits for from
+    /// then on.
+    #[tokio::test]
+    async fn a_swap_bounds_only_its_own_hold() {
+        let taken = async || {
+            let rig = Rig::start(beside(switched_program())).await;
+            rig.take("b", None).await;
+            until("the cut", || rig.plays(&["b", "c"])).await;
+            rig
+        };
+        let mut more = beside(switched_program());
+        more.programs[0].slots.push(switch_slot(&["a", "b"], 0x102, 0x202, 0x0F));
+        // A program with neither its number nor its slots is not the Take's:
+        // one the swap made of it goes out after 2 s.
+        let mut renumbered = beside(switched_program());
+        renumbered.programs[0].program_number = 7;
+        let mut made_of_it = more.clone();
+        made_of_it.programs[0].program_number = 7;
+        for (plan, goes_out) in [(renumbered, false), (made_of_it, true)] {
+            let mut rig = taken().await;
+            rig.replace(plan).await;
+            assert_eq!(feed(&mut rig, "b", 90_000, 0).await, [0u16; 0]);
+            tokio::time::sleep(Duration::from_millis(2_500)).await;
+            let out = if goes_out { vec![0x200, 0x201] } else { vec![] };
+            assert_eq!(feed(&mut rig, "b", 93_600, out.len()).await, out);
+            assert_eq!(rig.raised("pid_bus_swap_no_pcr").len(), usize::from(goes_out));
+        }
+        let mut rig = taken().await;
+        rig.replace(more).await;
+        assert_eq!(feed(&mut rig, "b", 90_000, 0).await, [0u16; 0]);
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert_eq!(feed(&mut rig, "b", 93_600, 0).await, [0u16; 0], "held as long as it takes");
+        assert!(rig.raised("pid_bus_swap_no_pcr").is_empty());
+
+        // c on b's clock: nothing of it is on air yet either.
+        let mut moved = pinned_beside("c");
+        moved.clocks.insert("c".into(), source_pcr("b"));
+        rig.replace(moved).await;
+        assert_eq!(feed(&mut rig, "c", 90_000, 0).await, [0u16; 0]);
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert_eq!(feed(&mut rig, "c", 93_600, 2).await, [0x200, 0x201]);
+        assert_eq!(rig.raised("pid_bus_swap_no_pcr").len(), 1);
+        // A Take after it waits as a Take does.
+        rig.replace(beside(switched_program())).await;
+        rig.send("a", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        rig.replace(pinned_beside("b")).await;
+        rig.replace(beside(one_program(vec![switch_slot(&["b", "a"], 0x100, 0x200, 0x1B)]))).await;
+        rig.take("a", None).await;
+        until("the cut", || rig.plays(&["a", "c"])).await;
+        for _ in 0..3 {
+            rig.send("a", es_pes(0x100, 0x1B, 90_000));
+            assert_eq!(rig.sent_pids(0).await, [0u16; 0]);
+            tokio::time::sleep(Duration::from_millis(900)).await;
+        }
+        assert!(rig.raised("pid_bus_swap_no_pcr").is_empty());
+    }
+
+    /// The source and PTS of each PES in `sent`, by the order they went out.
+    fn stamps(sent: &[(u16, Vec<u8>)]) -> Vec<(u16, u64)> {
+        sent.iter()
+            .filter_map(|(pid, p)| Some((*pid, crate::engine::ts_parse::extract_pes_pts(p)?)))
+            .collect()
+    }
+
+    /// What a fan-in the swap cancels had queued, with the packet it waits to
+    /// queue, goes out on the plan it was for, ahead of the swap's PSI, none
+    /// of it lost: on a stalled assembler that is a queue's depth. Nothing of
+    /// it goes out after, on the slot's PID or on a removed slot's, and no PCR
+    /// of it lets out a program that waits for the new input's.
+    #[tokio::test]
+    async fn what_a_cancelled_fan_in_queued_goes_out_before_the_swap() {
+        for (after, clock) in [("b", "a"), ("b", "b")] {
+            // The audio slot goes, the video is another input's.
+            let mut next = one_program(vec![slot(after, 0x100, 0x200, 0x1B)]);
+            next.clocks.insert("b".into(), source_pcr(clock));
+            let pinned = one_program(vec![slot("a", 0x100, 0x200, 0x1B), slot("a", 0x101, 0x201, 0x0F)]);
+            let mut rig = Rig::start(pinned).await;
+            let stall = rig.stall().await;
+            // More than there is room for: the rest is the bus ring's to lose.
+            for pts in 0..400u64 {
+                rig.send("a", es_pes(0x100, 0x1B, 90_000 + pts));
+                rig.send("a", es_pes(0x101, 0x0F, 90_000 + pts));
+            }
+            rig.send("a", es_pcr(0x100, 0x1B));
+            let taken = || 801 - rig.untaken("a", 0x100) - rig.untaken("a", 0x101);
+            until("a full queue, and what each waits to queue", || taken() == FANIN_DEPTH + 2).await;
+            while rig.out.try_recv().is_ok() {}
+            let done = rig.replaced(next).await;
+            drop(stall);
+            done.await.unwrap();
+            rig.send("b", es_pes(0x100, 0x1B, 5));
+            let wire = rig.wire(Duration::from_millis(300)).await;
+            let swap = wire
+                .iter()
+                .position(|(pid, p)| *pid == 0x1000 && pmt_version(p) == 1)
+                .expect("the swap's PMT");
+            let before = stamps(&wire[..swap]);
+            assert_eq!(before.len(), FANIN_DEPTH + 2, "all they had taken");
+            for pid in [0x200, 0x201] {
+                let of: Vec<u64> =
+                    before.iter().filter(|(p, _)| *p == pid).map(|(_, pts)| *pts).collect();
+                let all: Vec<u64> = (0..of.len() as u64).map(|i| 90_000 + i).collect();
+                assert_eq!(of, all, "0x{pid:X}: each once, in order");
+            }
+            let next: &[(u16, u64)] = if clock == "a" { &[(0x200, 5)] } else { &[] };
+            assert_eq!(stamps(&wire[swap..]), next, "only b's, if it need not wait");
+            rig.send("b", es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [0x200]);
+        }
+    }
+
+    /// What a fan-in the swap keeps had queued goes out on the new plan: the
+    /// packets of a leg it puts on air.
+    #[tokio::test]
+    async fn what_a_kept_fan_in_queued_goes_out_after_the_swap() {
+        let mut rig = Rig::start(one_clock(switched_program())).await;
+        let stall = rig.stall().await;
+        for pts in 0..5u64 {
+            rig.send("a", es_pes(0x100, 0x1B, 90_000 + pts));
+            rig.send("b", es_pes(0x100, 0x1B, 95_000 + pts));
+        }
+        until("the queue", || rig.untaken("a", 0x100) + rig.untaken("b", 0x100) == 0).await;
+        let mut pinned = one_program(vec![slot("b", 0x100, 0x300, 0x1B)]);
+        pinned.clocks.insert("b".into(), source_pcr("a"));
+        let done = rig.replaced(pinned).await;
+        // The next swap finds some of them still to send.
+        let mut again = one_program(vec![slot("b", 0x100, 0x301, 0x1B)]);
+        again.clocks.insert("b".into(), source_pcr("a"));
+        let and_again = rig.replaced(again).await;
+        drop(stall);
+        done.await.unwrap();
+        and_again.await.unwrap();
+        let of = |pid: u16, first: u64| (0..5).map(|i| (pid, first + i)).collect::<Vec<_>>();
+        let sent = stamps(&rig.sent(10).await);
+        assert_eq!(sent, [of(0x200, 90_000), of(0x301, 95_000)].concat());
+    }
+
+    /// Each slot goes on with its own fan-in, or for a slot whose `out_pid` is
+    /// new with its program's, before one that only reads the same source: two
+    /// slots that read one PID are not at one place in it.
+    #[test]
+    fn a_slot_goes_on_with_its_own_fan_in() {
+        let program = |number: u16, out_pid: u16| ProgramPlan {
+            program_number: number,
+            pmt_pid: 0x1000 + number,
+            pcr_source: ("a".to_string(), 0x100),
+            slots: vec![slot("a", 0x100, out_pid, 0x1B), slot("a", 0x101, out_pid + 1, 0x0F)],
+        };
+        let plan = |programs: &[(u16, u16)]| AssemblyPlan {
+            programs: programs.iter().map(|(n, pid)| program(*n, *pid)).collect(),
+            clocks: HashMap::new(),
+        };
+        let old = plan(&[(1, 0x200), (2, 0x300), (3, 0x400)]);
+        let mut flat: Vec<Option<FlatSlot>> = flatten(&old).into_iter().map(Some).collect();
+        let reused = |flat: &[Option<FlatSlot>], new: &AssemblyPlan| -> Vec<Option<usize>> {
+            let fanins = reuse_fanins(flat, new, &programs_before(&old, new));
+            for (slot, fanin) in &fanins {
+                if let Some(i) = fanin {
+                    assert_eq!(flat[*i].as_ref().expect("a live one").source, slot.source);
+                }
+            }
+            fanins.into_iter().map(|(_, fanin)| fanin).collect()
+        };
+        // In any order, whatever the numbers.
+        for (programs, expected) in [
+            ([(3, 0x400), (2, 0x300), (1, 0x200)], [4, 5, 2, 3, 0, 1]),
+            ([(7, 0x400), (1, 0x300), (2, 0x200)], [4, 5, 2, 3, 0, 1]),
+            // New PIDs: by the number. Then one of them has its own again.
+            ([(2, 0x310), (3, 0x410), (1, 0x210)], [2, 3, 4, 5, 0, 1]),
+            ([(2, 0x310), (3, 0x300), (1, 0x210)], [4, 5, 2, 3, 0, 1]),
+        ] {
+            assert_eq!(reused(&flat, &plan(&programs)), expected.map(Some), "{programs:?}");
+        }
+        // Any of its source, for a program that is new, while there is one.
+        let more = plan(&[(8, 0x500), (2, 0x300), (9, 0x600), (10, 0x700)]);
+        let fanins = reused(&flat, &more);
+        assert_eq!(fanins[2..4], [Some(2), Some(3)]);
+        assert_eq!([fanins[0], fanins[4], fanins[6]], [Some(0), Some(4), None]);
+        assert_eq!([fanins[1], fanins[5], fanins[7]], [Some(1), Some(5), None]);
+        // Never one that is gone.
+        flat[0] = None;
+        assert_eq!(reused(&flat, &plan(&[(1, 0x200)]))[0], Some(2));
+
+        // Two slots of one program on one PID.
+        let mut twice = plan(&[(1, 0x200)]);
+        twice.programs[0].slots[1] = slot("a", 0x100, 0x201, 0x1B);
+        let flat: Vec<Option<FlatSlot>> = flatten(&twice).into_iter().map(Some).collect();
+        let mut reversed = twice.clone();
+        reversed.programs[0].slots.reverse();
+        let fanins = reuse_fanins(&flat, &reversed, &programs_before(&twice, &reversed));
+        assert_eq!(fanins.iter().map(|(_, fanin)| *fanin).collect::<Vec<_>>(), [Some(1), Some(0)]);
+    }
+
+    /// A program is the one with its slots wherever a plan has it and whatever
+    /// its number: every way to order, leave out and renumber three programs.
+    #[test]
+    fn a_program_is_known_by_its_slots_and_its_number() {
+        let program = |number: u16, out_pid: u16| ProgramPlan {
+            program_number: number,
+            pmt_pid: 0x1000 + number,
+            pcr_source: ("a".to_string(), 0x100),
+            slots: vec![slot("a", 0x100, out_pid, 0x1B), slot("a", 0x101, out_pid + 1, 0x0F)],
+        };
+        let of = |programs: Vec<ProgramPlan>| AssemblyPlan { programs, clocks: HashMap::new() };
+        let pids = [0x200, 0x300, 0x400];
+        let old = of((0..3).map(|i| program(i as u16 + 1, pids[i])).collect());
+        let orders: Vec<Vec<usize>> = (0..64usize)
+            .map(|i| vec![i % 4, i / 4 % 4, i / 16])
+            .map(|order| order.into_iter().filter(|o| *o < 3).collect::<Vec<_>>())
+            .filter(|order| order.iter().collect::<HashSet<_>>().len() == order.len())
+            .collect();
+        let mut seen = 0;
+        for order in &orders {
+            for numbers in 0..125usize {
+                // Each a number of its own: one of the three, or two others.
+                let number = |i: usize| (numbers / 5usize.pow(i as u32) % 5 + 1) as u16;
+                let all: HashSet<u16> = (0..order.len()).map(number).collect();
+                if all.len() != order.len() {
+                    continue;
+                }
+                let programs = order.iter().enumerate().map(|(at, o)| program(number(at), pids[*o]));
+                let before = programs_before(&old, &of(programs.collect()));
+                assert_eq!(before, order.iter().map(|o| Some(*o)).collect::<Vec<_>>());
+                seen += 1;
+            }
+        }
+        assert!(seen > 500, "{seen}");
+
+        // Edited, by its number; moved to another and edited, by a PID; and
+        // no program is two, nor one that shares nothing.
+        let edit = |mut prog: ProgramPlan| {
+            prog.slots.push(slot("a", 0x102, prog.slots[0].out_pid + 2, 0x0F));
+            prog
+        };
+        let renumbered_pid = |number: u16, out_pid: u16, pid: u16| {
+            let mut prog = program(number, out_pid);
+            prog.slots[1].out_pid = pid;
+            prog
+        };
+        for (new, before) in [
+            (vec![edit(program(2, 0x500)), edit(program(1, 0x300))], vec![Some(1), Some(0)]),
+            (vec![edit(program(2, 0x200)), edit(program(1, 0x300))], vec![Some(1), Some(0)]),
+            (vec![edit(program(8, 0x300)), program(9, 0x600)], vec![Some(1), None]),
+            (vec![renumbered_pid(8, 0x500, 0x301), program(3, 0x700)], vec![Some(1), Some(2)]),
+            (vec![renumbered_pid(8, 0x200, 0x301), renumbered_pid(9, 0x500, 0x201)], vec![Some(0), None]),
+            (vec![program(8, 0x500)], vec![None]),
+        ] {
+            assert_eq!(programs_before(&old, &of(new.clone())), before, "{new:?}");
+        }
+        let one = of(vec![program(1, 0x200)]);
+        assert_eq!(programs_before(&one, &of(vec![program(8, 0x500)])), [Some(0)]);
+        let two = of(vec![program(8, 0x500), program(9, 0x600)]);
+        assert_eq!(programs_before(&one, &two), [None, None]);
+    }
+
+    /// After a swap to another clock nothing of the leg before it is compared
+    /// with a splice's, as after a Take: a slot had its PTS until the new leg
+    /// sent one. A swap on one clock leaves it.
+    #[tokio::test]
+    async fn a_swap_leaves_a_splice_no_reference_of_another_clock() {
+        let legs = |legs: [&str; 2]| {
+            one_program(vec![
+                switch_slot(&legs, 0x100, 0x200, 0x1B),
+                switch_slot(&legs, 0x101, 0x201, 0x0F),
+            ])
+        };
+        for (shared, armed) in [("b", false), ("a", true)] {
+            // a on its own clock or on b's, b and c on one.
+            let of = |mut plan: AssemblyPlan| {
+                plan.clocks.insert("b".into(), source_pcr(shared));
+                plan.clocks.insert("c".into(), source_pcr(shared));
+                pes_aligned(plan, 60_000)
+            };
+            let mut rig = Rig::start(of(legs(["a", "c"]))).await;
+            let adts = [0xFF, 0xF1, 0x40 | 3 << 2, 0x80];
+            let idr = [0, 0, 0, 1, 0x67, 66, 0, 30, 0xF4, 0x0A, 0x0F, 0x80, 0, 0, 0, 1, 0x65];
+            rig.send("a", es_pes_of(0x100, 0x1B, 90_000, &idr));
+            rig.send("a", es_pes_of(0x101, 0x0F, 90_000, &adts));
+            assert_eq!(rig.sent_pids(2).await, [0x200, 0x201]);
+            rig.replace(of(legs(["b", "c"]))).await;
+            assert!(rig.plays(&["b"]));
+            rig.take("c", None).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let reasons: Vec<_> =
+                rig.raised("pes_splice_degraded").iter().map(|d| d["reason"].clone()).collect();
+            if armed {
+                assert!(reasons.is_empty() && rig.plays(&["b"]), "b's PTS are a's: {reasons:?}");
+                continue;
+            }
+            assert_eq!(reasons, ["no_aligned_pes_reference"; 2]);
+            assert!(rig.plays(&["c"]));
+
+            // Nor its codec parameters: c's differ from a's, and b sent none.
+            let mut rig = Rig::start(of(legs(["a", "c"]))).await;
+            rig.send("a", es_pes_of(0x100, 0x1B, 90_000, &idr));
+            rig.send("a", es_pes_of(0x101, 0x0F, 90_000, &adts));
+            assert_eq!(rig.sent_pids(2).await, [0x200, 0x201]);
+            rig.replace(of(legs(["b", "c"]))).await;
+            rig.send("b", es_pcr(0x100, 0x1B));
+            assert_eq!(rig.sent_pids(1).await, [0x200]);
+            rig.send("b", es_pes_of(0x100, 0x1B, 90_000, &[]));
+            rig.send("b", es_pes_of(0x101, 0x0F, 90_000, &[]));
+            assert_eq!(rig.sent_pids(2).await, [0x200, 0x201]);
+            rig.take("c", None).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut other = idr;
+            other[7] = 40;
+            rig.send("c", es_pes_of(0x100, 0x1B, 97_200, &other));
+            rig.send("c", es_pes_of(0x101, 0x0F, 97_200, &[0xFF, 0xF1, 0x40 | 4 << 2, 0x80]));
+            assert_eq!(rig.sent_pids(2).await, [0x200, 0x201]);
+            assert!(rig.raised("pes_splice_codec_param_mismatch").is_empty());
+        }
+
+        // An unknown clock is the same one to itself: what a slot stays on is
+        // a reference still when its clock is known.
+        let mut rig = Rig::start(pes_aligned(legs(["x", "y"]), 60_000)).await;
+        feed(&mut rig, "x", 90_000, 2).await;
+        let mut more = pes_aligned(legs(["x", "y"]), 60_000);
+        more.programs[0].slots.push(slot("x", 0x102, 0x202, 0x0F));
+        rig.replace(more).await;
+        let known = clocks(&[("x", ClockIdentity::Wallclock), ("y", ClockIdentity::Wallclock)]);
+        rig.handle.plan_tx.send(PlanCommand::InputClocks(known)).await.unwrap();
+        rig.take("y", None).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rig.raised("pes_splice_degraded").is_empty(), "armed, not cut");
+
+        // A slot that was no Switch slot in between has none.
+        let of = |plan: AssemblyPlan| pes_aligned(one_clock(plan), 60_000);
+        let mut rig = Rig::start(of(legs(["a", "b"]))).await;
+        feed(&mut rig, "a", 90_000, 2).await;
+        rig.replace(one_clock(one_program(vec![slot("a", 0x100, 0x200, 0x1B), slot("a", 0x101, 0x201, 0x0F)]))).await;
+        rig.replace(of(legs(["a", "b"]))).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b"])).await;
+        let reasons: Vec<_> =
+            rig.raised("pes_splice_degraded").iter().map(|d| d["reason"].clone()).collect();
+        assert_eq!(reasons, ["no_aligned_pes_reference"; 2]);
+    }
+
+    /// A PCR carries the discontinuity where the swap gave its slot another
+    /// source, or the program's PCR, and one that was due goes on being due.
+    #[tokio::test]
+    async fn a_swap_marks_only_the_pcrs_it_moves() {
+        let mut rig = Rig::start(beside(one_clock(switched_program()))).await;
+        async fn marked(rig: &mut Rig, input: &str, pid: u16) -> (u16, bool) {
+            rig.send(input, es_pcr(pid, 0x1B));
+            let sent = rig.sent(1).await;
+            assert_eq!(sent.len(), 1);
+            (sent[0].0, sent[0].1[5] & 0x80 != 0)
+        }
+        assert_eq!(marked(&mut rig, "a", 0x100).await, (0x200, false));
+        assert_eq!(marked(&mut rig, "c", 0x110).await, (0x300, false));
+        // A slot beside the PCR's is another source's: not the PCR's.
+        let mut audio = beside(one_clock(switched_program()));
+        audio.programs[0].slots[1] = switch_slot(&["a", "b"], 0x109, 0x201, 0x0F);
+        audio.programs.reverse();
+        rig.replace(audio.clone()).await;
+        assert_eq!(marked(&mut rig, "a", 0x100).await, (0x200, false));
+        assert_eq!(marked(&mut rig, "c", 0x110).await, (0x300, false));
+        assert_eq!(marked(&mut rig, "a", 0x109).await, (0x201, true));
+        // Due since a Take, and still due after a swap of nothing it touches.
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b", "c"])).await;
+        audio.programs.reverse();
+        rig.replace(audio.clone()).await;
+        assert_eq!(marked(&mut rig, "b", 0x100).await, (0x200, true));
+        assert_eq!(marked(&mut rig, "b", 0x100).await, (0x200, false), "once");
+        // On a leg the swap puts it on, which it had before.
+        let mut one_leg = audio.clone();
+        one_leg.programs[0].slots[0] = switch_slot(&["a"], 0x100, 0x200, 0x1B);
+        one_leg.programs[0].slots[1] = switch_slot(&["a"], 0x109, 0x201, 0x0F);
+        rig.replace(one_leg).await;
+        assert_eq!(marked(&mut rig, "a", 0x100).await, (0x200, true));
+        rig.replace(audio.clone()).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b", "c"])).await;
+        assert_eq!(marked(&mut rig, "b", 0x100).await, (0x200, true));
+        // Another PID of the same input, and the PCR on another slot.
+        audio.programs[1].slots[0] = slot("c", 0x111, 0x300, 0x1B);
+        audio.programs[1].pcr_source = ("c".to_string(), 0x111);
+        audio.programs[0].pcr_source = ("b".to_string(), 0x109);
+        rig.replace(audio).await;
+        assert_eq!(marked(&mut rig, "c", 0x111).await, (0x300, true));
+        assert_eq!(marked(&mut rig, "b", 0x109).await, (0x201, true));
+        assert_eq!(marked(&mut rig, "b", 0x100).await, (0x200, false));
+    }
+
+    /// The output clock's rewriter follows one program's clock: from the swap
+    /// that first gives the output a second one, the first goes on with its
+    /// source's, and its next PCR says so. So does no PCR after it, nor one
+    /// after a swap back and one more.
+    #[tokio::test]
+    async fn the_first_swap_to_several_programs_marks_the_pcr_it_stops_regenerating() {
+        use crate::engine::av_sync_mux::AvSyncPacer;
+        use crate::engine::master_clock::MasterClockHandle;
+        let one = || one_program(vec![slot("a", 0x100, 0x200, 0x1B), slot("a", 0x101, 0x201, 0x0F)]);
+        let pacer = Arc::new(AvSyncPacer::new(MasterClockHandle::wallclock()));
+        let mut rig = Rig::start_with(one(), Some(pacer), Default::default()).await;
+        // The PCR `base` of a's next one, and its discontinuity.
+        async fn next(rig: &mut Rig, base: u32) -> (Option<u64>, bool) {
+            rig.send("a", es_pcr_at(0x100, 0x1B, base));
+            let sent: Vec<_> =
+                rig.sent(1).await.into_iter().filter(|(pid, _)| *pid == 0x200).collect();
+            assert_eq!(sent.len(), 1);
+            (extract_pcr(&sent[0].1), sent[0].1[5] & 0x80 != 0)
+        }
+        let source = |base: u32| Some(base as u64 * 300);
+        // The first packet of each PID is marked as such.
+        next(&mut rig, 900_000).await;
+        rig.send("a", es_pcr_at(0x101, 0x0F, 900_000));
+        assert_eq!(rig.sent_pids(1).await, [0x201]);
+        let (pcr, marked) = next(&mut rig, 903_600).await;
+        assert!(pcr != source(903_600) && !marked, "the output clock's: {pcr:?}");
+        // The order of the programs is no matter.
+        let mut two = beside(one());
+        two.programs.reverse();
+        rig.replace(two.clone()).await;
+        rig.send("a", es_pcr_at(0x101, 0x0F, 905_000));
+        let sent = rig.sent(1).await;
+        assert_eq!((sent[0].0, sent[0].1[5] & 0x80), (0x201, 0), "not the program's PCR");
+        assert_eq!(next(&mut rig, 907_200).await, (source(907_200), true), "the source's");
+        assert_eq!(next(&mut rig, 910_800).await, (source(910_800), false));
+        for plan in [one(), two] {
+            rig.replace(plan).await;
+            assert_eq!(next(&mut rig, 914_400).await, (source(914_400), false));
+        }
+    }
+
+    /// A changed PMT's version is the one after the last its number and its
+    /// PID had, whichever program had it, and a program that comes back does
+    /// not start over.
+    #[test]
+    fn a_pmt_version_never_steps_back_or_repeats() {
+        let prog = |program_number: u16, pmt_pid: u16| ProgramPlan {
+            program_number,
+            pmt_pid,
+            pcr_source: ("a".to_string(), 0x100),
+            slots: Vec::new(),
+        };
+        let mut versions = PmtVersions::default();
+        let mut bump = |number: u16, pid: u16| {
+            versions.bump(&prog(number, pid));
+            versions.of(&prog(number, pid))
+        };
+        assert_eq!([bump(1, 0x1000), bump(1, 0x1000), bump(1, 0x1000)], [0, 1, 2]);
+        assert_eq!(bump(2, 0x1001), 0, "its own");
+        assert_eq!(bump(7, 0x1000), 3, "another number on the PID");
+        assert_eq!(bump(1, 0x1000), 4, "the first one back");
+        assert_eq!(bump(2, 0x1000), 5, "ahead of the PID's, not of its own");
+        assert_eq!(bump(2, 0x1002), 6, "and of its own on a new PID");
+        assert_eq!(bump(1, 0x1002), 7);
+        let mut versions = PmtVersions::default();
+        let one = prog(1, 0x1000);
+        for expected in (0..32).chain(0..4) {
+            versions.bump(&one);
+            assert_eq!(versions.of(&one), expected);
+        }
+        // Over the wrap: 3 is past 30.
+        versions.by_program.insert(2, 30);
+        versions.bump(&prog(2, 0x1000));
+        assert_eq!(versions.of(&prog(2, 0x1000)), 4);
+        versions.by_pid.insert(0x1005, 30);
+        versions.bump(&prog(2, 0x1005));
+        assert_eq!(versions.of(&prog(2, 0x1005)), 5);
+    }
+
+    /// The PSI of a swap that changes a table says so, and the packets of a PID
+    /// count on when the swap makes a PMT's of an ES PID, or the reverse.
+    #[tokio::test]
+    async fn a_swap_that_changes_a_table_changes_its_version() {
+        let mut rig = Rig::start(two_programs()).await;
+        assert_eq!(rig.versions(&[0, 0x1000, 0x1001]).await, [0, 0, 0]);
+        // In another order the PAT is another one, the PMTs are not.
+        let mut plan = two_programs();
+        plan.programs.reverse();
+        rig.replace(plan.clone()).await;
+        assert_eq!(rig.versions(&[0, 0x1000, 0x1001]).await, [1, 0, 0]);
+        // Another PMT PID, number, PCR slot and slot.
+        plan.programs[0].pmt_pid = 0x1002;
+        rig.replace(plan.clone()).await;
+        assert_eq!(rig.versions(&[0, 0x1000, 0x1002]).await, [2, 0, 1]);
+        plan.programs[0].program_number = 5;
+        rig.replace(plan.clone()).await;
+        assert_eq!(rig.versions(&[0, 0x1000, 0x1002]).await, [3, 0, 2]);
+        plan.programs[1].pcr_source = ("a".to_string(), 0x101);
+        rig.replace(plan.clone()).await;
+        assert_eq!(rig.versions(&[0, 0x1000, 0x1002]).await, [3, 1, 2]);
+        plan.programs[1].slots.pop();
+        plan.programs[1].pcr_source = ("a".to_string(), 0x100);
+        rig.replace(plan.clone()).await;
+        assert_eq!(rig.versions(&[0, 0x1000, 0x1002]).await, [3, 2, 2]);
+        // A program that goes, and comes back.
+        let gone = plan.programs.remove(1);
+        rig.replace(plan.clone()).await;
+        assert_eq!(rig.versions(&[0, 0x1002]).await, [4, 2]);
+        plan.programs.push(gone);
+        rig.replace(plan).await;
+        assert_eq!(rig.versions(&[0, 0x1000, 0x1002]).await, [5, 3, 2]);
+
+        // Its packets on 0x1000 are PMTs until the swap, then video.
+        let plan = one_program(vec![slot("a", 0x100, 0x200, 0x1B)]);
+        let mut other = one_program(vec![slot("a", 0x100, 0x1000, 0x1B)]);
+        other.programs[0].pmt_pid = 0x200;
+        let mut rig = Rig::start(plan).await;
+        rig.send("a", es_pes(0x100, 0x1B, 90_000));
+        let mut wire = rig.wire(Duration::from_millis(250)).await;
+        rig.replace(other).await;
+        rig.send("a", es_pes(0x100, 0x1B, 90_000));
+        wire.extend(rig.wire(Duration::from_millis(250)).await);
+        for pid in [0x200, 0x1000] {
+            let ccs: Vec<u8> =
+                wire.iter().filter(|(p, _)| *p == pid).map(|(_, p)| p[3] & 0x0F).collect();
+            assert!(ccs.len() >= 3, "{ccs:?}");
+            assert!(ccs.windows(2).all(|w| w[1] == (w[0] + 1) & 0x0F), "0x{pid:X}: {ccs:?}");
+        }
+    }
+
+    /// What a swap leaves alone its PMT says as before: the codec the assembler
+    /// corrected, for which no second event is raised, and the descriptors of a
+    /// source that has no catalogue at the time. A change that came with the
+    /// swap bumps the version with it.
+    #[tokio::test]
+    async fn a_swap_leaves_a_pmt_it_does_not_edit() {
+        use crate::engine::ts_psi_catalog::*;
+        let store = |entries: &[(u16, u8, &str)]| {
+            let store = PsiCatalogStore::new();
+            let streams = entries.iter().map(|(pid, stream_type, descriptors)| CatalogStream {
+                pid: *pid,
+                stream_type: *stream_type,
+                codec: "test".to_string(),
+                kind: CatalogStreamKind::Video,
+                descriptors_hex: descriptors.to_string(),
+            });
+            let program = CatalogProgram {
+                program_number: 1,
+                pmt_pid: 0x1000,
+                pcr_pid: None,
+                streams: streams.collect(),
+            };
+            PsiCatalogStore::seed_for_test(
+                &store,
+                PsiCatalog { programs: vec![program], last_updated_us: 1 },
+            );
+            Arc::new(store)
+        };
+        // The program's PMT version, and its slots' stream types and descriptors.
+        async fn pmt(rig: &mut Rig) -> (u8, Vec<(u8, Vec<u8>)>) {
+            let wire = rig.wire(Duration::from_millis(350)).await;
+            let (_, p) = wire.iter().rev().find(|(pid, _)| *pid == 0x1000).expect("a PMT");
+            let end = 8 + ((p[6] as usize & 0x0F) << 8 | p[7] as usize) - 4;
+            let (mut at, mut entries) = (17, Vec::new());
+            while at < end {
+                let len = (p[at + 3] as usize & 0x0F) << 8 | p[at + 4] as usize;
+                entries.push((p[at], p[at + 5..at + 5 + len].to_vec()));
+                at += 5 + len;
+            }
+            (pmt_version(p), entries)
+        }
+        let audio = vec![0x6A, 0x01, 0x00];
+        let said = |video: u8| vec![(video, Vec::new()), (0x06, audio.clone())];
+        // Declared HEVC, and H.264.
+        let plan = || one_program(vec![slot("a", 0x100, 0x200, 0x24), slot("a", 0x101, 0x201, 0x06)]);
+        let full = || {
+            [("a".to_string(), store(&[(0x100, 0x1B, ""), (0x101, 0x06, "6a0100")]))]
+                .into_iter()
+                .collect::<HashMap<_, _>>()
+        };
+        let mismatches = |rig: &mut Rig| rig.raised("pid_bus_stream_type_mismatch").len();
+
+        let mut rig = Rig::start_with(plan(), None, full()).await;
+        assert_eq!(pmt(&mut rig).await, (1, said(0x1B)), "corrected");
+        assert_eq!(mismatches(&mut rig), 1);
+        let mut more = plan();
+        more.programs.insert(0, beside(plan()).programs.remove(1));
+        rig.replace(more.clone()).await;
+        assert_eq!(pmt(&mut rig).await, (1, said(0x1B)), "as it was");
+        more.programs.reverse();
+        rig.replace(more.clone()).await;
+        assert_eq!(pmt(&mut rig).await, (1, said(0x1B)), "and again");
+        assert_eq!(mismatches(&mut rig), 0);
+        // A catalogue that is empty when the swap comes.
+        let empty = [("a".to_string(), Arc::new(PsiCatalogStore::new()))].into_iter().collect();
+        let (applied, done) = tokio::sync::oneshot::channel();
+        more.programs.reverse();
+        let swap = |plan: AssemblyPlan, catalogs, applied| PlanCommand::ReplacePlan {
+            plan,
+            splice_mode_override: None,
+            catalogs,
+            applied: Some(applied),
+        };
+        rig.handle.plan_tx.send(swap(more.clone(), empty, applied)).await.unwrap();
+        done.await.unwrap();
+        assert_eq!(pmt(&mut rig).await, (1, said(0x1B)), "kept");
+        // One with another descriptor.
+        let other = [("a".to_string(), store(&[(0x100, 0x1B, ""), (0x101, 0x06, "7a0100")]))];
+        let (applied, done) = tokio::sync::oneshot::channel();
+        more.programs.reverse();
+        while rig.out.try_recv().is_ok() {}
+        rig.handle.plan_tx.send(swap(more.clone(), other.into_iter().collect(), applied)).await.unwrap();
+        done.await.unwrap();
+        for (pid, p) in rig.wire(Duration::from_millis(350)).await {
+            // The descriptor is the second entry's, the first has none.
+            let expected = if p[27] == 0x7A { 2 } else { 1 };
+            assert!(pid != 0x1000 || pmt_version(&p) == expected, "{p:X?}");
+        }
+        let other = vec![(0x1B, Vec::new()), (0x06, vec![0x7A, 0x01, 0x00])];
+        assert_eq!(pmt(&mut rig).await, (2, other));
+        // Declared as it is now, and another way: judged anew.
+        let mut edited = more.clone();
+        edited.programs[0].slots[0].stream_type = 0x1B;
+        rig.replace(edited.clone()).await;
+        assert_eq!(pmt(&mut rig).await.0, 2, "what the PMT says already");
+        edited.programs[0].slots[0].stream_type = 0x24;
+        rig.replace(edited.clone()).await;
+        assert_eq!(pmt(&mut rig).await.0, 4, "declared wrong, and corrected");
+        assert_eq!(mismatches(&mut rig), 1);
+        for (slot, pid) in edited.programs[0].slots.iter_mut().zip([0x100, 0x101]) {
+            slot.source = ("b".to_string(), pid);
+        }
+        edited.programs[0].pcr_source = ("b".to_string(), 0x100);
+        rig.replace(edited).await;
+        let b = vec![(0x24, Vec::new()), (0x06, Vec::new())];
+        assert_eq!(pmt(&mut rig).await.1, b, "declared so, and none of a's descriptors");
+    }
+
+    /// What became of a slot's source is said of the program it is in now.
+    #[tokio::test]
+    async fn a_closed_source_names_its_slots_program_as_it_is() {
+        let mut rig = Rig::start(two_programs()).await;
+        let mut plan = two_programs();
+        plan.programs.reverse();
+        plan.programs[1].program_number = 9;
+        rig.replace(plan.clone()).await;
+        let sender = rig.bus.sender_for("a", 0x100, 0x1B);
+        rig.bus.remove_if_same(&("a".to_string(), 0x100), &sender);
+        drop(sender);
+        let mut closed = Vec::new();
+        for _ in 0..100 {
+            closed = rig.raised("pid_bus_slot_source_closed");
+            if !closed.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            closed,
+            [serde_json::json!({
+                "error_code": "pid_bus_slot_source_closed",
+                "program_number": 9,
+                "out_pid": 0x200,
+                "source_input_id": "a",
+                "source_pid": 0x100,
+            })]
+        );
+        // The next swap reads it again.
+        plan.programs.reverse();
+        rig.replace(plan).await;
+        rig.send("a", es_pes(0x100, 0x1B, 90_000));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+    }
+
+    /// What [`swaps_leave_what_they_do_not_edit`] knows of a program on air.
+    #[derive(Clone, Debug)]
+    struct OnAirProgram {
+        /// Its slots: one of the five [`KINDS`].
+        kind: usize,
+        number: u16,
+        pmt_pid: u16,
+        /// With a slot more.
+        extra: bool,
+        /// The input it plays, the one a pending splice takes it to, and
+        /// whether it waits for that input's PCR.
+        on: &'static str,
+        to: Option<&'static str>,
+        held: bool,
+        /// Whether its next PCR is due a discontinuity.
+        marked: bool,
+    }
+
+    /// The inputs of a kind's slots (more than one: Switch slots, the first
+    /// initial) and the source PID of the first slot, its PCR's, the rest
+    /// following. e and f are on one clock, and their slots spliced.
+    const KINDS: [(&[&str], u16); 5] = [
+        (&["a", "b"], 0x100),
+        (&["e", "f"], 0x100),
+        (&["c"], 0x100),
+        (&["a", "b"], 0x110),
+        (&["d"], 0x100),
+    ];
+
+    impl OnAirProgram {
+        fn fresh(kind: usize, number: u16) -> Self {
+            let on = KINDS[kind].0[0];
+            let pmt_pid = 0x1000 + kind as u16;
+            Self { kind, number, pmt_pid, extra: false, on, to: None, held: false, marked: true }
+        }
+
+        /// The source and out PIDs of its slots.
+        fn pids(&self) -> Vec<(u16, u16)> {
+            let slots = 2 + u16::from(self.extra);
+            let out = 0x200 + 0x10 * self.kind as u16;
+            (0..slots).map(|i| (KINDS[self.kind].1 + i, out + i)).collect()
+        }
+
+        fn planned(&self) -> ProgramPlan {
+            let (legs, pcr_pid) = KINDS[self.kind];
+            let slots = self.pids().into_iter().map(|(src, out)| {
+                let mut slot = switch_slot(legs, src, out, 0x0F);
+                if legs.len() == 1 {
+                    slot.switch_legs = None;
+                }
+                if legs[0] == "e" {
+                    slot.splice_mode = crate::config::models::SpliceMode::PesAligned;
+                    slot.splice_budget_ms = Some(600_000);
+                }
+                slot
+            });
+            ProgramPlan {
+                program_number: self.number,
+                pmt_pid: self.pmt_pid,
+                pcr_source: (legs[0].to_string(), pcr_pid),
+                slots: slots.collect(),
+            }
+        }
+    }
+
+    /// The plan of `programs`, and every input but e and f on its own clock.
+    fn plan_on_air(programs: &[OnAirProgram]) -> AssemblyPlan {
+        let ids = ["a", "b", "c", "d", "e"].iter();
+        let mut map: HashMap<String, ClockIdentity> =
+            ids.map(|id| (id.to_string(), source_pcr(id))).collect();
+        map.insert("f".into(), source_pcr("e"));
+        AssemblyPlan { programs: programs.iter().map(OnAirProgram::planned).collect(), clocks: map }
+    }
+
+    /// Takes, PCRs and plan swaps at random, with a model beside: a swap moves
+    /// what it does not edit nowhere. A program's leg, its hold, its splice, the
+    /// discontinuity due on its PCR and the continuity counters of its PIDs are
+    /// what they were, and its PMT's version too unless the swap edits or
+    /// renumbers it, whatever programs the swap drops, adds or moves around it.
+    #[tokio::test]
+    async fn swaps_leave_what_they_do_not_edit() {
+        let mut runs = tokio::task::JoinSet::new();
+        for seed in 1..=16u64 {
+            runs.spawn(swap_at_random(seed));
+        }
+        let mut kept = 0;
+        while let Some(run) = runs.join_next().await {
+            kept += run.expect("the model and the assembler agree");
+        }
+        assert!(kept > 100, "programs a swap left alone: {kept}");
+    }
+
+    /// One run of [`swaps_leave_what_they_do_not_edit`]: how many times a swap
+    /// left a program that was taken, held or spliced as it was.
+    async fn swap_at_random(seed: u64) -> usize {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut below = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 33) as usize % n
+        };
+        let mut on_air: Vec<OnAirProgram> = [0, 1, 2]
+            .map(|kind| OnAirProgram { marked: false, ..OnAirProgram::fresh(kind, kind as u16 + 1) })
+            .to_vec();
+        let mut next_number = 10;
+        let mut rig = Rig::start(plan_on_air(&on_air)).await;
+        // The last version of each PMT, by PID and by number, and the last CC.
+        let mut by_pid: HashMap<u16, u8> = HashMap::new();
+        let mut by_number: HashMap<u16, u8> = HashMap::new();
+        let mut ccs: HashMap<u16, u8> = HashMap::new();
+        let mut kept = 0;
+        let mut log: Vec<String> = Vec::new();
+        for step in 0..40 {
+            // The programs whose PMT changes.
+            let mut edited: Vec<u16> = Vec::new();
+            let op = if step == 0 { 0 } else { 1 + below(8) };
+            match op {
+                0 => {}
+                1 | 2 => {
+                    let take = ["a", "b", "e", "f"][below(4)];
+                    log.push(format!("take {take}"));
+                    rig.take(take, None).await;
+                    for p in on_air.iter_mut().filter(|p| KINDS[p.kind].0.contains(&take)) {
+                        p.to = None;
+                        if KINDS[p.kind].0.len() == 1 || p.on == take {
+                            continue;
+                        }
+                        if p.kind == 1 {
+                            p.to = Some(take);
+                            continue;
+                        }
+                        (p.on, p.held, p.marked) = (take, true, true);
+                        edited.push(p.number);
+                    }
+                }
+                3 => {
+                    let from = ["a", "b", "c", "d"][below(4)];
+                    log.push(format!("PCR of {from}"));
+                    let mut expected = Vec::new();
+                    let pids: HashSet<u16> = on_air
+                        .iter()
+                        .filter(|p| KINDS[p.kind].0.contains(&from))
+                        .map(|p| KINDS[p.kind].1)
+                        .collect();
+                    pids.iter().for_each(|pid| rig.send(from, es_pcr(*pid, 0x0F)));
+                    for p in on_air.iter_mut().filter(|p| p.on == from) {
+                        expected.push((p.pids()[0].1, p.marked));
+                        (p.held, p.marked) = (false, false);
+                    }
+                    let sent = rig.sent(expected.len()).await;
+                    let mut got: Vec<_> = sent.iter().map(|(pid, p)| (*pid, p[5] & 0x80 != 0)).collect();
+                    got.sort_unstable();
+                    expected.sort_unstable();
+                    assert_eq!(got, expected, "seed {seed}: {log:#?}\n{on_air:#?}");
+                }
+                4 if on_air.iter().any(|p| p.to.is_some()) => {
+                    // The splice lands.
+                    let p = on_air.iter_mut().find(|p| p.to.is_some()).unwrap();
+                    let to = p.to.take().unwrap();
+                    log.push(format!("the splice to {to} lands"));
+                    for (src, _) in p.pids() {
+                        rig.send(to, es_pes(src, 0x0F, 99_000));
+                    }
+                    p.on = to;
+                    edited.push(p.number);
+                    assert_eq!(rig.sent_pids(2).await, [0x210, 0x211], "seed {seed}: {log:#?}");
+                }
+                _ => {
+                    let before = on_air.clone();
+                    // Drop some, add some, edit or renumber some.
+                    on_air.retain(|_| below(8) != 0);
+                    let left: HashSet<usize> = before.iter().map(|p| p.kind).collect();
+                    for kind in (0..KINDS.len()).filter(|kind| !left.contains(kind)) {
+                        if below(3) == 0 || (on_air.is_empty() && kind == 4) {
+                            next_number += 1;
+                            on_air.push(OnAirProgram::fresh(kind, next_number));
+                            edited.push(next_number);
+                        }
+                    }
+                    if on_air.is_empty() || (before.len() == 1 && on_air.len() == 1) {
+                        on_air = before.clone();
+                        edited.clear();
+                    }
+                    let slots_edited = |p: &OnAirProgram| {
+                        before.iter().any(|b| b.kind == p.kind && b.extra != p.extra)
+                    };
+                    for i in 0..on_air.len() {
+                        let p = &mut on_air[i];
+                        if edited.contains(&p.number) {
+                            continue;
+                        }
+                        match below(12) {
+                            0 if p.kind != 1 => {
+                                p.extra = !p.extra;
+                                edited.push(p.number);
+                            }
+                            1 => {
+                                p.pmt_pid ^= 0x80;
+                                edited.push(p.number);
+                            }
+                            2 => {
+                                next_number += 1;
+                                p.number = next_number;
+                                edited.push(p.number);
+                            }
+                            // Not with one whose slots the swap edits: with
+                            // another number as well, a hold of it would end
+                            // after 2 s, and the model knows no time.
+                            3 if i > 0 && !slots_edited(&on_air[0]) => {
+                                let other = std::mem::replace(&mut on_air[0].number, 0);
+                                on_air[0].number = std::mem::replace(&mut on_air[i].number, other);
+                                edited.extend([on_air[0].number, on_air[i].number]);
+                            }
+                            _ => {}
+                        }
+                    }
+                    for i in (1..on_air.len()).rev() {
+                        on_air.swap(i, below(i + 1));
+                    }
+                    let alone = |p: &&OnAirProgram| {
+                        !edited.contains(&p.number)
+                            && (p.held || p.to.is_some() || p.on != KINDS[p.kind].0[0])
+                    };
+                    kept += on_air.iter().filter(alone).count();
+                    log.push(format!("swap to {on_air:?}"));
+                    rig.replace(plan_on_air(&on_air)).await;
+                }
+            }
+
+            let context = || format!("seed {seed}: {log:#?}\n{on_air:#?}");
+            let pmt_pids: Vec<u16> = on_air.iter().map(|p| p.pmt_pid).collect();
+            for (p, version) in on_air.iter().zip(rig.versions(&pmt_pids).await) {
+                let last = [by_pid.insert(p.pmt_pid, version), by_number.insert(p.number, version)];
+                for last in last.into_iter().flatten() {
+                    // 17 where the number's last and the PID's are opposite.
+                    let ahead = version.wrapping_sub(last) & 0x1F;
+                    let right = if edited.contains(&p.number) { 1..18 } else { 0..1 };
+                    assert!(right.contains(&ahead), "version {last} to {version} of {p:?}, {}", context());
+                }
+            }
+            // A packet of every input of every slot: one on the leg a splice
+            // is to is behind what it waits for.
+            let mut expected = Vec::new();
+            let mut probes: HashMap<(&str, u16), u64> = HashMap::new();
+            for p in &on_air {
+                for (src, out) in p.pids() {
+                    for (i, input) in KINDS[p.kind].0.iter().enumerate() {
+                        let plays = *input == p.on;
+                        let pts = if plays { 90_000 } else { 10 } + i as u64;
+                        // Programs on the same inputs read PIDs of their own.
+                        probes.insert((input, src), pts);
+                        if plays && !p.held && p.to.is_none() {
+                            expected.push((out, pts));
+                        }
+                    }
+                }
+            }
+            for ((input, src), pts) in probes {
+                rig.send(input, es_pes(src, 0x0F, pts));
+            }
+            let sent = rig.sent(expected.len()).await;
+            let mut got = stamps(&sent);
+            got.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(got, expected, "{}", context());
+            for (pid, p) in &sent {
+                let cc = p[3] & 0x0F;
+                if let Some(last) = ccs.insert(*pid, cc) {
+                    // A PCR or the splice's own between two probes.
+                    let ahead = cc.wrapping_sub(last) & 0x0F;
+                    assert!((1..=2).contains(&ahead), "CC {last} to {cc} on 0x{pid:X}, {}", context());
+                }
+            }
+        }
+        kept
     }
 }

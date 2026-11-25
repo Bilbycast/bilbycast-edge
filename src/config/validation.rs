@@ -11052,6 +11052,41 @@ mod tests {
         );
     }
 
+    /// No PID is twice in an assembly that is accepted, on the flow's own
+    /// routes or the hot swap's, as an ES or a PMT PID of any of its programs,
+    /// and no program number: what the assembler keys a slot and a program by.
+    /// Every way to give two programs and three slots one of five PIDs each.
+    #[test]
+    fn an_accepted_assembly_has_no_pid_or_number_twice() {
+        let mut accepted = 0;
+        for pick in 0..5usize.pow(5) {
+            let pid = |i: u32| 0x100 + (pick / 5usize.pow(i) % 5) as u16;
+            let pids: Vec<u16> = (0..5).map(pid).collect();
+            let distinct =
+                pids.iter().collect::<std::collections::HashSet<_>>().len() == pids.len();
+            for (numbers, spts) in [([1, 2], false), ([3, 3], false), ([1, 2], true)] {
+                let mut a = spts_assembly("in-a");
+                if !spts {
+                    a.kind = AssemblyKind::Mpts;
+                }
+                let mut second = a.programs[0].clone();
+                let mut third = a.programs[0].streams[0].clone();
+                (a.programs[0].program_number, second.program_number) = (numbers[0], numbers[1]);
+                (a.programs[0].pmt_pid, second.pmt_pid) = (pids[0], pids[1]);
+                (a.programs[0].streams[0].out_pid, third.out_pid) = (pids[2], pids[3]);
+                second.streams[0].out_pid = pids[4];
+                a.programs[0].streams.push(third);
+                a.programs.push(second);
+                let right = distinct && numbers[0] != numbers[1] && !spts;
+                let flow = validate_flow_assembly(&a, &["in-a".into()], "test");
+                let swap = validate_assembly_for_hotswap(&a, "test");
+                assert_eq!((flow.is_ok(), swap.is_ok()), (right, right), "{pids:X?} {numbers:?}");
+                accepted += usize::from(right);
+            }
+        }
+        assert_eq!(accepted, 120, "the five PIDs in every order");
+    }
+
     #[test]
     fn assembly_rejects_duplicate_out_pid_across_programs() {
         // Cross-program out_pid duplicates were invisible pre-fix: the

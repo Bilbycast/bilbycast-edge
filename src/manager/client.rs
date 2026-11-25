@@ -1365,6 +1365,11 @@ pub fn edge_capabilities() -> Vec<&'static str> {
         // Pick Tracks + Advanced editor on this capability so older
         // edges hide the source type.
         "pid_bus_switch_slot",
+        // The assembler's clock check judges what two slots can play
+        // together, so the legs of a Switch slot may be on different
+        // clocks. Older edges judged every leg as if all of them played
+        // at once and refused such a plan; the manager gates on this.
+        "pid_bus_switch_clocks",
         // PES Switch redesign Phase 3: the elementary-stream bus is
         // node-wide (Phase 1) and accepts cross-flow assembly slot
         // references (Phase 2.1+); foreign-input Essence slots resolve
@@ -11277,6 +11282,14 @@ mod multiviewer_capability_gate {
     fn srt_path_differential_is_advertised() {
         let caps = super::edge_capabilities();
         assert!(caps.contains(&"srt-path-differential"), "caps = {caps:?}");
+    }
+
+    /// The manager accepts Switch legs on different clocks for an edge that
+    /// says this, on every build.
+    #[test]
+    fn switch_clocks_are_advertised() {
+        let caps = super::edge_capabilities();
+        assert!(caps.contains(&"pid_bus_switch_clocks"), "caps = {caps:?}");
     }
 
     #[cfg(feature = "multiviewer")]
