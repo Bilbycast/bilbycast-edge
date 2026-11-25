@@ -324,19 +324,21 @@ impl RelayLink {
     ) {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         let mut reports = Reports::new(Instant::now());
-        // When to bind again; or with the bind sent, when it is overdue.
-        let mut due: Option<Instant> = None;
+        let mut due: Option<Due> = None;
         let mut delay = RebindDelay(REBIND_MIN);
         let mut bound_at = Instant::now();
         let why = loop {
             let timer = async {
                 match due {
-                    Some(at) => sleep_until(at).await,
+                    Some(Due::Bind(at) | Due::Answer(at)) => sleep_until(at).await,
                     None => std::future::pending().await,
                 }
             };
             tokio::select! {
                 news = self.news() => match news {
+                    // Not about a side of ours: it is removed, and not bound
+                    // again yet. The relay may have had several things to say.
+                    Ok(_) if matches!(due, Some(Due::Bind(_))) => {}
                     Ok(news @ (News::Ready | News::Waiting)) => {
                         if due.take().is_some() {
                             bound_at = Instant::now();
@@ -361,7 +363,7 @@ impl RelayLink {
                             tunnel_id = %self.tunnel_id, reason = %reason,
                             "Tunnel removed on relay, binding again in {wait:?}"
                         );
-                        due = Some(Instant::now() + wait);
+                        due = Some(Due::Bind(Instant::now() + wait));
                         state_tx.send_replace(RelayTunnelState::Down);
                         reports.trouble = Some(Trouble::Removed(reason));
                     }
@@ -369,13 +371,13 @@ impl RelayLink {
                     Err(e) => break format!("control stream ended: {e}"),
                 },
                 _ = timer => {
-                    if self.unanswered {
+                    if let Some(Due::Answer(_)) = due {
                         break "the relay did not answer our bind".to_string();
                     }
                     if let Err(e) = self.bind().await {
                         break format!("bind not sent: {e}");
                     }
-                    due = Some(Instant::now() + REBIND_ANSWER_TIMEOUT);
+                    due = Some(Due::Answer(Instant::now() + REBIND_ANSWER_TIMEOUT));
                 }
                 _ = ping.tick() => {
                     if let Err(e) = protocol::write_message(&mut self.control, &EdgeMessage::Ping).await {
@@ -457,6 +459,15 @@ async fn read_notices(conn: Connection, received: mpsc::Sender<Received>) {
             Err(_) => tracing::debug!("Relay notice did not arrive in {NOTICE_TIMEOUT:?}"),
         }
     }
+}
+
+/// What there is to come of a side of ours that was removed.
+#[derive(Clone, Copy)]
+enum Due {
+    /// Our bind of it again.
+    Bind(Instant),
+    /// The relay's answer to that, by then.
+    Answer(Instant),
 }
 
 /// The wait before a removed side is bound again: see [`REBIND_MIN`].
@@ -691,6 +702,9 @@ pub async fn connect_with_retry(
 
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(60);
+    // The relays that have refused our bind since we began. That is an alarm
+    // once, and a refusal may go on for as long as nobody sees to it.
+    let mut refused_by = vec![false; n];
 
     loop {
         let relay_addr: &str = &params.relay_addrs[*active_idx];
@@ -741,13 +755,15 @@ pub async fn connect_with_retry(
                         relay = %relay_addr,
                         "Tunnel bind rejected by relay: {e}"
                     );
-                    event_sender.emit_flow_with_details(
-                        EventSeverity::Critical,
-                        category::TUNNEL,
-                        format!("Tunnel bind rejected by relay: {e}"),
-                        &params.tunnel_id.to_string(),
-                        serde_json::json!({ "relay_addr": relay_addr.to_string() }),
-                    );
+                    if !std::mem::replace(&mut refused_by[*active_idx], true) {
+                        event_sender.emit_flow_with_details(
+                            EventSeverity::Critical,
+                            category::TUNNEL,
+                            format!("Tunnel bind rejected by relay: {e}"),
+                            &params.tunnel_id.to_string(),
+                            serde_json::json!({ "relay_addr": relay_addr.to_string() }),
+                        );
+                    }
                 } else {
                     event_sender.emit_flow_with_details(
                         EventSeverity::Warning,
@@ -895,12 +911,15 @@ pub(super) mod stand_in {
 
         /// The next message that is not part of the greeting, nor a ping.
         pub(crate) async fn next(&mut self) -> EdgeMessage {
-            loop {
-                match self.raw().await {
-                    EdgeMessage::Hello { .. } | EdgeMessage::Identify { .. } | EdgeMessage::Ping => {}
-                    msg => return msg,
+            let next = async {
+                loop {
+                    match self.raw().await {
+                        EdgeMessage::Hello { .. } | EdgeMessage::Identify { .. } | EdgeMessage::Ping => {}
+                        msg => return msg,
+                    }
                 }
-            }
+            };
+            soon("a message", next).await
         }
 
         /// Whether the edge says anything within `time`, a ping aside.
@@ -1182,6 +1201,39 @@ mod tests {
         }
     }
 
+    /// Whatever else the relay had to say of a side it has removed changes
+    /// nothing: it is bound again, when it would have been, and stays down
+    /// until then.
+    #[tokio::test]
+    async fn what_is_said_of_a_removed_side_is_let_by() {
+        let mut t = Tunnel::start();
+        let (mut session, _conn) = t.up().await;
+        let removed = "tunnel closed by manager";
+        session.notify(down(t.id, removed)).await;
+        t.becomes(Down).await;
+        let since = Instant::now();
+        assert_eq!(t.told().await, format!("Tunnel removed on relay: {removed}"));
+        for msg in [
+            down(t.id, "peer disconnected"),
+            ready(t.id),
+            down(t.id, "tunnel deleted via relay REST API"),
+        ] {
+            session.notify(msg).await;
+            assert!(session.is_silent(A_MOMENT / 3).await);
+            assert_eq!(*t.state.borrow(), Down);
+        }
+        session.answer(waiting(t.id)).await;
+        t.assert_binds(&session.next().await);
+        let waited = since.elapsed();
+        assert!(waited >= REBIND_MIN - A_MOMENT && waited < REBIND_MIN * 2 - A_MOMENT, "{waited:?}");
+        assert_eq!(*t.state.borrow(), Down);
+        t.is_quiet(A_MOMENT).await;
+        session.answer(ready(t.id)).await;
+        t.becomes(Ready).await;
+        assert_eq!(t.told().await, "Tunnel ready again");
+        assert!(session.is_silent(REBIND_MIN + A_MOMENT).await);
+    }
+
     /// One removed again and again is bound again later and later. Its answer
     /// is that the tunnel is up, or that it is waiting.
     #[tokio::test(start_paused = true)]
@@ -1276,8 +1328,8 @@ mod tests {
         }
     }
 
-    /// The first bind is refused. That is reported, and it is tried again, not
-    /// at once, until it is not refused any more.
+    /// The first bind is refused. That is reported once, and it is tried again,
+    /// not at once, until it is not refused any more.
     #[tokio::test]
     async fn a_first_bind_that_is_refused_is_tried_again() {
         let mut t = Tunnel::start();
@@ -1288,15 +1340,45 @@ mod tests {
             assert!(refused.elapsed() >= Duration::from_secs(wait), "attempt {attempt}");
             assert_eq!(*t.state.borrow(), Connecting);
             session.answer(down(t.id, REFUSED)).await;
-            let event = t.event().await;
-            assert_eq!(event.severity, EventSeverity::Critical);
-            assert_eq!(event.message, format!("Tunnel bind rejected by relay: {REFUSED}"));
-            assert_eq!(event.details.unwrap()["relay_addr"], t.relay.addr);
+            if attempt == 0 {
+                let event = t.event().await;
+                assert_eq!(event.severity, EventSeverity::Critical);
+                assert_eq!(event.message, format!("Tunnel bind rejected by relay: {REFUSED}"));
+                assert_eq!(event.details.unwrap()["relay_addr"], t.relay.addr);
+            }
             refused = Instant::now();
             session.closed().await;
+            t.is_quiet(A_MOMENT).await;
         }
         let _up = t.up().await;
         t.is_quiet(A_MOMENT).await;
+    }
+
+    /// Of several relays each is reported once, whichever else is tried in
+    /// between.
+    #[tokio::test]
+    async fn each_relay_that_refuses_is_reported_once() {
+        let second = StandIn::start();
+        let mut t = Tunnel::start_with(|mut params| {
+            params.relay_addrs.push(second.addr.clone());
+            params
+        });
+        for round in 0..2 {
+            for second_relay in [false, true] {
+                let relay = if second_relay { &second } else { &t.relay };
+                let addr = relay.addr.clone();
+                let (mut session, _bind) = relay.binding().await;
+                session.answer(down(t.id, REFUSED)).await;
+                if round == 0 {
+                    let event = t.event().await;
+                    assert_eq!(event.message, format!("Tunnel bind rejected by relay: {REFUSED}"));
+                    assert_eq!(event.details.unwrap()["relay_addr"], addr);
+                }
+                session.closed().await;
+                t.is_quiet(A_MOMENT).await;
+            }
+        }
+        let _up = t.up().await;
     }
 
     /// The relay answers a bind before it says anything else of the side, but
@@ -1413,14 +1495,24 @@ mod tests {
     }
 
     /// The control stream ends and the connection does not: the edge closes
-    /// it, which ends the forwarder.
+    /// it, which ends the forwarder. It does not wait to bind a removed side
+    /// first.
     #[tokio::test]
     async fn the_end_of_the_control_stream_ends_the_connection() {
-        let mut t = Tunnel::start();
-        let (mut session, conn) = t.up().await;
-        session.send.finish().unwrap();
-        session.closed().await;
-        assert!(conn.close_reason().is_some());
+        for removed in [false, true] {
+            let mut t = Tunnel::start();
+            let (mut session, conn) = t.up().await;
+            if removed {
+                session.notify(down(t.id, "tunnel closed by manager")).await;
+                t.becomes(Down).await;
+            }
+            session.send.finish().unwrap();
+            session.closed().await;
+            assert!(conn.close_reason().is_some());
+            while let Ok(msg) = protocol::read_message(&mut session.recv).await {
+                assert!(matches!(msg, EdgeMessage::Ping), "{msg:?}");
+            }
+        }
     }
 
     /// Cancelled, the edge lets the connection go: at once, and while it waits

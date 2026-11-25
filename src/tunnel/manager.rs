@@ -1577,7 +1577,8 @@ mod relay_notice_tests {
     }
 
     /// Bound again and refused: the edge connects anew, is refused there too,
-    /// and goes on trying, more and more seldom, until it is not.
+    /// and goes on trying, more and more seldom, until it is not. It is an
+    /// alarm once, and again when a tunnel that was up since is refused.
     #[tokio::test]
     async fn a_tunnel_that_was_revoked_is_tried_again_and_again() {
         let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1591,16 +1592,25 @@ mod relay_notice_tests {
         edge.raises(&["Tunnel removed on relay: tunnel deleted via relay REST API"]).await;
         edge.raises(&["Tunnel disconnected from relay: quic datagram recv: closed"]).await;
         let mut since = tokio::time::Instant::now();
+        let rejected = ["Tunnel bind rejected by relay: bind authentication failed"];
         for wait in [1, 1, 2] {
             let (mut session, _bind) = edge.relay.binding().await;
             assert!(since.elapsed() >= Duration::from_millis(wait * 1000 - 100), "{:?}", since.elapsed());
             edge.becomes("connecting").await;
             session.answer(down(id, "bind authentication failed")).await;
-            edge.raises(&["Tunnel bind rejected by relay: bind authentication failed"]).await;
+            session.closed().await;
             since = tokio::time::Instant::now();
         }
-        let session = edge.up().await;
+        edge.raises(&rejected).await;
+        let mut session = edge.up().await;
         passes(&session, id, &app, &mut None).await;
+
+        session.send.finish().unwrap();
+        edge.raises(&["Tunnel disconnected from relay: quic datagram recv: closed"]).await;
+        let (mut session, _bind) = edge.relay.binding().await;
+        session.answer(down(id, "bind authentication failed")).await;
+        edge.raises(&rejected).await;
+        edge.up().await;
     }
 
     /// The relay's control stream ends: the edge connects anew.
