@@ -1056,7 +1056,7 @@ enum PcrHold {
     Take { since: Instant, reported: bool },
     /// A plan swap. The slots of `goes_on`, by `out_pid`, stay on the clock
     /// they were on, as far from the last PCR as they were: they go out as
-    /// they did. A Hitless slot is one of them while its legs are the same.
+    /// they did.
     /// An input that sends its PCR on a PID the program does not carry, which
     /// no swap refuses, would leave the others off air for good: the hold ends
     /// [`PCR_HOLD_ALARM`] after the first packet it withheld, and there is none

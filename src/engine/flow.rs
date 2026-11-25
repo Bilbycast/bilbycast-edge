@@ -7664,8 +7664,9 @@ impl AssemblySwap<'_> {
     /// 4. Brings the Hitless mergers in line with the new plan
     ///    ([`crate::engine::ts_es_hitless::HitlessMergers::apply`]): a slot
     ///    the swap leaves alone keeps its merger and the flag that says
-    ///    which leg it forwards; a slot it changes or drops has its merger
-    ///    stopped; every slot left without one gets a new one. Each slot's
+    ///    which leg it forwards; every other slot gets a new one. The merger
+    ///    of a slot changed on the primary it had is stopped first, that of a
+    ///    slot dropped or on another primary once the plan is on air. Each
     ///    bus key has one publisher, so no packet reaches the assembler
     ///    twice.
     /// 5. Sends [`crate::engine::ts_assembler::PlanCommand::ReplacePlan`]
