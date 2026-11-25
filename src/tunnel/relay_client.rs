@@ -35,7 +35,8 @@ const WAITING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long both sides have to be on the other relay before a tunnel moves
 /// there. Both edges may be trying each other's relay at that moment, and would
 /// go past each other, and again, if each went to where the other has just been.
-/// A tunnel that waits on its backup goes to its primary at once.
+/// A tunnel that waits on its backup goes to its primary at once, if that is
+/// near ([`OtherRelay::goes`]).
 const SETTLE: Duration = Duration::from_secs(1);
 
 /// How long we wait for the QUIC handshake to a relay to complete before
@@ -83,6 +84,10 @@ const FAILBACK_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a relay may take to have read that we leave it.
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How often a tunnel with two relays binds its side again while it waits for
+/// its peer ([`RelayLink::bind_again`]).
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
 /// The waits above that a test has no time for.
 #[derive(Debug, Clone)]
 pub struct Timing {
@@ -90,6 +95,7 @@ pub struct Timing {
     pub waiting: Duration,
     pub settle: Duration,
     pub failback: Duration,
+    pub refresh: Duration,
 }
 
 impl Default for Timing {
@@ -99,6 +105,7 @@ impl Default for Timing {
             waiting: WAITING_TIMEOUT,
             settle: SETTLE,
             failback: FAILBACK_INTERVAL,
+            refresh: REFRESH_INTERVAL,
         }
     }
 }
@@ -185,6 +192,8 @@ enum News {
     Removed(String),
     /// Our bind was refused.
     Refused(String),
+    /// Nothing, and our side may be bound no more ([`RelayLink::bind_again`]).
+    Stale,
 }
 
 impl News {
@@ -203,20 +212,38 @@ impl News {
     }
 }
 
+/// What others have of a [`RelayLink`].
+#[derive(Clone)]
+pub struct LinkHandle {
+    conn: Connection,
+    /// Has the link bind our side again ([`RelayLink::bind_again`]). One that is up
+    /// does so only if told `true`.
+    again: mpsc::Sender<bool>,
+}
+
 /// A connection to a relay, with our side of one tunnel bound on it.
 pub struct RelayLink {
-    conn: Connection,
+    handle: LinkHandle,
+    again: mpsc::Receiver<bool>,
     control: quinn::SendStream,
     tunnel_id: Uuid,
     bind: EdgeMessage,
     received: mpsc::Receiver<Received>,
     /// Read the relay's streams into `received`, and end with the link.
     _readers: JoinSet<()>,
-    /// The last bind sent has not been answered yet.
+    /// When we last bound, and whether that has not been answered yet.
+    bound_at: Instant,
     unanswered: bool,
     /// The last notice read ahead of that answer. The relay sends a notice
     /// about a side it has bound, so the notice is the later of the two.
     early: Option<News>,
+    /// What the relay's news has come to.
+    state: RelayTunnelState,
+    /// The peer has been there.
+    has_met: bool,
+    /// How often we bind again while it is not, and when next.
+    refresh_interval: Option<Duration>,
+    refresh: Option<Instant>,
 }
 
 impl RelayLink {
@@ -276,36 +303,87 @@ impl RelayLink {
         let mut readers = JoinSet::new();
         readers.spawn(read_control(control_recv, received_tx.clone()));
         readers.spawn(read_notices(conn.clone(), received_tx));
+        let (again_tx, again) = mpsc::channel(4);
         Ok(Self {
-            conn,
+            handle: LinkHandle { conn, again: again_tx },
+            again,
             control,
             tunnel_id: params.tunnel_id,
             bind: bind_message(params),
             received,
             _readers: readers,
+            bound_at: Instant::now(),
             unanswered: false,
             early: None,
+            state: RelayTunnelState::Connecting,
+            has_met: false,
+            refresh_interval: (params.relay_addrs.len() > 1).then_some(params.timing.refresh),
+            refresh: None,
         })
     }
 
     /// Bind our side of the tunnel.
     async fn bind(&mut self) -> Result<()> {
+        self.bound_at = Instant::now();
         self.unanswered = true;
         protocol::write_message(&mut self.control, &self.bind).await
     }
 
+    async fn unbind(&mut self) -> Result<()> {
+        let unbind = EdgeMessage::TunnelUnbind { tunnel_id: self.tunnel_id };
+        protocol::write_message(&mut self.control, &unbind).await
+    }
+
+    /// Bind our side again, in case another bind of it has taken it away: that of
+    /// a cloned edge, or our own on the other relay if the two are one relay's
+    /// addresses. The relay says nothing of it, nor when the other has gone and
+    /// nobody has the side.
+    ///
+    /// Relays up to v0.20.0 count the binds of a connection, less its unbinds, and
+    /// refuse too many. Nothing is lost by unbinding first while the peer is away.
+    async fn bind_again(&mut self) -> Result<()> {
+        if self.state == RelayTunnelState::Waiting {
+            self.unbind().await?;
+        }
+        self.bind().await
+    }
+
     /// The connection, for what the tunnel carries.
     pub fn conn(&self) -> &Connection {
-        &self.conn
+        &self.handle.conn
+    }
+
+    /// What [`other_relay`] needs of the link the tunnel is on.
+    pub fn handle(&self) -> &LinkHandle {
+        &self.handle
+    }
+
+    /// Leave the relay, for the link that the tunnel has moved to.
+    pub fn leave_for(self, other: &Self, after: Duration) {
+        let later = self.bound_at > other.bound_at;
+        self.let_go(other.handle.clone(), after, later);
+    }
+
+    /// Leave the relay, and then have the link that the tunnel is on bind again. If
+    /// that is up, it is to only if our bind is the `later` and may have taken the
+    /// side from it. It has not if it was answered, and not with a `TunnelReady`,
+    /// nor has any come since: that is another relay.
+    fn let_go(self, active: LinkHandle, after: Duration, later: bool) {
+        let if_up = self.unanswered || later && self.has_met;
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                self.leave(after).await;
+                let _ = active.again.try_send(if_up);
+            });
+        }
     }
 
     /// Let go of our side, so that the relay does not list it any more, and of
     /// the connection. The streams that are open on it keep it until they end.
-    pub async fn leave(mut self, after: Duration) {
+    async fn leave(mut self, after: Duration) {
         tokio::time::sleep(after).await;
         let left = async {
-            let unbind = EdgeMessage::TunnelUnbind { tunnel_id: self.tunnel_id };
-            protocol::write_message(&mut self.control, &unbind).await?;
+            self.unbind().await?;
             // A connection that is closed delivers nothing more.
             self.control.finish()?;
             self.control.stopped().await?;
@@ -323,23 +401,53 @@ impl RelayLink {
             if !self.unanswered
                 && let Some(news) = self.early.take()
             {
-                return Ok(news);
+                return Ok(self.taken_in(news));
             }
-            match self.received.recv().await {
-                Some(Received::Control(msg)) => {
-                    if let Some(news) = self.answer(msg) {
-                        return Ok(news);
-                    }
+            let refresh = self.refresh;
+            let stale = async move {
+                match refresh {
+                    Some(at) => sleep_until(at).await,
+                    None => std::future::pending().await,
                 }
-                Some(Received::Notice(msg)) => match self.notice(msg) {
-                    Some(news) if self.unanswered => self.early = Some(news),
-                    Some(news) => return Ok(news),
-                    None => {}
+            };
+            let news = tokio::select! {
+                biased;
+                received = self.received.recv() => match received {
+                    Some(Received::Control(msg)) => self.answer(msg),
+                    Some(Received::Notice(msg)) => match self.notice(msg) {
+                        Some(news) if self.unanswered => {
+                            self.early = Some(news);
+                            None
+                        }
+                        news => news,
+                    },
+                    Some(Received::Ended(e)) => return Err(e),
+                    None => anyhow::bail!("relay streams are no longer read"),
                 },
-                Some(Received::Ended(e)) => return Err(e),
-                None => anyhow::bail!("relay streams are no longer read"),
+                Some(if_up) = self.again.recv() => {
+                    (if_up || self.state != RelayTunnelState::Ready).then_some(News::Stale)
+                }
+                _ = stale => Some(News::Stale),
+            };
+            if let Some(news) = news {
+                return Ok(self.taken_in(news));
             }
         }
+    }
+
+    fn taken_in(&mut self, news: News) -> News {
+        self.state = match news {
+            News::Ready => RelayTunnelState::Ready,
+            News::Waiting | News::PeerGone(_) => RelayTunnelState::Waiting,
+            News::Removed(_) | News::Refused(_) => RelayTunnelState::Down,
+            News::Stale => self.state,
+        };
+        self.has_met |= self.state == RelayTunnelState::Ready;
+        self.refresh = match self.state {
+            RelayTunnelState::Waiting => self.refresh_interval.map(|wait| Instant::now() + wait),
+            _ => None,
+        };
+        news
     }
 
     /// What a message on the control stream says of our tunnel.
@@ -421,6 +529,9 @@ impl RelayLink {
                     // Not about a side of ours: it is removed, and not bound
                     // again yet. The relay may have had several things to say.
                     Ok(_) if matches!(due, Some(Due::Bind(_))) => {}
+                    Ok(News::Stale) => if let Err(e) = self.bind_again().await {
+                        break format!("bind not sent: {e}");
+                    },
                     Ok(news @ (News::Ready | News::Waiting)) => {
                         if due.take().is_some() {
                             bound_at = Instant::now();
@@ -429,7 +540,7 @@ impl RelayLink {
                             tracing::info!(tunnel_id = %self.tunnel_id, "Tunnel ready");
                             state_tx.send_replace(RelayTunnelState::Ready);
                             reports.trouble = None;
-                        } else {
+                        } else if *state_tx.borrow() != RelayTunnelState::Waiting {
                             tracing::info!(tunnel_id = %self.tunnel_id, "Waiting for peer to bind");
                             state_tx.send_replace(RelayTunnelState::Waiting);
                         }
@@ -495,7 +606,7 @@ impl RelayLink {
             }
         };
         tracing::warn!(tunnel_id = %self.tunnel_id, relay = %relay_addr, "Leaving the relay connection: {why}");
-        self.conn.close(0u32.into(), b"");
+        self.conn().close(0u32.into(), b"");
     }
 }
 
@@ -658,6 +769,8 @@ pub(super) struct OtherRelay {
     /// How long that puts off the next try, if it waits for its peer.
     pause: Duration,
     delay: RebindDelay,
+    /// The peer has been left on a primary that is too far.
+    gave_way: bool,
 }
 
 impl OtherRelay {
@@ -670,17 +783,21 @@ impl OtherRelay {
             idle: now,
             pause: Duration::ZERO,
             delay: RebindDelay(REBIND_MIN),
+            gave_way: false,
         }
     }
 
     pub(super) fn set(&mut self, state: RelayTunnelState, now: Instant) {
-        if state != self.state {
-            (self.state, self.since) = (state, now);
+        if state == self.state {
+            return;
         }
-        if state == RelayTunnelState::Ready {
+        // A peer that was there for less than it settles has only looked.
+        if self.state == RelayTunnelState::Ready && now >= self.since + 2 * self.timing.settle {
             self.pause = Duration::ZERO;
             self.delay = RebindDelay(REBIND_MIN);
+            self.gave_way = false;
         }
+        (self.state, self.since) = (state, now);
     }
 
     /// When the other relay is tried next, if it is.
@@ -712,6 +829,26 @@ impl OtherRelay {
             true => Duration::ZERO,
             false => self.timing.settle,
         }
+    }
+
+    /// Both sides are on the other relay: whether the tunnel goes there. One that
+    /// waits on its backup does not go to a primary that is too far until the peer
+    /// has had the time to come to the backup. A peer that starts looks for us on
+    /// the primary first, and on the backup only if we are not there.
+    pub(super) fn goes(&mut self, now: Instant, is_near: impl FnOnce() -> bool) -> bool {
+        let waits = self.on_backup && self.state != RelayTunnelState::Ready;
+        if !waits || self.gave_way || is_near() {
+            return true;
+        }
+        self.gave_way = true;
+        // What it waits, and what it may take to connect.
+        (self.idle, self.pause) = (now, self.timing.waiting + self.timing.connect);
+        false
+    }
+
+    /// The peer is not on the other relay.
+    pub(super) fn alone(&mut self) {
+        self.gave_way = false;
     }
 
     /// The try came to nothing.
@@ -751,14 +888,16 @@ impl Refusals {
 
 /// A second connection, that the tunnel may move to. It is let go of if it does
 /// not.
-struct Second(Option<RelayLink>);
+struct Second {
+    link: Option<RelayLink>,
+    /// The one the tunnel is on.
+    active: LinkHandle,
+}
 
 impl Drop for Second {
     fn drop(&mut self) {
-        if let Some(link) = self.0.take()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            runtime.spawn(link.leave(Duration::ZERO));
+        if let Some(link) = self.link.take() {
+            link.let_go(self.active.clone(), Duration::ZERO, true);
         }
     }
 }
@@ -767,16 +906,17 @@ impl Drop for Second {
 /// move there. With one relay there is none.
 ///
 /// Our side is bound there too, on a connection of its own, and the tunnel moves
-/// when the relay says that both sides are there. What it is on stays as it is
-/// until then: nothing is interrupted, and nothing moves while the peer cannot
-/// come too. That goes on for as long as the tunnel waits for its peer, which
-/// may have lost its path to the relay the tunnel is on, and, if the primary is
-/// near enough, while the tunnel is up on its backup. The peer needs to know
-/// nothing of it: an older one binds where it happens to look.
+/// when the relay says that both sides are there, but not at once to a primary
+/// that is too far ([`OtherRelay::goes`]). What it is on stays as it is until then:
+/// nothing is interrupted, and nothing moves while the peer cannot come too. That
+/// goes on for as long as the tunnel waits for its peer, which may have lost its
+/// path to the relay the tunnel is on, and, if the primary is near enough, while
+/// the tunnel is up on its backup. The peer needs to know nothing of it: an older
+/// one binds where it happens to look.
 pub async fn other_relay(
     params: &RelayTunnelParams,
     idx: usize,
-    active: &Connection,
+    active: &LinkHandle,
     state: watch::Receiver<RelayTunnelState>,
     events: &EventSender,
 ) -> (usize, RelayLink) {
@@ -786,7 +926,7 @@ pub async fn other_relay(
 async fn other_relay_refusing(
     params: &RelayTunnelParams,
     idx: usize,
-    active: &Connection,
+    active: &LinkHandle,
     mut state: watch::Receiver<RelayTunnelState>,
     refusals: &mut Refusals,
     events: &EventSender,
@@ -812,7 +952,12 @@ async fn other_relay_refusing(
             },
         }
         match try_other(params, to, active, &mut state, &mut rule).await {
-            Ok(link) => return (to, link),
+            Ok(Some(link)) => return (to, link),
+            Ok(None) => tracing::info!(
+                tunnel_id = %params.tunnel_id,
+                relay = %params.relay_addrs[to],
+                "The peer is on a primary that is too far, leaving it to come to the backup"
+            ),
             Err(e) => {
                 tracing::debug!(
                     tunnel_id = %params.tunnel_id,
@@ -829,18 +974,19 @@ async fn other_relay_refusing(
 }
 
 /// Bind our side on relay `to` and wait there until the tunnel is to move to it.
+/// `None` if the peer is there and it is not to ([`OtherRelay::goes`]).
 async fn try_other(
     params: &RelayTunnelParams,
     to: usize,
-    active: &Connection,
+    active: &LinkHandle,
     state: &mut watch::Receiver<RelayTunnelState>,
     rule: &mut OtherRelay,
-) -> Result<RelayLink> {
+) -> Result<Option<RelayLink>> {
     let link = RelayLink::dial(params, &params.relay_addrs[to]).await?;
-    let conn = link.conn.clone();
+    let conn = link.conn().clone();
     let is_near = || {
         let gate = Duration::from_millis(params.failback_rtt_gate_ms.into());
-        let (rtt, active_rtt) = (conn.rtt(), active.rtt());
+        let (rtt, active_rtt) = (conn.rtt(), active.conn.rtt());
         let near = rtt <= active_rtt.saturating_add(gate);
         if !near {
             tracing::info!(
@@ -854,8 +1000,8 @@ async fn try_other(
     if !rule.wanted(Instant::now(), is_near) {
         anyhow::bail!("it is not wanted, or too far");
     }
-    let mut second = Second(Some(link));
-    let link = second.0.as_mut().expect("just put there");
+    let mut second = Second { link: Some(link), active: active.clone() };
+    let link = second.link.as_mut().expect("just put there");
     link.bind().await?;
     let every = params.timing.failback;
     let mut check = tokio::time::interval_at(Instant::now() + every, every);
@@ -883,24 +1029,32 @@ async fn try_other(
                     }
                     Ok(News::Waiting | News::PeerGone(_)) => {
                         both_since = None;
+                        rule.alone();
+                        continue;
+                    }
+                    Ok(News::Stale) => {
+                        link.bind_again().await?;
                         continue;
                     }
                     Ok(News::Removed(reason)) => anyhow::anyhow!("tunnel removed on relay: {reason}"),
-                    Ok(News::Refused(reason)) => BindRejected(reason).into(),
+                    Ok(News::Refused(reason)) => {
+                        // There is no bind to let go of.
+                        second.link = None;
+                        return Err(BindRejected(reason).into());
+                    }
                     Err(e) => e,
                 };
-                // There is no bind to let go of.
-                second.0 = None;
                 return Err(why);
             }
             _ = check.tick() => {}
-            _ = settled => break,
+            _ = settled => {
+                return Ok(if rule.goes(Instant::now(), is_near) { second.link.take() } else { None });
+            }
         }
         if !rule.wanted(Instant::now(), is_near) {
             anyhow::bail!("it is not wanted any more, or too far");
         }
     }
-    Ok(second.0.take().expect("still there"))
 }
 
 /// Bind the tunnel on relay `idx` and wait until both sides are there, on this
@@ -925,8 +1079,8 @@ async fn meet(
     // Wait for tunnel to become ready. The relay says so in answer to our bind
     // if we are the second edge to bind, and in a notice if the peer binds
     // after us.
-    let conn = link.conn.clone();
-    let other = other_relay_refusing(params, idx, &conn, state_tx.subscribe(), refusals, events);
+    let active = link.handle().clone();
+    let other = other_relay_refusing(params, idx, &active, state_tx.subscribe(), refusals, events);
     tokio::pin!(other);
     let mut deadline: Option<Instant> = None;
     loop {
@@ -941,6 +1095,8 @@ async fn meet(
             biased;
             news = link.news() => match news? {
                 News::Ready => return Ok((idx, link)),
+                // As it did, after we have bound again.
+                News::Waiting if *state_tx.borrow() == RelayTunnelState::Waiting => {}
                 News::Waiting => {
                     state_tx.send_replace(RelayTunnelState::Waiting);
                     if params.relay_addrs.len() == 1 {
@@ -953,20 +1109,18 @@ async fn meet(
                 }
                 // It came and went before we were told that it came.
                 News::PeerGone(_) => {}
+                News::Stale => link.bind_again().await?,
                 News::Removed(reason) => anyhow::bail!("tunnel removed on relay: {reason}"),
                 News::Refused(reason) => return Err(BindRejected(reason).into()),
             },
             found = &mut other => {
-                tokio::spawn(link.leave(Duration::ZERO));
+                link.leave_for(&found.1, Duration::ZERO);
                 return Ok(found);
             }
             _ = waited_out => {
                 // Peer hasn't bound on this relay within the window. Unbind
                 // politely so the relay drops its pending state, then bail.
-                let _ = protocol::write_message(
-                    &mut link.control,
-                    &EdgeMessage::TunnelUnbind { tunnel_id: params.tunnel_id },
-                ).await;
+                let _ = link.unbind().await;
                 tracing::info!(
                     tunnel_id = %params.tunnel_id,
                     relay = %relay_addr,
@@ -1597,6 +1751,14 @@ mod tests {
         t.becomes(Ready).await;
         assert_eq!(t.told().await, "Tunnel ready again");
         assert!(session.is_silent(REBIND_MIN + A_MOMENT).await);
+
+        // The answer is one to our bind, whatever was said before it.
+        session.notify(down(t.id, removed)).await;
+        t.becomes(Down).await;
+        session.notify(down(t.id, "peer disconnected")).await;
+        t.assert_binds(&session.next().await);
+        session.answer(waiting(t.id)).await;
+        t.becomes(Waiting).await;
     }
 
     /// One removed again and again is bound again later and later. Its answer
@@ -1948,6 +2110,11 @@ mod tests {
             self.due()
         }
 
+        /// Both sides are on the other relay.
+        fn goes(&mut self, at: u64, near: bool) -> bool {
+            self.rule.goes(self.at(at), || near)
+        }
+
         /// A try that comes to nothing.
         fn fails(&mut self, at: u64) -> Option<u64> {
             self.rule.failed(self.at(at));
@@ -1977,11 +2144,14 @@ mod tests {
             assert_eq!(tries.fails(at), Some(at + wait));
             at += wait;
         }
-        // Soon again after the tunnel has been up.
+        // Soon again after the tunnel has been up, and not for a moment only.
         assert_eq!(tries.is(Ready, at), None);
         assert_eq!(tries.is(Waiting, at + 1), Some(at + 11));
-        assert_eq!(tries.fails(at + 11), Some(at + 12));
-        assert_eq!(tries.fails(at + 12), Some(at + 14));
+        assert_eq!(tries.fails(at + 11), Some(at + 71));
+        assert_eq!(tries.is(Ready, at + 71), None);
+        assert_eq!(tries.is(Waiting, at + 73), Some(at + 83));
+        assert_eq!(tries.fails(at + 83), Some(at + 84));
+        assert_eq!(tries.fails(at + 84), Some(at + 86));
     }
 
     #[test]
@@ -2023,11 +2193,51 @@ mod tests {
         }
     }
 
+    /// A peer that is on a primary that is too far has 16 s to come to the backup.
+    /// Then it is followed, if it is there still.
+    #[test]
+    fn a_peer_on_a_primary_that_is_too_far_has_time_to_come() {
+        let mut tries = Tries::of(true);
+        tries.is(Ready, 1);
+        assert_eq!(tries.is(Waiting, 100), Some(110));
+        assert!(!tries.goes(111, false));
+        assert_eq!(tries.due(), Some(127));
+        // It has only looked, and has the time still.
+        tries.is(Ready, 112);
+        assert_eq!(tries.is(Waiting, 113), Some(127));
+        assert_eq!(tries.fails(127), Some(128), "the primary was not there");
+        assert!(tries.goes(128, false));
+        // It is not there any more, and comes again later.
+        tries.rule.alone();
+        assert!(!tries.goes(500, false));
+        assert_eq!(tries.due(), Some(516));
+        assert!(tries.goes(516, false));
+        // It has come to the backup, and goes again.
+        assert_eq!(tries.is(Ready, 517), Some(560));
+        assert_eq!(tries.is(Waiting, 519), Some(529));
+        assert!(!tries.goes(530, false));
+    }
+
+    /// Nothing else is too far to go to.
+    #[test]
+    fn where_a_tunnel_goes() {
+        for on_backup in [false, true] {
+            for state in [Connecting, Waiting, Ready, Down] {
+                for near in [false, true] {
+                    let mut tries = Tries::of(on_backup);
+                    tries.is(state, 5);
+                    let stays = on_backup && state != Ready && !near;
+                    assert_eq!(tries.goes(6, near), !stays, "{on_backup} {state} {near}");
+                }
+            }
+        }
+    }
+
     /// What the tests have no time for.
     #[test]
     fn how_long_a_tunnel_waits() {
-        let Timing { connect, waiting, settle, failback } = Timing::default();
-        assert_eq!([connect, waiting, settle, failback].map(|t| t.as_secs()), [6, 10, 1, 60]);
+        let Timing { connect, waiting, settle, failback, refresh } = Timing::default();
+        assert_eq!([connect, waiting, settle, failback, refresh].map(|t| t.as_secs()), [6, 10, 1, 60, 60]);
     }
 
     fn gone(reason: &str) -> Option<Trouble> {

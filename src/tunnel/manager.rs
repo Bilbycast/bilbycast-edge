@@ -952,19 +952,19 @@ async fn run_relay_tunnel(
 
         // Until the QUIC connection drops or the tunnel is stopped.
         let ended = loop {
-            let conn = link.conn().clone();
+            let active = link.handle().clone();
             tokio::select! {
                 ended = &mut forwarder => break ended,
                 _ = link.hold(&params.relay_addrs[idx], &state_tx, &event_sender) => break (&mut forwarder).await,
                 (to, next) = relay_client::other_relay(
-                    &params, idx, &conn, state_tx.subscribe(), &event_sender,
+                    &params, idx, &active, state_tx.subscribe(), &event_sender,
                 ) => {
                     // The peer is told at the same time, and what it sends until
                     // it has moved too comes by the relay we leave.
                     let was_up = *state_tx.borrow() == RelayTunnelState::Ready;
                     let drain = if was_up { carrier::DRAIN } else { Duration::ZERO };
                     if to == 0 {
-                        report_failback(&params, &conn, next.conn(), &event_sender);
+                        report_failback(&params, link.conn(), next.conn(), &event_sender);
                         relay_client::report_up(&params, to, to, &event_sender);
                     } else {
                         relay_client::report_up(&params, idx, to, &event_sender);
@@ -972,7 +972,7 @@ async fn run_relay_tunnel(
                     // It is not taken if the forwarder has just ended.
                     let _ = moves.send(next.conn().clone()).await;
                     let left = std::mem::replace(&mut link, next);
-                    tokio::spawn(left.leave(drain));
+                    left.leave_for(&link, drain);
                     idx = to;
                     active_idx_tx.send_replace(idx);
                     state_tx.send_replace(RelayTunnelState::Ready);
@@ -1431,6 +1431,21 @@ mod relay_notice_tests {
         }
     }
 
+    /// Where the datagram comes from. One of another test may come first: it had
+    /// the port before.
+    pub(super) async fn gets(app: &UdpSocket, want: &[u8]) -> SocketAddr {
+        let mut buf = [0; 2048];
+        soon("a datagram", async {
+            loop {
+                let (n, from) = app.recv_from(&mut buf).await.unwrap();
+                if &buf[..n] == want {
+                    return from;
+                }
+            }
+        })
+        .await
+    }
+
     pub(super) async fn passes(
         session: &Session,
         id: Uuid,
@@ -1440,9 +1455,7 @@ mod relay_notice_tests {
         let payload = Uuid::new_v4().to_string();
         let datagram = protocol::encode_udp_datagram(&id, payload.as_bytes());
         session.conn.send_datagram(datagram.into()).unwrap();
-        let mut buf = [0; 64];
-        let (n, edge) = soon("a datagram", app.recv_from(&mut buf)).await.unwrap();
-        assert_eq!(&buf[..n], payload.as_bytes());
+        let edge = gets(app, payload.as_bytes()).await;
         assert_eq!(*from_edge.get_or_insert(edge), edge, "another forwarder");
         app.send_to(b"back", edge).await.unwrap();
         let back = soon("its answer", session.conn.read_datagram()).await.unwrap();
@@ -1606,7 +1619,7 @@ mod relay_notice_tests {
 mod two_relay_tests {
     //! A tunnel with two relays: where it looks for its peer, when it moves, and
     //! what becomes of what it carries.
-    use super::relay_notice_tests::passes;
+    use super::relay_notice_tests::{gets, passes};
     use super::*;
     use crate::manager::events::{Event, event_channel};
     use crate::tunnel::protocol::{self, EdgeMessage};
@@ -1684,6 +1697,7 @@ mod two_relay_tests {
                     waiting: Duration::from_secs(600),
                     settle: Duration::from_millis(1),
                     failback: Duration::from_secs(600),
+                    refresh: Duration::from_secs(600),
                 },
             };
             adjust(&mut params);
@@ -1816,6 +1830,17 @@ mod two_relay_tests {
         assert_eq!(serde_json::to_value(one).unwrap(), serde_json::to_value(other).unwrap());
     }
 
+    /// Our side is let go of and bound again.
+    async fn is_bound_again(session: &mut Session) {
+        assert!(matches!(session.next().await, EdgeMessage::TunnelUnbind { .. }));
+        is_bound(session).await;
+    }
+
+    async fn is_bound(session: &mut Session) {
+        let msg = session.next().await;
+        assert!(matches!(msg, EdgeMessage::TunnelBind { bind_token: Some(_), .. }), "{msg:?}");
+    }
+
     /// Nobody is there. The edge binds its primary, and after a while its backup
     /// as well, and stays on both. The peer comes to either.
     #[tokio::test]
@@ -1939,6 +1964,7 @@ mod two_relay_tests {
         primary.closed().await;
         edge.passes_on(&backup).await;
         assert!(!edge.primary.is_dialled(A_MOMENT).await, "that is for later");
+        assert!(backup.is_silent(A_MOMENT).await);
         edge.is_quiet(Duration::ZERO).await;
     }
 
@@ -2017,6 +2043,9 @@ mod two_relay_tests {
         edge.becomes(RelayTunnelState::Ready, 0).await;
         edge.raises(&["Tunnel ready again".into()]).await;
         backup.is_left().await;
+        // That bind may have taken our side from this one.
+        is_bound(&mut primary).await;
+        primary.answer(ready(id)).await;
 
         // One that was on the backup for a moment is not followed there. One
         // that is there again is, a whole while later.
@@ -2062,9 +2091,7 @@ mod two_relay_tests {
         // What the peer sent before it moved.
         let late = protocol::encode_udp_datagram(&id, b"late");
         backup.conn.send_datagram(late.into()).unwrap();
-        let mut buf = [0; 8];
-        let (n, _) = soon("what came late", edge.app.recv_from(&mut buf)).await.unwrap();
-        assert_eq!(&buf[..n], b"late");
+        gets(&edge.app, b"late").await;
 
         // The peer is not told that we leave before it has moved itself.
         backup.notify(down(id, "peer unbound")).await;
@@ -2108,15 +2135,13 @@ mod two_relay_tests {
         edge.was_only(RelayTunnelState::Ready);
     }
 
-    /// A tunnel whose peer leaves the backup finds it on the primary, however
-    /// far that is.
+    /// A tunnel whose peer leaves the backup finds it on the primary.
     #[tokio::test]
     async fn a_tunnel_follows_its_peer_to_the_primary() {
         let mut wait = Duration::ZERO;
         let mut edge = Edge::start_with(|params| {
             wait = short(&mut params.timing.waiting);
             params.timing.settle = Duration::from_secs(600);
-            params.failback_rtt_gate_ms = 0;
         })
         .await;
         let id = edge.id;
@@ -2130,6 +2155,89 @@ mod two_relay_tests {
         edge.raises(&[edge.fails_back(), connected()]).await;
         backup.is_left().await;
         edge.passes_on(&primary).await;
+    }
+
+    /// A tunnel that was up on its backup, and has found its peer on its primary,
+    /// which is too far: it waits on the backup, since when the peer may come.
+    async fn on_a_far_primary(edge: &mut Edge) -> (Session, Instant) {
+        let id = edge.id;
+        let mut backup = edge.up_on_backup().await;
+        edge.loses_its_peer(&backup).await;
+        let (mut primary, _bind) = edge.primary.binding().await;
+        primary.answer(ready(id)).await;
+        primary.is_left().await;
+        let since = Instant::now();
+        is_bound_again(&mut backup).await;
+        backup.answer(waiting(id)).await;
+        assert_eq!((*edge.state.borrow(), *edge.active.borrow()), (RelayTunnelState::Waiting, 1));
+        (backup, since)
+    }
+
+    /// An edge whose primary is 300 ms away, and that gives its peer 1.4 s.
+    async fn with_a_far_primary() -> (Edge, Far) {
+        let mut primary = StandIn::start();
+        let far = Far::to(&mut primary, 150).await;
+        let edge = Edge::between(primary, StandIn::start(), |params| {
+            short(&mut params.timing.waiting);
+            params.timing.connect = Duration::from_secs(1);
+            params.failback_rtt_gate_ms = 50;
+        })
+        .await;
+        (edge, far)
+    }
+
+    /// The peer is found on a primary that is too far. It is left there, and comes
+    /// to the backup.
+    #[tokio::test]
+    async fn a_peer_on_a_primary_that_is_too_far_comes_to_the_backup() {
+        let (mut edge, _far) = with_a_far_primary().await;
+        let id = edge.id;
+        let (mut backup, since) = on_a_far_primary(&mut edge).await;
+        backup.notify(ready(id)).await;
+        edge.becomes(RelayTunnelState::Ready, 1).await;
+        edge.raises(&["Tunnel ready again".into()]).await;
+        edge.passes_on(&backup).await;
+        let dialled = edge.primary.is_dialled(Duration::from_secs(2)).await;
+        assert!(!dialled && since.elapsed() > Duration::from_secs(2));
+        assert!(backup.is_silent(A_MOMENT).await);
+        edge.is_quiet(Duration::ZERO).await;
+    }
+
+    /// It does not come, and is followed to the primary.
+    #[tokio::test]
+    async fn a_peer_that_stays_on_a_primary_that_is_too_far_is_followed() {
+        let (mut edge, _far) = with_a_far_primary().await;
+        let id = edge.id;
+        let (mut backup, since) = on_a_far_primary(&mut edge).await;
+        let (mut primary, _bind) = edge.primary.binding().await;
+        assert!(since.elapsed() >= Duration::from_millis(1_350), "{:?}", since.elapsed());
+        primary.answer(ready(id)).await;
+        edge.becomes(RelayTunnelState::Ready, 0).await;
+        let event = soon("an event", edge.events.recv()).await.unwrap();
+        assert_eq!(event.message, edge.fails_back());
+        let details = event.details.unwrap();
+        let rtt = |of: &str| details[of].as_u64().unwrap();
+        assert!(rtt("primary_rtt_ms") > 250 && rtt("active_rtt_ms") < 250, "{details}");
+        edge.raises(&[connected()]).await;
+        backup.is_left().await;
+        edge.passes_on(&primary).await;
+    }
+
+    /// It is gone, and comes to the primary once more, where it looks first. It
+    /// has the same time again.
+    #[tokio::test]
+    async fn a_peer_that_comes_to_a_primary_that_is_too_far_has_the_time_each_time() {
+        let (mut edge, _far) = with_a_far_primary().await;
+        let id = edge.id;
+        let (mut backup, _since) = on_a_far_primary(&mut edge).await;
+        let (mut primary, _bind) = edge.primary.binding().await;
+        primary.answer(waiting(id)).await;
+        primary.notify(ready(id)).await;
+        primary.is_left().await;
+        is_bound_again(&mut backup).await;
+        backup.answer(waiting(id)).await;
+        edge.is_quiet(A_MOMENT).await;
+        assert_eq!((*edge.state.borrow(), *edge.active.borrow()), (RelayTunnelState::Waiting, 1));
     }
 
     /// A primary that is too far is not bound: the peer would be told to come.
@@ -2226,7 +2334,7 @@ mod two_relay_tests {
         let mut wait = Duration::ZERO;
         let mut edge = Edge::start_with(|params| wait = short(&mut params.timing.failback)).await;
         let id = edge.id;
-        let backup = edge.up_on_backup().await;
+        let mut backup = edge.up_on_backup().await;
         let mut since = Instant::now();
         for attempt in 0..3 {
             let (mut primary, _bind) = edge.primary.binding().await;
@@ -2244,6 +2352,7 @@ mod two_relay_tests {
             assert!(protocol::read_message::<EdgeMessage>(&mut primary.recv).await.is_err());
         }
         edge.passes_on(&backup).await;
+        assert!(backup.is_silent(Duration::ZERO).await);
         edge.was_only(RelayTunnelState::Ready);
         edge.is_quiet(Duration::ZERO).await;
     }
@@ -2268,7 +2377,8 @@ mod two_relay_tests {
         edge.is_quiet(A_MOMENT).await;
     }
 
-    /// The connection to the other relay ends. It is made again.
+    /// The connection to the other relay ends. It is made again. The relay may be
+    /// the same, and our side gone with it: it is bound again here, too.
     #[tokio::test]
     async fn an_other_relay_that_is_lost_is_bound_again() {
         let mut edge = Edge::start_with(|params| {
@@ -2285,9 +2395,165 @@ mod two_relay_tests {
             backup.answer(waiting(id)).await;
             since = Instant::now();
             backup.conn.close(0u32.into(), b"");
+            is_bound_again(&mut primary).await;
+            primary.answer(waiting(id)).await;
         }
         assert!(primary.is_silent(A_MOMENT).await);
+        assert_eq!((*edge.state.borrow(), *edge.active.borrow()), (RelayTunnelState::Waiting, 0));
         edge.is_quiet(Duration::ZERO).await;
+    }
+
+    /// The same if it ends when the tunnel is up again and it has not said that the
+    /// peer is not there. One that has is another relay.
+    #[tokio::test]
+    async fn a_bind_that_may_have_been_taken_is_bound_again() {
+        for answer in [true, false] {
+            let mut edge = Edge::start_with(|params| {
+                short(&mut params.timing.waiting);
+            })
+            .await;
+            let id = edge.id;
+            let mut primary = edge.up_on_primary().await;
+            edge.loses_its_peer(&primary).await;
+            let (mut backup, _bind) = edge.backup.binding().await;
+            if answer {
+                backup.answer(waiting(id)).await;
+                edge.rests([&mut primary, &mut backup]).await;
+            }
+            primary.notify(ready(id)).await;
+            edge.becomes(RelayTunnelState::Ready, 0).await;
+            backup.is_left().await;
+            if !answer {
+                is_bound(&mut primary).await;
+                primary.answer(ready(id)).await;
+            }
+            assert!(primary.is_silent(A_MOMENT).await, "{answer}");
+            assert_eq!((*edge.state.borrow(), *edge.active.borrow()), (RelayTunnelState::Ready, 0));
+        }
+    }
+
+    /// A relay does not say that another edge has bound our side, nor that it has
+    /// gone with it. A side that waits is bound again every now and then, on both
+    /// relays. Nothing is reported for it, and nothing sent once the tunnel is up.
+    #[tokio::test]
+    async fn a_side_that_waits_is_bound_again() {
+        for up in [false, true] {
+            let mut edge = Edge::start_with(|params| {
+                short(&mut params.timing.waiting);
+                params.timing.refresh = Duration::from_secs(1);
+            })
+            .await;
+            let id = edge.id;
+            let mut primary = if up {
+                let primary = edge.up_on_primary().await;
+                edge.loses_its_peer(&primary).await;
+                primary
+            } else {
+                let (mut primary, _bind) = edge.primary.binding().await;
+                primary.answer(waiting(id)).await;
+                primary
+            };
+            let since = Instant::now();
+            let (mut backup, _bind) = edge.backup.binding().await;
+            backup.answer(waiting(id)).await;
+            edge.becomes(RelayTunnelState::Waiting, 0).await;
+            while edge.states.try_recv().is_ok() {}
+            for round in 1..3 {
+                for relay in [&mut primary, &mut backup] {
+                    is_bound_again(relay).await;
+                    assert!(since.elapsed() >= Duration::from_millis(950) * round, "{:?}", since.elapsed());
+                    relay.answer(waiting(id)).await;
+                }
+            }
+            edge.is_quiet(Duration::ZERO).await;
+            assert_eq!((*edge.state.borrow(), *edge.active.borrow()), (RelayTunnelState::Waiting, 0));
+            assert!(edge.states.try_recv().is_err(), "it has not changed");
+
+            // Our side was not bound any more, and the peer is there.
+            is_bound_again(&mut primary).await;
+            primary.answer(ready(id)).await;
+            edge.becomes(RelayTunnelState::Ready, 0).await;
+            edge.raises(&[if up { "Tunnel ready again".into() } else { connected() }]).await;
+            edge.passes_on(&primary).await;
+            assert!(primary.is_silent(Duration::from_millis(1500)).await);
+            edge.is_quiet(Duration::ZERO).await;
+        }
+    }
+
+    /// The same of the other relay: the tunnel moves there if the peer is there.
+    #[tokio::test]
+    async fn a_side_that_was_taken_on_the_other_relay_is_bound_again() {
+        let mut edge = Edge::start_with(|params| {
+            short(&mut params.timing.waiting);
+            params.timing.refresh = Duration::from_secs(1);
+        })
+        .await;
+        let id = edge.id;
+        let mut primary = edge.up_on_primary().await;
+        edge.loses_its_peer(&primary).await;
+        let (mut backup, _bind) = edge.backup.binding().await;
+        backup.answer(waiting(id)).await;
+        is_bound_again(&mut primary).await;
+        primary.answer(waiting(id)).await;
+        is_bound_again(&mut backup).await;
+        backup.answer(ready(id)).await;
+        edge.becomes(RelayTunnelState::Ready, 1).await;
+        edge.raises(&[connected(), edge.failed_over()]).await;
+    }
+
+    /// A tunnel moves to a relay that is, for all it knows, the one it leaves. The
+    /// side may be bound by what it leaves: it binds again if that may be, and only
+    /// then.
+    #[tokio::test]
+    async fn a_tunnel_that_moves_holds_its_side() {
+        let mut cases = tokio::task::JoinSet::new();
+        // Whether the tunnel has been up where it was, and is answered there, and
+        // has bound there last: whether it binds again where it has gone.
+        for (was_up, answered, is_later, binds) in [
+            (true, true, true, true),
+            (true, true, false, false),
+            (false, true, true, false),
+            (false, false, false, true),
+        ] {
+            cases.spawn(async move {
+                let case = format!("{was_up} {answered} {is_later}");
+                let mut edge = Edge::start_with(|params| {
+                    params.timing.waiting = Duration::from_secs(2);
+                    params.timing.refresh = Duration::from_secs(4);
+                })
+                .await;
+                let id = edge.id;
+                let mut primary = if was_up {
+                    let primary = edge.up_on_primary().await;
+                    edge.loses_its_peer(&primary).await;
+                    primary
+                } else {
+                    let (mut primary, _bind) = edge.primary.binding().await;
+                    primary.answer(waiting(id)).await;
+                    primary
+                };
+                let (mut backup, _bind) = edge.backup.binding().await;
+                backup.answer(waiting(id)).await;
+                is_bound_again(&mut primary).await;
+                if answered {
+                    primary.answer(waiting(id)).await;
+                }
+                if !is_later {
+                    is_bound_again(&mut backup).await;
+                    backup.answer(waiting(id)).await;
+                }
+                backup.notify(ready(id)).await;
+                edge.becomes(RelayTunnelState::Ready, 1).await;
+                primary.is_left().await;
+                if binds {
+                    is_bound(&mut backup).await;
+                    backup.answer(ready(id)).await;
+                }
+                assert!(backup.is_silent(A_MOMENT).await, "{case}");
+                edge.passes_on(&backup).await;
+            });
+        }
+        cases.join_all().await;
     }
 
     /// The peer comes back while the edge dials the other relay. It is not bound
@@ -2319,6 +2585,7 @@ mod two_relay_tests {
     async fn a_tunnel_with_one_relay_stays_where_it_is() {
         let mut edge = Edge::start_with(|params| {
             short(&mut params.timing.waiting);
+            short(&mut params.timing.refresh);
             params.relay_addrs.truncate(1);
         })
         .await;
@@ -2355,6 +2622,8 @@ mod two_relay_tests {
             since = Instant::now();
             backup.notify(down(id, "tunnel closed by manager")).await;
             backup.closed().await;
+            is_bound_again(&mut primary).await;
+            primary.answer(waiting(id)).await;
         }
         assert!(primary.is_silent(A_MOMENT).await);
         edge.is_quiet(Duration::ZERO).await;
@@ -2362,6 +2631,7 @@ mod two_relay_tests {
         primary.notify(ready(id)).await;
         edge.becomes(RelayTunnelState::Ready, 0).await;
         edge.raises(&["Tunnel ready again".into()]).await;
+        tokio::time::sleep(A_MOMENT).await;
         edge.loses_its_peer(&primary).await;
         edge.backup.binding().await;
         assert!(since.elapsed() < Duration::from_secs(4), "{:?}", since.elapsed());
@@ -2413,6 +2683,27 @@ mod two_relay_tests {
         primary.answer(waiting(id)).await;
         edge.becomes(RelayTunnelState::Waiting, 0).await;
         edge.backup.binding().await;
+    }
+
+    /// Nor is it one that waits: it is bound when it is due, and once.
+    #[tokio::test]
+    async fn a_removed_side_is_bound_again_once() {
+        let mut edge = Edge::start_with(|params| {
+            params.timing.refresh = Duration::from_millis(800);
+        })
+        .await;
+        let id = edge.id;
+        let mut primary = edge.up_on_primary().await;
+        edge.loses_its_peer(&primary).await;
+        primary.notify(down(id, "tunnel closed by manager")).await;
+        edge.becomes(RelayTunnelState::Down, 0).await;
+        let since = Instant::now();
+        is_bound(&mut primary).await;
+        assert!(since.elapsed() >= Duration::from_millis(950), "{:?}", since.elapsed());
+        assert!(primary.is_silent(Duration::from_millis(1500)).await);
+        primary.answer(waiting(id)).await;
+        edge.becomes(RelayTunnelState::Waiting, 0).await;
+        is_bound_again(&mut primary).await;
     }
 
     /// Stopped, the edge lets go of both relays.

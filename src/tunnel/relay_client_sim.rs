@@ -6,8 +6,8 @@
 //! relays, and whatever their timers happen to be at.
 //!
 //! What an edge decides is decided by the code itself ([`Walk`], [`OtherRelay`]).
-//! What carries it out (`connect_with_retry`, `meet`, `try_other` and
-//! `run_relay_tunnel`) is acted out here, and so are the relays.
+//! What carries it out (`connect_with_retry`, `meet`, `try_other`,
+//! `run_relay_tunnel` and `RelayLink`) is acted out here, and so are the relays.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -32,6 +32,9 @@ const B: usize = 1;
 const PRIMARY: usize = 0;
 const BACKUP: usize = 1;
 
+/// `RelayLink::leave` tries no longer to tell a relay that it is left.
+const LEAVE: Ms = 5_000;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Said {
     Ready,
@@ -40,17 +43,52 @@ enum Said {
     Lost,
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Asked {
+    Bind,
+    Unbind,
+    /// An unbind after which the edge is gone.
+    Leave,
+}
+
 /// One connection of an edge to a relay. What is sent on it arrives in order,
 /// and late if the path was dark.
 struct Conn {
     edge: usize,
     relay: usize,
-    /// Since when nothing gets through, and whether either end is done with it.
+    /// Since when nothing gets through, when the edge is done with it, though the
+    /// relay may not be told, and whether it has ended.
     dark: Option<Ms>,
+    closes: Option<Ms>,
     ended: bool,
-    /// `true` is a bind, `false` an unbind after which the edge is gone.
-    to_relay: VecDeque<(Ms, bool)>,
-    to_edge: VecDeque<(Ms, Said)>,
+    to_relay: VecDeque<(Ms, Asked)>,
+    /// What the relay says, and whether it answers a bind.
+    to_edge: VecDeque<(Ms, Said, bool)>,
+    /// As the edge has it.
+    state: RelayTunnelState,
+    has_met: bool,
+    bound_at: Ms,
+    unanswered: bool,
+    refresh: Option<Ms>,
+}
+
+impl Conn {
+    fn to(edge: usize, relay: usize) -> Self {
+        Self {
+            edge,
+            relay,
+            dark: None,
+            closes: None,
+            ended: false,
+            to_relay: VecDeque::new(),
+            to_edge: VecDeque::new(),
+            state: Connecting,
+            has_met: false,
+            bound_at: 0,
+            unanswered: false,
+            refresh: None,
+        }
+    }
 }
 
 /// A connection being made.
@@ -83,7 +121,11 @@ struct Edge {
     up: bool,
     rule: OtherRelay,
     second: Option<Second>,
-    leaving: Vec<(Ms, usize)>,
+    /// When which connection is left, for which, and whether that is to bind again
+    /// even if it is up.
+    leaving: Vec<(Ms, usize, usize, bool)>,
+    /// When which connection is to bind again, and whether it is even if it is up.
+    again: Vec<(Ms, usize, bool)>,
     /// Whether it finds the primary near enough to go back to.
     near: bool,
     dials: [u32; 2],
@@ -97,6 +139,8 @@ struct World {
     paths: [[bool; 2]; 2],
     latency: [[Ms; 2]; 2],
     conns: Vec<Conn>,
+    /// Both relays are one, at two addresses.
+    one_relay: bool,
     /// By relay and edge: the connection that holds the side.
     holders: [[Option<usize>; 2]; 2],
     edges: [Edge; 2],
@@ -116,6 +160,7 @@ impl World {
             rule: OtherRelay::new(false, &timing, base),
             second: None,
             leaving: Vec::new(),
+            again: Vec::new(),
             near: true,
             dials: [0; 2],
             moves: 0,
@@ -127,10 +172,53 @@ impl World {
             paths: [[true; 2]; 2],
             latency: [[10; 2]; 2],
             conns: Vec::new(),
+            one_relay: false,
             holders: [[None; 2]; 2],
             edges,
             timing,
         }
+    }
+
+    /// Two edges to which a good deal has happened.
+    fn after_anything(numbers: &mut Numbers, one_relay: bool) -> Self {
+        let mut world = Self::new(Timing::default());
+        world.one_relay = one_relay;
+        for edge in [A, B] {
+            world.edges[edge].near = numbers.below(4) > 0;
+            for relay in [PRIMARY, BACKUP] {
+                world.latency[edge][relay] = 1 + numbers.below(300);
+            }
+        }
+        world.start(A);
+        world.run(numbers.below(120_000));
+        world.start(B);
+        for _ in 0..numbers.below(12) {
+            match numbers.below(5) {
+                0 => {
+                    let edge = numbers.below(2) as usize;
+                    world.stop(edge);
+                    world.run(numbers.below(40_000));
+                    world.start(edge);
+                }
+                1 if one_relay => world.clone_comes_and_goes(numbers.below(2) as usize),
+                _ => world.paths = paths(numbers.below(16)),
+            }
+            let most = if numbers.either() { 20_000 } else { 200_000 };
+            world.run(numbers.below(most));
+        }
+        world.paths = paths(numbers.below(16));
+        world
+    }
+
+    /// Both edges up on the backup, with the primary out of reach.
+    fn on_backup() -> Self {
+        let mut world = Self::new(Timing::default());
+        world.paths = [[false, true]; 2];
+        world.start(A);
+        world.start(B);
+        world.run(20_000);
+        assert!(world.met_on(BACKUP));
+        world
     }
 
     /// Both edges up on the primary.
@@ -149,12 +237,10 @@ impl World {
         let mut world = Self::new(Timing::default());
         for (edge, relay) in [(A, BACKUP), (B, PRIMARY)] {
             world.conns.push(Conn {
-                edge,
-                relay,
-                dark: None,
-                ended: false,
-                to_relay: VecDeque::new(),
-                to_edge: VecDeque::from([(if edge == B { skew } else { 0 }, Said::PeerGone)]),
+                to_edge: VecDeque::from([(if edge == B { skew } else { 0 }, Said::PeerGone, false)]),
+                state: Ready,
+                has_met: true,
+                ..Conn::to(edge, relay)
             });
             let conn = world.conns.len() - 1;
             world.holders[relay][edge] = Some(conn);
@@ -178,6 +264,7 @@ impl World {
     fn stop(&mut self, edge: usize) {
         for conn in self.conns.iter_mut().filter(|c| c.edge == edge && !c.ended) {
             conn.dark.get_or_insert(self.now);
+            conn.closes = Some(self.now);
             conn.to_relay.clear();
         }
         let e = &mut self.edges[edge];
@@ -185,7 +272,23 @@ impl World {
         e.phase = Phase::Off;
         e.second = None;
         e.leaving.clear();
+        e.again.clear();
         (e.up, e.state) = (false, Connecting);
+    }
+
+    /// A clone of an edge that waits binds what that has bound, and goes. Nobody
+    /// is told.
+    fn clone_comes_and_goes(&mut self, edge: usize) {
+        for relay in &mut self.holders {
+            if self.edges[edge].state == Waiting && relay[1 - edge].is_none() {
+                relay[edge] = None;
+            }
+        }
+    }
+
+    /// Which of the relays there are has this address.
+    fn at(&self, address: usize) -> usize {
+        if self.one_relay { 0 } else { address }
     }
 
     fn instant(&self, at: Ms) -> Instant {
@@ -193,15 +296,22 @@ impl World {
     }
 
     /// The tunnel carries what both edges send.
-    fn met_on(&self, relay: usize) -> bool {
-        [A, B].into_iter().all(|edge| {
+    fn met(&self) -> bool {
+        let on = [A, B].map(|edge| {
             let e = &self.edges[edge];
-            e.up && e.state == Ready && e.idx == relay && self.paths[edge][relay]
-        })
+            match e.phase {
+                Phase::On(conn) if e.up && e.state == Ready && self.paths[edge][e.idx] => {
+                    let relay = self.at(e.idx);
+                    (self.holders[relay][edge] == Some(conn)).then_some(relay)
+                }
+                _ => None,
+            }
+        });
+        on[A].is_some() && on[A] == on[B]
     }
 
-    fn met(&self) -> bool {
-        self.met_on(PRIMARY) || self.met_on(BACKUP)
+    fn met_on(&self, relay: usize) -> bool {
+        self.met() && self.edges.iter().all(|e| e.idx == relay)
     }
 
     fn run(&mut self, time: Ms) {
@@ -275,65 +385,104 @@ impl World {
             return;
         }
         let (edge, relay) = (conn.edge, conn.relay);
-        if !self.paths[edge][relay] || !self.edges[edge].on {
+        let closed = conn.dark.is_some() && conn.closes.is_some_and(|at| at <= now);
+        if closed || !self.paths[edge][relay] || !self.edges[edge].on {
             let dark = *conn.dark.get_or_insert(now);
             if now - dark >= IDLE {
                 conn.ended = true;
                 conn.to_edge.clear();
-                conn.to_edge.push_back((now, Said::Lost));
+                conn.to_edge.push_back((now, Said::Lost, false));
                 self.unbind(id);
             }
             return;
         }
         conn.dark = None;
-        while let Some(&(at, bind)) = self.conns[id].to_relay.front() {
+        let relay = self.at(relay);
+        while let Some(&(at, asked)) = self.conns[id].to_relay.front() {
             if at > now {
                 break;
             }
             self.conns[id].to_relay.pop_front();
-            if bind {
-                self.holders[relay][edge] = Some(id);
-                match self.holders[relay][1 - edge] {
-                    Some(peer) => {
-                        self.say(id, Said::Ready);
-                        self.say(peer, Said::Ready);
+            match asked {
+                Asked::Bind => {
+                    self.holders[relay][edge] = Some(id);
+                    match self.holders[relay][1 - edge] {
+                        Some(peer) => {
+                            self.say(id, Said::Ready, true);
+                            self.say(peer, Said::Ready, false);
+                        }
+                        None => self.say(id, Said::Waiting, true),
                     }
-                    None => self.say(id, Said::Waiting),
                 }
-            } else {
-                self.conns[id].ended = true;
-                self.unbind(id);
+                Asked::Unbind => self.unbind(id),
+                Asked::Leave => {
+                    self.conns[id].ended = true;
+                    self.unbind(id);
+                }
             }
         }
     }
 
     fn unbind(&mut self, id: usize) {
-        let (edge, relay) = (self.conns[id].edge, self.conns[id].relay);
+        let (edge, relay) = (self.conns[id].edge, self.at(self.conns[id].relay));
         if self.holders[relay][edge] == Some(id) {
             self.holders[relay][edge] = None;
             if let Some(peer) = self.holders[relay][1 - edge] {
-                self.say(peer, Said::PeerGone);
+                self.say(peer, Said::PeerGone, false);
             }
         }
     }
 
-    fn say(&mut self, id: usize, what: Said) {
+    fn say(&mut self, id: usize, what: Said, answer: bool) {
         let conn = &self.conns[id];
         let at = self.now + self.latency[conn.edge][conn.relay];
-        self.conns[id].to_edge.push_back((at, what));
+        self.conns[id].to_edge.push_back((at, what, answer));
     }
 
-    /// What the edge is told on a connection, if anything.
+    fn ask(&mut self, id: usize, what: Asked) {
+        let conn = &self.conns[id];
+        let at = self.now + self.latency[conn.edge][conn.relay];
+        self.conns[id].to_relay.push_back((at, what));
+    }
+
+    /// What the edge is told on a connection, if anything, as `RelayLink::news`
+    /// has it.
     fn told(&mut self, id: usize) -> Option<Said> {
+        let now = self.now;
         let conn = &mut self.conns[id];
         let dark = conn.dark.is_some() && !conn.ended;
-        match conn.to_edge.front() {
-            Some(&(at, said)) if at <= self.now && !dark => {
-                conn.to_edge.pop_front();
-                Some(said)
+        let Some((_, said, answer)) = conn.to_edge.pop_front_if(|(at, ..)| *at <= now && !dark) else {
+            if conn.refresh.is_some_and(|at| at <= now) {
+                self.bind_again(id);
             }
-            _ => None,
+            return None;
+        };
+        conn.unanswered &= !answer;
+        conn.state = match said {
+            Said::Ready => Ready,
+            Said::Waiting | Said::PeerGone => Waiting,
+            Said::Lost => Connecting,
+        };
+        conn.has_met |= said == Said::Ready;
+        conn.refresh = None;
+        if conn.state == Waiting {
+            conn.refresh = Some(now + self.timing.refresh.as_millis() as Ms);
         }
+        Some(said)
+    }
+
+    fn bind_again(&mut self, id: usize) {
+        if self.conns[id].state == Waiting {
+            self.conns[id].refresh = Some(self.now + self.timing.refresh.as_millis() as Ms);
+            self.ask(id, Asked::Unbind);
+        }
+        self.bind(id);
+    }
+
+    fn bind(&mut self, id: usize) {
+        self.conns[id].bound_at = self.now;
+        self.conns[id].unanswered = true;
+        self.ask(id, Asked::Bind);
     }
 
     fn dial(&mut self, edge: usize, relay: usize) -> Dial {
@@ -348,16 +497,10 @@ impl World {
             let round_trip = 2 * self.latency[edge][dial.relay];
             let up_at = *dial.up_at.get_or_insert(self.now + round_trip);
             if self.now >= up_at {
-                let at = self.now + self.latency[edge][dial.relay];
-                self.conns.push(Conn {
-                    edge,
-                    relay: dial.relay,
-                    dark: None,
-                    ended: false,
-                    to_relay: VecDeque::from([(at, true)]),
-                    to_edge: VecDeque::new(),
-                });
-                return Some(Some(self.conns.len() - 1));
+                self.conns.push(Conn::to(edge, dial.relay));
+                let conn = self.conns.len() - 1;
+                self.bind(conn);
+                return Some(Some(conn));
             }
         } else {
             dial.up_at = None;
@@ -365,28 +508,42 @@ impl World {
         (self.now >= dial.until).then_some(None)
     }
 
-    fn leave(&mut self, id: usize) {
+    /// Leave on this connection, and then have the other bind again, which the
+    /// tunnel is on.
+    fn leave(&mut self, id: usize, stays: usize, if_up: bool) {
+        self.ask(id, Asked::Leave);
         let conn = &mut self.conns[id];
-        let at = self.now + self.latency[conn.edge][conn.relay];
-        conn.to_relay.push_back((at, false));
+        let (edge, relay) = (conn.edge, conn.relay);
+        let takes = match conn.ended {
+            true => 0,
+            false if conn.dark.is_some() || !self.paths[edge][relay] => LEAVE,
+            false => 2 * self.latency[edge][relay],
+        };
+        conn.closes = Some(self.now + takes);
+        self.edges[edge].again.push((self.now + takes, stays, if_up));
     }
 
-    fn give_up_second(&mut self, edge: usize) {
-        if let Some(Second { conn: Some(conn), .. }) = self.edges[edge].second.take() {
-            self.leave(conn);
-        }
+    fn let_go(&mut self, id: usize, stays: usize, after: Ms, later: bool) {
+        let conn = &self.conns[id];
+        let if_up = conn.unanswered || later && conn.has_met;
+        self.edges[conn.edge].leaving.push((self.now + after, id, stays, if_up));
+    }
+
+    fn give_up_second(&mut self, conn: usize, active: usize) {
+        self.let_go(conn, active, 0, true);
     }
 
     fn act(&mut self, edge: usize) {
         let now = self.now;
-        let due: Vec<usize> = {
-            let leaving = &mut self.edges[edge].leaving;
-            let (due, later) = leaving.drain(..).partition(|(at, _)| *at <= now);
-            *leaving = later;
-            due.into_iter().map(|(_, conn): (Ms, usize)| conn).collect()
-        };
-        for conn in due {
-            self.leave(conn);
+        let due: Vec<_> = self.edges[edge].leaving.extract_if(.., |(at, ..)| *at <= now).collect();
+        for (_, conn, stays, if_up) in due {
+            self.leave(conn, stays, if_up);
+        }
+        let due: Vec<_> = self.edges[edge].again.extract_if(.., |(at, ..)| *at <= now).collect();
+        for (_, conn, if_up) in due {
+            if if_up || self.conns[conn].state != Ready {
+                self.bind_again(conn);
+            }
         }
         match std::mem::replace(&mut self.edges[edge].phase, Phase::Off) {
             Phase::Idle(until) if now >= until => {
@@ -432,7 +589,9 @@ impl World {
                 Said::Lost => {
                     let was_up = std::mem::take(&mut e.up);
                     e.state = Connecting;
-                    self.give_up_second(edge);
+                    if let Some(Second { conn: Some(second), .. }) = e.second.take() {
+                        self.give_up_second(second, conn);
+                    }
                     if was_up {
                         let e = &mut self.edges[edge];
                         e.walk = Walk::new(2, e.idx);
@@ -488,9 +647,13 @@ impl World {
                 Said::Ready => {
                     second.both_since.get_or_insert(now);
                 }
-                Said::Waiting | Said::PeerGone => second.both_since = None,
+                Said::Waiting | Said::PeerGone => {
+                    second.both_since = None;
+                    self.edges[edge].rule.alone();
+                }
                 Said::Lost => {
                     self.edges[edge].rule.failed(at);
+                    self.give_up_second(conn, active);
                     return;
                 }
             }
@@ -498,7 +661,7 @@ impl World {
         let rule = &mut self.edges[edge].rule;
         if !rule.wanted(at, || near) {
             rule.failed(at);
-            self.leave(conn);
+            self.give_up_second(conn, active);
             return;
         }
         let settle = rule.settle().as_millis() as Ms;
@@ -506,9 +669,15 @@ impl World {
             self.edges[edge].second = Some(second);
             return;
         }
+        if !rule.goes(at, || near) {
+            self.give_up_second(conn, active);
+            return;
+        }
         let e = &mut self.edges[edge];
         let drain = if e.up && e.state == Ready { DRAIN.as_millis() as Ms } else { 0 };
-        e.leaving.push((now + drain, active));
+        let later = self.conns[active].bound_at > self.conns[conn].bound_at;
+        self.let_go(active, conn, drain, later);
+        let e = &mut self.edges[edge];
         e.moves += 1;
         (e.idx, e.state, e.up) = (other, Ready, true);
         e.phase = Phase::On(conn);
@@ -545,8 +714,9 @@ fn can_meet(paths: &[[bool; 2]; 2]) -> bool {
 /// tries again, what it tries first in vain, and 10 s until it tries the next.
 const SOON: Ms = 80_000;
 
-/// The same when a connection may just have died, which is not noticed at once.
-const LATER: Ms = 100_000;
+/// The same when a connection may just have died, which is not noticed at once,
+/// and they have to meet on a primary that is too far.
+const LATER: Ms = 120_000;
 
 /// One edge loses its path to the primary, when the other does what it does. It
 /// comes to the backup, and the other follows, 10 s after it has been told. Both
@@ -589,6 +759,127 @@ fn an_edge_that_does_not_go_back_is_not_left() {
     world.edges[A].near = true;
     world.stays_met(100_000);
     assert!(world.met_on(PRIMARY));
+}
+
+/// The pair is on the backup because one edge finds the primary too far, or both
+/// do. The other is away, with its path to the backup or altogether, and when it
+/// is back it looks on the primary first. They meet on the backup again.
+#[test]
+fn edges_do_not_meet_on_a_primary_that_is_too_far() {
+    let cut = (500..40_000).step_by(500).map(|away| (true, away));
+    let off = (500..200_000).step_by(1_900).map(|away| (false, away));
+    for (by_path, away) in cut.chain(off) {
+        for (near, latency) in [(false, 150), (false, 400), (true, 150)] {
+            let mut world = World::on_backup();
+            world.latency = [[latency, 10]; 2];
+            world.edges[A].near = false;
+            world.edges[B].near = near;
+            world.paths = [[true; 2]; 2];
+            world.stays_met(90_000 + away);
+            assert!(world.met_on(BACKUP));
+            if by_path {
+                world.paths[B][BACKUP] = false;
+                world.run(away);
+                world.paths[B][BACKUP] = true;
+            } else {
+                world.stop(B);
+                world.run(away);
+                world.start(B);
+            }
+            let out = world.until_met_for_good(100_000);
+            // Until a connection is noticed to have ended, and then as an edge
+            // that starts, which looks on the backup after 10 s, or 10 s later if
+            // it is found on the primary just before.
+            assert!(out <= if by_path { 48_000 } else { 24_000 }, "{out} after {away}: {}", world.describe());
+            world.stays_met(600_000);
+            assert!(world.met_on(BACKUP), "after {away}: {}", world.describe());
+        }
+    }
+}
+
+/// The same, but the other edge has lost its path to the backup. Then they do
+/// meet there, once it has had the time to come.
+#[test]
+fn edges_meet_on_a_primary_that_is_too_far_if_they_must() {
+    for latency in [10, 150, 400] {
+        let mut world = World::on_backup();
+        world.latency = [[latency, 10]; 2];
+        world.edges[A].near = false;
+        world.paths = [[true; 2]; 2];
+        world.stays_met(100_000);
+        assert!(world.met_on(BACKUP));
+        world.paths[B][BACKUP] = false;
+        let out = world.until_met_for_good(200_000);
+        // It is told after 25 s, and is on the primary 10 s later, and 16 s later.
+        assert!((IDLE + 26_000..IDLE + 30_000).contains(&out), "{out}");
+        assert!(world.met_on(PRIMARY));
+        world.stays_met(600_000);
+    }
+}
+
+/// A clone of an edge that waits has bound what that edge has bound, and is gone,
+/// and the relays have told nobody. The edge has its side again in time, and the
+/// other finds it wherever it can.
+#[test]
+fn a_side_that_is_taken_away_is_bound_again() {
+    for at in (100..130_000).step_by(1_300) {
+        for paths in [[true, true], [true, false], [false, true]] {
+            let mut world = World::new(Timing::default());
+            world.start(A);
+            world.run(20_000 + at);
+            world.clone_comes_and_goes(A);
+            world.run(1_000);
+            world.paths[B] = paths;
+            world.start(B);
+            let met = world.until_met_for_good(150_000);
+            assert!(met <= 80_000, "{met}: {}", world.describe());
+        }
+    }
+}
+
+/// Both relays are addresses of one, where each bind of an edge takes the side
+/// from the other. The edges meet after anything, also if clones have come and
+/// gone, and stay.
+#[test]
+fn edges_meet_on_one_relay_at_two_addresses() {
+    let mut numbers = Numbers(2);
+    for _ in 0..600 {
+        let mut world = World::after_anything(&mut numbers, true);
+        for edge in [A, B] {
+            world.paths[edge][numbers.below(2) as usize] = true;
+        }
+        let met = world.until_met_for_good(300_000);
+        assert!(met <= LATER + 60_000, "{met}: {}", world.describe());
+        assert_eq!(world.until_met_for_good(600_000), 0, "{}", world.describe());
+    }
+}
+
+/// The same when the later edge comes as the other binds, one way or the other.
+#[test]
+fn edges_meet_on_one_relay_as_they_bind() {
+    for latency in [[10, 10], [300, 20], [300, 120], [20, 300], [400, 400]] {
+        for on_backup in [false, true] {
+            for paths in [[true, true], [false, true]] {
+                for binds in [10_000, 60_000, 70_000] {
+                    for at in (binds - 2_000..binds + 1_500).step_by(50) {
+                        let mut world = World::new(Timing::default());
+                        world.one_relay = true;
+                        world.latency = [latency; 2];
+                        world.paths[A][PRIMARY] = !on_backup;
+                        world.start(A);
+                        // The primary is tried for 6 s first.
+                        world.run(if on_backup { 6_500 } else { 500 });
+                        world.paths[A][PRIMARY] = true;
+                        world.run(at);
+                        world.paths[B] = paths;
+                        world.start(B);
+                        let met = world.until_met_for_good(90_000);
+                        assert!(met <= 75_000, "{met} after {at}: {}", world.describe());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Two edges that start at any time of each other: the later one finds the
@@ -706,30 +997,7 @@ fn edges_meet_after_anything() {
     let mut numbers = Numbers(1);
     let (mut longest, mut alone) = (0, 0);
     for _ in 0..600 {
-        let mut world = World::new(Timing::default());
-        for edge in [A, B] {
-            world.edges[edge].near = numbers.below(4) > 0;
-            for relay in [PRIMARY, BACKUP] {
-                world.latency[edge][relay] = 1 + numbers.below(300);
-            }
-        }
-        world.start(A);
-        world.run(numbers.below(120_000));
-        world.start(B);
-        for _ in 0..numbers.below(12) {
-            match numbers.below(5) {
-                0 => {
-                    let edge = numbers.below(2) as usize;
-                    world.stop(edge);
-                    world.run(numbers.below(40_000));
-                    world.start(edge);
-                }
-                _ => world.paths = paths(numbers.below(16)),
-            }
-            let most = if numbers.either() { 20_000 } else { 200_000 };
-            world.run(numbers.below(most));
-        }
-        world.paths = paths(numbers.below(16));
+        let mut world = World::after_anything(&mut numbers, false);
         if can_meet(&world.paths) {
             let met = world.until_met_for_good(300_000);
             assert!(met <= LATER, "{met}: {}", world.describe());
