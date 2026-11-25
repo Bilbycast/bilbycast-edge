@@ -206,8 +206,9 @@ pub fn hitless_bus_key(scope: &str, uid: &str) -> (String, u16) {
 }
 
 /// The uid of a Hitless slot on `out_pid`, which no other slot of the plan is
-/// on. `n` tells it from a slot that had that `out_pid` in an earlier plan
-/// and whose merger, with its key, went on in another.
+/// on. `n` tells it from a slot that had that `out_pid` in an earlier plan:
+/// one whose merger, with its key, went on in another, or one on another
+/// primary.
 pub fn hitless_uid(out_pid: u16, n: u32) -> String {
     format!("slot_{out_pid}_{n}")
 }
@@ -594,7 +595,8 @@ impl HitlessMergers {
     /// following the merger's failovers and the flow's health its fallback. A
     /// merger whose slot is gone or changed is cancelled and awaited, so it is
     /// no longer publishing onto the slot's bus key when its replacement
-    /// starts there. Every slot without a merger then gets one, under
+    /// starts there, or, on another primary, on a key of its own. Every slot
+    /// without a merger then gets one, under
     /// `parent` — until the flow is found to have stopped meanwhile ([`HitlessOutputs::register`]), whose stop
     /// has released every channel but the one just taken: that one is
     /// released, and the rest of the slots get none.
@@ -613,13 +615,16 @@ impl HitlessMergers {
         // has retired and the assembler may still read.
         let used: HashSet<(String, u16)> = self.outputs.lock().channels.keys().cloned().collect();
         // The merger each slot goes on with: its own, one that merges the same
-        // under another `out_pid`, or the one its settings change under.
+        // under another `out_pid`, or the one its settings change under. A new
+        // one starts on its primary, before the plan is on air: on another
+        // input it takes a key the plan before does not read, or that plan
+        // would play it.
         let mut running = std::mem::take(&mut self.running);
         let mut taken: Vec<Option<RunningMerger>> = slots.iter().map(|_| None).collect();
         let rules: [fn(&PendingHitlessSlot, &PendingHitlessSlot) -> bool; 3] = [
             |was, slot| was.out_pid == slot.out_pid && was.merges_as(slot),
             |was, slot| was.merges_as(slot),
-            |was, slot| was.out_pid == slot.out_pid,
+            |was, slot| was.out_pid == slot.out_pid && was.primary.0 == slot.primary.0,
         ];
         for suits in rules {
             for (slot, taken) in slots.iter().zip(&mut taken).filter(|(_, taken)| taken.is_none()) {
@@ -2335,5 +2340,34 @@ mod tests {
         assert_eq!((read, gone), (vec![key("slot_512_0", true)], 0));
         let (read, gone) = swap(&[of(512, 600)]).await;
         assert_eq!((read, gone), (vec![key("slot_512_1", true)], 1));
+    }
+
+    /// A merger on another primary starts before the plan it is for is on air,
+    /// and the plan before plays nothing of it: it publishes onto a key of its
+    /// own. One on the same primary, whatever else of it changes, goes on on
+    /// its slot's.
+    #[tokio::test]
+    async fn a_new_primary_is_not_played_by_the_plan_before() {
+        let bus = Arc::new(NodeEsBus::new());
+        let flow = CancellationToken::new();
+        let _stop = flow.clone().drop_guard();
+        let mut mergers = HitlessMergers::default();
+        let mut plan = AssemblyPlan { programs: Vec::new(), clocks: Default::default() };
+        mergers.apply(&[pending("f1:0", 257)], &mut plan, &bus, &flow).await;
+        let mut played = bus.subscribe(&hitless_bus_key("f1:0", "slot_257_0").0, 0);
+
+        let leg = |input: &str| (input.to_string(), 0x300);
+        for (primary, backup, plays_on) in [("in-a", "in-c", true), ("in-c", "in-b", false)] {
+            let slot = PendingHitlessSlot {
+                primary: leg(primary),
+                backup: leg(backup),
+                ..pending("f1:0", 257)
+            };
+            let retired = mergers.apply(&[slot], &mut plan, &bus, &flow).await;
+            assert_eq!(retired.len(), usize::from(!plays_on), "{primary}");
+            bus.sender_for(primary, 0x300, 0x1B).send(es(0x300, 7)).expect("read");
+            let got = tokio::time::timeout(Duration::from_millis(300), played.recv()).await;
+            assert_eq!(matches!(got, Ok(Ok(_))), plays_on, "{primary}: {got:?}");
+        }
     }
 }

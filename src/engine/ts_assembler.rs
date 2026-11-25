@@ -1382,14 +1382,18 @@ async fn run_assembler(
                         && (was_prog.program_number == prog.program_number
                             || was_prog.slots == prog.slots);
                     // A slot of the program that stays on its clock goes on,
-                    // unless it was held.
+                    // unless it was held. A Hitless slot does with the legs it
+                    // had: its source, its merger's key, does not name them.
                     let stays = |out_pid: &u16| {
-                        let plays = |prog: &ProgramPlan, legs| {
-                            let slot = prog.slots.iter().find(|s| s.out_pid == *out_pid)?;
-                            Some(slot_health_identity(slot, legs).0)
+                        let it = |s: &&AssemblySlot| s.out_pid == *out_pid;
+                        let found = (was_prog.slots.iter().find(it), prog.slots.iter().find(it));
+                        let (Some(was), Some(is)) = found else {
+                            return false;
                         };
-                        let (was, is) = (plays(was_prog, &legs_from), plays(prog, &active_leg_input));
-                        was.zip(is).is_some_and(|(was, is)| was == is || plan.share_clock(&was, &is))
+                        let played = slot_health_identity(was, &legs_from).0;
+                        let plays = slot_health_identity(is, &active_leg_input).0;
+                        (played == plays && was.hitless_legs == is.hitless_legs)
+                            || plan.share_clock(&played, &plays)
                     };
                     let hold = match held.remove(&was_prog.program_number) {
                         None if from == now || plan.share_clock(from, now) => None,
@@ -6910,6 +6914,17 @@ mod tests {
             plan.programs[0].slots[1] = audio;
             plan
         };
+        // The audio slot on merger `key`, whose legs are the others.
+        let merged = |key: &str, primary: &str, backup: &str| AssemblySlot {
+            hitless_legs: Some(HitlessLegs {
+                primary: primary.to_string(),
+                backup: backup.to_string(),
+                forwarding_primary: Default::default(),
+                seq_fallback: Default::default(),
+            }),
+            ..slot(key, 0x101, 0x201, 0x0F)
+        };
+        let renumbered = AssemblySlot { out_pid: 0x202, ..merged("m", "a", "c") };
         // Another program's slot on 0x202, before the swap gives it to this one.
         let mut theirs = beside(breakaway("x", "a"));
         theirs.programs[1].slots.push(slot("a", 0x102, 0x202, 0x0F));
@@ -6930,10 +6945,20 @@ mod tests {
             // A Switch slot on the leg it was on, and one that loses it.
             (video("x", legs(&["a", "b"])), video("y", legs(&["a", "b"])), ("a", 0x101), true),
             (video("x", legs(&["a", "b"])), video("y", legs(&["b"])), ("b", 0x101), false),
+            // A Hitless slot with the legs it had, however they are merged;
+            // with another primary, or backup, behind the key it read; on
+            // another merger's, or none; and on another `out_pid`.
+            (video("x", merged("m", "a", "c")), video("y", merged("m", "a", "c")), ("m", 0x101), true),
+            (video("x", merged("m", "a", "c")), video("y", merged("m", "b", "c")), ("m", 0x101), false),
+            (video("x", merged("m", "a", "c")), video("y", merged("m", "a", "b")), ("m", 0x101), false),
+            (video("x", merged("m", "a", "c")), video("y", merged("n", "a", "c")), ("n", 0x101), false),
+            (video("x", merged("m", "a", "c")), breakaway("y", "a"), ("a", 0x101), false),
+            (breakaway("x", "a"), video("y", merged("m", "a", "c")), ("m", 0x101), false),
+            (video("x", merged("m", "a", "c")), video("y", renumbered), ("m", 0x101), false),
         ] {
             let what = format!("{id} 0x{pid:X} of {after:?}");
-            let out = pid + 0x100;
-            let out = if out == 0x209 { 0x201 } else { out };
+            let reads = |s: &&AssemblySlot| s.reads(&(id.to_string(), pid));
+            let out = after.programs[0].slots.iter().find(reads).expect("a slot").out_pid;
             let mut rig = Rig::start(before).await;
             rig.replace(after).await;
             rig.send(id, es_pes(pid, 0x0F, 90_000));
