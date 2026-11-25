@@ -386,9 +386,11 @@ pub async fn run_egress<L: DatagramLink>(
                 // to be provisioned with the same id — and both relay carriers
                 // forward the framing verbatim (bilbycast-relay `session.rs`
                 // "Forward the full datagram (with tunnel_id prefix)" and
-                // `udp_relay.rs`). The relay routes QUIC datagrams on this prefix
-                // alone with no per-datagram bind auth, so the receiving edge is
-                // the only place a re-addressed datagram can be refused.
+                // `udp_relay.rs`). The carrier is no substitute for it: up to
+                // v0.20.0 the relay took a QUIC datagram for any tunnel from any
+                // connection (since then only from one bound to the tunnel it
+                // names), and it knows a native-UDP sender by its source address
+                // alone, which can be forged.
                 if datagram_id != tunnel_id {
                     stats.framing_errors.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -456,9 +458,7 @@ pub async fn run_ingress<L: DatagramLink>(
                 let Some((datagram_id, encrypted_payload)) = protocol::decode_udp_datagram(&datagram) else { continue };
                 // Same refusal as `run_egress` above, same safety argument: one
                 // tunnel carries one id at both ends, both carriers forward the
-                // framing verbatim, and the prefix is outside the AEAD so the
-                // receiving edge is the only place a re-addressed datagram can be
-                // refused.
+                // framing verbatim, and the prefix is outside the AEAD.
                 if datagram_id != tunnel_id {
                     stats.framing_errors.fetch_add(1, Ordering::Relaxed);
                     continue;
@@ -562,11 +562,11 @@ mod tunnel_prefix_tests {
     /// A datagram framed for a DIFFERENT tunnel must never reach the local
     /// application.
     ///
-    /// The 16-byte prefix rides outside the AEAD, and the relay routes purely on
-    /// it with no per-datagram bind auth, so the receiving edge is the only
-    /// place a re-addressed datagram can be refused. The foreign datagram is
-    /// queued FIRST so a leak shows up as the wrong bytes arriving, not as a
-    /// timeout that a slow machine could also produce.
+    /// The 16-byte prefix rides outside the AEAD, and not every carrier refuses
+    /// a datagram that its sender had no business addressing there (see
+    /// [`run_egress`]). The foreign datagram is queued FIRST so a leak shows up
+    /// as the wrong bytes arriving, not as a timeout that a slow machine could
+    /// also produce.
     #[tokio::test]
     async fn ingress_drops_a_datagram_framed_for_another_tunnel() {
         let tunnel_id = Uuid::new_v4();

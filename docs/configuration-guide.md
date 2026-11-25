@@ -806,11 +806,21 @@ When `relay_addrs` contains a second entry, the edge provides automatic primaryâ
 
 - **Detection.** The QUIC transport uses a 5 s keep-alive interval and a 25 s max-idle timeout, so a dead relay is detected after ~25 s of silence. This tolerates typical Starlink satellite handovers and mobile cell-handoffs without flapping.
 - **Failover.** Once the primary is detected down, the edge reconnects and walks to the next relay in `relay_addrs`. Each reconnect attempt is bounded to 6 s so a dead primary cannot stall the loop behind the transport timeout. Expected end-to-end failover budget is **~30â€“40 s** on WAN links (both edges detect independently; the slower side sets total latency).
-- **Waiting convergence.** If the two edges initially land on different relays, the first-to-bind sees `Waiting`; after 10 s it steps forward to the next relay so the pair converges on the same one.
+- **Waiting convergence.** If the two edges initially land on different relays, the first-to-bind sees `Waiting`; after 10 s it steps forward to the next relay so the pair converges on the same one. This is while the edge connects. One whose peer leaves a tunnel that was up waits for it on the relay it is on.
 - **Failback.** A background probe (every 60 s) measures the primary's QUIC RTT. When the primary's RTT is within `max_rtt_failback_increase_ms` (default 50 ms) of the currently-active backup, traffic fails back to the primary. This RTT gate prevents returning to a degraded primary that is reachable but slow.
 - **Event visibility.** Each failover emits a Warning event to the manager with `from_relay_addr`, `to_relay_addr`, `from_idx`, `to_idx` details.
 
 Failover is only engaged for tunnels with two relays configured. A tunnel with a single `relay_addrs` entry will simply reconnect to that same address until it returns.
+
+### What the relay tells an edge
+
+A QUIC relay tunnel that is up is told by the relay what becomes of it, and follows with no new connection:
+
+- **The peer left or is back.** The state goes to `waiting` and to `ready` again. The edge keeps its connection and its bind.
+- **This edge's side was removed** (the manager's `close_tunnel`, or a delete on the relay's REST API). The state goes to `down` and the edge binds again on the same connection: after 1 s, and later and later, up to 60 s, if it keeps being removed. A tunnel that is being deleted has its `delete_tunnel` by then and does not bind again, unless the manager cannot reach the edge: a relay without `require_bind_auth` then takes the bind, and the tunnel is there until it can. The manager gives up after 24 h, and an edge that comes back later keeps the tunnel until it is deleted there (the manager's `tunnel_orphan_auto_cleanup` setting, off by default, does that when the edge reconnects). Up to relay v0.20.0 a delete on the REST API also took the tunnel's bind tokens away, so on such a relay without `require_bind_auth` anyone may bind the tunnel after one, until the relay next connects to the manager.
+- **A bind was refused**, at first or again. The edge raises `Tunnel bind rejected by relay`, and tries again on the next relay in the list, after 1 s doubling to 60 s once each has refused. So a relay with `require_bind_auth` on can come up ahead of the manager's authorizations.
+
+Up to v0.117.0 an edge read none of this once its tunnel was up, and no refusal at all: it stayed `ready`, or `connecting`, until its connection ended or it was restarted. Any relay release tells it, so upgrading the edge is enough. Native-UDP and direct tunnels have no such messages: on the native plane the edge registers again every 5 s whatever the relay holds, and a direct tunnel's connection is its peer.
 
 ---
 

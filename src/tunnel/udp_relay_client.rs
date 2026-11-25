@@ -1058,9 +1058,9 @@ pub async fn run_native_relay_leg_inproc(
                     // Same refusal as `udp_forwarder::run_{egress,ingress}`, same
                     // safety argument: this leg is one tunnel with one id at both
                     // ends (the register token binds it), and the relay forwards
-                    // the framing verbatim while routing on that prefix alone with
-                    // no per-datagram bind auth — so the receiving edge is the only
-                    // place a re-addressed datagram can be refused.
+                    // the framing verbatim, knowing a sender by its source address
+                    // alone: no token goes with a datagram, and an address can be
+                    // forged.
                     if datagram_id != params.tunnel_id {
                         stats.framing_errors.fetch_add(1, Ordering::Relaxed);
                         continue;

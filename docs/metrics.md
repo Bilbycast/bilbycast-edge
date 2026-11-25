@@ -487,7 +487,8 @@ Present on raw UDP / RTP inputs running the ingress de-jitter buffer
 > sends `"flows": []` alongside the same tunnel list.
 
 Each entry is a `TunnelStatus` — `id`, `name`, `protocol`, `mode`,
-`direction`, `local_addr`, `state`, plus `relay_addrs` /
+`direction`, `local_addr`, `state` (`connecting`, `waiting`, `ready` or
+`down`: see the [API reference](api-reference.md#tunnels)), plus `relay_addrs` /
 `active_relay_idx` / `active_relay_addr` on relay-mode tunnels — carrying a
 `stats` object:
 
