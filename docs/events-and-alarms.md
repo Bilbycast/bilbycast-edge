@@ -934,15 +934,17 @@ three published release artefacts carry it. Full reference:
 |----------|---------|---------|---------|
 | info | Tunnel '{name}' started | Tunnel created and connecting | `{ tunnel_name }` |
 | info | Tunnel '{name}' stopped | Tunnel stopped by command or config change | `{ tunnel_name }` |
-| info | Tunnel connected to relay | QUIC connection established and TunnelReady received | `{ relay_addr }` |
+| info | Tunnel connected to relay | TunnelReady received on a new connection: the edge has connected, or the tunnel has moved to its other relay | `{ relay_addr }` |
+| warning | Tunnel failed over to {backup or primary} relay {addr} | With two relays: the tunnel is up on another relay than it was. The edge could not reach the one it was on, or the peer has gone from it and is on the other. Comes with `Tunnel connected to relay`. Up to v0.117.0 it always said `backup` | `{ from_relay_addr, to_relay_addr, from_idx, to_idx }` |
+| info | Tunnel failing back to primary relay {addr} | A tunnel that was up on its backup moves to its primary, where the peer is or comes at the same time. Comes with `Tunnel connected to relay`, and interrupts nothing if the peer was on the backup. Up to v0.117.0 the edge ended its connection first, whether or not the peer could come | `{ primary_relay_addr, primary_rtt_ms, active_rtt_ms, gate_ms }` |
 | warning | Tunnel disconnected from relay: {reason} | QUIC connection lost or forwarder exited. The edge closes the connection itself when the relay refuses to bind a removed side again, or does not answer, or ends the control stream; the reason then ends in `closed`, and the log says which | `{ reason }` |
-| warning | Tunnel peer disconnected: {reason} | The relay says the peer is gone (`peer disconnected`, `peer unbound`). The connection and this edge's bind stay, the state is `waiting`, and the tunnel is `ready` again as soon as the peer is back. Up to v0.117.0 the edge did not read this: it stayed `ready` | `{ reason, relay_addr }` |
+| warning | Tunnel peer disconnected: {reason} | The relay says the peer is gone (`peer disconnected`, `peer unbound`). The connection and this edge's bind stay, the state is `waiting`, and the tunnel is `ready` again as soon as the peer is back. With two relays the edge binds the other one too after 10 s, and the tunnel may be ready there (`Tunnel connected to relay`). Up to v0.117.0 the edge did not read this: it stayed `ready` | `{ reason, relay_addr }` |
 | warning | Tunnel removed on relay: {reason} | The relay removed this edge's side under it: the manager's `close_tunnel` (`tunnel closed by manager`), or a delete on the relay's REST API (`tunnel deleted via relay REST API`). The state is `down`, and the edge binds its side again on the same connection after 1 s, doubling to 60 s while it is removed again within a minute of binding. Open TCP connections are not cut. Up to v0.117.0 the edge did not read this: it stayed `ready`, and silent until its connection ended | `{ reason, relay_addr }` |
 | info | Tunnel ready again | Both sides are bound again, with no new connection: the peer is back, or this edge's removed side is bound again and the peer is there | `{ relay_addr }` |
-| warning | Tunnel connection to relay failed: {error} | QUIC connect or TLS error | `{ relay_addr }` |
+| warning | Tunnel connection to relay failed: {error} | QUIC connect or TLS error, while the tunnel is bound nowhere. The other relay of a tunnel that is bound is tried without an event | `{ relay_addr }` |
 | warning | Tunnel '{name}' attempt {N} failed: {error} | Direct-mode retry failed | `{ tunnel_name, attempt }` |
 | critical | Tunnel '{name}' failed: {error} | Tunnel task exited with fatal error | `{ tunnel_name }` |
-| critical | Tunnel bind rejected by relay: {reason} | HMAC bind token verification failed (`bind authentication failed`): another token is registered for the tunnel, or none is and the relay has `require_bind_auth` on, as after a relay restart until the manager has registered it again. Tried again after 1 s, doubling to 60 s. Raised once for each relay until the tunnel has been up. Up to v0.117.0 never raised: the edge did not read the refusal, and stayed `connecting` until it was restarted | `{ relay_addr }` |
+| critical | Tunnel bind rejected by relay: {reason} | HMAC bind token verification failed (`bind authentication failed`): another token is registered for the tunnel, or none is and the relay has `require_bind_auth` on, as after a relay restart until the manager has registered it again. Tried again after 1 s, doubling to 60 s. Raised once for each relay until the tunnel has been up, and by a tunnel that is up, on its other relay, once until it moves or connects anew. Up to v0.117.0 never raised: the edge did not read the refusal, and stayed `connecting` until it was restarted | `{ relay_addr }` |
 | critical | Tunnel '{name}': {N} decrypt failures and zero packets delivered in {W}s — likely tunnel_encryption_key mismatch between edges | AEAD (ChaCha20-Poly1305) decrypt kept failing on inbound tunnel traffic while nothing was delivered across a full window — almost always the two edges hold different `tunnel_encryption_key` values. Emitted once per window | `{ error_code: "tunnel_decrypt_failure", tunnel_name, decrypt_errors_window, packets_delivered_window, window_secs }` |
 | warning | Tunnel '{name}': the kernel is dropping datagrams on the carrier socket before the edge reads them (receive buffer overrun) | `kernel_rx_drops` moved within a 10 s window on a native-UDP tunnel: the carrier socket's receive buffer overflowed and the kernel discarded datagrams before the edge read them. SRT/RIST will retransmit what they can, so media may look clean while a share of the wire is wasted, until the loss outgrows the latency budget. Raise `net.core.rmem_max` if the edge has logged that `SO_RCVBUF` was clamped; otherwise the receiving host is not reading fast enough. Raised once per episode — again only after a minute without drops; the message does not change between raises, the numbers are in `details` | `{ error_code: "tunnel_kernel_rx_drops", tunnel_name, dropped_window, dropped_total, window_secs }` |
 | warning | Tunnel {tunnel_id}: gateway route {source} via {gateway} dev {interface} not programmed: {error}. The tunnel runs without it… | A relay bond leg, or a native-UDP relay or direct tunnel, with `gateway` / `source` / `interface` set could not have its policy route programmed — the bond routing-table bases refused, no `CAP_NET_ADMIN`, the interface missing, or a netlink error. The route is best-effort, so the tunnel runs on, its packets following the host's own routing, which need not be via that gateway. Raised each time the tunnel starts — for a direct tunnel, each connection attempt, which backs off to one every 30 s while the peer is unreachable; until this release only a log line said so | `{ error_code: "tunnel_gateway_route_failed", tunnel_id, interface, source, gateway, error }` |
@@ -1217,7 +1219,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `webrtc` | 21 | WHIP/WHEP session lifecycle + `codec_needs_encode` (output-scoped from edge 0.113.0; HEVC and audio cases added) + `webrtc_negotiation_panic` + `opus_layout_unsupported` + `webrtc_no_h264` + `webrtc_setup_timeout` + `audio_codec_unpublishable` and `aac_channel_layout_missing` (output-scoped) + `whep_answer_unusable` |
 | `audio_encode` | 11 | Audio encoder lifecycle — ffmpeg sidecar (RTMP/HLS/WebRTC) + in-process TsAudioReplacer (SRT/RIST/RTP/UDP) |
 | `video_encode` | unaudited | Video transcoder lifecycle (started / failed) on the TS, RTMP, WebRTC and CMAF re-encoders, plus `video_encode_interlace_unavailable` (TS outputs and inputs; RTMP / CMAF from edge 0.113.0) and `video_encode_fps_mismatch` (TS outputs and inputs, a WS event from edge 0.113.0) |
-| `tunnel` | 15 | Tunnel connection state (now with structured details), what the relay says of a tunnel that is up (the peer gone, this edge's side removed, ready again) + AEAD decrypt failure (`tunnel_decrypt_failure`) + direct-listener register refusal (`tunnel_register_refused`) + carrier-socket kernel receive drops on a native-UDP tunnel (`tunnel_kernel_rx_drops`) + a gateway route a tunnel could not program (`tunnel_gateway_route_failed`) |
+| `tunnel` | 17 | Tunnel connection state (now with structured details), failover and failback, what the relay says of a tunnel that is up (the peer gone, this edge's side removed, ready again) + AEAD decrypt failure (`tunnel_decrypt_failure`) + direct-listener register refusal (`tunnel_register_refused`) + carrier-socket kernel receive drops on a native-UDP tunnel (`tunnel_kernel_rx_drops`) + a gateway route a tunnel could not program (`tunnel_gateway_route_failed`) |
 | `manager` | 13 | Manager WebSocket connection: connected, the nine `Manager connection lost` kinds, authentication refused, a secret rotated, credentials not saved |
 | `config` | 8 | Configuration changes, the three stale-environment-variable kinds (`deprecated_env_var`), `tuning_requires_restart`, and a bond routing-table base that is not a whole number as written (`bond_rt_base_unparseable`) or is refused (`bond_rt_base_refused`) |
 | `master_clock` | 2 | Source-PCR PLL lock-state transitions (fallback to wallclock, recovery) |
@@ -1243,7 +1245,7 @@ These are generated server-side in `bilbycast-manager/crates/manager-server/src/
 | `upgrade` | 7 | Remote binary upgrade lifecycle. See the [Remote upgrade section](#remote-upgrade-upgrade) — the failure codes there are `command_ack`-only, not events |
 | `cellular` | 6 | Cellular uplink telemetry (modem / RutOS). See [Cellular uplink events](#cellular-uplink-events-cellular) |
 | `starlink` | 6 | Starlink dish telemetry. See [Starlink dish events](#starlink-dish-events-starlink) |
-| **Total** | **243** | The numbered rows above; `flow`, `video_encode` and the rows marked — are not in it |
+| **Total** | **245** | The numbered rows above; `flow`, `video_encode` and the rows marked — are not in it |
 
 **What the Count column counts.** Each number was recounted against the code
 on 2026-10-31: the events this document's tables list for that category (a
@@ -1261,13 +1263,11 @@ The code also raises events no table here lists, and the counts leave them out:
 the SRT bonded input and output lifecycle (`SRT bonded input connected
 (caller)` / `(listener)`, `accept failed`, `connection failed`, `disconnected,
 reconnecting`, and the output's `connected` / `disconnected`) and the SRT
-input's `ingress_delay_ms`-over-latency warning (`srt`); `Tunnel failed over
-to backup relay {addr}`, `Tunnel failing back to primary relay {addr}` and the
-bare `Tunnel disconnected from relay` (`tunnel`);
-the flow-group and essence-flow persistence events (`config`); `manager binary
-frame too short` (`manager`); the RTMP and WebRTC `audio_encode` lifecycle
-messages beyond the rows above (`audio_encode`); and the local display's decode
-fallbacks (`display_hw_decode_*`, `display_*_prime_export_failed`,
+input's `ingress_delay_ms`-over-latency warning (`srt`); the flow-group and
+essence-flow persistence events (`config`); `manager binary frame too short`
+(`manager`); the RTMP and WebRTC `audio_encode` lifecycle messages beyond the
+rows above (`audio_encode`); and the local display's decode fallbacks
+(`display_hw_decode_*`, `display_*_prime_export_failed`,
 `display_unsupported_pixfmt`), which ride `system_resources` and are listed in
 the [Display section](#display-output-events-display).
 Until 2026-10-31 the Total read 118, a figure the column had long stopped

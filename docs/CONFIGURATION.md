@@ -273,7 +273,7 @@ An array of IP tunnel definitions. Tunnels create encrypted point-to-point links
 | `local_addr`           | `string`  | --      | Local address. For **egress**: listen address for local traffic to tunnel (e.g. `"0.0.0.0:9000"`). For **ingress**: forward address for received tunnel traffic (e.g. `"127.0.0.1:9000"`). |
 | `relay_addrs`          | `string[]`| `[]`    | Ordered relay server QUIC addresses. Index 0 is the primary; a second entry enables automatic primary↔backup failover. Max 2 entries. **Required for relay mode.** |
 | `relay_addr`           | `string?` | `null`  | **Legacy.** Single relay address. Accepted on load and migrated into `relay_addrs[0]`. Prefer `relay_addrs`. |
-| `max_rtt_failback_increase_ms` | `u32?` | `50` | RTT gate for failback from backup to primary. Failback is refused if the primary's measured RTT exceeds the active backup's by more than this many ms. |
+| `max_rtt_failback_increase_ms` | `u32?` | `50` | RTT gate for failback from backup to primary. Failback is refused if the primary's measured RTT exceeds the active backup's by more than this many ms. QUIC carrier only. |
 | `tunnel_encryption_key`| `string?` | `null`  | End-to-end encryption key (hex-encoded, exactly 64 chars = 32 bytes). Both edges must have the same key (distributed by manager). **Required for relay mode** (relay sees only ciphertext). Optional for direct mode (defense-in-depth). **Stored in `secrets.json`.** |
 | `tunnel_bind_secret`   | `string?` | `null`  | Shared secret for relay bind authentication (hex-encoded, exactly 64 chars = 32 bytes). Used to compute HMAC-SHA256 bind tokens. **Stored in `secrets.json`.** |
 | `peer_addr`            | `string?` | `null`  | Remote peer QUIC address, e.g. `"203.0.113.50:4433"`. **Required for direct mode, egress direction.** |
@@ -327,7 +327,7 @@ Both edges behind NAT, traffic forwarded through a bilbycast-relay server. End-t
 }
 ```
 
-Both edges must use the same `id`, `relay_addrs` ordering, `tunnel_encryption_key`, and `tunnel_bind_secret`. The manager distributes these automatically when creating tunnels. With two entries in `relay_addrs`, the edges automatically fail over to the backup when the primary goes down and fail back when the primary recovers (RTT-gated). See [Redundant Relay Failover](configuration-guide.md#redundant-relay-failover) in the configuration guide for the timing budget.
+Both edges must use the same `id`, `relay_addrs` ordering, `tunnel_encryption_key`, and `tunnel_bind_secret`. The manager distributes these automatically when creating tunnels. With two entries in `relay_addrs`, the edges automatically fail over to the backup when the primary goes down for either of them, and fail back together when it has recovered for both (RTT-gated). See [Redundant Relay Failover](configuration-guide.md#redundant-relay-failover) in the configuration guide for the timing budget.
 
 If only a single relay is needed, `relay_addrs` may contain just one entry (or the legacy `"relay_addr": "host:port"` form is still accepted).
 
