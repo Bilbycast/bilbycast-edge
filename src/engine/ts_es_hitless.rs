@@ -62,7 +62,7 @@
 //!   across a plan swap that leaves the slot alone and stops it before
 //!   anything else publishes onto the slot's bus key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::time::Duration;
@@ -198,18 +198,25 @@ pub fn hitless_scope(flow_id: &str) -> String {
 /// on the slot alone, two assembled flows with a Hitless slot at the same
 /// position published onto one key and each assembler played both flows'
 /// packets. `uid` is unique per Hitless slot within the flow
-/// (`"slot_{program_idx}_{slot_idx}"`) and, like the generation, holds no
+/// ([`hitless_uid`]) and, like the generation, holds no
 /// `:`, so the last two `:` separate the three and no two flows' slots, nor
 /// two runs of one flow, share a key.
 pub fn hitless_bus_key(scope: &str, uid: &str) -> (String, u16) {
     (format!("{HITLESS_INPUT_PREFIX}{scope}:{uid}"), 0)
 }
 
+/// The uid of a Hitless slot on `out_pid`, which no other slot of the plan is
+/// on. `n` tells it from a slot that had that `out_pid` in an earlier plan
+/// and whose merger, with its key, went on in another.
+pub fn hitless_uid(out_pid: u16, n: u32) -> String {
+    format!("slot_{out_pid}_{n}")
+}
+
 /// Whether `(input_id, source_pid)` has the whole shape of a Hitless slot's
 /// merger output, as [`hitless_bus_key`] builds it from a flow run's
-/// [`hitless_scope`] and a slot uid —
-/// `("hitless:{flow_id}:{generation}:slot_{program_idx}_{slot_idx}", 0)`,
-/// the generation and both indexes decimal. [`NodeEsBus::subscribe`] mints
+/// [`hitless_scope`] and a slot's [`hitless_uid`] —
+/// `("hitless:{flow_id}:{generation}:slot_{out_pid}_{n}", 0)`,
+/// the generation, the PID and `n` decimal. [`NodeEsBus::subscribe`] mints
 /// no such key. Judged on the
 /// prefix alone, it minted none for an input whose id only starts with it
 /// (`hitless:cam1`): subscribed before the input's first packet, a Pid slot
@@ -229,11 +236,11 @@ pub fn is_hitless_bus_key(input_id: &str, source_pid: u16) -> bool {
     let Some((flow_id, generation)) = scope.rsplit_once(':') else {
         return false;
     };
-    let slot = uid.strip_prefix("slot_").and_then(|indexes| indexes.split_once('_'));
+    let slot = uid.strip_prefix("slot_").and_then(|slot| slot.split_once('_'));
     source_pid == 0
         && !flow_id.is_empty()
         && decimal(generation)
-        && slot.is_some_and(|(program, slot)| decimal(program) && decimal(slot))
+        && slot.is_some_and(|(out_pid, n)| decimal(out_pid) && decimal(n))
 }
 
 /// How long a seq-aware Hitless leg's input holds each packet, by its
@@ -443,13 +450,13 @@ impl PartialEq for LegLag {
 
 impl Eq for LegLag {}
 
-/// The mergers running behind one assembled flow's Hitless slots, by slot
-/// uid. A slot's merger is the only publisher onto the slot's bus key, so
-/// the flow keeps exactly one per slot: [`Self::apply`] brings the set in
-/// line with each plan before it goes on air.
+/// The mergers running behind one assembled flow's Hitless slots. A slot's
+/// merger is the only publisher onto the slot's bus key, so the flow keeps
+/// exactly one per slot: [`Self::apply`] brings the set in line with each plan
+/// before it goes on air.
 #[derive(Default)]
 pub struct HitlessMergers {
-    running: HashMap<String, RunningMerger>,
+    running: Vec<RunningMerger>,
     /// The bus channels the mergers publish onto, shared with the flow so it
     /// can release them when it stops without taking the mergers' lock.
     outputs: Arc<HitlessOutputs>,
@@ -465,7 +472,10 @@ pub struct MergerEvents {
 }
 
 struct RunningMerger {
+    /// The slot it feeds, as the last plan has it.
     slot: PendingHitlessSlot,
+    /// The bus key it publishes onto, its own for life.
+    key: (String, u16),
     cancel: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -574,17 +584,18 @@ impl HitlessMergers {
     }
 
     /// Bring the running mergers in line with `slots`, the Hitless slots of
-    /// `plan`, before `plan` goes on air.
+    /// `plan`, before `plan` goes on air, and point each at its merger's bus
+    /// key.
     ///
-    /// A slot the plan leaves as it was keeps its merger, uninterrupted,
-    /// and `plan` takes that merger's [`ForwardingPrimary`] and
-    /// [`SeqFallback`] in place of the fresh ones it was built with, so the
-    /// on-air set goes on following the merger's failovers and the flow's
-    /// health its fallback. A merger whose slot is gone or changed is
-    /// cancelled and awaited, so it is no longer publishing onto the slot's
-    /// bus key when its replacement starts there. Every slot without a
-    /// merger then gets one, under `parent` — until the flow is found to
-    /// have stopped meanwhile ([`HitlessOutputs::register`]), whose stop
+    /// A slot the plan leaves as it was, wherever it has it now, and one whose
+    /// `out_pid` alone changed, keeps its merger, uninterrupted, and `plan`
+    /// takes that merger's [`ForwardingPrimary`] and [`SeqFallback`] in place
+    /// of the fresh ones it was built with, so the on-air set goes on
+    /// following the merger's failovers and the flow's health its fallback. A
+    /// merger whose slot is gone or changed is cancelled and awaited, so it is
+    /// no longer publishing onto the slot's bus key when its replacement
+    /// starts there. Every slot without a merger then gets one, under
+    /// `parent` — until the flow is found to have stopped meanwhile ([`HitlessOutputs::register`]), whose stop
     /// has released every channel but the one just taken: that one is
     /// released, and the rest of the slots get none.
     ///
@@ -598,39 +609,67 @@ impl HitlessMergers {
         bus: &Arc<NodeEsBus>,
         parent: &CancellationToken,
     ) -> Vec<RetiredOutput> {
-        let mut kept = HashMap::with_capacity(slots.len());
-        let mut retired = Vec::new();
-        for (uid, running) in std::mem::take(&mut self.running) {
-            // `ForwardingPrimary` compares equal whatever it holds, so this
-            // compares the slot's legs and settings only.
-            if slots.contains(&running.slot) {
-                kept.insert(uid, running);
-            } else {
-                running.cancel.cancel();
-                let _ = running.task.await;
-                let key = running.slot.bus_key;
-                if !slots.iter().any(|slot| slot.bus_key == key)
-                    && let Some(sender) = self.outputs.take(&key)
-                {
-                    retired.push(RetiredOutput { key, sender });
-                }
+        // Keys a new merger may not take: a running one's, or one's a swap
+        // has retired and the assembler may still read.
+        let used: HashSet<(String, u16)> = self.outputs.lock().channels.keys().cloned().collect();
+        // The merger each slot goes on with: its own, one that merges the same
+        // under another `out_pid`, or the one its settings change under.
+        let mut running = std::mem::take(&mut self.running);
+        let mut taken: Vec<Option<RunningMerger>> = slots.iter().map(|_| None).collect();
+        let rules: [fn(&PendingHitlessSlot, &PendingHitlessSlot) -> bool; 3] = [
+            |was, slot| was.out_pid == slot.out_pid && was.merges_as(slot),
+            |was, slot| was.merges_as(slot),
+            |was, slot| was.out_pid == slot.out_pid,
+        ];
+        for suits in rules {
+            for (slot, taken) in slots.iter().zip(&mut taken).filter(|(_, taken)| taken.is_none()) {
+                let found = running.iter().position(|merger| suits(&merger.slot, slot));
+                *taken = found.map(|at| running.swap_remove(at));
             }
         }
-        for slot in slots {
-            if let Some(running) = kept.get(&slot.uid) {
-                for planned in plan.programs.iter_mut().flat_map(|p| p.slots.iter_mut()) {
-                    if planned.source == slot.bus_key
-                        && let Some(legs) = planned.hitless_legs.as_mut()
-                    {
-                        legs.forwarding_primary = running.slot.forwarding_primary.clone();
-                        legs.seq_fallback = running.slot.seq_fallback.clone();
+        let mut retired = Vec::new();
+        for gone in running {
+            gone.cancel.cancel();
+            let _ = gone.task.await;
+            if let Some(sender) = self.outputs.take(&gone.key) {
+                retired.push(RetiredOutput { key: gone.key, sender });
+            }
+        }
+        for (slot, taken) in slots.iter().zip(taken) {
+            let key = match &taken {
+                Some(merger) => merger.key.clone(),
+                None => (0..)
+                    .map(|n| hitless_bus_key(&slot.scope, &hitless_uid(slot.out_pid, n)))
+                    .find(|key| !used.contains(key))
+                    .expect("a free key"),
+            };
+            let mut planned = plan
+                .programs
+                .iter_mut()
+                .flat_map(|p| p.slots.iter_mut())
+                .find(|planned| planned.out_pid == slot.out_pid);
+            if let Some(planned) = &mut planned {
+                planned.source = key.clone();
+            }
+            match taken {
+                Some(mut merger) if merger.slot.merges_as(slot) => {
+                    if let Some(legs) = planned.and_then(|planned| planned.hitless_legs.as_mut()) {
+                        legs.forwarding_primary = merger.slot.forwarding_primary.clone();
+                        legs.seq_fallback = merger.slot.seq_fallback.clone();
                     }
+                    merger.slot.out_pid = slot.out_pid;
+                    self.running.push(merger);
+                    continue;
                 }
-                continue;
+                Some(merger) => {
+                    merger.cancel.cancel();
+                    let _ = merger.task.await;
+                }
+                None => {}
             }
             let cancel = parent.child_token();
             let task = spawn_hitless_es_merger_full(
-                slot.bus_key.clone(),
+                key.clone(),
                 slot.primary.clone(),
                 slot.backup.clone(),
                 bus.clone(),
@@ -647,14 +686,13 @@ impl HitlessMergers {
             // The channel the merger just took, for releasing it later. A
             // flow that stopped under the swap has released the others and
             // refuses it: released here, and no further merger started.
-            let sender = bus.sender_for(&slot.bus_key.0, slot.bus_key.1, 0);
-            if !self.outputs.register(slot.bus_key.clone(), sender, bus) {
+            let sender = bus.sender_for(&key.0, key.1, 0);
+            if !self.outputs.register(key.clone(), sender, bus) {
                 cancel.cancel();
                 break;
             }
-            kept.insert(slot.uid.clone(), RunningMerger { slot: slot.clone(), cancel, task });
+            self.running.push(RunningMerger { slot: slot.clone(), key, cancel, task });
         }
-        self.running = kept;
         retired
     }
 
@@ -664,10 +702,12 @@ impl HitlessMergers {
         self.outputs.clone()
     }
 
-    /// How far apart the merger behind slot `uid` is told its legs are now.
+    /// How far apart the merger behind the slot on `out_pid` is told its legs
+    /// are now.
     #[cfg(test)]
-    pub fn leg_lag(&self, uid: &str) -> Option<Duration> {
-        self.running.get(uid).map(|running| running.slot.leg_lag.current())
+    pub fn leg_lag(&self, out_pid: u16) -> Option<Duration> {
+        let merger = self.running.iter().find(|merger| merger.slot.out_pid == out_pid)?;
+        Some(merger.slot.leg_lag.current())
     }
 }
 
@@ -2065,12 +2105,12 @@ mod tests {
         }
     }
 
-    /// A primary-preference Hitless slot `uid` of the flow run `scope`, over
-    /// `in-a` / `in-b`.
-    fn pending(scope: &str, uid: &str) -> PendingHitlessSlot {
+    /// A primary-preference Hitless slot on `out_pid` of the flow run `scope`,
+    /// over `in-a` / `in-b`.
+    fn pending(scope: &str, out_pid: u16) -> PendingHitlessSlot {
         PendingHitlessSlot {
-            uid: uid.to_string(),
-            bus_key: hitless_bus_key(scope, uid),
+            out_pid,
+            scope: scope.to_string(),
             primary: ("in-a".to_string(), 0x100),
             backup: ("in-b".to_string(), 0x200),
             stall_ms: DEFAULT_STALL_MS,
@@ -2098,18 +2138,19 @@ mod tests {
         let mut mergers = HitlessMergers::default();
         let outputs = mergers.outputs();
         let mut plan = AssemblyPlan { programs: Vec::new(), clocks: Default::default() };
-        mergers.apply(&[pending(&scope, "slot_0_0")], &mut plan, &bus, &flow).await;
+        mergers.apply(&[pending(&scope, 257)], &mut plan, &bus, &flow).await;
 
         // The flow stops: its cancel, then its channels.
         flow.cancel();
         outputs.release_all(&bus);
         // The swap goes on, onto a plan with another slot.
-        let retired = mergers.apply(&[pending(&scope, "slot_0_1")], &mut plan, &bus, &flow).await;
+        let another = PendingHitlessSlot { stall_ms: 500, ..pending(&scope, 258) };
+        let retired = mergers.apply(&[another], &mut plan, &bus, &flow).await;
         assert!(retired.is_empty(), "the stop took the old slot's channel");
         // On its way out the swap starts the new slot's analyzer, and the
         // assembler a fan-in on the old one.
-        let mut analyzer = bus.subscribe(&hitless_bus_key(&scope, "slot_0_1").0, 0);
-        let _fanin = bus.subscribe(&hitless_bus_key(&scope, "slot_0_0").0, 0);
+        let mut analyzer = bus.subscribe(&hitless_bus_key(&scope, "slot_258_0").0, 0);
+        let _fanin = bus.subscribe(&hitless_bus_key(&scope, "slot_257_0").0, 0);
         assert!(
             matches!(
                 tokio::time::timeout(Duration::from_millis(500), analyzer.recv()).await,
@@ -2138,7 +2179,7 @@ mod tests {
         let old_flow = CancellationToken::new();
         let old = hitless_scope("f1");
         let mut old_mergers = HitlessMergers::default();
-        old_mergers.apply(&[pending(&old, "slot_0_0")], &mut plan, &bus, &old_flow).await;
+        old_mergers.apply(&[pending(&old, 257)], &mut plan, &bus, &old_flow).await;
         let retired = old_mergers.apply(&[], &mut plan, &bus, &old_flow).await;
         assert_eq!(retired.len(), 1, "the dropped slot's channel is retired");
 
@@ -2149,7 +2190,7 @@ mod tests {
         let _stop = new_flow.clone().drop_guard();
         let new = hitless_scope("f1");
         let mut new_mergers = HitlessMergers::default();
-        new_mergers.apply(&[pending(&new, "slot_0_0")], &mut plan, &bus, &new_flow).await;
+        new_mergers.apply(&[pending(&new, 257)], &mut plan, &bus, &new_flow).await;
 
         // The old run's assembler answers, and its swap releases the channel
         // it retired.
@@ -2157,7 +2198,7 @@ mod tests {
             output.release(&bus);
         }
         // A fan-in subscribing now still reads the new run's merger.
-        let (key, pid) = hitless_bus_key(&new, "slot_0_0");
+        let (key, pid) = hitless_bus_key(&new, "slot_257_0");
         let mut fanin = bus.subscribe(&key, pid);
         bus.sender_for("in-a", 0x100, 0x1B)
             .send(es(0x100, 0xAA))
@@ -2167,5 +2208,132 @@ mod tests {
             .expect("the merger forwards its primary")
             .expect("onto the slot's channel, still on the bus");
         assert_eq!(got.payload[4], 0xAA);
+    }
+
+    /// A slot keeps its merger, and the bus key it reads, wherever a plan swap
+    /// puts it, and when its `out_pid` alone changes. Known by its place in
+    /// the plan, it got a new one, on its primary again, for a swap of the
+    /// programs before it.
+    #[tokio::test]
+    async fn a_slot_keeps_its_merger_wherever_the_plan_has_it() {
+        use crate::engine::ts_assembler::{AssemblySlot, HitlessLegs, ProgramPlan};
+        let bus = Arc::new(NodeEsBus::new());
+        let flow = CancellationToken::new();
+        let _stop = flow.clone().drop_guard();
+        let mut mergers = HitlessMergers::default();
+        let of = |out_pid: u16, stall_ms: u64| PendingHitlessSlot { stall_ms, ..pending("f1:0", out_pid) };
+        // Put the slots on air, a program each, and say what they read, which
+        // leg they say is on air, and how many channels went.
+        let mut swap = async |slots: &[PendingHitlessSlot]| {
+            let programs = slots.iter().map(|s| ProgramPlan {
+                program_number: s.out_pid,
+                pmt_pid: 0x1000 + s.out_pid,
+                pcr_source: ("in-c".to_string(), 0x100),
+                slots: vec![AssemblySlot {
+                    source: hitless_bus_key(&s.scope, &hitless_uid(s.out_pid, 0)),
+                    out_pid: s.out_pid,
+                    stream_type: 0x0F,
+                    switch_legs: None,
+                    hitless_legs: Some(HitlessLegs {
+                        primary: s.primary.0.clone(),
+                        backup: s.backup.0.clone(),
+                        forwarding_primary: s.forwarding_primary.clone(),
+                        seq_fallback: s.seq_fallback.clone(),
+                    }),
+                    splice_mode: Default::default(),
+                    splice_budget_ms: None,
+                }],
+            });
+            let mut plan = AssemblyPlan { programs: programs.collect(), clocks: Default::default() };
+            let retired = mergers.apply(slots, &mut plan, &bus, &flow).await;
+            let read: Vec<(String, bool)> = plan
+                .programs
+                .iter()
+                .map(|p| {
+                    let legs = p.slots[0].hitless_legs.as_ref().unwrap();
+                    // The one merger here that fails over says it fell back too.
+                    let primary = legs.forwarding_primary.get();
+                    assert_eq!(legs.seq_fallback.leg().is_none(), primary);
+                    (p.slots[0].source.0.clone(), primary)
+                })
+                .collect();
+            let gone = retired.len();
+            for output in retired {
+                output.release(&bus);
+            }
+            (read, gone)
+        };
+        let key = |uid: &str, primary: bool| (format!("hitless:f1:0:{uid}"), primary);
+
+        let (a, b) = (of(512, 200), of(513, 300));
+        let (read, _) = swap(&[a.clone(), b.clone()]).await;
+        assert_eq!(read, [key("slot_512_0", true), key("slot_513_0", true)]);
+        // The first fails over, which the plans after it go on saying.
+        bus.sender_for("in-a", 0x100, 0x1B).send(es(0x100, 1)).expect("read");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        bus.sender_for("in-b", 0x200, 0x1B).send(es(0x200, 2)).expect("read");
+        let mut waited = 0;
+        while a.forwarding_primary.get() {
+            waited += 1;
+            assert!(waited < 100, "the merger fails over");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        a.seq_fallback.set(Leg::Backup);
+
+        // The other way round, one of them alone, and beside a new one.
+        let (read, gone) = swap(&[of(513, 300), of(512, 200)]).await;
+        assert_eq!(read, [key("slot_513_0", true), key("slot_512_0", false)]);
+        assert_eq!(gone, 0);
+        let (read, gone) = swap(&[of(512, 200)]).await;
+        assert_eq!(read, [key("slot_512_0", false)]);
+        assert_eq!(gone, 1, "the dropped slot's channel");
+        let (read, _) = swap(&[of(514, 400), of(512, 200)]).await;
+        assert_eq!(read, [key("slot_514_0", true), key("slot_512_0", false)]);
+
+        // Its `out_pid` changes, and another slot takes the one it had.
+        let (read, gone) = swap(&[of(514, 400), of(600, 200)]).await;
+        assert_eq!(read, [key("slot_514_0", true), key("slot_512_0", false)]);
+        assert_eq!(gone, 0);
+        let (read, _) = swap(&[of(512, 500), of(600, 200), of(514, 400)]).await;
+        assert_eq!(
+            read,
+            [key("slot_512_1", true), key("slot_512_0", false), key("slot_514_0", true)]
+        );
+        // Edited on its own `out_pid`, it keeps the key under a new merger.
+        let (read, gone) = swap(&[of(512, 500), of(600, 201)]).await;
+        assert_eq!(read, [key("slot_512_1", true), key("slot_512_0", true)]);
+        assert_eq!(gone, 1);
+        // Two that exchange their `out_pid`s keep their own.
+        let (read, gone) = swap(&[of(512, 201), of(600, 500)]).await;
+        assert_eq!(read, [key("slot_512_0", true), key("slot_512_1", true)]);
+        assert_eq!(gone, 0);
+        // Two that merge the same go on as each was, in either order, and one
+        // on other legs is another.
+        let (read, _) = swap(&[of(800, 700), of(801, 700)]).await;
+        assert_eq!(read, [key("slot_800_0", true), key("slot_801_0", true)]);
+        let (read, gone) = swap(&[of(801, 700), of(800, 700)]).await;
+        assert_eq!(read, [key("slot_801_0", true), key("slot_800_0", true)]);
+        assert_eq!(gone, 0);
+        let elsewhere = |out_pid| PendingHitlessSlot {
+            primary: ("in-d".to_string(), 0x300),
+            ..of(out_pid, 700)
+        };
+        let (read, gone) = swap(&[of(801, 700), elsewhere(802)]).await;
+        assert_eq!(read, [key("slot_801_0", true), key("slot_802_0", true)]);
+        assert_eq!(gone, 1, "800's");
+        let readers = |input: &str, pid: u16| bus.sender_for(input, pid, 0x1B).receiver_count();
+        assert_eq!((readers("in-a", 0x100), readers("in-d", 0x300)), (1, 1));
+        let (read, gone) = swap(&[elsewhere(801)]).await;
+        assert_eq!((read, gone), (vec![key("slot_802_0", true)], 1), "802's, on 801");
+        assert_eq!((readers("in-a", 0x100), readers("in-d", 0x300)), (0, 1), "801's is gone");
+        swap(&[PendingHitlessSlot { stall_ms: 800, ..elsewhere(801) }]).await;
+        assert_eq!(readers("in-d", 0x300), 1, "one in the place of the other");
+        // A key the swap retires is not taken before it is released.
+        swap(&[of(512, 500)]).await;
+        assert_eq!(readers("in-d", 0x300), 0);
+        let (read, gone) = swap(&[of(600, 500)]).await;
+        assert_eq!((read, gone), (vec![key("slot_512_0", true)], 0));
+        let (read, gone) = swap(&[of(512, 600)]).await;
+        assert_eq!((read, gone), (vec![key("slot_512_1", true)], 1));
     }
 }

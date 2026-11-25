@@ -2029,7 +2029,7 @@ mod tests {
             let bus = fm.node_es_bus();
             let runtime = runtime.clone();
             async move {
-                let (merged, merged_pid) = runtime.hitless_bus_key("slot_0_1");
+                let (merged, merged_pid) = runtime.hitless_bus_key(257);
                 let primary = bus.sender_for("in-a", 257, 0x0F);
                 let backup = bus.sender_for("in-b", 257, 0x0F);
                 let packet = || EsPacket {
@@ -2554,6 +2554,217 @@ mod tests {
         then_stop(&fm, checks).await;
     }
 
+    /// A packet on `pid`, opening a PES stamped `pts` (90 kHz), or with a PCR
+    /// of that and nothing else.
+    fn es_packet(pid: u16, stamp: u64, pcr: bool) -> crate::engine::ts_es_bus::EsPacket {
+        let mut p = [0xFFu8; 188];
+        p[0] = 0x47;
+        p[1] = (pid >> 8) as u8 | if pcr { 0 } else { 0x40 };
+        p[2] = pid as u8;
+        if pcr {
+            p[3] = 0x20;
+            p[4] = 183;
+            p[5] = 0x10;
+            let base = stamp << 7;
+            p[6..10].copy_from_slice(&((base >> 8) as u32).to_be_bytes());
+            p[10] = (base as u8) | 0x7E;
+            p[11] = 0;
+        } else {
+            p[3] = 0x10;
+            p[4..9].copy_from_slice(&[0, 0, 1, 0xE0, 0]);
+            p[9..13].copy_from_slice(&[0, 0x80, 0x80, 5]);
+            p[13] = 0x21 | ((stamp >> 29) & 0x0E) as u8;
+            p[14] = (stamp >> 22) as u8;
+            p[15] = 0x01 | ((stamp >> 14) & 0xFE) as u8;
+            p[16] = (stamp >> 7) as u8;
+            p[17] = 0x01 | ((stamp << 1) & 0xFE) as u8;
+        }
+        crate::engine::ts_es_bus::EsPacket {
+            source_pid: pid,
+            stream_type: 27,
+            payload: bytes::Bytes::copy_from_slice(&p),
+            is_pusi: !pcr,
+            has_pcr: pcr,
+            pcr: pcr.then_some(stamp * 300),
+            recv_time_us: 0,
+            upstream_seq: None,
+        }
+    }
+
+    /// What goes out on `pids` in `wait`: the PID, and the PCR (27 MHz) or the
+    /// PTS (90 kHz).
+    async fn es_out(
+        out: &mut broadcast::Receiver<RtpPacket>,
+        pids: &[u16],
+        wait: std::time::Duration,
+    ) -> Vec<(u16, Option<u64>, Option<u64>)> {
+        use crate::engine::ts_parse::{extract_pcr, extract_pes_pts, ts_pid};
+        let end = tokio::time::Instant::now() + wait;
+        let mut seen = Vec::new();
+        while let Ok(Ok(bundle)) = tokio::time::timeout_at(end, out.recv()).await {
+            let es = bundle.data.chunks_exact(188).filter(|p| pids.contains(&ts_pid(p)));
+            seen.extend(es.map(|p| (ts_pid(p), extract_pcr(p), extract_pes_pts(p))));
+        }
+        seen
+    }
+
+    /// A swap between two encoders, or to another flow's input, is a cut that
+    /// waits for the new one's PCR: what goes out of it ahead of that was
+    /// stamped on the old one's clock by the output's clock rewriter, off by
+    /// the difference of the two. An input that sends its PCR on another PID
+    /// is not waited for longer than 2 s, and the event says so.
+    #[tokio::test]
+    async fn a_plan_swap_between_two_encoders_waits_for_the_new_ones_pcr() {
+        use std::time::Duration;
+        let (fm, mut events) = make_fm_with_events();
+        let on = |id: &str| assembly_of(id, &[pid_source(id, 256), pid_source(id, 257)]);
+        let runtime = fm
+            .create_flow(assembled_flow(42120, &["a", "b"], "a", &on("a")))
+            .await
+            .expect("create_flow");
+        let checks = {
+            let (bus, runtime) = (fm.node_es_bus(), runtime.clone());
+            let mut out = runtime.broadcast_tx.subscribe();
+            async move {
+                let send = |id: &str, pid: u16, stamp: u64, pcr: bool| {
+                    let _ = bus.sender_for(id, pid, 27).send(es_packet(pid, stamp, pcr));
+                };
+                // A PES's distance from the PCR ahead of it, in milliseconds.
+                let distance = |seen: &[(u16, Option<u64>, Option<u64>)]| -> Vec<i64> {
+                    let mut pcr = None;
+                    seen.iter()
+                        .filter_map(|(_, p, pts)| {
+                            pcr = p.or(pcr);
+                            Some((*pts.as_ref()? as i64 - (pcr? / 300) as i64) / 90)
+                        })
+                        .collect()
+                };
+                let pids = [512, 513];
+                let wait = Duration::from_millis(200);
+                plays(&runtime, &["a"]).await;
+                tokio::time::sleep(wait).await;
+                send("a", 256, 9_000_000, true);
+                send("a", 257, 9_000_000, false);
+                tokio::time::sleep(wait).await;
+                send("a", 256, 9_003_600, false);
+                assert!(!distance(&es_out(&mut out, &pids, wait).await).is_empty(), "a plays");
+
+                // Two encoders, and one that only another flow has.
+                for (id, epoch) in [("b", 900_000_000), ("elsewhere", 1_800_000_000), ("a", 9_100_000)] {
+                    runtime.replace_assembly(on(id), None).await.expect("swap");
+                    send(id, 256, epoch, false);
+                    send(id, 257, epoch, true);
+                    send(id, 257, epoch, false);
+                    assert_eq!(es_out(&mut out, &pids, wait).await, [], "{id}: held for its PCR");
+                    send(id, 256, epoch, true);
+                    tokio::time::sleep(wait).await;
+                    send(id, 256, epoch + 3_600, false);
+                    send(id, 257, epoch + 3_600, false);
+                    let seen = es_out(&mut out, &pids, Duration::from_millis(500)).await;
+                    assert!(seen.first().is_some_and(|s| s.1.is_some()), "{id}: the PCR first: {seen:?}");
+                    assert_eq!(distance(&seen), [40, 40], "{id}: {seen:?}");
+                }
+                // One whose PCR is on neither PID: the PMT names a PID without.
+                let mut separate = on("b");
+                separate.pcr_source.as_mut().unwrap().pid = 510;
+                runtime.replace_assembly(separate, None).await.expect("swap");
+                let since = std::time::Instant::now();
+                for pts in 0.. {
+                    send("b", 257, 900_000_000 + 9_000 * pts, false);
+                    if !es_out(&mut out, &pids, Duration::from_millis(100)).await.is_empty() {
+                        break;
+                    }
+                    assert!(since.elapsed() < Duration::from_secs(10), "it goes out without");
+                }
+                assert!(since.elapsed() >= Duration::from_secs(2), "{:?}", since.elapsed());
+                send("b", 257, 990_000_000, false);
+                assert_eq!(es_out(&mut out, &pids, wait).await.len(), 1, "and from there on");
+                let said: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                    .filter_map(|e| e.details)
+                    .filter(|d| d["error_code"] == "pid_bus_swap_no_pcr")
+                    .map(|d| (d["out_pid"].clone(), d["input_id"].clone(), d["source_pid"].clone()))
+                    .collect();
+                assert_eq!(said, [(512.into(), "b".into(), 256.into())]);
+            }
+        };
+        then_stop(&fm, checks).await;
+    }
+
+    /// What a Take put a program on it stays on when a swap moves the program
+    /// in the plan, or drops one ahead of it, and so does a Hitless slot's
+    /// merger on its backup.
+    #[tokio::test]
+    async fn a_plan_swap_leaves_a_program_it_moves() {
+        use std::time::Duration;
+        let fm = make_fm();
+        let program = |number: u16, pcr: &str, sources: &[serde_json::Value]| {
+            let streams: Vec<_> = sources
+                .iter()
+                .enumerate()
+                .map(|(i, source)| {
+                    serde_json::json!({
+                        "source": source, "out_pid": 512 + 16 * number as usize + i, "stream_type": 27
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "program_number": number, "pmt_pid": 4096 + number,
+                "pcr_source": { "input_id": pcr, "pid": 256 }, "streams": streams
+            })
+        };
+        let mpts = |programs: &[&serde_json::Value]| -> crate::config::models::FlowAssembly {
+            serde_json::from_value(serde_json::json!({ "kind": "mpts", "programs": programs }))
+                .expect("assembly fixture")
+        };
+        let first = program(1, "c", &[pid_source("c", 256)]);
+        let switched = program(2, "a", &[switch_source(&["a", "b"], 256)]);
+        let merged = program(3, "c", &[
+            pid_source("c", 256),
+            serde_json::json!({
+                "type": "hitless", "stall_ms": 50,
+                "primary": pid_source("x", 257), "backup": pid_source("y", 257)
+            }),
+        ]);
+        let runtime = fm
+            .create_flow(assembled_flow(42123, &["a", "b", "c"], "a", &mpts(&[&first, &switched, &merged])))
+            .await
+            .expect("create_flow");
+        let checks = {
+            let (fm, runtime) = (fm.clone(), runtime.clone());
+            async move {
+                let bus = fm.node_es_bus();
+                plays(&runtime, &["a", "c"]).await;
+                fm.switch_active_input("f1", "b", None).await.expect("a Take");
+                plays(&runtime, &["b", "c"]).await;
+                let backup = || runtime.stats.on_air.contains("y") && !runtime.stats.on_air.contains("x");
+                bus.sender_for("x", 257, 27).send(es_packet(257, 9_000, false)).expect("read");
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                bus.sender_for("y", 257, 27).send(es_packet(257, 9_000, false)).expect("read");
+                let mut waited = 0;
+                while !backup() {
+                    waited += 1;
+                    assert!(waited < 100, "the merger is on its backup");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                for programs in [
+                    &[&merged, &switched, &first][..],
+                    &[&switched, &merged],
+                    &[&merged, &switched],
+                ] {
+                    runtime.replace_assembly(mpts(programs), None).await.expect("swap");
+                    plays(&runtime, &["b", "c"]).await;
+                    assert!(backup(), "the merger is the one it was");
+                }
+                // Renumbered too.
+                let mut seventh = switched.clone();
+                seventh["program_number"] = 7.into();
+                runtime.replace_assembly(mpts(&[&seventh, &merged]), None).await.expect("swap");
+                plays(&runtime, &["b", "c"]).await;
+            }
+        };
+        then_stop(&fm, checks).await;
+    }
+
     /// The assembler is told the flow's clocks, at start and on a swap: a
     /// PES-aligned Take between two WebRTC inputs, on the host's one clock,
     /// is spliced (degraded here for want of a PES to align to), and between
@@ -2869,7 +3080,7 @@ mod tests {
                 let mut swap = runtime.begin_assembly_swap().await;
                 let on_air = swap.replace(wanted, leg_holds, None).await.expect("swap");
                 assert!(matches!(on_air, crate::engine::flow::SwapOutcome::OnAir));
-                assert_eq!(swap.leg_lag("slot_0_1"), Some(Duration::from_millis(1_900)));
+                assert_eq!(swap.leg_lag(257), Some(Duration::from_millis(1_900)));
             }
         });
         let outcome = checks.await;
@@ -2961,7 +3172,7 @@ mod tests {
             let (fm, runtime) = (fm.clone(), runtime.clone());
             async move {
                 let lag = || async {
-                    runtime.begin_assembly_swap().await.leg_lag("slot_0_1").expect("the slot")
+                    runtime.begin_assembly_swap().await.leg_lag(257).expect("the slot")
                 };
                 assert_eq!(lag().await, Duration::from_millis(1_900), "as the hosts run");
 
@@ -2973,7 +3184,7 @@ mod tests {
                 let on_air = swap.replace(wanted, leg_holds, None).await.expect("swap");
                 assert!(matches!(on_air, crate::engine::flow::SwapOutcome::OnAir));
                 assert_eq!(
-                    swap.leg_lag("slot_0_1"),
+                    swap.leg_lag(257),
                     Some(Duration::from_millis(1_900)),
                     "the kept merger, on what runs"
                 );
