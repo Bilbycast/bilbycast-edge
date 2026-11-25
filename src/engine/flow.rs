@@ -3307,6 +3307,14 @@ impl FlowRuntime {
                     .iter()
                     .any(|d| matches!(d.config, InputConfig::Bonded(_)));
             live.push(input_def);
+            // A running plan with a Switch leg on the input judges a Take to
+            // it by its clock. With no room in the queue those Takes are cuts
+            // until the next plan swap.
+            if let Some(handle) = self.pid_bus_assembler_handle.as_ref() {
+                let _ = handle.plan_tx.try_send(
+                    crate::engine::ts_assembler::PlanCommand::InputClocks(input_clocks(&live)),
+                );
+            }
         }
         {
             let mut handles = self.input_handles.write().await;

@@ -1001,8 +1001,8 @@ impl FlowManager {
     ///
     /// - `Flow '...' is not running` if the flow id is unknown.
     /// - The runtime's `InputMembershipError` variants
-    ///   (`input_already_member`, `hitless_leg_change_requires_restart`)
-    ///   propagated verbatim.
+    ///   (`input_already_member`, `hitless_leg_change_requires_restart`,
+    ///   `pid_bus_master_clock_mismatch`) propagated verbatim.
     /// - Asynchronous bind failures (`port_conflict`, `bind_failed`) do
     ///   NOT surface here; the WS handler uses
     ///   `wait_for_first_bind_failure` to detect them within
@@ -2645,6 +2645,45 @@ mod tests {
             };
             then_stop(&fm, checks).await;
         }
+    }
+
+    /// An input that joins a flow whose assembly has a Switch leg on it is on
+    /// the clocks the assembler was told at the start: a PES-aligned Take
+    /// between two WebRTC inputs, on the host's one clock, stays a splice
+    /// (degraded here for want of a PES to align to).
+    #[tokio::test]
+    async fn an_input_that_joins_brings_its_clock() {
+        let legs = ["a", "c"];
+        let aligned = |pid: u16| {
+            let mut source = switch_source(&legs, pid);
+            source["splice_mode"] = "pes_aligned".into();
+            source
+        };
+        let webrtc = |id: &str| {
+            input(serde_json::json!({ "id": id, "name": id, "active": id == "a", "type": "webrtc" }))
+        };
+        let (fm, mut events) = make_fm_with_events();
+        let mut resolved =
+            assembled_flow(42117, &["a"], "a", &assembly_of("a", &[aligned(256), aligned(257)]));
+        resolved.inputs = vec![webrtc("a")];
+        let runtime = fm.create_flow(resolved).await.expect("create_flow");
+        let checks = {
+            let fm = fm.clone();
+            async move {
+                fm.add_input("f1", webrtc("c")).await.expect("joins");
+                for take in ["c", "a"] {
+                    fm.switch_active_input("f1", take, None).await.expect("a Take");
+                    plays(&runtime, &[take]).await;
+                }
+                let reasons: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+                    .filter_map(|e| e.details)
+                    .filter(|d| d["error_code"] == "pes_splice_degraded")
+                    .map(|d| d["reason"].clone())
+                    .collect();
+                assert_eq!(reasons, ["no_aligned_pes_reference"; 4]);
+            }
+        };
+        then_stop(&fm, checks).await;
     }
 
     /// A plan swap its flow's assembler does not confirm still stands: the
