@@ -54,7 +54,8 @@ pub struct PsiCatalog {
 pub struct CatalogProgram {
     pub program_number: u16,
     pub pmt_pid: u16,
-    /// PCR PID for this program (`None` on malformed/empty PMT).
+    /// PCR PID for this program. `None` until its PMT is read, like an empty
+    /// `streams`, and where the PMT names none (0x1FFF).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pcr_pid: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -719,6 +720,24 @@ mod tests {
         let p2 = &cat.programs[1];
         assert_eq!(p2.streams[0].codec, "H.265 / HEVC");
         assert_eq!(p2.streams[1].codec, "AC-3 (ATSC)");
+    }
+
+    /// `pcr_pid` is `None` beside a program's streams only where its PMT names
+    /// none: both come with the PMT.
+    #[test]
+    fn a_pmt_that_names_no_pcr_pid_has_its_streams() {
+        let mut state = ObserverState::default();
+        let store = PsiCatalogStore::new();
+        drive(&mut state, &store, &build_pat(&[(1, 0x100)], 0));
+        let read = || {
+            let cat = store.load().expect("catalog present");
+            (cat.programs[0].pcr_pid, cat.programs[0].streams.len())
+        };
+        assert_eq!(read(), (None, 0), "not read yet");
+        drive(&mut state, &store, &build_pmt(0x100, &[(0x0F, 0x101)], 0x101, 0));
+        assert_eq!(read(), (Some(0x101), 1));
+        drive(&mut state, &store, &build_pmt(0x100, &[(0x0F, 0x101)], 0x1FFF, 1));
+        assert_eq!(read(), (None, 1));
     }
 
     #[test]

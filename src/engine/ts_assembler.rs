@@ -241,6 +241,38 @@ fn pcr_leg_of(
     pcr_legs(plan, pcr_out_pid_by_program, active_leg_input).swap_remove(pidx)
 }
 
+/// Say that a program goes out without a PCR since a plan swap: `leg` has none,
+/// for `why`.
+fn emit_swap_no_pcr(
+    event_sender: &Option<crate::manager::events::EventSender>,
+    flow_id: &str,
+    program_number: u16,
+    leg: &PcrLeg,
+    why: &str,
+) {
+    let Some(events) = event_sender else {
+        return;
+    };
+    let PcrLeg { out_pid, source: (input_id, source_pid) } = leg;
+    events.emit_flow_with_details(
+        crate::manager::events::EventSeverity::Warning,
+        crate::manager::events::category::FLOW,
+        format!(
+            "Flow '{flow_id}': program {program_number} goes out without a PCR since the plan \
+             swap to '{input_id}' — its source_pid 0x{source_pid:04X}, which carries the \
+             program's clock on out_pid 0x{out_pid:04X}, {why}",
+        ),
+        flow_id,
+        serde_json::json!({
+            "error_code": "pid_bus_swap_no_pcr",
+            "program_number": program_number,
+            "out_pid": out_pid,
+            "input_id": input_id,
+            "source_pid": source_pid,
+        }),
+    );
+}
+
 /// What the assembled output plays from: each Pid / Essence slot's source,
 /// each Switch slot's active leg and each Hitless slot's legs, of which the
 /// one its merger is forwarding is on air — never the merger's synthetic
@@ -501,8 +533,8 @@ pub enum PlanCommand {
     /// A splice pending in a slot that keeps both its legs goes on, and any
     /// other ends ([`legs_after_swap`]). Where the swap moves a program's PCR
     /// to an input not known to share the clock of the one before, what it
-    /// moves with it is held for the first PCR from there, but not for good
-    /// ([`PcrHold::Swap`]).
+    /// moves with it is held for the first PCR from there, if one is to come,
+    /// but not for good ([`PcrHold::Swap`]).
     ReplacePlan {
         plan: AssemblyPlan,
         /// Per-swap splice request carried through from the manager's
@@ -1015,9 +1047,11 @@ enum PcrHold {
     Take { since: Instant, reported: bool },
     /// A plan swap. The slots of `goes_on`, by `out_pid`, stay on the clock
     /// they were on, as far from the last PCR as they were: they go out as
-    /// they did. An input that sends its PCR on a PID the program does not
-    /// carry, which no swap refuses, would leave the others off air for good:
-    /// the hold ends [`PCR_HOLD_ALARM`] after the first packet it withheld.
+    /// they did. A Hitless slot is one of them while its legs are the same.
+    /// An input that sends its PCR on a PID the program does not carry, which
+    /// no swap refuses, would leave the others off air for good: the hold ends
+    /// [`PCR_HOLD_ALARM`] after the first packet it withheld, and there is none
+    /// where the input's PMT says so ([`no_pcr_expected`]).
     Swap { goes_on: HashSet<u16>, withheld: Option<Instant> },
 }
 
@@ -1372,10 +1406,10 @@ async fn run_assembler(
                 let from = before[pidx].and_then(|b| pcr_from[b].as_ref());
                 // Where its PCR comes from another input now, the program is
                 // held for the first one, unless the two are known to share
-                // a clock and it was not held already. One the swap adds was
-                // on no clock.
-                if let (Some(was_prog), Some(from), Some(now)) = (was_prog, from, &pcr_now[pidx]) {
-                    let (from, now) = (&from.source.0, &now.source.0);
+                // a clock and it was not held already, or none is to come.
+                // One the swap adds was on no clock.
+                if let (Some(was_prog), Some(was_leg), Some(leg)) = (was_prog, from, &pcr_now[pidx]) {
+                    let (from, now) = (&was_leg.source.0, &leg.source.0);
                     // A hold goes on as it is in the program it is of, which
                     // has its number or its slots.
                     let same = from == now
@@ -1396,8 +1430,15 @@ async fn run_assembler(
                             || plan.share_clock(&played, &plays)
                     };
                     let hold = match held.remove(&was_prog.program_number) {
-                        None if from == now || plan.share_clock(from, now) => None,
                         hold @ Some(PcrHold::Take { .. }) if same => hold,
+                        hold if no_pcr_expected(&catalogs, &leg.source) => {
+                            if hold.is_some() || was_leg.source != leg.source {
+                                let why = "has none by the input's PMT";
+                                emit_swap_no_pcr(&event_sender, &flow_id, prog.program_number, leg, why);
+                            }
+                            None
+                        }
+                        None if from == now || plan.share_clock(from, now) => None,
                         hold => {
                             let (mut goes_on, withheld) = match hold {
                                 None => (was_prog.slots.iter().map(|s| s.out_pid).collect(), None),
@@ -2489,28 +2530,11 @@ async fn run_assembler(
                     if now.duration_since(*since) < PCR_HOLD_ALARM {
                         return true;
                     }
-                    if let Some(es_) = &event_sender
-                        && let Some(PcrLeg { out_pid, source: (input_id, source_pid) }) =
-                            pcr_leg_of(*program_number, &plan, &pcr_out_pid_by_program, &active_leg_input)
-                    {
-                        es_.emit_flow_with_details(
-                            crate::manager::events::EventSeverity::Warning,
-                            crate::manager::events::category::FLOW,
-                            format!(
-                                "Flow '{flow_id}': program {program_number} goes out without a \
-                                 PCR since the plan swap to '{input_id}' — none on its source_pid \
-                                 0x{source_pid:04X}, which carries the program's clock on out_pid \
-                                 0x{out_pid:04X}, in the 2 s it was held for one",
-                            ),
-                            &flow_id,
-                            serde_json::json!({
-                                "error_code": "pid_bus_swap_no_pcr",
-                                "program_number": program_number,
-                                "out_pid": out_pid,
-                                "input_id": input_id,
-                                "source_pid": source_pid,
-                            }),
-                        );
+                    let leg =
+                        pcr_leg_of(*program_number, &plan, &pcr_out_pid_by_program, &active_leg_input);
+                    if let Some(leg) = leg {
+                        let why = "sent none in the 2 s it was waited for";
+                        emit_swap_no_pcr(&event_sender, &flow_id, *program_number, &leg, why);
                     }
                     false
                 });
@@ -3335,6 +3359,20 @@ fn observed_source_stream_type(
             .flat_map(|p| p.streams.iter())
             .find(|s| s.pid == source.1)
             .map(|s| s.stream_type)
+    })
+}
+
+/// Whether no PCR is to come on `source`: a program of its input has the PID,
+/// and none has its PCR there (one whose PMT names no PCR PID has it nowhere).
+/// `false` where the input has no catalogue yet or the PID is in none of its
+/// PMTs.
+fn no_pcr_expected(
+    catalogs: &HashMap<String, Arc<crate::engine::ts_psi_catalog::PsiCatalogStore>>,
+    source: &(String, u16),
+) -> bool {
+    catalogs.get(&source.0).and_then(|store| store.load()).is_some_and(|cat| {
+        cat.programs.iter().any(|p| p.streams.iter().any(|s| s.pid == source.1))
+            && cat.programs.iter().all(|p| p.pcr_pid != Some(source.1))
     })
 }
 
@@ -7245,6 +7283,149 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(2_500)).await;
         assert!(rig.raised(code).is_empty(), "nor once it has its PCR");
         assert!(rig.raised("pid_bus_take_no_pcr").is_empty(), "no Take was");
+    }
+
+    /// The catalogue of an input with `programs`, each its PCR PID and the PIDs
+    /// of its streams.
+    fn pcr_catalogue(
+        programs: &[(Option<u16>, &[u16])],
+    ) -> Arc<crate::engine::ts_psi_catalog::PsiCatalogStore> {
+        use crate::engine::ts_psi_catalog::*;
+        let store = PsiCatalogStore::new();
+        seed_programs(&store, programs);
+        Arc::new(store)
+    }
+
+    fn seed_programs(
+        store: &crate::engine::ts_psi_catalog::PsiCatalogStore,
+        programs: &[(Option<u16>, &[u16])],
+    ) {
+        use crate::engine::ts_psi_catalog::*;
+        let stream = |pid: &u16| CatalogStream {
+            pid: *pid,
+            stream_type: 0x1B,
+            codec: "test".to_string(),
+            kind: CatalogStreamKind::Video,
+            descriptors_hex: String::new(),
+        };
+        let program = |(i, (pcr_pid, pids)): (usize, &(Option<u16>, &[u16]))| CatalogProgram {
+            program_number: i as u16 + 1,
+            pmt_pid: 0x1000 + i as u16,
+            pcr_pid: *pcr_pid,
+            streams: pids.iter().map(stream).collect(),
+        };
+        let programs = programs.iter().enumerate().map(program).collect();
+        PsiCatalogStore::seed_for_test(store, PsiCatalog { programs, last_updated_us: 1 });
+    }
+
+    /// No PCR is to come on a PID a program has, if none has its PCR there. A
+    /// PMT that names no PCR PID (0x1FFF, in the catalogue `None`) has it
+    /// nowhere; one that has not come yet says nothing.
+    #[test]
+    fn no_pcr_is_expected_where_the_pmts_have_it_elsewhere() {
+        for (programs, none) in [
+            (&[(Some(0x1FE), &[0x100, 0x101][..])][..], true),
+            (&[(Some(0x101), &[0x100, 0x101])], true),
+            (&[(None, &[0x100, 0x101])], true),
+            (&[(Some(0x1FFF), &[0x100])], true),
+            (&[(Some(0x1FE), &[0x100]), (Some(0x1FD), &[0x100])], true),
+            (&[(Some(0x1FE), &[0x100]), (None, &[])], true),
+            // There, for one of the programs that have the PID or of the others.
+            (&[(Some(0x100), &[0x100, 0x101])], false),
+            (&[(Some(0x1FE), &[0x100]), (Some(0x100), &[0x100])], false),
+            (&[(Some(0x1FE), &[0x100]), (Some(0x100), &[0x200])], false),
+            // Not known.
+            (&[(Some(0x1FE), &[0x101])], false),
+            (&[(None, &[])], false),
+            (&[], false),
+        ] {
+            let catalogs = HashMap::from([("b".to_string(), pcr_catalogue(programs))]);
+            assert_eq!(no_pcr_expected(&catalogs, &("b".to_string(), 0x100)), none, "{programs:X?}");
+            assert!(!no_pcr_expected(&catalogs, &("a".to_string(), 0x100)), "no catalogue");
+        }
+        let unread = HashMap::from([("b".to_string(), Arc::default())]);
+        assert!(!no_pcr_expected(&unread, &("b".to_string(), 0x100)));
+    }
+
+    /// A swap to an input whose PMT has its PCR on another PID does not wait
+    /// for one: no packet of the program is lost, and the event comes at once,
+    /// once, and for a swap within the input too. It ends another swap's hold
+    /// for the same leg, whose PMT has come since, but not a Take's.
+    #[tokio::test]
+    async fn a_swap_waits_for_no_pcr_that_is_not_to_come() {
+        let code = "pid_bus_swap_no_pcr";
+        let es: &[u16] = &[0x100, 0x101];
+        let late = Arc::new(crate::engine::ts_psi_catalog::PsiCatalogStore::new());
+        let catalogs = || {
+            HashMap::from([
+                ("a".to_string(), pcr_catalogue(&[(Some(0x100), es)])),
+                ("b".to_string(), pcr_catalogue(&[(Some(0x1FE), es)])),
+                ("late".to_string(), late.clone()),
+            ])
+        };
+        let said = |input: &str, out_pid: u16, source_pid: u16| {
+            vec![serde_json::json!({
+                "error_code": code,
+                "program_number": 1,
+                "out_pid": out_pid,
+                "input_id": input,
+                "source_pid": source_pid,
+            })]
+        };
+        let mut rig = Rig::start_with(pinned_beside("a"), None, catalogs()).await;
+        rig.replace(pinned_beside("b")).await;
+        assert_eq!(rig.raised(code), said("b", 0x200, 0x100), "at once");
+        for pts in 0..20 {
+            assert_eq!(feed(&mut rig, "b", 90_000 + pts, 2).await, [0x200, 0x201], "{pts}");
+        }
+        // It is not said again: 2 s on, and after a swap that leaves the PCR.
+        let mut more = pinned_beside("b");
+        more.programs[0].slots.push(slot("b", 0x102, 0x202, 0x0F));
+        rig.replace(more.clone()).await;
+        assert_eq!(feed(&mut rig, "b", 93_600, 2).await, [0x200, 0x201]);
+        assert!(rig.raised(code).is_empty());
+        // The PCR to another slot of the program, with none on its PID either.
+        more.programs[0].pcr_source.1 = 0x101;
+        rig.replace(more).await;
+        assert_eq!(rig.raised(code), said("b", 0x201, 0x101));
+        assert_eq!(feed(&mut rig, "b", 97_200, 2).await, [0x200, 0x201]);
+        // To one with a PCR it waits for it, and within it for none.
+        rig.replace(pinned_beside("a")).await;
+        assert_eq!(feed(&mut rig, "a", 90_000, 0).await, [0u16; 0]);
+        rig.send("a", es_pcr(0x100, 0x1B));
+        assert_eq!(rig.sent_pids(1).await, [0x200]);
+        assert!(rig.raised(code).is_empty());
+        let mut on_audio = pinned_beside("a");
+        on_audio.programs[0].pcr_source.1 = 0x101;
+        rig.replace(on_audio).await;
+        assert_eq!(rig.raised(code), said("a", 0x201, 0x101));
+        assert_eq!(feed(&mut rig, "a", 93_600, 2).await, [0x200, 0x201]);
+
+        // One whose PMT comes during the hold: the next swap ends it.
+        rig.replace(pinned_beside("late")).await;
+        assert_eq!(feed(&mut rig, "late", 90_000, 0).await, [0u16; 0], "not known yet");
+        seed_programs(&late, &[(Some(0x1FE), es)]);
+        assert!(rig.raised(code).is_empty());
+        let mut more = pinned_beside("late");
+        more.programs[0].slots.push(slot("late", 0x102, 0x202, 0x0F));
+        rig.replace(more).await;
+        assert_eq!(rig.raised(code), said("late", 0x200, 0x100));
+        assert_eq!(feed(&mut rig, "late", 93_600, 2).await, [0x200, 0x201]);
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(rig.raised(code).is_empty(), "for the hold that ended");
+
+        // A Take's is over with the PCR, or with a swap to another leg.
+        let mut rig = Rig::start_with(beside(switched_program()), None, catalogs()).await;
+        rig.take("b", None).await;
+        until("the cut", || rig.plays(&["b", "c"])).await;
+        let mut more = beside(switched_program());
+        more.programs[0].slots.push(switch_slot(&["a", "b"], 0x102, 0x202, 0x0F));
+        rig.replace(more).await;
+        assert_eq!(feed(&mut rig, "b", 90_000, 0).await, [0u16; 0], "as long as the Take's lasts");
+        assert!(rig.raised(code).is_empty());
+        rig.replace(pinned_beside("late")).await;
+        assert_eq!(rig.raised(code), said("late", 0x200, 0x100));
+        assert_eq!(feed(&mut rig, "late", 90_000, 2).await, [0x200, 0x201]);
     }
 
     /// A swap that leaves a program waiting where a Take put it leaves it to
