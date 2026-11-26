@@ -34,6 +34,8 @@ pub mod crypto;
 pub mod manager;
 pub(crate) mod native_carrier;
 mod native_meet;
+#[cfg(test)]
+mod native_meet_sim;
 pub mod protocol;
 pub mod quic;
 pub mod relay_client;

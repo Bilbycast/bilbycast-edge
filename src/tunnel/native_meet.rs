@@ -370,6 +370,12 @@ impl NativeMeet {
         self.heard(self.active, now)
     }
 
+    /// The two relay addresses have answered with one relay id.
+    #[cfg(test)]
+    pub(crate) fn same_relay_seen(&self) -> bool {
+        self.same_relay
+    }
+
     /// The median of relay `i`'s last Register → Ack round trips.
     pub(crate) fn median_rtt(&self, i: usize) -> Option<Duration> {
         median(&self.relays.get(i)?.rtts)
