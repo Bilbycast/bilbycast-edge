@@ -579,23 +579,7 @@ impl RelayLink {
                 }
             }
             if let Some(report) = reports.due(Instant::now()) {
-                let (severity, message, details) = match report {
-                    Some(Trouble::PeerGone(reason)) => (
-                        EventSeverity::Warning,
-                        format!("Tunnel peer disconnected: {reason}"),
-                        serde_json::json!({ "reason": reason, "relay_addr": relay_addr }),
-                    ),
-                    Some(Trouble::Removed(reason)) => (
-                        EventSeverity::Warning,
-                        format!("Tunnel removed on relay: {reason}"),
-                        serde_json::json!({ "reason": reason, "relay_addr": relay_addr }),
-                    ),
-                    None => (
-                        EventSeverity::Info,
-                        "Tunnel ready again".to_string(),
-                        serde_json::json!({ "relay_addr": relay_addr }),
-                    ),
-                };
+                let (severity, message, details) = trouble_event(report, relay_addr);
                 event_sender.emit_flow_with_details(
                     severity,
                     category::TUNNEL,
@@ -679,28 +663,53 @@ impl RebindDelay {
 
 /// What has befallen a tunnel since it came up.
 #[derive(Debug, Clone, PartialEq)]
-enum Trouble {
+pub(super) enum Trouble {
     PeerGone(String),
     Removed(String),
+}
+
+/// The event that reports `report`: the trouble a tunnel is in, or with `None`
+/// that it is out of it. Shared by both carriers.
+pub(super) fn trouble_event(
+    report: Option<Trouble>,
+    relay_addr: &str,
+) -> (EventSeverity, String, serde_json::Value) {
+    match report {
+        Some(Trouble::PeerGone(reason)) => (
+            EventSeverity::Warning,
+            format!("Tunnel peer disconnected: {reason}"),
+            serde_json::json!({ "reason": reason, "relay_addr": relay_addr }),
+        ),
+        Some(Trouble::Removed(reason)) => (
+            EventSeverity::Warning,
+            format!("Tunnel removed on relay: {reason}"),
+            serde_json::json!({ "reason": reason, "relay_addr": relay_addr }),
+        ),
+        None => (
+            EventSeverity::Info,
+            "Tunnel ready again".to_string(),
+            serde_json::json!({ "relay_addr": relay_addr }),
+        ),
+    }
 }
 
 /// Which changes of a tunnel's fortune are reported, and when. One that comes
 /// too soon after others waits, and what is reported then is what it has come
 /// to: the last report is always the one that is true.
-struct Reports {
-    trouble: Option<Trouble>,
+pub(super) struct Reports {
+    pub(super) trouble: Option<Trouble>,
     reported: Option<Trouble>,
     left: u32,
     refilled: Instant,
 }
 
 impl Reports {
-    fn new(now: Instant) -> Self {
+    pub(super) fn new(now: Instant) -> Self {
         Self { trouble: None, reported: None, left: REPORT_BURST, refilled: now }
     }
 
     /// The trouble to report now, or that there is none any more.
-    fn due(&mut self, now: Instant) -> Option<Option<Trouble>> {
+    pub(super) fn due(&mut self, now: Instant) -> Option<Option<Trouble>> {
         let earned = (now.duration_since(self.refilled).as_secs() / REPORT_INTERVAL.as_secs()) as u32;
         self.refilled += REPORT_INTERVAL * earned;
         self.left = self.left.saturating_add(earned).min(REPORT_BURST);
@@ -1135,8 +1144,21 @@ async fn meet(
 
 /// Report that the tunnel is up on relay `to`, and was on relay `from` before.
 pub fn report_up(params: &RelayTunnelParams, from: usize, to: usize, events: &EventSender) {
-    let tunnel_id = params.tunnel_id.to_string();
-    let (from_addr, to_addr) = (&params.relay_addrs[from], &params.relay_addrs[to]);
+    report_moved(&params.tunnel_id, &params.relay_addrs, from, to, serde_json::json!({}), events);
+}
+
+/// [`report_up`] for any carrier: `extra` goes into the failover event's
+/// details beside what QUIC puts there.
+pub(super) fn report_moved(
+    tunnel_id: &Uuid,
+    relay_addrs: &[String],
+    from: usize,
+    to: usize,
+    extra: serde_json::Value,
+    events: &EventSender,
+) {
+    let tunnel_id = tunnel_id.to_string();
+    let (from_addr, to_addr) = (&relay_addrs[from], &relay_addrs[to]);
     events.emit_flow_with_details(
         EventSeverity::Info,
         category::TUNNEL,
@@ -1152,16 +1174,47 @@ pub fn report_up(params: &RelayTunnelParams, from: usize, to: usize, events: &Ev
         tunnel_id = %tunnel_id,
         "Tunnel failed over from {from_addr} to {to_addr} (idx {from} → {to})"
     );
+    let mut details = serde_json::json!({
+        "from_relay_addr": from_addr,
+        "to_relay_addr": to_addr,
+        "from_idx": from,
+        "to_idx": to,
+    });
+    if let (Some(base), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        base.extend(extra);
+    }
     events.emit_flow_with_details(
         EventSeverity::Warning,
         category::TUNNEL,
         format!("Tunnel failed over to {which} relay {to_addr}"),
         &tunnel_id,
+        details,
+    );
+}
+
+/// Report that a native-UDP tunnel goes back to its primary relay: the sibling
+/// of the QUIC carrier's report in `manager.rs`, with the RTTs it measures from
+/// its Registers (`null` while it has too few) and its `transport`.
+pub(super) fn report_failing_back(
+    tunnel_id: &Uuid,
+    primary_relay: &str,
+    primary_rtt: Option<Duration>,
+    active_rtt: Option<Duration>,
+    gate_ms: u32,
+    transport: &str,
+    events: &EventSender,
+) {
+    events.emit_flow_with_details(
+        EventSeverity::Info,
+        category::TUNNEL,
+        format!("Tunnel failing back to primary relay {primary_relay}"),
+        &tunnel_id.to_string(),
         serde_json::json!({
-            "from_relay_addr": from_addr,
-            "to_relay_addr": to_addr,
-            "from_idx": from,
-            "to_idx": to,
+            "primary_relay_addr": primary_relay,
+            "primary_rtt_ms": primary_rtt.map(|d| d.as_millis()),
+            "active_rtt_ms": active_rtt.map(|d| d.as_millis()),
+            "gate_ms": gate_ms,
+            "transport": transport,
         }),
     );
 }

@@ -293,6 +293,13 @@ pub fn decode_udp_datagram(data: &[u8]) -> Option<(Uuid, &[u8])> {
 /// Carried in a datagram prefixed with the nil UUID (see [`encode_udp_control`] /
 /// [`try_decode_udp_control`]). The relay distinguishes these from media datagrams
 /// purely by the nil prefix.
+///
+/// Every field added after the first release is optional and left off the wire
+/// when unset, so each side still reads the other's older shape: a relay up to
+/// v0.20.0 sends `{"type":"ack","tunnel_id":…,"ready":…}` and nothing else, and
+/// an edge up to v0.117.0 sends a `Register` without `seq` or `standby`. Neither
+/// enum denies unknown keys, so a newer shape decodes on an older build too.
+/// [`TUNNEL_PROTOCOL_VERSION`] stays 2: no message type and no meaning changed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum UdpRelayControl {
@@ -309,12 +316,47 @@ pub enum UdpRelayControl {
         bind_token: Option<String>,
         #[serde(default)]
         protocol_version: u32,
+        /// A per-socket counter: random at the socket's first Register, one up
+        /// on each after. The relay echoes it in its [`UdpRelayControl::Ack`],
+        /// which lets the edge time the round trip and refuse an Ack that
+        /// answers nothing it sent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u32>,
+        /// `true` when the socket this came on is not the one the edge sends
+        /// its media on: it stands by on this relay, to meet its peer there or
+        /// to return to it. The relay counts a pair of standing-by sides as
+        /// standing by rather than active.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        standby: Option<bool>,
     },
 
     /// relay → edge (or peer → edge): acknowledge a [`UdpRelayControl::Register`] and
     /// report whether both sides of the tunnel are now registered (media may flow).
+    ///
+    /// `ready` keeps its first meaning: both slots have been latched. The
+    /// liveness fields below are what a relay after v0.20.0 adds, and their
+    /// presence is how an edge tells such a relay from an older one.
     #[serde(rename = "ack")]
-    Ack { tunnel_id: Uuid, ready: bool },
+    Ack {
+        tunnel_id: Uuid,
+        ready: bool,
+        /// The other side of the tunnel was heard within 16 s: a Register
+        /// accepted from its slot, or media forwarded from its address.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer_live: Option<bool>,
+        /// How long, in milliseconds, both sides have been heard without a
+        /// break, as the relay saw it at Registers. 0 while `peer_live` is false.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        live_ms: Option<u64>,
+        /// 32 lowercase hex characters, one value per relay process: two
+        /// relay addresses that answer with the same id are one relay, and a
+        /// new id is a restarted relay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_id: Option<String>,
+        /// The `seq` of the Register this answers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u32>,
+    },
 }
 
 /// Encode a [`UdpRelayControl`] message as a control datagram: nil-UUID prefix + JSON.
@@ -350,15 +392,19 @@ mod udp_relay_tests {
             direction: RelayDirection::Egress,
             bind_token: Some("deadbeef".to_string()),
             protocol_version: TUNNEL_PROTOCOL_VERSION,
+            seq: Some(u32::MAX),
+            standby: Some(true),
         };
         let bytes = encode_udp_control(&msg).unwrap();
         // Control datagrams carry the nil-UUID sentinel prefix.
         assert_eq!(&bytes[..16], Uuid::nil().as_bytes());
         match try_decode_udp_control(&bytes) {
-            Some(UdpRelayControl::Register { tunnel_id, direction, bind_token, .. }) => {
+            Some(UdpRelayControl::Register { tunnel_id, direction, bind_token, seq, standby, .. }) => {
                 assert_eq!(tunnel_id, tid);
                 assert_eq!(direction, RelayDirection::Egress);
                 assert_eq!(bind_token.as_deref(), Some("deadbeef"));
+                assert_eq!(seq, Some(u32::MAX));
+                assert_eq!(standby, Some(true));
             }
             other => panic!("expected Register, got {other:?}"),
         }
@@ -367,14 +413,119 @@ mod udp_relay_tests {
     #[test]
     fn ack_control_roundtrips() {
         let tid = Uuid::new_v4();
-        let bytes = encode_udp_control(&UdpRelayControl::Ack { tunnel_id: tid, ready: true }).unwrap();
+        let bytes = encode_udp_control(&UdpRelayControl::Ack {
+            tunnel_id: tid,
+            ready: true,
+            peer_live: Some(false),
+            live_ms: Some(604_800_000),
+            relay_id: Some("0123456789abcdef0123456789abcdef".into()),
+            seq: Some(7),
+        })
+        .unwrap();
         match try_decode_udp_control(&bytes) {
-            Some(UdpRelayControl::Ack { tunnel_id, ready }) => {
+            Some(UdpRelayControl::Ack { tunnel_id, ready, peer_live, live_ms, relay_id, seq }) => {
                 assert_eq!(tunnel_id, tid);
                 assert!(ready);
+                assert_eq!(peer_live, Some(false));
+                assert_eq!(live_ms, Some(604_800_000));
+                assert_eq!(relay_id.as_deref(), Some("0123456789abcdef0123456789abcdef"));
+                assert_eq!(seq, Some(7));
             }
             other => panic!("expected Ack, got {other:?}"),
         }
+    }
+
+    /// A field nobody set stays off the wire, so an older peer reads exactly
+    /// what it always did.
+    #[test]
+    fn unset_new_fields_are_not_sent() {
+        let tid = Uuid::new_v4();
+        let json = serde_json::to_value(UdpRelayControl::Ack {
+            tunnel_id: tid,
+            ready: true,
+            peer_live: None,
+            live_ms: None,
+            relay_id: None,
+            seq: None,
+        })
+        .unwrap();
+        assert_eq!(json, serde_json::json!({ "type": "ack", "tunnel_id": tid, "ready": true }));
+        let json = serde_json::to_value(UdpRelayControl::Register {
+            tunnel_id: tid,
+            direction: RelayDirection::Ingress,
+            bind_token: None,
+            protocol_version: 2,
+            seq: None,
+            standby: None,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "register", "tunnel_id": tid, "direction": "ingress", "protocol_version": 2
+            })
+        );
+    }
+
+    /// What a relay up to v0.20.0 sends and what an edge up to v0.117.0 sends,
+    /// spelled out literally.
+    #[test]
+    fn the_old_shapes_decode_with_every_new_field_unset() {
+        let tid = Uuid::new_v4();
+        let control = |json: String| {
+            let mut bytes = Uuid::nil().as_bytes().to_vec();
+            bytes.extend_from_slice(json.as_bytes());
+            try_decode_udp_control(&bytes)
+        };
+        match control(format!(r#"{{"type":"ack","tunnel_id":"{tid}","ready":true}}"#)) {
+            Some(UdpRelayControl::Ack { tunnel_id, ready, peer_live, live_ms, relay_id, seq }) => {
+                assert_eq!(tunnel_id, tid);
+                assert!(ready);
+                assert_eq!((peer_live, live_ms, relay_id, seq), (None, None, None, None));
+            }
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        let old = format!(
+            r#"{{"type":"register","tunnel_id":"{tid}","direction":"egress","bind_token":"ab","protocol_version":2}}"#
+        );
+        match control(old) {
+            Some(UdpRelayControl::Register { tunnel_id, seq, standby, .. }) => {
+                assert_eq!(tunnel_id, tid);
+                assert_eq!((seq, standby), (None, None));
+            }
+            other => panic!("expected Register, got {other:?}"),
+        }
+    }
+
+    /// Neither enum denies unknown keys, so a key a later release adds does
+    /// not make this one drop the message.
+    #[test]
+    fn a_new_shape_with_a_key_unknown_here_still_decodes() {
+        let tid = Uuid::new_v4();
+        let mut bytes = Uuid::nil().as_bytes().to_vec();
+        bytes.extend_from_slice(
+            format!(
+                r#"{{"type":"ack","tunnel_id":"{tid}","ready":false,"peer_live":true,"live_ms":5,"relay_id":"ab","seq":9,"later":1}}"#
+            )
+            .as_bytes(),
+        );
+        match try_decode_udp_control(&bytes) {
+            Some(UdpRelayControl::Ack { peer_live, live_ms, seq, .. }) => {
+                assert_eq!((peer_live, live_ms, seq), (Some(true), Some(5), Some(9)));
+            }
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        let mut bytes = Uuid::nil().as_bytes().to_vec();
+        bytes.extend_from_slice(
+            format!(
+                r#"{{"type":"register","tunnel_id":"{tid}","direction":"egress","protocol_version":2,"seq":1,"standby":false,"later":"x"}}"#
+            )
+            .as_bytes(),
+        );
+        assert!(matches!(
+            try_decode_udp_control(&bytes),
+            Some(UdpRelayControl::Register { seq: Some(1), standby: Some(false), .. })
+        ));
     }
 
     #[test]

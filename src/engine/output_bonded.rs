@@ -45,7 +45,7 @@ use crate::stats::collector::OutputStatsAccumulator;
 
 use super::input_bonded::{
     parse_sockaddr, prepare_relay_leg, spawn_relay_leg_bridges, translate_tls, BondBuild,
-    RelayLegBridge,
+    LegOwner, RelayLegBridge,
 };
 use crate::tunnel::config::TunnelDirection;
 use super::packet::RtpPacket;
@@ -624,14 +624,17 @@ async fn bonded_output_run(
         cfg: socket_cfg,
         attachments,
         bridges,
-    } = build_sender_cfg(config)?;
+    } = build_sender_cfg(
+        config,
+        &LegOwner { flow_id, scope: BondEventScope::Output, id: &config.id },
+    )?;
     let path_ids: Vec<u8> = socket_cfg.paths.iter().map(|p| p.id).collect();
 
     // Spawn one in-process relay bridge per relay leg BEFORE the socket binds —
-    // each owns its relay socket (Register/keepalive + failover) and pumps the
-    // attached leg's channels with no loopback hop. The bridge tasks live under
-    // the output's cancel token; a relay rotation re-Registers on a fresh socket
-    // but the leg channels persist (the bond leg is never torn down).
+    // each owns its relay sockets (Register/keepalive, and the move between
+    // relays with its peer) and pumps the attached leg's channels with no
+    // loopback hop. The bridge tasks live under the output's cancel token; the
+    // leg channels persist across every move (the bond leg is never torn down).
     spawn_relay_leg_bridges(bridges, &cancel, events);
 
     // Shared handles to the adaptive scheduler's discovered per-leg
@@ -1301,7 +1304,7 @@ fn derive_retransmit_capacity(cfg: &BondedOutputConfig) -> usize {
     derived.clamp(DEFAULT_CAPACITY, MAX_CAPACITY)
 }
 
-fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondBuild> {
+fn build_sender_cfg(cfg: &BondedOutputConfig, owner: &LegOwner<'_>) -> anyhow::Result<BondBuild> {
     let mut out = BondSocketConfig {
         flow_id: cfg.bond_flow_id,
         paths: Vec::with_capacity(cfg.paths.len()),
@@ -1368,7 +1371,8 @@ fn build_sender_cfg(cfg: &BondedOutputConfig) -> anyhow::Result<BondBuild> {
             &p.transport,
             crate::config::models::BondPathTransportConfig::Relay { .. }
         ) {
-            let (att, bridge, t) = prepare_relay_leg(p, bond_has_key, TunnelDirection::Egress)?;
+            let (att, bridge, t) =
+                prepare_relay_leg(p, bond_has_key, TunnelDirection::Egress, owner)?;
             attachments.insert(p.id, att);
             bridges.push(bridge);
             t
@@ -1545,6 +1549,10 @@ fn translate_transport_for_sender(
 mod bonded_output_tests {
     use super::*;
 
+    fn test_owner() -> LegOwner<'static> {
+        LegOwner { flow_id: "flow-1", scope: BondEventScope::Output, id: "bond-1" }
+    }
+
     #[test]
     fn build_congestion_maps_operator_knobs_to_library_units() {
         let c = crate::config::models::BondCongestionConfig {
@@ -1581,7 +1589,7 @@ mod bonded_output_tests {
                  ] }"#,
         )
         .unwrap();
-        let sock = build_sender_cfg(&cfg).expect("sender cfg builds").cfg;
+        let sock = build_sender_cfg(&cfg, &test_owner()).expect("sender cfg builds").cfg;
         assert_eq!(sock.flow_id, 6016);
         assert_eq!(sock.paths.len(), 2);
     }
@@ -1782,7 +1790,7 @@ mod bonded_output_tests {
         let build = |json: &str| {
             let cfg: crate::config::models::BondedOutputConfig =
                 serde_json::from_str(json).unwrap();
-            build_sender_cfg(&cfg).expect("sender cfg builds").cfg
+            build_sender_cfg(&cfg, &test_owner()).expect("sender cfg builds").cfg
         };
 
         // Default (no equalization, no redundancy) → Auto, no suppression.

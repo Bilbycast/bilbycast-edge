@@ -37,7 +37,8 @@ use crate::config::models::{
 use crate::tunnel::config::TunnelDirection;
 use crate::tunnel::crypto::TunnelCipher;
 use crate::tunnel::udp_forwarder::UdpForwarderStats;
-use crate::tunnel::udp_relay_client::NativeRelayParams;
+use crate::tunnel::config::DEFAULT_FAILBACK_RTT_GATE_MS;
+use crate::tunnel::udp_relay_client::{NativeEventScope, NativeRelayParams};
 
 use bonding_transport::{AttachedBridgeEnds, AttachedChannels};
 
@@ -72,6 +73,14 @@ pub(crate) struct RelayLegBridge {
     pub leg_name: String,
 }
 
+/// The bonded input or output a relay leg belongs to, which its events name.
+pub(crate) struct LegOwner<'a> {
+    pub flow_id: &'a str,
+    pub scope: BondEventScope,
+    /// The bonded input's or output's id.
+    pub id: &'a str,
+}
+
 /// Build the bridge + attachment channels for one relay leg, and the
 /// `Attached` path-transport that goes into the bond socket config.
 ///
@@ -85,6 +94,7 @@ pub(crate) fn prepare_relay_leg(
     p: &BondPathConfig,
     bond_has_key: bool,
     direction: TunnelDirection,
+    owner: &LegOwner<'_>,
 ) -> anyhow::Result<(AttachedChannels, RelayLegBridge, BondPathTxTransport)> {
     let BondPathTransportConfig::Relay {
         tunnel_id,
@@ -131,6 +141,15 @@ pub(crate) fn prepare_relay_leg(
         interface: interface.clone(),
         source: source.clone(),
         gateway: gateway.clone(),
+        // A leg has no gate of its own to set.
+        failback_rtt_gate_ms: DEFAULT_FAILBACK_RTT_GATE_MS,
+        event_scope: NativeEventScope::Leg {
+            flow_id: owner.flow_id.to_string(),
+            scope: owner.scope,
+            target_id: owner.id.to_string(),
+            path_id: p.id,
+            path_name: p.name.clone(),
+        },
     };
     let bridge = RelayLegBridge {
         params,
@@ -146,8 +165,8 @@ pub(crate) fn prepare_relay_leg(
 /// Spawn one in-process relay bridge per relay leg under a child of `cancel`.
 /// Shared by the bonded input (ingress legs) and output (egress legs). Each
 /// bridge drains `from_bond` → relay and pumps relay → `to_bond`, drop-on-full
-/// both directions; it self-redials the relay on failover without tearing down
-/// the leg channels.
+/// both directions; it moves between the leg's relays with its peer, and opens a
+/// new socket to a relay gone silent, without tearing down the leg channels.
 pub(crate) fn spawn_relay_leg_bridges(
     bridges: Vec<RelayLegBridge>,
     cancel: &CancellationToken,
@@ -244,7 +263,8 @@ pub fn spawn_bonded_input(
             super::bond_leg_probe::leg_keys_for_paths(&config.paths),
         );
 
-        let build = match build_receiver_cfg(&config) {
+        let owner = LegOwner { flow_id: &flow_id, scope: BondEventScope::Input, id: &input_id };
+        let build = match build_receiver_cfg(&config, &owner) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!("bonded input '{}': config translation failed: {}", input_id, e);
@@ -264,10 +284,10 @@ pub fn spawn_bonded_input(
         } = build;
 
         // Spawn one in-process relay bridge per relay leg BEFORE the socket
-        // binds — each owns its relay socket (Register/keepalive + failover)
-        // and pumps the attached leg's channels with no loopback hop. The
-        // bridge task lives under the input's cancel token; relay rotation
-        // re-Registers on a fresh socket but the leg channels persist.
+        // binds — each owns its relay sockets (Register/keepalive, and the
+        // move between relays with its peer) and pumps the attached leg's
+        // channels with no loopback hop. The bridge task lives under the
+        // input's cancel token; the leg channels persist across every move.
         spawn_relay_leg_bridges(bridges, &cancel, &event_sender);
 
         let socket = match BondSocket::receiver_attached(socket_cfg, attachments).await {
@@ -459,7 +479,10 @@ fn publish(
 
 /// Translate an edge `BondedInputConfig` into a
 /// `bonding_transport::BondSocketConfig` for the receiver side.
-pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<BondBuild> {
+pub(crate) fn build_receiver_cfg(
+    cfg: &BondedInputConfig,
+    owner: &LegOwner<'_>,
+) -> anyhow::Result<BondBuild> {
     let mut out = BondSocketConfig {
         flow_id: cfg.bond_flow_id,
         paths: Vec::with_capacity(cfg.paths.len()),
@@ -535,7 +558,7 @@ pub(crate) fn build_receiver_cfg(cfg: &BondedInputConfig) -> anyhow::Result<Bond
         // receives media; the matching bonded output leg registers `egress`).
         let transport = if matches!(&p.transport, BondPathTransportConfig::Relay { .. }) {
             let (att, bridge, t) =
-                prepare_relay_leg(p, bond_has_key, TunnelDirection::Ingress)?;
+                prepare_relay_leg(p, bond_has_key, TunnelDirection::Ingress, owner)?;
             attachments.insert(p.id, att);
             bridges.push(bridge);
             t
@@ -732,6 +755,10 @@ pub(crate) fn bond_path_tunnel_id(t: &BondPathTransportConfig) -> Option<String>
 mod bonded_input_tests {
     use super::*;
 
+    fn test_owner() -> LegOwner<'static> {
+        LegOwner { flow_id: "flow-1", scope: BondEventScope::Input, id: "bond-1" }
+    }
+
     #[test]
     fn bond_transport_label_names_each_transport() {
         let udp: crate::config::models::BondPathTransportConfig =
@@ -784,7 +811,7 @@ mod bonded_input_tests {
                  ] }"#,
         )
         .unwrap();
-        let sock = build_receiver_cfg(&cfg).expect("receiver cfg builds").cfg;
+        let sock = build_receiver_cfg(&cfg, &test_owner()).expect("receiver cfg builds").cfg;
         assert_eq!(sock.flow_id, 6016);
         assert_eq!(sock.paths.len(), 2);
     }
@@ -796,7 +823,7 @@ mod bonded_input_tests {
         let build = |json: &str| {
             let cfg: crate::config::models::BondedInputConfig =
                 serde_json::from_str(json).unwrap();
-            build_receiver_cfg(&cfg).expect("receiver cfg builds").cfg
+            build_receiver_cfg(&cfg, &test_owner()).expect("receiver cfg builds").cfg
         };
 
         // Legacy `true` → Auto; no budget set → defaults to 1000.

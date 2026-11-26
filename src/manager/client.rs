@@ -1568,6 +1568,16 @@ pub fn edge_capabilities() -> Vec<&'static str> {
     // engine::bond_leg_probe + docs/leg-bandwidth-test.md.
     caps.push("bond-leg-capacity");
     caps.push("bond-probe-responder");
+    // A native-UDP relay tunnel or relayed bond leg with two relays follows
+    // its peer to whichever relay both reach, and fails back to the primary
+    // with it, reading the liveness a relay after v0.20.0 adds to its Acks
+    // (`tunnel::native_meet`). An edge without this bit moves only when its
+    // relay stops answering, or on any refused datagram, and never back, so
+    // a pair with one such edge can split. Advertised for the vintage: the
+    // rule is compiled in on every build. The manager's tunnel modal reads
+    // it, with the relays' `udp-peer-liveness`, to say when a tunnel's backup
+    // works the old way.
+    caps.push("native-relay-meet");
     // Media-player operator control (Phase 3b). Now default-on, so advertise
     // unless the node-wide `BILBYCAST_MEDIA_PLAYER_CONTROLLER=0` escape hatch
     // disables it (passing `None` = "no per-input override" resolves to the
@@ -11256,6 +11266,14 @@ mod multiviewer_capability_gate {
     fn clip_export_is_advertised_under_the_name_the_manager_reads() {
         let caps = super::edge_capabilities();
         assert!(caps.contains(&"clip-export"), "caps = {caps:?}");
+    }
+
+    /// The manager's tunnel modal tells an operator a tunnel's backup relay
+    /// works the old way on any edge whose capability list lacks exactly this.
+    #[test]
+    fn native_relay_meet_is_advertised_under_the_name_the_manager_reads() {
+        let caps = super::edge_capabilities();
+        assert!(caps.contains(&"native-relay-meet"), "caps = {caps:?}");
     }
 
     /// `video_encode.scan` is gated on this string in the manager UI; an

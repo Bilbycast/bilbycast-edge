@@ -7,15 +7,19 @@
 //! data plane. It rides the SAME loopback-forwarder contract as the QUIC path
 //! (`udp_forwarder::run_egress`/`run_ingress`) — the SRT/RIST endpoint still
 //! binds a local loopback port — but swaps the carrier from a `quinn::Connection`
-//! ([`udp_forwarder::QuicLink`]) to a plain connected `UdpSocket`
-//! ([`udp_forwarder::PlainUdpLink`]). No QUIC overhead, no second congestion
-//! controller fighting SRT/RIST ARQ.
+//! ([`udp_forwarder::QuicLink`]) to plain connected `UdpSocket`s
+//! ([`NativeCarrier`] for a relay, [`udp_forwarder::PlainUdpLink`] for a
+//! direct peer). No QUIC overhead, no second congestion controller fighting
+//! SRT/RIST ARQ.
 //!
 //! **Relay mode:** both edges connect outbound to the relay's UDP listener
 //! (firewall traversal), each periodically sending an authenticated
 //! `Register` control datagram (HMAC bind token, same registry as the QUIC
 //! path). The relay latches each edge's source address and forwards media
-//! verbatim between them.
+//! verbatim between them. A tunnel with a backup relay may hold a socket on
+//! each, standing by on one, and moves between them with its peer by what the
+//! relays' Acks say ([`super::native_meet`]); one supervisor task owns the
+//! sockets and one forwarder serves the tunnel's whole life.
 //!
 //! **Direct mode:** the caller (egress) connects to the listener's public UDP
 //! port and registers with a PSK token; the listener latches the caller's source
@@ -36,30 +40,40 @@ use anyhow::Result;
 use bytes::Bytes;
 use tokio::net::{lookup_host, UdpSocket};
 use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::config::TunnelDirection;
 use super::crypto::TunnelCipher;
+use super::native_carrier::{
+    is_refusal, CarrierNote, CarrierSet, Leg, NativeCarrier, RelayAck, NOTES_CAPACITY,
+};
+use super::native_meet::{Act, AckView, NativeMeet, NativeTiming, Why};
 use super::protocol::{
     self, encode_udp_control, try_decode_udp_control, RelayDirection, UdpRelayControl,
     TUNNEL_PROTOCOL_VERSION,
 };
-use super::relay_client::RelayTunnelState;
+use super::relay_client::{
+    report_failing_back, report_moved, trouble_event, RelayTunnelState, Reports, Trouble,
+};
 use super::udp_forwarder::{self, DatagramLink, PlainUdpLink, UdpForwarderStats};
-use crate::manager::events::{category, EventSender, EventSeverity};
+use crate::manager::events::{category, BondEventScope, Event, EventSender, EventSeverity};
 
 /// How often the edge re-sends a `Register` (keepalive) to maintain the relay's
 /// source-address latch + NAT binding. Must be well under the relay's idle
 /// timeout (30 s).
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+pub(super) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 
-/// No control ack for this long on the current relay → consider it dead and
-/// rotate to the next `relay_addrs` entry (sized like the QUIC ~25 s window so
-/// cellular/satellite handovers don't flap).
-const RELAY_DEAD_TIMEOUT_MS: u64 = 25_000;
+/// No control ack for this long on a relay → consider it dead: a new socket to
+/// it, or with an older relay a move to the other `relay_addrs` entry (sized
+/// like the QUIC ~25 s window so cellular/satellite handovers don't flap). See
+/// `native_meet::NativeTiming::dead`.
+pub(super) const RELAY_DEAD_TIMEOUT_MS: u64 = 25_000;
 
-/// Brief delay between failover attempts.
+/// How long a native relay tunnel's forwarder waits before it starts again
+/// after it ended on its own (its local socket failed).
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// A direct-mode listener's latched caller may only move to a DIFFERENT source
@@ -88,7 +102,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// manager respawns with backoff — by which time the grace has usually elapsed.
 /// Worst case this adds ≤ 12 s to a handover blackout, ≤ 17 s counting the next
 /// keepalive.
-const SLOT_TAKEOVER_GRACE_MS: u64 = 12_000;
+pub(super) const SLOT_TAKEOVER_GRACE_MS: u64 = 12_000;
 
 /// A slot must not be held against a persistently-present challenger forever.
 ///
@@ -431,6 +445,30 @@ pub struct NativeRelayParams {
     /// the gateway before the socket binds, so this tunnel egresses out a
     /// specific uplink on a shared NIC.
     pub gateway: Option<String>,
+    /// How much slower than the backup, in Register → Ack round trip, the
+    /// primary may be for the tunnel to go back to it
+    /// (`max_rtt_failback_increase_ms`; a relayed bond leg takes the default).
+    pub failback_rtt_gate_ms: u32,
+    /// Who the tunnel's events are about.
+    pub event_scope: NativeEventScope,
+}
+
+/// Who a native relay supervisor's events are about.
+#[derive(Debug, Clone)]
+pub enum NativeEventScope {
+    /// A tunnel, named `name`: the tunnel events of the QUIC carrier, with
+    /// `"transport": "udp"`.
+    Tunnel { name: String },
+    /// A relayed bond leg: one `bond_leg_relay_moved` event per move, scoped to
+    /// the flow and to the bonded input or output.
+    Leg {
+        flow_id: String,
+        scope: BondEventScope,
+        /// The bonded input's or output's id.
+        target_id: String,
+        path_id: u8,
+        path_name: String,
+    },
 }
 
 fn relay_direction(d: TunnelDirection) -> RelayDirection {
@@ -639,9 +677,11 @@ async fn teardown_tunnel_gateway(tunnel_id: &Uuid) {
     }
 }
 
-/// Run a native plain-UDP **relay** tunnel: connect outbound to the relay,
-/// register/keepalive, and bridge the local loopback port over plain UDP.
-/// Loops over `relay_addrs` for failover; returns only on cancellation.
+/// Run a native plain-UDP **relay** tunnel: register on its relay, or on both
+/// of them while it looks for its peer or stands by ([`super::native_meet`]),
+/// and bridge the local loopback port over plain UDP with one forwarder for
+/// the tunnel's life. Returns only on cancellation, or with the error when the
+/// local port is taken, after a Critical `port_conflict` event.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_relay_tunnel(
     params: NativeRelayParams,
@@ -653,213 +693,53 @@ pub async fn run_native_relay_tunnel(
     cipher: Option<Arc<TunnelCipher>>,
     event_sender: EventSender,
 ) -> Result<()> {
-    if params.relay_addrs.is_empty() {
-        anyhow::bail!("native-UDP relay tunnel requires at least one relay address");
-    }
-
-    let bind_token = params.tunnel_bind_secret.as_deref().map(|secret| {
-        super::auth::compute_bind_token(
-            &params.tunnel_id.to_string(),
-            direction_str(params.direction),
-            secret,
-        )
-    });
-
-    // Gateway-mode policy routing (best-effort) BEFORE any socket binds the
-    // source IP. Tracked so we tear it down on every exit path below.
-    let gateway_programmed = match (
-        params.gateway.as_deref(),
-        params.source.as_deref(),
-        params.interface.as_deref(),
-    ) {
-        (Some(gw), Some(src), Some(iface)) => {
-            let routes = crate::engine::bond_routing::BondRouteManager::global().await;
-            program_tunnel_gateway(routes, &params.tunnel_id, iface, src, gw, &event_sender).await
-        }
-        _ => false,
-    };
-
-    let mut idx = 0usize;
-    let outcome: Result<()> = 'outer: loop {
-        if cancel.is_cancelled() {
-            break 'outer Ok(());
-        }
-        let relay_addr = params.relay_addrs[idx % params.relay_addrs.len()].clone();
-        let _ = active_idx_tx.send(idx % params.relay_addrs.len());
-        state_tx.send_replace(RelayTunnelState::Connecting);
-
-        // Resolve all candidate addresses (IPv4 first) and connect to the first
-        // reachable one, falling back across address families.
-        let candidates = resolve_candidates(&relay_addr).await;
-        if candidates.is_empty() {
-            tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay: cannot resolve '{relay_addr}'");
-            rotate_after(&cancel, &mut idx).await;
-            continue;
-        }
-        let (resolved, sock) = match connect_any(
-            &candidates,
-            idx,
-            params.interface.as_deref(),
-            params.source.as_deref(),
-            &params.tunnel_id,
-        )
-        .await
-        {
-            Some(pair) => pair,
-            None => {
-                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay: all addresses for '{relay_addr}' failed to connect");
-                rotate_after(&cancel, &mut idx).await;
-                continue;
-            }
-        };
-
-        tracing::info!(
-            tunnel_id = %params.tunnel_id,
-            relay = %resolved,
-            direction = %params.direction,
-            "native-UDP relay tunnel connecting"
-        );
-
-        let link = PlainUdpLink::new(sock.clone());
-        let ready = link.ready.clone();
-        let last_ack = link.last_ack_ms.clone();
-
-        // Reset liveness for this attempt.
-        ready.store(false, Ordering::Relaxed);
-        last_ack.store(udp_forwarder::now_epoch_ms(), Ordering::Relaxed);
-
-        let attempt_cancel = cancel.child_token();
-        // Every exit from this attempt ends its register task and drop
-        // sampler, which hold the attempt's socket: a forwarder that errors
-        // ends the attempt as surely as a dead relay does.
-        let _attempt_guard = attempt_cancel.clone().drop_guard();
-        udp_forwarder::spawn_kernel_drop_sampler(sock.clone(), stats.clone(), attempt_cancel.clone());
-
-        // Register / keepalive + liveness watchdog task.
-        {
-            let reg_sock = sock.clone();
-            let reg_cancel = attempt_cancel.clone();
-            let tunnel_id = params.tunnel_id;
-            let direction = relay_direction(params.direction);
-            let bind_token = bind_token.clone();
-            let ready = ready.clone();
-            let last_ack = last_ack.clone();
-            let state_tx = state_tx.clone();
-            tokio::spawn(async move {
-                let register = match encode_udp_control(&UdpRelayControl::Register {
-                    tunnel_id,
-                    direction,
-                    bind_token,
-                    protocol_version: TUNNEL_PROTOCOL_VERSION,
-                }) {
-                    Ok(b) => b,
-                    Err(_) => return,
-                };
-                // Send one immediately, then on each tick.
-                let _ = reg_sock.send(&register).await;
-                let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
-                tick.tick().await; // consume the immediate first tick
-                loop {
-                    tokio::select! {
-                        _ = reg_cancel.cancelled() => return,
-                        _ = tick.tick() => {
-                            let _ = reg_sock.send(&register).await;
-                            // Promote to Ready once the relay acks both sides latched.
-                            if ready.load(Ordering::Relaxed) {
-                                state_tx.send_if_modified(|s| {
-                                    if *s != RelayTunnelState::Ready { *s = RelayTunnelState::Ready; true } else { false }
-                                });
-                            }
-                            // Liveness: no ack within the dead window → rotate relay.
-                            let since = udp_forwarder::now_epoch_ms()
-                                .saturating_sub(last_ack.load(Ordering::Relaxed));
-                            if since > RELAY_DEAD_TIMEOUT_MS {
-                                tracing::warn!(%tunnel_id, "native-UDP relay silent for {since} ms — rotating");
-                                reg_cancel.cancel();
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        // Run the loopback forwarder over the plain-UDP link until the attempt
-        // is cancelled (relay dead / outer shutdown) or the forwarder errors.
-        let fwd = match params.direction {
-            // Edge Egress = source side: bind local_addr, listen for the SRT/RIST
-            // caller, send INTO the tunnel.
-            TunnelDirection::Egress => {
-                udp_forwarder::run_egress(
-                    params.tunnel_id,
-                    local_addr,
-                    link,
-                    stats.clone(),
-                    attempt_cancel.clone(),
-                    cipher.clone(),
-                )
-                .await
-            }
-            // Edge Ingress = destination side: receive from the tunnel, forward
-            // to the local loopback (SRT/RIST listener).
-            TunnelDirection::Ingress => {
-                udp_forwarder::run_ingress(
-                    params.tunnel_id,
-                    local_addr,
-                    link,
-                    stats.clone(),
-                    attempt_cancel.clone(),
-                    cipher.clone(),
-                )
-                .await
-            }
-        };
-
-        // End the attempt now, not after the retry delay: the abandoned
-        // socket must stop registering, or the relay can latch back onto it.
-        attempt_cancel.cancel();
-        state_tx.send_replace(RelayTunnelState::Down);
-        if cancel.is_cancelled() {
-            break 'outer Ok(());
-        }
-        if let Err(e) = fwd {
-            tracing::debug!(tunnel_id = %params.tunnel_id, "native-UDP forwarder exited: {e}");
-        }
-        rotate_after(&cancel, &mut idx).await;
-    };
-
-    if gateway_programmed {
-        teardown_tunnel_gateway(&params.tunnel_id).await;
-    }
-    outcome
+    relay_tunnel_with(
+        NativeTiming::default(),
+        params,
+        local_addr,
+        state_tx,
+        active_idx_tx,
+        cancel,
+        stats,
+        cipher,
+        event_sender,
+    )
+    .await
 }
 
-/// Advance the relay index and sleep the retry delay (cancel-aware).
-async fn rotate_after(cancel: &CancellationToken, idx: &mut usize) {
-    *idx = idx.wrapping_add(1);
-    tokio::select! {
-        _ = cancel.cancelled() => {}
-        _ = tokio::time::sleep(RETRY_DELAY) => {}
-    }
+/// [`run_native_relay_tunnel`] with the rule's waits given.
+#[allow(clippy::too_many_arguments)]
+async fn relay_tunnel_with(
+    timing: NativeTiming,
+    params: NativeRelayParams,
+    local_addr: SocketAddr,
+    state_tx: watch::Sender<RelayTunnelState>,
+    active_idx_tx: watch::Sender<usize>,
+    cancel: CancellationToken,
+    stats: Arc<UdpForwarderStats>,
+    cipher: Option<Arc<TunnelCipher>>,
+    events: EventSender,
+) -> Result<()> {
+    let role = Role::Tunnel { local_addr, state_tx, active_idx_tx };
+    run_native_relay(params, timing, role, stats, cipher, cancel, events).await
 }
 
-/// Run a native plain-UDP **relay bond leg** entirely in-process: connect
-/// outbound to the relay, Register/keepalive, and bridge the bond's framed
-/// datagrams ↔ the relay socket over `from_bond` / `to_bond` channels — with
-/// NO `127.0.0.1` loopback hop and NO `TunnelManager` loopback tunnel.
+/// Run a native plain-UDP **relay bond leg** entirely in-process: register on
+/// the leg's relay (or both of its relays, as a tunnel does) and bridge the
+/// bond's framed datagrams ↔ the relay sockets over `from_bond` / `to_bond`
+/// channels — with NO `127.0.0.1` loopback hop and NO `TunnelManager`
+/// loopback tunnel.
 ///
-/// This shares the relay-socket lifecycle (resolve → connect → Register /
-/// keepalive → liveness-watchdog → failover rotation → gateway routing) with
-/// [`run_native_relay_tunnel`]; only the forwarder differs. Instead of
-/// `udp_forwarder::run_egress`/`run_ingress` (which own a loopback UDP socket),
-/// the in-process pump:
+/// It shares everything with [`run_native_relay_tunnel`] but the forwarder.
+/// Instead of `udp_forwarder::run_egress`/`run_ingress` (which own a loopback
+/// UDP socket), the in-process pump:
 ///   - drains `from_bond` (datagrams the bond scheduler emitted on this leg),
 ///     conditionally tunnel-AEAD-encrypts, prepends the 16-byte `tunnel_id`
-///     ([`protocol::encode_udp_datagram`]) and writes the relay socket —
+///     ([`protocol::encode_udp_datagram`]) and sends it on the active relay —
 ///     **byte-identical** to `run_egress`, so `bilbycast-relay` is unchanged;
-///   - reads the relay socket ([`PlainUdpLink::recv_datagram`], which peels
-///     control acks), decodes the prefix, conditionally decrypts, and
-///     `to_bond.try_send`s the inner datagram to the bond receiver.
+///   - reads every relay socket (the carrier peels control acks off),
+///     decodes the prefix, conditionally decrypts, and `to_bond.try_send`s the
+///     inner datagram to the bond receiver.
 ///
 /// Both directions are pumped regardless of `direction` (a bonded leg carries
 /// media one way and the NACK/keepalive back-channel the other); `direction`
@@ -871,9 +751,8 @@ async fn rotate_after(cancel: &CancellationToken, idx: &mut usize) {
 /// seals/opens it). This decision MUST match the peer edge's leg — a mismatch
 /// is a total blackout, surfaced via `decrypt_errors` (the key-skew watchdog).
 ///
-/// **Relay rotation**: the bond leg channels (`from_bond` / `to_bond`) PERSIST
-/// across a relay failover — only the socket + Register task are rebuilt; the
-/// bond leg is never torn down for a relay rotation. Returns only on
+/// The bond leg channels persist across every move between relays and every
+/// new socket: the bond leg is never torn down for them. Returns only on
 /// cancellation or when the bond drops its end (leg removed).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_relay_leg_inproc(
@@ -882,25 +761,72 @@ pub async fn run_native_relay_leg_inproc(
     stats: Arc<UdpForwarderStats>,
     cipher: Option<Arc<TunnelCipher>>,
     to_bond: mpsc::Sender<Bytes>,
-    mut from_bond: mpsc::Receiver<Bytes>,
+    from_bond: mpsc::Receiver<Bytes>,
+    events: EventSender,
+) -> Result<()> {
+    relay_leg_with(NativeTiming::default(), params, cancel, stats, cipher, to_bond, from_bond, events)
+        .await
+}
+
+/// [`run_native_relay_leg_inproc`] with the rule's waits given.
+#[allow(clippy::too_many_arguments)]
+async fn relay_leg_with(
+    timing: NativeTiming,
+    params: NativeRelayParams,
+    cancel: CancellationToken,
+    stats: Arc<UdpForwarderStats>,
+    cipher: Option<Arc<TunnelCipher>>,
+    to_bond: mpsc::Sender<Bytes>,
+    from_bond: mpsc::Receiver<Bytes>,
+    events: EventSender,
+) -> Result<()> {
+    let role = Role::Leg { to_bond, from_bond };
+    run_native_relay(params, timing, role, stats, cipher, cancel, events).await
+}
+
+/// What the supervisor bridges the relays to.
+enum Role {
+    /// A tunnel's local loopback port.
+    Tunnel {
+        local_addr: SocketAddr,
+        state_tx: watch::Sender<RelayTunnelState>,
+        active_idx_tx: watch::Sender<usize>,
+    },
+    /// A bond leg's channels.
+    Leg { to_bond: mpsc::Sender<Bytes>, from_bond: mpsc::Receiver<Bytes> },
+}
+
+/// What the supervisor keeps of its [`Role`] once the forwarder has what it
+/// needs.
+enum Seat {
+    Tunnel {
+        local_addr: SocketAddr,
+        state_tx: watch::Sender<RelayTunnelState>,
+        active_idx_tx: watch::Sender<usize>,
+    },
+    Leg,
+}
+
+/// The supervisor of a native relay tunnel or leg: the one task that owns its
+/// relay sockets, sends their Registers, reads what the carrier noted, asks
+/// [`NativeMeet`] what to do and does it.
+async fn run_native_relay(
+    params: NativeRelayParams,
+    timing: NativeTiming,
+    role: Role,
+    stats: Arc<UdpForwarderStats>,
+    cipher: Option<Arc<TunnelCipher>>,
+    cancel: CancellationToken,
     events: EventSender,
 ) -> Result<()> {
     if params.relay_addrs.is_empty() {
-        anyhow::bail!("native-UDP relay bond leg requires at least one relay address");
+        anyhow::bail!("native-UDP relay tunnel requires at least one relay address");
     }
 
-    let bind_token = params.tunnel_bind_secret.as_deref().map(|secret| {
-        super::auth::compute_bind_token(
-            &params.tunnel_id.to_string(),
-            direction_str(params.direction),
-            secret,
-        )
-    });
-
     // Gateway-mode policy routing (best-effort) BEFORE any socket binds the
-    // source IP. Tracked so it's torn down on every exit path below. Unlike a
-    // UDP leg (sender-only gateway), BOTH ends of a relay leg dial out, so
-    // gateway mode is valid on either direction.
+    // source IP, and torn down on every exit below. Unlike a UDP bond leg
+    // (sender-only gateway), both ends of a relay leg dial out, so gateway
+    // mode is valid on either direction.
     let gateway_programmed = match (
         params.gateway.as_deref(),
         params.source.as_deref(),
@@ -913,191 +839,649 @@ pub async fn run_native_relay_leg_inproc(
         _ => false,
     };
 
-    let mut idx = 0usize;
-    let outcome: Result<()> = 'outer: loop {
-        if cancel.is_cancelled() {
-            break 'outer Ok(());
-        }
-        let relay_addr = params.relay_addrs[idx % params.relay_addrs.len()].clone();
-
-        let candidates = resolve_candidates(&relay_addr).await;
-        if candidates.is_empty() {
-            tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay bond leg: cannot resolve '{relay_addr}'");
-            rotate_after(&cancel, &mut idx).await;
-            continue;
-        }
-        let (resolved, sock) = match connect_any(
-            &candidates,
-            idx,
-            params.interface.as_deref(),
-            params.source.as_deref(),
-            &params.tunnel_id,
-        )
-        .await
-        {
-            Some(pair) => pair,
-            None => {
-                tracing::warn!(tunnel_id = %params.tunnel_id, "native-UDP relay bond leg: all addresses for '{relay_addr}' failed to connect");
-                rotate_after(&cancel, &mut idx).await;
-                continue;
+    // Everything the supervisor starts ends with it, however it ends.
+    let life = cancel.child_token();
+    let _life_guard = life.clone().drop_guard();
+    let outcome = {
+        let mut sup = Supervisor::new(&params, timing, stats, cipher, life, &cancel, events, &role);
+        let (seat, forwarder) = match role {
+            Role::Tunnel { local_addr, state_tx, active_idx_tx } => {
+                let forwarder = sup.spawn_tunnel_forwarder(local_addr);
+                (Seat::Tunnel { local_addr, state_tx, active_idx_tx }, forwarder)
             }
+            Role::Leg { to_bond, from_bond } => (Seat::Leg, sup.spawn_leg_pump(to_bond, from_bond)),
         };
-
-        tracing::info!(
-            tunnel_id = %params.tunnel_id,
-            relay = %resolved,
-            direction = %params.direction,
-            encrypted = cipher.is_some(),
-            "native-UDP relay bond leg connecting"
-        );
-
-        let mut link = PlainUdpLink::new(sock.clone());
-        let last_ack = link.last_ack_ms.clone();
-        // Seed liveness to "now" — PlainUdpLink::new leaves last_ack at 0, which
-        // the watchdog would read as silent-forever and rotate instantly.
-        last_ack.store(udp_forwarder::now_epoch_ms(), Ordering::Relaxed);
-
-        let attempt_cancel = cancel.child_token();
-        // Ends this attempt's register task on every exit (see
-        // `run_native_relay_tunnel`). No kernel-drop sampler here: this
-        // leg's `UdpForwarderStats` has no reader, and a carrier overrun
-        // shows up as leg loss in the bond's own path stats.
-        let _attempt_guard = attempt_cancel.clone().drop_guard();
-
-        // Register / keepalive + liveness watchdog (mirrors run_native_relay_tunnel,
-        // minus the RelayTunnelState watch — bond leg health is the bond's own job).
-        {
-            let reg_sock = sock.clone();
-            let reg_cancel = attempt_cancel.clone();
-            let tunnel_id = params.tunnel_id;
-            let direction = relay_direction(params.direction);
-            let bind_token = bind_token.clone();
-            let last_ack = last_ack.clone();
-            tokio::spawn(async move {
-                let register = match encode_udp_control(&UdpRelayControl::Register {
-                    tunnel_id,
-                    direction,
-                    bind_token,
-                    protocol_version: TUNNEL_PROTOCOL_VERSION,
-                }) {
-                    Ok(b) => b,
-                    Err(_) => return,
-                };
-                let _ = reg_sock.send(&register).await;
-                let mut tick = tokio::time::interval(KEEPALIVE_INTERVAL);
-                tick.tick().await; // consume the immediate first tick
-                loop {
-                    tokio::select! {
-                        _ = reg_cancel.cancelled() => return,
-                        _ = tick.tick() => {
-                            let _ = reg_sock.send(&register).await;
-                            let since = udp_forwarder::now_epoch_ms()
-                                .saturating_sub(last_ack.load(Ordering::Relaxed));
-                            if since > RELAY_DEAD_TIMEOUT_MS {
-                                tracing::warn!(%tunnel_id, "native-UDP relay bond leg silent for {since} ms — rotating");
-                                reg_cancel.cancel();
-                                return;
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        // In-process pump until the attempt is cancelled (relay dead / outer
-        // shutdown), the link errors, or the bond drops its end (leg removed).
-        loop {
-            tokio::select! {
-                _ = attempt_cancel.cancelled() => break,
-                // Bond → relay. `from_bond` yields an already-bond-framed datagram
-                // (0xBD-sealed when the bond is keyed, else plaintext 0xBC). The
-                // `await` here is the DRAIN side, not a backpressure injection on
-                // the bond sender (the bond `try_send`'d into the path channel and
-                // drops on full), so it is safe — never stalls the bond.
-                maybe = from_bond.recv() => {
-                    let Some(frame) = maybe else {
-                        // Bond dropped its sender → this leg is gone for good.
-                        break 'outer Ok(());
-                    };
-                    let payload = if let Some(c) = &cipher {
-                        match c.encrypt(frame.as_ref()) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                                tracing::debug!(tunnel_id = %params.tunnel_id, "relay bond leg encrypt error: {e}");
-                                continue;
-                            }
-                        }
-                    } else {
-                        frame.to_vec()
-                    };
-                    // Byte-identical framing to udp_forwarder::run_egress so the
-                    // relay forwards it verbatim with zero changes.
-                    let datagram = protocol::encode_udp_datagram(&params.tunnel_id, &payload);
-                    match link.send_datagram(Bytes::from(datagram)) {
-                        Ok(()) => {
-                            stats.packets_sent.fetch_add(1, Ordering::Relaxed);
-                            stats.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
-                        }
-                        Err(e) => {
-                            stats.send_errors.fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!(tunnel_id = %params.tunnel_id, "relay bond leg send error: {e}");
-                        }
-                    }
-                }
-                // Relay → bond.
-                res = link.recv_datagram() => {
-                    let datagram = match res {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::debug!(tunnel_id = %params.tunnel_id, "relay bond leg recv error: {e}");
-                            break;
-                        }
-                    };
-                    let Some((datagram_id, enc)) = protocol::decode_udp_datagram(&datagram) else { continue };
-                    // Same refusal as `udp_forwarder::run_{egress,ingress}`, same
-                    // safety argument: this leg is one tunnel with one id at both
-                    // ends (the register token binds it), and the relay forwards
-                    // the framing verbatim, knowing a sender by its source address
-                    // alone: no token goes with a datagram, and an address can be
-                    // forged.
-                    if datagram_id != params.tunnel_id {
-                        stats.framing_errors.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    let payload = if let Some(c) = &cipher {
-                        match c.decrypt(enc) {
-                            Ok(p) => p,
-                            Err(_) => {
-                                stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            }
-                        }
-                    } else {
-                        enc.to_vec()
-                    };
-                    stats.packets_received.fetch_add(1, Ordering::Relaxed);
-                    stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                    // Drop-on-full — the bond owns recovery (cross-leg ARQ/FEC).
-                    // NEVER await: the attached-path recv loop drains this and
-                    // a full channel is leg loss like any other.
-                    let _ = to_bond.try_send(Bytes::from(payload));
-                }
-            }
-        }
-
-        // End the attempt before the retry delay, as the tunnel path does.
-        attempt_cancel.cancel();
-        if cancel.is_cancelled() {
-            break 'outer Ok(());
-        }
-        rotate_after(&cancel, &mut idx).await;
+        sup.run(seat, forwarder).await
     };
 
     if gateway_programmed {
         teardown_tunnel_gateway(&params.tunnel_id).await;
     }
     outcome
+}
+
+/// How many recent Register `seq`s an Ack may echo.
+const SEQS_KEPT: usize = 4;
+
+/// The longest `live_ms` an Ack is believed: a week.
+const MAX_LIVE_MS: u64 = 604_800_000;
+
+/// One relay's socket, as the supervisor has it.
+struct RelaySock {
+    generation: u64,
+    sock: Arc<UdpSocket>,
+    /// The `seq` of its next Register.
+    seq: u32,
+    /// Its last Registers' `seq`s and when they went.
+    sent: [Option<(u32, Instant)>; SEQS_KEPT],
+    next_sent: usize,
+    next_register: Instant,
+    /// Ends what was started for this socket (its kernel-drop sampler).
+    token: CancellationToken,
+}
+
+impl RelaySock {
+    fn new(generation: u64, sock: Arc<UdpSocket>, token: CancellationToken, now: Instant) -> Self {
+        Self {
+            generation,
+            sock,
+            seq: rand::random(),
+            sent: [None; SEQS_KEPT],
+            next_sent: 0,
+            next_register: now,
+            token,
+        }
+    }
+
+    fn note_sent(&mut self, now: Instant) {
+        self.sent[self.next_sent] = Some((self.seq, now));
+        self.next_sent = (self.next_sent + 1) % SEQS_KEPT;
+        self.seq = self.seq.wrapping_add(1);
+    }
+}
+
+impl Drop for RelaySock {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
+/// Check an Ack before anything is decided on it, and time it. `None` drops
+/// it: it echoes no Register sent on its socket lately, or carries what no
+/// relay sends. (Its `tunnel_id` was checked by the carrier.)
+fn ack_view(sent: &[Option<(u32, Instant)>], ack: RelayAck, at: Instant) -> Option<AckView> {
+    let rtt = match ack.seq {
+        Some(seq) => {
+            let (_, sent_at) = sent.iter().flatten().find(|(s, _)| *s == seq)?;
+            Some(at.saturating_duration_since(*sent_at))
+        }
+        None => None,
+    };
+    if let Some(id) = &ack.relay_id
+        && !((1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return None;
+    }
+    if ack.live_ms.is_some_and(|ms| ms > MAX_LIVE_MS) {
+        return None;
+    }
+    Some(AckView {
+        ready: ack.ready,
+        peer_live: ack.peer_live,
+        live_ms: ack.live_ms,
+        relay_id: ack.relay_id,
+        rtt,
+    })
+}
+
+/// A socket asked for, as the task that opened it found it.
+struct Opened {
+    idx: usize,
+    sock: Option<(SocketAddr, Arc<UdpSocket>)>,
+}
+
+struct Supervisor<'a> {
+    params: &'a NativeRelayParams,
+    tick: Duration,
+    rule: NativeMeet,
+    direction: RelayDirection,
+    bind_token: Option<String>,
+    socks: [Option<RelaySock>; 2],
+    next_gen: u64,
+    /// Opens per relay so far: each starts at the next resolved address.
+    attempts: [usize; 2],
+    opened_tx: mpsc::Sender<Opened>,
+    opened_rx: mpsc::Receiver<Opened>,
+    notes_tx: mpsc::Sender<CarrierNote>,
+    notes_rx: mpsc::Receiver<CarrierNote>,
+    sets_tx: mpsc::UnboundedSender<CarrierSet>,
+    stats: Arc<UdpForwarderStats>,
+    cipher: Option<Arc<TunnelCipher>>,
+    /// Ends with the supervisor.
+    life: CancellationToken,
+    /// The tunnel's own token: its end is the end of the tunnel.
+    cancel: CancellationToken,
+    events: EventSender,
+    /// Sample each socket's kernel drops (tunnels only: a leg's stats have no
+    /// reader, and a carrier overrun shows as leg loss in the bond's stats).
+    sample_drops: bool,
+    /// The tunnel has been ready once.
+    up: bool,
+    reports: Reports,
+}
+
+impl<'a> Supervisor<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        params: &'a NativeRelayParams,
+        timing: NativeTiming,
+        stats: Arc<UdpForwarderStats>,
+        cipher: Option<Arc<TunnelCipher>>,
+        life: CancellationToken,
+        cancel: &CancellationToken,
+        events: EventSender,
+        role: &Role,
+    ) -> Self {
+        let bind_token = params.tunnel_bind_secret.as_deref().map(|secret| {
+            super::auth::compute_bind_token(
+                &params.tunnel_id.to_string(),
+                direction_str(params.direction),
+                secret,
+            )
+        });
+        let now = Instant::now();
+        let (opened_tx, opened_rx) = mpsc::channel(4);
+        let (notes_tx, notes_rx) = mpsc::channel(NOTES_CAPACITY);
+        Self {
+            params,
+            tick: timing.tick,
+            rule: NativeMeet::new(params.relay_addrs.len(), timing, params.failback_rtt_gate_ms, now),
+            direction: relay_direction(params.direction),
+            bind_token,
+            socks: [None, None],
+            next_gen: 1,
+            attempts: [0, 0],
+            opened_tx,
+            opened_rx,
+            notes_tx,
+            notes_rx,
+            sets_tx: mpsc::unbounded_channel().0,
+            stats,
+            cipher,
+            life,
+            cancel: cancel.clone(),
+            events,
+            sample_drops: matches!(role, Role::Tunnel { .. }),
+            up: false,
+            reports: Reports::new(now),
+        }
+    }
+
+    /// A carrier for a new forwarder, with the sockets there are now.
+    fn carrier(&mut self) -> NativeCarrier {
+        let (sets_tx, sets_rx) = mpsc::unbounded_channel();
+        self.sets_tx = sets_tx;
+        self.push_set();
+        NativeCarrier::new(self.params.tunnel_id, sets_rx, self.notes_tx.clone())
+    }
+
+    /// Tell the carrier what it has now.
+    fn push_set(&self) {
+        let leg = |s: &Option<RelaySock>| s.as_ref().map(|s| Leg::new(s.generation, s.sock.clone()));
+        let active = self.rule.active();
+        let set = CarrierSet {
+            legs: [leg(&self.socks[0]), leg(&self.socks[1])],
+            active: self.socks[active].as_ref().map(|_| active),
+        };
+        // A forwarder that has ended takes no more; the next one starts with
+        // a set of its own.
+        let _ = self.sets_tx.send(set);
+    }
+
+    fn spawn_tunnel_forwarder(&mut self, local_addr: SocketAddr) -> JoinHandle<Result<()>> {
+        let link = self.carrier();
+        let (id, stats, cipher, token) =
+            (self.params.tunnel_id, self.stats.clone(), self.cipher.clone(), self.life.child_token());
+        match self.params.direction {
+            // Edge Egress = source side: bind local_addr, listen for the SRT/RIST
+            // caller, send INTO the tunnel.
+            TunnelDirection::Egress => {
+                tokio::spawn(udp_forwarder::run_egress(id, local_addr, link, stats, token, cipher))
+            }
+            // Edge Ingress = destination side: receive from the tunnel, forward
+            // to the local loopback (SRT/RIST listener).
+            TunnelDirection::Ingress => {
+                tokio::spawn(udp_forwarder::run_ingress(id, local_addr, link, stats, token, cipher))
+            }
+        }
+    }
+
+    fn spawn_leg_pump(
+        &mut self,
+        to_bond: mpsc::Sender<Bytes>,
+        from_bond: mpsc::Receiver<Bytes>,
+    ) -> JoinHandle<Result<()>> {
+        let link = self.carrier();
+        tokio::spawn(pump_leg(
+            self.params.tunnel_id,
+            link,
+            from_bond,
+            to_bond,
+            self.stats.clone(),
+            self.cipher.clone(),
+            self.life.child_token(),
+        ))
+    }
+
+    async fn run(&mut self, seat: Seat, forwarder: JoinHandle<Result<()>>) -> Result<()> {
+        let mut forwarder = Some(forwarder);
+        let mut restart_at: Option<Instant> = None;
+        let mut tick = tokio::time::interval(self.tick);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let next_register = self.socks.iter().flatten().map(|s| s.next_register).min();
+            tokio::select! {
+                _ = self.cancel.cancelled() => return Ok(()),
+                Some(note) = self.notes_rx.recv() => {
+                    self.take_note(note);
+                    self.apply(Instant::now(), &seat);
+                }
+                Some(opened) = self.opened_rx.recv() => {
+                    self.take_opened(opened, Instant::now());
+                    self.apply(Instant::now(), &seat);
+                }
+                _ = tick.tick() => self.apply(Instant::now(), &seat),
+                _ = sleep_until_some(next_register) => self.send_registers(Instant::now()),
+                ended = join_some(&mut forwarder) => {
+                    forwarder = None;
+                    if self.cancel.is_cancelled() {
+                        return Ok(());
+                    }
+                    let Seat::Tunnel { .. } = seat else {
+                        // The bond dropped its end: the leg is gone.
+                        return Ok(());
+                    };
+                    let e = match ended {
+                        Ok(Err(e)) => e,
+                        Ok(Ok(())) => anyhow::anyhow!("forwarder exited"),
+                        Err(e) => anyhow::anyhow!("forwarder: {e}"),
+                    };
+                    if crate::util::port_error::anyhow_is_addr_in_use(&e) {
+                        self.port_conflict(&e);
+                        return Err(e);
+                    }
+                    tracing::warn!(
+                        tunnel_id = %self.params.tunnel_id,
+                        "native-UDP relay tunnel forwarder ended: {e}; starting it again in {RETRY_DELAY:?}"
+                    );
+                    restart_at = Some(Instant::now() + RETRY_DELAY);
+                }
+                _ = sleep_until_some(restart_at) => {
+                    restart_at = None;
+                    if let Seat::Tunnel { local_addr, .. } = &seat {
+                        forwarder = Some(self.spawn_tunnel_forwarder(*local_addr));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open a socket on relay `i`, off this task: a slow name lookup must not
+    /// hold up the other socket's Registers.
+    fn open(&mut self, i: usize) {
+        let relay_addr = self.params.relay_addrs[i].clone();
+        let offset = self.attempts[i];
+        self.attempts[i] = offset.wrapping_add(1);
+        let (interface, source) = (self.params.interface.clone(), self.params.source.clone());
+        let (tunnel_id, opened, life) = (self.params.tunnel_id, self.opened_tx.clone(), self.life.clone());
+        tokio::spawn(async move {
+            let connect = async {
+                let candidates = resolve_candidates(&relay_addr).await;
+                if candidates.is_empty() {
+                    tracing::warn!(%tunnel_id, "native-UDP relay: cannot resolve '{relay_addr}'");
+                    return None;
+                }
+                let sock = connect_any(&candidates, offset, interface.as_deref(), source.as_deref(), &tunnel_id).await;
+                if sock.is_none() {
+                    tracing::warn!(%tunnel_id, "native-UDP relay: all addresses for '{relay_addr}' failed to connect");
+                }
+                sock
+            };
+            let sock = tokio::select! {
+                _ = life.cancelled() => return,
+                sock = connect => sock,
+            };
+            let _ = opened.send(Opened { idx: i, sock }).await;
+        });
+    }
+
+    fn take_opened(&mut self, opened: Opened, now: Instant) {
+        let Opened { idx, sock } = opened;
+        let Some((addr, sock)) = sock else {
+            self.rule.open_failed(idx, now);
+            return;
+        };
+        let generation = self.next_gen;
+        self.next_gen += 1;
+        if !self.rule.opened(idx, generation, now) {
+            return;
+        }
+        tracing::info!(
+            tunnel_id = %self.params.tunnel_id,
+            relay = %addr,
+            relay_idx = idx,
+            direction = %self.params.direction,
+            encrypted = self.cipher.is_some(),
+            "native-UDP relay socket open"
+        );
+        let token = self.life.child_token();
+        if self.sample_drops {
+            udp_forwarder::spawn_kernel_drop_sampler(sock.clone(), self.stats.clone(), token.clone());
+        }
+        self.socks[idx] = Some(RelaySock::new(generation, sock, token, now));
+        self.push_set();
+    }
+
+    fn take_note(&mut self, note: CarrierNote) {
+        match note {
+            CarrierNote::Ack { idx, generation, at, ack } => {
+                let Some(sock) = self.socks[idx].as_ref().filter(|s| s.generation == generation) else { return };
+                match ack_view(&sock.sent, ack, at) {
+                    Some(view) => self.rule.note_ack(idx, generation, at, view),
+                    None => tracing::debug!(
+                        tunnel_id = %self.params.tunnel_id,
+                        relay_idx = idx,
+                        "native-UDP relay: dropped an Ack that answers no Register of ours"
+                    ),
+                }
+            }
+            CarrierNote::Refused { idx, generation, at } => self.rule.note_refused(idx, generation, at),
+        }
+    }
+
+    /// Send every Register that is due.
+    fn send_registers(&mut self, now: Instant) {
+        let active = self.rule.active();
+        let mut refused = Vec::new();
+        for (i, slot) in self.socks.iter_mut().enumerate() {
+            let Some(s) = slot.as_mut() else { continue };
+            if s.next_register > now {
+                continue;
+            }
+            let register = UdpRelayControl::Register {
+                tunnel_id: self.params.tunnel_id,
+                direction: self.direction,
+                bind_token: self.bind_token.clone(),
+                protocol_version: TUNNEL_PROTOCOL_VERSION,
+                seq: Some(s.seq),
+                standby: Some(i != active),
+            };
+            if let Ok(bytes) = encode_udp_control(&register)
+                && let Err(e) = s.sock.try_send(&bytes)
+                && is_refusal(&e)
+            {
+                refused.push((i, s.generation));
+            }
+            s.note_sent(now);
+            s.next_register = now + self.rule.register_interval(i, now);
+        }
+        for (i, generation) in refused {
+            self.rule.note_refused(i, generation, now);
+        }
+    }
+
+    /// Ask the rule what to do now, and do it.
+    fn apply(&mut self, now: Instant, seat: &Seat) {
+        let mut changed = false;
+        for act in self.rule.step(now) {
+            match act {
+                Act::Open(i) | Act::Redial(i) => self.open(i),
+                Act::Close(i) => {
+                    self.socks[i] = None;
+                    changed = true;
+                }
+                Act::RegisterNow(i) => {
+                    if let Some(s) = self.socks[i].as_mut() {
+                        s.next_register = now;
+                    }
+                }
+                Act::Move { from, to, why } => {
+                    changed = true;
+                    if let Seat::Tunnel { active_idx_tx, .. } = seat {
+                        active_idx_tx.send_replace(to);
+                    }
+                    self.report_move(from, to, why);
+                }
+                Act::State(state) => {
+                    if let Seat::Tunnel { state_tx, .. } = seat {
+                        state_tx.send_replace(state);
+                    }
+                    self.take_state(state, now);
+                }
+            }
+        }
+        if changed {
+            self.push_set();
+        }
+        if self.up
+            && let NativeEventScope::Tunnel { .. } = self.params.event_scope
+            && let Some(report) = self.reports.due(now)
+        {
+            let (severity, message, mut details) =
+                trouble_event(report, &self.params.relay_addrs[self.rule.active()]);
+            details["transport"] = "udp".into();
+            self.events.emit_flow_with_details(
+                severity,
+                category::TUNNEL,
+                message,
+                &self.params.tunnel_id.to_string(),
+                details,
+            );
+        }
+    }
+
+    fn take_state(&mut self, state: RelayTunnelState, now: Instant) {
+        let NativeEventScope::Tunnel { .. } = self.params.event_scope else { return };
+        match state {
+            RelayTunnelState::Ready if !self.up => {
+                self.up = true;
+                self.reports = Reports::new(now);
+                let a = self.rule.active();
+                tracing::info!(tunnel_id = %self.params.tunnel_id, relay_idx = a, "Tunnel ready");
+                report_moved(&self.params.tunnel_id, &self.params.relay_addrs, a, a, serde_json::json!({}), &self.events);
+            }
+            RelayTunnelState::Ready => self.reports.trouble = None,
+            _ if self.up => {
+                let reason = match self.rule.active_heard(now) {
+                    true => "peer not heard by relay",
+                    false => "relay not heard",
+                };
+                tracing::info!(tunnel_id = %self.params.tunnel_id, "Tunnel peer gone: {reason}");
+                self.reports.trouble = Some(Trouble::PeerGone(reason.into()));
+            }
+            _ => {}
+        }
+    }
+
+    fn report_move(&self, from: usize, to: usize, why: Why) {
+        let addrs = &self.params.relay_addrs;
+        let id = &self.params.tunnel_id;
+        match &self.params.event_scope {
+            NativeEventScope::Tunnel { .. } => match why {
+                Why::Failback => {
+                    tracing::info!(tunnel_id = %id, "Tunnel failing back to primary relay {}", addrs[0]);
+                    let (primary_rtt, active_rtt) = (self.rule.median_rtt(0), self.rule.median_rtt(1));
+                    let gate = self.params.failback_rtt_gate_ms;
+                    report_failing_back(id, &addrs[0], primary_rtt, active_rtt, gate, "udp", &self.events);
+                    report_moved(id, addrs, to, to, serde_json::json!({}), &self.events);
+                }
+                _ => {
+                    let extra = serde_json::json!({ "transport": "udp", "reason": why.code() });
+                    report_moved(id, addrs, from, to, extra, &self.events);
+                }
+            },
+            NativeEventScope::Leg { flow_id, scope, target_id, path_id, path_name } => {
+                let to_primary = to == 0;
+                let (severity, which) = match to_primary {
+                    true => (EventSeverity::Info, "primary"),
+                    false => (EventSeverity::Warning, "backup"),
+                };
+                let (kind, input_id, output_id) = match scope {
+                    BondEventScope::Input => ("input", Some(target_id.clone()), None),
+                    BondEventScope::Output => ("output", None, Some(target_id.clone())),
+                };
+                tracing::info!(tunnel_id = %id, "bonded {kind} path '{path_name}' moved to {which} relay {}", addrs[to]);
+                self.events.send(Event {
+                    severity,
+                    category: category::BOND.to_string(),
+                    message: format!(
+                        "bonded {kind} path '{path_name}' (#{path_id}) moved to {which} relay {}",
+                        addrs[to]
+                    ),
+                    details: Some(serde_json::json!({
+                        "error_code": "bond_leg_relay_moved",
+                        "path_id": path_id,
+                        "path_name": path_name,
+                        "scope": kind,
+                        "tunnel_id": id.to_string(),
+                        "from_relay_addr": addrs[from],
+                        "to_relay_addr": addrs[to],
+                        "from_idx": from,
+                        "to_idx": to,
+                        "reason": why.code(),
+                    })),
+                    flow_id: Some(flow_id.clone()),
+                    input_id,
+                    output_id,
+                });
+            }
+        }
+    }
+
+    /// The tunnel's local port is taken: that is no relay's fault, and trying
+    /// again will not free it.
+    fn port_conflict(&self, e: &anyhow::Error) {
+        let name = match &self.params.event_scope {
+            NativeEventScope::Tunnel { name } => name.as_str(),
+            NativeEventScope::Leg { path_name, .. } => path_name.as_str(),
+        };
+        tracing::error!(tunnel_id = %self.params.tunnel_id, "Tunnel local port conflict, stopping tunnel: {e}");
+        self.events.emit_flow_with_details(
+            EventSeverity::Critical,
+            category::PORT_CONFLICT,
+            format!("Tunnel '{name}' stopped: {e}"),
+            &self.params.tunnel_id.to_string(),
+            serde_json::json!({
+                "error_code": "port_conflict",
+                "component": format!("Tunnel '{name}'"),
+                "tunnel_name": name,
+                "transport": "udp",
+                "error": e.to_string(),
+            }),
+        );
+    }
+}
+
+async fn sleep_until_some(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn join_some(
+    handle: &mut Option<JoinHandle<Result<()>>>,
+) -> std::result::Result<Result<()>, tokio::task::JoinError> {
+    match handle.as_mut() {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A relayed bond leg's forwarder: bond ↔ relay, for the leg's life. Ends
+/// only when the bond drops its end or the leg is stopped.
+async fn pump_leg(
+    tunnel_id: Uuid,
+    mut link: NativeCarrier,
+    mut from_bond: mpsc::Receiver<Bytes>,
+    to_bond: mpsc::Sender<Bytes>,
+    stats: Arc<UdpForwarderStats>,
+    cipher: Option<Arc<TunnelCipher>>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return Ok(()),
+            // Bond → relay. `from_bond` yields an already-bond-framed datagram
+            // (0xBD-sealed when the bond is keyed, else plaintext 0xBC). The
+            // `await` here is the DRAIN side, not a backpressure injection on
+            // the bond sender (the bond `try_send`'d into the path channel and
+            // drops on full), so it is safe — never stalls the bond.
+            maybe = from_bond.recv() => {
+                let Some(frame) = maybe else {
+                    // Bond dropped its sender → this leg is gone for good.
+                    return Ok(());
+                };
+                let payload = if let Some(c) = &cipher {
+                    match c.encrypt(frame.as_ref()) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(%tunnel_id, "relay bond leg encrypt error: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    frame.to_vec()
+                };
+                // Byte-identical framing to udp_forwarder::run_egress so the
+                // relay forwards it verbatim with zero changes.
+                let datagram = protocol::encode_udp_datagram(&tunnel_id, &payload);
+                match link.send_datagram(Bytes::from(datagram)) {
+                    Ok(()) => {
+                        stats.packets_sent.fetch_add(1, Ordering::Relaxed);
+                        stats.bytes_sent.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        stats.send_errors.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(%tunnel_id, "relay bond leg send error: {e}");
+                    }
+                }
+            }
+            // Relay → bond. The carrier ends only with its supervisor.
+            res = link.recv_datagram() => {
+                let Ok(datagram) = res else { return Ok(()) };
+                let Some((datagram_id, enc)) = protocol::decode_udp_datagram(&datagram) else { continue };
+                // Same refusal as `udp_forwarder::run_{egress,ingress}`, same
+                // safety argument: this leg is one tunnel with one id at both
+                // ends (the register token binds it), and the relay forwards
+                // the framing verbatim, knowing a sender by its source address
+                // alone: no token goes with a datagram, and an address can be
+                // forged.
+                if datagram_id != tunnel_id {
+                    stats.framing_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let payload = if let Some(c) = &cipher {
+                    match c.decrypt(enc) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            stats.decrypt_errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    }
+                } else {
+                    enc.to_vec()
+                };
+                stats.packets_received.fetch_add(1, Ordering::Relaxed);
+                stats.bytes_received.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                // Drop-on-full — the bond owns recovery (cross-leg ARQ/FEC).
+                // NEVER await: the attached-path recv loop drains this and
+                // a full channel is leg loss like any other.
+                let _ = to_bond.try_send(Bytes::from(payload));
+            }
+        }
+    }
 }
 
 // ── Direct mode (peer-to-peer, no relay) ──
@@ -1172,6 +1556,10 @@ pub async fn run_native_direct_tunnel(
                             direction: RelayDirection::Egress,
                             bind_token: Some(token),
                             protocol_version: TUNNEL_PROTOCOL_VERSION,
+                            // A direct listener neither echoes a seq nor
+                            // counts standing by: the caller's shape is as it was.
+                            seq: None,
+                            standby: None,
                         }) {
                             Ok(b) => b,
                             Err(_) => return,
@@ -1351,7 +1739,17 @@ async fn run_native_direct_listener(
                     caller.store(from);
                     state_tx.send_replace(RelayTunnelState::Ready);
                     // Ack so the caller confirms reachability.
-                    if let Ok(ack) = encode_udp_control(&UdpRelayControl::Ack { tunnel_id, ready: true }) {
+                    // A direct listener sends none of a relay's liveness
+                    // fields: its caller does not read them.
+                    let ack = UdpRelayControl::Ack {
+                        tunnel_id,
+                        ready: true,
+                        peer_live: None,
+                        live_ms: None,
+                        relay_id: None,
+                        seq: None,
+                    };
+                    if let Ok(ack) = encode_udp_control(&ack) {
                         let _ = public.send_to(&ack, from).await;
                     }
                     continue;
@@ -1892,6 +2290,8 @@ mod direct_listener_wire_tests {
             direction: RelayDirection::Egress,
             bind_token: Some(token),
             protocol_version: TUNNEL_PROTOCOL_VERSION,
+            seq: None,
+            standby: None,
         })
         .expect("encode register")
     }
@@ -2366,5 +2766,960 @@ mod gateway_route_event_tests {
         let fine = FakeRoutes::new();
         assert!(program(Ok(&fine), &events).await);
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod ack_check_tests {
+    //! What an Ack has to be before the rule takes it in (the edge's half of
+    //! the wire contract's validation).
+    use super::*;
+
+    fn ack(seq: Option<u32>, relay_id: Option<&str>, live_ms: Option<u64>) -> RelayAck {
+        RelayAck {
+            ready: true,
+            peer_live: Some(true),
+            live_ms,
+            relay_id: relay_id.map(str::to_string),
+            seq,
+        }
+    }
+
+    #[test]
+    fn an_ack_is_taken_only_for_a_register_sent_lately() {
+        let t0 = Instant::now();
+        let sent = [Some((7, t0)), Some((8, t0 + Duration::from_millis(10))), None, None];
+        let at = t0 + Duration::from_millis(40);
+        let view = ack_view(&sent, ack(Some(8), Some("ab"), Some(1)), at).expect("echoes seq 8");
+        assert_eq!(view.rtt, Some(Duration::from_millis(30)));
+        assert!(ack_view(&sent, ack(Some(9), Some("ab"), Some(1)), at).is_none(), "seq 9 was never sent");
+        // An older relay echoes nothing: taken, with no round trip.
+        let view = ack_view(&sent, ack(None, None, None), at).expect("no seq to check");
+        assert_eq!(view.rtt, None);
+    }
+
+    #[test]
+    fn an_ack_with_what_no_relay_sends_is_dropped() {
+        let t0 = Instant::now();
+        let sent = [Some((1, t0)), None, None, None];
+        let ok = |id: &str, live: u64| ack_view(&sent, ack(Some(1), Some(id), Some(live)), t0).is_some();
+        assert!(ok("0123456789abcdef0123456789abcdef", MAX_LIVE_MS));
+        assert!(ok(&"F".repeat(64), 0), "1 to 64 hex characters, either case");
+        assert!(!ok("", 0), "empty");
+        assert!(!ok(&"a".repeat(65), 0), "too long");
+        assert!(!ok("not-hex", 0), "not hex");
+        assert!(!ok("ab", MAX_LIVE_MS + 1), "live_ms past a week");
+    }
+
+    #[test]
+    fn only_the_last_four_seqs_are_kept() {
+        let now = Instant::now();
+        let sock = Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap());
+        sock.set_nonblocking(true).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = rt.enter();
+        let sock = Arc::new(UdpSocket::from_std(Arc::try_unwrap(sock).unwrap()).unwrap());
+        let mut s = RelaySock::new(1, sock, CancellationToken::new(), now);
+        let first = s.seq;
+        for _ in 0..5 {
+            s.note_sent(now);
+        }
+        let seqs: Vec<u32> = s.sent.iter().flatten().map(|(q, _)| *q).collect();
+        assert!(!seqs.contains(&first), "the fifth Register pushes the first out");
+        assert!(seqs.contains(&first.wrapping_add(4)));
+        assert_eq!(seqs.len(), SEQS_KEPT);
+    }
+}
+
+/// The supervisor over real UDP on 127.0.0.1, against relays acted out in the
+/// test: one that keeps bilbycast-relay's rules after v0.20.0 (sides heard by
+/// Register or media within its live window, `live_ms`, a side cleared once
+/// unheard for its idle time) with a cutter for each direction's path, the
+/// same with the older Ack and none of the clearing, and a socket the test
+/// answers by hand. The rule's waits are shortened by [`timing`], and the
+/// relay's to match.
+#[cfg(all(test, target_os = "linux"))]
+mod native_relay_wire_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::manager::events::event_channel;
+    use crate::tunnel::protocol::decode_udp_datagram;
+
+    const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// The relay's live window and idle time, scaled like [`timing`].
+    const PEER_LIVE: Duration = Duration::from_millis(640);
+    const IDLE: Duration = Duration::from_millis(1_200);
+    const PATIENCE: Duration = Duration::from_secs(15);
+
+    /// The production waits, 25 times shorter (tick aside), in their order.
+    fn timing() -> NativeTiming {
+        let ms = Duration::from_millis;
+        NativeTiming {
+            keepalive: ms(200),
+            fast: ms(50),
+            fast_for: ms(2_400),
+            silent: ms(400),
+            waiting: ms(400),
+            settle: ms(320),
+            dead: ms(1_000),
+            steady: ms(2_400),
+            linger: ms(3_200),
+            move_quiet: ms(800),
+            gate_retry: ms(2_400),
+            legacy_recheck: ms(24_000),
+            backoff_min: ms(40),
+            backoff_max: ms(1_200),
+            backoff_reset: ms(2_400),
+            tick: ms(20),
+        }
+    }
+
+    #[derive(Default, Clone, Copy)]
+    struct Slot {
+        addr: Option<SocketAddr>,
+        /// Which of the relay's sockets the side came by.
+        via: usize,
+        seen: Option<Instant>,
+        media: Option<Instant>,
+    }
+
+    fn heard(slot: &Slot, now: Instant) -> bool {
+        let last = slot.seen.max(slot.media);
+        slot.addr.is_some() && last.is_some_and(|t| now.saturating_duration_since(t) < PEER_LIVE)
+    }
+
+    #[derive(Default)]
+    struct Session {
+        /// Ingress, egress.
+        slots: [Slot; 2],
+        live_since: Option<Instant>,
+        ever_both: bool,
+    }
+
+    struct State {
+        id: String,
+        legacy: bool,
+        refuse_binds: bool,
+        sessions: HashMap<Uuid, Session>,
+        /// Directions whose path to this relay is cut, and every address a
+        /// side of that direction has registered from.
+        cut: HashSet<u8>,
+        dir_of: HashMap<SocketAddr, u8>,
+        /// Registers received, per relay socket.
+        registers: Vec<u64>,
+    }
+
+    fn side(d: RelayDirection) -> u8 {
+        match d {
+            RelayDirection::Ingress => 0,
+            RelayDirection::Egress => 1,
+        }
+    }
+
+    /// A relay at one address or more, all of it one process.
+    struct Relay {
+        addrs: Vec<SocketAddr>,
+        state: Arc<Mutex<State>>,
+        running: Option<(CancellationToken, Vec<tokio::task::JoinHandle<()>>)>,
+    }
+
+    impl Relay {
+        async fn start(addresses: usize, legacy: bool) -> Self {
+            let mut socks = Vec::new();
+            for _ in 0..addresses {
+                socks.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            }
+            let addrs = socks.iter().map(|s| s.local_addr().unwrap()).collect();
+            let state = Arc::new(Mutex::new(State {
+                id: Uuid::new_v4().simple().to_string(),
+                legacy,
+                refuse_binds: false,
+                sessions: HashMap::new(),
+                cut: HashSet::new(),
+                dir_of: HashMap::new(),
+                registers: vec![0; addresses],
+            }));
+            let mut relay = Self { addrs, state, running: None };
+            relay.serve(socks);
+            relay
+        }
+
+        fn addr(&self, i: usize) -> String {
+            self.addrs[i].to_string()
+        }
+
+        fn serve(&mut self, socks: Vec<UdpSocket>) {
+            let socks: Vec<Arc<UdpSocket>> = socks.into_iter().map(Arc::new).collect();
+            let cancel = CancellationToken::new();
+            let tasks = (0..socks.len())
+                .map(|i| tokio::spawn(serve(i, socks.clone(), self.state.clone(), cancel.clone())))
+                .collect();
+            self.running = Some((cancel, tasks));
+        }
+
+        /// Gone: its host refuses what is sent to it.
+        async fn stop(&mut self) {
+            if let Some((cancel, tasks)) = self.running.take() {
+                cancel.cancel();
+                for t in tasks {
+                    let _ = t.await;
+                }
+            }
+        }
+
+        /// Back at the same addresses, as a new process.
+        async fn start_again(&mut self) {
+            let mut socks = Vec::new();
+            for a in &self.addrs {
+                socks.push(UdpSocket::bind(a).await.unwrap());
+            }
+            {
+                let mut st = self.state.lock().unwrap();
+                st.id = Uuid::new_v4().simple().to_string();
+                st.sessions.clear();
+                st.dir_of.clear();
+            }
+            self.serve(socks);
+        }
+
+        fn cut(&self, d: RelayDirection) {
+            self.state.lock().unwrap().cut.insert(side(d));
+        }
+
+        fn restore(&self, d: RelayDirection) {
+            let mut st = self.state.lock().unwrap();
+            st.cut.remove(&side(d));
+        }
+
+        fn refuse_binds(&self, refuse: bool) {
+            self.state.lock().unwrap().refuse_binds = refuse;
+        }
+
+        fn registers(&self) -> Vec<u64> {
+            self.state.lock().unwrap().registers.clone()
+        }
+    }
+
+    async fn serve(i: usize, socks: Vec<Arc<UdpSocket>>, state: Arc<Mutex<State>>, cancel: CancellationToken) {
+        let mut buf = vec![0u8; 2048];
+        let mut reap = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            let (n, from) = tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = reap.tick() => {
+                    if i == 0 {
+                        reap_idle(&state);
+                    }
+                    continue;
+                }
+                r = socks[i].recv_from(&mut buf) => match r {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                },
+            };
+            let out = handle(&buf[..n], from, i, &state);
+            if let Some((via, bytes, to)) = out {
+                let _ = socks[via].send_to(&bytes, to).await;
+            }
+        }
+    }
+
+    fn reap_idle(state: &Mutex<State>) {
+        let mut st = state.lock().unwrap();
+        if st.legacy {
+            return;
+        }
+        let now = Instant::now();
+        for sess in st.sessions.values_mut() {
+            for s in 0..2 {
+                let slot = sess.slots[s];
+                let last = slot.seen.max(slot.media);
+                if slot.addr.is_some() && last.is_some_and(|t| now.saturating_duration_since(t) >= IDLE) {
+                    sess.slots[s] = Slot::default();
+                    sess.live_since = None;
+                }
+            }
+        }
+    }
+
+    /// What one datagram makes the relay send, if anything.
+    fn handle(data: &[u8], from: SocketAddr, via: usize, state: &Mutex<State>) -> Option<(usize, Vec<u8>, SocketAddr)> {
+        let now = Instant::now();
+        let mut st = state.lock().unwrap();
+        if st.dir_of.get(&from).is_some_and(|d| st.cut.contains(d)) {
+            return None;
+        }
+        if let Some(ctrl) = try_decode_udp_control(data) {
+            let UdpRelayControl::Register { tunnel_id, direction, seq, .. } = ctrl else { return None };
+            st.registers[via] += 1;
+            let d = side(direction);
+            st.dir_of.insert(from, d);
+            if st.cut.contains(&d) || st.refuse_binds {
+                return None;
+            }
+            let (legacy, id) = (st.legacy, st.id.clone());
+            let sess = st.sessions.entry(tunnel_id).or_default();
+            let s = d as usize;
+            let gap = !heard(&sess.slots[s], now);
+            sess.slots[s] = Slot { addr: Some(from), via, seen: Some(now), media: sess.slots[s].media };
+            let both = sess.slots.iter().all(|s| s.addr.is_some());
+            sess.ever_both |= both;
+            let other = heard(&sess.slots[1 - s], now);
+            if !other {
+                sess.live_since = None;
+            } else if sess.live_since.is_none() || gap {
+                sess.live_since = Some(now);
+            }
+            let ack = match legacy {
+                true => UdpRelayControl::Ack {
+                    tunnel_id,
+                    ready: sess.ever_both,
+                    peer_live: None,
+                    live_ms: None,
+                    relay_id: None,
+                    seq: None,
+                },
+                false => UdpRelayControl::Ack {
+                    tunnel_id,
+                    ready: both,
+                    peer_live: Some(other),
+                    live_ms: Some(sess.live_since.map_or(0, |t| now.duration_since(t).as_millis() as u64)),
+                    relay_id: Some(id),
+                    seq,
+                },
+            };
+            return Some((via, encode_udp_control(&ack).unwrap(), from));
+        }
+        let (tunnel_id, _) = decode_udp_datagram(data)?;
+        let cut = st.cut.clone();
+        let dir_of = st.dir_of.clone();
+        let sess = st.sessions.get_mut(&tunnel_id)?;
+        let s = (0..2).find(|&s| sess.slots[s].addr == Some(from))?;
+        sess.slots[s].media = Some(now);
+        let target = sess.slots[1 - s];
+        let to = target.addr?;
+        if dir_of.get(&to).is_some_and(|d| cut.contains(d)) {
+            return None;
+        }
+        Some((target.via, data.to_vec(), to))
+    }
+
+    /// A reserved port the tunnel under test binds a moment later.
+    fn free_port() -> SocketAddr {
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+    }
+
+    fn params(id: Uuid, relays: Vec<String>, direction: TunnelDirection) -> NativeRelayParams {
+        NativeRelayParams {
+            tunnel_id: id,
+            relay_addrs: relays,
+            direction,
+            tunnel_bind_secret: None,
+            interface: None,
+            source: None,
+            gateway: None,
+            failback_rtt_gate_ms: 5_000,
+            event_scope: NativeEventScope::Tunnel { name: format!("t-{direction}") },
+        }
+    }
+
+    /// One side of a tunnel under test.
+    struct Side {
+        state: watch::Receiver<RelayTunnelState>,
+        active: watch::Receiver<usize>,
+        events: mpsc::Receiver<Event>,
+        cancel: CancellationToken,
+        task: tokio::task::JoinHandle<Result<()>>,
+    }
+
+    impl Side {
+        fn start(params: NativeRelayParams, local_addr: SocketAddr) -> Self {
+            let (state_tx, state) = watch::channel(RelayTunnelState::Connecting);
+            let (active_tx, active) = watch::channel(0);
+            let (events_tx, events) = event_channel();
+            let cancel = CancellationToken::new();
+            let task = tokio::spawn(relay_tunnel_with(
+                timing(),
+                params,
+                local_addr,
+                state_tx,
+                active_tx,
+                cancel.clone(),
+                Arc::new(UdpForwarderStats::default()),
+                Some(Arc::new(TunnelCipher::new(KEY).unwrap())),
+                events_tx,
+            ));
+            Self { state, active, events, cancel, task }
+        }
+
+        async fn on(&mut self, relay: usize) {
+            let active = &mut self.active;
+            timeout(PATIENCE, active.wait_for(|a| *a == relay))
+                .await
+                .unwrap_or_else(|_| panic!("never on relay {relay}"))
+                .unwrap();
+        }
+
+        async fn becomes(&mut self, want: RelayTunnelState) {
+            timeout(PATIENCE, self.state.wait_for(|s| *s == want))
+                .await
+                .unwrap_or_else(|_| panic!("never {want}"))
+                .unwrap();
+        }
+
+        /// The next event with this message, skipping others.
+        async fn raises(&mut self, message: &str) -> Event {
+            timeout(PATIENCE, async {
+                loop {
+                    let ev = self.events.recv().await.expect("events open");
+                    if ev.message.starts_with(message) {
+                        return ev;
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("never raised '{message}'"))
+        }
+
+        fn drained(&mut self) -> Vec<Event> {
+            let mut out = Vec::new();
+            while let Ok(ev) = self.events.try_recv() {
+                out.push(ev);
+            }
+            out
+        }
+
+        async fn stop(self) {
+            self.cancel.cancel();
+            let _ = timeout(PATIENCE, self.task).await;
+        }
+    }
+
+    /// A tunnel between two edges over `relays`, with an app at each end.
+    struct Pair {
+        /// The sending side (egress), and the app that feeds it.
+        a: Side,
+        app_a: UdpSocket,
+        a_addr: SocketAddr,
+        /// The receiving side (ingress), and the app it delivers to.
+        b: Side,
+        app_b: UdpSocket,
+        id: Uuid,
+        relays: Vec<String>,
+    }
+
+    impl Pair {
+        async fn start(relays: Vec<String>) -> Self {
+            let id = Uuid::new_v4();
+            let a_addr = free_port();
+            let app_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let app_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let a = Side::start(params(id, relays.clone(), TunnelDirection::Egress), a_addr);
+            let b = Side::start(params(id, relays.clone(), TunnelDirection::Ingress), app_b.local_addr().unwrap());
+            Self { a, app_a, a_addr, b, app_b, id, relays }
+        }
+
+        fn restart_b(&mut self) -> Side {
+            let b = Side::start(
+                params(self.id, self.relays.clone(), TunnelDirection::Ingress),
+                self.app_b.local_addr().unwrap(),
+            );
+            std::mem::replace(&mut self.b, b)
+        }
+
+        /// A datagram from A's app reaches B's app; where B's forwarder sent
+        /// it from.
+        async fn passes(&self, body: &[u8]) -> SocketAddr {
+            let mut buf = [0u8; 2048];
+            timeout(PATIENCE, async {
+                loop {
+                    let _ = self.app_a.send_to(body, self.a_addr).await;
+                    if let Ok(Ok((n, from))) = timeout(Duration::from_millis(50), self.app_b.recv_from(&mut buf)).await
+                        && &buf[..n] == body
+                    {
+                        return from;
+                    }
+                }
+            })
+            .await
+            .expect("A's media never reached B")
+        }
+
+        /// And back: B's app answers what it got, and A's app gets the answer.
+        async fn returns(&self) {
+            let from = self.passes(b"ping").await;
+            let mut buf = [0u8; 2048];
+            timeout(PATIENCE, async {
+                loop {
+                    let _ = self.app_b.send_to(b"pong", from).await;
+                    if let Ok(Ok(n)) = timeout(Duration::from_millis(50), self.app_a.recv(&mut buf)).await
+                        && &buf[..n] == b"pong"
+                    {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("B's answer never reached A");
+        }
+
+        async fn stop(self) {
+            self.a.stop().await;
+            self.b.stop().await;
+        }
+    }
+
+    async fn two_relays() -> (Relay, Relay, Vec<String>) {
+        let (r0, r1) = (Relay::start(1, false).await, Relay::start(1, false).await);
+        let addrs = vec![r0.addr(0), r1.addr(0)];
+        (r0, r1, addrs)
+    }
+
+    /// A relay restart used to end a one-way tunnel's forwarder (its refused
+    /// datagram) and move the sender to the backup alone, splitting the pair.
+    #[tokio::test]
+    async fn a_one_way_tunnel_survives_a_relay_restart_without_moving() {
+        let (mut r0, _r1, addrs) = two_relays().await;
+        let mut p = Pair::start(addrs).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        p.b.becomes(RelayTunnelState::Ready).await;
+        p.passes(b"before").await;
+        r0.stop().await;
+        // A sends into the refusing host throughout.
+        for _ in 0..15 {
+            let _ = p.app_a.send_to(b"lost", p.a_addr).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        r0.start_again().await;
+        p.passes(b"after").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!((*p.a.active.borrow(), *p.b.active.borrow()), (0, 0), "nobody moved");
+        for ev in p.a.drained().into_iter().chain(p.b.drained()) {
+            assert!(!ev.message.starts_with("Tunnel failed over"), "{}", ev.message);
+        }
+        assert!(!p.a.task.is_finished());
+        p.stop().await;
+    }
+
+    /// The sender's path to the primary goes: both move to the backup, the
+    /// move is reported as on QUIC with `transport: "udp"`, and the loopback
+    /// port the receiving app sees stays the same.
+    #[tokio::test]
+    async fn a_native_tunnel_follows_its_peer_to_the_backup() {
+        let (r0, _r1, addrs) = two_relays().await;
+        let mut p = Pair::start(addrs.clone()).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        let port = p.passes(b"on the primary").await;
+        r0.cut(RelayDirection::Egress);
+        p.a.on(1).await;
+        p.b.on(1).await;
+        let ev = p.a.raises("Tunnel failed over to backup relay").await;
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::TUNNEL);
+        let d = ev.details.expect("details");
+        assert_eq!(d["transport"], "udp");
+        assert_eq!(d["reason"], "relay_silent");
+        assert_eq!((d["from_idx"].as_u64(), d["to_idx"].as_u64()), (Some(0), Some(1)));
+        assert_eq!(d["to_relay_addr"], addrs[1]);
+        let ev = p.b.raises("Tunnel failed over to backup relay").await;
+        assert_eq!(ev.details.expect("details")["reason"], "peer_elsewhere");
+        assert_eq!(p.passes(b"on the backup").await, port, "the loopback port is kept across the move");
+        p.returns().await;
+        p.stop().await;
+    }
+
+    /// Once the primary is back for both, the pair returns to it together, and
+    /// nothing either way is lost as it crosses.
+    #[tokio::test]
+    async fn a_native_tunnel_fails_back_with_its_peer() {
+        let (r0, _r1, addrs) = two_relays().await;
+        let mut p = Pair::start(addrs).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        r0.cut(RelayDirection::Egress);
+        p.a.on(1).await;
+        p.b.on(1).await;
+        p.returns().await;
+        let from = p.passes(b"x").await;
+        // Numbered datagrams both ways, every 5 ms, from before the primary
+        // is back until both are on it again.
+        let app_a = Arc::new(std::mem::replace(&mut p.app_a, UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        let app_b = Arc::new(std::mem::replace(&mut p.app_b, UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        let stop = CancellationToken::new();
+        let a_addr = p.a_addr;
+        let sender = |sock: Arc<UdpSocket>, to: SocketAddr| {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut n = 0u32;
+                while !stop.is_cancelled() {
+                    let _ = sock.send_to(&n.to_be_bytes(), to).await;
+                    n += 1;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                n
+            })
+        };
+        let counter = |sock: Arc<UdpSocket>| {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                let mut got = HashSet::new();
+                let mut buf = [0u8; 64];
+                loop {
+                    tokio::select! {
+                        _ = stop.cancelled() => {
+                            // Whatever is still in flight.
+                            while let Ok(Ok(n)) = timeout(Duration::from_millis(300), sock.recv(&mut buf)).await {
+                                if n == 4 {
+                                    got.insert(u32::from_be_bytes(buf[..4].try_into().unwrap()));
+                                }
+                            }
+                            return got;
+                        }
+                        r = sock.recv(&mut buf) => if let Ok(4) = r {
+                            got.insert(u32::from_be_bytes(buf[..4].try_into().unwrap()));
+                        },
+                    }
+                }
+            })
+        };
+        let (got_b, got_a) = (counter(app_b.clone()), counter(app_a.clone()));
+        let (sent_a, sent_b) = (sender(app_a.clone(), a_addr), sender(app_b.clone(), from));
+        r0.restore(RelayDirection::Egress);
+        p.a.on(0).await;
+        p.b.on(0).await;
+        let ev = p.a.raises("Tunnel failing back to primary relay").await;
+        let d = ev.details.expect("details");
+        assert_eq!(d["transport"], "udp");
+        assert_eq!(d["gate_ms"], 5_000);
+        assert!(d["primary_rtt_ms"].is_u64() && d["active_rtt_ms"].is_u64(), "{d}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        stop.cancel();
+        let (sent_a, sent_b) = (sent_a.await.unwrap(), sent_b.await.unwrap());
+        let (got_b, got_a) = (got_b.await.unwrap(), got_a.await.unwrap());
+        let lost_ab: Vec<u32> = (0..sent_a).filter(|n| !got_b.contains(n)).collect();
+        let lost_ba: Vec<u32> = (0..sent_b).filter(|n| !got_a.contains(n)).collect();
+        assert!(lost_ab.is_empty() && lost_ba.is_empty(), "lost A→B {lost_ab:?}, B→A {lost_ba:?}");
+        p.a.cancel.cancel();
+        p.b.cancel.cancel();
+    }
+
+    /// An edge restarted while the pair is on the backup, the primary out of
+    /// its reach: it finds its peer there.
+    #[tokio::test]
+    async fn a_restarted_edge_finds_the_pair_on_the_backup() {
+        let (r0, _r1, addrs) = two_relays().await;
+        let mut p = Pair::start(addrs).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        r0.cut(RelayDirection::Ingress);
+        p.a.on(1).await;
+        p.b.on(1).await;
+        p.returns().await;
+        let old = p.restart_b();
+        old.stop().await;
+        p.b.on(1).await;
+        p.returns().await;
+        assert_eq!(*p.a.active.borrow(), 1);
+        p.stop().await;
+    }
+
+    /// The edge's state follows what the relay says of the peer: Waiting
+    /// while it is not heard, Ready again when it is, with the QUIC events.
+    #[tokio::test]
+    async fn the_state_goes_waiting_when_the_peer_is_not_heard() {
+        let r0 = Relay::start(1, false).await;
+        let mut p = Pair::start(vec![r0.addr(0)]).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        p.a.raises("Tunnel connected to relay").await;
+        let b = p.restart_b();
+        b.stop().await;
+        // A new B under another tunnel id never comes: A is alone.
+        p.b.cancel.cancel();
+        p.a.becomes(RelayTunnelState::Waiting).await;
+        let ev = p.a.raises("Tunnel peer disconnected").await;
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        let d = ev.details.expect("details");
+        assert_eq!(d["reason"], "peer not heard by relay");
+        assert_eq!(d["transport"], "udp");
+        let b = Side::start(params(p.id, p.relays.clone(), TunnelDirection::Ingress), p.app_b.local_addr().unwrap());
+        let _ = std::mem::replace(&mut p.b, b);
+        p.a.becomes(RelayTunnelState::Ready).await;
+        let ev = p.a.raises("Tunnel ready again").await;
+        assert_eq!(ev.severity, EventSeverity::Info);
+        p.passes(b"again").await;
+        p.stop().await;
+    }
+
+    /// A local port that is taken stops the tunnel with a Critical
+    /// `port_conflict`, as on every other tunnel kind, rather than retrying it
+    /// quietly for ever.
+    #[tokio::test]
+    async fn a_native_tunnel_whose_port_is_taken_raises_port_conflict() {
+        let r0 = Relay::start(1, false).await;
+        let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut a = Side::start(
+            params(Uuid::new_v4(), vec![r0.addr(0)], TunnelDirection::Egress),
+            taken.local_addr().unwrap(),
+        );
+        let ev = a.raises("Tunnel 't-egress' stopped").await;
+        assert_eq!(ev.severity, EventSeverity::Critical);
+        assert_eq!(ev.category, category::PORT_CONFLICT);
+        let d = ev.details.expect("details");
+        assert_eq!(d["error_code"], "port_conflict");
+        assert_eq!(d["transport"], "udp");
+        let ended = timeout(PATIENCE, a.task).await.expect("the tunnel stops").unwrap();
+        assert!(ended.is_err());
+    }
+
+    /// With relays up to v0.20.0 a tunnel keeps today's rules, minus the
+    /// refusal moves: a restart of its relay moves nothing.
+    #[tokio::test]
+    async fn an_old_relay_gets_todays_rules_without_refusal_moves() {
+        let (mut r0, r1) = (Relay::start(1, true).await, Relay::start(1, true).await);
+        let mut p = Pair::start(vec![r0.addr(0), r1.addr(0)]).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        p.b.becomes(RelayTunnelState::Ready).await;
+        p.passes(b"before").await;
+        r0.stop().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r0.start_again().await;
+        p.passes(b"after").await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!((*p.a.active.borrow(), *p.b.active.borrow()), (0, 0));
+        assert_eq!(r1.registers(), [0], "an older backup is not stood by on");
+        p.stop().await;
+    }
+
+    /// Two addresses of one relay: the edge that looks for its peer at the
+    /// second finds the same relay, lets go of that socket and takes its side
+    /// back on the first.
+    #[tokio::test]
+    async fn one_relay_at_two_addresses_keeps_one_socket() {
+        let relay = Relay::start(2, false).await;
+        let addrs = vec![relay.addr(0), relay.addr(1)];
+        let id = Uuid::new_v4();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // B alone: its peer is away long enough for it to look elsewhere.
+        let mut b = Side::start(params(id, addrs.clone(), TunnelDirection::Ingress), app.local_addr().unwrap());
+        b.becomes(RelayTunnelState::Waiting).await;
+        timeout(PATIENCE, async {
+            while relay.registers()[1] == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the second address was never tried");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let at_second = relay.registers()[1];
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(relay.registers()[1], at_second, "the second socket was kept");
+        assert!(relay.registers()[0] > 0);
+        // And the side is back on the first.
+        let a_addr = free_port();
+        let a = Side::start(params(id, addrs, TunnelDirection::Egress), a_addr);
+        b.becomes(RelayTunnelState::Ready).await;
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 64];
+        timeout(PATIENCE, async {
+            loop {
+                let _ = sender.send_to(b"m", a_addr).await;
+                if timeout(Duration::from_millis(50), app.recv(&mut buf)).await.is_ok() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("media through the one relay");
+        assert_eq!(*b.active.borrow(), 0);
+        a.stop().await;
+        b.stop().await;
+    }
+
+    /// An Ack the tunnel did not ask for — another tunnel's, one echoing no
+    /// Register sent, one carrying what no relay sends — decides nothing.
+    #[tokio::test]
+    async fn forged_or_foreign_acks_are_ignored() {
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let id = Uuid::new_v4();
+        let mut a = Side::start(params(id, vec![relay.local_addr().unwrap().to_string()], TunnelDirection::Egress), free_port());
+        let mut buf = [0u8; 2048];
+        let (n, edge) = timeout(PATIENCE, relay.recv_from(&mut buf)).await.unwrap().unwrap();
+        let Some(UdpRelayControl::Register { seq: Some(seq), standby: Some(false), .. }) = try_decode_udp_control(&buf[..n])
+        else {
+            panic!("a Register with seq and standby");
+        };
+        let ack = |tunnel_id: Uuid, seq: Option<u32>, relay_id: &str, live_ms: u64| {
+            encode_udp_control(&UdpRelayControl::Ack {
+                tunnel_id,
+                ready: true,
+                peer_live: Some(true),
+                live_ms: Some(live_ms),
+                relay_id: Some(relay_id.into()),
+                seq,
+            })
+            .unwrap()
+        };
+        let good_id = "0123456789abcdef0123456789abcdef";
+        for forged in [
+            ack(Uuid::new_v4(), Some(seq), good_id, 1),
+            ack(id, Some(seq.wrapping_add(1000)), good_id, 1),
+            ack(id, Some(seq), "relay!", 1),
+            ack(id, Some(seq), good_id, 604_800_001),
+        ] {
+            relay.send_to(&forged, edge).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(*a.state.borrow(), RelayTunnelState::Connecting, "a forged Ack moved the state");
+        // A real answer to the Register just sent.
+        let latest = loop {
+            let (n, _) = timeout(PATIENCE, relay.recv_from(&mut buf)).await.unwrap().unwrap();
+            if let Some(UdpRelayControl::Register { seq: Some(seq), .. }) = try_decode_udp_control(&buf[..n]) {
+                break seq;
+            }
+        };
+        relay.send_to(&ack(id, Some(latest), good_id, 1), edge).await.unwrap();
+        a.becomes(RelayTunnelState::Ready).await;
+        a.stop().await;
+    }
+
+    fn leg_params(id: Uuid, relays: Vec<String>, direction: TunnelDirection, scope: BondEventScope) -> NativeRelayParams {
+        NativeRelayParams {
+            event_scope: NativeEventScope::Leg {
+                flow_id: "flow-1".into(),
+                scope,
+                target_id: "bond-1".into(),
+                path_id: 2,
+                path_name: "cell".into(),
+            },
+            ..params(id, relays, direction)
+        }
+    }
+
+    /// One end of a relayed bond leg.
+    struct LegEnd {
+        to_relay: mpsc::Sender<Bytes>,
+        from_relay: mpsc::Receiver<Bytes>,
+        events: mpsc::Receiver<Event>,
+        cancel: CancellationToken,
+    }
+
+    impl LegEnd {
+        fn start(params: NativeRelayParams) -> Self {
+            let (to_relay, from_bond) = mpsc::channel(64);
+            let (to_bond, from_relay) = mpsc::channel(64);
+            let (events_tx, events) = event_channel();
+            let cancel = CancellationToken::new();
+            tokio::spawn(relay_leg_with(
+                timing(),
+                params,
+                cancel.clone(),
+                Arc::new(UdpForwarderStats::default()),
+                Some(Arc::new(TunnelCipher::new(KEY).unwrap())),
+                to_bond,
+                from_bond,
+                events_tx,
+            ));
+            Self { to_relay, from_relay, events, cancel }
+        }
+    }
+
+    /// A frame from one end reaches the other.
+    async fn carries(from: &LegEnd, to: &mut LegEnd, frame: &'static [u8]) {
+        timeout(PATIENCE, async {
+            loop {
+                let _ = from.to_relay.try_send(Bytes::from_static(frame));
+                if let Ok(Some(got)) = timeout(Duration::from_millis(50), to.from_relay.recv()).await
+                    && got.as_ref() == frame
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the leg never carried {frame:?}"));
+    }
+
+    fn legs(addrs: &[String]) -> (LegEnd, LegEnd) {
+        let id = Uuid::new_v4();
+        let out = LegEnd::start(leg_params(id, addrs.to_vec(), TunnelDirection::Egress, BondEventScope::Output));
+        let inp = LegEnd::start(leg_params(id, addrs.to_vec(), TunnelDirection::Ingress, BondEventScope::Input));
+        (out, inp)
+    }
+
+    #[tokio::test]
+    async fn a_bond_leg_follows_its_peer() {
+        let (r0, _r1, addrs) = two_relays().await;
+        let (mut out, mut inp) = legs(&addrs);
+        carries(&out, &mut inp, b"frame-1").await;
+        carries(&inp, &mut out, b"nack-1").await;
+        r0.cut(RelayDirection::Ingress);
+        let ev = timeout(PATIENCE, async {
+            loop {
+                let ev = out.events.recv().await.expect("events");
+                if ev.details.as_ref().is_some_and(|d| d["error_code"] == "bond_leg_relay_moved") {
+                    return ev;
+                }
+            }
+        })
+        .await
+        .expect("the output's leg reports its move");
+        assert_eq!(ev.severity, EventSeverity::Warning);
+        assert_eq!(ev.category, category::BOND);
+        assert_eq!(ev.message, format!("bonded output path 'cell' (#2) moved to backup relay {}", addrs[1]));
+        assert_eq!((ev.flow_id.as_deref(), ev.output_id.as_deref()), (Some("flow-1"), Some("bond-1")));
+        let d = ev.details.expect("details");
+        assert_eq!(d["reason"], "peer_elsewhere");
+        assert_eq!(d["scope"], "output");
+        assert_eq!((d["from_idx"].as_u64(), d["to_idx"].as_u64()), (Some(0), Some(1)));
+        carries(&out, &mut inp, b"frame-2").await;
+        carries(&inp, &mut out, b"nack-2").await;
+        assert!(inp.events.try_recv().is_ok_and(|ev| ev.category == category::BOND));
+        out.cancel.cancel();
+        inp.cancel.cancel();
+    }
+
+    /// A relay restart used to break a leg's pump on its first refused
+    /// receive; now the leg rides it.
+    #[tokio::test]
+    async fn a_bond_leg_rides_a_relay_restart() {
+        let (mut r0, _r1, addrs) = two_relays().await;
+        let (mut out, mut inp) = legs(&addrs);
+        carries(&out, &mut inp, b"before").await;
+        r0.stop().await;
+        for _ in 0..10 {
+            let _ = out.to_relay.try_send(Bytes::from_static(b"into nothing"));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        r0.start_again().await;
+        carries(&out, &mut inp, b"after").await;
+        carries(&inp, &mut out, b"after-back").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for ev in std::iter::from_fn(|| out.events.try_recv().ok()) {
+            assert_ne!(ev.details.as_ref().map(|d| d["error_code"].clone()), Some("bond_leg_relay_moved".into()));
+        }
+        out.cancel.cancel();
+        inp.cancel.cancel();
+    }
+
+    /// The backup refusing binds after a restart, the primary's path cut for
+    /// one side: the pair has nowhere to meet, then meets on the backup once
+    /// it is authorized again.
+    #[tokio::test]
+    async fn a_relay_that_refuses_binds_is_met_on_once_it_takes_them() {
+        let (r0, r1, addrs) = two_relays().await;
+        r1.refuse_binds(true);
+        let mut p = Pair::start(addrs).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        r0.cut(RelayDirection::Egress);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(*p.a.active.borrow(), 0, "nothing to meet on");
+        r1.refuse_binds(false);
+        p.a.on(1).await;
+        p.b.on(1).await;
+        p.returns().await;
+        p.stop().await;
     }
 }
