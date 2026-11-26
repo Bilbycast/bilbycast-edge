@@ -11,7 +11,7 @@
 
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use super::carrier::Carrier;
 use super::crypto::TunnelCipher;
-use super::protocol::{self, try_decode_udp_control, UdpRelayControl};
+use super::protocol::{self, try_decode_udp_control};
 
 /// 32 MB socket buffers on every tunnel datagram socket: the loopback bridge
 /// sockets here and the carrier sockets that face the relay or the peer
@@ -58,9 +58,11 @@ pub(crate) fn bind_buffered_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> 
 ///
 /// Each datagram is already framed (`[16-byte tunnel_id][AEAD payload]` via
 /// [`protocol::encode_udp_datagram`]). This trait lets [`run_egress`] /
-/// [`run_ingress`] work over either the legacy QUIC carrier ([`QuicLink`]) or
-/// the native plain-UDP carrier ([`PlainUdpLink`]) with one implementation —
-/// the encrypt / frame / `AtomicPeerAddr` / stats logic is transport-agnostic.
+/// [`run_ingress`] work over the QUIC carrier ([`QuicLink`]), the native
+/// relay carrier (`native_carrier::NativeCarrier`, one socket per relay, for
+/// the tunnel's life) or a direct-mode socket ([`PlainUdpLink`]) with one
+/// implementation — the encrypt / frame / `AtomicPeerAddr` / stats logic is
+/// transport-agnostic.
 pub trait DatagramLink: Send + Sync {
     /// Send one framed datagram. Best-effort: never blocks, and the caller
     /// treats `Err` as non-fatal — it counts it in `send_errors` and keeps
@@ -70,7 +72,7 @@ pub trait DatagramLink: Send + Sync {
     /// drops the oldest queued datagram), so that impl returns `Ok`.
     fn send_datagram(&self, data: Bytes) -> Result<()>;
     /// Receive the next inbound framed media datagram. Control datagrams (the
-    /// nil-UUID-prefixed [`UdpRelayControl`]) are consumed internally and never
+    /// nil-UUID-prefixed [`protocol::UdpRelayControl`]) are consumed internally and never
     /// surface here.
     fn recv_datagram(&mut self) -> impl Future<Output = Result<Bytes>> + Send;
 }
@@ -95,39 +97,26 @@ impl DatagramLink for QuicLink {
     }
 }
 
-/// Plain-UDP carrier — native SRT/RIST over relay / direct without QUIC.
+/// Plain-UDP carrier of a direct-mode caller — native SRT/RIST to a peer's
+/// public port without QUIC.
 ///
-/// Wraps a `UdpSocket` *connected* to the relay (or direct peer), so the same
-/// 5-tuple carries both the registration/keepalive control datagrams (sent by a
-/// sibling task — see `udp_relay_client`) and the media. `recv_datagram` peels
-/// off control acks (updating liveness state used for failover) and returns
-/// only media.
+/// Wraps a `UdpSocket` *connected* to the peer, so the same 5-tuple carries
+/// both the registration/keepalive control datagrams (sent by a sibling task —
+/// see `udp_relay_client::run_native_direct_tunnel`) and the media.
+/// `recv_datagram` drops the listener's control acks, which a direct caller
+/// does not act on, and returns only media. A relay tunnel rides
+/// `native_carrier::NativeCarrier` instead, which reads the acks.
 pub struct PlainUdpLink {
     sock: Arc<UdpSocket>,
-    /// Set true once the relay/peer acks with both sides latched.
-    pub ready: Arc<AtomicBool>,
-    /// Epoch-ms of the last control ack (0 = none). Drives relay-liveness /
-    /// failover decisions in the register task.
-    pub last_ack_ms: Arc<AtomicU64>,
+    /// Read into on every receive, rather than allocated each time the
+    /// forwarder's `select!` builds the future anew.
+    buf: Vec<u8>,
 }
 
 impl PlainUdpLink {
     pub fn new(sock: Arc<UdpSocket>) -> Self {
-        Self {
-            sock,
-            ready: Arc::new(AtomicBool::new(false)),
-            last_ack_ms: Arc::new(AtomicU64::new(0)),
-        }
+        Self { sock, buf: vec![0u8; 2048] }
     }
-}
-
-/// Wall-clock epoch in milliseconds (saturating to 0 before 1970).
-pub(crate) fn now_epoch_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 impl DatagramLink for PlainUdpLink {
@@ -146,21 +135,14 @@ impl DatagramLink for PlainUdpLink {
     }
 
     async fn recv_datagram(&mut self) -> Result<Bytes> {
-        {
-            let mut buf = vec![0u8; 2048];
-            loop {
-                let n = self.sock.recv(&mut buf).await?;
-                let data = &buf[..n];
-                // Control plane (acks) → update liveness, keep looping for media.
-                if let Some(ctrl) = try_decode_udp_control(data) {
-                    if let UdpRelayControl::Ack { ready, .. } = ctrl {
-                        self.ready.store(ready, Ordering::Relaxed);
-                        self.last_ack_ms.store(now_epoch_ms(), Ordering::Relaxed);
-                    }
-                    continue;
-                }
-                return Ok(Bytes::copy_from_slice(data));
+        loop {
+            let n = self.sock.recv(&mut self.buf).await?;
+            let data = &self.buf[..n];
+            // Control plane (the listener's acks): nothing to act on here.
+            if try_decode_udp_control(data).is_some() {
+                continue;
             }
+            return Ok(Bytes::copy_from_slice(data));
         }
     }
 }

@@ -257,7 +257,7 @@ NAT traversal on both ends):
 | Subfield | Meaning |
 |---|---|
 | `tunnel_id` | **Required.** Relay tunnel UUID. The relay pairs the ingress and egress halves by it, so both ends carry the same value (the manager stamps it) |
-| `relay_addrs` | **Required, ≥1.** Relay `host:port` list; extra entries are a failover list the bridge rotates through when a relay is dead or unresolvable. Duplicates are refused |
+| `relay_addrs` | **Required, ≥1.** Relay `host:port` list, primary first; only the first two are used (the manager writes no more, and a third is logged and left alone). With a backup the leg meets its far end on whichever relay both reach, follows it there, and returns to the primary with it, as a native-UDP tunnel does ([configuration guide](configuration-guide.md#native-udp-tunnels-and-relayed-bond-legs)); the RTT gate is the tunnel default, 50 ms. Each move raises a `bond_leg_relay_moved` event ([events](events-and-alarms.md#bonding-bond)). Up to v0.117.0, and with relays up to v0.20.0, the leg moves only when its relay stops answering and never back. Duplicates are refused |
 | `tunnel_bind_secret` | Optional 64-hex (32-byte) secret → HMAC-SHA256 bind token in the `Register`, the same auth the native SRT/RIST relay tunnel uses |
 | `tunnel_encryption_key` | Optional 64-hex (32-byte) per-leg tunnel AEAD key, applied by the bridge under the `tunnel_id` prefix. Set it **only** when the bond itself is unkeyed — see the one-layer rule below |
 | `interface` / `source` / `gateway` | Uplink pinning for the bridge's own relay socket, same fields and same mechanism as a UDP leg. Unlike a UDP leg (sender-only gateway mode), gateway mode is legal on **both** ends here — both ends dial out to the relay — and requires `source` + `interface` |
@@ -286,7 +286,10 @@ to the bond **in-process**: no `127.0.0.1` round-trip and no second AEAD pass.
 The bond's ARQ / FEC / reordering still run **end-to-end edge ↔ edge**; the
 relay only forwards `[tunnel_id][AEAD]` opaquely and cannot read bond traffic.
 Because both ends dial the relay outbound, a relayed leg traverses NAT on both
-ends, and each leg carries its own primary + backup relay list for failover.
+ends, and each leg carries its own primary + backup relay list: the two ends of
+a leg move between its relays together, and the bond's channels to the leg ride
+every move, a relay restart and a refused datagram (up to v0.117.0 a refused
+receive broke the leg's pump until it moved).
 The manager wires this up automatically when you mark a leg "via relay"; there
 is no bond-side terminate/re-originate ("bond bridge") — the relay is a generic
 per-path forwarder for every path type (tunnels, native SRT/RIST, and

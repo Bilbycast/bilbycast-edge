@@ -498,6 +498,8 @@ impl TunnelManager {
             interface: config.interface.clone(),
             source: config.source.clone(),
             gateway: config.gateway.clone(),
+            failback_rtt_gate_ms: config.failback_rtt_gate_ms(),
+            event_scope: udp_relay_client::NativeEventScope::Tunnel { name: config.name.clone() },
         };
         let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
         let (active_idx_tx, active_idx_rx) = watch::channel(0usize);
@@ -520,6 +522,7 @@ impl TunnelManager {
             )
             .await;
 
+            // A taken local port has raised its `port_conflict` already.
             if let Err(e) = result
                 && !cancel.is_cancelled() {
                     tracing::error!(tunnel_id = %config_id, "Native-UDP relay tunnel failed: {e}");
@@ -1215,7 +1218,8 @@ async fn run_forwarder(
         (TunnelProtocol::Udp, TunnelDirection::Egress) => {
             let stats = udp_stats.unwrap_or_else(|| Arc::new(UdpForwarderStats::default()));
             // Wrap the QUIC carrier as a DatagramLink; the native-UDP path
-            // (transport=udp) uses a PlainUdpLink instead — see udp_relay_client.
+            // (transport=udp) rides a NativeCarrier (relay) or a PlainUdpLink
+            // (direct) instead — see udp_relay_client.
             udp_forwarder::run_egress(
                 tunnel_id,
                 local_addr,

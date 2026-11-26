@@ -5210,8 +5210,10 @@ pub enum BondPathTransportConfig {
         /// Relay tunnel id (UUID) — stamped by the manager FK; both ends share
         /// it so the relay pairs the ingress + egress halves.
         tunnel_id: String,
-        /// Relay address(es) `host:port`. ≥1 required; extra entries are a
-        /// failover list (the bridge rotates on a dead relay).
+        /// Relay address(es) `host:port`: the primary first, then an optional
+        /// backup. ≥1 required, and only the first two are used (a third is
+        /// ignored with a warning). With two the leg follows its far end
+        /// between them and fails back with it (`docs/bonding.md`).
         relay_addrs: Vec<String>,
         /// Optional 64-hex (32-byte) relay bind secret → HMAC-SHA256 bind token
         /// in the `Register` (same auth the native SRT/RIST relay tunnel uses).
