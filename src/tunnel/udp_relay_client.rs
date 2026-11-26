@@ -3315,30 +3315,58 @@ mod native_relay_wire_tests {
         p.stop().await;
     }
 
-    /// The sender's path to the primary goes: both move to the backup, the
-    /// move is reported as on QUIC with `transport: "udp"`, and the loopback
-    /// port the receiving app sees stays the same.
+    /// The sender's path to the primary goes: the receiver, which still has
+    /// the primary, follows it to the backup, and the media flows there both
+    /// ways. Up to v0.117.0 the receiver never followed.
     #[tokio::test]
     async fn a_native_tunnel_follows_its_peer_to_the_backup() {
         let (r0, _r1, addrs) = two_relays().await;
-        let mut p = Pair::start(addrs.clone()).await;
+        let mut p = Pair::start(addrs).await;
         p.a.becomes(RelayTunnelState::Ready).await;
-        let port = p.passes(b"on the primary").await;
+        p.returns().await;
         r0.cut(RelayDirection::Egress);
         p.a.on(1).await;
         p.b.on(1).await;
+        p.returns().await;
+        assert_eq!(*p.b.state.borrow(), RelayTunnelState::Ready);
+        p.stop().await;
+    }
+
+    /// The forwarder outlives the move: the receiving app sees the media come
+    /// from the same loopback port before and after. Up to v0.117.0 every
+    /// move bound a new one, which an SRT listener takes for another caller.
+    #[tokio::test]
+    async fn a_move_keeps_the_loopback_port() {
+        let (r0, _r1, addrs) = two_relays().await;
+        let mut p = Pair::start(addrs).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        let port = p.passes(b"on the primary").await;
+        r0.cut(RelayDirection::Ingress);
+        p.b.on(1).await;
+        p.a.on(1).await;
+        assert_eq!(p.passes(b"on the backup").await, port, "the loopback port is kept across the move");
+        p.stop().await;
+    }
+
+    /// A move is reported as on QUIC, with `transport: "udp"` and why. Up to
+    /// v0.117.0 a native tunnel raised nothing when it moved.
+    #[tokio::test]
+    async fn a_move_raises_failed_over_with_transport_udp() {
+        let (r0, _r1, addrs) = two_relays().await;
+        let mut p = Pair::start(addrs.clone()).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        r0.cut(RelayDirection::Egress);
         let ev = p.a.raises("Tunnel failed over to backup relay").await;
         assert_eq!(ev.severity, EventSeverity::Warning);
         assert_eq!(ev.category, category::TUNNEL);
+        assert_eq!(ev.flow_id.as_deref(), Some(p.id.to_string().as_str()));
         let d = ev.details.expect("details");
         assert_eq!(d["transport"], "udp");
         assert_eq!(d["reason"], "relay_silent");
         assert_eq!((d["from_idx"].as_u64(), d["to_idx"].as_u64()), (Some(0), Some(1)));
-        assert_eq!(d["to_relay_addr"], addrs[1]);
+        assert_eq!((&d["from_relay_addr"], &d["to_relay_addr"]), (&addrs[0].clone().into(), &addrs[1].clone().into()));
         let ev = p.b.raises("Tunnel failed over to backup relay").await;
         assert_eq!(ev.details.expect("details")["reason"], "peer_elsewhere");
-        assert_eq!(p.passes(b"on the backup").await, port, "the loopback port is kept across the move");
-        p.returns().await;
         p.stop().await;
     }
 

@@ -869,7 +869,7 @@ fn a_cut_path_is_followed_and_returned_from() {
 fn an_uplink_outage_moves_nothing() {
     for side in [A, B] {
         for outage in [30_000, 45_000, 60_000, 75_000] {
-            for seed in 0..SEEDS / 4 {
+            for seed in 0..SEEDS {
                 let mut setup = setups_new();
                 setup.two_way = seed % 2 == 0;
                 let mut w = World::up(seed * 7 + outage, setup);
@@ -897,7 +897,7 @@ fn an_uplink_outage_moves_nothing() {
 fn an_edge_restarted_on_the_backup_finds_its_peer() {
     for side in [A, B] {
         for primary_reachable in [false, true] {
-            for seed in 0..SEEDS / 2 {
+            for seed in 0..SEEDS {
                 let mut w = World::up(seed * 13 + 5, setups_new());
                 // Onto the backup: the restarting edge's path to the primary is cut.
                 w.paths[side][PRIMARY] = false;
@@ -958,7 +958,7 @@ fn a_relay_restart_moves_nothing() {
 /// pair meets on the backup, and returns once the primary takes them.
 #[test]
 fn a_relay_that_refuses_binds_after_a_restart_is_returned_to() {
-    for seed in 0..SEEDS / 2 {
+    for seed in 0..SEEDS {
         let mut w = World::up(seed * 11 + 3, setups_new());
         w.restart_relay(PRIMARY, 2_000, Some(120_000));
         let met = w.until(60_000, |w| w.met_on(BACKUP));
@@ -1013,7 +1013,7 @@ fn todays_edges_split_on_a_relay_restart_as_measured() {
 #[test]
 fn todays_edges_split_on_a_cut_path() {
     let mut splits = 0;
-    for seed in 0..SEEDS / 5 {
+    for seed in 0..SEEDS {
         let mut setup = setups_new();
         setup.old = [true, true];
         let mut w = World::up(seed, setup);
@@ -1025,13 +1025,14 @@ fn todays_edges_split_on_a_cut_path() {
             splits += 1;
         }
     }
-    assert_eq!(splits, SEEDS / 5, "every such pair splits");
+    assert_eq!(splits, SEEDS, "every such pair splits");
 }
 
 /// Five tunnels of one node all ride the node's path cut and come back.
 #[test]
 fn five_tunnels_on_one_node_all_meet() {
     for seed in 0..SEEDS / 5 {
+        // Five tunnels each: 500 tunnels in all.
         let mut tunnels: Vec<World> = (0..5).map(|t| World::up(seed * 5 + t, setups_new())).collect();
         for w in &mut tunnels {
             w.paths[A][PRIMARY] = false;
@@ -1086,7 +1087,7 @@ fn a_flapping_primary_is_not_chased() {
 /// and the two keep one socket each.
 #[test]
 fn one_relay_at_two_addresses_is_one_relay() {
-    for seed in 0..SEEDS / 5 {
+    for seed in 0..SEEDS {
         let mut setup = setups_new();
         setup.same_relay = true;
         let mut w = World::up(seed, setup);
@@ -1111,7 +1112,7 @@ fn one_relay_at_two_addresses_is_one_relay() {
 /// the backup it stays there.
 #[test]
 fn a_far_primary_is_not_returned_to() {
-    for seed in 0..SEEDS / 5 {
+    for seed in 0..SEEDS {
         let mut setup = setups_new();
         setup.gate_ms = 50;
         let mut w = World::new(seed, setup);
@@ -1132,7 +1133,7 @@ fn a_far_primary_is_not_returned_to() {
 /// A single relay: a relay restart and a path cut are ridden out.
 #[test]
 fn a_single_relay_is_ridden_through() {
-    for seed in 0..SEEDS / 5 {
+    for seed in 0..SEEDS {
         let mut setup = setups_new();
         setup.addresses = 1;
         let mut w = World::up(seed, setup);
@@ -1151,7 +1152,7 @@ fn a_single_relay_is_ridden_through() {
 #[test]
 fn a_new_edge_follows_an_old_one() {
     for old in [A, B] {
-        for seed in 0..SEEDS / 5 {
+        for seed in 0..SEEDS {
             let mut setup = setups_new();
             setup.old[old] = true;
             let mut w = World::up(seed, setup);
@@ -1173,7 +1174,7 @@ fn a_new_edge_follows_an_old_one() {
 /// 25 s of silence, and never a failback.
 #[test]
 fn new_edges_keep_todays_rules_with_old_relays() {
-    for seed in 0..SEEDS / 5 {
+    for seed in 0..SEEDS {
         let mut setup = setups_new();
         setup.legacy = [true, true];
         let mut w = World::up(seed, setup);
@@ -1191,7 +1192,7 @@ fn new_edges_keep_todays_rules_with_old_relays() {
         assert!(w.met_on(BACKUP), "never a failback: {}", w.describe());
     }
     // One relay older than the other: a move only off a silent relay too.
-    for seed in 0..SEEDS / 5 {
+    for seed in 0..SEEDS {
         let mut setup = setups_new();
         setup.legacy = [false, true];
         let mut w = World::up(seed, setup);
