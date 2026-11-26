@@ -26,9 +26,13 @@
 //!   answers;
 //! - keeps today's rules with an older relay (R6, R7): it moves only once its
 //!   relay has been silent for [`RELAY_DEAD_TIMEOUT_MS`] and never fails back,
-//!   nor follows the peer. So an outage of that long or more on one side's
-//!   path leaves the pair on two relays for good about half the time: the
-//!   side rotates while unheard and stays where it is when its path is back,
+//!   nor follows the peer. So an outage of about that long or more on one
+//!   side's path to its relay (from about 20 s, since the silence counts from
+//!   the last Ack) leaves the pair on two relays for good whenever the other
+//!   relay answers that side: it moves once and stays. With the side's whole
+//!   uplink out it rotates while unheard and stays where it is when its path
+//!   is back, so the pair ends apart when the outage ends while the side is on
+//!   the relay its peer is not on (about 25-45 s, 75-95 s, ... after the cut),
 //!   and a path back within the last keepalive before a rotation is due races
 //!   the Register due at the same moment (`NativeMeet::dead_active`).
 //!
