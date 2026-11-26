@@ -22,13 +22,16 @@
 //!   nothing, because each edge still reads the socket it moved from;
 //! - opens the other socket only while it has reason to (R3), closes it once it
 //!   has none (R4), and keeps one socket on a relay that turns out to be the
-//!   same relay at a second address (R5);
+//!   same relay at a second address (R5) for as long as the address it keeps
+//!   answers;
 //! - keeps today's rules with an older relay (R6, R7): it moves only once its
 //!   relay has been silent for [`RELAY_DEAD_TIMEOUT_MS`] and never fails back.
 //!
 //! A refused datagram (the relay process is down, so its host answers ICMP)
 //! moves nothing: it only speeds up the Registers, so a restarted relay is
-//! found again within a second.
+//! found again within a second. An answer that is a Register and its fast
+//! retry late is asked for again every [`NativeTiming::fast`], so one or two
+//! lost Registers or Acks never let a relay count as silent.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -94,7 +97,8 @@ pub(crate) struct NativeTiming {
     /// A socket's Register cadence ([`KEEPALIVE_INTERVAL`]).
     pub keepalive: Duration,
     /// The cadence while there is something to find out quickly: a socket's
-    /// first [`Self::keepalive`], a refusal, a peer that is not heard.
+    /// first [`Self::keepalive`], a refusal, an answer that is late, a peer
+    /// that is not heard.
     pub fast: Duration,
     /// How long a refusal, or one absence of the peer, keeps the fast cadence.
     pub fast_for: Duration,
@@ -243,6 +247,9 @@ struct Relay {
     /// An Ack on this socket said `ready`.
     ready_seen: bool,
     rtts: VecDeque<Duration>,
+    /// The median round trip of the last socket on it that had any: how long
+    /// to give a new socket's first answer, before it has any of its own.
+    last_rtt: Option<Duration>,
     /// Not reopened, or redialled, before this.
     retry_at: Option<Instant>,
     backoff: Duration,
@@ -266,6 +273,7 @@ impl Relay {
             relay_id: None,
             ready_seen: false,
             rtts: VecDeque::with_capacity(RTT_SAMPLES),
+            last_rtt: None,
             retry_at: None,
             backoff: timing.backoff_min,
             gate_closed_until: None,
@@ -282,6 +290,7 @@ impl Relay {
         self.heard_at = None;
         self.peer = Peer::Unknown;
         self.ready_seen = false;
+        self.last_rtt = median(&self.rtts).or(self.last_rtt);
         self.rtts.clear();
         self.refused_at = None;
         self.live_run = None;
@@ -467,18 +476,30 @@ impl NativeMeet {
         }
     }
 
-    /// How long after a Register on relay `i` the next one is due.
+    /// How long after a Register on relay `i` the next one is due, as the rule
+    /// stands at `now`. The supervisor asks again at every step, and sends at
+    /// once when the last Register is older than this: a refusal, or an answer
+    /// that is late, brings the next one forward.
     pub(crate) fn register_interval(&self, i: usize, now: Instant) -> Duration {
         let t = &self.timing;
         let Some(r) = self.relays.get(i) else { return t.keepalive };
         let Some(sock) = r.sock else { return t.keepalive };
         let young = now.saturating_duration_since(sock.opened_at) < t.keepalive;
         let refused = r.refused_at.is_some_and(|at| now.saturating_duration_since(at) < t.fast_for);
+        // A relay that answered and has not answered the Register since, a
+        // `fast` after it was due to: asked again every `fast` until it counts
+        // as not heard, so one or two lost Registers or Acks in a row never
+        // let it lapse. A relay that goes on not answering is asked at the
+        // keepalive from then on, like one that never answered.
+        let late = r.heard_at.is_some_and(|at| {
+            let age = now.saturating_duration_since(at);
+            t.keepalive + t.fast <= age && age < t.silent
+        });
         // At most `fast_for` per absence: an episode that goes on is checked
         // at the keepalive, like a relay that does not answer at all.
         let absent = self.heard(i, now)
             && matches!(r.peer, Peer::Absent { since } if now.saturating_duration_since(since) < t.fast_for);
-        if young || refused || absent { t.fast } else { t.keepalive }
+        if young || refused || late || absent { t.fast } else { t.keepalive }
     }
 
     /// Relay `i` has answered the socket it has within [`NativeTiming::silent`].
@@ -605,14 +626,25 @@ impl NativeMeet {
         let a = self.active;
         let o = 1 - a;
 
+        // What R5 learned holds only while the address it kept answers: once
+        // that has been silent for `silent`, the other address may be the
+        // only way left to the relay, and the full rules look for it there.
+        if self.same_relay
+            && self.relays[a].quiet_since().is_some_and(|q| now.saturating_duration_since(q) >= t.silent)
+        {
+            tracing::info!("native-UDP relay: the relay address kept has gone silent; trying its other address");
+            self.same_relay = false;
+        }
+
         // R5: the other relay is this one at a second address. Its socket
-        // took our side away from this one: let go of it, and take it back.
-        if self.relays[o].sock.is_some()
-            && self.relays[a].sock.is_some()
+        // took our side away from this one: let go of it, and take it back —
+        // while this one answers. One that does not is left for R1, which
+        // moves to the address that does.
+        if self.heard(a, now)
+            && self.relays[o].sock.is_some()
             && self.relays[o].relay_id.is_some()
             && self.relays[o].relay_id == self.relays[a].relay_id
             && self.relays[o].heard_at.is_some()
-            && self.relays[a].heard_at.is_some()
         {
             tracing::info!("native-UDP relay: both relay addresses are one relay; keeping one socket");
             self.close(o, acts);
@@ -640,15 +672,25 @@ impl NativeMeet {
                 let heard = self.heard(a, now);
                 // A relay that answers is asked once more a `fast` later, by
                 // when a peer that has just come back to it has registered
-                // there. One that does not is given a few round trips of the
-                // other relay to answer, which is all an uplink that has just
-                // come back needs.
+                // there. One that does not is given a few round trips to
+                // answer — its own, as it answered before it fell silent (on
+                // the socket it had then, if it has been given a new one), or
+                // the other relay's if those are longer — which is all an
+                // uplink that has just come back needs: at least
+                // [`SILENT_CONFIRM_MIN`], and at most a `fast`, or two of its
+                // own round trips if those are longer still.
                 let wait = match heard {
                     true => t.fast,
-                    false => self.relays[o]
-                        .rtts
-                        .back()
-                        .map_or(t.fast, |rtt| (*rtt * 3).max(SILENT_CONFIRM_MIN).min(t.fast)),
+                    false => {
+                        let own = self.median_rtt(a).or(self.relays[a].last_rtt);
+                        match own.max(self.relays[o].rtts.back().copied()) {
+                            Some(rtt) => {
+                                let most = t.fast.max(own.unwrap_or_default() * 2);
+                                (rtt * 3).max(SILENT_CONFIRM_MIN).min(most)
+                            }
+                            None => t.fast,
+                        }
+                    }
                 };
                 let c = match self.confirm {
                     Some(c) => c,
@@ -1172,6 +1214,94 @@ mod tests {
         assert_eq!(r.opened(1), 2);
     }
 
+    /// One relay at two addresses, the path to the one in use cut: the tunnel
+    /// moves to the address that answers, whether or not it had learned the
+    /// two were one relay. It used to keep the silent one, as the one socket
+    /// it keeps on one relay, for as long as the cut lasted.
+    #[test]
+    fn one_relay_at_two_addresses_follows_the_address_that_answers() {
+        // Not learned yet: the cut is what opens the second address.
+        let mut r = Rule::up_on_primary();
+        r.run(20.0, |r, s| {
+            if every(s, 5.0) {
+                r.ack(0, s, view(true, (s * 1000.0) as u64, ID0, 20));
+            }
+        });
+        r.run(40.0, |r, s| {
+            if r.is_open(1) && every(s, 1.0) {
+                r.ack(1, s, view(true, 40_000, ID0, 20));
+            }
+        });
+        assert_eq!(r.moves(), [(0, 1, Why::RelaySilent)], "{:?}", r.log);
+        assert!(!r.is_open(0), "the silent address is let go of once the other is known to be the same relay");
+        assert!(r.rule.same_relay_seen());
+        assert_eq!(r.last_state(), Some(Ready));
+
+        // Learned while the peer was away, then the cut.
+        let mut r = Rule::up_on_primary();
+        r.run(40.0, |r, s| {
+            if every(s, 1.0) {
+                r.ack(0, s, view(s < 5.0, 1000, ID0, 20));
+                if r.is_open(1) {
+                    r.ack(1, s, view(false, 0, ID0, 20));
+                }
+            }
+        });
+        assert!(r.rule.same_relay_seen() && !r.is_open(1), "{:?}", r.log);
+        r.run(60.0, |r, s| {
+            if every(s, 5.0) {
+                r.ack(0, s, view(true, ((s - 40.0) * 1000.0) as u64, ID0, 20));
+            }
+        });
+        // The path to the first address goes at 60 s.
+        r.run(90.0, |r, s| {
+            if r.is_open(1) && every(s, 1.0) {
+                r.ack(1, s, view(true, 40_000, ID0, 20));
+            }
+        });
+        assert_eq!(r.moves(), [(0, 1, Why::RelaySilent)], "{:?}", r.log);
+        let moved = r.log.iter().position(|a| matches!(a, Act::Move { .. })).unwrap();
+        assert!(
+            !r.log[..moved].contains(&Act::Redial(0)),
+            "moved before the silent address was given a new socket: {:?}",
+            r.log
+        );
+        assert_eq!(r.last_state(), Some(Ready));
+    }
+
+    /// A silent active relay with a long round trip, back just after a backup
+    /// with a short one has gone live: the move waits for the active relay's
+    /// own round trips, and its answer stops it. It used to wait three of the
+    /// backup's.
+    #[test]
+    fn a_silent_relay_is_given_its_own_round_trips_to_answer() {
+        let mut r = Rule::new(2);
+        r.run(100.0, |r, s| {
+            if every(s, 5.0) {
+                r.ack(0, s, view(true, (s * 1000.0) as u64, ID0, 320));
+            }
+        });
+        // This edge's uplink goes at 100 s; the backup is opened while it is
+        // out, and the peer, which no longer hears it on the primary, comes
+        // there.
+        r.run(140.0, |_, _| {});
+        assert!(r.is_open(1));
+        // Back at 140 s: the backup answers in 15 ms, the primary in 320.
+        r.ack(1, 140.015, view(true, 5_000, ID1, 15));
+        r.at(140.02);
+        r.at(140.35);
+        r.at(140.4);
+        r.ack(0, 140.42, view(true, 140_000, ID0, 320));
+        r.at(140.5);
+        r.run(160.0, |r, s| {
+            if every(s, 1.0) {
+                r.ack(0, s, view(true, (s * 1000.0) as u64, ID0, 320));
+                r.ack(1, s, view(true, 5_000, ID1, 15));
+            }
+        });
+        assert!(r.moves().is_empty(), "{:?}", r.log);
+    }
+
     #[test]
     fn a_legacy_other_is_never_followed_and_is_rechecked() {
         let mut r = Rule::up_on_primary();
@@ -1343,5 +1473,11 @@ mod tests {
         // Heard with the peer there: the keepalive.
         r.new_ack(0, 132.0, true, 0);
         assert_eq!(gap(&r, 0, 132.0), t.keepalive);
+        // An answer a Register and its fast retry late: asked for every
+        // `fast` until the relay counts as not heard, then at the keepalive.
+        assert_eq!(gap(&r, 0, 137.9), t.keepalive);
+        assert_eq!(gap(&r, 0, 138.0), t.fast);
+        assert_eq!(gap(&r, 0, 141.9), t.fast);
+        assert_eq!(gap(&r, 0, 142.0), t.keepalive);
     }
 }

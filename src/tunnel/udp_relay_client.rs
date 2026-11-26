@@ -56,7 +56,7 @@ use super::protocol::{
     TUNNEL_PROTOCOL_VERSION,
 };
 use super::relay_client::{
-    report_failing_back, report_moved, trouble_event, RelayTunnelState, Reports, Trouble,
+    report_failed_over, report_failing_back, report_moved, trouble_event, RelayTunnelState, Reports, Trouble,
 };
 use super::udp_forwarder::{self, DatagramLink, PlainUdpLink, UdpForwarderStats};
 use crate::manager::events::{category, BondEventScope, Event, EventSender, EventSeverity};
@@ -681,7 +681,8 @@ async fn teardown_tunnel_gateway(tunnel_id: &Uuid) {
 /// of them while it looks for its peer or stands by ([`super::native_meet`]),
 /// and bridge the local loopback port over plain UDP with one forwarder for
 /// the tunnel's life. Returns only on cancellation, or with the error when the
-/// local port is taken, after a Critical `port_conflict` event.
+/// local port is still taken after [`PORT_TAKEN_RETRIES`] tries a second apart,
+/// after a Critical `port_conflict` event.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_native_relay_tunnel(
     params: NativeRelayParams,
@@ -872,6 +873,13 @@ async fn run_native_relay(
 /// How many recent Register `seq`s an Ack may echo.
 const SEQS_KEPT: usize = 4;
 
+/// How many times a forwarder that finds its local port taken is started
+/// again, [`RETRY_DELAY`] apart, before the port is reported taken. A tunnel
+/// replaced in place — any change to its config — is cancelled and started
+/// again at once, and its old forwarder lets go of the port only when its own
+/// task next runs, which on a busy edge can be after the new one first binds.
+const PORT_TAKEN_RETRIES: u32 = 3;
+
 /// The longest `live_ms` an Ack is taken at: a week. A longer one is read as
 /// a week rather than dropped — a pair live for more than a week is not a
 /// relay gone silent — and a week is as steady as a minute to the rule.
@@ -886,6 +894,8 @@ struct RelaySock {
     /// Its last Registers' `seq`s and when they went.
     sent: [Option<(u32, Instant)>; SEQS_KEPT],
     next_sent: usize,
+    /// When its last Register went.
+    last_sent: Option<Instant>,
     next_register: Instant,
     /// Ends what was started for this socket (its kernel-drop sampler).
     token: CancellationToken,
@@ -899,6 +909,7 @@ impl RelaySock {
             seq: rand::random(),
             sent: [None; SEQS_KEPT],
             next_sent: 0,
+            last_sent: None,
             next_register: now,
             token,
         }
@@ -908,6 +919,7 @@ impl RelaySock {
         self.sent[self.next_sent] = Some((self.seq, now));
         self.next_sent = (self.next_sent + 1) % SEQS_KEPT;
         self.seq = self.seq.wrapping_add(1);
+        self.last_sent = Some(now);
     }
 }
 
@@ -976,6 +988,9 @@ struct Supervisor<'a> {
     /// The tunnel has been ready once.
     up: bool,
     reports: Reports,
+    /// A move to a relay that had not answered yet, to report once the active
+    /// relay answers: where the tunnel was last reported on, and why it left.
+    unanswered_move: Option<(usize, Why)>,
 }
 
 impl<'a> Supervisor<'a> {
@@ -1022,6 +1037,7 @@ impl<'a> Supervisor<'a> {
             sample_drops: matches!(role, Role::Tunnel { .. }),
             up: false,
             reports: Reports::new(now),
+            unanswered_move: None,
         }
     }
 
@@ -1084,6 +1100,8 @@ impl<'a> Supervisor<'a> {
     async fn run(&mut self, seat: Seat, forwarder: JoinHandle<Result<()>>) -> Result<()> {
         let mut forwarder = Some(forwarder);
         let mut restart_at: Option<Instant> = None;
+        // Forwarders in a row that found the local port taken.
+        let mut port_taken = 0u32;
         let mut tick = tokio::time::interval(self.tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -1115,13 +1133,23 @@ impl<'a> Supervisor<'a> {
                         Err(e) => anyhow::anyhow!("forwarder: {e}"),
                     };
                     if crate::util::port_error::anyhow_is_addr_in_use(&e) {
-                        self.port_conflict(&e);
-                        return Err(e);
+                        port_taken += 1;
+                        if port_taken > PORT_TAKEN_RETRIES {
+                            self.port_conflict(&e);
+                            return Err(e);
+                        }
+                        tracing::warn!(
+                            tunnel_id = %self.params.tunnel_id,
+                            "native-UDP relay tunnel: the local port is taken ({e}); trying it again in \
+                             {RETRY_DELAY:?} ({port_taken} of {PORT_TAKEN_RETRIES})"
+                        );
+                    } else {
+                        port_taken = 0;
+                        tracing::warn!(
+                            tunnel_id = %self.params.tunnel_id,
+                            "native-UDP relay tunnel forwarder ended: {e}; starting it again in {RETRY_DELAY:?}"
+                        );
                     }
-                    tracing::warn!(
-                        tunnel_id = %self.params.tunnel_id,
-                        "native-UDP relay tunnel forwarder ended: {e}; starting it again in {RETRY_DELAY:?}"
-                    );
                     restart_at = Some(Instant::now() + RETRY_DELAY);
                 }
                 _ = sleep_until_some(restart_at) => {
@@ -1210,7 +1238,6 @@ impl<'a> Supervisor<'a> {
     /// Send every Register that is due.
     fn send_registers(&mut self, now: Instant) {
         let active = self.rule.active();
-        let mut refused = Vec::new();
         for (i, slot) in self.socks.iter_mut().enumerate() {
             let Some(s) = slot.as_mut() else { continue };
             if s.next_register > now {
@@ -1228,18 +1255,37 @@ impl<'a> Supervisor<'a> {
                 && let Err(e) = s.sock.try_send(&bytes)
                 && is_refusal(&e)
             {
-                refused.push((i, s.generation));
+                self.rule.note_refused(i, s.generation, now);
             }
             s.note_sent(now);
             s.next_register = now + self.rule.register_interval(i, now);
         }
-        for (i, generation) in refused {
-            self.rule.note_refused(i, generation, now);
+    }
+
+    /// Bring each socket's next Register forward to the cadence the rule asks
+    /// for now: a refusal, an answer that is late or a peer gone ask for
+    /// [`NativeTiming::fast`] before the keepalive the last one went with is up.
+    fn pull_registers_forward(&mut self, now: Instant) {
+        for (i, slot) in self.socks.iter_mut().enumerate() {
+            if let Some(s) = slot.as_mut()
+                && let Some(last) = s.last_sent
+            {
+                s.next_register = s.next_register.min(last + self.rule.register_interval(i, now));
+            }
         }
     }
 
     /// Ask the rule what to do now, and do it.
     fn apply(&mut self, now: Instant, seat: &Seat) {
+        if let Some((from, why)) = self.unanswered_move
+            && self.rule.active_heard(now)
+        {
+            self.unanswered_move = None;
+            let to = self.rule.active();
+            if from != to {
+                self.report_move(from, to, why);
+            }
+        }
         let mut changed = false;
         for act in self.rule.step(now) {
             match act {
@@ -1258,7 +1304,17 @@ impl<'a> Supervisor<'a> {
                     if let Seat::Tunnel { active_idx_tx, .. } = seat {
                         active_idx_tx.send_replace(to);
                     }
-                    self.report_move(from, to, why);
+                    // A move to a relay that has not answered (an older
+                    // relay's rotation off a silent one, to one that may be as
+                    // silent) is reported once that relay answers, from where
+                    // the last report left the tunnel: an outage spent
+                    // rotating raises one event, not one per rotation.
+                    let from = self.unanswered_move.take().map_or(from, |(from, _)| from);
+                    if !self.rule.active_heard(now) {
+                        self.unanswered_move = Some((from, why));
+                    } else if from != to {
+                        self.report_move(from, to, why);
+                    }
                 }
                 Act::State(state) => {
                     if let Seat::Tunnel { state_tx, .. } = seat {
@@ -1271,6 +1327,7 @@ impl<'a> Supervisor<'a> {
         if changed {
             self.push_set();
         }
+        self.pull_registers_forward(now);
         if self.up
             && let NativeEventScope::Tunnel { .. } = self.params.event_scope
             && let Some(report) = self.reports.due(now)
@@ -1316,16 +1373,23 @@ impl<'a> Supervisor<'a> {
         let id = &self.params.tunnel_id;
         match &self.params.event_scope {
             NativeEventScope::Tunnel { .. } => match why {
+                // A tunnel not yet up says it is connected when it is
+                // (`take_state`), wherever it moved before that.
                 Why::Failback => {
                     tracing::info!(tunnel_id = %id, "Tunnel failing back to primary relay {}", addrs[0]);
                     let (primary_rtt, active_rtt) = (self.rule.median_rtt(0), self.rule.median_rtt(1));
                     let gate = self.params.failback_rtt_gate_ms;
                     report_failing_back(id, &addrs[0], primary_rtt, active_rtt, gate, "udp", &self.events);
-                    report_moved(id, addrs, to, to, serde_json::json!({}), &self.events);
+                    if self.up {
+                        report_moved(id, addrs, to, to, serde_json::json!({}), &self.events);
+                    }
                 }
                 _ => {
                     let extra = serde_json::json!({ "transport": "udp", "reason": why.code() });
-                    report_moved(id, addrs, from, to, extra, &self.events);
+                    match self.up {
+                        true => report_moved(id, addrs, from, to, extra, &self.events),
+                        false => report_failed_over(id, addrs, from, to, extra, &self.events),
+                    }
                 }
             },
             NativeEventScope::Leg { flow_id, scope, target_id, path_id, path_name } => {
@@ -3158,12 +3222,16 @@ mod native_relay_wire_tests {
 
     impl Side {
         fn start(params: NativeRelayParams, local_addr: SocketAddr) -> Self {
+            Self::start_with(timing(), params, local_addr)
+        }
+
+        fn start_with(timing: NativeTiming, params: NativeRelayParams, local_addr: SocketAddr) -> Self {
             let (state_tx, state) = watch::channel(RelayTunnelState::Connecting);
             let (active_tx, active) = watch::channel(0);
             let (events_tx, events) = event_channel();
             let cancel = CancellationToken::new();
             let task = tokio::spawn(relay_tunnel_with(
-                timing(),
+                timing,
                 params,
                 local_addr,
                 state_tx,
@@ -3519,6 +3587,162 @@ mod native_relay_wire_tests {
         assert_eq!(d["transport"], "udp");
         let ended = timeout(PATIENCE, a.task).await.expect("the tunnel stops").unwrap();
         assert!(ended.is_err());
+    }
+
+    /// A local port held a moment longer — by the tunnel's own forwarder of
+    /// before, as a config change replaces the tunnel and its old forwarder
+    /// lets go only when its task next runs — is waited for, not reported
+    /// taken. It used to stop the tunnel at the first try.
+    #[tokio::test]
+    async fn a_local_port_let_go_of_a_moment_later_is_taken() {
+        let r0 = Relay::start(1, false).await;
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let a_addr = held.local_addr().unwrap();
+        let id = Uuid::new_v4();
+        let mut a = Side::start(params(id, vec![r0.addr(0)], TunnelDirection::Egress), a_addr);
+        let app_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = Side::start(params(id, vec![r0.addr(0)], TunnelDirection::Ingress), app_b.local_addr().unwrap());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(held);
+        let app_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 64];
+        timeout(PATIENCE, async {
+            loop {
+                let _ = app_a.send_to(b"m", a_addr).await;
+                if timeout(Duration::from_millis(50), app_b.recv(&mut buf)).await.is_ok() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("media through the port once it was let go of");
+        for ev in a.drained() {
+            assert_ne!(ev.category, category::PORT_CONFLICT, "{}", ev.message);
+        }
+        assert!(!a.task.is_finished());
+        a.stop().await;
+        b.stop().await;
+    }
+
+    /// A tunnel that comes up on its backup, the primary down from the start,
+    /// says once that it is connected, and that it failed over. It used to say
+    /// it was connected twice.
+    #[tokio::test]
+    async fn a_tunnel_that_comes_up_on_the_backup_says_connected_once() {
+        let (mut r0, _r1, addrs) = two_relays().await;
+        r0.stop().await;
+        let mut p = Pair::start(addrs).await;
+        p.a.on(1).await;
+        p.b.on(1).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        p.b.becomes(RelayTunnelState::Ready).await;
+        p.returns().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for side in [&mut p.a, &mut p.b] {
+            let events = side.drained();
+            let count = |m: &str| events.iter().filter(|ev| ev.message.starts_with(m)).count();
+            let messages: Vec<&str> = events.iter().map(|ev| ev.message.as_str()).collect();
+            assert_eq!(count("Tunnel connected to relay"), 1, "{messages:?}");
+            assert_eq!(count("Tunnel failed over to backup relay"), 1, "{messages:?}");
+        }
+        p.stop().await;
+    }
+
+    /// Older relays, one side's paths to both of them cut: that side rotates
+    /// between them while they stay silent, and says it failed over only once
+    /// one answers — once, whatever the rotations. It used to say it was
+    /// connected, and had failed over, at every rotation.
+    #[tokio::test]
+    async fn rotating_between_silent_older_relays_is_reported_once_one_answers() {
+        let (r0, r1) = (Relay::start(1, true).await, Relay::start(1, true).await);
+        let mut p = Pair::start(vec![r0.addr(0), r1.addr(0)]).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        p.b.becomes(RelayTunnelState::Ready).await;
+        let _ = p.a.drained();
+        r0.cut(RelayDirection::Egress);
+        r1.cut(RelayDirection::Egress);
+        let active = &mut p.a.active;
+        timeout(PATIENCE, async {
+            for _ in 0..3 {
+                active.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("A rotates while both relays are silent");
+        let rotating = p.a.drained();
+        assert!(
+            rotating.iter().all(|ev| !ev.message.starts_with("Tunnel failed over")
+                && !ev.message.starts_with("Tunnel connected")),
+            "{:?}",
+            rotating.iter().map(|ev| &ev.message).collect::<Vec<_>>()
+        );
+        r0.restore(RelayDirection::Egress);
+        r1.restore(RelayDirection::Egress);
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let on = *p.a.active.borrow();
+        let events = p.a.drained();
+        let failed_over = events.iter().filter(|ev| ev.message.starts_with("Tunnel failed over")).count();
+        assert_eq!(failed_over, on, "on relay {on}: {:?}", events.iter().map(|ev| &ev.message).collect::<Vec<_>>());
+        p.stop().await;
+    }
+
+    /// A refused datagram brings the next Register forward, so a restarted
+    /// relay is found again within a `fast` rather than at the next keepalive,
+    /// by a side that sends no media too. It used to wait for the keepalive
+    /// the last Register went with.
+    #[tokio::test]
+    async fn a_refusal_brings_the_next_register_forward() {
+        let ms = Duration::from_millis;
+        let slow = NativeTiming {
+            keepalive: ms(2_000),
+            fast: ms(100),
+            fast_for: ms(10_000),
+            silent: ms(4_000),
+            waiting: ms(4_000),
+            settle: ms(3_000),
+            dead: ms(30_000),
+            steady: ms(60_000),
+            linger: ms(80_000),
+            move_quiet: ms(20_000),
+            gate_retry: ms(60_000),
+            legacy_recheck: ms(600_000),
+            backoff_min: ms(1_000),
+            backoff_max: ms(30_000),
+            backoff_reset: ms(60_000),
+            tick: ms(20),
+        };
+        let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let b = Side::start_with(
+            slow,
+            params(Uuid::new_v4(), vec![relay_addr.to_string()], TunnelDirection::Ingress),
+            app.local_addr().unwrap(),
+        );
+        let mut buf = [0u8; 2048];
+        let first = Instant::now();
+        // Past its first keepalive, when it registers at the keepalive.
+        let last = timeout(PATIENCE, async {
+            loop {
+                relay.recv_from(&mut buf).await.unwrap();
+                if first.elapsed() >= ms(2_500) {
+                    return Instant::now();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // The relay goes: the next Register, a keepalive on, is refused.
+        drop(relay);
+        tokio::time::sleep_until(last + ms(2_300)).await;
+        let relay = UdpSocket::bind(relay_addr).await.unwrap();
+        let back = Instant::now();
+        timeout(ms(1_000), relay.recv_from(&mut buf))
+            .await
+            .expect("no Register within a second of the relay's return")
+            .unwrap();
+        assert!(back.elapsed() < ms(1_000));
+        b.stop().await;
     }
 
     /// With relays up to v0.20.0 a tunnel keeps today's rules, minus the

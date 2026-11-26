@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
+use tokio::io::{Interest, Ready};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -138,17 +139,28 @@ impl NativeCarrier {
     }
 }
 
-/// Wait until leg `leg` has something to read, or for ever if there is none.
-async fn readable(leg: Option<&Leg>) -> std::io::Result<()> {
+/// Wait until leg `leg` has something to read, or an error to report — the
+/// refusal of a datagram sent on it, which wakes no receive — or for ever if
+/// there is none.
+async fn readable(leg: Option<&Leg>) -> std::io::Result<Ready> {
     match leg {
-        Some(leg) => leg.sock.readable().await,
+        Some(leg) => leg.sock.ready(Interest::READABLE | Interest::ERROR).await,
         None => std::future::pending().await,
     }
 }
 
+/// Take the error waiting on `sock`, if any: `WouldBlock` (and its readiness
+/// cleared) when there is none.
+fn take_error(sock: &UdpSocket) -> std::io::Result<()> {
+    sock.try_io(Interest::ERROR, || match sock.take_error()? {
+        Some(e) => Err(e),
+        None => Err(ErrorKind::WouldBlock.into()),
+    })
+}
+
 enum Woken {
     Set(Option<CarrierSet>),
-    Readable(usize, std::io::Result<()>),
+    Readable(usize, std::io::Result<Ready>),
 }
 
 impl DatagramLink for NativeCarrier {
@@ -184,19 +196,34 @@ impl DatagramLink for NativeCarrier {
                 r = readable(self.legs[first].as_ref()) => Woken::Readable(first, r),
                 r = readable(self.legs[first ^ 1].as_ref()) => Woken::Readable(first ^ 1, r),
             };
-            let idx = match woken {
+            let (idx, woke) = match woken {
                 Woken::Set(Some(set)) => {
                     (self.legs, self.active) = (set.legs, set.active);
                     continue;
                 }
                 Woken::Set(None) => anyhow::bail!("native relay carrier: its supervisor has gone"),
-                Woken::Readable(idx, Ok(())) => idx,
+                Woken::Readable(idx, Ok(woke)) => (idx, woke),
                 Woken::Readable(idx, Err(e)) => {
                     tracing::debug!(tunnel_id = %self.tunnel_id, "native relay leg {idx} not readable: {e}");
                     continue;
                 }
             };
             let Some(leg) = self.legs[idx].as_ref() else { continue };
+            if woke.is_error() {
+                // A Register refused while nothing else is sent or comes on
+                // the leg (the receiving side of a one-way flow) shows only
+                // here, and is what speeds up the Registers that find a
+                // restarted relay.
+                match take_error(&leg.sock) {
+                    Err(e) if is_refusal(&e) => self.refused(idx, leg),
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(e) => tracing::debug!(tunnel_id = %self.tunnel_id, "native relay leg {idx} error: {e}"),
+                    Ok(()) => {}
+                }
+                if !woke.is_readable() {
+                    continue;
+                }
+            }
             let n = match leg.sock.try_recv(&mut self.buf) {
                 Ok(n) => n,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
@@ -392,6 +419,26 @@ mod tests {
         assert_eq!(note.seq, Some(5));
         stop.cancel();
         let _ = flooding.await;
+        reader.abort();
+    }
+
+    /// A refused datagram the supervisor sent (a Register), with nothing to
+    /// read on the leg, is noted too. It used to show only once something else
+    /// came or went on the leg: the receiving side of a one-way flow heard of
+    /// a relay restart at its next keepalive.
+    #[tokio::test]
+    async fn a_refusal_with_nothing_to_read_is_noted() {
+        let id = Uuid::new_v4();
+        let closed = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        sock.connect(closed).await.unwrap();
+        let (mut c, _sets, mut notes) = carrier(id, [Some(Leg::new(4, sock.clone())), None], Some(0));
+        let reader = tokio::spawn(async move {
+            let _ = c.recv_datagram().await;
+        });
+        sock.send(b"register").await.unwrap();
+        let note = timeout(PATIENCE, notes.recv()).await.expect("the refusal was never noted");
+        assert!(matches!(note, Some(CarrierNote::Refused { idx: 0, generation: 4, .. })), "{note:?}");
         reader.abort();
     }
 

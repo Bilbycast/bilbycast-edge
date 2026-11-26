@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::native_meet::{Act, AckView, NativeMeet, NativeTiming, RELAY_PEER_LIVE_MS, Why};
+use super::relay_client::RelayTunnelState;
 
 /// Milliseconds.
 type Ms = u64;
@@ -230,6 +231,8 @@ struct NewEdge {
     generation: u64,
     next_step: Ms,
     moves: Vec<(Ms, usize, usize, Why)>,
+    /// Every state it reported, and when.
+    states: Vec<(Ms, RelayTunnelState)>,
 }
 
 /// An edge up to v0.117.0: one socket, on one relay at a time.
@@ -284,6 +287,8 @@ struct World {
     /// By edge and relay address.
     paths: [[bool; 2]; 2],
     latency: [[Ms; 2]; 2],
+    /// Up to this much more on each way of every Register and Ack, at random.
+    jitter: Ms,
     edges: [Edge; 2],
     /// When each edge starts, after it is started.
     starts: [Option<Ms>; 2],
@@ -323,6 +328,7 @@ impl World {
             relays,
             paths: [[true; 2]; 2],
             latency,
+            jitter: 0,
             edges: [Edge::Off, Edge::Off],
             starts: [None; 2],
             queue: BinaryHeap::new(),
@@ -375,6 +381,15 @@ impl World {
 
     fn rand(&mut self, n: u64) -> u64 {
         self.numbers.below(n)
+    }
+
+    /// One way of a Register or an Ack between `edge` and `address`.
+    fn one_way(&mut self, edge: usize, address: usize) -> Ms {
+        let jitter = match self.jitter {
+            0 => 0,
+            j => self.rand(j + 1),
+        };
+        self.latency[edge][address] + jitter
     }
 
     fn post(&mut self, after: Ms, msg: Msg) {
@@ -508,6 +523,7 @@ impl World {
                             generation: 0,
                             next_step: now,
                             moves: Vec::new(),
+                            states: Vec::new(),
                         }))
                     }
                 };
@@ -546,7 +562,7 @@ impl World {
                     return;
                 }
                 if let Some(answer) = self.relays[r].register(now, edge, sock, standby, seq) {
-                    let back = self.latency[edge][address];
+                    let back = self.one_way(edge, address);
                     self.post(back, Msg::Ack { address, edge, sock, answer });
                 }
             }
@@ -644,7 +660,7 @@ impl World {
         if !self.paths[edge][address] {
             return;
         }
-        let after = self.latency[edge][address];
+        let after = self.one_way(edge, address);
         self.post(after, Msg::Register { address, edge, sock, seq, standby });
     }
 
@@ -779,7 +795,17 @@ impl World {
                     }
                 }
                 Act::Move { from, to, why } => e.moves.push((now, from, to, why)),
-                Act::State(_) => {}
+                Act::State(state) => e.states.push((now, state)),
+            }
+        }
+        // As the supervisor does after each step: a Register the rule now
+        // wants sooner goes sooner.
+        for i in 0..2 {
+            let interval = e.rule.register_interval(i, at).as_millis() as u64;
+            if let Some(s) = e.socks[i].as_mut()
+                && let Some(&(_, last)) = s.sent.back()
+            {
+                s.next_reg = s.next_reg.min(last + interval);
             }
         }
     }
@@ -1108,6 +1134,50 @@ fn one_relay_at_two_addresses_is_one_relay() {
     }
 }
 
+/// One relay at two addresses, the path from one edge to the address both
+/// use cut for 40 s: that edge moves to the other address, and the two are
+/// together again within 15 s of the cut — whether or not that edge had
+/// learned the two addresses were one relay. Up to the fix it kept the silent
+/// address for the whole cut, as its one socket on one relay; up to v0.117.0
+/// it moved after 25 s.
+#[test]
+fn one_relay_at_two_addresses_rides_a_cut_path() {
+    for side in [A, B] {
+        for learned in [false, true] {
+            for seed in 0..SEEDS {
+                let mut setup = setups_new();
+                setup.same_relay = true;
+                setup.two_way = seed % 2 == 0;
+                let mut w = World::up(seed * 17 + 9, setup);
+                if learned {
+                    // The other edge goes away for 40 s: this one looks for it at
+                    // the second address, and finds the same relay there.
+                    w.stop(1 - side);
+                    w.run(40_000);
+                    w.start_in(1 - side, 0);
+                    assert!(w.until(40_000, |w| w.met()).is_some(), "seed {seed}: {}", w.describe());
+                    let Edge::New(e) = &w.edges[side] else { unreachable!() };
+                    assert!(e.rule.same_relay_seen(), "seed {seed}: {}", w.describe());
+                }
+                let on = w.active(side).expect("on");
+                w.run(1_000);
+                w.paths[side][on] = false;
+                w.run(TICK);
+                let met = w.until(15_000, |w| w.met());
+                assert!(met.is_some(), "seed {seed} side {side} learned {learned}: {}", w.describe());
+                w.run(40_000 - met.unwrap_or(0));
+                w.paths[side][on] = true;
+                w.run(300_000);
+                assert!(w.met(), "seed {seed}: {}", w.describe());
+                for edge in [A, B] {
+                    let Edge::New(e) = &w.edges[edge] else { unreachable!() };
+                    assert_eq!(e.socks.iter().flatten().count(), 1, "seed {seed}: {}", w.describe());
+                }
+            }
+        }
+    }
+}
+
 /// A primary more than the gate slower than the backup: once the pair is on
 /// the backup it stays there.
 #[test]
@@ -1166,6 +1236,30 @@ fn a_new_edge_follows_an_old_one() {
             // Its backup path goes: it rotates back, and is followed.
             w.paths[old][BACKUP] = false;
             assert!(w.until(25_000 + 35_000, |w| w.met_on(PRIMARY)).is_some(), "{}", w.describe());
+        }
+    }
+}
+
+/// A new edge paired with an older one, on new relays, through a restart of
+/// the primary: the older edge may leave on a refused datagram, and the new
+/// one is with it again within 35 s of the restart, and stays.
+#[test]
+fn a_new_edge_follows_an_old_one_off_a_restarted_relay() {
+    for old in [A, B] {
+        for two_way in both_ways() {
+            for seed in 0..SEEDS {
+                let mut setup = setups_new();
+                setup.old[old] = true;
+                setup.two_way = two_way;
+                let mut w = World::up(seed * 5 + 2, setup);
+                let down = 1_000 + (seed % 21) * 100;
+                w.restart_relay(PRIMARY, down, None);
+                w.run(TICK);
+                let met = w.until(35_000, |w| w.met() && w.relays[PRIMARY].up);
+                assert!(met.is_some(), "seed {seed} old {old} two_way {two_way}: {}", w.describe());
+                w.run(300_000);
+                assert!(w.met(), "seed {seed} old {old}: {}", w.describe());
+            }
         }
     }
 }
@@ -1254,17 +1348,30 @@ fn edges_meet_after_anything() {
     }
 }
 
-/// An hour on the primary with Registers lost, at most two in a row: nobody
-/// moves.
+/// An hour on the primary with Registers lost, at most two in a row, and
+/// every Register and Ack up to 40 ms late at random: nobody moves, and
+/// neither edge's state leaves `ready`, so no event says the peer has gone.
+/// Up to the fast retry of a late answer, two lost in a row left the relay
+/// unheard for a keepalive, and one lost with a little jitter now and then.
 #[test]
 fn lost_registers_move_nothing() {
     for seed in 0..SEEDS / 50 {
         let mut setup = setups_new();
         setup.two_way = seed % 2 == 0;
         let mut w = World::up(seed, setup);
+        let from = [A, B].map(|e| match &w.edges[e] {
+            Edge::New(e) => e.states.len(),
+            _ => unreachable!(),
+        });
         w.register_loss = 300;
+        w.jitter = 40;
         w.run(3_600_000);
         assert!(w.max_lost_run == 2, "the trial lost no two in a row");
         assert_eq!((w.moves(A), w.moves(B)), (0, 0), "seed {seed}: {}", w.describe());
+        for e in [A, B] {
+            let Edge::New(edge) = &w.edges[e] else { unreachable!() };
+            assert!(edge.states[..from[e]].last().is_some_and(|(_, s)| *s == RelayTunnelState::Ready));
+            assert_eq!(edge.states[from[e]..], [], "seed {seed} edge {e}: the state left ready");
+        }
     }
 }

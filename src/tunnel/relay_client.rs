@@ -1157,18 +1157,31 @@ pub(super) fn report_moved(
     extra: serde_json::Value,
     events: &EventSender,
 ) {
-    let tunnel_id = tunnel_id.to_string();
-    let (from_addr, to_addr) = (&relay_addrs[from], &relay_addrs[to]);
     events.emit_flow_with_details(
         EventSeverity::Info,
         category::TUNNEL,
         "Tunnel connected to relay",
-        &tunnel_id,
-        serde_json::json!({ "relay_addr": to_addr }),
+        &tunnel_id.to_string(),
+        serde_json::json!({ "relay_addr": &relay_addrs[to] }),
     );
+    report_failed_over(tunnel_id, relay_addrs, from, to, extra, events);
+}
+
+/// The failover half of [`report_moved`]: the Warning that the tunnel left
+/// relay `from` for relay `to`, and nothing when they are one.
+pub(super) fn report_failed_over(
+    tunnel_id: &Uuid,
+    relay_addrs: &[String],
+    from: usize,
+    to: usize,
+    extra: serde_json::Value,
+    events: &EventSender,
+) {
     if from == to {
         return;
     }
+    let tunnel_id = tunnel_id.to_string();
+    let (from_addr, to_addr) = (&relay_addrs[from], &relay_addrs[to]);
     let which = if to == 0 { "primary" } else { "backup" };
     tracing::warn!(
         tunnel_id = %tunnel_id,
