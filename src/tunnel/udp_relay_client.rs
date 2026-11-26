@@ -1333,7 +1333,7 @@ impl<'a> Supervisor<'a> {
             && let Some(report) = self.reports.due(now)
         {
             let (severity, message, mut details) =
-                trouble_event(report, &self.params.relay_addrs[self.rule.active()]);
+                trouble_event(report, &self.params.relay_addrs[self.reported_relay()]);
             details["transport"] = "udp".into();
             self.events.emit_flow_with_details(
                 severity,
@@ -1343,6 +1343,13 @@ impl<'a> Supervisor<'a> {
                 details,
             );
         }
+    }
+
+    /// The relay the tunnel's events last put it on: the active relay, or
+    /// while a move to one that has not answered is held, the one it left. No
+    /// event has said the tunnel went to the other, and it may come back.
+    fn reported_relay(&self) -> usize {
+        self.unanswered_move.map_or(self.rule.active(), |(from, _)| from)
     }
 
     fn take_state(&mut self, state: RelayTunnelState, now: Instant) {
@@ -3686,10 +3693,56 @@ mod native_relay_wire_tests {
         p.stop().await;
     }
 
+    /// While a rotation to a relay that has not answered is held back, the
+    /// trouble is reported on the relay the tunnel was last reported on, and
+    /// back there it is ready again, with no move reported between. The
+    /// Warning used to name the relay rotated to, which no event had said the
+    /// tunnel went to.
+    #[tokio::test]
+    async fn a_held_rotation_reports_trouble_on_the_relay_last_reported() {
+        let (r0, r1) = (Relay::start(1, true).await, Relay::start(1, true).await);
+        let addrs = vec![r0.addr(0), r1.addr(0)];
+        let mut p = Pair::start(addrs.clone()).await;
+        p.a.becomes(RelayTunnelState::Ready).await;
+        p.b.becomes(RelayTunnelState::Ready).await;
+        p.a.raises("Tunnel connected to relay").await;
+        r0.cut(RelayDirection::Egress);
+        r1.cut(RelayDirection::Egress);
+        // An older relay never says the peer is gone: the trouble is the
+        // rotation off the silent primary, to a backup as silent.
+        let ev = p.a.raises("Tunnel peer disconnected").await;
+        let d = ev.details.expect("details");
+        assert_eq!(d["reason"], "relay not heard");
+        assert_eq!(d["relay_addr"], addrs[0].as_str());
+        p.a.on(1).await;
+        r0.restore(RelayDirection::Egress);
+        let (ev, between) = timeout(PATIENCE, async {
+            let mut between = Vec::new();
+            loop {
+                let ev = p.a.events.recv().await.expect("events open");
+                if ev.message.starts_with("Tunnel ready again") {
+                    return (ev, between);
+                }
+                between.push(ev.message);
+            }
+        })
+        .await
+        .expect("never ready again");
+        assert_eq!(ev.details.expect("details")["relay_addr"], addrs[0].as_str());
+        assert_eq!(*p.a.active.borrow(), 0);
+        assert!(
+            between.iter().all(|m| !m.starts_with("Tunnel failed over") && !m.starts_with("Tunnel connected")),
+            "{between:?}"
+        );
+        p.stop().await;
+    }
+
     /// A refused datagram brings the next Register forward, so a restarted
     /// relay is found again within a `fast` rather than at the next keepalive,
-    /// by a side that sends no media too. It used to wait for the keepalive
-    /// the last Register went with.
+    /// by a side that sends no media too once one of its Registers is refused
+    /// (here the first after the relay goes; one whose keepalive steps over
+    /// the restart is refused nothing, and waits for that keepalive). It used
+    /// to wait for the keepalive the last Register went with.
     #[tokio::test]
     async fn a_refusal_brings_the_next_register_forward() {
         let ms = Duration::from_millis;
