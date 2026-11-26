@@ -822,6 +822,15 @@ async fn run_native_relay(
     if params.relay_addrs.is_empty() {
         anyhow::bail!("native-UDP relay tunnel requires at least one relay address");
     }
+    if params.relay_addrs.len() > 2 {
+        // A tunnel's validation refuses a third; a bond leg's list has no
+        // cap, but no manager writes more than a primary and a backup.
+        tracing::warn!(
+            tunnel_id = %params.tunnel_id,
+            "native-UDP relay: {} relay addresses given, only the first two are used",
+            params.relay_addrs.len()
+        );
+    }
 
     // Gateway-mode policy routing (best-effort) BEFORE any socket binds the
     // source IP, and torn down on every exit below. Unlike a UDP bond leg
