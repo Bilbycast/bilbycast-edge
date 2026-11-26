@@ -872,7 +872,9 @@ async fn run_native_relay(
 /// How many recent Register `seq`s an Ack may echo.
 const SEQS_KEPT: usize = 4;
 
-/// The longest `live_ms` an Ack is believed: a week.
+/// The longest `live_ms` an Ack is taken at: a week. A longer one is read as
+/// a week rather than dropped — a pair live for more than a week is not a
+/// relay gone silent — and a week is as steady as a minute to the rule.
 const MAX_LIVE_MS: u64 = 604_800_000;
 
 /// One relay's socket, as the supervisor has it.
@@ -916,8 +918,8 @@ impl Drop for RelaySock {
 }
 
 /// Check an Ack before anything is decided on it, and time it. `None` drops
-/// it: it echoes no Register sent on its socket lately, or carries what no
-/// relay sends. (Its `tunnel_id` was checked by the carrier.)
+/// it: it echoes no Register sent on its socket lately, or carries a relay id
+/// no relay sends. (Its `tunnel_id` was checked by the carrier.)
 fn ack_view(sent: &[Option<(u32, Instant)>], ack: RelayAck, at: Instant) -> Option<AckView> {
     let rtt = match ack.seq {
         Some(seq) => {
@@ -931,13 +933,10 @@ fn ack_view(sent: &[Option<(u32, Instant)>], ack: RelayAck, at: Instant) -> Opti
     {
         return None;
     }
-    if ack.live_ms.is_some_and(|ms| ms > MAX_LIVE_MS) {
-        return None;
-    }
     Some(AckView {
         ready: ack.ready,
         peer_live: ack.peer_live,
-        live_ms: ack.live_ms,
+        live_ms: ack.live_ms.map(|ms| ms.min(MAX_LIVE_MS)),
         relay_id: ack.relay_id,
         rtt,
     })
@@ -2811,13 +2810,24 @@ mod ack_check_tests {
     fn an_ack_with_what_no_relay_sends_is_dropped() {
         let t0 = Instant::now();
         let sent = [Some((1, t0)), None, None, None];
-        let ok = |id: &str, live: u64| ack_view(&sent, ack(Some(1), Some(id), Some(live)), t0).is_some();
-        assert!(ok("0123456789abcdef0123456789abcdef", MAX_LIVE_MS));
-        assert!(ok(&"F".repeat(64), 0), "1 to 64 hex characters, either case");
-        assert!(!ok("", 0), "empty");
-        assert!(!ok(&"a".repeat(65), 0), "too long");
-        assert!(!ok("not-hex", 0), "not hex");
-        assert!(!ok("ab", MAX_LIVE_MS + 1), "live_ms past a week");
+        let ok = |id: &str| ack_view(&sent, ack(Some(1), Some(id), Some(1)), t0).is_some();
+        assert!(ok("0123456789abcdef0123456789abcdef"));
+        assert!(ok(&"F".repeat(64)), "1 to 64 hex characters, either case");
+        assert!(!ok(""), "empty");
+        assert!(!ok(&"a".repeat(65)), "too long");
+        assert!(!ok("not-hex"), "not hex");
+    }
+
+    /// A pair both sides of which have been heard for more than a week is
+    /// not a relay gone silent: its Ack is taken, at a week.
+    #[test]
+    fn a_live_ms_past_a_week_is_read_as_a_week() {
+        let t0 = Instant::now();
+        let sent = [Some((1, t0)), None, None, None];
+        let view = |live: u64| ack_view(&sent, ack(Some(1), Some("ab"), Some(live)), t0).expect("taken");
+        assert_eq!(view(MAX_LIVE_MS).live_ms, Some(MAX_LIVE_MS));
+        assert_eq!(view(MAX_LIVE_MS + 1).live_ms, Some(MAX_LIVE_MS));
+        assert_eq!(view(u64::MAX).live_ms, Some(MAX_LIVE_MS));
     }
 
     #[test]
@@ -3604,7 +3614,6 @@ mod native_relay_wire_tests {
             ack(Uuid::new_v4(), Some(seq), good_id, 1),
             ack(id, Some(seq.wrapping_add(1000)), good_id, 1),
             ack(id, Some(seq), "relay!", 1),
-            ack(id, Some(seq), good_id, 604_800_001),
         ] {
             relay.send_to(&forged, edge).await.unwrap();
         }
