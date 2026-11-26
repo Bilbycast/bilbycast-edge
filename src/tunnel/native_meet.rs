@@ -25,13 +25,22 @@
 //!   same relay at a second address (R5) for as long as the address it keeps
 //!   answers;
 //! - keeps today's rules with an older relay (R6, R7): it moves only once its
-//!   relay has been silent for [`RELAY_DEAD_TIMEOUT_MS`] and never fails back.
+//!   relay has been silent for [`RELAY_DEAD_TIMEOUT_MS`] and never fails back,
+//!   nor follows the peer. So an outage of that long or more on one side's
+//!   path leaves the pair on two relays for good about half the time: the
+//!   side rotates while unheard and stays where it is when its path is back,
+//!   and a path back within the last keepalive before a rotation is due races
+//!   the Register due at the same moment (`NativeMeet::dead_active`).
 //!
 //! A refused datagram (the relay process is down, so its host answers ICMP)
-//! moves nothing: it only speeds up the Registers, so a restarted relay is
-//! found again within a second. An answer that is a Register and its fast
-//! retry late is asked for again every [`NativeTiming::fast`], so one or two
-//! lost Registers or Acks never let a relay count as silent.
+//! moves nothing: it only speeds up the Registers, so a side whose media or
+//! Register was refused while the relay was down finds it again within a
+//! second of its return. A side that was refused nothing (no media, its
+//! keepalive stepping over the restart) finds it at its next keepalive, up to
+//! 5 s after; the media is back within the restart and 6 s either way
+//! (`native_meet_sim`). An answer that is a Register and its fast retry late
+//! is asked for again every [`NativeTiming::fast`], so one or two lost
+//! Registers or Acks never let a relay count as silent.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -446,7 +455,8 @@ impl NativeMeet {
 
     /// A datagram to relay `i`, on socket `generation`, was refused: its host has
     /// nothing listening there. That moves nothing; it only speeds up the
-    /// Registers, so a relay that restarts is found again at once.
+    /// Registers, so a relay that restarts is found again within a
+    /// [`NativeTiming::fast`] of its return rather than at the next keepalive.
     pub(crate) fn note_refused(&mut self, i: usize, generation: u64, at: Instant) {
         if let Some(r) = self.relays.get_mut(i)
             && r.sock.is_some_and(|s| s.generation == generation)
